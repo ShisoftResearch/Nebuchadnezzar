@@ -2,14 +2,8 @@
 <project version="4">
   <component name="ChangeListManager">
     <list default="true" id="c4efb9c3-9d18-47fd-893b-977bb3467d02" name="Default" comment="">
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/addrTable.java" />
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/cleaner.java" />
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/writer.java" />
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/store.java" />
-      <change type="NEW" beforePath="" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" />
-      <change type="MODIFICATION" beforePath="$PROJECT_DIR$/.idea/misc.xml" afterPath="$PROJECT_DIR$/.idea/misc.xml" />
-      <change type="MODIFICATION" beforePath="$PROJECT_DIR$/.idea/workspace.xml" afterPath="$PROJECT_DIR$/.idea/workspace.xml" />
+      <change type="MODIFICATION" beforePath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
+      <change type="MODIFICATION" beforePath="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" />
     </list>
     <ignored path="Nebuchadnezzar.iws" />
     <ignored path=".idea/workspace.xml" />
@@ -31,30 +25,68 @@
   </component>
   <component name="FileEditorManager">
     <leaf>
-      <file leaf-file-name="writer.java" pinned="false" current-in-tab="false">
-        <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/writer.java">
+      <file leaf-file-name="trunk.java" pinned="false" current-in-tab="true">
+        <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java">
           <provider selected="true" editor-type-id="text-editor">
-            <state vertical-scroll-proportion="0.0">
-              <caret line="14" column="0" selection-start-line="14" selection-start-column="0" selection-end-line="14" selection-end-column="0" />
-              <folding />
+            <state vertical-scroll-proportion="0.8453608">
+              <caret line="323" column="61" selection-start-line="323" selection-start-column="61" selection-end-line="323" selection-end-column="61" />
+              <folding>
+                <element signature="imports" expanded="true" />
+                <element signature="e#519#520#0" expanded="true" />
+                <element signature="e#549#550#0" expanded="true" />
+                <element signature="e#4308#4309#0" expanded="true" />
+                <element signature="e#4350#4351#0" expanded="true" />
+                <element signature="e#4530#4531#0" expanded="true" />
+                <element signature="e#4599#4600#0" expanded="true" />
+                <element signature="e#4872#4873#0" expanded="true" />
+                <element signature="e#4939#4940#0" expanded="true" />
+                <element signature="e#5121#5122#0" expanded="true" />
+                <element signature="e#5193#5194#0" expanded="true" />
+                <element signature="e#6440#6441#0" expanded="true" />
+                <element signature="e#6509#6510#0" expanded="true" />
+                <element signature="e#6564#6565#0" expanded="true" />
+                <element signature="e#6608#6609#0" expanded="true" />
+                <element signature="e#6651#6652#0" expanded="true" />
+                <element signature="e#6726#6727#0" expanded="true" />
+                <element signature="e#6775#6776#0" expanded="true" />
+                <element signature="e#6809#6810#0" expanded="true" />
+                <element signature="e#6846#6847#0" expanded="true" />
+                <element signature="e#6915#6916#0" expanded="true" />
+                <element signature="e#6965#6966#0" expanded="true" />
+                <element signature="e#7022#7023#0" expanded="true" />
+                <element signature="e#7060#7061#0" expanded="true" />
+                <element signature="e#7131#7132#0" expanded="true" />
+                <element signature="e#7184#7185#0" expanded="true" />
+                <element signature="e#7245#7246#0" expanded="true" />
+                <element signature="e#7286#7287#0" expanded="true" />
+                <element signature="e#7359#7360#0" expanded="true" />
+                <element signature="e#7629#7630#0" expanded="true" />
+                <element signature="e#7698#7699#0" expanded="true" />
+                <element signature="e#7745#7746#0" expanded="true" />
+                <element signature="e#7781#7782#0" expanded="true" />
+                <element signature="e#7816#7817#0" expanded="true" />
+                <element signature="e#7844#7845#0" expanded="true" />
+                <element signature="e#8056#8057#0" expanded="true" />
+                <element signature="e#8127#8128#0" expanded="true" />
+                <element signature="e#8416#8417#0" expanded="true" />
+                <element signature="e#8487#8488#0" expanded="true" />
+                <element signature="e#8853#8854#0" expanded="true" />
+                <element signature="e#8924#8925#0" expanded="true" />
+                <element signature="e#9128#9129#0" expanded="true" />
+                <element signature="e#9195#9196#0" expanded="true" />
+                <element signature="e#9359#9360#0" expanded="true" />
+                <element signature="e#9428#9429#0" expanded="true" />
+              </folding>
             </state>
           </provider>
         </entry>
       </file>
-      <file leaf-file-name="trunk.java" pinned="false" current-in-tab="true">
-        <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java">
+      <file leaf-file-name="type_lengths.java" pinned="false" current-in-tab="false">
+        <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java">
           <provider selected="true" editor-type-id="text-editor">
-            <state vertical-scroll-proportion="0.69072163">
-              <caret line="242" column="37" selection-start-line="242" selection-start-column="37" selection-end-line="242" selection-end-column="37" />
-              <folding>
-                <element signature="imports" expanded="true" />
-                <element signature="e#4080#4081#0" expanded="true" />
-                <element signature="e#4122#4123#0" expanded="true" />
-                <element signature="e#5563#5564#0" expanded="true" />
-                <element signature="e#5603#5604#0" expanded="true" />
-                <element signature="e#5652#5653#0" expanded="true" />
-                <element signature="e#5682#5683#0" expanded="true" />
-              </folding>
+            <state vertical-scroll-proportion="0.0">
+              <caret line="19" column="55" selection-start-line="19" selection-start-column="55" selection-end-line="19" selection-end-column="55" />
+              <folding />
             </state>
           </provider>
         </entry>
@@ -90,9 +122,9 @@
         <option value="/Library/Java/JavaVirtualMachines/jdk1.8.0_20.jdk/Contents/Home/src.zip!/java/lang/Math.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/store.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/streams/locator.java" />
-        <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/reader.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/writer.java" />
+        <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" />
       </list>
     </option>
@@ -741,12 +773,12 @@
       <created>1453050338630</created>
       <option name="number" value="Default" />
       <updated>1453050338630</updated>
-      <workItem from="1453050339827" duration="5196000" />
+      <workItem from="1453050339827" duration="11201000" />
     </task>
     <servers />
   </component>
   <component name="TimeTrackingManager">
-    <option name="totallyTimeSpent" value="5196000" />
+    <option name="totallyTimeSpent" value="11201000" />
   </component>
   <component name="ToolWindowManager">
     <frame x="0" y="23" width="1920" height="1002" extended-state="6" />
@@ -884,31 +916,61 @@
     <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java">
       <provider selected="true" editor-type-id="text-editor">
         <state vertical-scroll-proportion="0.0">
-          <caret line="0" column="0" selection-start-line="0" selection-start-column="0" selection-end-line="0" selection-end-column="0" />
-          <folding />
-        </state>
-      </provider>
-    </entry>
-    <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/writer.java">
-      <provider selected="true" editor-type-id="text-editor">
-        <state vertical-scroll-proportion="0.0">
-          <caret line="14" column="0" selection-start-line="14" selection-start-column="0" selection-end-line="14" selection-end-column="0" />
+          <caret line="19" column="55" selection-start-line="19" selection-start-column="55" selection-end-line="19" selection-end-column="55" />
           <folding />
         </state>
       </provider>
     </entry>
     <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java">
       <provider selected="true" editor-type-id="text-editor">
-        <state vertical-scroll-proportion="0.69072163">
-          <caret line="242" column="37" selection-start-line="242" selection-start-column="37" selection-end-line="242" selection-end-column="37" />
+        <state vertical-scroll-proportion="0.8453608">
+          <caret line="323" column="61" selection-start-line="323" selection-start-column="61" selection-end-line="323" selection-end-column="61" />
           <folding>
             <element signature="imports" expanded="true" />
-            <element signature="e#4080#4081#0" expanded="true" />
-            <element signature="e#4122#4123#0" expanded="true" />
-            <element signature="e#5563#5564#0" expanded="true" />
-            <element signature="e#5603#5604#0" expanded="true" />
-            <element signature="e#5652#5653#0" expanded="true" />
-            <element signature="e#5682#5683#0" expanded="true" />
+            <element signature="e#519#520#0" expanded="true" />
+            <element signature="e#549#550#0" expanded="true" />
+            <element signature="e#4308#4309#0" expanded="true" />
+            <element signature="e#4350#4351#0" expanded="true" />
+            <element signature="e#4530#4531#0" expanded="true" />
+            <element signature="e#4599#4600#0" expanded="true" />
+            <element signature="e#4872#4873#0" expanded="true" />
+            <element signature="e#4939#4940#0" expanded="true" />
+            <element signature="e#5121#5122#0" expanded="true" />
+            <element signature="e#5193#5194#0" expanded="true" />
+            <element signature="e#6440#6441#0" expanded="true" />
+            <element signature="e#6509#6510#0" expanded="true" />
+            <element signature="e#6564#6565#0" expanded="true" />
+            <element signature="e#6608#6609#0" expanded="true" />
+            <element signature="e#6651#6652#0" expanded="true" />
+            <element signature="e#6726#6727#0" expanded="true" />
+            <element signature="e#6775#6776#0" expanded="true" />
+            <element signature="e#6809#6810#0" expanded="true" />
+            <element signature="e#6846#6847#0" expanded="true" />
+            <element signature="e#6915#6916#0" expanded="true" />
+            <element signature="e#6965#6966#0" expanded="true" />
+            <element signature="e#7022#7023#0" expanded="true" />
+            <element signature="e#7060#7061#0" expanded="true" />
+            <element signature="e#7131#7132#0" expanded="true" />
+            <element signature="e#7184#7185#0" expanded="true" />
+            <element signature="e#7245#7246#0" expanded="true" />
+            <element signature="e#7286#7287#0" expanded="true" />
+            <element signature="e#7359#7360#0" expanded="true" />
+            <element signature="e#7629#7630#0" expanded="true" />
+            <element signature="e#7698#7699#0" expanded="true" />
+            <element signature="e#7745#7746#0" expanded="true" />
+            <element signature="e#7781#7782#0" expanded="true" />
+            <element signature="e#7816#7817#0" expanded="true" />
+            <element signature="e#7844#7845#0" expanded="true" />
+            <element signature="e#8056#8057#0" expanded="true" />
+            <element signature="e#8127#8128#0" expanded="true" />
+            <element signature="e#8416#8417#0" expanded="true" />
+            <element signature="e#8487#8488#0" expanded="true" />
+            <element signature="e#8853#8854#0" expanded="true" />
+            <element signature="e#8924#8925#0" expanded="true" />
+            <element signature="e#9128#9129#0" expanded="true" />
+            <element signature="e#9195#9196#0" expanded="true" />
+            <element signature="e#9359#9360#0" expanded="true" />
+            <element signature="e#9428#9429#0" expanded="true" />
           </folding>
         </state>
       </provider>

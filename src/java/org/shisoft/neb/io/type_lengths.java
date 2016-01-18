@@ -13,11 +13,11 @@ public class type_lengths {
     public static final short byteLen = 1;
     public static final short floatLen = 4;
     public static final short doubleLen = 8;
-    public static final short uuidLen = 16;
+    public static final short uuidLen = 2 * longLen;
     public static final short cidLen = 16;
-    public static final short pos2dLen = 16;
-    public static final short pos3dLen = 24;
-    public static final short pos4dLen = 32;
-    public static final short geoLen = 8;
-    public static final short dateLen = 8;
+    public static final short pos2dLen = 2 * doubleLen;
+    public static final short pos3dLen = 3 * doubleLen;
+    public static final short pos4dLen = 4 * doubleLen;
+    public static final short geoLen = 2 * doubleLen;
+    public static final short dateLen = longLen;
 }

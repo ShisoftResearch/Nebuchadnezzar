@@ -6,6 +6,7 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.util.Date;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Created by shisoft on 18/1/2016.
@@ -13,13 +14,19 @@ import java.util.UUID;
 public class trunk {
 
     byte[] store;
-    int committed = 0;
+    AtomicInteger pointer = new AtomicInteger(0);
     public trunk(int size){
         store = new byte[size];
     }
     public byte[] getStore() {
         return store;
     }
+
+    public AtomicInteger getPointer() {
+        return pointer;
+    }
+
+    //////////////////////////////////////////////////////////////////////
 
     public  char readChar(int offset) throws EOFException {
         return (char)((store[offset] << 8) + (store[offset + 1] << 0));
@@ -133,33 +140,53 @@ public class trunk {
 
     ///////////////////////////////////////////////////////////////
 
-    private void put(int offset, int val){
+    private void setByte(int offset, int val){
         store[offset] = (byte) val;
     }
 
     public void writeChar(char v, int offset){
-        put(offset, (v >>> 8) & 0xFF);
-        put(offset + 1, (v >>> 0) & 0xFF);
+        setByte(offset, (v >>> 8) & 0xFF);
+        setByte(offset + 1, (v >>> 0) & 0xFF);
+    }
+
+    public void writeChar(char v){
+        writeChar(v, pointer.getAndAdd(type_lengths.charLen));
     }
 
     public void writeInt(int v, int offset){
-        put(offset, (v >>> 24) & 0xFF);
-        put(offset + 1, (v >>> 16) & 0xFF);
-        put(offset + 2, (v >>>  8) & 0xFF);
-        put(offset + 3, (v >>> 0) & 0xFF);
+        setByte(offset, (v >>> 24) & 0xFF);
+        setByte(offset + 1, (v >>> 16) & 0xFF);
+        setByte(offset + 2, (v >>>  8) & 0xFF);
+        setByte(offset + 3, (v >>> 0) & 0xFF);
+    }
+
+    public void writeInt(int v){
+        writeInt(v, pointer.getAndAdd(type_lengths.intLen));
     }
 
     public void writeShorts(int v, int offset){
-        put(offset, (v >>> 8) & 0xFF);
-        put(offset + 1, (v >>> 0) & 0xFF);
+        setByte(offset, (v >>> 8) & 0xFF);
+        setByte(offset + 1, (v >>> 0) & 0xFF);
+    }
+
+    public void writeShorts(int v){
+        writeShorts(v, pointer.getAndAdd(type_lengths.shortLen));
     }
 
     public void writeUshort(int v, int offset){
         writeShorts(v, offset);
     }
 
+    public void writeUshort(int v){
+        writeShorts(v);
+    }
+
     public void writeShort(short v, int offset){
         writeShorts(v, offset);
+    }
+
+    public void writeShort(short v){
+        writeShorts(v);
     }
 
     public void writeText(String v, int offset){ //TODO: Optimize for performance
@@ -172,31 +199,55 @@ public class trunk {
         }
     }
 
+    public void writeText(String v){
+        writeText(v, pointer.getAndAdd(type_lengths.intLen + v.toCharArray().length * type_lengths.charLen));
+    }
+
     public void writeLong(long v, int offset){
-        put(offset, (int) (v >>> 56));
-        put(offset + 1, (int) (v >>> 48));
-        put(offset + 2, (int) (v >>> 40));
-        put(offset + 3, (int) (v >>> 32));
-        put(offset + 4, (int) (v >>> 24));
-        put(offset + 5, (int) (v >>> 16));
-        put(offset + 6, (int) (v >>> 8));
-        put(offset + 7, (int) (v >>> 0));
+        setByte(offset, (int) (v >>> 56));
+        setByte(offset + 1, (int) (v >>> 48));
+        setByte(offset + 2, (int) (v >>> 40));
+        setByte(offset + 3, (int) (v >>> 32));
+        setByte(offset + 4, (int) (v >>> 24));
+        setByte(offset + 5, (int) (v >>> 16));
+        setByte(offset + 6, (int) (v >>> 8));
+        setByte(offset + 7, (int) (v >>> 0));
+    }
+
+    public void writeLong(long v){
+        writeLong(v, pointer.getAndAdd(type_lengths.longLen));
     }
 
     public void writeBoolean (boolean v, int offset){
-        put(offset, (v ? 1 : 0));
+        setByte(offset, (v ? 1 : 0));
+    }
+
+    public void writeBoolean (boolean v){
+        writeBoolean(v, pointer.getAndAdd(type_lengths.booleanLen));
     }
 
     public void writeByte (byte v, int offset){
-        put(offset, v);
+        setByte(offset, v);
+    }
+
+    public void writeByte (byte v){
+        writeByte(v, pointer.getAndAdd(type_lengths.byteLen));
     }
 
     public void writeFloat(float v, int offset){
         writeInt(Float.floatToIntBits(v), offset);
     }
 
+    public void writeFloat(float v){
+        writeFloat(v, pointer.getAndAdd(type_lengths.floatLen));
+    }
+
     public void writeDouble (double v, int offset){
         writeLong(Double.doubleToLongBits(v), offset);
+    }
+
+    public void writeDouble (double v){
+        writeDouble(v, pointer.getAndAdd(type_lengths.doubleLen));
     }
 
     public void writeUuid (UUID v, int offset){
@@ -206,8 +257,16 @@ public class trunk {
         writeLong(lb, offset + type_lengths.longLen);
     }
 
+    public void writeUuid (UUID v){
+        writeUuid(v, pointer.getAndAdd(type_lengths.uuidLen));
+    }
+
     public void writeCid(UUID v, int offset){
         writeUuid(v, offset);
+    }
+
+    public void writeCid(UUID v){
+        writeUuid(v);
     }
 
     public void writePos2d(double[] v, int offset){
@@ -216,12 +275,20 @@ public class trunk {
         writeDouble(v[1], offset);
     }
 
+    public void writePos2d(double[] v){
+        writePos2d(v, pointer.getAndAdd(type_lengths.pos2dLen));
+    }
+
     public void writePos3d(double[] v, int offset){
         writeDouble(v[0], offset);
         offset += type_lengths.doubleLen;
         writeDouble(v[1], offset);
         offset += type_lengths.doubleLen;
         writeDouble(v[2], offset);
+    }
+
+    public void writePos3d(double[] v){
+        writePos3d(v, pointer.getAndAdd(type_lengths.pos3dLen));
     }
 
     public void writePos4d(double[] v, int offset){
@@ -234,15 +301,27 @@ public class trunk {
         writeDouble(v[3], offset);
     }
 
+    public void writePos4d(double[] v){
+        writePos4d(v, pointer.getAndAdd(type_lengths.pos4dLen));
+    }
+
     public void writeGeo(float[] v, int offset){
         writeFloat(v[0], offset);
         offset += type_lengths.doubleLen;
         writeFloat(v[1], offset);
     }
 
+    public void writeGeo(float[] v){
+        writeGeo(v, pointer.getAndAdd(type_lengths.geoLen));
+    }
+
     public void writeDate(Date v, int offset){
         long timespan = v.getTime();
         writeLong(timespan, offset);
+    }
+
+    public void writeDate(Date v){
+        writeDate(v, pointer.getAndAdd(type_lengths.dateLen));
     }
 
 }
