@@ -18,6 +18,6 @@ public class type_lengths {
     public static final short pos2dLen = 2 * doubleLen;
     public static final short pos3dLen = 3 * doubleLen;
     public static final short pos4dLen = 4 * doubleLen;
-    public static final short geoLen = 2 * doubleLen;
+    public static final short geoLen = 2 * floatLen;
     public static final short dateLen = longLen;
 }

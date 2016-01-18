@@ -3,7 +3,6 @@
   <component name="ChangeListManager">
     <list default="true" id="c4efb9c3-9d18-47fd-893b-977bb3467d02" name="Default" comment="">
       <change type="MODIFICATION" beforePath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
-      <change type="MODIFICATION" beforePath="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" afterPath="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" />
     </list>
     <ignored path="Nebuchadnezzar.iws" />
     <ignored path=".idea/workspace.xml" />
@@ -25,11 +24,11 @@
   </component>
   <component name="FileEditorManager">
     <leaf>
-      <file leaf-file-name="trunk.java" pinned="false" current-in-tab="true">
+      <file leaf-file-name="trunk.java" pinned="false" current-in-tab="false">
         <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java">
           <provider selected="true" editor-type-id="text-editor">
-            <state vertical-scroll-proportion="0.8453608">
-              <caret line="323" column="61" selection-start-line="323" selection-start-column="61" selection-end-line="323" selection-end-column="61" />
+            <state vertical-scroll-proportion="0.0">
+              <caret line="319" column="36" selection-start-line="319" selection-start-column="36" selection-end-line="319" selection-end-column="36" />
               <folding>
                 <element signature="imports" expanded="true" />
                 <element signature="e#519#520#0" expanded="true" />
@@ -81,11 +80,11 @@
           </provider>
         </entry>
       </file>
-      <file leaf-file-name="type_lengths.java" pinned="false" current-in-tab="false">
+      <file leaf-file-name="type_lengths.java" pinned="false" current-in-tab="true">
         <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java">
           <provider selected="true" editor-type-id="text-editor">
-            <state vertical-scroll-proportion="0.0">
-              <caret line="19" column="55" selection-start-line="19" selection-start-column="55" selection-end-line="19" selection-end-column="55" />
+            <state vertical-scroll-proportion="0.5154639">
+              <caret line="20" column="51" selection-start-line="20" selection-start-column="51" selection-end-line="20" selection-end-column="51" />
               <folding />
             </state>
           </provider>
@@ -124,8 +123,8 @@
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/streams/locator.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/reader.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/writer.java" />
-        <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
         <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java" />
+        <option value="$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java" />
       </list>
     </option>
   </component>
@@ -773,12 +772,12 @@
       <created>1453050338630</created>
       <option name="number" value="Default" />
       <updated>1453050338630</updated>
-      <workItem from="1453050339827" duration="11201000" />
+      <workItem from="1453050339827" duration="11365000" />
     </task>
     <servers />
   </component>
   <component name="TimeTrackingManager">
-    <option name="totallyTimeSpent" value="11201000" />
+    <option name="totallyTimeSpent" value="11365000" />
   </component>
   <component name="ToolWindowManager">
     <frame x="0" y="23" width="1920" height="1002" extended-state="6" />
@@ -913,18 +912,10 @@
         </state>
       </provider>
     </entry>
-    <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java">
-      <provider selected="true" editor-type-id="text-editor">
-        <state vertical-scroll-proportion="0.0">
-          <caret line="19" column="55" selection-start-line="19" selection-start-column="55" selection-end-line="19" selection-end-column="55" />
-          <folding />
-        </state>
-      </provider>
-    </entry>
     <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/trunk.java">
       <provider selected="true" editor-type-id="text-editor">
-        <state vertical-scroll-proportion="0.8453608">
-          <caret line="323" column="61" selection-start-line="323" selection-start-column="61" selection-end-line="323" selection-end-column="61" />
+        <state vertical-scroll-proportion="0.0">
+          <caret line="319" column="36" selection-start-line="319" selection-start-column="36" selection-end-line="319" selection-end-column="36" />
           <folding>
             <element signature="imports" expanded="true" />
             <element signature="e#519#520#0" expanded="true" />
@@ -972,6 +963,14 @@
             <element signature="e#9359#9360#0" expanded="true" />
             <element signature="e#9428#9429#0" expanded="true" />
           </folding>
+        </state>
+      </provider>
+    </entry>
+    <entry file="file://$PROJECT_DIR$/src/java/org/shisoft/neb/io/type_lengths.java">
+      <provider selected="true" editor-type-id="text-editor">
+        <state vertical-scroll-proportion="0.5154639">
+          <caret line="20" column="51" selection-start-line="20" selection-start-column="51" selection-end-line="20" selection-end-column="51" />
+          <folding />
         </state>
       </provider>
     </entry>
