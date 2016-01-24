@@ -12,21 +12,29 @@
         {}
         (map
           (fn [[k {:keys [id example dynamic? preproc succproc dep] :as v}]]
-            [k (merge v
-                      {:reader (when-not dep
-                                 `(fn [trunk# offset#]
-                                    (~(symbol (str "reader/read"
-                                                   (clojure.string/capitalize (name k))))
-                                      trunk#
-                                      offset#)))
-                       :writer (when-not dep
-                                 `(fn [trunk# value# offset#]
-                                    (~(symbol (str "writer/write"
-                                                   (clojure.string/capitalize (name k))))
-                                      trunk#
-                                      value#
-                                      offset#)))
-                       :length (when-not dynamic? (symbol (str "type_lengths/" (name k) "Len")))})])
+            (let [obj-symbol (symbol "obj")
+                  length (when-not dynamic? (symbol (str "type_lengths/" (name k) "Len")))]
+              [k (merge v
+                        {:reader (when-not dep
+                                   `(fn [trunk# offset#]
+                                      (~(symbol (str "reader/read"
+                                                     (clojure.string/capitalize (name k))))
+                                        trunk#
+                                        offset#)))
+                         :writer (when-not dep
+                                   `(fn [trunk# value# offset#]
+                                      (~(symbol (str "writer/write"
+                                                     (clojure.string/capitalize (name k))))
+                                        trunk#
+                                        value#
+                                        offset#)))
+                         :length length
+                         :unit-length (when dynamic? (symbol (str "type_lengths/" (name k) "UnitLen")))
+                         :count-length (when dynamic?
+                                         `(fn [~obj-symbol]
+                                            (~(symbol (str "type_lengths/count"
+                                                           (clojure.string/capitalize (name k))))
+                                              ~obj-symbol)))})]))
           m))))
 
 (defDataTypes data-types

@@ -23,4 +23,7 @@ public class cellReader {
         return r;
     }
 
+    public int getCurrLoc() {
+        return currLoc;
+    }
 }

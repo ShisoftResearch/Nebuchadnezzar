@@ -20,4 +20,18 @@ public class type_lengths {
     public static final short pos4dLen = 4 * doubleLen;
     public static final short geoLen = 2 * floatLen;
     public static final short dateLen = longLen;
+
+    public static final short bytesUnitLen = byteLen;
+    public static final short objUnitLen   = byteLen;
+    public static final short textUnitLen  = charLen;
+
+    public static int countBytes(byte[] bs){
+        return bs.length;
+    }
+    public static int countObj(byte[] bs){
+        return countBytes(bs);
+    }
+    public static int countText(String str){
+        return str.length();
+    }
 }
