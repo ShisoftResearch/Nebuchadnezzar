@@ -1,6 +1,7 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types]]
-            [neb.schema :refer [schema-store]])
+            [neb.schema :refer [schema-store]]
+            [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
 
@@ -24,7 +25,7 @@
                 cell-head-struc))
      ~@body))
 
-(defn schema-by-id [^Integer schema-id]
+(defn schema-by-id [^Short schema-id]
   (-> (.getSchemaIdMap schema-store)
       (.get schema-id)))
 
@@ -70,7 +71,7 @@
                                    unit-length count-length]} (get data-types data-type)
                            dep (when dep (get data-types dep))
                            writer (or writer (get dep :reader))
-                           writer (if preproc (comp reader preproc) reader)
+                           writer (if preproc (comp writer preproc) writer)
                            field-data (get m key-name)]
                        {:key-name key-name
                         :type data-type
@@ -89,4 +90,5 @@
                        :schema schema-id}]
       (write-cell-header trunk cell-writer header-data)
       (doseq [{:keys [key-name type value writer length] :as field} fields]
-        (.streamWrite cell-writer writer value length)))))
+        (.streamWrite cell-writer writer value length))
+      (.addCellToTrunkIndex cell-writer hash))))
