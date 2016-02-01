@@ -14,7 +14,7 @@
                       [:len-offset :int]])
 (def compound-scheme-data {:int-value (rand-int Integer/MAX_VALUE) :long-value Long/MAX_VALUE
                            :char-value \测
-                           :text-value "Нет никого, кто любил бы боль саму по себе, кто искал бы её и кто хотел бы иметь её просто потому, что это боль."
+                           :text-value "Google DeepMind开发的AlphaGo成为首个在公平比赛击败职业围棋选手的电脑围棋程式。 Нет никого, кто любил бы боль саму по себе, кто искал бы её и кто хотел бы иметь её просто потому, что это боль."
                            :len-offset 15})
 
 
@@ -24,14 +24,14 @@
        (fact "define simple scheme"
              (add-scheme :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
-             (write-cell @ttrunk (int 123456) (short 1) simple-scheme-data) => anything)
+             (time (do (write-cell @ttrunk (int 123456) (short 1) simple-scheme-data) => anything)))
        (fact "read cell with simple scheme"
-             (read-cell @ttrunk (int 123456)) => simple-scheme-data)
+             (time (do (read-cell @ttrunk (int 123456)) => simple-scheme-data)))
        (fact "define compound scheme"
-             (add-scheme :test-schema2 compound-scheme 2) => anything)
+             (time (do (add-scheme :test-schema2 compound-scheme 2) => anything)))
        (fact "write cell with compound shceme"
-             (write-cell @ttrunk (int 123456) (short 2) compound-scheme-data) => anything)
+             (time (do (write-cell @ttrunk (int 123456) (short 2) compound-scheme-data) => anything)))
        (fact "read cell with compound scheme"
-             (read-cell @ttrunk (int 123456)) => compound-scheme-data)
+             (time (do (read-cell @ttrunk (int 123456)) => compound-scheme-data)))
        (fact "dispose"
              (.dispose @ttrunk) => truthy))
