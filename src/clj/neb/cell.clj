@@ -40,10 +40,10 @@
           (map
             (fn [[key-name data-type]]
               [key-name
-               (let [{:keys [length reader dep dynamic? succproc unit-length]} (get data-types data-type)
+               (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
                      dep (when dep (get data-types dep))
                      reader (or reader (get dep :reader))
-                     reader (if succproc (comp succproc reader) reader)
+                     reader (if decoder (comp decoder reader) reader)
                      length (or length
                                 (+ (* (reader/readInt
                                         trunk (.getCurrLoc cell-reader))
@@ -67,12 +67,12 @@
   (when-let [schema (schema-by-id schema-id)]
     (let [fields (map
                    (fn [[key-name data-type]]
-                     (let [{:keys [length writer dep dynamic? preproc
+                     (let [{:keys [length writer dep dynamic? encoder
                                    unit-length count-length]} (get data-types data-type)
                            dep (when dep (get data-types dep))
-                           writer (or writer (get dep :reader))
-                           writer (if preproc (comp writer preproc) writer)
-                           field-data (get m key-name)]
+                           writer (or writer (get dep :writer))
+                           field-data (get m key-name)
+                           field-data (if encoder (encoder field-data) field-data)]
                        {:key-name key-name
                         :type data-type
                         :value field-data

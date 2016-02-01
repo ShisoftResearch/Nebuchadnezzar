@@ -1,7 +1,8 @@
 (ns neb.types
   (:require [taoensso.nippy :as nippy])
   (:import [org.shisoft.neb.io writer reader type_lengths]
-           (java.util UUID Date)))
+           (java.util UUID Date)
+           (java.nio.charset Charset)))
 
 (declare read-array)
 (declare write-array)
@@ -37,12 +38,17 @@
                                               ~obj-symbol)))})]))
           m))))
 
+(def ^Charset string-encoding (Charset/forName "UTF-8"))
+
 (defDataTypes data-types
   {
    :char    {:id      1
              :example [\a \测 \å \∫ \≤ \œ]}
    :text    {:id      3 :dynamic? true
-             :example ["The morpueus engine" "这是一段测试文本 abc"]}
+             :example ["The morpueus engine" "这是一段测试文本 abc"]
+             :encoder (fn [^String string] (.getBytes string string-encoding))
+             :decoder (fn [byte-arr] (String. byte-arr string-encoding))
+             :dep :bytes}
    :int     {:id      4
              :example [(int 1) (int Integer/MIN_VALUE) (int Integer/MAX_VALUE)]}
    :long    {:id      5
@@ -76,7 +82,8 @@
    :date    {:id      19
              :example [(Date.)]}
    :obj     {:id      20 :dynamic? true
-             :preproc nippy/freeze :succproc nippy/thaw
+             :encoder nippy/freeze
+             :decoder nippy/thaw
              :dep :bytes
              :example [{:a 1 :b 2}]}
    })

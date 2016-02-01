@@ -15,6 +15,9 @@ public class writer {
     }
 
     public static void writeBytes(trunk store, byte[] val, int offset){
+        int length = val.length;
+        writeInt(store, length, offset);
+        offset += type_lengths.intLen;
         for (int i = 0 ; i < val.length ; i++){
             setByte(store, offset + i, val[i]);
         }
@@ -29,11 +32,12 @@ public class writer {
         writeChar(store, v, store.getPointer().getAndAdd(type_lengths.charLen));
     }
 
-    public static void writeInt(trunk store, int v, int offset){
-        setByte(store, offset, (v >>> 24) & 0xFF);
-        setByte(store, offset + 1, (v >>> 16) & 0xFF);
-        setByte(store, offset + 2, (v >>>  8) & 0xFF);
-        setByte(store, offset + 3, (v >>> 0) & 0xFF);
+    public static void writeInt(trunk store, int val, int offset){
+        for(int i= offset + 3; i > offset; i--) {
+            setByte(store, i, (byte) val);
+            val >>>= 8;
+        }
+        setByte(store, offset, (byte) val);
     }
 
     public static void writeInt(trunk store, int v){
@@ -65,29 +69,12 @@ public class writer {
         writeShorts(store, v);
     }
 
-    public static void writeText(trunk store, String v, int offset){ //TODO: Optimize for performance
-        int length = v.length();
-        writeInt(store, length, offset);
-        offset += type_lengths.intLen;
-        for (char c : v.toCharArray()){
-            writeChar(store, c, offset);
-            offset += type_lengths.charLen;
+    public static void writeLong(trunk store, long val, int offset){
+        for(int i = offset + 7; i > offset; i--) {
+            setByte(store, i, (byte) val);
+            val >>>= 8;
         }
-    }
-
-    public static void writeText(trunk store, String v){
-        writeText(store, v, store.getPointer().getAndAdd(type_lengths.intLen + v.toCharArray().length * type_lengths.charLen));
-    }
-
-    public static void writeLong(trunk store, long v, int offset){
-        setByte(store, offset, (int) (v >>> 56));
-        setByte(store, offset + 1, (int) (v >>> 48));
-        setByte(store, offset + 2, (int) (v >>> 40));
-        setByte(store, offset + 3, (int) (v >>> 32));
-        setByte(store, offset + 4, (int) (v >>> 24));
-        setByte(store, offset + 5, (int) (v >>> 16));
-        setByte(store, offset + 6, (int) (v >>> 8));
-        setByte(store, offset + 7, (int) (v >>> 0));
+        setByte(store, offset, (byte) val);
     }
 
     public static void writeLong(trunk store, long v){

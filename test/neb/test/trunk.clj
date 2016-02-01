@@ -10,10 +10,12 @@
 (def simple-scheme [[:int-value :int]])
 (def simple-scheme-data {:int-value (rand-int Integer/MAX_VALUE)})
 
-(def compound-scheme [[:int-value :int] [:long-value :long] [:char-value :char] [:text-value :text]])
+(def compound-scheme [[:int-value :int] [:long-value :long] [:char-value :char] [:text-value :text]
+                      [:len-offset :int]])
 (def compound-scheme-data {:int-value (rand-int Integer/MAX_VALUE) :long-value Long/MAX_VALUE
-                           :char-value \å
-                           :text-value "Нет никого, кто любил бы боль саму по себе, кто искал бы её и кто хотел бы иметь её просто потому, что это боль."})
+                           :char-value \测
+                           :text-value "Нет никого, кто любил бы боль саму по себе, кто искал бы её и кто хотел бы иметь её просто потому, что это боль."
+                           :len-offset 15})
 
 
 (facts "trunk test"

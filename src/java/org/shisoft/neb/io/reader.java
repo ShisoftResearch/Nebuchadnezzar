@@ -12,13 +12,17 @@ import java.util.UUID;
 public class reader {
 
     public static char readChar(trunk trunk, int offset) {
-        byte[] store = trunk.getStore();
-        return (char)((store[offset] << 8) + (store[offset + 1] << 0));
+        return (char)readShort(trunk, offset);
     }
 
     public static int readInt(trunk trunk, int offset)  {
         byte[] store = trunk.getStore();
-        return ((store[offset] << 24) + (store[offset + 1] << 16) + (store[offset + 2] << 8) + (store[offset + 3] << 0));
+        int n = 0;
+        for(int i = offset; i < (offset + type_lengths.intLen); i++) {
+            n <<= 8;
+            n ^= store[i] & 0xFF;
+        }
+        return n;
     }
 
     public static int readUnsignedShort(trunk trunk, int offset) {
@@ -26,27 +30,14 @@ public class reader {
         return (store[offset] << 8) + (store[offset + 1] << 0);
     }
 
-    public static String readText(trunk trunk, int offset) { //TODO: Optimize for performance
-        int length = readInt(trunk, offset);
-        offset += type_lengths.intLen;
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i< length; i++){
-            sb.append(readChar(trunk, offset));
-            offset += 2;
-        }
-        return sb.toString();
-    }
-
     public static long readLong(trunk trunk, int offset) {
         byte[] store = trunk.getStore();
-        return (((long) store[offset] << 56) +
-                ((store[offset + 1] & 255) << 48) +
-                ((store[offset + 2] & 255) << 40) +
-                ((store[offset + 3] & 255) << 32) +
-                ((store[offset + 4] & 255) << 24) +
-                ((store[offset + 5] & 255) << 16) +
-                ((store[offset + 6] & 255) <<  8) +
-                ((store[offset + 7] & 255) <<  0));
+        long l = 0;
+        for(int i = offset; i < offset + type_lengths.longLen; i++) {
+            l <<= 8;
+            l ^= store[i] & 0xFF;
+        }
+        return l;
     }
 
     public static boolean readBoolean(trunk trunk, int offset) {
