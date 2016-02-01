@@ -68,9 +68,9 @@
    :double  {:id      12
              :example [`(double 1.0) `(double 2.0) `Double/MIN_VALUE `Double/MAX_VALUE]}
    :uuid    {:id      13
-             :example [`(UUID/randomUUID) `(UUID/randomUUID) `(UUID/randomUUID)]}
+             :example [`(UUID/randomUUID) `(UUID/randomUUID)]}
    :cid     {:id      14
-             :example [`(UUID/randomUUID) `(UUID/randomUUID) `(UUID/randomUUID)]}
+             :example [`(UUID/randomUUID) `(UUID/randomUUID)]}
    :pos2d   {:id      15
              :example [[1.0, 2.0] [3.0 4.0]]
              :encoder double-array
@@ -80,7 +80,7 @@
              :encoder double-array
              :decoder vec}
    :pos4d   {:id      17
-             :example [[1.0, 2.0 3.0 1024] [3.0 4.0 4096 12]]
+             :example [[1.0, 2.0 3.0 1024.0] [3.0 4.0 4096.0 12.0]]
              :encoder double-array
              :decoder vec}
    :geo     {:id      18

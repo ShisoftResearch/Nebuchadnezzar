@@ -1,7 +1,7 @@
 (ns neb.test.data-type-io
   (:require [midje.sweet :refer :all]
             [neb.schema :refer [add-scheme]]
-            [neb.cell :refer [write-cell read-cell]]
+            [neb.cell :refer [write-cell read-cell schema-by-id]]
             [neb.types :refer [data-types]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
@@ -9,18 +9,33 @@
 
 (def ttrunk (atom nil))
 
+(defn rt []
+  (reset! ttrunk (trunk. 5000)))
+
+(defn dt []
+  (.dispose @ttrunk))
+
+(defn wc [test-case]
+  (write-cell @ttrunk (int 123456) (short 20) test-case))
+
+(defn rc []
+  (read-cell  @ttrunk (int 123456)))
+
 (defmacro gen-test-cases []
   `(do ~@(map
            (fn [[dname {:keys [example]}]]
              (when (seq example)
-               `(do (reset! ttrunk (trunk. 5000))
-                    (add-scheme :test-type-schama [[:test ~dname]] 1)
+               `(do (add-scheme :test-type-schama [[:test ~dname]] (short 20))
+                    (schema-by-id (short 20)) =not=> nil
                     ~@(map
                         (fn [test-case]
                           `(fact ~(str (name dname) " - " (pr-str test-case))
-                                 (write-cell @ttrunk (int 123456) (short 1) {:test ~test-case}) => anything))
-                        example)
-                    (.dispose @ttrunk))))
+                                 (let [test-case# {:test ~test-case}]
+                                   (rt)
+                                    (wc test-case#) => anything
+                                    (rc) => test-case#
+                                   (dt))))
+                        example))))
            data-types)))
 
 (facts "Data types io integrity test"
