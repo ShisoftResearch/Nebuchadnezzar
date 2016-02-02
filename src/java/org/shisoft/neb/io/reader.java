@@ -26,8 +26,8 @@ public class reader {
     }
 
     public static int readUnsignedShort(trunk trunk, int offset) {
-        byte[] store = trunk.getStore();
-        return (store[offset] << 8) + (store[offset + 1] << 0);
+        short s = readShort(trunk, offset);
+        return s < 0 ? (-1 * s) + Short.MAX_VALUE : s;
     }
 
     public static long readLong(trunk trunk, int offset) {
@@ -48,7 +48,12 @@ public class reader {
 
     public static short readShort(trunk trunk, int offset) {
         byte[] store = trunk.getStore();
-        return (short)((store[offset] << 8) + (store[offset + 1] << 0));
+        short s = 0;
+        for(int i = offset; i < offset + type_lengths.shortLen; i++) {
+            s <<= 8;
+            s ^= store[i] & 0xFF;
+        }
+        return s;
     }
 
     public static int readUshort(trunk trunk, int offset) {

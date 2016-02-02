@@ -44,9 +44,12 @@ public class writer {
         writeInt(store, v, store.getPointer().getAndAdd(type_lengths.intLen));
     }
 
-    public static void writeShorts(trunk store, int v, int offset){
-        setByte(store, offset, (v >>> 8) & 0xFF);
-        setByte(store, offset + 1, (v >>> 0) & 0xFF);
+    public static void writeShorts(trunk store, int val, int offset){
+        for(int i = offset + (type_lengths.shortLen - 1); i > offset; i--) {
+            setByte(store, i, (byte) val);
+            val >>>= 8;
+        }
+        setByte(store, offset, (byte) val);
     }
 
     public static void writeShorts(trunk store, int v){
@@ -54,11 +57,11 @@ public class writer {
     }
 
     public static void writeUshort(trunk store, int v, int offset){
-        writeShorts(store, v, offset);
+        writeShorts(store, (v > Short.MAX_VALUE ? (-1 * (v - Short.MAX_VALUE)) : v), offset);
     }
 
     public static void writeUshort(trunk store, int v){
-        writeShorts(store, v);
+        writeUshort(store, v, store.getPointer().getAndAdd(type_lengths.ushortLen));
     }
 
     public static void writeShort(trunk store, short v, int offset){
@@ -170,7 +173,7 @@ public class writer {
 
     public static void writeGeo(trunk store, float[] v, int offset){
         writeFloat(store, v[0], offset);
-        offset += type_lengths.doubleLen;
+        offset += type_lengths.floatLen;
         writeFloat(store, v[1], offset);
     }
 

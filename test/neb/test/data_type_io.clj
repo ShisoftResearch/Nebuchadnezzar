@@ -32,8 +32,8 @@
                           `(fact ~(str (name dname) " - " (pr-str test-case))
                                  (let [test-case# {:test ~test-case}]
                                    (rt)
-                                    (wc test-case#) => anything
-                                    (rc) => test-case#
+                                   (wc test-case#) => anything
+                                   (rc) => test-case#
                                    (dt))))
                         example))))
            data-types)))

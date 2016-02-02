@@ -62,7 +62,7 @@
    :byte    {:id      9
              :example [`(byte 1) `(byte 2) `(byte (Byte/MIN_VALUE)) `(byte (Byte/MAX_VALUE))]}
    :bytes   {:id      10 :dynamic? true
-             :example [`(.getBytes "this is a bytes test")]}
+             :example []}
    :float   {:id      11
              :example [`(float 1) `(float 2) `Float/MIN_VALUE `Float/MAX_VALUE]}
    :double  {:id      12
@@ -84,7 +84,7 @@
              :encoder double-array
              :decoder vec}
    :geo     {:id      18
-             :example [[31.12 121.30] [40.30 71.51]]
+             :example [`(map float [31.12 121.30]) `(map float [40.30 71.51])]
              :encoder float-array
              :decoder vec}
    :date    {:id      19
