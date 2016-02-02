@@ -25,32 +25,69 @@
                 cell-head-struc))
      ~@body))
 
+(defmacro gen-cell-header-offsets []
+  (let [loc-counter (atom 0)]
+    `(do ~@(map
+             (fn [[prop type]]
+               (let [{:keys [length]} (get data-types type)
+                     out-code `(def ~(symbol (str (name prop) "-offset")) ~(deref loc-counter))]
+                 (swap! loc-counter (partial + length))
+                 out-code))
+             cell-head-struc)
+         ~(do (reset! loc-counter 0) nil)
+         (def cell-head-struc-map
+           ~(into {}
+                  (map
+                    (fn [[prop type]]
+                      (let [{:keys [length] :as fields} (get data-types type)
+                            res [prop (assoc (select-keys fields [:reader :writer]) :offset @loc-counter)]]
+                        (swap! loc-counter (partial + length))
+                        res))
+                    cell-head-struc))))))
+
+(gen-cell-header-offsets)
+
 (defn schema-by-id [^Short schema-id]
   (-> (.getSchemaIdMap schema-store)
       (.get schema-id)))
 
+(defn read-cell-header-field [^trunk trunk loc field]
+  (let [{:keys [reader offset]} (get cell-head-struc-map field)]
+    (reader trunk (+ loc offset))))
+
+(defn write-cell-header-field [^trunk trunk loc field value]
+  (let [{:keys [writer offset]} (get cell-head-struc-map field)]
+    (writer trunk value (+ loc offset))))
+
+(defn delete-cell [^trunk trunk ^Integer hash]
+  (let [cell-loc (.get (.getCellIndex trunk) hash)
+        length (read-cell-header-field trunk cell-loc :cell-length)]
+    (.removeCellFromIndex trunk hash)
+    (write-cell-header-field trunk cell-loc :cell-length (* -1 length))))
+
 (defn read-cell [^trunk trunk ^Integer hash]
-  (let [loc (.get (.getCellIndex trunk) hash)
-        cell-reader (cellReader. trunk loc)]
-    (with-cell
-      cell-reader
-      (when-let [schema (schema-by-id schema-id)]
-        (into
-          {}
-          (map
-            (fn [[key-name data-type]]
-              [key-name
-               (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
-                     dep (when dep (get data-types dep))
-                     reader (or reader (get dep :reader))
-                     reader (if decoder (comp decoder reader) reader)
-                     length (or length
-                                (+ (* (reader/readInt
-                                        trunk (.getCurrLoc cell-reader))
-                                      unit-length)
-                                   type_lengths/intLen))]
-                 (.streamRead cell-reader reader length))])
-            (:f schema)))))))
+  (when-let [loc (.get (.getCellIndex trunk) hash)]
+    (let [cell-reader (cellReader. trunk loc)]
+      (with-cell
+        cell-reader
+        (when (> cell-length 0)
+          (when-let [schema (schema-by-id schema-id)]
+            (into
+              {}
+              (map
+                (fn [[key-name data-type]]
+                  [key-name
+                   (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
+                         dep (when dep (get data-types dep))
+                         reader (or reader (get dep :reader))
+                         reader (if decoder (comp decoder reader) reader)
+                         length (or length
+                                    (+ (* (reader/readInt
+                                            trunk (.getCurrLoc cell-reader))
+                                          unit-length)
+                                       type_lengths/intLen))]
+                     (.streamRead cell-reader reader length))])
+                (:f schema)))))))))
 
 (defmacro write-cell-header [trunk cell-writer header-data]
   `(do ~@(map

@@ -28,4 +28,7 @@ public class trunk {
         this.store = null;
         return true;
     }
+    public void removeCellFromIndex(int hash){
+        getCellIndex().remove(hash);
+    }
 }
