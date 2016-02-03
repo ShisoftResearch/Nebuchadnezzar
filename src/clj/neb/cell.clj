@@ -70,7 +70,7 @@
     (throw (Exception. "Cell hash does not existed to delete"))))
 
 (defn read-cell [^trunk trunk ^Integer hash]
-  (when-let [loc (.get (.getCellIndex trunk) hash)]
+  (if-let [loc (.get (.getCellIndex trunk) hash)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
@@ -158,7 +158,6 @@
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
           fields (cell-fields-to-write schema data)
-          new-data-fields (cell-fields-to-write schema data)
           new-data-length (cell-len-by-fields fields)]
       (if (>= data-len new-data-length)
         (do (write-cell trunk schema data :loc cell-loc)
@@ -167,5 +166,11 @@
                 trunk
                 (+ cell-data-loc new-data-length)
                 (+ cell-data-loc data-len))))
-        (do (write-cell trunk schema data :hash hash)
+        (do (write-cell trunk schema data :hash hash :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
+
+(defn update-cell [^trunk trunk ^Integer hash fn & params]  ;TODO Replace with less overhead function
+  (when-let [cell-content (read-cell trunk hash)]
+    (let [replacement  (apply fn cell-content params)]
+      (replace-cell trunk hash replacement)
+      replacement)))
