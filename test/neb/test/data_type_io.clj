@@ -16,7 +16,7 @@
   (.dispose @ttrunk))
 
 (defn wc [test-case]
-  (new-cell @ttrunk (int 123456) (short 20) test-case))
+  (new-cell @ttrunk (int 123456) (int 20) test-case))
 
 (defn rc []
   (read-cell  @ttrunk (int 123456)))
@@ -26,7 +26,7 @@
            (fn [[dname {:keys [example]}]]
              (when (seq example)
                `(do (add-scheme :test-type-schama [[:test ~dname]] (short 20))
-                    (schema-by-id (short 20)) =not=> nil
+                    (schema-by-id (int 20)) =not=> nil
                     ~@(map
                         (fn [test-case]
                           `(fact ~(str (name dname) " - " (pr-str test-case))

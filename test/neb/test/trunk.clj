@@ -35,13 +35,13 @@
        (fact "define simple scheme"
              (add-scheme :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
-             (time (do (new-cell @ttrunk (int 1) (short 1) simple-scheme-data))) => anything)
+             (time (do (new-cell @ttrunk (int 1) (int 1) simple-scheme-data))) => anything)
        (fact "read cell with simple scheme"
              (time (do (read-cell @ttrunk (int 1)))) => simple-scheme-data)
        (fact "define compound scheme"
              (time (do (add-scheme :test-schema2 compound-scheme 2))) => anything)
        (fact "write cell with compound shceme"
-             (time (do (new-cell @ttrunk (int 2) (short 2) compound-scheme-data))) => anything)
+             (time (do (new-cell @ttrunk (int 2) (int 2) compound-scheme-data))) => anything)
        (fact "read cell with compound scheme"
              (time (do (read-cell @ttrunk (int 2)))) => compound-scheme-data)
        (fact "delete cell"
@@ -53,7 +53,7 @@
        (fact "cell should been replaced"
              (read-cell @ttrunk (int 1)) => simple-scheme-data-replacement)
        (fact "shrinked replace cell"
-             (new-cell @ttrunk (int 2) (short 2) compound-scheme-data) => anything
+             (new-cell @ttrunk (int 2) (int 2) compound-scheme-data) => anything
              (time (do (replace-cell @ttrunk (int 2) compound-scheme-data-shrinked-replacement))) => anything)
        (fact "shrinked cell should been replaced"
              (read-cell @ttrunk (int 2)) => compound-scheme-data-shrinked-replacement)

@@ -1,7 +1,7 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.hash.HashShortObjMap;
-import net.openhft.koloboke.collect.map.hash.HashShortObjMaps;
+import net.openhft.koloboke.collect.map.hash.HashIntObjMap;
+import net.openhft.koloboke.collect.map.hash.HashIntObjMaps;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class schemaStore {
 
     AtomicInteger idCounter = new AtomicInteger(0);
-    HashShortObjMap schemaIdMap = HashShortObjMaps.newMutableMap();
+    HashIntObjMap schemaIdMap = HashIntObjMaps.newMutableMap();
 
     public schemaStore() {
     }
@@ -24,11 +24,11 @@ public class schemaStore {
         this.idCounter = idCounter;
     }
 
-    public HashShortObjMap getSchemaIdMap() {
+    public HashIntObjMap getSchemaIdMap() {
         return schemaIdMap;
     }
 
-    public void setSchemaIdMap(HashShortObjMap schemaIdMap) {
+    public void setSchemaIdMap(HashIntObjMap schemaIdMap) {
         this.schemaIdMap = schemaIdMap;
     }
 }

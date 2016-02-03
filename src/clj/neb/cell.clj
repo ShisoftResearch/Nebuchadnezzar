@@ -7,7 +7,7 @@
 
 (def cell-head-struc
   [[:cell-length :int :length]
-   [:schema-id :short :schema]])
+   [:schema-id :ushort :schema]])
 (def cell-head-len
   (reduce + (map
               (fn [[_ type]]
@@ -47,7 +47,7 @@
 
 (gen-cell-header-offsets)
 
-(defn schema-by-id [^Short schema-id]
+(defn schema-by-id [^Integer schema-id]
   (-> (.getSchemaIdMap schema-store)
       (.get schema-id)))
 
@@ -164,7 +164,7 @@
             (when (< new-data-length data-len)
               (.addFragment
                 trunk
-                (+ cell-data-loc new-data-length)
+                (+ cell-data-loc new-data-length 1)
                 (+ cell-data-loc data-len))))
         (do (write-cell trunk schema data :hash hash :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
