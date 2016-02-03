@@ -1,7 +1,7 @@
 (ns neb.test.data-type-io
   (:require [midje.sweet :refer :all]
             [neb.schema :refer [add-scheme]]
-            [neb.cell :refer [write-cell read-cell schema-by-id]]
+            [neb.cell :refer [new-cell read-cell schema-by-id]]
             [neb.types :refer [data-types]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
@@ -16,7 +16,7 @@
   (.dispose @ttrunk))
 
 (defn wc [test-case]
-  (write-cell @ttrunk (int 123456) (short 20) test-case))
+  (new-cell @ttrunk (int 123456) (short 20) test-case))
 
 (defn rc []
   (read-cell  @ttrunk (int 123456)))

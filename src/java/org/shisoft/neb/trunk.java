@@ -3,6 +3,7 @@ package org.shisoft.neb;
 import net.openhft.koloboke.collect.map.hash.HashIntIntMap;
 import net.openhft.koloboke.collect.map.hash.HashIntIntMaps;
 
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -12,6 +13,7 @@ public class trunk {
     byte[] store;
     HashIntIntMap cellIndex = HashIntIntMaps.newMutableMap();
     AtomicInteger pointer = new AtomicInteger(0);
+    ConcurrentSkipListMap<Integer, Integer> fragments = new ConcurrentSkipListMap<Integer, Integer>();
     public trunk(int size){
         store = new byte[size];
     }
@@ -20,6 +22,9 @@ public class trunk {
     }
     public AtomicInteger getPointer() {
         return pointer;
+    }
+    public ConcurrentSkipListMap getFragments() {
+        return fragments;
     }
     public HashIntIntMap getCellIndex() {
         return cellIndex;
@@ -30,5 +35,16 @@ public class trunk {
     }
     public void removeCellFromIndex(int hash){
         getCellIndex().remove(hash);
+    }
+
+    public boolean hasCell (int hash){
+        return getCellIndex().containsKey(hash);
+    }
+
+    public void addFragment (int startPos, int endPos) throws Exception {
+        if (fragments.containsKey(startPos)){
+            throw new Exception("fragment at pos " + startPos + " already exists");
+        }
+        fragments.put(startPos, endPos);
     }
 }

@@ -11,10 +11,18 @@ public class cellWriter {
     int currLoc;
     org.shisoft.neb.trunk trunk;
 
-    public cellWriter(org.shisoft.neb.trunk trunk, int length) {
+    private void init(org.shisoft.neb.trunk trunk, int length, int currLoc){
         this.trunk = trunk;
-        this.currLoc = trunk.getPointer().getAndAdd(length);
+        this.currLoc = currLoc;
         this.startLoc = currLoc;
+    }
+
+    public cellWriter(org.shisoft.neb.trunk trunk, int length) {
+        init(trunk, length, trunk.getPointer().getAndAdd(length));
+    }
+
+    public cellWriter(org.shisoft.neb.trunk trunk, int length, int currLoc){
+        init(trunk, length, currLoc);
     }
 
     public void streamWrite (IFn fn, Object value, int length){
@@ -24,6 +32,10 @@ public class cellWriter {
 
     public void addCellToTrunkIndex(int hash){
         trunk.getCellIndex().addValue(hash, startLoc);
+    }
+
+    public void updateCellToTrunkIndex(int hash){
+        trunk.getCellIndex().put(hash, startLoc);
     }
 
     public int getCurrLoc() {

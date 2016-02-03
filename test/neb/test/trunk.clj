@@ -1,7 +1,7 @@
 (ns neb.test.trunk
   (:require [midje.sweet :refer :all]
             [neb.schema :refer [add-scheme]]
-            [neb.cell :refer [write-cell read-cell delete-cell]]
+            [neb.cell :refer [new-cell read-cell delete-cell]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
@@ -24,18 +24,18 @@
        (fact "define simple scheme"
              (add-scheme :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
-             (time (do (write-cell @ttrunk (int 123456) (short 1) simple-scheme-data) => anything)))
+             (time (do (new-cell @ttrunk (int 1) (short 1) simple-scheme-data) => anything)))
        (fact "read cell with simple scheme"
-             (time (do (read-cell @ttrunk (int 123456)) => simple-scheme-data)))
+             (time (do (read-cell @ttrunk (int 1)) => simple-scheme-data)))
        (fact "define compound scheme"
              (time (do (add-scheme :test-schema2 compound-scheme 2) => anything)))
        (fact "write cell with compound shceme"
-             (time (do (write-cell @ttrunk (int 123456) (short 2) compound-scheme-data) => anything)))
+             (time (do (new-cell @ttrunk (int 2) (short 2) compound-scheme-data) => anything)))
        (fact "read cell with compound scheme"
-             (time (do (read-cell @ttrunk (int 123456)) => compound-scheme-data)))
+             (time (do (read-cell @ttrunk (int 2)) => compound-scheme-data)))
        (fact "delete cell"
-             (time (do (delete-cell @ttrunk (int 123456)) => anything)))
+             (time (do (delete-cell @ttrunk (int 2)) => anything)))
        (fact "deleted cell cannot been read"
-             (read-cell @ttrunk (int 123456)) => nil)
+             (read-cell @ttrunk (int 2)) => nil)
        (fact "dispose"
              (.dispose @ttrunk) => truthy))
