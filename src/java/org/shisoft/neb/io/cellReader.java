@@ -19,8 +19,14 @@ public class cellReader {
 
     public Object streamRead (IFn fn, int len){
         Object r = fn.invoke(trunk, currLoc);
-        currLoc += len;
+        advancePointer(len);
         return r;
+    }
+
+    public int advancePointer(int len){
+        int originalLoc = currLoc;
+        currLoc += len;
+        return originalLoc;
     }
 
     public int getCurrLoc() {

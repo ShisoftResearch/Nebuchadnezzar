@@ -6,7 +6,7 @@
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
 
 (def cell-head-struc
-  [[:cell-length :int :length]
+  [[:hash :int :hash]
    [:schema-id :ushort :schema]])
 (def cell-head-len
   (reduce + (map
@@ -60,11 +60,29 @@
     (writer trunk value (+ loc offset))))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
-  (write-cell-header-field trunk cell-loc :cell-length (* -1 data-length)))
+  (.addFragment trunk cell-loc (+ cell-loc cell-head-len data-length)))
+
+(defn calc-dynamic-field-length [trunk unit-length field-loc]
+  (+ (* (reader/readInt trunk field-loc)
+        unit-length)
+     type_lengths/intLen))
+
+(defn calc-trunk-cell-length [^trunk trunk ^Integer cell-loc schema]
+  (let [cell-data-loc (+ cell-loc cell-head-len)
+        cell-reader (cellReader. trunk cell-data-loc)]
+    (reduce + (map
+                (fn [[_ data-type]]
+                  (let [{:keys [unit-length length]} (get data-types data-type)
+                        field-length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
+                    (.advancePointer cell-reader field-length)
+                    field-length))
+                (:f schema)))))
 
 (defn delete-cell [^trunk trunk ^Integer hash]
   (if-let [cell-loc (.get (.getCellIndex trunk) hash)]
-    (let [data-length (when cell-loc (read-cell-header-field trunk cell-loc :cell-length))]
+    (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
+          schema (schema-by-id schema-id)
+          data-length (calc-trunk-cell-length trunk cell-loc schema)]
       (.removeCellFromIndex trunk hash)
       (mark-cell-deleted trunk cell-loc data-length))
     (throw (Exception. "Cell hash does not existed to delete"))))
@@ -74,26 +92,21 @@
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
-        (when (> cell-length 0)
-          (when-let [schema (schema-by-id schema-id)]
-            (into
-              {}
-              (map
-                (fn [[key-name data-type]]
-                  [key-name
-                   (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
-                         dep (when dep (get data-types dep))
-                         reader (or reader (get dep :reader))
-                         reader (if decoder (comp decoder reader) reader)
-                         length (or length
-                                    (+ (* (reader/readInt
-                                            trunk (.getCurrLoc cell-reader))
-                                          unit-length)
-                                       type_lengths/intLen))]
-                     (.streamRead cell-reader reader length))])
-                (:f schema)))))))))
+        (when-let [schema (schema-by-id schema-id)]
+          (into
+            {}
+            (map
+              (fn [[key-name data-type]]
+                [key-name
+                 (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
+                       dep (when dep (get data-types dep))
+                       reader (or reader (get dep :reader))
+                       reader (if decoder (comp decoder reader) reader)
+                       length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
+                   (.streamRead cell-reader reader length))])
+              (:f schema))))))))
 
-(defmacro write-cell-header [trunk cell-writer header-data]
+(defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
            (fn [[head-name head-type head-data-func]]
              (let [{:keys [length]} (get data-types head-type)]
@@ -127,7 +140,7 @@
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
-(defn write-cell [^trunk trunk schema data & {:keys [loc hash update-cell?]}]
+(defn write-cell [^trunk trunk schema data & {:keys [loc hash update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (cell-fields-to-write schema data)
         fields-length (cell-len-by-fields fields)
@@ -135,12 +148,12 @@
         cell-writer (if loc
                       (cellWriter. ^trunk trunk ^Integer cell-length loc)
                       (cellWriter. ^trunk trunk ^Integer cell-length))
-        header-data {:length fields-length
-                     :schema schema-id}]
-    (write-cell-header trunk cell-writer header-data)
+        header-data {:schema schema-id
+                     :hash hash}]
+    (write-cell-header cell-writer header-data)
     (doseq [{:keys [key-name type value writer length] :as field} fields]
       (.streamWrite cell-writer writer value length))
-    (when hash
+    (when update-hash-index?
       (if update-cell?
         (.updateCellToTrunkIndex cell-writer hash)
         (.addCellToTrunkIndex cell-writer hash)))))
@@ -154,13 +167,13 @@
 (defn replace-cell [^trunk trunk ^Integer hash data]
   (when-let [cell-loc (.get (.getCellIndex trunk) hash)]
     (let [cell-data-loc (+ cell-loc cell-head-len)
-          data-len (read-cell-header-field trunk cell-loc :cell-length)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
+          data-len (calc-trunk-cell-length trunk cell-loc schema)
           fields (cell-fields-to-write schema data)
           new-data-length (cell-len-by-fields fields)]
       (if (>= data-len new-data-length)
-        (do (write-cell trunk schema data :loc cell-loc)
+        (do (write-cell trunk schema data :loc cell-loc :hash hash :update-hash-index? false)
             (when (< new-data-length data-len)
               (.addFragment
                 trunk
