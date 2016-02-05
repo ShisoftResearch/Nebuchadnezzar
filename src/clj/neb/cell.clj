@@ -46,16 +46,16 @@
                     cell-head-struc))))))
 
 (defmacro with-write-lock [trunk hash & body]
-  `(do (.lockWrite ~trunk ~hash)
-       (let [value# (do ~@body)]
-         (.unlockWrite ~trunk ~hash)
-         value#)))
+  `(let [lock# (.lockWrite ~trunk ~hash)
+         value# (do ~@body)]
+     (.unlockWrite ~trunk lock#)
+     value#))
 
 (defmacro with-read-lock [trunk hash & body]
-  `(do (.lockRead ~trunk ~hash)
-       (let [value# (do ~@body)]
-         (.unlockRead ~trunk ~hash)
-         value#)))
+  `(let [lock# (.lockRead ~trunk ~hash)
+         value# (do ~@body)]
+     (.unlockRead ~trunk lock#)
+     value#))
 
 (gen-cell-header-offsets)
 

@@ -10,12 +10,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class cellLock {
 
+    int hash;
     ReentrantReadWriteLock lock;
     AtomicInteger operationsInProgress;
     ReentrantLock initLock = new ReentrantLock();
 
-    public boolean init(){
+    public boolean init(int hash){
         try {
+            this.hash = hash;
             initLock.tryLock(1, TimeUnit.MILLISECONDS);
             lock = new ReentrantReadWriteLock();
             operationsInProgress = new AtomicInteger(0);
@@ -24,16 +26,16 @@ public class cellLock {
         return true;
     }
 
-    public int lockWrite (){
-        int oip = operationsInProgress.incrementAndGet();
+    public cellLock lockWrite (){
+        operationsInProgress.incrementAndGet();
         lock.writeLock().lock();
-        return oip;
+        return this;
     }
 
-    public int lockRead (){
-        int oip = operationsInProgress.incrementAndGet();
+    public cellLock lockRead (){
+        operationsInProgress.incrementAndGet();
         lock.readLock().lock();
-        return oip;
+        return this;
     }
 
     public int unlockWrite (){
@@ -48,5 +50,9 @@ public class cellLock {
 
     public int getOperationsInProgress (){
         return operationsInProgress.get();
+    }
+
+    public int getHash() {
+        return hash;
     }
 }

@@ -53,40 +53,38 @@ public class trunk {
         fragments.put(startPos, endPos);
     }
 
-    private cellLock obtainLock (int hash){
+    private cellLock obtainLock (final int hash){
         return locks.computeIfAbsent(hash, new IntFunction<cellLock>() {
             @Override
             public cellLock apply(int value) {
                 cellLock lock = new cellLock();
-                lock.init();
+                lock.init(hash);
                 return lock;
             }
         });
     }
 
-    public void lockWrite(int hash){
-        obtainLock(hash).lockWrite();
+    public cellLock lockWrite(int hash){
+        return obtainLock(hash).lockWrite();
     }
 
-    public void unlockWrite(int hash){
-        cellLock lock = obtainLock(hash);
+    public void unlockWrite(cellLock lock){
         lock.unlockWrite();
-        checkLock(hash, lock);
+        checkLock(lock);
     }
 
-    public void lockRead(int hash){
-        obtainLock(hash).lockRead();
+    public cellLock lockRead(int hash){
+        return obtainLock(hash).lockRead();
     }
 
-    public void unlockRead(int hash){
-        cellLock lock = obtainLock(hash);
+    public void unlockRead(cellLock lock){
         lock.unlockRead();
-        checkLock(hash, lock);
+        checkLock(lock);
     }
 
-    public void checkLock(int hash, cellLock lock){
+    public void checkLock(cellLock lock){
         if (lock.getOperationsInProgress() == 0){
-            locks.remove(hash);
+            locks.remove(lock.getHash(), lock);
         }
     }
 }
