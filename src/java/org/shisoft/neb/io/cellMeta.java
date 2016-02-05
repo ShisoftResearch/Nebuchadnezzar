@@ -1,14 +1,14 @@
 package org.shisoft.neb.io;
 
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Created by shisoft on 5/2/2016.
  */
 public class cellMeta {
 
-    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    ReentrantLock lock = new ReentrantLock();
     AtomicInteger location;
 
     public cellMeta(int location) {
@@ -23,28 +23,19 @@ public class cellMeta {
         this.location.set(location);
     }
 
-    public ReentrantReadWriteLock getLock() {
-        return lock;
-    }
-
-    public void setLock(ReentrantReadWriteLock lock) {
-        this.lock = lock;
-    }
-
-
     public void lockWrite(){
-        lock.writeLock().lock();
+        lock.lock();
     }
 
     public void unlockWrite(){
-        lock.writeLock().unlock();
+        lock.unlock();
     }
 
     public void lockRead(){
-        lock.readLock().lock();
+        lock.lock();
     }
 
     public void unlockRead(){
-        lock.readLock().unlock();
+        lock.unlock();
     }
 }
