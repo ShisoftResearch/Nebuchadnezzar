@@ -5,7 +5,7 @@
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
 
-(def ^:dynamic *cell-meta* nil)
+(def ^:dynamic ^cellMeta *cell-meta* nil)
 
 (def cell-head-struc
   [[:hash :int :hash]
