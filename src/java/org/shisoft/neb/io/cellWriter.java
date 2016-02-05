@@ -31,11 +31,11 @@ public class cellWriter {
     }
 
     public void addCellToTrunkIndex(int hash){
-        trunk.getCellIndex().addValue(hash, startLoc);
+        trunk.getCellIndex().put(hash, new cellMeta(startLoc));
     }
 
     public void updateCellToTrunkIndex(int hash){
-        trunk.getCellIndex().put(hash, startLoc);
+        trunk.getCellIndex().get(hash).setLocation(startLoc);
     }
 
     public int getCurrLoc() {

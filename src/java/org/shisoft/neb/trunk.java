@@ -1,22 +1,18 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.hash.HashIntIntMap;
-import net.openhft.koloboke.collect.map.hash.HashIntIntMaps;
 import net.openhft.koloboke.collect.map.hash.HashIntObjMap;
 import net.openhft.koloboke.collect.map.hash.HashIntObjMaps;
-import org.shisoft.neb.io.cellLock;
+import org.shisoft.neb.io.cellMeta;
 
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.IntFunction;
 
 /**
  * Created by shisoft on 18/1/2016.
  */
 public class trunk {
     byte[] store;
-    HashIntIntMap cellIndex = HashIntIntMaps.newMutableMap();
-    HashIntObjMap<cellLock> locks = HashIntObjMaps.newMutableMap();
+    HashIntObjMap<cellMeta> cellIndex = HashIntObjMaps.newMutableMap();
     AtomicInteger pointer = new AtomicInteger(0);
     ConcurrentSkipListMap<Integer, Integer> fragments = new ConcurrentSkipListMap<Integer, Integer>();
     public trunk(int size){
@@ -31,8 +27,11 @@ public class trunk {
     public ConcurrentSkipListMap getFragments() {
         return fragments;
     }
-    public HashIntIntMap getCellIndex() {
+    public HashIntObjMap<cellMeta> getCellIndex() {
         return cellIndex;
+    }
+    public int getCellLoc(int hash){
+        return cellIndex.get(hash).getLocation();
     }
     public boolean dispose (){
         this.store = null;
@@ -51,40 +50,5 @@ public class trunk {
             throw new Exception("fragment at pos " + startPos + " already exists");
         }
         fragments.put(startPos, endPos);
-    }
-
-    private cellLock obtainLock (final int hash){
-        return locks.computeIfAbsent(hash, new IntFunction<cellLock>() {
-            @Override
-            public cellLock apply(int value) {
-                cellLock lock = new cellLock();
-                lock.init(hash);
-                return lock;
-            }
-        });
-    }
-
-    public cellLock lockWrite(int hash){
-        return obtainLock(hash).lockWrite();
-    }
-
-    public void unlockWrite(cellLock lock){
-        lock.unlockWrite();
-        checkLock(lock);
-    }
-
-    public cellLock lockRead(int hash){
-        return obtainLock(hash).lockRead();
-    }
-
-    public void unlockRead(cellLock lock){
-        lock.unlockRead();
-        checkLock(lock);
-    }
-
-    public void checkLock(cellLock lock){
-        if (lock.getOperationsInProgress() == 0){
-            locks.remove(lock.getHash(), lock);
-        }
     }
 }

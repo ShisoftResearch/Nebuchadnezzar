@@ -3,7 +3,9 @@
             [neb.schema :refer [schema-store]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
+           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
+
+(def ^:dynamic *cell-meta* nil)
 
 (def cell-head-struc
   [[:hash :int :hash]
@@ -45,17 +47,29 @@
                         res))
                     cell-head-struc))))))
 
+(defmacro with-cell-meta [trunk hash & body]
+  `(with-bindings {#'*cell-meta* (try (-> ~trunk (.getCellIndex) (.get ~hash)))}
+     (when *cell-meta*
+       ~@body)))
+
 (defmacro with-write-lock [trunk hash & body]
-  `(let [lock# (.lockWrite ~trunk ~hash)
-         value# (do ~@body)]
-     (.unlockWrite ~trunk lock#)
-     value#))
+  `(with-cell-meta
+     ~trunk ~hash
+     (do (.lockWrite *cell-meta*)
+         (let [value# (do ~@body)]
+           (.unlockWrite *cell-meta*)
+           value#))))
 
 (defmacro with-read-lock [trunk hash & body]
-  `(let [lock# (.lockRead ~trunk ~hash)
-         value# (do ~@body)]
-     (.unlockRead ~trunk lock#)
-     value#))
+  `(with-cell-meta
+     ~trunk ~hash
+     (do (.lockRead *cell-meta*)
+         (let [value# (do ~@body)]
+           (.unlockRead *cell-meta*)
+           value#))))
+
+(defn get-cell-id []
+  (.getLocation *cell-meta*))
 
 (gen-cell-header-offsets)
 
@@ -93,7 +107,7 @@
 (defn delete-cell [^trunk trunk ^Integer hash]
   (with-write-lock
     trunk hash
-    (if-let [cell-loc (.get (.getCellIndex trunk) hash)]
+    (if-let [cell-loc (get-cell-id)]
       (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
             schema (schema-by-id schema-id)
             data-length (calc-trunk-cell-length trunk cell-loc schema)]
@@ -102,7 +116,7 @@
       (throw (Exception. "Cell hash does not existed to delete")))))
 
 (defn read-cell* [^trunk trunk ^Integer hash]
-  (if-let [loc (.get (.getCellIndex trunk) hash)]
+  (if-let [loc (get-cell-id)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
@@ -178,15 +192,13 @@
         (.addCellToTrunkIndex cell-writer hash)))))
 
 (defn new-cell [^trunk trunk ^Integer hash ^Integer schema-id data]
-  (with-write-lock
-    trunk hash
-    (when (.hasCell trunk hash)
-      (throw (Exception. "Cell hash already exists")))
-    (when-let [schema (schema-by-id schema-id)]
-      (write-cell trunk schema data :hash hash))))
+  (when (.hasCell trunk hash)
+    (throw (Exception. "Cell hash already exists")))
+  (when-let [schema (schema-by-id schema-id)]
+    (write-cell trunk schema data :hash hash)))
 
 (defn replace-cell* [^trunk trunk ^Integer hash data]
-  (when-let [cell-loc (.get (.getCellIndex trunk) hash)]
+  (when-let [cell-loc (get-cell-id)]
     (let [cell-data-loc (+ cell-loc cell-head-len)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
