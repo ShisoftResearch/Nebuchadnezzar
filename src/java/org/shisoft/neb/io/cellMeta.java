@@ -1,6 +1,5 @@
 package org.shisoft.neb.io;
 
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -9,18 +8,18 @@ import java.util.concurrent.locks.ReentrantLock;
 public class cellMeta {
 
     ReentrantLock lock = new ReentrantLock();
-    AtomicInteger location;
+    volatile int location;
 
     public cellMeta(int location) {
-        this.location = new AtomicInteger(location);
+        this.location = location;
     }
 
     public int getLocation() {
-        return location.get();
+        return location;
     }
 
     public void setLocation(int location) {
-        this.location.set(location);
+        this.location = location;
     }
 
     public void lockWrite(){
