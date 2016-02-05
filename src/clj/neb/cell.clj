@@ -56,17 +56,19 @@
   `(with-cell-meta
      ~trunk ~hash
      (do (.lockWrite *cell-meta*)
-         (let [value# (do ~@body)]
-           (.unlockWrite *cell-meta*)
-           value#))))
+         (try
+           ~@body
+           (finally
+             (.unlockWrite *cell-meta*))))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
      (do (.lockRead *cell-meta*)
-         (let [value# (do ~@body)]
-           (.unlockRead *cell-meta*)
-           value#))))
+         (try
+           ~@body
+           (finally
+             (.unlockRead *cell-meta*))))))
 
 (defn get-cell-id []
   (.getLocation *cell-meta*))
