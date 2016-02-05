@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Created by shisoft on 18/1/2016.
  */
 public class trunk {
-    byte[] store;
+    volatile byte[] store;
     HashIntObjMap<cellMeta> cellIndex = HashIntObjMaps.newMutableMap();
     AtomicInteger pointer = new AtomicInteger(0);
     ConcurrentSkipListMap<Integer, Integer> fragments = new ConcurrentSkipListMap<Integer, Integer>();
