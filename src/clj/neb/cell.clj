@@ -45,6 +45,18 @@
                         res))
                     cell-head-struc))))))
 
+(defmacro with-write-lock [trunk hash & body]
+  `(do (.lockWrite ~trunk ~hash)
+       (let [value# (do ~@body)]
+         (.unlockWrite ~trunk ~hash)
+         value#)))
+
+(defmacro with-read-lock [trunk hash & body]
+  `(do (.lockRead ~trunk ~hash)
+       (let [value# (do ~@body)]
+         (.unlockRead ~trunk ~hash)
+         value#)))
+
 (gen-cell-header-offsets)
 
 (defn schema-by-id [^Integer schema-id]
@@ -79,15 +91,17 @@
                 (:f schema)))))
 
 (defn delete-cell [^trunk trunk ^Integer hash]
-  (if-let [cell-loc (.get (.getCellIndex trunk) hash)]
-    (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
-          schema (schema-by-id schema-id)
-          data-length (calc-trunk-cell-length trunk cell-loc schema)]
-      (.removeCellFromIndex trunk hash)
-      (mark-cell-deleted trunk cell-loc data-length))
-    (throw (Exception. "Cell hash does not existed to delete"))))
+  (with-write-lock
+    trunk hash
+    (if-let [cell-loc (.get (.getCellIndex trunk) hash)]
+      (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
+            schema (schema-by-id schema-id)
+            data-length (calc-trunk-cell-length trunk cell-loc schema)]
+        (.removeCellFromIndex trunk hash)
+        (mark-cell-deleted trunk cell-loc data-length))
+      (throw (Exception. "Cell hash does not existed to delete")))))
 
-(defn read-cell [^trunk trunk ^Integer hash]
+(defn read-cell* [^trunk trunk ^Integer hash]
   (if-let [loc (.get (.getCellIndex trunk) hash)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
@@ -105,6 +119,11 @@
                        length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
                    (.streamRead cell-reader reader length))])
               (:f schema))))))))
+
+(defn read-cell [^trunk trunk ^Integer hash]
+  (with-read-lock
+    trunk hash
+    (read-cell* trunk hash)))
 
 (defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
@@ -159,12 +178,14 @@
         (.addCellToTrunkIndex cell-writer hash)))))
 
 (defn new-cell [^trunk trunk ^Integer hash ^Integer schema-id data]
-  (when (.hasCell trunk hash)
-    (throw (Exception. "Cell hash already exists")))
-  (when-let [schema (schema-by-id schema-id)]
-    (write-cell trunk schema data :hash hash)))
+  (with-write-lock
+    trunk hash
+    (when (.hasCell trunk hash)
+      (throw (Exception. "Cell hash already exists")))
+    (when-let [schema (schema-by-id schema-id)]
+      (write-cell trunk schema data :hash hash))))
 
-(defn replace-cell [^trunk trunk ^Integer hash data]
+(defn replace-cell* [^trunk trunk ^Integer hash data]
   (when-let [cell-loc (.get (.getCellIndex trunk) hash)]
     (let [cell-data-loc (+ cell-loc cell-head-len)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
@@ -182,8 +203,15 @@
         (do (write-cell trunk schema data :hash hash :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
+(defn replace-cell [^trunk trunk ^Integer hash data]
+  (with-write-lock
+    trunk hash
+    (replace-cell* trunk hash data)))
+
 (defn update-cell [^trunk trunk ^Integer hash fn & params]  ;TODO Replace with less overhead function
-  (when-let [cell-content (read-cell trunk hash)]
-    (let [replacement  (apply fn cell-content params)]
-      (replace-cell trunk hash replacement)
-      replacement)))
+  (with-write-lock
+    trunk hash
+    (when-let [cell-content (read-cell* trunk hash)]
+      (let [replacement  (apply fn cell-content params)]
+        (replace-cell* trunk hash replacement)
+        replacement))))
