@@ -3,7 +3,8 @@
             [neb.schema :refer [schema-store]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
+           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
+           (org.shisoft.neb.utils MemoryMeasure)))
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 

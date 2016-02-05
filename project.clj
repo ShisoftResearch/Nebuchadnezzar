@@ -12,4 +12,13 @@
                  [net.openhft/koloboke-impl-jdk8 "0.6.8"]]
   :plugins [[lein-midje "3.1.3"]]
   :profiles {:uberjar {:aot :all}
-             :dev {:dependencies [[midje "1.8.3"]]}})
+             :dev {:dependencies [[midje "1.8.3"]
+                                  [com.github.jbellis/jamm "0.3.1"]]}}
+  :jvm-opts [;"-Djava.rmi.server.hostname=<hostname>" ;;add this when remote-connect fail
+             ;"-Dcom.sun.management.jmxremote"
+             ;"-Dcom.sun.management.jmxremote.port=9876"
+             ;"-Dcom.sun.management.jmxremote.authenticate=false"
+             ;"-Dcom.sun.management.jmxremote.ssl=false"
+             "-javaagent:/Users/shisoft/.m2/repository/com/github/jbellis/jamm/0.3.1/jamm-0.3.1.jar"
+             ;"-Xmx8g"
+             "-XX:+UseParNewGC" "-XX:+UseConcMarkSweepGC" "-XX:+CMSParallelRemarkEnabled"])
