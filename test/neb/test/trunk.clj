@@ -35,35 +35,35 @@
        (fact "define simple scheme"
              (add-scheme :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
-             (time (do (new-cell @ttrunk (int 1) (int 1) simple-scheme-data))) => anything)
+             (time (do (new-cell @ttrunk 1 (int 1) simple-scheme-data))) => anything)
        (fact "read cell with simple scheme"
-             (time (do (read-cell @ttrunk (int 1)))) => simple-scheme-data)
+             (time (do (read-cell @ttrunk 1))) => simple-scheme-data)
        (fact "define compound scheme"
              (time (do (add-scheme :test-schema2 compound-scheme 2))) => anything)
        (fact "write cell with compound shceme"
-             (time (do (new-cell @ttrunk (int 2) (int 2) compound-scheme-data))) => anything)
+             (time (do (new-cell @ttrunk 2 (int 2) compound-scheme-data))) => anything)
        (fact "read cell with compound scheme"
-             (time (do (read-cell @ttrunk (int 2)))) => compound-scheme-data)
+             (time (do (read-cell @ttrunk 2))) => compound-scheme-data)
        (fact "delete cell"
-             (time (do (delete-cell @ttrunk (int 2)))) => anything)
+             (time (do (delete-cell @ttrunk 2))) => anything)
        (fact "deleted cell cannot been read"
-             (read-cell @ttrunk (int 2)) => nil)
+             (read-cell @ttrunk 2) => nil)
        (fact "replace cell"
-             (time (do (replace-cell @ttrunk (int 1) simple-scheme-data-replacement))) => anything)
+             (time (do (replace-cell @ttrunk 1 simple-scheme-data-replacement))) => anything)
        (fact "cell should been replaced"
-             (read-cell @ttrunk (int 1)) => simple-scheme-data-replacement)
+             (read-cell @ttrunk 1) => simple-scheme-data-replacement)
        (fact "shrinked replace cell"
-             (new-cell @ttrunk (int 2) (int 2) compound-scheme-data) => anything
-             (time (do (replace-cell @ttrunk (int 2) compound-scheme-data-shrinked-replacement))) => anything)
+             (new-cell @ttrunk 2 (int 2) compound-scheme-data) => anything
+             (time (do (replace-cell @ttrunk 2 compound-scheme-data-shrinked-replacement))) => anything)
        (fact "shrinked cell should been replaced"
-             (read-cell @ttrunk (int 2)) => compound-scheme-data-shrinked-replacement)
+             (read-cell @ttrunk 2) => compound-scheme-data-shrinked-replacement)
        (fact "overflow replace cell"
-             (time (do (replace-cell @ttrunk (int 2) compound-scheme-data-replacement))) => anything)
+             (time (do (replace-cell @ttrunk 2 compound-scheme-data-replacement))) => anything)
        (fact "overflow cell should been replaced"
-             (read-cell @ttrunk (int 2)) => compound-scheme-data-replacement)
+             (read-cell @ttrunk 2) => compound-scheme-data-replacement)
        (fact "update cell"
-             (time (do (update-cell @ttrunk (int 2) update :len-offset dec))) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
+             (time (do (update-cell @ttrunk 2 update :len-offset dec))) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
        (fact "cell updated"
-             (read-cell @ttrunk (int 2)) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
+             (read-cell @ttrunk 2) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
        (fact "dispose"
              (.dispose @ttrunk) => truthy))
