@@ -7,38 +7,38 @@ import clojure.lang.IFn;
  */
 public class cellWriter {
 
-    int startLoc;
-    int currLoc;
+    long startLoc;
+    long currLoc;
     org.shisoft.neb.trunk trunk;
 
-    private void init(org.shisoft.neb.trunk trunk, int length, int currLoc){
+    private void init(org.shisoft.neb.trunk trunk, long length, long currLoc){
         this.trunk = trunk;
         this.currLoc = currLoc;
         this.startLoc = currLoc;
     }
 
-    public cellWriter(org.shisoft.neb.trunk trunk, int length) {
+    public cellWriter(org.shisoft.neb.trunk trunk, long length) {
         init(trunk, length, trunk.getPointer().getAndAdd(length));
     }
 
-    public cellWriter(org.shisoft.neb.trunk trunk, int length, int currLoc){
+    public cellWriter(org.shisoft.neb.trunk trunk, long length, long currLoc){
         init(trunk, length, currLoc);
     }
 
-    public void streamWrite (IFn fn, Object value, int length){
+    public void streamWrite (IFn fn, Object value, long length){
         fn.invoke(trunk, value, currLoc);
         currLoc += length;
     }
 
-    public void addCellToTrunkIndex(int hash){
+    public void addCellToTrunkIndex(long hash){
         trunk.getCellIndex().put(hash, new cellMeta(startLoc));
     }
 
-    public void updateCellToTrunkIndex(int hash){
+    public void updateCellToTrunkIndex(long hash){
         trunk.getCellIndex().get(hash).setLocation(startLoc);
     }
 
-    public int getCurrLoc() {
+    public long getCurrLoc() {
         return currLoc;
     }
 }

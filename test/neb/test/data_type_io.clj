@@ -16,10 +16,10 @@
   (.dispose @ttrunk))
 
 (defn wc [test-case]
-  (new-cell @ttrunk (int 123456) (int 20) test-case))
+  (new-cell @ttrunk 123456 (int 20) test-case))
 
 (defn rc []
-  (read-cell  @ttrunk (int 123456)))
+  (read-cell  @ttrunk 123456))
 
 (defmacro gen-test-cases []
   `(do ~@(map
