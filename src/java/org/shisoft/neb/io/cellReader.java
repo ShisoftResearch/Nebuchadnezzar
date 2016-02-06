@@ -9,27 +9,27 @@ import org.shisoft.neb.trunk;
 
 public class cellReader {
 
-    int currLoc;
+    long currLoc;
     trunk trunk;
 
-    public cellReader(org.shisoft.neb.trunk trunk, int currLoc) {
+    public cellReader(org.shisoft.neb.trunk trunk, long currLoc) {
         this.currLoc = currLoc;
         this.trunk = trunk;
     }
 
-    public Object streamRead (IFn fn, int len){
+    public Object streamRead (IFn fn, long len){
         Object r = fn.invoke(trunk, currLoc);
         advancePointer(len);
         return r;
     }
 
-    public int advancePointer(int len){
-        int originalLoc = currLoc;
+    public long advancePointer(long len){
+        long originalLoc = currLoc;
         currLoc += len;
         return originalLoc;
     }
 
-    public int getCurrLoc() {
+    public long getCurrLoc() {
         return currLoc;
     }
 }

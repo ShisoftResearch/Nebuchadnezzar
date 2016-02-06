@@ -8,17 +8,17 @@ import java.util.concurrent.locks.ReentrantLock;
 public class cellMeta {
 
     ReentrantLock lock = new ReentrantLock();
-    volatile int location;
+    volatile long location;
 
-    public cellMeta(int location) {
+    public cellMeta(long location) {
         this.location = location;
     }
 
-    public int getLocation() {
+    public long getLocation() {
         return location;
     }
 
-    public void setLocation(int location) {
+    public void setLocation(long location) {
         this.location = location;
     }
 
