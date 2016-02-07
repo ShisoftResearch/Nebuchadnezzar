@@ -31,7 +31,7 @@
 
 (facts "trunk test"
        (fact "memory init"
-             (reset! ttrunk (trunk. 50000)) => anything)
+             (reset! ttrunk (trunk. 5000000)) => anything)
        (fact "define simple scheme"
              (add-scheme :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"

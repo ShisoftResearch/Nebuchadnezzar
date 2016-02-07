@@ -6,6 +6,7 @@ import org.shisoft.neb.io.cellMeta;
 import sun.misc.Unsafe;
 
 import java.lang.reflect.Field;
+import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -73,14 +74,24 @@ public class trunk {
     }
 
     public void addFragment_ (long startPos, long endPos) throws Exception {
-        Long seqPos = endPos + 1;
-        Long seqFrag = fragments.get(seqPos);
+        Long seqFPos = endPos + 1;
+        Long seqBPos = startPos - 1;
+        Long seqFrag = fragments.get(seqFPos);
         if (seqFrag != null){
             addFragment_(startPos, seqFrag);
-            removeFrag(seqPos);
+            removeFrag(seqFPos);
         } else {
-            fragments.put(startPos, endPos);
+            Map.Entry<Long, Long> fe = fragments.floorEntry(seqBPos);
+            if (fe != null && fe.getValue().equals(seqBPos)){
+                addFragment(fe.getKey(), endPos);
+            } else {
+                fragments.put(startPos, endPos);
+            }
         }
+    }
+
+    public int countFragments (){
+        return fragments.size();
     }
 
     public void removeFrag (long startPos){
@@ -96,7 +107,10 @@ public class trunk {
     public void resetAppendHeader(Long loc){
         appendHeader.set(loc);
     }
+    public long getAppendHeaderValue (){
+        return appendHeader.get();
+    }
     public void copyMemory(Long startPos, Long target, Long len){
-        getUnsafe().copyMemory(startPos, target, len);
+        getUnsafe().copyMemory(storeAddress + startPos, storeAddress + target, len);
     }
 }

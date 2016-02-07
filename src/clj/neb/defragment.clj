@@ -1,5 +1,6 @@
 (ns neb.defragment
-  (:require [neb.cell :refer [read-cell-header-field schema-by-id calc-trunk-cell-length cell-head-len]])
+  (:require [neb.cell :refer [read-cell-header-field schema-by-id calc-trunk-cell-length cell-head-len]]
+            [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk)
            (org.shisoft.neb.io cellMeta)
            (java.util.concurrent ConcurrentSkipListMap)))
@@ -15,20 +16,22 @@
   (let [frags (.getFragments trunk)]
     (loop [pos 0]
       (.lockFrags trunk)
-      (let [frag (.ceilingEntry frags pos)]
+      (let [frag (.ceilingEntry frags pos)
+            append-header (.getAppendHeaderValue trunk)]
         (if frag
           (let [lw-pos (.getKey frag)
                 hi-pos (.getValue frag)
                 hn-pos (inc hi-pos)
                 cell-hash (read-cell-header-field trunk hn-pos :hash)
                 ^cellMeta cell-meta (-> trunk (.getCellIndex) (.get cell-hash))]
-            (if cell-meta
+            (cond
+              cell-meta
               (let [cell-schema-id  (read-cell-header-field trunk hn-pos :schema-id)
                     cell-schema     (schema-by-id cell-schema-id)
                     cell-data-len   (calc-trunk-cell-length trunk hn-pos cell-schema)
                     cell-len        (+ cell-data-len cell-head-len)
-                    cell-end-pos    (dec (+ lw-pos cell-len))
-                    new-frag-pos    (+ hn-pos cell-len)]
+                    cell-end-pos    (dec (+ hn-pos cell-len))
+                    new-frag-pos    (+ lw-pos cell-len)]
                 (.lockWrite cell-meta)
                 (try
                   (.copyMemory trunk hn-pos lw-pos cell-len)
@@ -38,8 +41,10 @@
                 (.removeFrag trunk lw-pos)
                 (.addFragment_ trunk new-frag-pos cell-end-pos)
                 (unlock-frag-recur trunk new-frag-pos))
-              (do (println "Missing cell meta when defrag at" hn-pos ", retry.")
-                  (unlock-frag-recur trunk pos))))
-          (when (pos? pos)
-            (.resetAppendHeader trunk pos)
-            (unlock-frag trunk)))))))
+              (= append-header (inc hi-pos))
+              (do (.resetAppendHeader trunk pos)
+                  (unlock-frag trunk))
+              :else
+              (do (spy [(.getFragments trunk) append-header])
+                  (println "Missing cell meta when defrag at" hn-pos ", retry.")
+                  (unlock-frag-recur trunk pos)))))))))

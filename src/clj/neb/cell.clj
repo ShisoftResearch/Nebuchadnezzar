@@ -9,7 +9,7 @@
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 
 (def cell-head-struc
-  [[:hash :int :hash]
+  [[:hash :long :hash]
    [:schema-id :ushort :schema]])
 (def cell-head-len
   (reduce + (map
