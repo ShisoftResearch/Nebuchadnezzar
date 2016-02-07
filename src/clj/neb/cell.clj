@@ -89,7 +89,7 @@
     (writer trunk value (+ loc offset))))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
-  (.addFragment trunk cell-loc (+ cell-loc cell-head-len data-length)))
+  (.addFragment trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
 
 (defn calc-dynamic-field-length [trunk unit-length field-loc]
   (+ (* (reader/readInt trunk field-loc)

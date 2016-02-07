@@ -18,7 +18,7 @@ public class cellWriter {
     }
 
     public cellWriter(org.shisoft.neb.trunk trunk, long length) {
-        init(trunk, length, trunk.getPointer().getAndAdd(length));
+        init(trunk, length, trunk.getAppendHeader().getAndAdd(length));
     }
 
     public cellWriter(org.shisoft.neb.trunk trunk, long length, long currLoc){

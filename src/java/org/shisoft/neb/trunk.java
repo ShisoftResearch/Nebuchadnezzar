@@ -8,6 +8,7 @@ import sun.misc.Unsafe;
 import java.lang.reflect.Field;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Created by shisoft on 18/1/2016.
@@ -26,19 +27,14 @@ public class trunk {
     }
     private long storeAddress;
     HashLongObjMap<cellMeta> cellIndex = HashLongObjMaps.newMutableMap();
-    AtomicLong pointer = new AtomicLong(0);
+    AtomicLong appendHeader = new AtomicLong(0);
     ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<Long, Long>();
+    ReentrantLock fragsLock = new ReentrantLock();
     public trunk(long size){
         storeAddress = unsafe.allocateMemory(size);
     }
-    public byte getMemory(long addr) {
-        return unsafe.getByte(storeAddress + addr);
-    }
-    public void setMemory(long addr, byte b) {
-        unsafe.putByte(storeAddress + addr, b);
-    }
-    public AtomicLong getPointer() {
-        return pointer;
+    public AtomicLong getAppendHeader() {
+        return appendHeader;
     }
     public ConcurrentSkipListMap getFragments() {
         return fragments;
@@ -68,9 +64,39 @@ public class trunk {
     }
 
     public void addFragment (long startPos, long endPos) throws Exception {
-        if (fragments.containsKey(startPos)){
-            throw new Exception("fragment at pos " + startPos + " already exists");
+        lockFrags();
+        try {
+            addFragment_(startPos, endPos);
+        } finally {
+            unlockFrags();
         }
-        fragments.put(startPos, endPos);
+    }
+
+    public void addFragment_ (long startPos, long endPos) throws Exception {
+        Long seqPos = endPos + 1;
+        Long seqFrag = fragments.get(seqPos);
+        if (seqFrag != null){
+            addFragment_(startPos, seqFrag);
+            removeFrag(seqPos);
+        } else {
+            fragments.put(startPos, endPos);
+        }
+    }
+
+    public void removeFrag (long startPos){
+        fragments.remove(startPos);
+    }
+
+    public void lockFrags(){
+        fragsLock.lock();
+    }
+    public void unlockFrags(){
+        fragsLock.unlock();
+    }
+    public void resetAppendHeader(Long loc){
+        appendHeader.set(loc);
+    }
+    public void copyMemory(Long startPos, Long target, Long len){
+        getUnsafe().copyMemory(startPos, target, len);
     }
 }
