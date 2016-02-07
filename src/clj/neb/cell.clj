@@ -49,7 +49,7 @@
                     cell-head-struc))))))
 
 (defmacro with-cell-meta [trunk hash & body]
-  `(with-bindings {#'*cell-meta* (try (-> ~trunk (.getCellIndex) (.get ~hash)))}
+  `(with-bindings {#'*cell-meta* (-> ~trunk (.getCellIndex) (.get ~hash))}
      (when *cell-meta*
        ~@body)))
 
