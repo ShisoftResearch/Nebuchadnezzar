@@ -92,7 +92,7 @@ public class trunk {
         } else {
             Map.Entry<Long, Long> fe = fragments.floorEntry(seqBPos);
             if (fe != null && fe.getValue().equals(seqBPos)){
-                addFragment(fe.getKey(), endPos);
+                addFragment_(fe.getKey(), endPos);
             } else {
                 fragments.put(startPos, endPos);
             }

@@ -43,6 +43,7 @@
                 (unlock-frag-recur trunk new-frag-pos))
               (= append-header (inc hi-pos))
               (do (.resetAppendHeader trunk pos)
+                  (.removeFrag trunk pos)
                   (unlock-frag trunk))
               :else
               (do (spy [(.getFragments trunk) append-header])
