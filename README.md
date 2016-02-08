@@ -8,8 +8,8 @@ RAMCloud implementation for Clojure applications.
 * Full off-heap, no GC impact and pauses, internal defragment mechanism
 * High concurrency, cell level lock
 * Able to allocate large amount of memory (TBs)
-* Low latency, tests indicates each read/write costs less than 1 ~ 1/10 msec
-* Support both schema (for memory efficient) and schema less
+* Low latency, tests indicates each read/write costs less than 1 ~ 1/100 msec
+* Support both schema (for memory efficiency) and schema less
 * Shard-nothing distributed architecture (working in progress)
 
 ## Usage
