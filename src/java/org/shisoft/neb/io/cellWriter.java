@@ -1,5 +1,6 @@
 package org.shisoft.neb.io;
 
+import clojure.java.api.Clojure;
 import clojure.lang.IFn;
 
 /**
@@ -7,6 +8,7 @@ import clojure.lang.IFn;
  */
 public class cellWriter {
 
+    static IFn defragFn = Clojure.var("neb.defragment", "scan-trunk-and-defragment");
     long startLoc;
     long currLoc;
     org.shisoft.neb.trunk trunk;
@@ -17,8 +19,30 @@ public class cellWriter {
         this.startLoc = currLoc;
     }
 
-    public cellWriter(org.shisoft.neb.trunk trunk, long length) {
-        init(trunk, length, trunk.getAppendHeader().getAndAdd(length));
+    public cellWriter(org.shisoft.neb.trunk trunk, long length) throws Exception {
+        tryAllocate(trunk, length, false);
+    }
+
+    public void tryAllocate(org.shisoft.neb.trunk trunk, long length, boolean defraged){
+        trunk.getCellWriterLock().lock();
+        try {
+            long loc = trunk.getAppendHeader().getAndAdd(length);
+            if (loc + length > trunk.getSize()){
+                trunk.getAppendHeader().set(loc);
+                if (defraged){
+                    throw new Exception("Store full, expected length:" + length + " remains:" + (trunk.getSize() - loc));
+                } else {
+                    defragFn.invoke(trunk);
+                    tryAllocate(trunk, length, true);
+                }
+            }  else {
+                init(trunk, length, loc);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            trunk.getCellWriterLock().unlock();
+        }
     }
 
     public cellWriter(org.shisoft.neb.trunk trunk, long length, long currLoc){

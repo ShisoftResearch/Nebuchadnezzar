@@ -27,12 +27,21 @@ public class trunk {
         }
     }
     private long storeAddress;
+    long size;
     HashLongObjMap<cellMeta> cellIndex = HashLongObjMaps.newMutableMap();
     AtomicLong appendHeader = new AtomicLong(0);
     ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<Long, Long>();
     ReentrantLock fragsLock = new ReentrantLock();
+    ReentrantLock cellWriterLock = new ReentrantLock();
     public trunk(long size){
+        this.size = size;
         storeAddress = unsafe.allocateMemory(size);
+    }
+    public long getSize() {
+        return size;
+    }
+    public ReentrantLock getCellWriterLock() {
+        return cellWriterLock;
     }
     public AtomicLong getAppendHeader() {
         return appendHeader;
