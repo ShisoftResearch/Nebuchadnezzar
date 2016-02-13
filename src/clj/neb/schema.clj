@@ -4,8 +4,21 @@
 
 (def ^schemaStore schema-store (schemaStore.))
 
-(defn add-scheme [sname fields & [id]]
+(defn add-schema [sname fields & [id]]
   (let [id (short (or id (-> (.getIdCounter schema-store) (.getAndIncrement))))]
     (-> (.getSchemaIdMap schema-store)
         (.put id {:n sname :f fields :i id}))
     id))
+
+(defn load-schemas-file [schema-file]
+  (read-string (slurp schema-file)))
+
+(defn load-schemas [schema-map]
+  (doseq [{:keys [n f i]} schema-map]
+    (add-schema n f i)))
+
+(defn save-schemas [schema-file]
+  (spit schema-file
+        (pr-str (vec (-> (.getSchemaIdMap schema-store)
+                         (.values))))
+        :append false))

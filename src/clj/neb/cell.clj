@@ -118,7 +118,7 @@
         (mark-cell-deleted trunk cell-loc data-length))
       (throw (Exception. "Cell hash does not existed to delete")))))
 
-(defn read-cell* [^trunk trunk ^Long hash]
+(defn read-cell* [^trunk trunk]
   (if-let [loc (get-cell-id)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
@@ -140,7 +140,7 @@
 (defn read-cell [^trunk trunk ^Long hash]
   (with-read-lock
     trunk hash
-    (read-cell* trunk hash)))
+    (read-cell* trunk)))
 
 (defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
@@ -176,7 +176,7 @@
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
-(defn write-cell [^trunk trunk schema data & {:keys [loc hash update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^trunk trunk ^Long hash schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (cell-fields-to-write schema data)
         fields-length (cell-len-by-fields fields)
@@ -198,7 +198,7 @@
   (when (.hasCell trunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
-    (write-cell trunk schema data :hash hash)))
+    (write-cell trunk hash schema data)))
 
 (defn replace-cell* [^trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-id)]
@@ -209,13 +209,13 @@
           fields (cell-fields-to-write schema data)
           new-data-length (cell-len-by-fields fields)]
       (if (>= data-len new-data-length)
-        (do (write-cell trunk schema data :loc cell-loc :hash hash :update-hash-index? false)
+        (do (write-cell trunk hash schema data :loc cell-loc :update-hash-index? false)
             (when (< new-data-length data-len)
               (.addFragment
                 trunk
                 (+ cell-data-loc new-data-length 1)
                 (+ cell-data-loc data-len))))
-        (do (write-cell trunk schema data :hash hash :update-cell? true)
+        (do (write-cell trunk hash schema data :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
 (defn replace-cell [^trunk trunk ^Long hash data]
@@ -226,7 +226,7 @@
 (defn update-cell [^trunk trunk ^Long hash fn & params]  ;TODO Replace with less overhead function
   (with-write-lock
     trunk hash
-    (when-let [cell-content (read-cell* trunk hash)]
+    (when-let [cell-content (read-cell* trunk)]
       (let [replacement  (apply fn cell-content params)]
         (replace-cell* trunk hash replacement)
         replacement))))

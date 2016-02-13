@@ -1,6 +1,6 @@
 (ns neb.test.data-type-io
   (:require [midje.sweet :refer :all]
-            [neb.schema :refer [add-scheme]]
+            [neb.schema :refer [add-schema]]
             [neb.cell :refer [new-cell read-cell schema-by-id]]
             [neb.types :refer [data-types]]
             [cluster-connector.utils.for-debug :refer [spy $]])
@@ -25,7 +25,7 @@
   `(do ~@(map
            (fn [[dname {:keys [example]}]]
              (when (seq example)
-               `(do (add-scheme :test-type-schama [[:test ~dname]] (short 20))
+               `(do (add-schema :test-type-schama [[:test ~dname]] (short 20))
                     (schema-by-id (int 20)) =not=> nil
                     ~@(map
                         (fn [test-case]
