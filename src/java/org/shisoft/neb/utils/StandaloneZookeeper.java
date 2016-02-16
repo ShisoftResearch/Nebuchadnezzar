@@ -15,7 +15,7 @@ public class StandaloneZookeeper {
 
     public void startZookeeper (int clientPort) throws IOException, InterruptedException {
         int numConnections = 5000;
-        int tickTime = 2000;
+        int tickTime = 200;
         String dataDirectory = System.getProperty("java.io.tmpdir");
         File dir = new File(dataDirectory, "zookeeper").getAbsoluteFile();
         ZooKeeperServer server = new ZooKeeperServer(dir, dir, tickTime);

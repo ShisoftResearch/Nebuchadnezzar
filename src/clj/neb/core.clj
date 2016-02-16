@@ -5,6 +5,7 @@
             [cluster-connector.native-cache.core :refer :all]
             [cluster-connector.sharding.DHT :refer :all]
             [neb.schema :refer [load-schemas-file load-schemas]]
+            [neb.trunk-store :refer [init-trunks dispose-trunks]]
             [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
@@ -16,6 +17,7 @@
 (defn stop-server []
   (println "Shutdowning...")
   (rfi/stop-server)
+  (dispose-trunks)
   (leave-cluster))
 
 (defn start-server [config]
@@ -38,11 +40,16 @@
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
           (load-schemas schemas)
+          (init-trunks trunk-count trunks-size)
           (register-as-master (* 20 trunk-count))
           (rfi/start-server port)))
       :expired-fn
       (fn []
         (stop-server)))))
+
+(defn clear-zk []
+  (ds/delete-configure :schemas)
+  (ds/delete-configure :neb))
 
 (defn rand-cell-id [] (UUID/randomUUID))
 

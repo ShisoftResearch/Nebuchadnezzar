@@ -10,9 +10,16 @@ public class trunkStore {
     trunk[] trunks;
 
     public void init(int trunkCount, long trunkSize) {
-        trunks = new trunk[trunkCount - 1];
+        trunks = new trunk[trunkCount];
         for (int i = 0; i < trunkCount; i++){
             trunks[i] = new trunk(trunkSize);
+        }
+    }
+
+    public void dispose (){
+        for (int i = 0; i < getTrunkCount(); i++){
+            trunks[i].dispose();
+            trunks[i] = null;
         }
     }
 
@@ -22,5 +29,9 @@ public class trunkStore {
 
     public int getTrunkCount(){
         return trunks.length;
+    }
+
+    public long getTrunkSize(){
+        return trunks[0].getSize();
     }
 }

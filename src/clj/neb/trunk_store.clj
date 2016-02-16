@@ -8,12 +8,19 @@
 (defn init-trunks [trunk-count trunks-size]
   (.init trunks trunk-count trunks-size))
 
+(defn dispose-trunks []
+  (.dispose trunks))
+
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)
         trunk-id (mod (.getMostSignificantBits cell-id)
                       (.getTrunkCount trunks))
         trunk (.getTrunk trunks (int trunk-id))]
     (apply func trunk hash params)))
+
+(defn get-trunk-store-params []
+  {:trunks-size (.getTrunkSize trunks)
+   :trunk-count  (.getTrunkCount trunks)})
 
 (defn delete-cell [^UUID cell-id]
   (dispatch-trunk cell-id cell/delete-cell))
