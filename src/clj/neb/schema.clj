@@ -11,7 +11,8 @@
     id))
 
 (defn load-schemas-file [schema-file]
-  (read-string (slurp schema-file)))
+  (or (try (read-string (slurp schema-file)) (catch Exception _))
+      []))
 
 (defn load-schemas [schema-map]
   (doseq [{:keys [n f i]} schema-map]

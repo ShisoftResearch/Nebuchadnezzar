@@ -4,39 +4,45 @@
             [cluster-connector.sharding.core :refer [register-as-master checkout-as-master]]
             [cluster-connector.native-cache.core :refer :all]
             [cluster-connector.sharding.DHT :refer :all]
-            [neb.schema :refer [load-schemas-file load-schemas]])
+            [neb.schema :refer [load-schemas-file load-schemas]]
+            [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
            (java.nio.charset Charset)))
 
 (def cluster-config-fields [:trunks-size])
 
-(defn start-server [svr-name port zk meta config]
-  (join-cluster
-    :neb
-    (:name config)
-    port zk meta
-    :connected-fn
-    (fn []
-      (let [cluster-configs (select-keys config cluster-config-fields)
-            cluster-configs (or (ds/get-configure :neb)
-                                (do (ds/set-configure :neb cluster-configs)
-                                    cluster-configs))
-            {:keys [trunks-size]} cluster-configs
-            {:keys [memory-size data-path]} config
-            schemas (or (ds/get-configure :schemas)
-                        (let [s (load-schemas-file data-path)]
-                          (ds/set-configure :schemas s) s))
-            trunk-count (int (Math/floor (/ memory-size trunks-size)))]
 
-        (load-schemas schemas)
-        (register-as-master (* 20 trunk-count))
-        (rfi/start-server port)))
-    :expired-fn
-    (fn []
-      (rfi/stop-server))))
+(defn stop-server []
+  (println "Shutdowning...")
+  (rfi/stop-server)
+  (leave-cluster))
 
-(def stop-server leave-cluster)
+(defn start-server [config]
+  (let [{:keys [server-name port zk meta]} config]
+    (join-cluster
+      :neb
+      server-name
+      port zk meta
+      :connected-fn
+      (fn []
+        (let [cluster-configs (select-keys config cluster-config-fields)
+              cluster-configs (or (try (:data (ds/get-configure :neb)) (catch Exception _))
+                                  (do (ds/set-configure :neb cluster-configs)
+                                      cluster-configs))
+              {:keys [trunks-size]} cluster-configs
+              {:keys [memory-size data-path]} config
+              schemas (or (try (:data (ds/get-configure :schemas)) (catch Exception _))
+                          (let [s (load-schemas-file (str data-path "/schemas"))]
+                            (ds/set-configure :schemas s) s))
+              trunk-count (int (Math/floor (/ memory-size trunks-size)))]
+          (println "Loading Store...")
+          (load-schemas schemas)
+          (register-as-master (* 20 trunk-count))
+          (rfi/start-server port)))
+      :expired-fn
+      (fn []
+        (stop-server)))))
 
 (defn rand-cell-id [] (UUID/randomUUID))
 
