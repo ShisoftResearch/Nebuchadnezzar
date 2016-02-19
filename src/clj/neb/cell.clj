@@ -1,6 +1,6 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types]]
-            [neb.schema :refer [schema-store]]
+            [neb.schema :refer [schema-store schema-by-id]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
@@ -75,10 +75,6 @@
   (.getLocation *cell-meta*))
 
 (gen-cell-header-offsets)
-
-(defn schema-by-id [^Integer schema-id]
-  (-> (.getSchemaIdMap schema-store)
-      (.get schema-id)))
 
 (defn read-cell-header-field [^trunk trunk loc field]
   (let [{:keys [reader offset]} (get cell-head-struc-map field)]

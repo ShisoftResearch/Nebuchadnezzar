@@ -20,10 +20,16 @@
          (fact "Start Server"
                (start-server config) => anything)
          (fact "Check server parameters"
-               (ts/get-trunk-store-params) => (contains {:trunks-size (fn [& _] trunks-size)
-                                                         :trunk-count 2}))
+               (ts/get-trunk-store-params) => (contains {:trunks-size (fn [& _] trunks-size) :trunk-count 2}))
          (fact "Add Distributed Schemas"
-               (s/add-schema-distributed :test-data [[:id :int]]))
+               (add-schema :test-data   [[:id :int]]) => 0
+               (add-schema :test-data2  [[:id :int]]) => 1)
+         (fact "Remove Distributed Schemas"
+               (remove-schema :test-data)   => 0
+               (remove-schema :test-data2)  => 1
+               (get-schemas) => empty?)
+         (fact "Schema Id Reuse"
+               (add-schema :raw-data [[:data :bytes]]) => 0)
          (fact "Clear Zookeeper Server"
                (clear-zk) => anything)
          (fact "Stop Server"

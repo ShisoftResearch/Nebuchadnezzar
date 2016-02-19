@@ -4,9 +4,10 @@
             [cluster-connector.sharding.core :refer [register-as-master checkout-as-master]]
             [cluster-connector.native-cache.core :refer :all]
             [cluster-connector.sharding.DHT :refer :all]
-            [neb.schema :refer [load-schemas-file load-schemas]]
+            [neb.schema :refer [load-schemas-file load-schemas clear-schemas schema-id-by-sname] :as s]
             [neb.trunk-store :refer [init-trunks dispose-trunks]]
-            [cluster-connector.utils.for-debug :refer [$ spy]])
+            [cluster-connector.utils.for-debug :refer [$ spy]]
+            [cluster-connector.distributed-store.lock :as d-lock])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
            (java.nio.charset Charset)))
@@ -39,6 +40,7 @@
                             (ds/set-configure :schemas s) s))
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
+          (clear-schemas)
           (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
           (register-as-master (* 20 trunk-count))
@@ -92,3 +94,25 @@
 
 (defn update-cell [key fn & params]
   (apply dist-call key 'neb.trunk-store/update-cell fn params))
+
+
+(d-lock/deflock schemas)
+
+(defn add-schema [sname fields]
+  (d-lock/locking
+    schemas
+    (let [server-new-ids (group-by identity (rfi/broadcast-invoke 'neb.schema/gen-id))
+          new-id (apply max (keys server-new-ids))]
+      (when (> (count server-new-ids) 1)
+        (println "WARNING: Inconsistant schemas in server nodes. Synchronization required." (keys server-new-ids)))
+      (rfi/broadcast-invoke 'neb.schema/add-schema sname fields new-id)
+      new-id)))
+
+(defn remove-schema [sname]
+  (d-lock/locking
+    schemas
+    (let [schema-id (schema-id-by-sname sname)]
+      (first (rfi/broadcast-invoke 'neb.schema/remove-schema-by-id schema-id)))))
+
+(defn get-schemas []
+  (.getSchemaIdMap s/schema-store))
