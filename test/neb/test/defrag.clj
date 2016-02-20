@@ -1,6 +1,6 @@
 (ns neb.test.defrag
   (:require [midje.sweet :refer :all]
-            [neb.schema :refer [add-scheme]]
+            [neb.schema :refer [add-schema]]
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
             [neb.defragment :refer [scan-trunk-and-defragment]]
             [cluster-connector.utils.for-debug :refer [spy $]])
@@ -13,9 +13,9 @@
              b-d {:l 456}
              c-d  {:f (float 1.23) :i (int 101112)}]
          (fact "create some cells"
-               (add-scheme :a [[:i :int]] 1) => anything
-               (add-scheme :b [[:l :long]] 2) => anything
-               (add-scheme :c [[:f :float] [:i :int]] 3) => anything
+               (add-schema :a [[:i :int]] 1) => anything
+               (add-schema :b [[:l :long]] 2) => anything
+               (add-schema :c [[:f :float] [:i :int]] 3) => anything
                (new-cell trunk 1 (int 1) a-d) => anything
                (new-cell trunk 2 (int 2) b-d) => anything
                (new-cell trunk 3 (int 3) c-d) => anything

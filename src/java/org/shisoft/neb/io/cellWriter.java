@@ -62,6 +62,14 @@ public class cellWriter {
         trunk.getCellIndex().get(hash).setLocation(startLoc);
     }
 
+    public void lockIndex (){
+        trunk.getIndexWriteLock().lock();
+    }
+
+    public void unlockIndex (){
+        trunk.getIndexWriteLock().unlock();
+    }
+
     public long getCurrLoc() {
         return currLoc;
     }

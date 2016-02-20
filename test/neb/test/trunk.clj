@@ -1,6 +1,6 @@
 (ns neb.test.trunk
   (:require [midje.sweet :refer :all]
-            [neb.schema :refer [add-scheme]]
+            [neb.schema :refer [add-schema]]
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
@@ -33,13 +33,13 @@
        (fact "memory init"
              (reset! ttrunk (trunk. 5000000)) => anything)
        (fact "define simple scheme"
-             (add-scheme :test-schema simple-scheme 1) => anything)
+             (add-schema :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
              (new-cell @ttrunk 1 (int 1) simple-scheme-data) => anything)
        (fact "read cell with simple scheme"
              (read-cell @ttrunk 1) => simple-scheme-data)
        (fact "define compound scheme"
-             (add-scheme :test-schema2 compound-scheme 2) => anything)
+             (add-schema :test-schema2 compound-scheme 2) => anything)
        (fact "write cell with compound shceme"
              (new-cell @ttrunk 2 (int 2) compound-scheme-data) => anything)
        (fact "read cell with compound scheme"
