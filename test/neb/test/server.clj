@@ -2,7 +2,8 @@
   (:require [neb.core :refer :all]
             [neb.trunk-store :as ts]
             [neb.schema :as s]
-            [midje.sweet :refer :all])
+            [midje.sweet :refer :all]
+            [cluster-connector.utils.for-debug :refer [$]])
   (:import [org.shisoft.neb.utils StandaloneZookeeper]))
 
 (def trunks-size (* Integer/MAX_VALUE 0.2))
@@ -56,7 +57,26 @@
          (fact "Check Cell Distribution"
                (let [trunks-cell-count (ts/trunks-cell-count)]
                  (reduce + trunks-cell-count) => 1000
-                 (calc-standard-deviation trunks-cell-count) => (fn [minus] (< minus 10))))
+                 (calc-standard-deviation trunks-cell-count) => (fn [sd] (< sd 10))))
+         (fact "Batch Add Cell"
+               (batch-new-cell
+                 (map
+                   (fn [id]
+                     [(str "test-2-" id)
+                      :raw-data {:data id}])
+                   (range 1000))) => anything)
+         (fact "Check total cells"
+               (reduce + (ts/trunks-cell-count)) => 2000)
+         (fact "Check Batch Cells Added"
+               (batch-read-cell-by-key
+                 (map
+                   #(str "test-2-" %)
+                   (range 1000))) => (into {} (map (fn [id] [(str "test-2-" id) {:data id}]) (range 1000))))
+         (fact "Batch Delete"
+               (batch-delete-cell-noreply
+                 (map #(str "test-2-" %) (range 1000))) => anything)
+         (fact "Check Batch Delete"
+               (reduce + (ts/trunks-cell-count)) => 1000)
          (fact "Clear Zookeeper Server"
                (clear-zk) => anything)
          (fact "Stop Server"

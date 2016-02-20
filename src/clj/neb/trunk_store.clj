@@ -1,5 +1,6 @@
 (ns neb.trunk-store
-  (:require [neb.cell :as cell])
+  (:require [neb.cell :as cell]
+            [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb.io trunkStore)
            (java.util UUID)))
 
@@ -39,3 +40,19 @@
 
 (defn update-cell [^UUID cell-id fn & params]
   (apply dispatch-trunk cell-id cell/update-cell fn params))
+
+(defmacro batch-fn [func]
+  `(do (defn ~(symbol (str "batch-" (name func))) [coll#]
+         (into
+           {}
+           (for [[^UUID cell-id# & params#] coll#]
+             [cell-id# (apply ~func cell-id# params#)])))
+       (defn ~(symbol (str "batch-" (name func) "-noreply")) [coll#]
+         (doseq [[^UUID cell-id# & params#] coll#]
+           [cell-id# (apply ~func cell-id# params#)]))))
+
+(batch-fn delete-cell)
+(batch-fn read-cell)
+(batch-fn new-cell)
+(batch-fn replace-cell)
+(batch-fn update-cell)
