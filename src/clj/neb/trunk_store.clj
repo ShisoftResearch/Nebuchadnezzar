@@ -11,6 +11,9 @@
 (defn dispose-trunks []
   (.dispose trunks))
 
+(defn trunks-cell-count []
+  (.getTrunksCellCount trunks))
+
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)
         trunk-id (mod (.getMostSignificantBits cell-id)

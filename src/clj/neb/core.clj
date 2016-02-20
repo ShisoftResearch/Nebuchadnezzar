@@ -73,35 +73,54 @@
 (defn cell-key-to-id [key]
   (if (= (class key) UUID)
     key
-    (cell-id-by-key key)))
+    (cell-id-by-key (name key))))
 
 (defn- dist-call [cell-key func & params]
   (let [cell-id (cell-key-to-id cell-key)
         server-name (locate-cell-by-id cell-id)]
     (apply rfi/invoke server-name func cell-id params)))
 
-(defn delete-cell [key]
-  (dist-call key 'neb.trunk-store/delete-cell))
+(defn delete-cell* [id]
+  (dist-call id 'neb.trunk-store/delete-cell))
 
-(defn read-cell [key]
-  (dist-call key 'neb.trunk-store/read-cell))
+(defn read-cell* [id]
+  (dist-call id 'neb.trunk-store/read-cell))
 
-(defn new-cell [key schema-id data]
-  (dist-call key 'neb.trunk-store/new-cell schema-id data))
+(defn new-cell* [id schema data]
+  (dist-call
+    id 'neb.trunk-store/new-cell
+    (s/schema-id-by-sname schema)
+    data))
 
-(defn replace-cell [key data]
-  (dist-call key 'neb.trunk-store/replace-cell data))
+(defn replace-cell* [id data]
+  (dist-call id 'neb.trunk-store/replace-cell data))
 
-(defn update-cell [key fn & params]
-  (apply dist-call key 'neb.trunk-store/update-cell fn params))
+(defn update-cell* [id fn & params]
+  (apply dist-call id 'neb.trunk-store/update-cell fn params))
 
+(defmacro op-fns [func]
+  (let [base-func (symbol (str (name func) "*"))]
+    `(do (defn ~(symbol (str (name func) "-by-key")) [key# & params#]
+           (apply ~base-func
+                  (cell-id-by-key key#)
+                  params#))
+         (defn ~func [key# & params#]
+           (apply ~base-func
+                  (cell-key-to-id key#)
+                  params#)))))
+
+(op-fns delete-cell)
+(op-fns read-cell)
+(op-fns new-cell)
+(op-fns replace-cell)
+(op-fns update-cell)
 
 (d-lock/deflock schemas)
 
 (defn add-schema [sname fields]
   (d-lock/locking
     schemas
-    (let [server-new-ids (group-by identity (rfi/broadcast-invoke 'neb.schema/gen-id))
+    (let [server-new-ids (group-by identity (map second (rfi/broadcast-invoke 'neb.schema/gen-id)))
           new-id (apply max (keys server-new-ids))]
       (when (> (count server-new-ids) 1)
         (println "WARNING: Inconsistant schemas in server nodes. Synchronization required." (keys server-new-ids)))
@@ -112,7 +131,7 @@
   (d-lock/locking
     schemas
     (let [schema-id (schema-id-by-sname sname)]
-      (first (rfi/broadcast-invoke 'neb.schema/remove-schema-by-id schema-id)))))
+      (last (first (rfi/broadcast-invoke 'neb.schema/remove-schema-by-id schema-id))))))
 
 (defn get-schemas []
   (.getSchemaIdMap s/schema-store))

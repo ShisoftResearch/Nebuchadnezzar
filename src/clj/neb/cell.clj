@@ -186,9 +186,13 @@
     (doseq [{:keys [key-name type value writer length] :as field} fields]
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
-      (if update-cell?
-        (.updateCellToTrunkIndex cell-writer hash)
-        (.addCellToTrunkIndex cell-writer hash)))))
+      (.lockIndex cell-writer)
+      (try
+        (if update-cell?
+          (.updateCellToTrunkIndex cell-writer hash)
+          (.addCellToTrunkIndex cell-writer hash))
+        (finally
+          (.unlockIndex cell-writer))))))
 
 (defn new-cell [^trunk trunk ^Long hash ^Integer schema-id data]
   (when (.hasCell trunk hash)

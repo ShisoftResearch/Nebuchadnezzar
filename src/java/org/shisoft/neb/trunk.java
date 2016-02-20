@@ -33,6 +33,7 @@ public class trunk {
     ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<Long, Long>();
     ReentrantLock fragsLock = new ReentrantLock();
     ReentrantLock cellWriterLock = new ReentrantLock();
+    ReentrantLock indexWriteLock = new ReentrantLock();
     public trunk(long size){
         this.size = size;
         storeAddress = unsafe.allocateMemory(size);
@@ -43,6 +44,10 @@ public class trunk {
     public ReentrantLock getCellWriterLock() {
         return cellWriterLock;
     }
+    public ReentrantLock getIndexWriteLock() {
+        return indexWriteLock;
+    }
+
     public AtomicLong getAppendHeader() {
         return appendHeader;
     }
