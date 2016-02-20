@@ -23,6 +23,10 @@ public class trunkStore {
         }
     }
 
+    public trunk[] getTrunks() {
+        return trunks;
+    }
+
     public trunk getTrunk (int id){
         return trunks[id];
     }

@@ -7,19 +7,19 @@
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock]
             [neb.schema :refer [load-schemas-file load-schemas clear-schemas schema-id-by-sname] :as s]
-            [neb.trunk-store :refer [init-trunks dispose-trunks]]
+            [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag]]
             [neb.utils :refer :all])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
            (java.nio.charset Charset)))
 
 (def cluster-config-fields [:trunks-size])
-
 (def ^:dynamic *batch-size* 200)
 
 (defn stop-server []
   (println "Shutdowning...")
   (rfi/stop-server)
+  (stop-defrag)
   (dispose-trunks)
   (leave-cluster))
 
@@ -45,6 +45,7 @@
           (clear-schemas)
           (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
+          (start-defrag)
           (register-as-master (* 20 trunk-count))
           (rfi/start-server port)))
       :expired-fn

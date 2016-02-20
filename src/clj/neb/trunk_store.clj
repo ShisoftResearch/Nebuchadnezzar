@@ -1,10 +1,13 @@
 (ns neb.trunk-store
   (:require [neb.cell :as cell]
-            [cluster-connector.utils.for-debug :refer [spy $]])
+            [neb.defragment :as defrag]
+            [cluster-connector.utils.for-debug :refer [spy $]]
+            [cluster-connector.microservice.circular :as ms])
   (:import (org.shisoft.neb.io trunkStore)
            (java.util UUID)))
 
 (def trunks (trunkStore.))
+(def defrag-service (atom nil))
 
 (defn init-trunks [trunk-count trunks-size]
   (.init trunks trunk-count trunks-size))
@@ -14,6 +17,17 @@
 
 (defn trunks-cell-count []
   (.getTrunksCellCount trunks))
+
+(defn defrag-store-trunks []
+  (doseq [trunk (.getTrunks trunks)]
+    (defrag/scan-trunk-and-defragment trunk))
+  (Thread/sleep 1000))
+
+(defn start-defrag []
+  ($ reset! defrag-service (ms/start-service defrag-store-trunks)))
+
+(defn stop-defrag []
+  ($ ms/stop-service @defrag-service))
 
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)
