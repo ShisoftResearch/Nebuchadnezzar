@@ -21,13 +21,13 @@
 (defn defrag-store-trunks []
   (doseq [trunk (.getTrunks trunks)]
     (defrag/scan-trunk-and-defragment trunk))
-  (Thread/sleep 1000))
+  (Thread/sleep 10))
 
 (defn start-defrag []
-  ($ reset! defrag-service (ms/start-service defrag-store-trunks)))
+  (reset! defrag-service (ms/start-service defrag-store-trunks)))
 
 (defn stop-defrag []
-  ($ ms/stop-service @defrag-service))
+  (ms/stop-service @defrag-service))
 
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)

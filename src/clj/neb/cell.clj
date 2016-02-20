@@ -56,20 +56,14 @@
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (do (.lockWrite *cell-meta*)
-         (try
-           ~@body
-           (finally
-             (.unlockWrite *cell-meta*))))))
+     (locking *cell-meta*
+       ~@body)))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (do (.lockRead *cell-meta*)
-         (try
-           ~@body
-           (finally
-             (.unlockRead *cell-meta*))))))
+     (locking *cell-meta*
+       ~@body)))
 
 (defn get-cell-id []
   (.getLocation *cell-meta*))
@@ -84,8 +78,12 @@
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
     (writer trunk value (+ loc offset))))
 
+(defn add-frag [^trunk trunk start end]
+  (locking (.getFragments trunk)
+    (.addFragment trunk start end)))
+
 (defn mark-cell-deleted [trunk cell-loc data-length]
-  (.addFragment trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
+  (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
 
 (defn calc-dynamic-field-length [trunk unit-length field-loc]
   (+ (* (reader/readInt trunk field-loc)
@@ -172,6 +170,10 @@
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
+(defmacro locking-index [^trunk trunk & body]
+  `(locking (.getCellIndex ~trunk)
+     ~@body))
+
 (defn write-cell [^trunk trunk ^Long hash schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (cell-fields-to-write schema data)
@@ -186,13 +188,11 @@
     (doseq [{:keys [key-name type value writer length] :as field} fields]
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
-      (.lockIndex cell-writer)
-      (try
+      (locking-index
+        trunk
         (if update-cell?
           (.updateCellToTrunkIndex cell-writer hash)
-          (.addCellToTrunkIndex cell-writer hash))
-        (finally
-          (.unlockIndex cell-writer))))))
+          (.addCellToTrunkIndex cell-writer hash))))))
 
 (defn new-cell [^trunk trunk ^Long hash ^Integer schema-id data]
   (when (.hasCell trunk hash)
@@ -211,7 +211,7 @@
       (if (>= data-len new-data-length)
         (do (write-cell trunk hash schema data :loc cell-loc :update-hash-index? false)
             (when (< new-data-length data-len)
-              (.addFragment
+              (add-frag
                 trunk
                 (+ cell-data-loc new-data-length 1)
                 (+ cell-data-loc data-len))))
