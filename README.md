@@ -11,6 +11,7 @@ RAMCloud implementation for Clojure applications.
 * Low latency, tests indicates each read/write costs less than 1 ~ 1/100 msec
 * Support both schema (for memory efficiency) and schema less
 * Shard-nothing distributed architecture
+* Rich data type support, including text, geo coordinate, bytes, java objects, and arrays
 
 ## Usage
 
