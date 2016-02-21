@@ -19,6 +19,5 @@
              ;"-Dcom.sun.management.jmxremote.port=9876"
              ;"-Dcom.sun.management.jmxremote.authenticate=false"
              ;"-Dcom.sun.management.jmxremote.ssl=false"
-             "-javaagent:/Users/shisoft/.m2/repository/com/github/jbellis/jamm/0.3.1/jamm-0.3.1.jar"
              ;"-Xmx8g"
              "-XX:+UseParNewGC" "-XX:+UseConcMarkSweepGC" "-XX:+CMSParallelRemarkEnabled"])
