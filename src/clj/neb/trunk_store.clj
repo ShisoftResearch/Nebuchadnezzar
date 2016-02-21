@@ -21,7 +21,7 @@
 (defn defrag-store-trunks []
   (doseq [trunk (.getTrunks trunks)]
     (defrag/scan-trunk-and-defragment trunk))
-  (Thread/sleep 10))
+  (Thread/sleep 100))
 
 (defn start-defrag []
   (reset! defrag-service (ms/start-service defrag-store-trunks)))

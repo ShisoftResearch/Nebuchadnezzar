@@ -46,7 +46,7 @@
           (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
           (start-defrag)
-          (register-as-master (* 20 trunk-count))
+          (register-as-master (* 50 trunk-count))
           (rfi/start-server port)))
       :expired-fn
       (fn []
