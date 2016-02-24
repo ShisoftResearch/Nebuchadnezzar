@@ -71,7 +71,7 @@
                (batch-read-cell-by-key
                  (map
                    #(str "test-2-" %)
-                   (range 1000))) => (contains (into {} (map (fn [id] [(str "test-2-" id) (contains {:data id})]) (range 1000)))))
+                   (range 1000))) => (just (into {} (map (fn [id] [(str "test-2-" id) (contains {:data id})]) (range 1000)))))
          (fact "Batch Delete"
                (batch-delete-cell-noreply
                  (map #(str "test-2-" %) (range 1000))) => anything)
