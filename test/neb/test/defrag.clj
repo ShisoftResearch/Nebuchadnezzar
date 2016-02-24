@@ -35,13 +35,13 @@
                  (< (.getAppendHeaderValue trunk) frag-append-head) => true
                  (- (.getAppendHeaderValue trunk) frag-append-head) => -54))
          (fact "data did not corrupted"
-               (read-cell trunk 1) => a-d
-               (read-cell trunk 4) => a-d
-               (read-cell trunk 6) => b-d)
+               (read-cell trunk 1) => (contains a-d)
+               (read-cell trunk 4) => (contains a-d)
+               (read-cell trunk 6) => (contains b-d))
          (fact "data can write"
                (new-cell trunk 7 (int 3) c-d) => anything)
          (fact "new written did not make data correpted"
-               (read-cell trunk 1) => a-d
-               (read-cell trunk 4) => a-d
-               (read-cell trunk 6) => b-d
-               (read-cell trunk 7) => c-d)))
+               (read-cell trunk 1) => (contains a-d)
+               (read-cell trunk 4) => (contains a-d)
+               (read-cell trunk 6) => (contains b-d)
+               (read-cell trunk 7) => (contains c-d))))

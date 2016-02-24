@@ -50,7 +50,7 @@
                (dorun
                  (pmap
                    (fn [id]
-                     (read-cell (str "test" id)) => {:data id})
+                     (read-cell (str "test" id)) => (contains {:data id}))
                    (range 1000))))
          (fact "Delete Cell"
                (delete-cell :test) => anything)
@@ -71,7 +71,7 @@
                (batch-read-cell-by-key
                  (map
                    #(str "test-2-" %)
-                   (range 1000))) => (into {} (map (fn [id] [(str "test-2-" id) {:data id}]) (range 1000))))
+                   (range 1000))) => (contains (into {} (map (fn [id] [(str "test-2-" id) (contains {:data id})]) (range 1000)))))
          (fact "Batch Delete"
                (batch-delete-cell-noreply
                  (map #(str "test-2-" %) (range 1000))) => anything)

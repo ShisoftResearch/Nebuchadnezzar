@@ -33,7 +33,7 @@
                                  (let [test-case# {:test ~test-case}]
                                    (rt)
                                    (wc test-case#) => anything
-                                   (rc) => test-case#
+                                   (rc) => (contains test-case#)
                                    (dt))))
                         example))))
            data-types)))

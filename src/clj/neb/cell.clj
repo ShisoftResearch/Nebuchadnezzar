@@ -6,6 +6,7 @@
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
+(def ^:dynamic *cell-hash* nil)
 
 (def cell-head-struc
   [[:hash :long :hash]
@@ -48,7 +49,8 @@
                     cell-head-struc))))))
 
 (defmacro with-cell-meta [trunk hash & body]
-  `(with-bindings {#'*cell-meta* (-> ~trunk (.getCellIndex) (.get ~hash))}
+  `(with-bindings {#'*cell-meta* (-> ~trunk (.getCellIndex) (.get ~hash))
+                   #'*cell-hash* ~hash}
      (when *cell-meta*
        ~@body)))
 
@@ -117,18 +119,20 @@
       (with-cell
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
-          (into
-            {}
-            (map
-              (fn [[key-name data-type]]
-                [key-name
-                 (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
-                       dep (when dep (get data-types dep))
-                       reader (or reader (get dep :reader))
-                       reader (if decoder (comp decoder reader) reader)
-                       length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
-                   (.streamRead cell-reader reader length))])
-              (:f schema))))))))
+          (merge (into
+                   {}
+                   (map
+                     (fn [[key-name data-type]]
+                       [key-name
+                        (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
+                              dep (when dep (get data-types dep))
+                              reader (or reader (get dep :reader))
+                              reader (if decoder (comp decoder reader) reader)
+                              length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
+                          (.streamRead cell-reader reader length))])
+                     (:f schema)))
+                 {:*schema* schema-id
+                  :*hash*   *cell-hash*}))))))
 
 (defn read-cell [^trunk trunk ^Long hash]
   (with-read-lock
