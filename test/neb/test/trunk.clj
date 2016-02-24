@@ -37,13 +37,13 @@
        (fact "write cell with simple shceme"
              (new-cell @ttrunk 1 (int 1) simple-scheme-data) => anything)
        (fact "read cell with simple scheme"
-             (read-cell @ttrunk 1) => simple-scheme-data)
+             (read-cell @ttrunk 1) => (contains simple-scheme-data))
        (fact "define compound scheme"
              (add-schema :test-schema2 compound-scheme 2) => anything)
        (fact "write cell with compound shceme"
              (new-cell @ttrunk 2 (int 2) compound-scheme-data) => anything)
        (fact "read cell with compound scheme"
-             (read-cell @ttrunk 2) => compound-scheme-data)
+             (read-cell @ttrunk 2) => (contains compound-scheme-data))
        (fact "delete cell"
              (delete-cell @ttrunk 2) => anything)
        (fact "deleted cell cannot been read"
@@ -51,16 +51,16 @@
        (fact "replace cell"
              (replace-cell @ttrunk 1 simple-scheme-data-replacement) => anything)
        (fact "cell should been replaced"
-             (read-cell @ttrunk 1) => simple-scheme-data-replacement)
+             (read-cell @ttrunk 1) => (contains simple-scheme-data-replacement))
        (fact "shrinked replace cell"
              (new-cell @ttrunk 2 (int 2) compound-scheme-data) => anything
              (replace-cell @ttrunk 2 compound-scheme-data-shrinked-replacement) => anything)
        (fact "shrinked cell should been replaced"
-             (read-cell @ttrunk 2) => compound-scheme-data-shrinked-replacement)
+             (read-cell @ttrunk 2) => (contains compound-scheme-data-shrinked-replacement))
        (fact "overflow replace cell"
              (replace-cell @ttrunk 2 compound-scheme-data-replacement) => anything)
        (fact "overflow cell should been replaced"
-             (read-cell @ttrunk 2) => compound-scheme-data-replacement)
+             (read-cell @ttrunk 2) => (contains compound-scheme-data-replacement))
        (fact "update cell"
              (update-cell @ttrunk 2 update :len-offset dec) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
        (fact "cell updated"

@@ -10,7 +10,7 @@
 
 (def cell-head-struc
   [[:hash :long :hash]
-   [:schema-id :ushort :schema]])
+   [:schema-id :int :schema]])
 (def cell-head-len
   (reduce + (map
               (fn [[_ type]]
