@@ -23,9 +23,9 @@
                (new-cell trunk 5 (int 3) c-d) => anything
                (new-cell trunk 6 (int 2) b-d) => anything)
          (fact "make some frags"
-               (delete-cell trunk 2) => anything
-               (delete-cell trunk 3) => anything
-               (delete-cell trunk 5) => anything)
+               @(delete-cell trunk 2) => anything
+               @(delete-cell trunk 3) => anything
+               @(delete-cell trunk 5) => anything)
          (fact "check frag count for auto merge"
                (.countFragments trunk) => 2)
          (let [frag-append-head (.getAppendHeaderValue trunk)]

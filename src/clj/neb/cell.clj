@@ -80,8 +80,9 @@
     (writer trunk value (+ loc offset))))
 
 (defn add-frag [^trunk trunk start end]
-  (locking (.getFragments trunk)
-    (.addFragment trunk start end)))
+  (future     ;Use future to avoid deadlock with defragmentation daemon
+    (locking (.getFragments trunk)
+      (.addFragment trunk start end))))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
