@@ -11,5 +11,5 @@
         (fact "Write Cell With Array"
               (new-cell trunk 1 (int 1) {:arr (range 100)}) => anything)
         (fact "Read Cell With Array"
-              (read-cell trunk 1) => (fn [m] (= m {:arr (vec (range 100))})))
+              (read-cell trunk 1) => (contains {:arr (vec (range 100))}))
         (.dispose trunk)))
