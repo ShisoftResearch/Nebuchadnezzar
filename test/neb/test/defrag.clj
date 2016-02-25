@@ -33,7 +33,7 @@
                  (scan-trunk-and-defragment trunk) => anything)
            (fact "space reclaimed"
                  (< (.getAppendHeaderValue trunk) frag-append-head) => true
-                 (- (.getAppendHeaderValue trunk) frag-append-head) => -54))
+                 (- (.getAppendHeaderValue trunk) frag-append-head) => -60))
          (fact "data did not corrupted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)
