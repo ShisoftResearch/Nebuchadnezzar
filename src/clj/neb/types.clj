@@ -9,66 +9,68 @@
 
 (defmacro defDataTypes [n m]
   `(def ~n
-     ~(apply hash-map
-        (mapcat
-          (fn [[k {:keys [id example dynamic? preproc succproc dep] :as v}]]
-            (let [obj-symbol (symbol "obj")
-                  length (when-not dynamic? (symbol (str "type_lengths/" (name k) "Len")))
-                  reader-sym (symbol (str "reader/read"
-                                          (clojure.string/capitalize (name k))))
-                  writer-sym (symbol (str "writer/write"
-                                          (clojure.string/capitalize (name k))))]
-              (concat
-                [k (merge v
-                          {:reader (when-not dep
-                                     `(fn [trunk# offset#]
-                                        (~reader-sym
-                                          trunk#
-                                          offset#)))
-                           :writer (when-not dep
-                                     `(fn [trunk# value# offset#]
-                                        (~writer-sym
-                                          trunk#
-                                          value#
-                                          offset#)))
-                           :length length
-                           :unit-length (when dynamic? (symbol (str "type_lengths/" (name k) "UnitLen")))
-                           :count-length (when dynamic?
-                                           `(fn [~obj-symbol]
-                                              (~(symbol (str "type_lengths/count"
-                                                             (clojure.string/capitalize (name k))))
-                                                ~obj-symbol)))
-                           })]
-                (if-not dynamic?
-                  [(keyword  (str (name k) "-array"))
-                   {:id (* id 100)
-                    :dynamic? true
-                    :reader `(fn [trunk# offset#]
-                               (let [arr-len# (reader/readInt trunk# offset#)
-                                     offset# (+ offset# type_lengths/intLen)]
-                                 (vec
-                                   (map
-                                     (fn [i#]
-                                       (~reader-sym trunk# (+ offset# (* i# ~length))))
-                                     (range arr-len#)))))
-                    :writer `(fn [trunk# value# offset#]
-                               (let [value# (vec value#)
-                                     arr-len# (count value#)]
-                                 (writer/writeInt trunk# (int arr-len#) offset#)
-                                 (let [offset# (+ offset# type_lengths/intLen)]
-                                   (doseq [i# (range arr-len#)]
-                                     (~writer-sym
-                                       trunk#
-                                       (get value# i#)
-                                       (+ offset# (* i# ~length)))))))
-                    :unit-length length
-                    :count-length count}]
-                  []))))
-          m))))
+     (atom
+       ~(apply hash-map
+               (mapcat
+                 (fn [[k {:keys [id example dynamic? preproc succproc dep] :as v}]]
+                   (let [obj-symbol (symbol "obj")
+                         length (when-not dynamic? (symbol (str "type_lengths/" (name k) "Len")))
+                         reader-sym (symbol (str "reader/read"
+                                                 (clojure.string/capitalize (name k))))
+                         writer-sym (symbol (str "writer/write"
+                                                 (clojure.string/capitalize (name k))))]
+                     (concat
+                       [k (merge v
+                                 {:reader (when-not dep
+                                            `(fn [trunk# offset#]
+                                               (~reader-sym
+                                                 trunk#
+                                                 offset#)))
+                                  :writer (when-not dep
+                                            `(fn [trunk# value# offset#]
+                                               (~writer-sym
+                                                 trunk#
+                                                 value#
+                                                 offset#)))
+                                  :length length
+                                  :unit-length (when dynamic? (symbol (str "type_lengths/" (name k) "UnitLen")))
+                                  :count-length (when dynamic?
+                                                  `(fn [~obj-symbol]
+                                                     (~(symbol (str "type_lengths/count"
+                                                                    (clojure.string/capitalize (name k))))
+                                                       ~obj-symbol)))
+                                  :id (int id)})]
+                       (if-not dynamic?
+                         [(keyword  (str (name k) "-array"))
+                          {:id (int (* id 100))
+                           :dynamic? true
+                           :reader `(fn [trunk# offset#]
+                                      (let [arr-len# (reader/readInt trunk# offset#)
+                                            offset# (+ offset# type_lengths/intLen)]
+                                        (vec
+                                          (map
+                                            (fn [i#]
+                                              (~reader-sym trunk# (+ offset# (* i# ~length))))
+                                            (range arr-len#)))))
+                           :writer `(fn [trunk# value# offset#]
+                                      (let [value# (vec value#)
+                                            arr-len# (count value#)]
+                                        (writer/writeInt trunk# (int arr-len#) offset#)
+                                        (let [offset# (+ offset# type_lengths/intLen)]
+                                          (doseq [i# (range arr-len#)]
+                                            (~writer-sym
+                                              trunk#
+                                              (get value# i#)
+                                              (+ offset# (* i# ~length)))))))
+                           :unit-length length
+                           :count-length count}]
+                         []))))
+                 m)))))
 
 (def ^Charset string-encoding (Charset/forName "UTF-8"))
 
-(defDataTypes data-types
+(defDataTypes
+  data-types
   {
    :char    {:id      1
              :example [\a \测 \å \∫ \≤ \œ]}
@@ -122,3 +124,6 @@
              :decoder nippy/thaw
              :dep :bytes
              :example [{:a 1 :b 2}]}})
+
+(defn new-custom-data-type [type-name props]
+  (swap! data-types assoc type-name props))

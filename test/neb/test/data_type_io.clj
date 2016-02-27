@@ -36,7 +36,7 @@
                                    (rc) => (contains test-case#)
                                    (dt))))
                         example))))
-           data-types)))
+           @data-types)))
 
 (facts "Data types io integrity test"
        (gen-test-cases))

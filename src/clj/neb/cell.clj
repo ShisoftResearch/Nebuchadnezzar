@@ -14,7 +14,7 @@
 (def cell-head-len
   (reduce + (map
               (fn [[_ type]]
-                (get-in data-types [type :length]))
+                (get-in @data-types [type :length]))
               cell-head-struc)))
 
 (defmacro with-cell [^cellReader cell-reader & body]
@@ -23,8 +23,8 @@
                   [(symbol (name n))
                    `(.streamRead
                       ~cell-reader
-                      (get-in data-types [~t :reader])
-                      ~(get-in data-types [ t :length]))])
+                      (get-in @data-types [~t :reader])
+                      ~(get-in @data-types [ t :length]))])
                 cell-head-struc))
      ~@body))
 
@@ -32,7 +32,7 @@
   (let [loc-counter (atom 0)]
     `(do ~@(map
              (fn [[prop type]]
-               (let [{:keys [length]} (get data-types type)
+               (let [{:keys [length]} (get @data-types type)
                      out-code `(def ~(symbol (str (name prop) "-offset")) ~(deref loc-counter))]
                  (swap! loc-counter (partial + length))
                  out-code))
@@ -42,7 +42,7 @@
            ~(into {}
                   (map
                     (fn [[prop type]]
-                      (let [{:keys [length] :as fields} (get data-types type)
+                      (let [{:keys [length] :as fields} (get @data-types type)
                             res [prop (assoc (select-keys fields [:reader :writer]) :offset @loc-counter)]]
                         (swap! loc-counter (partial + length))
                         res))
@@ -97,7 +97,7 @@
         cell-reader (cellReader. trunk cell-data-loc)]
     (reduce + (map
                 (fn [[_ data-type]]
-                  (let [{:keys [unit-length length]} (get data-types data-type)
+                  (let [{:keys [unit-length length]} (get @data-types data-type)
                         field-length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
                     (.advancePointer cell-reader field-length)
                     field-length))
@@ -125,8 +125,8 @@
                    (map
                      (fn [[key-name data-type]]
                        [key-name
-                        (let [{:keys [length reader dep dynamic? decoder unit-length]} (get data-types data-type)
-                              dep (when dep (get data-types dep))
+                        (let [{:keys [length reader dep dynamic? decoder unit-length]} (get @data-types data-type)
+                              dep (when dep (get @data-types dep))
                               reader (or reader (get dep :reader))
                               reader (if decoder (comp decoder reader) reader)
                               length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
@@ -143,10 +143,10 @@
 (defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
            (fn [[head-name head-type head-data-func]]
-             (let [{:keys [length]} (get data-types head-type)]
+             (let [{:keys [length]} (get @data-types head-type)]
                `(.streamWrite
                   ~cell-writer
-                  (get-in data-types [~head-type :writer])
+                  (get-in @data-types [~head-type :writer])
                   (~head-data-func ~header-data)
                   ~length)))
            cell-head-struc)))
@@ -155,8 +155,8 @@
   (map
     (fn [[key-name data-type]]
       (let [{:keys [length writer dep dynamic? encoder
-                    unit-length count-length]} (get data-types data-type)
-            dep (when dep (get data-types dep))
+                    unit-length count-length]} (get @data-types data-type)
+            dep (when dep (get @data-types dep))
             writer (or writer (get dep :writer))
             field-data (get data key-name)
             field-data (if encoder (encoder field-data) field-data)]
