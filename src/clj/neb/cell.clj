@@ -155,7 +155,7 @@
   (map
     (fn [[key-name data-type]]
       (let [{:keys [length writer dep dynamic? encoder
-                    unit-length count-length]} (get @data-types data-type)
+                    unit-length count-array-length count-length]} (get @data-types data-type)
             dep (when dep (get @data-types dep))
             writer (or writer (get dep :writer))
             field-data (get data key-name)
@@ -165,9 +165,13 @@
          :value field-data
          :writer writer
          :length (if dynamic?
-                   (+ (* (count-length field-data)
-                         unit-length)
-                      type_lengths/intLen)
+                   (cond
+                     count-array-length
+                     (+ (* (count-array-length field-data)
+                           unit-length)
+                        type_lengths/intLen)
+                     count-length
+                     (count-length field-data))
                    length)}))
     (:f schema)))
 
