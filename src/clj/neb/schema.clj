@@ -53,3 +53,21 @@
         (pr-str (vec (-> (.getSchemaIdMap schema-store)
                          (.values))))
         :append false))
+
+(defn walk-schema [schema-fields map-func field-func array-func]
+  (apply
+    map-func
+    (doall
+      (map
+        (fn [[field-name field-format]]
+          [field-name
+           (let [is-type? keyword?
+                 is-nested? vector?]
+             (cond
+               (is-nested? field-format)
+               (if (= :ARRAY (first field-format))
+                 (array-func field-name (second field-format))
+                 (walk-schema field-format map-func field-func array-func))
+               (is-type? field-format)
+               (field-func field-name field-format)))])
+        schema-fields))))
