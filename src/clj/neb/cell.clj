@@ -1,6 +1,6 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types]]
-            [neb.schema :refer [schema-store schema-by-id]]
+            [neb.schema :refer [schema-store schema-by-id schema-id-by-sname]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
@@ -87,20 +87,70 @@
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
 
-(defn calc-dynamic-field-length [trunk unit-length field-loc]
+(defn calc-dynamic-type-length [trunk unit-length field-loc]
   (+ (* (reader/readInt trunk field-loc)
         unit-length)
      type_lengths/intLen))
+
+;[[:id             :int]
+; [:name           :text]
+; [:map            [[:field1 :int] [:field2 :int]]]
+; [:int-array     [:ARRRAY :int]]
+; [:map-array      [:ARRAY [[:map-field :text]]]
+; [:nested-array   [:ARRAY [:ARRAY :int]]]]
+
+(defn walk-schema-for-read* [schema-fields ^cellReader cell-reader field-func map-func array-func]
+  (apply
+    map-func
+    (doall
+      (map
+        (fn [[field-name field-format]]
+          [field-name
+           (let [recur-nested (fn [nested-schema & _] (walk-schema-for-read* nested-schema cell-reader field-func map-func array-func))
+                 is-type? keyword?
+                 is-nested? vector?]
+             (cond
+               (is-nested? field-format)
+               (if (= :ARRAY (first field-format))
+                 (let [array-format (second field-format)
+                       array-len (reader/readInt trunk (.getCurrLoc cell-reader))]
+                   (.advancePointer cell-reader type_lengths/intLen)
+                   (apply
+                     array-func
+                     (doall
+                       (repeatedly
+                         array-len
+                         (fn []
+                           (cond
+                             (is-nested? array-format)
+                             (recur-nested field-format)
+                             (is-type? array-format)
+                             (if (get @data-types array-format)
+                               (:d (recur-nested [[:d field-format]]))
+                               (recur-nested (schema-id-by-sname array-format)))))))))
+                 (recur-nested field-format))
+               (is-type? field-format)
+               (let [{:keys [unit-length length] :as type-props} (get @data-types field-format)
+                     field-length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))
+                     field-result (field-func field-name (.getCurrLoc cell-reader) type-props field-length)]
+                 (.advancePointer cell-reader field-length)
+                 field-result)))])
+        schema-fields))))
+
+(defn walk-schema-for-read [schema-fields ^Long cell-loc field-func map-func array-func]
+  (walk-schema-for-read* schema-fields (cellReader. trunk cell-loc) field-func map-func array-func))
 
 (defn calc-trunk-cell-length [^trunk trunk ^Long cell-loc schema]
   (let [cell-data-loc (+ cell-loc cell-head-len)
         cell-reader (cellReader. trunk cell-data-loc)]
     (reduce + (map
                 (fn [[_ data-type]]
-                  (let [{:keys [unit-length length]} (get @data-types data-type)
-                        field-length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
-                    (.advancePointer cell-reader field-length)
-                    field-length))
+                  (if (vector? data-type)
+                    (calc-trunk-cell-length trunk (.getCurrLoc cell-reader) data-type)
+                    (let [{:keys [unit-length length]} (get @data-types data-type)
+                          field-length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))]
+                      (.advancePointer cell-reader field-length)
+                      field-length)))
                 (:f schema)))))
 
 (defn delete-cell [^trunk trunk ^Long hash]
@@ -129,7 +179,7 @@
                               dep (when dep (get @data-types dep))
                               reader (or reader (get dep :reader))
                               reader (if decoder (comp decoder reader) reader)
-                              length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
+                              length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))]
                           (.streamRead cell-reader reader length))])
                      (:f schema)))
                  {:*schema* schema-id
