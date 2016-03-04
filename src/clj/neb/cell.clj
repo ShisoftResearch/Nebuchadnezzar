@@ -1,6 +1,6 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
-            [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema]]
+            [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
@@ -104,37 +104,43 @@
 (def check-is-nested vector?)
 
 (defn walk-schema-for-read [schema-fields ^trunk trunk ^cellReader cell-reader field-func map-func array-func]
-  (walk-schema
-    schema-fields
-    map-func
-    (fn [field-name field-format]
-      (let [{:keys [unit-length length] :as type-props} (get @data-types field-format)
-            field-length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))
-            field-result (field-func field-name (.getCurrLoc cell-reader) type-props field-length)]
-        (.advancePointer cell-reader field-length)
-        field-result))
-    (fn [field-name array-format]
-      (let [array-len (reader/readInt trunk (.getCurrLoc cell-reader))
-            recur-nested (fn [nested-schema & _] (walk-schema-for-read nested-schema trunk cell-reader field-func map-func array-func))
-            nested-format? (check-is-nested array-format)
-            array-format? (and nested-format? (= :ARRAY (first array-format)))
-            type-format? (and (keyword array-format) (get @data-types array-format))
-            nested-map-format? (and nested-format? (not array-format?))
-            require-packing? (or array-format? type-format?)]
-        (.advancePointer cell-reader type_lengths/intLen)
-        (apply
-          array-func
-          (doall
-            (repeatedly
-              array-len
-              (fn []
-                (cond
-                  nested-map-format?
-                  (recur-nested array-format)
-                  :else
-                  (if require-packing?
-                    (:d (recur-nested [[:d array-format]]))
-                    (recur-nested (schema-id-by-sname array-format))))))))))))
+  (let [recur-nested (fn [nested-schema & _]
+                       (walk-schema-for-read
+                         nested-schema trunk cell-reader
+                         field-func map-func array-func))]
+    (walk-schema
+      schema-fields
+      map-func
+      (fn [field-name field-format]
+        (let [type-props (get @data-types field-format)]
+          (if type-props
+            (let [{:keys [unit-length length]} type-props
+                  field-length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))
+                  field-result (field-func field-name (.getCurrLoc cell-reader) type-props field-length)]
+              (.advancePointer cell-reader field-length)
+              field-result)
+            (recur-nested (:f (schema-by-sname field-format))))))
+      (fn [field-name array-format]
+        (let [array-len (reader/readInt trunk (.getCurrLoc cell-reader))
+              nested-format? (check-is-nested array-format)
+              array-format? (and nested-format? (= :ARRAY (first array-format)))
+              type-format? (and (keyword array-format) (get @data-types array-format))
+              nested-map-format? (and nested-format? (not array-format?))
+              require-packing? (or array-format? type-format?)]
+          (.advancePointer cell-reader type_lengths/intLen)
+          (apply
+            array-func
+            (doall
+              (repeatedly
+                array-len
+                (fn []
+                  (cond
+                    nested-map-format?
+                    (recur-nested array-format)
+                    :else
+                    (if require-packing?
+                      (:d (recur-nested [[:d array-format]]))
+                      (recur-nested (:f (schema-by-sname array-format))))))))))))))
 
 (defn walk-schema-for-write
   "It was assumed to have some side effect"
@@ -146,7 +152,11 @@
         (fn [[field-name field-format]]
           [field-name
            (let [is-type? keyword?
-                 is-nested? vector?]
+                 is-nested? vector?
+                 recur-nested (fn [nested-schema data & _]
+                                (walk-schema-for-write
+                                  nested-schema data field-func map-func
+                                  array-func array-header-func))]
              (cond
                (is-nested? field-format)
                (if (= :ARRAY (first field-format))
@@ -160,7 +170,6 @@
                        type-format? (and (keyword array-format) (get @data-types array-format))
                        nested-map-format? (and nested-format? (not array-format?))
                        require-packing? (or array-format? type-format?)
-                       recur-nested (fn [nested-schema data & _] (walk-schema-for-write nested-schema data field-func map-func array-func array-header-func))
                        array-content
                        (doall (map
                                 (fn [item]
@@ -170,12 +179,14 @@
                                     :else
                                     (if require-packing?
                                       (recur-nested [[:d array-format]] {:d item})
-                                      (recur-nested (schema-id-by-sname array-format) {:d item}))))
+                                      (recur-nested (:f (schema-by-sname array-format)) item))))
                                 array-items))]
                    (apply array-func array-name array-format array-header array-content))
-                 (walk-schema-for-write field-format (get data field-name) field-func map-func array-func array-header-func))
+                 (recur-nested field-format (get data field-name)))
                (is-type? field-format)
-               (field-func (get data field-name) field-name field-format (get @data-types field-format))))])
+               (if (get @data-types field-format)
+                 (field-func (get data field-name) field-name field-format (get @data-types field-format))
+                 (recur-nested (:f (schema-by-sname field-format)) (get data field-name)))))])
         schema-fields))))
 
 (defn plan-data-write [data schema]
@@ -202,7 +213,7 @@
          (fn [& items]
            (map second items))
          (fn [_ _ array-header & array-content]
-           [array-header (map first array-content)])
+           [array-header array-content])
          (fn [len]
            {:value len
             :writer int-writer

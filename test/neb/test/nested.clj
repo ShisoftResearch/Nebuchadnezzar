@@ -64,3 +64,25 @@
         (fact "Read Cell With Map"
               (read-cell trunk 1) => (contains {:map {:a 1 :b (repeat 10 {:arr-map 5})}}))
         (.dispose trunk)))
+
+(fact "Test Schema Type"
+      (let [trunk (trunk. 5000000)]
+        (fact "Schemas"
+              (add-schema :item-schema [[:id :long] [:val :long]] 2) => anything
+              (add-schema :array-schema [[:data :item-schema]] 1) => anything)
+        (fact "Write Cell With Schema Type"
+              (new-cell trunk 1 (int 1) {:data {:id 1 :val 2}}) => anything)
+        (fact "Read Cell With Schema Type"
+              (read-cell trunk 1) => (contains {:data {:id 1 :val 2}}))
+        (.dispose trunk)))
+
+(fact "Test Schema Type in array"
+      (let [trunk (trunk. 5000000)]
+        (fact "Schemas"
+              (add-schema :item-schema [[:id :long] [:val :long]] 2) => anything
+              (add-schema :array-schema [[:data [:ARRAY :item-schema]]] 1) => anything)
+        (fact "Write Cell With Schema Type"
+              (new-cell trunk 1 (int 1) {:data (repeat 10 {:id 1 :val 2})}) => anything)
+        (fact "Read Cell With Schema Type"
+              (read-cell trunk 1) => (contains {:data (repeat 10 {:id 1 :val 2})}))
+        (.dispose trunk)))

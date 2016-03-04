@@ -12,6 +12,9 @@
 (defn schema-id-by-sname [sname]
   (.sname2Id schema-store sname))
 
+(defn schema-by-sname [sname]
+  (schema-by-id (schema-id-by-sname sname)))
+
 (defn add-schema [sname fields id]
   (.put schema-store id sname {:n sname :f fields :i id}))
 
