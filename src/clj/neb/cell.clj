@@ -126,21 +126,19 @@
               array-format? (and nested-format? (= :ARRAY (first array-format)))
               type-format? (and (keyword array-format) (get @data-types array-format))
               nested-map-format? (and nested-format? (not array-format?))
-              require-packing? (or array-format? type-format?)]
+              require-packing? (or array-format? type-format?)
+              nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
+              repeat-func (cond
+                            nested-map-format?
+                            #(recur-nested array-format)
+                            nested-schema
+                            #(recur-nested nested-schema)
+                            require-packing?
+                            #(:d (recur-nested [[:d array-format]])))]
           (.advancePointer cell-reader type_lengths/intLen)
           (apply
             array-func
-            (doall
-              (repeatedly
-                array-len
-                (fn []
-                  (cond
-                    nested-map-format?
-                    (recur-nested array-format)
-                    :else
-                    (if require-packing?
-                      (:d (recur-nested [[:d array-format]]))
-                      (recur-nested (:f (schema-by-sname array-format))))))))))))))
+            (doall (repeatedly array-len repeat-func))))))))
 
 (defn walk-schema-for-write
   "It was assumed to have some side effect"
@@ -170,17 +168,16 @@
                        type-format? (and (keyword array-format) (get @data-types array-format))
                        nested-map-format? (and nested-format? (not array-format?))
                        require-packing? (or array-format? type-format?)
+                       nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
+                       map-func (cond
+                                  nested-map-format?
+                                  (partial recur-nested array-format)
+                                  nested-schema
+                                  (partial recur-nested nested-schema)
+                                  require-packing?
+                                  #(recur-nested [[:d array-format]] {:d %}))
                        array-content
-                       (doall (map
-                                (fn [item]
-                                  (cond
-                                    nested-map-format?
-                                    (recur-nested array-format item)
-                                    :else
-                                    (if require-packing?
-                                      (recur-nested [[:d array-format]] {:d item})
-                                      (recur-nested (:f (schema-by-sname array-format)) item))))
-                                array-items))]
+                       (doall (map map-func array-items))]
                    (apply array-func array-name array-format array-header array-content))
                  (recur-nested field-format (get data field-name)))
                (is-type? field-format)
