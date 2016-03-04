@@ -17,8 +17,12 @@ public class cellReader {
         this.trunk = trunk;
     }
 
+    public Object streamRead (IFn fn){
+        return fn.invoke(trunk, currLoc);
+    }
+
     public Object streamRead (IFn fn, long len){
-        Object r = fn.invoke(trunk, currLoc);
+        Object r = streamRead(fn);
         advancePointer(len);
         return r;
     }
