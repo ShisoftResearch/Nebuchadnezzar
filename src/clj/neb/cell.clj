@@ -130,11 +130,11 @@
               nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
               repeat-func (cond
                             nested-map-format?
-                            #(recur-nested array-format)
+                            (fn [] (recur-nested array-format))
                             nested-schema
-                            #(recur-nested nested-schema)
+                            (fn [] (recur-nested nested-schema))
                             require-packing?
-                            #(:d (recur-nested [[:d array-format]])))]
+                            (fn [] (:d (recur-nested [[:d array-format]]))))]
           (.advancePointer cell-reader type_lengths/intLen)
           (apply
             array-func
@@ -171,11 +171,11 @@
                        nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
                        map-func (cond
                                   nested-map-format?
-                                  (partial recur-nested array-format)
+                                  (fn [x] (recur-nested array-format x))
                                   nested-schema
-                                  (partial recur-nested nested-schema)
+                                  (fn [x] (recur-nested nested-schema x))
                                   require-packing?
-                                  #(recur-nested [[:d array-format]] {:d %}))
+                                  (fn [x] (recur-nested [[:d array-format]] {:d x})))
                        array-content
                        (doall (map map-func array-items))]
                    (apply array-func array-name array-format array-header array-content))
