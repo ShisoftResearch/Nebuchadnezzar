@@ -12,6 +12,7 @@ RAMCloud implementation for Clojure applications.
 * Support both schema (for memory efficiency) and schema less
 * Shard-nothing distributed architecture
 * Rich data type support, including text, geo coordinate, bytes, java objects, and arrays
+* Array, Map and nested schemas. Use the DSL to describe your documents  
 
 ## Usage
 
