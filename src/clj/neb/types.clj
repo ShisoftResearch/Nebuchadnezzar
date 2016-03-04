@@ -125,5 +125,7 @@
              :dep :bytes
              :example [{:a 1 :b 2}]}})
 
+(def int-writer (get-in @data-types [:int :writer]))
+
 (defn new-custom-data-type [type-name props]
   (swap! data-types assoc type-name props))
