@@ -1,6 +1,6 @@
 (ns neb.cell
-  (:require [neb.types :refer [data-types]]
-            [neb.schema :refer [schema-store schema-by-id]]
+  (:require [neb.types :refer [data-types int-writer]]
+            [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
@@ -10,7 +10,9 @@
 
 (def cell-head-struc
   [[:hash :long :hash]
-   [:schema-id :int :schema]])
+   [:schema-id :int :schema]
+   [:cell-length :int :length]])
+
 (def cell-head-len
   (reduce + (map
               (fn [[_ type]]
@@ -87,51 +89,156 @@
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
 
-(defn calc-dynamic-field-length [trunk unit-length field-loc]
+(defn calc-dynamic-type-length [trunk unit-length field-loc]
   (+ (* (reader/readInt trunk field-loc)
         unit-length)
      type_lengths/intLen))
 
-(defn calc-trunk-cell-length [^trunk trunk ^Long cell-loc schema]
-  (let [cell-data-loc (+ cell-loc cell-head-len)
-        cell-reader (cellReader. trunk cell-data-loc)]
-    (reduce + (map
-                (fn [[_ data-type]]
-                  (let [{:keys [unit-length length]} (get @data-types data-type)
-                        field-length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
-                    (.advancePointer cell-reader field-length)
-                    field-length))
-                (:f schema)))))
+;[[:id             :int]
+; [:name           :text]
+; [:map            [[:field1 :int] [:field2 :int]]]
+; [:int-array     [:ARRRAY :int]]
+; [:map-array      [:ARRAY [[:map-field :text]]]
+; [:nested-array   [:ARRAY [:ARRAY :int]]]]
 
-(defn delete-cell [^trunk trunk ^Long hash]
-  (with-write-lock
-    trunk hash
-    (if-let [cell-loc (get-cell-id)]
-      (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
-            schema (schema-by-id schema-id)
-            data-length (calc-trunk-cell-length trunk cell-loc schema)]
-        (.removeCellFromIndex trunk hash)
-        (mark-cell-deleted trunk cell-loc data-length))
-      (throw (Exception. "Cell hash does not existed to delete")))))
+(def check-is-nested vector?)
+
+(defn walk-schema-for-read [schema-fields ^trunk trunk ^cellReader cell-reader field-func map-func array-func]
+  (let [recur-nested (fn [nested-schema & _]
+                       (walk-schema-for-read
+                         nested-schema trunk cell-reader
+                         field-func map-func array-func))]
+    (walk-schema
+      schema-fields
+      map-func
+      (fn [field-name field-format]
+        (let [type-props (get @data-types field-format)]
+          (if type-props
+            (let [{:keys [unit-length length]} type-props
+                  field-length (or length (calc-dynamic-type-length trunk unit-length (.getCurrLoc cell-reader)))
+                  field-result (field-func field-name (.getCurrLoc cell-reader) type-props field-length)]
+              (.advancePointer cell-reader field-length)
+              field-result)
+            (recur-nested (:f (schema-by-sname field-format))))))
+      (fn [field-name array-format]
+        (let [array-len (reader/readInt trunk (.getCurrLoc cell-reader))
+              nested-format? (check-is-nested array-format)
+              array-format? (and nested-format? (= :ARRAY (first array-format)))
+              type-format? (and (keyword array-format) (get @data-types array-format))
+              nested-map-format? (and nested-format? (not array-format?))
+              require-packing? (or array-format? type-format?)]
+          (.advancePointer cell-reader type_lengths/intLen)
+          (apply
+            array-func
+            (doall
+              (repeatedly
+                array-len
+                (fn []
+                  (cond
+                    nested-map-format?
+                    (recur-nested array-format)
+                    :else
+                    (if require-packing?
+                      (:d (recur-nested [[:d array-format]]))
+                      (recur-nested (:f (schema-by-sname array-format))))))))))))))
+
+(defn walk-schema-for-write
+  "It was assumed to have some side effect"
+  [schema-fields data field-func map-func array-func array-header-func]
+  (apply
+    map-func
+    (doall
+      (map
+        (fn [[field-name field-format]]
+          [field-name
+           (let [is-type? keyword?
+                 is-nested? vector?
+                 recur-nested (fn [nested-schema data & _]
+                                (walk-schema-for-write
+                                  nested-schema data field-func map-func
+                                  array-func array-header-func))]
+             (cond
+               (is-nested? field-format)
+               (if (= :ARRAY (first field-format))
+                 (let [array-name field-name
+                       array-format (second field-format)
+                       array-items (get data array-name)
+                       array-length (count array-items)
+                       array-header (array-header-func array-length)
+                       nested-format? (check-is-nested array-format)
+                       array-format? (and nested-format? (= :ARRAY (first array-format)))
+                       type-format? (and (keyword array-format) (get @data-types array-format))
+                       nested-map-format? (and nested-format? (not array-format?))
+                       require-packing? (or array-format? type-format?)
+                       array-content
+                       (doall (map
+                                (fn [item]
+                                  (cond
+                                    nested-map-format?
+                                    (recur-nested array-format item)
+                                    :else
+                                    (if require-packing?
+                                      (recur-nested [[:d array-format]] {:d item})
+                                      (recur-nested (:f (schema-by-sname array-format)) item))))
+                                array-items))]
+                   (apply array-func array-name array-format array-header array-content))
+                 (recur-nested field-format (get data field-name)))
+               (is-type? field-format)
+               (if (get @data-types field-format)
+                 (field-func (get data field-name) field-name field-format (get @data-types field-format))
+                 (recur-nested (:f (schema-by-sname field-format)) (get data field-name)))))])
+        schema-fields))))
+
+(defn plan-data-write [data schema]
+  (->> (walk-schema-for-write
+         (:f schema) data
+         (fn [field-data field-name field-format field-props]
+           (let [{:keys [length writer dep dynamic? encoder
+                         unit-length count-array-length count-length]} field-props
+                 dep (when dep (get @data-types dep))
+                 writer (or writer (get dep :writer))
+                 field-data (if encoder (encoder field-data) field-data)]
+             (when (not (nil? field-data))
+               {:value field-data
+                :writer writer
+                :length (if dynamic?
+                          (cond
+                            count-array-length
+                            (+ (* (count-array-length field-data)
+                                  unit-length)
+                               type_lengths/intLen)
+                            count-length
+                            (count-length field-data))
+                          length)})))
+         (fn [& items]
+           (map second items))
+         (fn [_ _ array-header & array-content]
+           [array-header array-content])
+         (fn [len]
+           {:value len
+            :writer int-writer
+            :length type_lengths/intLen}))
+       (flatten)
+       (filter identity)))
 
 (defn read-cell* [^trunk trunk]
-  (if-let [loc (get-cell-id)]
+  (when-let [loc (get-cell-id)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
-          (merge (into
-                   {}
-                   (map
-                     (fn [[key-name data-type]]
-                       [key-name
-                        (let [{:keys [length reader dep dynamic? decoder unit-length]} (get @data-types data-type)
-                              dep (when dep (get @data-types dep))
-                              reader (or reader (get dep :reader))
-                              reader (if decoder (comp decoder reader) reader)
-                              length (or length (calc-dynamic-field-length trunk unit-length (.getCurrLoc cell-reader)))]
-                          (.streamRead cell-reader reader length))])
-                     (:f schema)))
+          (merge (walk-schema-for-read
+                   (:f schema) trunk cell-reader
+                   (fn [field-name loc type-props field-length]
+                     (let [{:keys [length reader dep dynamic? decoder unit-length]} type-props
+                           dep (when dep (get @data-types dep))
+                           reader (or reader (get dep :reader))
+                           reader (if decoder (comp decoder reader) reader)]
+                       (.streamRead cell-reader reader)))
+                   (fn [& items]
+                     (into {} items))
+                   (fn [& items]
+                     (into [] items)))
                  {:*schema* schema-id
                   :*hash*   *cell-hash*}))))))
 
@@ -139,6 +246,15 @@
   (with-read-lock
     trunk hash
     (read-cell* trunk)))
+
+(defn delete-cell [^trunk trunk ^Long hash]
+  (with-write-lock
+    trunk hash
+    (if-let [cell-loc (get-cell-id)]
+      (let [data-length (read-cell-header-field trunk cell-loc :cell-length)]
+        (.removeCellFromIndex trunk hash)
+        (mark-cell-deleted trunk cell-loc data-length))
+      (throw (Exception. "Cell hash does not existed to delete")))))
 
 (defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
@@ -151,26 +267,6 @@
                   ~length)))
            cell-head-struc)))
 
-(defn cell-fields-to-write [schema data]
-  (map
-    (fn [[key-name data-type]]
-      (let [{:keys [length writer dep dynamic? encoder
-                    unit-length count-length]} (get @data-types data-type)
-            dep (when dep (get @data-types dep))
-            writer (or writer (get dep :writer))
-            field-data (get data key-name)
-            field-data (if encoder (encoder field-data) field-data)]
-        {:key-name key-name
-         :type data-type
-         :value field-data
-         :writer writer
-         :length (if dynamic?
-                   (+ (* (count-length field-data)
-                         unit-length)
-                      type_lengths/intLen)
-                   length)}))
-    (:f schema)))
-
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
@@ -180,16 +276,17 @@
 
 (defn write-cell [^trunk trunk ^Long hash schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
-        fields (cell-fields-to-write schema data)
+        fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)
         cell-length (+ cell-head-len fields-length)
         cell-writer (if loc
                       (cellWriter. ^trunk trunk ^Long cell-length loc)
                       (cellWriter. ^trunk trunk ^Long cell-length))
         header-data {:schema schema-id
-                     :hash hash}]
+                     :hash hash
+                     :length fields-length}]
     (write-cell-header cell-writer header-data)
-    (doseq [{:keys [key-name type value writer length] :as field} fields]
+    (doseq [{:keys [value writer length] :as field} fields]
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
       (locking-index
@@ -209,8 +306,8 @@
     (let [cell-data-loc (+ cell-loc cell-head-len)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
-          data-len (calc-trunk-cell-length trunk cell-loc schema)
-          fields (cell-fields-to-write schema data)
+          data-len (read-cell-header-field trunk cell-loc :cell-length)
+          fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
       (if (>= data-len new-data-length)
         (do (write-cell trunk hash schema data :loc cell-loc :update-hash-index? false)

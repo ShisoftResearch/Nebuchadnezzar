@@ -1,5 +1,5 @@
 (ns neb.defragment
-  (:require [neb.cell :refer [read-cell-header-field calc-trunk-cell-length cell-head-len]]
+  (:require [neb.cell :refer [read-cell-header-field cell-head-len]]
             [neb.schema :refer [schema-by-id]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk)
@@ -20,9 +20,7 @@
                   ^cellMeta cell-meta (-> trunk (.getCellIndex) (.get cell-hash))]
               (cond
                 cell-meta
-                (let [cell-schema-id  (read-cell-header-field trunk hn-pos :schema-id)
-                      cell-schema     (schema-by-id cell-schema-id)
-                      cell-data-len   (calc-trunk-cell-length trunk hn-pos cell-schema)
+                (let [cell-data-len   (read-cell-header-field trunk hn-pos :cell-length)
                       cell-len        (+ cell-data-len cell-head-len)
                       cell-end-pos    (dec (+ hn-pos cell-len))
                       new-frag-pos    (+ lw-pos cell-len)]
