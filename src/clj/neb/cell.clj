@@ -130,7 +130,7 @@
               (fn []
                 (cond
                   nested-map-format?
-                  (recur-nested (spy array-format))
+                  (recur-nested array-format)
                   :else
                   (if require-packing?
                     (:d (recur-nested [[:d array-format]]))
@@ -166,7 +166,7 @@
                                 (fn [item]
                                   (cond
                                     nested-map-format?
-                                    (recur-nested (spy array-format) item)
+                                    (recur-nested array-format item)
                                     :else
                                     (if require-packing?
                                       (recur-nested [[:d array-format]] {:d item})
