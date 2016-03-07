@@ -1,7 +1,7 @@
 (ns neb.test.nested
   (:require [midje.sweet :refer :all]
             [neb.schema :refer [add-schema]]
-            [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell get-in-cell]]
+            [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell get-in-cell select-keys-from-cell]]
             [cluster-connector.utils.for-debug :refer [$]])
   (:import (org.shisoft.neb trunk)))
 
@@ -87,12 +87,18 @@
               (read-cell trunk 1) => (contains {:data (repeat 1000 {:id 1 :val 2})}))
         (.dispose trunk)))
 
-(fact "Test get-in"
+(fact "Test get-in and select-keys"
       (let [trunk (trunk. 5000000)]
         (fact "Map Schema"
-              (add-schema :array-schema [[:map [[:a :long] [:b [:ARRAY [[:arr-map :long]]]]]]] 1) => anything)
+              (add-schema :array-schema [[:a :int]
+                                         [:b :int]
+                                         [:c :int]
+                                         [:map [[:a :long] [:b [:ARRAY [[:arr-map :long]]]]]]] 1) => anything)
         (fact "Write Cell With Map"
-              (new-cell trunk 1 (int 1) {:map {:a 1 :b (repeat 1000 {:arr-map 50})}}) => anything)
+              (new-cell trunk 1 (int 1) {:map {:a 1 :b (repeat 1000 {:arr-map 50})}
+                                         :a 1
+                                         :b 2
+                                         :c 3}) => anything)
         (fact "Read Cell With Map"
               (read-cell trunk 1) => (contains {:map {:a 1 :b (repeat 1000 {:arr-map 50})}}))
         (fact "get-in"
@@ -100,4 +106,7 @@
               (get-in-cell trunk 1 :map) => {:a 1 :b (repeat 1000 {:arr-map 50})}
               (get-in-cell trunk 1 [:map :b]) => (repeat 1000 {:arr-map 50})
               (get-in-cell trunk 1 [:map :b 0 :arr-map]) => 50)
+        (fact "select-keys"
+              (select-keys-from-cell trunk 1 [:a :c]) => {:a 1 :c 3}
+              (select-keys-from-cell trunk 1 [:a :b]) => {:a 1 :b 2})
         (.dispose trunk)))

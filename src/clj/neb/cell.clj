@@ -377,3 +377,29 @@
               (let [compiled-schema (compile-schema-for-get-in (:f schema) ks)
                     partical-cell (read-cell** trunk compiled-schema cell-reader schema-id)]
                 (get-in partical-cell ks)))))))))
+
+(defn- get-last-key-schema-for-select [schema-fields ks]
+  (loop [committed-fields (transient [])
+         keys-remains  (set ks)
+         fields-to-check schema-fields]
+    (let [field-pair (first fields-to-check)
+          [field-name _] field-pair]
+      (if (or (and (= 1 (count keys-remains))
+                   (= field-name (first keys-remains)))
+              (= 1 (count fields-to-check)))
+        (persistent! (conj! committed-fields field-pair))
+        (recur (conj! committed-fields field-pair)
+               (disj keys-remains field-name)
+               (rest fields-to-check))))))
+
+(defn select-keys-from-cell [^trunk trunk ^Long hash ks]
+  (with-read-lock
+    trunk hash
+    (when-let [loc (get-cell-id)]
+      (let [cell-reader (cellReader. trunk loc)]
+        (with-cell
+          cell-reader
+          (when-let [schema (schema-by-id schema-id)]
+            (let [compiled-schema (get-last-key-schema-for-select (:f schema) ks)
+                  partical-cell (read-cell** trunk compiled-schema cell-reader schema-id)]
+              (select-keys partical-cell ks))))))))
