@@ -100,6 +100,12 @@
 (defn update-cell* [id fn & params]
   (apply dist-call id 'neb.trunk-store/update-cell fn params))
 
+(defn select-keys-from-cell* [id ks]
+  (dist-call id 'neb.trunk-store/select-keys-from-cell ks))
+
+(defn get-in-cell* [id ks]
+  (dist-call id 'neb.trunk-store/get-in-cell ks))
+
 (defn get-batch-server-name [params-coll]
   (group-by
     first
@@ -167,6 +173,8 @@
 (op-fns new-cell)
 (op-fns replace-cell)
 (op-fns update-cell)
+(op-fns get-in-cell)
+(op-fns select-keys-from-cell)
 
 (d-lock/deflock schemas)
 

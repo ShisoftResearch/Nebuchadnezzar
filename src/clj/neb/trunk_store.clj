@@ -55,6 +55,12 @@
 (defn update-cell [^UUID cell-id fn & params]
   (apply dispatch-trunk cell-id cell/update-cell fn params))
 
+(defn get-in-cell [^UUID cell-id ks]
+  (dispatch-trunk cell-id cell/get-in-cell ks))
+
+(defn select-keys-from-cell [^UUID cell-id ks]
+  (dispatch-trunk cell-id cell/select-keys-from-cell ks))
+
 (defmacro batch-fn [func]
   `(do (defn ~(symbol (str "batch-" (name func))) [coll#]
          (into
@@ -70,3 +76,5 @@
 (batch-fn new-cell)
 (batch-fn replace-cell)
 (batch-fn update-cell)
+(batch-fn get-in-cell)
+(batch-fn select-keys-from-cell)
