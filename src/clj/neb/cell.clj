@@ -218,26 +218,29 @@
        (flatten)
        (filter identity)))
 
+(defn read-cell** [^trunk trunk schema-fields cell-reader schema-id]
+  (merge (walk-schema-for-read
+           schema-fields trunk cell-reader
+           (fn [field-name loc type-props field-length]
+             (let [{:keys [length reader dep dynamic? decoder unit-length]} type-props
+                   dep (when dep (get @data-types dep))
+                   reader (or reader (get dep :reader))
+                   reader (if decoder (comp decoder reader) reader)]
+               (.streamRead cell-reader reader)))
+           (fn [& items]
+             (into {} items))
+           (fn [& items]
+             (into [] items)))
+         {:*schema* schema-id
+          :*hash*   *cell-hash*}))
+
 (defn read-cell* [^trunk trunk]
   (when-let [loc (get-cell-id)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
-          (merge (walk-schema-for-read
-                   (:f schema) trunk cell-reader
-                   (fn [field-name loc type-props field-length]
-                     (let [{:keys [length reader dep dynamic? decoder unit-length]} type-props
-                           dep (when dep (get @data-types dep))
-                           reader (or reader (get dep :reader))
-                           reader (if decoder (comp decoder reader) reader)]
-                       (.streamRead cell-reader reader)))
-                   (fn [& items]
-                     (into {} items))
-                   (fn [& items]
-                     (into [] items)))
-                 {:*schema* schema-id
-                  :*hash*   *cell-hash*}))))))
+          (read-cell** trunk (:f schema) cell-reader schema-id))))))
 
 (defn read-cell [^trunk trunk ^Long hash]
   (with-read-lock
@@ -328,3 +331,49 @@
       (let [replacement  (apply fn cell-content params)]
         (replace-cell* trunk hash replacement)
         replacement))))
+
+(defn- compile-schema-for-get-in* [schema-fields ks]
+  (loop [commetted-fields (transient [])
+         remain-fields schema-fields]
+    (let [field-pair (first remain-fields)
+          [field-name field-type] field-pair
+          current-key (first ks)]
+      (cond
+        (empty? remain-fields)
+        commetted-fields
+        (= field-name current-key)
+        (persistent!
+          (conj! commetted-fields
+                 (if (or (= 1 (count ks))
+                         (keyword? field-type))
+                   field-pair
+                   [field-name (compile-schema-for-get-in* field-type (rest ks))])))
+        :else
+        (recur (conj! commetted-fields field-pair)
+               (rest remain-fields))))))
+
+(defn- compile-schema-for-get-in [schema-fields ks]
+  (compile-schema-for-get-in*
+    schema-fields
+    (loop [committed (transient [])
+           keys-remains ks]
+      (let [curr-key (first keys-remains)]
+        (if (or (number? curr-key)
+                (empty? keys-remains))
+          (persistent! committed)
+          (recur (conj! committed curr-key)
+                 (rest keys-remains)))))))
+
+(defn get-in-cell [^trunk trunk ^Long hash ks]
+  (if (keyword? ks)
+    (get-in-cell trunk hash [ks])
+    (with-read-lock
+      trunk hash
+      (when-let [loc (get-cell-id)]
+        (let [cell-reader (cellReader. trunk loc)]
+          (with-cell
+            cell-reader
+            (when-let [schema (schema-by-id schema-id)]
+              (let [compiled-schema (compile-schema-for-get-in (:f schema) ks)
+                    partical-cell (read-cell** trunk compiled-schema cell-reader schema-id)]
+                (get-in partical-cell ks)))))))))
