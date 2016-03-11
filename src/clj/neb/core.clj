@@ -47,8 +47,8 @@
                                       cluster-configs))
               {:keys [trunks-size]} cluster-configs
               {:keys [memory-size data-path]} config
-              ;trunks-size (interpret-volume trunks-size)
-              ;memory-size (interpret-volume memory-size)
+              trunks-size (interpret-volume trunks-size)
+              memory-size (interpret-volume memory-size)
               schemas (or (try (:data (ds/get-configure :schemas)) (catch Exception _))
                           (let [s (load-schemas-file (str data-path "/schemas"))]
                             (ds/set-configure :schemas s) s))
