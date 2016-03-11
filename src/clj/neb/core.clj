@@ -49,13 +49,9 @@
               {:keys [memory-size data-path]} config
               trunks-size (interpret-volume trunks-size)
               memory-size (interpret-volume memory-size)
-              schemas (or (try (:data (ds/get-configure :schemas)) (catch Exception _))
-                          (let [s (load-schemas-file (str data-path "/schemas"))]
-                            (ds/set-configure :schemas s) s))
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
           (clear-schemas)
-          (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
           (start-defrag)
           (register-as-master (* 50 trunk-count))
