@@ -23,6 +23,16 @@
   (dispose-trunks)
   (leave-cluster))
 
+(defn interpret-volume [str-volume]
+  (let [str-volume (clojure.string/lower-case (str str-volume))
+        num-part (re-find #"\d+" str-volume)
+        unit-part (first (re-find #"[a-zA-Z]+" str-volume))
+        multiply (Math/pow
+                   1024
+                   (case unit-part
+                     \k 1 \m 2 \g 3 \t 4 0))]
+    (long (* (read-string num-part) multiply))))
+
 (defn start-server [config]
   (let [{:keys [server-name port zk meta]} config]
     (join-cluster
@@ -37,6 +47,8 @@
                                       cluster-configs))
               {:keys [trunks-size]} cluster-configs
               {:keys [memory-size data-path]} config
+              ;trunks-size (interpret-volume trunks-size)
+              ;memory-size (interpret-volume memory-size)
               schemas (or (try (:data (ds/get-configure :schemas)) (catch Exception _))
                           (let [s (load-schemas-file (str data-path "/schemas"))]
                             (ds/set-configure :schemas s) s))
