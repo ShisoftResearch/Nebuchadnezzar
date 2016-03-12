@@ -14,7 +14,9 @@
            (java.nio.charset Charset)))
 
 (def cluster-config-fields [:trunks-size])
+(def cluster-confiugres (atom nil))
 (def ^:dynamic *batch-size* 200)
+(d-lock/deflock schemas-lock)
 
 (defn stop-server []
   (println "Shutdowning...")
@@ -24,14 +26,19 @@
   (leave-cluster))
 
 (defn interpret-volume [str-volume]
-  (let [str-volume (clojure.string/lower-case (str str-volume))
-        num-part (re-find #"\d+" str-volume)
-        unit-part (first (re-find #"[a-zA-Z]+" str-volume))
-        multiply (Math/pow
-                   1024
-                   (case unit-part
-                     \k 1 \m 2 \g 3 \t 4 0))]
-    (long (* (read-string num-part) multiply))))
+  (if (number? str-volume)
+    str-volume
+    (let [str-volume (clojure.string/lower-case (str str-volume))
+          num-part (re-find #"\d+" str-volume)
+          unit-part (first (re-find #"[a-zA-Z]+" str-volume))
+          multiply (Math/pow
+                     1024
+                     (case unit-part
+                       \k 1 \m 2 \g 3 \t 4 0))]
+      (long (* (read-string num-part) multiply)))))
+
+(defn get-cluster-configures []
+  @cluster-confiugres)
 
 (defn start-server [config]
   (let [{:keys [server-name port zk meta]} config]
@@ -41,17 +48,24 @@
       port zk meta
       :connected-fn
       (fn []
-        (let [cluster-configs (select-keys config cluster-config-fields)
-              cluster-configs (or (try (:data (ds/get-configure :neb)) (catch Exception _))
-                                  (do (ds/set-configure :neb cluster-configs)
-                                      cluster-configs))
+        (let [is-first-node? (ds/is-first-node?)
+              cluster-configs (select-keys config cluster-config-fields)
+              cluster-configs (if is-first-node?
+                                cluster-configs
+                                (or (rfi/condinated-siblings-invoke 'neb.core/get-cluster-configures)
+                                    cluster-configs))
               {:keys [trunks-size]} cluster-configs
-              {:keys [memory-size data-path]} config
+              {:keys [memory-size schema-file]} config
               trunks-size (interpret-volume trunks-size)
               memory-size (interpret-volume memory-size)
+              schemas (if is-first-node?
+                        (load-schemas-file schema-file)
+                        (rfi/condinated-siblings-invoke-with-lock schemas-lock 'neb.schema/get-schemas))
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
+          (reset! cluster-confiugres cluster-configs)
           (clear-schemas)
+          (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
           (start-defrag)
           (register-as-master (* 50 trunk-count))
@@ -184,11 +198,9 @@
 (op-fns get-in-cell)
 (op-fns select-keys-from-cell)
 
-(d-lock/deflock schemas)
-
 (defn add-schema [sname fields]
   (d-lock/locking
-    schemas
+    schemas-lock
     (let [server-new-ids (group-by identity (map second (rfi/broadcast-invoke 'neb.schema/gen-id)))
           new-id (apply max (keys server-new-ids))]
       (when (> (count server-new-ids) 1)
@@ -198,7 +210,7 @@
 
 (defn remove-schema [sname]
   (d-lock/locking
-    schemas
+    schemas-lock
     (let [schema-id (schema-id-by-sname sname)]
       (last (first (rfi/broadcast-invoke 'neb.schema/remove-schema-by-id schema-id))))))
 

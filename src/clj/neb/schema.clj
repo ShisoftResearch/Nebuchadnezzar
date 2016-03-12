@@ -51,10 +51,13 @@
           (recur (rest e-ids)
                  (rest r-ids)))))))
 
+(defn get-schemas []
+  (vec (-> (.getSchemaIdMap schema-store)
+           (.values))))
+
 (defn save-schemas [schema-file]
   (spit schema-file
-        (pr-str (vec (-> (.getSchemaIdMap schema-store)
-                         (.values))))
+        (pr-str (get-schemas))
         :append false))
 
 (defn walk-schema [schema-fields map-func field-func array-func]
