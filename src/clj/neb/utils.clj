@@ -5,3 +5,8 @@
 
 (defn map-on-keys [f m]
   (into {} (for [[k v] m] [(f k) v])))
+
+(defmacro try-all [& body]
+  `(do ~@(map
+           (fn [line] `(try ~line (catch Exception _#)))
+           body)))

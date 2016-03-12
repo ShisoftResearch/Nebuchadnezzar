@@ -15,6 +15,9 @@
 (defn schema-by-sname [sname]
   (schema-by-id (schema-id-by-sname sname)))
 
+(defn schema-sname-exists? [sname]
+  (.snameExists schema-store sname))
+
 (defn add-schema [sname fields id]
   (.put schema-store id sname {:n sname :f fields :i id}))
 

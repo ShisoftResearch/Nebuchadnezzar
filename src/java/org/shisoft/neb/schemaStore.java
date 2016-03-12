@@ -5,6 +5,8 @@ import net.openhft.koloboke.collect.map.hash.HashIntObjMaps;
 import net.openhft.koloboke.collect.map.hash.HashObjIntMap;
 import net.openhft.koloboke.collect.map.hash.HashObjIntMaps;
 
+import java.util.Objects;
+
 /**
  * Created by shisoft on 19/1/2016.
  */
@@ -28,6 +30,10 @@ public class schemaStore {
         this.schemaIdMap.put(id, schema);
         this.snameIdMap.put(sname, id);
         return  id;
+    }
+
+    public boolean snameExists (Object sname){
+        return this.snameIdMap.containsKey(sname);
     }
 
     public void clear (){

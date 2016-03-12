@@ -6,24 +6,32 @@
             [cluster-connector.sharding.DHT :refer :all]
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock]
-            [neb.schema :refer [load-schemas-file load-schemas clear-schemas schema-id-by-sname] :as s]
+            [neb.schema :refer [load-schemas-file load-schemas clear-schemas schema-id-by-sname save-schemas] :as s]
             [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag]]
             [neb.utils :refer :all])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
-           (java.nio.charset Charset)))
+           (java.nio.charset Charset)
+           (org.shisoft.neb.exceptions SchemaAlreadyExistsException)))
 
 (def cluster-config-fields [:trunks-size])
 (def cluster-confiugres (atom nil))
+(def confiugres (atom nil))
 (def ^:dynamic *batch-size* 200)
 (d-lock/deflock schemas-lock)
 
+(defn shutdown []
+  (let [{:keys [schema-file]} @confiugres]
+    (when schema-file (save-schemas schema-file))))
+
 (defn stop-server []
   (println "Shutdowning...")
-  (rfi/stop-server)
-  (stop-defrag)
-  (dispose-trunks)
-  (leave-cluster))
+  (try-all
+    (rfi/stop-server)
+    (stop-defrag)
+    (dispose-trunks)
+    (leave-cluster)
+    (shutdown)))
 
 (defn interpret-volume [str-volume]
   (if (number? str-volume)
@@ -64,6 +72,7 @@
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
           (reset! cluster-confiugres cluster-configs)
+          (reset! confiugres config)
           (clear-schemas)
           (load-schemas schemas)
           (init-trunks trunk-count trunks-size)
@@ -201,12 +210,14 @@
 (defn add-schema [sname fields]
   (d-lock/locking
     schemas-lock
-    (let [server-new-ids (group-by identity (map second (rfi/broadcast-invoke 'neb.schema/gen-id)))
-          new-id (apply max (keys server-new-ids))]
-      (when (> (count server-new-ids) 1)
-        (println "WARNING: Inconsistant schemas in server nodes. Synchronization required." (keys server-new-ids)))
-      (rfi/broadcast-invoke 'neb.schema/add-schema sname fields new-id)
-      new-id)))
+    (if (neb.schema/schema-sname-exists? sname)
+      (throw (SchemaAlreadyExistsException.))
+      (let [server-new-ids (group-by identity (map second (rfi/broadcast-invoke 'neb.schema/gen-id)))
+            new-id (apply max (keys server-new-ids))]
+        (when (> (count server-new-ids) 1)
+          (println "WARNING: Inconsistant schemas in server nodes. Synchronization required." (keys server-new-ids)))
+        (rfi/broadcast-invoke 'neb.schema/add-schema sname fields new-id)
+        new-id))))
 
 (defn remove-schema [sname]
   (d-lock/locking
