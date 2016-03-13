@@ -212,12 +212,9 @@
     schemas-lock
     (if (neb.schema/schema-sname-exists? sname)
       (throw (SchemaAlreadyExistsException.))
-      (let [server-new-ids (group-by identity (map second (rfi/broadcast-invoke 'neb.schema/gen-id)))
-            new-id (apply max (keys server-new-ids))]
-        (when (> (count server-new-ids) 1)
-          (println "WARNING: Inconsistant schemas in server nodes. Synchronization required." (keys server-new-ids)))
-        (rfi/broadcast-invoke 'neb.schema/add-schema sname fields new-id)
-        new-id))))
+      (rfi/condinated-invoke-with-selection
+        ['neb.schema/gen-id nil]
+        ['neb.schema/add-schema [sname fields '<>]] max))))
 
 (defn remove-schema [sname]
   (d-lock/locking

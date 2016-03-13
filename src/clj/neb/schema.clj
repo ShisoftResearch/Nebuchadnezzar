@@ -6,8 +6,7 @@
 (def ^schemaStore schema-store (schemaStore.))
 
 (defn schema-by-id [^Integer schema-id]
-  (-> (.getSchemaIdMap schema-store)
-      (.get schema-id)))
+  (.getById schema-store schema-id))
 
 (defn schema-id-by-sname [sname]
   (.sname2Id schema-store sname))

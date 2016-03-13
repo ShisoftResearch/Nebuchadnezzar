@@ -18,7 +18,7 @@
 (facts "Server Tests"
        (let [zk (StandaloneZookeeper.)
              config {:server-name :test-server
-                     :port 5132
+                     :port 5134
                      :zk  "127.0.0.1:21817"
                      :trunks-size trunks-size
                      :memory-size memory-size

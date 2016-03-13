@@ -32,6 +32,10 @@ public class schemaStore {
         return  id;
     }
 
+    public Object getById (int id){
+        return schemaIdMap.get(id);
+    }
+
     public boolean snameExists (Object sname){
         return this.snameIdMap.containsKey(sname);
     }
