@@ -26,10 +26,11 @@
     <orderEntry type="library" name="Leiningen: com.github.jbellis/jamm:0.3.1" level="project" />
     <orderEntry type="library" name="Leiningen: com.google.guava/guava:19.0" level="project" />
     <orderEntry type="library" name="Leiningen: com.rpl/specter:0.9.0" level="project" />
-    <orderEntry type="library" name="Leiningen: com.taoensso/carmine:2.12.1" level="project" />
-    <orderEntry type="library" name="Leiningen: com.taoensso/encore:2.26.1" level="project" />
+    <orderEntry type="library" name="Leiningen: com.taoensso/carmine:2.12.2" level="project" />
+    <orderEntry type="library" name="Leiningen: com.taoensso/encore:2.32.0" level="project" />
     <orderEntry type="library" name="Leiningen: com.taoensso/nippy:2.10.0" level="project" />
-    <orderEntry type="library" name="Leiningen: com.taoensso/timbre:4.1.4" level="project" />
+    <orderEntry type="library" name="Leiningen: com.taoensso/timbre:4.2.1" level="project" />
+    <orderEntry type="library" name="Leiningen: com.taoensso/truss:1.0.0" level="project" />
     <orderEntry type="library" name="Leiningen: com.yammer.metrics/metrics-core:2.2.0" level="project" />
     <orderEntry type="library" name="Leiningen: commons-codec:1.7" level="project" />
     <orderEntry type="library" name="Leiningen: commons-lang:2.6" level="project" />
@@ -38,7 +39,7 @@
     <orderEntry type="library" name="Leiningen: gloss:0.2.5" level="project" />
     <orderEntry type="library" name="Leiningen: http-kit:2.1.19" level="project" />
     <orderEntry type="library" name="Leiningen: io.aleph/dirigiste:0.1.1" level="project" />
-    <orderEntry type="library" name="Leiningen: io.aviso/pretty:0.1.17" level="project" />
+    <orderEntry type="library" name="Leiningen: io.aviso/pretty:0.1.21" level="project" />
     <orderEntry type="library" name="Leiningen: io.netty/netty-all:4.1.0.Beta6" level="project" />
     <orderEntry type="library" name="Leiningen: jline:0.9.94" level="project" />
     <orderEntry type="library" name="Leiningen: joda-time:2.8.2" level="project" />

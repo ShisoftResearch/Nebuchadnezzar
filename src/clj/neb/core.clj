@@ -224,3 +224,6 @@
 
 (defn get-schemas []
   (.getSchemaIdMap s/schema-store))
+
+(defn get-schema-by-name [sname]
+  (s/schema-by-sname sname))
