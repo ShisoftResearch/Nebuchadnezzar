@@ -227,3 +227,6 @@
 
 (defn get-schema-by-name [sname]
   (s/schema-by-sname sname))
+
+(defn get-schema-by-name [^Integer id]
+  (s/schema-by-id id))
