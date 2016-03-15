@@ -330,7 +330,8 @@
     trunk hash
     (when-let [cell-content (read-cell* trunk)]
       (let [replacement  (apply (compiled-cache fn) cell-content params)]
-        (replace-cell* trunk hash replacement)
+        (when-not (= cell-content replacement)
+          (replace-cell* trunk hash replacement))
         replacement))))
 
 (defn- compile-schema-for-get-in* [schema-fields ks]
