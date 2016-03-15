@@ -1,6 +1,7 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
+            [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
@@ -328,7 +329,7 @@
   (with-write-lock
     trunk hash
     (when-let [cell-content (read-cell* trunk)]
-      (let [replacement  (apply fn cell-content params)]
+      (let [replacement  (apply (compiled-cache fn) cell-content params)]
         (replace-cell* trunk hash replacement)
         replacement))))
 
