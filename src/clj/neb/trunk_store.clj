@@ -33,11 +33,8 @@
   (let [hash (.getLeastSignificantBits cell-id)
         trunk-id (mod (.getMostSignificantBits cell-id)
                       (.getTrunkCount trunks))
-        trunk (.getTrunk trunks (int trunk-id))
-        result (apply func trunk hash params)]
-    (if (map? result)
-      (assoc result :*id* cell-id)
-      result)))
+        trunk (.getTrunk trunks (int trunk-id))]
+    (apply func trunk hash params)))
 
 (defn get-trunk-store-params []
   {:trunks-size (.getTrunkSize trunks)
@@ -50,8 +47,7 @@
   (dispatch-trunk cell-id cell/read-cell))
 
 (defn new-cell [^UUID cell-id schema-id data]
-  (dispatch-trunk cell-id cell/new-cell schema-id data)
-  cell-id)
+  (dispatch-trunk cell-id cell/new-cell schema-id data))
 
 (defn replace-cell [^UUID cell-id data]
   (dispatch-trunk cell-id cell/replace-cell data))
