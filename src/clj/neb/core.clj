@@ -6,7 +6,7 @@
             [cluster-connector.sharding.DHT :refer :all]
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock]
-            [neb.schema :refer [load-schemas-file load-schemas clear-schemas schema-id-by-sname save-schemas] :as s]
+            [neb.schema :as s]
             [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag]]
             [neb.utils :refer :all])
   (:import (java.util UUID)
@@ -22,7 +22,7 @@
 
 (defn shutdown []
   (let [{:keys [schema-file]} @confiugres]
-    (when schema-file (save-schemas schema-file))))
+    (when schema-file (s/save-schemas schema-file))))
 
 (defn stop-server []
   (println "Shutdowning...")
@@ -67,14 +67,14 @@
               trunks-size (interpret-volume trunks-size)
               memory-size (interpret-volume memory-size)
               schemas (if is-first-node?
-                        (load-schemas-file schema-file)
+                        (s/load-schemas-file schema-file)
                         (rfi/condinated-siblings-invoke-with-lock schemas-lock 'neb.schema/get-schemas))
               trunk-count (int (Math/floor (/ memory-size trunks-size)))]
           (println "Loading Store...")
           (reset! cluster-confiugres cluster-configs)
           (reset! confiugres config)
-          (clear-schemas)
-          (load-schemas schemas)
+          (s/clear-schemas)
+          (s/load-schemas schemas)
           (init-trunks trunk-count trunks-size)
           (start-defrag)
           (register-as-master (* 50 trunk-count))
@@ -227,7 +227,7 @@
 (defn remove-schema [sname]
   (d-lock/locking
     schemas-lock
-    (let [schema-id (schema-id-by-sname sname)]
+    (let [schema-id (s/schema-id-by-sname sname)]
       (last (first (rfi/broadcast-invoke 'neb.schema/remove-schema-by-id schema-id))))))
 
 (defn get-schemas []
@@ -238,3 +238,6 @@
 
 (defn get-schema-by-id [^Integer id]
   (s/schema-by-id id))
+
+(defn schema-id-by-sname [sname]
+  (s/schema-id-by-sname sname))

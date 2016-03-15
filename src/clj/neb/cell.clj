@@ -69,7 +69,7 @@
      (locking *cell-meta*
        ~@body)))
 
-(defn get-cell-id []
+(defn get-cell-location []
   (.getLocation *cell-meta*))
 
 (gen-cell-header-offsets)
@@ -236,7 +236,7 @@
           :*hash*   *cell-hash*}))
 
 (defn read-cell* [^trunk trunk]
-  (when-let [loc (get-cell-id)]
+  (when-let [loc (get-cell-location)]
     (let [cell-reader (cellReader. trunk loc)]
       (with-cell
         cell-reader
@@ -251,7 +251,7 @@
 (defn delete-cell [^trunk trunk ^Long hash]
   (with-write-lock
     trunk hash
-    (if-let [cell-loc (get-cell-id)]
+    (if-let [cell-loc (get-cell-location)]
       (let [data-length (read-cell-header-field trunk cell-loc :cell-length)]
         (.removeCellFromIndex trunk hash)
         (mark-cell-deleted trunk cell-loc data-length))
@@ -303,7 +303,7 @@
     (write-cell trunk hash schema data)))
 
 (defn replace-cell* [^trunk trunk ^Long hash data]
-  (when-let [cell-loc (get-cell-id)]
+  (when-let [cell-loc (get-cell-location)]
     (let [cell-data-loc (+ cell-loc cell-head-len)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
@@ -370,7 +370,7 @@
     (get-in-cell trunk hash [ks])
     (with-read-lock
       trunk hash
-      (when-let [loc (get-cell-id)]
+      (when-let [loc (get-cell-location)]
         (let [cell-reader (cellReader. trunk loc)]
           (with-cell
             cell-reader
@@ -396,7 +396,7 @@
 (defn select-keys-from-cell [^trunk trunk ^Long hash ks]
   (with-read-lock
     trunk hash
-    (when-let [loc (get-cell-id)]
+    (when-let [loc (get-cell-location)]
       (let [cell-reader (cellReader. trunk loc)]
         (with-cell
           cell-reader
