@@ -119,11 +119,11 @@
 (defn read-cell* [id]
   (dist-call id 'neb.trunk-store/read-cell))
 
+(defn new-cell-by-ids [id schema-id data]
+  (dist-call id 'neb.trunk-store/new-cell schema-id data))
+
 (defn new-cell* [id schema data]
-  (dist-call
-    id 'neb.trunk-store/new-cell
-    (s/schema-id-by-sname schema)
-    data))
+  (new-cell-by-ids id (s/schema-id-by-sname schema) data))
 
 (defn replace-cell* [id data]
   (dist-call id 'neb.trunk-store/replace-cell data))
@@ -228,5 +228,5 @@
 (defn get-schema-by-name [sname]
   (s/schema-by-sname sname))
 
-(defn get-schema-by-name [^Integer id]
+(defn get-schema-by-id [^Integer id]
   (s/schema-by-id id))
