@@ -219,6 +219,8 @@
        (flatten)
        (filter identity)))
 
+(def internal-cell-fields [:*schema* :*hash*])
+
 (defn read-cell** [^trunk trunk schema-fields cell-reader schema-id]
   (merge (walk-schema-for-read
            schema-fields trunk cell-reader
