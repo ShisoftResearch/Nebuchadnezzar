@@ -115,8 +115,6 @@
     (cond
       (map? result)
       (assoc result :*id* cell-id)
-      (nil? result)
-      cell-id
       :else
       result)))
 
