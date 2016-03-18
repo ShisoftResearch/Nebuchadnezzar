@@ -52,14 +52,17 @@
 (defn replace-cell [^UUID cell-id data]
   (dispatch-trunk cell-id cell/replace-cell data))
 
-(defn update-cell [^UUID cell-id fn & params]
-  (apply dispatch-trunk cell-id cell/update-cell fn params))
+(defn update-cell [^UUID cell-id func-sym & params]
+  (apply dispatch-trunk cell-id cell/update-cell func-sym params))
 
 (defn get-in-cell [^UUID cell-id ks]
   (dispatch-trunk cell-id cell/get-in-cell ks))
 
 (defn select-keys-from-cell [^UUID cell-id ks]
   (dispatch-trunk cell-id cell/select-keys-from-cell ks))
+
+(defn write-lock-exec [^UUID cell-id func-sym & params]
+  (apply dispatch-trunk cell-id cell/write-lock-exec func-sym params))
 
 (defmacro batch-fn [func]
   `(do (defn ~(symbol (str "batch-" (name func))) [coll#]

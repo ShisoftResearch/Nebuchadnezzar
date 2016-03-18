@@ -407,3 +407,8 @@
             (let [compiled-schema (get-last-key-schema-for-select (:f schema) ks)
                   partical-cell (read-cell** trunk compiled-schema cell-reader schema-id)]
               (select-keys partical-cell ks))))))))
+
+(defn write-lock-exec [^trunk trunk ^Long hash func-sym & params]
+  (with-write-lock
+    trunk hash
+    ((compiled-cache func-sym) (read-cell trunk hash) params)))

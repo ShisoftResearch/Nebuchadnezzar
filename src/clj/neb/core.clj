@@ -145,6 +145,9 @@
 (defn get-in-cell* [id ks]
   (dist-call id 'neb.trunk-store/get-in-cell ks))
 
+(defn write-lock-exec* [id func-sym & params]
+  (apply dist-call id 'neb.trunk-store/write-lock-exec func-sym params))
+
 (defn get-batch-server-name [params-coll]
   (group-by
     first
@@ -214,6 +217,7 @@
 (op-fns update-cell)
 (op-fns get-in-cell)
 (op-fns select-keys-from-cell)
+(op-fns write-lock-exec)
 
 (defn add-schema [sname fields]
   (d-lock/locking
