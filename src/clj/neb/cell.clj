@@ -8,6 +8,7 @@
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
+(def ^:dynamic ^trunk *cell-trunk* nil)
 
 (def cell-head-struc
   [[:hash :long :hash]
@@ -53,7 +54,8 @@
 
 (defmacro with-cell-meta [trunk hash & body]
   `(with-bindings {#'*cell-meta* (-> ~trunk (.getCellIndex) (.get ~hash))
-                   #'*cell-hash* ~hash}
+                   #'*cell-hash* ~hash
+                   #'*cell-trunk* ~trunk}
      (when *cell-meta*
        ~@body)))
 
