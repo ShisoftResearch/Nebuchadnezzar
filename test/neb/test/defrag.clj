@@ -16,12 +16,12 @@
                (add-schema :a [[:i :int]] 1) => anything
                (add-schema :b [[:l :long]] 2) => anything
                (add-schema :c [[:f :float] [:i :int]] 3) => anything
-               (new-cell trunk 1 (int 1) a-d) => anything
-               (new-cell trunk 2 (int 2) b-d) => anything
-               (new-cell trunk 3 (int 3) c-d) => anything
-               (new-cell trunk 4 (int 1) a-d) => anything
-               (new-cell trunk 5 (int 3) c-d) => anything
-               (new-cell trunk 6 (int 2) b-d) => anything)
+               (new-cell trunk 1 1 (int 1) a-d) => anything
+               (new-cell trunk 2 1 (int 2) b-d) => anything
+               (new-cell trunk 3 1 (int 3) c-d) => anything
+               (new-cell trunk 4 1 (int 1) a-d) => anything
+               (new-cell trunk 5 1 (int 3) c-d) => anything
+               (new-cell trunk 6 1 (int 2) b-d) => anything)
          (fact "make some frags"
                @(delete-cell trunk 2) => anything
                @(delete-cell trunk 3) => anything
@@ -33,13 +33,13 @@
                  (scan-trunk-and-defragment trunk) => anything)
            (fact "space reclaimed"
                  (< (.getAppendHeaderValue trunk) frag-append-head) => true
-                 (- (.getAppendHeaderValue trunk) frag-append-head) => -72))
+                 (- (.getAppendHeaderValue trunk) frag-append-head) => -96))
          (fact "data did not corrupted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)
                (read-cell trunk 6) => (contains b-d))
          (fact "data can write"
-               (new-cell trunk 7 (int 3) c-d) => anything)
+               (new-cell trunk 7 1 (int 3) c-d) => anything)
          (fact "new written did not make data correpted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)

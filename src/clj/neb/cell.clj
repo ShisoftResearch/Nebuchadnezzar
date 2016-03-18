@@ -4,14 +4,16 @@
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)))
+           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
+           (java.util UUID)))
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^trunk *cell-trunk* nil)
 
 (def cell-head-struc
-  [[:hash :long :hash]
+  [[:partition :long :partition]
+   [:hash :long :hash]
    [:schema-id :int :schema]
    [:cell-length :int :length]])
 
@@ -245,7 +247,8 @@
       (with-cell
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
-          (read-cell** trunk (:f schema) cell-reader schema-id))))))
+          (-> (read-cell** trunk (:f schema) cell-reader schema-id)
+              (assoc :*id* (UUID. partition hash))))))))
 
 (defn read-cell [^trunk trunk ^Long hash]
   (with-read-lock
@@ -279,7 +282,7 @@
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
-(defn write-cell [^trunk trunk ^Long hash schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^trunk trunk ^Long partition ^Long hash schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)
@@ -289,6 +292,7 @@
                       (cellWriter. ^trunk trunk ^Long cell-length))
         header-data {:schema schema-id
                      :hash hash
+                     :partition partition
                      :length fields-length}]
     (write-cell-header cell-writer header-data)
     (doseq [{:keys [value writer length] :as field} fields]
@@ -300,11 +304,11 @@
           (.updateCellToTrunkIndex cell-writer hash)
           (.addCellToTrunkIndex cell-writer hash))))))
 
-(defn new-cell [^trunk trunk ^Long hash ^Integer schema-id data]
+(defn new-cell [^trunk trunk ^Long hash ^Long partition ^Integer schema-id data]
   (when (.hasCell trunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
-    (write-cell trunk hash schema data)))
+    (write-cell trunk partition hash schema data)))
 
 (defn replace-cell* [^trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]
@@ -312,16 +316,17 @@
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
           data-len (read-cell-header-field trunk cell-loc :cell-length)
+          partition (read-cell-header-field trunk cell-loc :partition)
           fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
       (if (>= data-len new-data-length)
-        (do (write-cell trunk hash schema data :loc cell-loc :update-hash-index? false)
+        (do (write-cell trunk hash partition schema data :loc cell-loc :update-hash-index? false)
             (when (< new-data-length data-len)
               (add-frag
                 trunk
                 (+ cell-data-loc new-data-length 1)
                 (+ cell-data-loc data-len))))
-        (do (write-cell trunk hash schema data :update-cell? true)
+        (do (write-cell trunk hash partition schema data :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
 (defn replace-cell [^trunk trunk ^Long hash data]

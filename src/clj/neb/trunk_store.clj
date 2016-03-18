@@ -47,7 +47,7 @@
   (dispatch-trunk cell-id cell/read-cell))
 
 (defn new-cell [^UUID cell-id schema-id data]
-  (dispatch-trunk cell-id cell/new-cell schema-id data))
+  (dispatch-trunk cell-id cell/new-cell (.getMostSignificantBits cell-id) schema-id data))
 
 (defn replace-cell [^UUID cell-id data]
   (dispatch-trunk cell-id cell/replace-cell data))
