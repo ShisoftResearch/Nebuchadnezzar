@@ -282,7 +282,7 @@
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
-(defn write-cell [^trunk trunk ^Long partition ^Long hash schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^trunk trunk ^Long hash ^Long partition schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)
@@ -308,7 +308,7 @@
   (when (.hasCell trunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
-    (write-cell trunk partition hash schema data)))
+    (write-cell trunk hash partition schema data)))
 
 (defn replace-cell* [^trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]
