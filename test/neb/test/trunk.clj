@@ -60,9 +60,9 @@
        (fact "overflow replace cell"
              (replace-cell @ttrunk 2 compound-scheme-data-replacement) => anything)
        (fact "overflow cell should been replaced"
-             (time (read-cell @ttrunk 2)) => (contains compound-scheme-data-replacement))
+             (read-cell @ttrunk 2) => (contains compound-scheme-data-replacement))
        (fact "update cell"
-             (time (update-cell @ttrunk 2 'clojure.core/update :len-offset dec)) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
+             (update-cell @ttrunk 2 'clojure.core/update :len-offset dec) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
        (fact "cell updated"
              (read-cell @ttrunk 2) => (contains {:len-offset (dec (:len-offset compound-scheme-data-replacement))}))
        (fact "dispose"

@@ -63,8 +63,7 @@
   `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
-     (when *cell-meta*
-       ~@body)))
+     (when *cell-meta* ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
@@ -113,7 +112,7 @@
 
 (def check-is-nested vector?)
 
-(defn walk-schema-for-read [schema-fields ^trunk trunk ^cellReader cell-reader field-func map-func array-func]
+(defn walk-schema-for-read [schema-fields trunk ^cellReader cell-reader field-func map-func array-func]
   (let [recur-nested (fn [nested-schema & _]
                        (walk-schema-for-read
                          nested-schema trunk cell-reader
@@ -233,8 +232,8 @@
 (defn read-cell** [^trunk trunk schema-fields ^cellReader cell-reader schema-id]
   (merge (walk-schema-for-read
            schema-fields trunk cell-reader
-           (fn [field-name loc type-props field-length]
-             (let [{:keys [length reader dep dynamic? decoder unit-length]} type-props
+           (fn [_ _ type-props _]
+             (let [{:keys [reader dep decoder]} type-props
                    dep (when dep (get @data-types dep))
                    reader (or reader (get dep :reader))
                    reader (if decoder (comp decoder reader) reader)]
@@ -271,8 +270,10 @@
 
 (defmacro write-cell-header [cell-writer header-data]
   `(do ~@(map
-           (fn [[head-name head-type head-data-func]]
-             (let [{:keys [length]} (get @data-types head-type)]
+           (fn [coll-param]
+             (let [head-type (coll-param 1)
+                   head-data-func (coll-param 2)
+                   {:keys [length]} (get @data-types head-type)]
                `(.streamWrite
                   ~cell-writer
                   (get-in @data-types [~head-type :writer])
@@ -300,7 +301,7 @@
                      :partition partition
                      :length fields-length}]
     (write-cell-header cell-writer header-data)
-    (doseq [{:keys [value writer length] :as field} fields]
+    (doseq [{:keys [value writer length]} fields]
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
       (locking-index
