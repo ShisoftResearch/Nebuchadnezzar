@@ -6,7 +6,9 @@
   (:import (org.shisoft.neb.io trunkStore)
            (java.util UUID)))
 
-(def trunks (trunkStore.))
+(set! *warn-on-reflection* true)
+
+(def ^trunkStore trunks (trunkStore.))
 (def defrag-service (atom nil))
 
 (defn init-trunks [trunk-count trunks-size]

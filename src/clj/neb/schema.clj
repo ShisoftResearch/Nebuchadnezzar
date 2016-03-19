@@ -3,6 +3,8 @@
             [cluster-connector.distributed-store.lock :as d-lock])
   (:import (org.shisoft.neb schemaStore)))
 
+(set! *warn-on-reflection* true)
+
 (def ^schemaStore schema-store (schemaStore.))
 
 (defn schema-by-id [^Integer schema-id]

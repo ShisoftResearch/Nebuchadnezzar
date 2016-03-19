@@ -4,6 +4,8 @@
            (java.util UUID Date)
            (java.nio.charset Charset)))
 
+(set! *warn-on-reflection* true)
+
 (declare read-array)
 (declare write-array)
 
@@ -77,7 +79,7 @@
    :text    {:id      3 :dynamic? true
              :example ["The morpueus engine" "这是一段测试文本 abc"]
              :encoder (fn [^String string] (.getBytes string string-encoding))
-             :decoder (fn [byte-arr] (String. byte-arr string-encoding))
+             :decoder (fn [^bytes byte-arr] (String. byte-arr string-encoding))
              :dep :bytes}
    :int     {:id      4
              :example [`(int 1) `(int Integer/MIN_VALUE) `(int Integer/MAX_VALUE)]}

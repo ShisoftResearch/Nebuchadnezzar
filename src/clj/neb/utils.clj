@@ -1,5 +1,7 @@
 (ns neb.utils)
 
+(set! *warn-on-reflection* true)
+
 (defn map-on-vals [f m]
   (into {} (for [[k v] m] [k (f v)])))
 
