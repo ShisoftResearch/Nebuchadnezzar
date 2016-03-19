@@ -1,5 +1,6 @@
 package org.shisoft.neb;
 
+import clojure.lang.Obj;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.cellMeta;
@@ -68,11 +69,12 @@ public class trunk {
     public void removeCellFromIndex(long hash){
         getCellIndex().remove(hash);
     }
-
     public boolean hasCell (long hash){
         return getCellIndex().containsKey(hash);
     }
-
+    public Object getCellMeta(long hash){
+        return getCellIndex().get(hash);
+    }
     public void addFragment (long startPos, long endPos) throws Exception {
         Long seqFPos = endPos + 1;
         Long seqBPos = startPos - 1;

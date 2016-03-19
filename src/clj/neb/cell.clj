@@ -7,7 +7,7 @@
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
            (java.util UUID)))
 
-;(set! *warn-on-reflection* true)
+(set! *warn-on-reflection* true)
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
@@ -29,10 +29,10 @@
   `(let ~(vec (mapcat
                 (fn [[n t]]
                   [(symbol (name n))
-                   `(.streamRead
-                      ~cell-reader
-                      (get-in @data-types [~t :reader])
-                      ~(get-in @data-types [ t :length]))])
+                   `(. ~cell-reader
+                       streamRead
+                       (get-in @data-types [~t :reader])
+                       ~(get-in @data-types [ t :length]))])
                 cell-head-struc))
      ~@body))
 
@@ -56,8 +56,11 @@
                         res))
                     cell-head-struc))))))
 
+(defn extract-cell-meta [ttrunk hash]
+  (.getCellMeta ^trunk ttrunk ^long hash))
+
 (defmacro with-cell-meta [trunk hash & body]
-  `(with-bindings {#'*cell-meta* (-> ~trunk (.getCellIndex) (.get ~hash))
+  `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
      (when *cell-meta*
@@ -88,10 +91,10 @@
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
     (writer trunk value (+ loc offset))))
 
-(defn add-frag [^trunk trunk start end]
+(defn add-frag [^trunk ttrunk start end]
   (future     ;Use future to avoid deadlock with defragmentation daemon
-    (locking (.getFragments trunk)
-      (.addFragment trunk start end))))
+    (locking (.getFragments ttrunk)
+      (.addFragment ttrunk start end))))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
@@ -257,13 +260,13 @@
     trunk hash
     (read-cell* trunk)))
 
-(defn delete-cell [^trunk trunk ^Long hash]
+(defn delete-cell [^trunk ttrunk ^Long hash]
   (with-write-lock
-    trunk hash
+    ttrunk hash
     (if-let [cell-loc (get-cell-location)]
-      (let [data-length (read-cell-header-field trunk cell-loc :cell-length)]
-        (.removeCellFromIndex trunk hash)
-        (mark-cell-deleted trunk cell-loc data-length))
+      (let [data-length (read-cell-header-field ttrunk cell-loc :cell-length)]
+        (.removeCellFromIndex ttrunk hash)
+        (mark-cell-deleted ttrunk cell-loc data-length))
       (throw (Exception. "Cell hash does not existed to delete")))))
 
 (defmacro write-cell-header [cell-writer header-data]
@@ -284,14 +287,14 @@
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
-(defn write-cell [^trunk trunk ^Long hash ^Long partition schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^trunk ttrunk ^Long hash ^Long partition schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)
         cell-length (+ cell-head-len fields-length)
         cell-writer (if loc
-                      (cellWriter. ^trunk trunk ^Long cell-length loc)
-                      (cellWriter. ^trunk trunk ^Long cell-length))
+                      (cellWriter. ttrunk ^Long cell-length loc)
+                      (cellWriter. ttrunk ^Long cell-length))
         header-data {:schema schema-id
                      :hash hash
                      :partition partition
@@ -301,16 +304,16 @@
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
       (locking-index
-        trunk
+        ttrunk
         (if update-cell?
           (.updateCellToTrunkIndex cell-writer hash)
           (.addCellToTrunkIndex cell-writer hash))))))
 
-(defn new-cell [^trunk trunk ^Long hash ^Long partition ^Integer schema-id data]
-  (when (.hasCell trunk hash)
+(defn new-cell [^trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
+  (when (.hasCell ttrunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
-    (write-cell trunk hash partition schema data)))
+    (write-cell ttrunk hash partition schema data)))
 
 (defn replace-cell* [^trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]
