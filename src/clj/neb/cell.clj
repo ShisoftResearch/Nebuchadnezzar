@@ -3,9 +3,11 @@
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb trunk schemaStore)
+  (:import (org.shisoft.neb trunk)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
            (java.util UUID)))
+
+;(set! *warn-on-reflection* true)
 
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
@@ -225,7 +227,7 @@
 
 (def internal-cell-fields [:*schema* :*hash* :*id*])
 
-(defn read-cell** [^trunk trunk schema-fields cell-reader schema-id]
+(defn read-cell** [^trunk trunk schema-fields ^cellReader cell-reader schema-id]
   (merge (walk-schema-for-read
            schema-fields trunk cell-reader
            (fn [field-name loc type-props field-length]
