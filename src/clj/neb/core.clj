@@ -10,9 +10,11 @@
             [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag]]
             [neb.utils :refer :all])
   (:import (java.util UUID)
-           (com.google.common.hash Hashing MessageDigestHashFunction HashCode)
+           (com.google.common.hash Hashing MessageDigestHashFunction HashCode HashFunction)
            (java.nio.charset Charset)
            (org.shisoft.neb.exceptions SchemaAlreadyExistsException)))
+
+(set! *warn-on-reflection* true)
 
 (def cluster-config-fields [:trunks-size])
 (def cluster-confiugres (atom nil))
@@ -89,7 +91,7 @@
 
 (defn rand-cell-id [] (UUID/randomUUID))
 
-(defn hash-str [string alog]
+(defn hash-str [string ^HashFunction alog]
   (-> alog
       (.hashString string (Charset/forName "UTF-8"))
       (.asLong)))
@@ -102,7 +104,7 @@
 (defcache cell-id-by-key {:expire-after-access-secs :3600} cell-id-by-key*)
 
 (defn locate-cell-by-id [^UUID cell-id]
-  (get-server-for-name cell-id :hashing #(.getMostSignificantBits %)))
+  (get-server-for-name cell-id :hashing (fn [^UUID id] (.getMostSignificantBits id))))
 
 (defn to-id [key]
   (if (= (class key) UUID)
