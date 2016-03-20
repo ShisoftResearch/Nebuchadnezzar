@@ -2,7 +2,8 @@
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
-            [cluster-connector.utils.for-debug :refer [spy $]])
+            [cluster-connector.utils.for-debug :refer [spy $]]
+            [clojure.core.async :as a])
   (:import (org.shisoft.neb trunk)
            (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
            (java.util UUID)))
@@ -12,6 +13,8 @@
 (def ^:dynamic ^cellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^trunk *cell-trunk* nil)
+
+(def pending-frags (a/chan))
 
 (def cell-head-struc
   [[:partition :long :partition]
@@ -91,9 +94,7 @@
     (writer trunk value (+ loc offset))))
 
 (defn add-frag [^trunk ttrunk start end]
-  (future     ;Use future to avoid deadlock with defragmentation daemon
-    (locking (.getFragments ttrunk)
-      (.addFragment ttrunk start end))))
+  (a/go (a/>! pending-frags [ttrunk start end])))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))

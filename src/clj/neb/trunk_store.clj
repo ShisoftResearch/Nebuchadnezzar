@@ -26,6 +26,7 @@
   (Thread/sleep 100))
 
 (defn start-defrag []
+  (defrag/collecting-frags)
   (reset! defrag-service (ms/start-service defrag-store-trunks)))
 
 (defn stop-defrag []

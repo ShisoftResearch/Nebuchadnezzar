@@ -1,12 +1,18 @@
 (ns neb.defragment
-  (:require [neb.cell :refer [read-cell-header-field cell-head-len]]
+  (:require [neb.cell :refer [read-cell-header-field cell-head-len pending-frags]]
             [neb.schema :refer [schema-by-id]]
-            [cluster-connector.utils.for-debug :refer [spy $]])
+            [cluster-connector.utils.for-debug :refer [spy $]]
+            [clojure.core.async :as a])
   (:import (org.shisoft.neb trunk)
-           (org.shisoft.neb.io cellMeta)
-           (java.util.concurrent ConcurrentSkipListMap)))
+           (org.shisoft.neb.io cellMeta)))
 
 (set! *warn-on-reflection* true)
+
+(defn collecting-frags []
+  (a/go-loop []
+    (let [[^trunk ttrunk start end] (a/<! pending-frags)]
+      (locking (.getFragments ttrunk)
+        (.addFragment ttrunk start end)))))
 
 (defn scan-trunk-and-defragment [^trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
