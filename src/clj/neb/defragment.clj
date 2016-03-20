@@ -12,7 +12,8 @@
   (a/go-loop []
     (let [[^trunk ttrunk start end] (a/<! pending-frags)]
       (locking (.getFragments ttrunk)
-        (.addFragment ttrunk start end)))))
+        (.addFragment ttrunk start end)))
+    (recur)))
 
 (defn scan-trunk-and-defragment [^trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
