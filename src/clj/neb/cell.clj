@@ -265,8 +265,8 @@
     ttrunk hash
     (if-let [cell-loc (get-cell-location)]
       (let [data-length (read-cell-header-field ttrunk cell-loc :cell-length)]
-        (.removeCellFromIndex ttrunk hash)
-        (mark-cell-deleted ttrunk cell-loc data-length))
+        (mark-cell-deleted ttrunk cell-loc data-length)
+        (.removeCellFromIndex ttrunk hash))
       (throw (Exception. "Cell hash does not existed to delete")))))
 
 (defmacro write-cell-header [cell-writer header-data]
@@ -289,7 +289,7 @@
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
-(defn write-cell [^trunk ttrunk ^Long hash ^Long partition schema data & {:keys [ loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)

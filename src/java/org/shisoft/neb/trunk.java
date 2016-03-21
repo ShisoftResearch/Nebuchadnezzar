@@ -31,7 +31,7 @@ public class trunk {
     long size;
     HashLongObjMap<cellMeta> cellIndex = HashLongObjMaps.newMutableMap();
     AtomicLong appendHeader = new AtomicLong(0);
-    ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<Long, Long>();
+    ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     ReentrantLock cellWriterLock = new ReentrantLock();
     public trunk(long size){
         this.size = size;
@@ -80,8 +80,8 @@ public class trunk {
         Long seqBPos = startPos - 1;
         Long seqFrag = fragments.get(seqFPos);
         if (seqFrag != null){
-            addFragment(startPos, seqFrag);
             removeFrag(seqFPos);
+            addFragment(startPos, seqFrag);
         } else {
             Map.Entry<Long, Long> fe = fragments.floorEntry(seqBPos);
             if (fe != null && fe.getValue().equals(seqBPos)){

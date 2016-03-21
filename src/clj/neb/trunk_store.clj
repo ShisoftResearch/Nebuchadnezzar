@@ -21,9 +21,10 @@
   (.getTrunksCellCount trunks))
 
 (defn defrag-store-trunks []
-  (doseq [trunk (.getTrunks trunks)]
-    (defrag/scan-trunk-and-defragment trunk))
-  (Thread/sleep 100))
+  (locking defrag-service
+    (doseq [trunk (.getTrunks trunks)]
+      (defrag/scan-trunk-and-defragment trunk)))
+  (Thread/sleep 1))
 
 (defn start-defrag []
   (defrag/collecting-frags)
