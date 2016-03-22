@@ -50,7 +50,7 @@ public class trunk {
     public ConcurrentSkipListMap getFragments() {
         return fragments;
     }
-    public HashLongObjMap<cellMeta> getCellIndex() {
+    public synchronized HashLongObjMap<cellMeta> getCellIndex() {
         return cellIndex;
     }
     public long getCellLoc(long hash){

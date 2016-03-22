@@ -38,6 +38,7 @@
         trunk-id (mod (.getMostSignificantBits cell-id)
                       (.getTrunkCount trunks))
         trunk (.getTrunk trunks (int trunk-id))]
+    (assert trunk "Cannot get trunk for dispatch")
     (apply func trunk hash params)))
 
 (defn get-trunk-store-params []
