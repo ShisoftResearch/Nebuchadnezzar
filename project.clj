@@ -9,7 +9,8 @@
                  [aleph "0.4.1-beta2"]
                  [cluster-connector "0.1.0-SNAPSHOT"]
                  [net.openhft/koloboke-api-jdk8 "0.6.8"]
-                 [net.openhft/koloboke-impl-jdk8 "0.6.8"]]
+                 [net.openhft/koloboke-impl-jdk8 "0.6.8"]
+                 [net.java.dev.jna/jna "4.2.2"]]
   :plugins [[lein-midje "3.1.3"]]
   :profiles {:uberjar {:aot :all}
              :dev {:dependencies [[midje "1.8.3"]

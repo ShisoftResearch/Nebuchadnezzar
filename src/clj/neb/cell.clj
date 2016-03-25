@@ -309,7 +309,8 @@
         ttrunk
         (if update-cell?
           (.updateCellToTrunkIndex cell-writer hash)
-          (.addCellToTrunkIndex cell-writer hash))))))
+          (.addCellToTrunkIndex cell-writer hash))))
+    (.markDirty cell-writer)))
 
 (defn new-cell [^trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
   (when (.hasCell ttrunk hash)

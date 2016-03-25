@@ -65,4 +65,8 @@ public class cellWriter {
     public long getCurrLoc() {
         return currLoc;
     }
+
+    public void markDirty () {
+        trunk.addDirtyRanges(startLoc, currLoc - 1);
+    }
 }
