@@ -71,14 +71,22 @@
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta*
-       ~@body)))
+     (.readLock trunk)
+     (try
+       (locking *cell-meta*
+         ~@body)
+       (finally
+         (.readUnLock trunk)))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta*
-       ~@body)))
+     (.readLock trunk)
+     (try
+       (locking *cell-meta*
+         ~@body)
+       (finally
+         (.readUnLock trunk)))))
 
 (defn get-cell-location []
   (.getLocation *cell-meta*))
@@ -289,6 +297,10 @@
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
+(defn mark-dirty [^CellWriter cell-writer]
+  (locking (-> cell-writer (.getTrunk) (.getDirtyRanges))
+    (.markDirty cell-writer)))
+
 (defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
@@ -310,7 +322,7 @@
         (if update-cell?
           (.updateCellToTrunkIndex cell-writer hash)
           (.addCellToTrunkIndex cell-writer hash))))
-    (.markDirty cell-writer)))
+    (mark-dirty cell-writer)))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
   (when (.hasCell ttrunk hash)

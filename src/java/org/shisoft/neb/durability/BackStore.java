@@ -12,6 +12,7 @@ public class BackStore {
     Trunk trunk;
     BufferedRandomAccessFile memoryBRAF;
     String basePath;
+    String metaPath;
     public BufferedRandomAccessFile getMemoryBRAF() {
         return memoryBRAF;
     }
@@ -33,12 +34,21 @@ public class BackStore {
         this.memoryBRAF = braf;
     }
     private void setMetaBackend(String path) throws IOException {
-
+        metaPath = path;
     }
     public void close () throws IOException {
         if (memoryBRAF != null) memoryBRAF.close();
     }
-    public void sync () {
-
+    public void syncRange (long start, long end) throws IOException {
+        memoryBRAF.seek(start);
+        for (long i = start; i <= end; i++){
+            memoryBRAF.write(trunk.getMemoryFork().getByte(trunk.getStoreAddress() + i));
+        }
+    }
+    public void resetTail (long pos) throws IOException {
+        memoryBRAF.getChannel().truncate(pos);
+    }
+    public String getMetaPath() {
+        return metaPath;
     }
 }

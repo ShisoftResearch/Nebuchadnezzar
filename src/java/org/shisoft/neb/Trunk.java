@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Created by shisoft on 18/1/2016.
@@ -25,6 +26,8 @@ public class Trunk {
     ConcurrentSkipListMap<Long, Long> dirtyRanges = new ConcurrentSkipListMap<>();
     ReentrantLock cellWriterLock = new ReentrantLock();
     BackStore backStore;
+    MemoryFork memoryFork;
+    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     boolean hasBackend = false;
     public boolean isHasBackend() {
         return hasBackend;
@@ -70,6 +73,9 @@ public class Trunk {
     public Object getCellMeta(long hash){
         return getCellIndex().get(hash);
     }
+    public MemoryFork getMemoryFork() {
+        return memoryFork;
+    }
     public synchronized void addFragment (long startPos, long endPos) {
         addAndAutoMerge(fragments, startPos, endPos);
     }
@@ -78,8 +84,16 @@ public class Trunk {
             addAndAutoMerge(dirtyRanges, startPos, endPos);
         }
     }
+    public void copyMemForFork(long start, long end){
+        if (memoryFork != null){
+            memoryFork.copyMemory(start, end);
+        }
+    }
     public void setBackStore (String basePath) throws IOException {
         this.backStore = new BackStore(basePath);
+    }
+    public BackStore getBackStore() {
+        return backStore;
     }
     public void addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
         Long seqFPos = endPos + 1;
@@ -118,7 +132,28 @@ public class Trunk {
         return appendHeader.get();
     }
     public void copyMemory(Long startPos, Long target, Long len){
+        long dirtyEndPos = target + len - 1;
+        copyMemForFork(target, dirtyEndPos);
         getUnsafe().copyMemory(storeAddress + startPos, storeAddress + target, len);
-        addDirtyRanges(target, target + len - 1);
+        addDirtyRanges(target, dirtyEndPos);
+    }
+    public MemoryFork fork(){
+        assert memoryFork == null : "Only one folk allowed";
+        memoryFork = new MemoryFork(this);
+        return memoryFork;
+    }
+    public void readLock(){
+        this.lock.readLock().lock();
+    }
+    public void readUnLock(){
+        this.lock.readLock().unlock();
+    }
+    public void writeLock(){
+        this.lock.writeLock().lock();
+    }
+    public void writeUnlock(){
+        if (this.lock.writeLock().isHeldByCurrentThread()) {
+            this.lock.writeLock().unlock();
+        }
     }
 }

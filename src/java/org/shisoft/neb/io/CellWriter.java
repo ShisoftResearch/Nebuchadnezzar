@@ -18,6 +18,7 @@ public class CellWriter {
         this.trunk = trunk;
         this.currLoc = currLoc;
         this.startLoc = currLoc;
+        trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
     public CellWriter(Trunk trunk, long length) throws Exception {
@@ -65,6 +66,10 @@ public class CellWriter {
 
     public long getCurrLoc() {
         return currLoc;
+    }
+
+    public Trunk getTrunk() {
+        return trunk;
     }
 
     public void markDirty () {
