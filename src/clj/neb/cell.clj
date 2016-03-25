@@ -66,27 +66,23 @@
   `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
-     (when *cell-meta* ~@body)))
+     (.readLock ~trunk)
+     (try
+       (when *cell-meta* ~@body)
+       (finally
+         (.readUnLock ~trunk)))))
 
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (.readLock trunk)
-     (try
-       (locking *cell-meta*
-         ~@body)
-       (finally
-         (.readUnLock trunk)))))
+     (locking *cell-meta*
+       ~@body)))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (.readLock trunk)
-     (try
-       (locking *cell-meta*
-         ~@body)
-       (finally
-         (.readUnLock trunk)))))
+     (locking *cell-meta*
+       ~@body)))
 
 (defn get-cell-location []
   (.getLocation *cell-meta*))
