@@ -3,12 +3,12 @@
             [neb.schema :refer [schema-by-id]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])
-  (:import (org.shisoft.neb trunk)
-           (org.shisoft.neb.io cellMeta)))
+  (:import (org.shisoft.neb Trunk)
+           (org.shisoft.neb.io CellMeta)))
 
 (set! *warn-on-reflection* true)
 
-(defn collect-frag* [^trunk ttrunk start end]
+(defn collect-frag* [^Trunk ttrunk start end]
   (locking (.getFragments ttrunk)
     (.addFragment ttrunk start end)))
 
@@ -21,7 +21,7 @@
       (collect-frag* ttrunk start end))
     (recur)))
 
-(defn scan-trunk-and-defragment [^trunk ttrunk]
+(defn scan-trunk-and-defragment [^Trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
     (locking frags
       (loop [pos 0]
@@ -32,7 +32,7 @@
                   hi-pos (.getValue frag)
                   hn-pos (inc hi-pos)
                   cell-hash (read-cell-header-field ttrunk hn-pos :hash)
-                  ^cellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
+                  ^CellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
               (cond
                 cell-meta
                 (let [new-frag-pos

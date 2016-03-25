@@ -4,14 +4,14 @@
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
             [neb.defragment :refer [scan-trunk-and-defragment]]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
+  (:import (org.shisoft.neb Trunk SchemaStore)
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths)))
 
 
 ;; We cannot test this feature right now because the defrag is async
 
 #_(facts "Defragmentation"
-       (let [trunk (trunk. 5000000)
+       (let [trunk (Trunk. 5000000)
              a-d {:i (int 123)}
              b-d {:l 456}
              c-d  {:f (float 1.23) :i (int 101112)}]

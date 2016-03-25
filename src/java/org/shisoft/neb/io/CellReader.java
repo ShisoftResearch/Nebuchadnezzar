@@ -5,14 +5,14 @@ package org.shisoft.neb.io;
  */
 
 import clojure.lang.IFn;
-import org.shisoft.neb.trunk;
+import org.shisoft.neb.Trunk;
 
-public class cellReader {
+public class CellReader {
 
     long currLoc;
-    trunk trunk;
+    Trunk trunk;
 
-    public cellReader(org.shisoft.neb.trunk trunk, long currLoc) {
+    public CellReader(Trunk trunk, long currLoc) {
         this.currLoc = currLoc;
         this.trunk = trunk;
     }

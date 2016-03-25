@@ -2,28 +2,29 @@ package org.shisoft.neb.io;
 
 import clojure.java.api.Clojure;
 import clojure.lang.IFn;
+import org.shisoft.neb.Trunk;
 
 /**
  * Created by shisoft on 21/1/2016.
  */
-public class cellWriter {
+public class CellWriter {
 
     static IFn defragFn = Clojure.var("neb.defragment", "scan-trunk-and-defragment");
     long startLoc;
     long currLoc;
-    org.shisoft.neb.trunk trunk;
+    Trunk trunk;
 
-    private void init(org.shisoft.neb.trunk trunk, long length, long currLoc){
+    private void init(Trunk trunk, long length, long currLoc){
         this.trunk = trunk;
         this.currLoc = currLoc;
         this.startLoc = currLoc;
     }
 
-    public cellWriter(org.shisoft.neb.trunk trunk, long length) throws Exception {
+    public CellWriter(Trunk trunk, long length) throws Exception {
         tryAllocate(trunk, length, false);
     }
 
-    public void tryAllocate(org.shisoft.neb.trunk trunk, long length, boolean defraged){
+    public void tryAllocate(Trunk trunk, long length, boolean defraged){
         trunk.getCellWriterLock().lock();
         try {
             long loc = trunk.getAppendHeader().getAndAdd(length);
@@ -45,7 +46,7 @@ public class cellWriter {
         }
     }
 
-    public cellWriter(org.shisoft.neb.trunk trunk, long length, long currLoc){
+    public CellWriter(Trunk trunk, long length, long currLoc){
         init(trunk, length, currLoc);
     }
 
@@ -55,7 +56,7 @@ public class cellWriter {
     }
 
     public void addCellToTrunkIndex(long hash){
-        trunk.getCellIndex().put(hash, new cellMeta(startLoc));
+        trunk.getCellIndex().put(hash, new CellMeta(startLoc));
     }
 
     public void updateCellToTrunkIndex(long hash){

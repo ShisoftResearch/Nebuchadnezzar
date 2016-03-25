@@ -1,5 +1,5 @@
 (ns neb.durability
-  (:import (org.shisoft.neb trunk)))
+  (:import (org.shisoft.neb Trunk)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
 ;      The ideal design is to provide multi-master replication backend. Right now, there will be no replication.
@@ -8,11 +8,5 @@
 
 (def data-path (atom nil))
 
-(defn dump-trunk [^trunk ttrunk id]
-  (let [file-name (str @data-path "/trunk-" id)
-        bin-name (str file-name ".bin")
-        meta-name (str file-name ".meta")]
-    ))
-
-(defn enable-durability [path]
+(defn enable-durability [^Trunk trunk path]
   (reset! data-path path))

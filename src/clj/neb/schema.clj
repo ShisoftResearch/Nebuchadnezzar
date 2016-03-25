@@ -1,11 +1,11 @@
 (ns neb.schema
   (:require [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock])
-  (:import (org.shisoft.neb schemaStore)))
+  (:import (org.shisoft.neb SchemaStore)))
 
 (set! *warn-on-reflection* true)
 
-(def ^schemaStore schema-store (schemaStore.))
+(def ^SchemaStore schema-store (SchemaStore.))
 
 (defn schema-by-id [^Integer schema-id]
   (.getById schema-store schema-id))

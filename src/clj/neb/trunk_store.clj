@@ -3,12 +3,12 @@
             [neb.defragment :as defrag]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [cluster-connector.microservice.circular :as ms])
-  (:import (org.shisoft.neb.io trunkStore)
+  (:import (org.shisoft.neb.io TrunkStore)
            (java.util UUID)))
 
 (set! *warn-on-reflection* true)
 
-(def ^trunkStore trunks (trunkStore.))
+(def ^TrunkStore trunks (TrunkStore.))
 (def defrag-service (atom nil))
 
 (defn init-trunks [trunk-count trunks-size]

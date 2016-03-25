@@ -1,6 +1,6 @@
 (ns neb.types
   (:require [taoensso.nippy :as nippy])
-  (:import [org.shisoft.neb.io writer reader type_lengths]
+  (:import [org.shisoft.neb.io Writer Reader type_lengths]
            (java.util UUID Date)
            (java.nio.charset Charset)))
 
@@ -17,9 +17,9 @@
                  (fn [[k {:keys [id example dynamic? preproc succproc dep] :as v}]]
                    (let [obj-symbol (symbol "obj")
                          length (when-not dynamic? (symbol (str "type_lengths/" (name k) "Len")))
-                         reader-sym (symbol (str "reader/read"
+                         reader-sym (symbol (str "Reader/read"
                                                  (clojure.string/capitalize (name k))))
-                         writer-sym (symbol (str "writer/write"
+                         writer-sym (symbol (str "Writer/write"
                                                  (clojure.string/capitalize (name k))))]
                      (concat
                        [k (merge v
@@ -47,7 +47,7 @@
                           {:id                 (int (* id 100))
                            :dynamic?           true
                            :reader             `(fn [trunk# offset#]
-                                                  (let [arr-len# (reader/readInt trunk# offset#)
+                                                  (let [arr-len# (Reader/readInt trunk# offset#)
                                                         offset# (+ offset# type_lengths/intLen)]
                                                     (vec
                                                       (map
@@ -57,7 +57,7 @@
                            :writer             `(fn [trunk# value# offset#]
                                                   (let [value# (vec value#)
                                                         arr-len# (count value#)]
-                                                    (writer/writeInt trunk# (int arr-len#) offset#)
+                                                    (Writer/writeInt trunk# (int arr-len#) offset#)
                                                     (let [offset# (+ offset# type_lengths/intLen)]
                                                       (doseq [i# (range arr-len#)]
                                                         (~writer-sym
