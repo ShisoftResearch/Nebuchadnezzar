@@ -1,6 +1,7 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
+            [neb.base :refer [cell-head-struct cell-head-struc-map]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])
@@ -16,17 +17,11 @@
 
 (def pending-frags (a/chan))
 
-(def cell-head-struc
-  [[:partition :long :partition]
-   [:hash :long :hash]
-   [:schema-id :int :schema]
-   [:cell-length :int :length]])
-
 (def cell-head-len
   (reduce + (map
               (fn [[_ type]]
                 (get-in @data-types [type :length]))
-              cell-head-struc)))
+              cell-head-struct)))
 
 (defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
@@ -36,28 +31,8 @@
                        streamRead
                        (get-in @data-types [~t :reader])
                        ~(get-in @data-types [ t :length]))])
-                cell-head-struc))
+                cell-head-struct))
      ~@body))
-
-(defmacro gen-cell-header-offsets []
-  (let [loc-counter (atom 0)]
-    `(do ~@(map
-             (fn [[prop type]]
-               (let [{:keys [length]} (get @data-types type)
-                     out-code `(def ~(symbol (str (name prop) "-offset")) ~(deref loc-counter))]
-                 (swap! loc-counter (partial + length))
-                 out-code))
-             cell-head-struc)
-         ~(do (reset! loc-counter 0) nil)
-         (def cell-head-struc-map
-           ~(into {}
-                  (map
-                    (fn [[prop type]]
-                      (let [{:keys [length] :as fields} (get @data-types type)
-                            res [prop (assoc (select-keys fields [:reader :writer]) :offset @loc-counter)]]
-                        (swap! loc-counter (partial + length))
-                        res))
-                    cell-head-struc))))))
 
 (defn extract-cell-meta [ttrunk hash]
   (.getCellMeta ^Trunk ttrunk ^long hash))
@@ -87,7 +62,6 @@
 (defn get-cell-location []
   (.getLocation *cell-meta*))
 
-(gen-cell-header-offsets)
 
 (defn read-cell-header-field [^Trunk trunk loc field]
   (let [{:keys [reader offset]} (get cell-head-struc-map field)]
@@ -284,7 +258,7 @@
                   (get-in @data-types [~head-type :writer])
                   (~head-data-func ~header-data)
                   ~length)))
-           cell-head-struc)))
+           cell-head-struct)))
 
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))

@@ -24,14 +24,7 @@ public class BackStore {
     }
 
     private void setMemoryBackend(String path) throws IOException {
-        BufferedRandomAccessFile braf = new BufferedRandomAccessFile(path, "rw");
-        if (braf.length() > 0){
-            for (int i = 0; i < braf.length(); i++){
-                braf.seek(i);
-                trunk.getUnsafe().putByte(trunk.getStoreAddress() + i, braf.readByte());
-            }
-        }
-        this.memoryBRAF = braf;
+        this.memoryBRAF = new BufferedRandomAccessFile(path, "rw");
     }
     private void setMetaBackend(String path) throws IOException {
         metaPath = path;

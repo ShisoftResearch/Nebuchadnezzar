@@ -89,8 +89,9 @@ public class Trunk {
             memoryFork.copyMemory(start, end);
         }
     }
-    public void setBackStore (String basePath) throws IOException {
+    public BackStore setBackStore (String basePath) throws IOException {
         this.backStore = new BackStore(basePath);
+        return this.backStore;
     }
     public BackStore getBackStore() {
         return backStore;
