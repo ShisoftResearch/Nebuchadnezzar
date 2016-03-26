@@ -19,16 +19,16 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  */
 public class Trunk {
     private long storeAddress;
-    long size;
-    HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
-    AtomicLong appendHeader = new AtomicLong(0);
-    ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
-    ConcurrentSkipListMap<Long, Long> dirtyRanges = new ConcurrentSkipListMap<>();
-    ReentrantLock cellWriterLock = new ReentrantLock();
-    BackStore backStore;
-    MemoryFork memoryFork;
-    ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-    boolean hasBackend = false;
+    private long size;
+    private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
+    private AtomicLong appendHeader = new AtomicLong(0);
+    private ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
+    private ConcurrentSkipListMap<Long, Long> dirtyRanges;
+    private ReentrantLock cellWriterLock = new ReentrantLock();
+    private BackStore backStore;
+    private MemoryFork memoryFork;
+    private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+    private boolean hasBackend = false;
     public boolean isHasBackend() {
         return hasBackend;
     }
@@ -80,7 +80,7 @@ public class Trunk {
         addAndAutoMerge(fragments, startPos, endPos);
     }
     public synchronized void addDirtyRanges (long startPos, long endPos) {
-        if (hasBackend) {
+        if (hasBackend) synchronized (dirtyRanges) {
             addAndAutoMerge(dirtyRanges, startPos, endPos);
         }
     }
@@ -91,6 +91,8 @@ public class Trunk {
     }
     public BackStore setBackStore (String basePath) throws IOException {
         this.backStore = new BackStore(basePath);
+        this.dirtyRanges = new ConcurrentSkipListMap<>();
+        this.hasBackend = true;
         return this.backStore;
     }
     public BackStore getBackStore() {

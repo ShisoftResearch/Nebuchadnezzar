@@ -5,7 +5,8 @@
   (:import (org.shisoft.neb Trunk MemoryFork)
            (org.shisoft.neb.durability BackStore)
            (org.shisoft.neb.io CellMeta)
-           (java.io DataOutputStream DataInputStream)))
+           (java.io DataOutputStream DataInputStream)
+           (org.shisoft.neb.durability.io BufferedRandomAccessFile)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
 ;      The ideal design is to provide multi-master replication backend. Right now, there will be no replication.
@@ -21,14 +22,8 @@
 
 (defn set-trunk-backstore [^Trunk trunk id]
   (let [^BackStore bs (.setBackStore trunk (str @data-path "-" id))
-        cell-metas (with-open [r (io/input-stream (.getMetaPath bs))]
-                     (nippy/thaw-from-in! (DataInputStream. r)))]
-    (doseq [location cell-metas]
-      (let []))))
-
-(defn update-meta [^BackStore bs meta-coll]
-  (with-open [w (io/output-stream (.getMetaPath bs))]
-    (nippy/freeze-to-out! (DataOutputStream. w) meta-coll)))
+        ^BufferedRandomAccessFile mbraf (.getMemoryBRAF bs)]
+    ))
 
 (defn sync-trunk [^Trunk trunk]
   (.writeLock trunk)
@@ -38,9 +33,6 @@
     (let [^BackStore bs (.getBackStore trunk)
           dirty-ranges  (.clone (.getDirtyRanges trunk))
           append-header (.getAppendHeaderValue trunk)
-          cell-metas (sort (map (fn [[^Long hash ^CellMeta meta]]
-                                  (.getLocation meta))
-                                (.getCellIndex trunk)))
           ^MemoryFork mf (.fork trunk)]
       (.clear (.getDirtyRanges trunk))
       (.writeUnlock trunk)
@@ -53,7 +45,6 @@
                         end (.getValue d-range)]
                     (.syncRange bs start end)))
                 (recur (.getValue d-range))))))
-      (.release mf)
-      (update-meta bs cell-metas))
+      (.release mf))
     (finally
       (.writeUnlock trunk))))

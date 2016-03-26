@@ -3,6 +3,7 @@ package org.shisoft.neb.durability;
 import org.shisoft.neb.Trunk;
 import org.shisoft.neb.durability.io.BufferedRandomAccessFile;
 
+import java.io.File;
 import java.io.IOException;
 
 /**
@@ -12,22 +13,16 @@ public class BackStore {
     Trunk trunk;
     BufferedRandomAccessFile memoryBRAF;
     String basePath;
-    String metaPath;
     public BufferedRandomAccessFile getMemoryBRAF() {
         return memoryBRAF;
     }
-
     public BackStore(String basePath) throws IOException {
         this.basePath = basePath;
         setMemoryBackend(basePath + ".dat");
-        setMetaBackend(basePath + ".meta");
     }
 
     private void setMemoryBackend(String path) throws IOException {
         this.memoryBRAF = new BufferedRandomAccessFile(path, "rw");
-    }
-    private void setMetaBackend(String path) throws IOException {
-        metaPath = path;
     }
     public void close () throws IOException {
         if (memoryBRAF != null) memoryBRAF.close();
@@ -40,8 +35,5 @@ public class BackStore {
     }
     public void resetTail (long pos) throws IOException {
         memoryBRAF.getChannel().truncate(pos);
-    }
-    public String getMetaPath() {
-        return metaPath;
     }
 }
