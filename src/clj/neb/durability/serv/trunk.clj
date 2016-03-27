@@ -7,4 +7,5 @@
     (.seek accessor loc)
     (.write accessor bs)))
 
-(defn recover [file-path])
+(defn recover [file-path]
+  )

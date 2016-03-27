@@ -12,13 +12,13 @@
 (def data-path (atom nil))
 (def clients (atom {}))
 (def ids (atom 0))
-(def log-reaper (a/chan))
+(def pending-logs (a/chan))
 
 (declare reape-log)
 
 (defn prepare-backup-server [data-path]
   (reset! data-path (str data-path "/" start-time "/"))
-  (a/go-loop [] (apply reape-log (a/<! log-reaper))))
+  (a/go-loop [] (apply reape-log (a/<! pending-logs))))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))
 
@@ -57,7 +57,7 @@
         ^OutputStream appender @(get-in client [:appenders trunk-id])
         act (get {:write 0
                   :delete 1} act)]
-    (a/go (a/>! log-reaper [appender act timestamp ^UUID cell-id data]))))
+    (a/go (a/>! pending-logs [appender act timestamp ^UUID cell-id data]))))
 
 (defn switch-log [sid trunk-id timestamp]
   (let [client (get @clients sid)
@@ -69,7 +69,7 @@
             ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
         (reset! (get-in client [:appenders trunk-id]) new-appender)
         ;close orignal appender
-        (a/>! log-reaper [appender -1 timestamp nil]))
+        (a/>! pending-logs [appender -1 timestamp nil]))
       (finally
         (.unlock log-switch)))))
 
