@@ -19,4 +19,19 @@ public class UnsafeUtils {
             throw new RuntimeException(e);
         }
     }
+
+    public static byte[] getBytes (long offset, int length){
+        byte[] r = new byte[length];
+        for (int i = 0; i < length; i++){
+            r[i] = unsafe.getByte(offset + i);
+        }
+        return r;
+    }
+
+    public static void setBytes (long offset, byte[] bs){
+        for (int i = 0; i < bs.length; i++){
+            unsafe.putByte(offset + i, bs[i]);
+        }
+    }
+
 }

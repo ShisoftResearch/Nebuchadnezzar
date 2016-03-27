@@ -1,5 +1,6 @@
 (ns neb.durability.serv.logs
-  (:require [clojure.java.io :as io])
+  (:require [neb.durability.serv.native :refer [read-long read-int]]
+            [clojure.java.io :as io])
   (:import (com.google.common.primitives Ints Longs)
            (java.io OutputStream)
            (java.util UUID)))
@@ -14,6 +15,14 @@
     (doto appender
       (.write (Ints/toByteArray (count data)))
       (.write data))))
+
+(defn read-bytes [reader byte-count]
+  (let [^bytes byte-arr (byte-array byte-count)]
+    (.read reader byte-arr)
+    byte-arr))
+
+(defn read-long [reader]
+  (Longs/fromByteArray (read-bytes reader 8)))
 
 (defn read-all-from-log [log-path process-fn]
   (let [reader (io/input-stream log-path)]
