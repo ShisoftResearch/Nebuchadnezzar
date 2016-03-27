@@ -15,5 +15,26 @@
       (.write (Ints/toByteArray (count data)))
       (.write data))))
 
+(defn read-bytes [reader byte-count]
+  (let [^bytes byte-arr (byte-array byte-count)]
+    (.read reader byte-arr)
+    byte-arr))
+
+(defn read-long [reader]
+  (Longs/fromByteArray (read-bytes reader 8)))
+
 (defn read-all-from-log [log-path process-fn]
-  (let [reader (io/input-stream log-path)]))
+  (let [reader (io/input-stream log-path)]
+    (while (> (.available reader) 0)
+      (let [act (byte (.read reader))
+            has-body? (zero? act)
+            timestamp (read-long reader)
+            cell-id (UUID. (read-long reader) (read-long reader))
+            body-read? (when has-body? (atom false))
+            body-length (when has-body? (Ints/fromByteArray (read-bytes reader 4)))
+            read-body (when has-body?
+                        (fn []
+                          (reset! body-read? true)
+                          (read-bytes reader body-length)))]
+        (process-fn act timestamp cell-id read-body)
+        (if (and has-body? (not @body-read?)) (.skip reader body-length))))))
