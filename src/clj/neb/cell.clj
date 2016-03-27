@@ -268,8 +268,7 @@
      ~@body))
 
 (defn mark-dirty [^CellWriter cell-writer]
-  (locking (-> cell-writer (.getTrunk) (.getDirtyRanges))
-    (.markDirty cell-writer)))
+  (.markDirty cell-writer))
 
 (defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)

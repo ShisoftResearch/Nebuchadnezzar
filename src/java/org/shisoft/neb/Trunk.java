@@ -44,7 +44,7 @@ public class Trunk {
     public ConcurrentSkipListMap getFragments() {
         return fragments;
     }
-    public synchronized HashLongObjMap<CellMeta> getCellIndex() {
+    public HashLongObjMap<CellMeta> getCellIndex() {
         return cellIndex;
     }
     public long getCellLoc(long hash){
@@ -80,7 +80,7 @@ public class Trunk {
         addAndAutoMerge(fragments, startPos, endPos);
     }
     public synchronized void addDirtyRanges (long startPos, long endPos) {
-        if (hasBackend) synchronized (dirtyRanges) {
+        if (hasBackend) {
             addAndAutoMerge(dirtyRanges, startPos, endPos);
         }
     }

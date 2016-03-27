@@ -1,11 +1,9 @@
-(ns neb.durability
+(ns neb.durability.core
   (:require [neb.defragment :as defrag]
             [taoensso.nippy :as nippy]
             [clojure.java.io :as io])
   (:import (org.shisoft.neb Trunk MemoryFork)
            (org.shisoft.neb.durability BackStore)
-           (org.shisoft.neb.io CellMeta)
-           (java.io DataOutputStream DataInputStream)
            (org.shisoft.neb.durability.io BufferedRandomAccessFile)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
@@ -20,7 +18,7 @@
 (defn enable-durability [path]
   (reset! data-path path))
 
-(defn set-trunk-backstore [^Trunk trunk id]
+(defn recover-data [^Trunk trunk id]
   (let [^BackStore bs (.setBackStore trunk (str @data-path "-" id))
         ^BufferedRandomAccessFile mbraf (.getMemoryBRAF bs)]
     ))
@@ -33,7 +31,8 @@
     (let [^BackStore bs (.getBackStore trunk)
           dirty-ranges  (.clone (.getDirtyRanges trunk))
           append-header (.getAppendHeaderValue trunk)
-          ^MemoryFork mf (.fork trunk)]
+          ^MemoryFork mf (.fork trunk)
+          timestamp (System/currentTimeMillis)]
       (.clear (.getDirtyRanges trunk))
       (.writeUnlock trunk)
       (loop [pos 0]
