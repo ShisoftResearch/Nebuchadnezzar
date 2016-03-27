@@ -68,8 +68,9 @@
     (try
       (let [^OutputStream appender @(get-in client [:appenders trunk-id])
             ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
-        (a/>! log-reaper [appender -1 timestamp nil])       ;close orignal appender
-        (reset! (get-in client [:appenders trunk-id]) new-appender))
+        (reset! (get-in client [:appenders trunk-id]) new-appender)
+        ;close orignal appender
+        (a/>! log-reaper [appender -1 timestamp nil]))
       (finally
         (.unlock log-switch)))))
 
@@ -83,5 +84,5 @@
 
 (defn reape-log [^OutputStream appender act timestamp ^UUID cell-id & [data]]
   (if (neg? act)
-    (close-appender act)
+    (close-appender appender)
     (l/append appender act timestamp cell-id data)))
