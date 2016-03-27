@@ -4,8 +4,7 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.durability.BackStore;
 import org.shisoft.neb.io.CellMeta;
-import org.shisoft.neb.utils.unsafe;
-import sun.misc.Unsafe;
+import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
 import java.util.Map;
@@ -61,8 +60,8 @@ public class Trunk {
         getUnsafe().freeMemory(storeAddress);
         return true;
     }
-    public static Unsafe getUnsafe() {
-        return unsafe.unsafe;
+    public static sun.misc.Unsafe getUnsafe() {
+        return UnsafeUtils.unsafe;
     }
     public long getStoreAddress() {
         return storeAddress;
