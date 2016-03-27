@@ -1,5 +1,6 @@
 (ns neb.durability.serv.core
   (:require [neb.durability.serv.logs :as l]
+            [neb.durability.serv.trunk :as t]
             [clojure.java.io :as io]
             [clojure.core.async :as a])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
@@ -49,9 +50,7 @@
 (defn sync-trunk [sid trunk-id loc ^bytes bs]
   (let [client (get @clients sid)
         accessor (get-in client [:accessors trunk-id])]
-    (locking accessor
-      (.seek accessor loc)
-      (.write accessor bs))))
+    (t/sync-to-disk accessor loc bs)))
 
 (defn append-log [sid trunk-id act timestamp ^UUID cell-id & [data]]
   (let [client (get @clients sid)

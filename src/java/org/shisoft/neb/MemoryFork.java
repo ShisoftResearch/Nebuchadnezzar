@@ -26,6 +26,6 @@ public class MemoryFork {
 
     public void release(){
         orignalBytes.clear();
-        trunk.memoryFork = null;
+        trunk.setMemoryFork(null);
     }
 }

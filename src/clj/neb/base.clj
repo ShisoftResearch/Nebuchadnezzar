@@ -28,3 +28,9 @@
                     cell-head-struct))))))
 
 (gen-cell-header-offsets)
+
+(def cell-head-len
+  (reduce + (map
+              (fn [[_ type]]
+                (get-in @data-types [type :length]))
+              cell-head-struct)))

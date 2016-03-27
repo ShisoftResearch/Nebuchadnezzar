@@ -50,6 +50,9 @@ public class Trunk {
     public long getCellLoc(long hash){
         return cellIndex.get(hash).getLocation();
     }
+    public void setMemoryFork(MemoryFork memoryFork) {
+        this.memoryFork = memoryFork;
+    }
     public Trunk(long size){
         this.size = size;
         storeAddress = getUnsafe().allocateMemory(size);

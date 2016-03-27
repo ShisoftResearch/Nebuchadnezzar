@@ -1,12 +1,12 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
-            [neb.base :refer [cell-head-struct cell-head-struc-map]]
+            [neb.base :refer [cell-head-struct cell-head-struc-map cell-head-len]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])
   (:import (org.shisoft.neb Trunk)
-           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta)
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta Writer)
            (java.util UUID)))
 
 (set! *warn-on-reflection* true)
@@ -16,12 +16,6 @@
 (def ^:dynamic ^Trunk *cell-trunk* nil)
 
 (def pending-frags (a/chan))
-
-(def cell-head-len
-  (reduce + (map
-              (fn [[_ type]]
-                (get-in @data-types [type :length]))
-              cell-head-struct)))
 
 (defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
@@ -276,8 +270,8 @@
         fields-length (cell-len-by-fields fields)
         cell-length (+ cell-head-len fields-length)
         cell-writer (if loc
-                      (CellWriter. ttrunk ^Long cell-length loc)
-                      (CellWriter. ttrunk ^Long cell-length))
+                      (CellWriter. ttrunk cell-length loc)
+                      (CellWriter. ttrunk cell-length))
         header-data {:schema schema-id
                      :hash hash
                      :partition partition
@@ -292,6 +286,13 @@
           (.updateCellToTrunkIndex cell-writer hash)
           (.addCellToTrunkIndex cell-writer hash))))
     (mark-dirty cell-writer)))
+
+(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
+  (let [cell-length (count bs)
+        cell-writer (CellWriter. ttrunk cell-length)
+        writer (fn [trunk value curr-loc] (Writer/writeBytes trunk value curr-loc))]
+    (.streamWrite cell-writer writer bs cell-length)
+    (.addCellToTrunkIndex cell-writer hash)))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
   (when (.hasCell ttrunk hash)
