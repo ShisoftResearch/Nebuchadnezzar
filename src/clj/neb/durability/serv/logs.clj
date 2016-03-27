@@ -15,14 +15,6 @@
       (.write (Ints/toByteArray (count data)))
       (.write data))))
 
-(defn read-bytes [reader byte-count]
-  (let [^bytes byte-arr (byte-array byte-count)]
-    (.read reader byte-arr)
-    byte-arr))
-
-(defn read-long [reader]
-  (Longs/fromByteArray (read-bytes reader 8)))
-
 (defn read-all-from-log [log-path process-fn]
   (let [reader (io/input-stream log-path)]
     (while (> (.available reader) 0)
