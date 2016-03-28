@@ -14,11 +14,11 @@
 (def ids (atom 0))
 (def pending-logs (a/chan))
 
-(declare reape-log)
+(declare collect-log)
 
 (defn prepare-backup-server [data-path]
   (reset! data-path (str data-path "/" start-time "/"))
-  (a/go-loop [] (apply reape-log (a/<! pending-logs))))
+  (a/go-loop [] (apply collect-log (a/<! pending-logs))))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))
 
@@ -69,7 +69,7 @@
             ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
         (reset! (get-in client [:appenders trunk-id]) new-appender)
         ;close orignal appender
-        (a/>! pending-logs [appender -1 timestamp nil]))
+        (a/>! pending-logs [appender -10 timestamp nil]))
       (finally
         (.unlock log-switch)))))
 
@@ -81,7 +81,7 @@
   (.flush appender)
   (.close appender))
 
-(defn reape-log [^OutputStream appender act timestamp ^UUID cell-id & [data]]
-  (if (neg? act)
+(defn collect-log [^OutputStream appender act timestamp ^UUID cell-id & [data]]
+  (if (= -10 act)
     (close-appender appender)
     (l/append appender act timestamp cell-id data)))
