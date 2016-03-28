@@ -3,7 +3,6 @@
             [taoensso.nippy :as nippy]
             [clojure.java.io :as io])
   (:import (org.shisoft.neb Trunk MemoryFork)
-           (org.shisoft.neb.durability BackStore)
            (org.shisoft.neb.durability.io BufferedRandomAccessFile)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
@@ -13,23 +12,14 @@
 
 (set! *warn-on-reflection* true)
 
-(def data-path (atom nil))
-
-(defn enable-durability [path]
-  (reset! data-path path))
-
-(defn recover-data [^Trunk trunk id]
-  (let [^BackStore bs (.setBackStore trunk (str @data-path "-" id))
-        ^BufferedRandomAccessFile mbraf (.getMemoryBRAF bs)]
-    ))
+(def server-sids (atom nil))
 
 (defn sync-trunk [^Trunk trunk]
   (.writeLock trunk)
   (try
     (defrag/scan-trunk-and-defragment trunk)
     (assert (empty? (.getFragments trunk)) "Defrag not succeed")
-    (let [^BackStore bs (.getBackStore trunk)
-          dirty-ranges  (.clone (.getDirtyRanges trunk))
+    #_(let [dirty-ranges  (.clone (.getDirtyRanges trunk))
           append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
           timestamp (System/currentTimeMillis)]

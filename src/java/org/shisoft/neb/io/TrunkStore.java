@@ -11,10 +11,13 @@ public class TrunkStore {
 
     Trunk[] trunks;
 
-    public void init(int trunkCount, long trunkSize) {
+    public void init(int trunkCount, long trunkSize, boolean durability) {
         trunks = new Trunk[trunkCount];
         for (int i = 0; i < trunkCount; i++){
             trunks[i] = new Trunk(trunkSize);
+            if (durability){
+                trunks[i].enableDurability();
+            }
         }
     }
 
@@ -48,5 +51,4 @@ public class TrunkStore {
         }
         return r;
     }
-
 }

@@ -8,7 +8,7 @@
            (java.util.concurrent.locks ReentrantLock)
            (java.io OutputStream)))
 
-(def start-time (System/currentTimeMillis))
+(def start-time (System/nanoTime))
 (def data-path (atom nil))
 (def clients (atom {}))
 (def ids (atom 0))
@@ -16,8 +16,9 @@
 
 (declare collect-log)
 
-(defn prepare-backup-server [data-path]
-  (reset! data-path (str data-path "/" start-time "/"))
+(defn prepare-backup-server [path]
+  (println "Starting backup server at:" @data-path)
+  (reset! data-path (str path "/" start-time "/"))
   (a/go-loop [] (apply collect-log (a/<! pending-logs))))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))

@@ -2,7 +2,6 @@ package org.shisoft.neb;
 
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
-import org.shisoft.neb.durability.BackStore;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.utils.UnsafeUtils;
 
@@ -24,12 +23,11 @@ public class Trunk {
     private ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private ReentrantLock cellWriterLock = new ReentrantLock();
-    private BackStore backStore;
     private MemoryFork memoryFork;
     private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-    private boolean hasBackend = false;
-    public boolean isHasBackend() {
-        return hasBackend;
+    private boolean backendEnabled = false;
+    public boolean isBackendEnabled() {
+        return backendEnabled;
     }
     public long getSize() {
         return size;
@@ -82,7 +80,7 @@ public class Trunk {
         addAndAutoMerge(fragments, startPos, endPos);
     }
     public synchronized void addDirtyRanges (long startPos, long endPos) {
-        if (hasBackend) {
+        if (backendEnabled) {
             addAndAutoMerge(dirtyRanges, startPos, endPos);
         }
     }
@@ -91,14 +89,9 @@ public class Trunk {
             memoryFork.copyMemory(start, end);
         }
     }
-    public BackStore setBackStore (String basePath) throws IOException {
-        this.backStore = new BackStore(basePath);
+    public void enableDurability () {
         this.dirtyRanges = new ConcurrentSkipListMap<>();
-        this.hasBackend = true;
-        return this.backStore;
-    }
-    public BackStore getBackStore() {
-        return backStore;
+        this.backendEnabled = true;
     }
     public void addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
         Long seqFPos = endPos + 1;

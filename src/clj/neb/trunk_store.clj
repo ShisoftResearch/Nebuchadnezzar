@@ -1,8 +1,12 @@
 (ns neb.trunk-store
   (:require [neb.cell :as cell]
+            [neb.durability.core :refer :all]
             [neb.defragment :as defrag]
             [cluster-connector.utils.for-debug :refer [spy $]]
-            [cluster-connector.microservice.circular :as ms])
+            [cluster-connector.microservice.circular :as ms]
+            [cluster-connector.replication.core :as rep]
+            [cluster-connector.remote-function-invocation.core :as rfi]
+            [cluster-connector.distributed-store.core :as ds])
   (:import (org.shisoft.neb.io TrunkStore)
            (java.util UUID)))
 
@@ -11,8 +15,19 @@
 (def ^TrunkStore trunks (TrunkStore.))
 (def defrag-service (atom nil))
 
-(defn init-trunks [trunk-count trunks-size]
-  (.init trunks trunk-count trunks-size))
+(defn init-trunks [trunk-count trunks-size durability]
+  (.init trunks trunk-count trunks-size durability))
+
+(defn init-durability-client [replication]
+  (println "Registering to durability servers:" replication)
+  (let [backup-servers (rep/select-random replication)
+        sids (into {}
+               (map (fn [sn]
+                      [sn (rfi/invoke sn 'neb.durability.serv.core/register-client-trunks
+                                      (System/nanoTime) @ds/this-server-name (.getTrunkCount trunks))])
+                    backup-servers))]
+    (println "Wil replicate to:" sids)
+    (reset! server-sids sids)))
 
 (defn dispose-trunks []
   (.dispose trunks))
