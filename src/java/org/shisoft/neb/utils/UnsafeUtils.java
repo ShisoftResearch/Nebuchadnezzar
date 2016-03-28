@@ -34,4 +34,10 @@ public class UnsafeUtils {
         }
     }
 
+    public static byte[] subBytes (byte[] bs, int offset, int length){
+        byte[] r = new byte[length -1];
+        System.arraycopy(bs, offset, r, 0, length);
+        return r;
+    }
+
 }

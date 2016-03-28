@@ -1,4 +1,4 @@
-(ns neb.base
+(ns neb.header
   (:require [neb.types :refer [data-types]]))
 
 (def cell-head-struct

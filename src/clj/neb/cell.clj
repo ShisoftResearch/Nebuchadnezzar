@@ -1,7 +1,7 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
-            [neb.base :refer [cell-head-struct cell-head-struc-map cell-head-len]]
+            [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])

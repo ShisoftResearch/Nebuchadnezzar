@@ -1,6 +1,6 @@
 (ns neb.defragment
   (:require [neb.cell :refer [read-cell-header-field pending-frags]]
-            [neb.base :refer [cell-head-len]]
+            [neb.header :refer [cell-head-len]]
             [neb.schema :refer [schema-by-id]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])

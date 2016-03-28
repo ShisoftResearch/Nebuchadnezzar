@@ -14,15 +14,15 @@
     (UnsafeUtils/setBytes addr bs)
     addr))
 
-(defn read-long [reader]
-  (let [addr (-> (read-bytes reader 8)
+(defn read-long [bs offset]
+  (let [addr (-> (UnsafeUtils/subBytes bs offset 8)
                  (malloc-bytes))
         value (.getLong us addr)]
     (.freeMemory us addr)
     value))
 
-(defn read-int [reader]
-  (let [addr (-> (read-bytes reader 4)
+(defn read-int [bs offset]
+  (let [addr (-> (UnsafeUtils/subBytes bs offset 4)
                  (malloc-bytes))
         value (.getInt us addr)]
     (.freeMemory us addr)
