@@ -1,6 +1,6 @@
 (ns neb.durability.serv.logs
   (:require [neb.durability.serv.file-reader :refer [read-bytes]]
-            [neb.core :refer [new-cell-by-raw* delete-cell*]]
+            [neb.core :refer [new-cell-by-raw* delete-cell* replace-cell*]]
             [clojure.java.io :as io])
   (:import (com.google.common.primitives Ints Longs)
            (java.io OutputStream)
@@ -24,7 +24,7 @@
   (let [reader (io/input-stream log-path)]
     (while (> (.available reader) 0)
       (let [act (byte (.read reader))
-            has-body? (zero? act)
+            has-body? (pos? act)
             timestamp (read-long reader)
             cell-id (UUID. (read-long reader) (read-long reader))
             body-read? (when has-body? (atom false))
@@ -43,4 +43,5 @@
       (when (> timestamp trunk-timestamp)
         (case act
           0 (new-cell-by-raw* cell-id (read-body))
-          1 (delete-cell* cell-id))))))
+          1 (replace-cell* cell-id (read-body))
+          -1 (delete-cell* cell-id))))))
