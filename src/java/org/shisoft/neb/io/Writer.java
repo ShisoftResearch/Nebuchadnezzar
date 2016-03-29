@@ -14,13 +14,17 @@ public class Writer {
         Trunk.getUnsafe().putByte(trunk.getStoreAddress() + offset, (byte) val);
     }
 
+    public static void writeRawBytes(Trunk store, byte[] val, long offset){
+        for (int i = 0 ; i < val.length ; i++){
+            setByte(store, offset + i, val[i]);
+        }
+    }
+
     public static void writeBytes(Trunk store, byte[] val, long offset){
         int length = val.length;
         writeInt(store, length, offset);
         offset += type_lengths.intLen;
-        for (int i = 0 ; i < val.length ; i++){
-            setByte(store, offset + i, val[i]);
-        }
+        writeRawBytes(store, val, offset);
     }
 
     public static void writeChar(Trunk store, char v, long offset){

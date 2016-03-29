@@ -2,6 +2,7 @@
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
             [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
+            [neb.durability.serv.native :refer [read-int]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])
@@ -223,14 +224,14 @@
     (let [cell-reader (CellReader. trunk loc)]
       (with-cell
         cell-reader
-        (when-let [schema ($ schema-by-id (spy schema-id))]
+        (when-let [schema (schema-by-id schema-id)]
           (-> (read-cell** trunk (:f schema) cell-reader schema-id)
               (assoc :*id* (UUID. partition hash))))))))
 
 (defn read-cell [^Trunk trunk ^Long hash]
   (with-read-lock
     trunk hash
-    ($ read-cell* trunk)))
+    (read-cell* trunk)))
 
 (defn delete-cell [^Trunk ttrunk ^Long hash]
   (with-write-lock
@@ -290,9 +291,8 @@
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (let [cell-length (count bs)
         cell-writer (CellWriter. ttrunk cell-length)
-        bytes-writer (fn [trunk value curr-loc] (Writer/writeBytes trunk value curr-loc))]
+        bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
     (.streamWrite cell-writer bytes-writer bs cell-length)
-    #_(spy (Reader/readInt ttrunk (+ 20 (.getStartLoc cell-writer))))
     (.addCellToTrunkIndex cell-writer hash)))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]

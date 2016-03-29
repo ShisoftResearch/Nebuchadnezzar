@@ -41,8 +41,6 @@
               cell-id (UUID. partition hash)
               body-bytes (read-bytes reader cell-length)
               cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
-          (spy schema-id)
-          (spy (read-int cell-bytes 20))
           (new-cell-by-raw* cell-id cell-bytes)))
       (finally
         (.close reader)))))
