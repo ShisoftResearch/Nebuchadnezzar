@@ -19,4 +19,10 @@ public class CellMeta {
         this.location = location;
     }
 
+    @Override
+    public String toString() {
+        return "CellMeta{" +
+                "location=" + location +
+                '}';
+    }
 }

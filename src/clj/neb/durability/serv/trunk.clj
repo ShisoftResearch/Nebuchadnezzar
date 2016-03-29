@@ -3,7 +3,8 @@
             [neb.durability.serv.file-reader :refer [read-bytes]]
             [neb.durability.serv.native :refer [read-int read-long]]
             [neb.core :refer [new-cell-by-raw*]]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.io InputStream)
            (java.util UUID)))
@@ -33,10 +34,30 @@
 
 (defn recover [file-path]
   (let [^InputStream reader (io/input-stream file-path)]
-    (while (> (.available reader) 0)
-      (let [header-bytes (read-bytes reader cell-head-len)
-            {:keys [partition hash cell-length]} (read-header-bytes header-bytes)
-            cell-id (UUID. partition hash)
-            body-bytes (read-bytes reader cell-length)
-            cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
-        (new-cell-by-raw* cell-id cell-bytes)))))
+    (try
+      (while (> (.available reader) 0)
+        (let [header-bytes (read-bytes reader cell-head-len)
+              {:keys [partition hash cell-length schema-id]} (read-header-bytes header-bytes)
+              cell-id (UUID. partition hash)
+              body-bytes (read-bytes reader cell-length)
+              cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
+          (spy schema-id)
+          (spy (read-int cell-bytes 20))
+          (new-cell-by-raw* cell-id cell-bytes)))
+      (finally
+        (.close reader)))))
+
+(defn list-ids [file-path]
+  (let [^InputStream reader (io/input-stream file-path)]
+    (try
+      (loop [ids []]
+        (if (> (.available reader) 0)
+          (let [header-bytes (read-bytes reader cell-head-len)
+                {:keys [partition hash cell-length]} (read-header-bytes header-bytes)
+                cell-id (UUID. partition hash)
+                body-bytes (read-bytes reader cell-length)
+                cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
+            (recur (conj ids cell-id)))
+          ids))
+      (finally
+        (.close reader)))))

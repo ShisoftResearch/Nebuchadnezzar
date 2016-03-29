@@ -75,4 +75,8 @@ public class CellWriter {
     public void markDirty () {
         trunk.addDirtyRanges(startLoc, currLoc - 1);
     }
+
+    public long getStartLoc() {
+        return startLoc;
+    }
 }

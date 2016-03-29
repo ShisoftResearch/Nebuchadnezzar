@@ -223,14 +223,14 @@
     (let [cell-reader (CellReader. trunk loc)]
       (with-cell
         cell-reader
-        (when-let [schema (schema-by-id schema-id)]
+        (when-let [schema ($ schema-by-id (spy schema-id))]
           (-> (read-cell** trunk (:f schema) cell-reader schema-id)
               (assoc :*id* (UUID. partition hash))))))))
 
 (defn read-cell [^Trunk trunk ^Long hash]
   (with-read-lock
     trunk hash
-    (read-cell* trunk)))
+    ($ read-cell* trunk)))
 
 (defn delete-cell [^Trunk ttrunk ^Long hash]
   (with-write-lock
@@ -290,8 +290,9 @@
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (let [cell-length (count bs)
         cell-writer (CellWriter. ttrunk cell-length)
-        writer (fn [trunk value curr-loc] (Writer/writeBytes trunk value curr-loc))]
-    (.streamWrite cell-writer writer bs cell-length)
+        bytes-writer (fn [trunk value curr-loc] (Writer/writeBytes trunk value curr-loc))]
+    (.streamWrite cell-writer bytes-writer bs cell-length)
+    #_(spy (Reader/readInt ttrunk (+ 20 (.getStartLoc cell-writer))))
     (.addCellToTrunkIndex cell-writer hash)))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]

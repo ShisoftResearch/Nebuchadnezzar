@@ -2,7 +2,8 @@
   (:require [neb.durability.serv.logs :as l]
             [neb.durability.serv.trunk :as t]
             [clojure.java.io :as io]
-            [clojure.core.async :as a])
+            [clojure.core.async :as a]
+            [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
@@ -10,6 +11,7 @@
 
 (def start-time (System/nanoTime))
 (def data-path (atom nil))
+(def defed-path (atom nil))
 (def clients (atom {}))
 (def ids (atom 0))
 (def ^:deprecated pending-logs (a/chan))
@@ -17,6 +19,7 @@
 (declare collect-log)
 
 (defn prepare-backup-server [path]
+  (reset! defed-path path)
   (reset! data-path (str path "/" start-time "/"))
   (println "Starting backup server at:" @data-path)
   #_(a/go-loop [] (apply collect-log (a/<! pending-logs))))
@@ -31,8 +34,10 @@
 (defn register-client-trunks [timestamp server-name trunks]
   (let [sid (swap! ids inc)
         base-path (let [^String path (file-base-path server-name timestamp)
-                        file-ins (.getParentFile (File. path))]
+                        file-ins (.getParentFile (File. path))
+                        imported-tag (File. (str (.getAbsolutePath file-ins) "/imported"))]
                     (when-not (.exists file-ins) (.mkdirs file-ins))
+                    (when (.exists imported-tag) (.delete imported-tag))
                     path)
         replica-accessors (vec (map (fn [n] (let [file-path (str base-path n ".dat")
                                                   file-ins (File. file-path)]
@@ -103,5 +108,31 @@
     (close-appender appender)
     (l/append appender act timestamp cell-id data)))
 
+(defn list-recover-dir []
+  (let [path-file (File. ^String @defed-path)
+        dir-files (.listFiles path-file)]
+    (->> (filter
+           (fn [fdir]
+             (not (.exists (File. (str (.getAbsolutePath fdir) "/imported")))))
+           dir-files)
+         (sort-by #(.getName %)))))
+
 (defn recover-backup []
-  )
+  (let [dirs-to-recover (list-recover-dir)]
+    (doseq [data-dir dirs-to-recover]
+      (when (.isDirectory data-dir)
+        (doseq [data-file (sort-by #(.getName %) (.listFiles data-dir))]
+          (t/recover data-file))
+        (.createNewFile (File. (str (.getAbsolutePath data-dir) "/imported")))))))
+
+(defn list-backup-ids []
+  (let [dirs-to-recover (list-recover-dir)]
+    (mapcat
+      (fn [data-dir]
+        (if (.isDirectory data-dir)
+          (mapcat
+            (fn [data-file]
+              (t/list-ids data-file))
+            (sort-by #(.getName %) (.listFiles data-dir)))
+          []))
+      dirs-to-recover)))

@@ -1,4 +1,5 @@
 (ns neb.durability.serv.native
+  (:require [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (org.shisoft.neb.utils UnsafeUtils)
            (sun.misc Unsafe)))
 
