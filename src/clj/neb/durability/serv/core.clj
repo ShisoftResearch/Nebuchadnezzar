@@ -75,11 +75,15 @@
             ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
         (reset! (get-in client [:appenders trunk-id]) new-appender)
         ;close orignal appender
-        (a/>! pending-logs [appender -10 timestamp nil]))
+        (a/go (a/>! pending-logs [appender -10 timestamp nil])))
       (finally
         (.unlock log-switch)))))
 
-(defn set-sync-time [sid trunk-id timestamp]
+(defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
+  (let [client (get @clients sid)
+        accessor (get-in client [:accessors trunk-id])]
+    (.truncate (.getChannel accessor) tail-loc)
+    (.flush accessor))
   (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp)
   (switch-log sid trunk-id timestamp))
 

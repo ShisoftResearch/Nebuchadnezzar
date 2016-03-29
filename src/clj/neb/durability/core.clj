@@ -1,9 +1,12 @@
 (ns neb.durability.core
   (:require [neb.defragment :as defrag]
             [taoensso.nippy :as nippy]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [cluster-connector.utils.for-debug :refer [$ spy]]
+            [cluster-connector.remote-function-invocation.core :as rfi])
   (:import (org.shisoft.neb Trunk MemoryFork)
-           (org.shisoft.neb.durability.io BufferedRandomAccessFile)))
+           (org.shisoft.neb.durability.io BufferedRandomAccessFile)
+           (org.shisoft.neb.utils UnsafeUtils)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
 ;      The ideal design is to provide multi-master replication backend. Right now, there will be no replication.
@@ -14,25 +17,45 @@
 
 (def server-sids (atom nil))
 
+(defn sync-range [^Trunk trunk start end]
+  (let [bs (UnsafeUtils/getBytes (+ (.getStoreAddress trunk) start)
+                                 (- end start))
+        trunk-id (.getId trunk)]
+    (dorun
+      (pmap
+        (fn [[sn sid]]
+          (rfi/invoke sn 'neb.durability.serv.core/sync-trunk
+                      sid trunk-id start bs))
+        @server-sids))))
+
+(defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
+  (let [trunk-id (.getId trunk)]
+    (dorun
+      (pmap
+        (fn [[sn sid]]
+          (rfi/invoke sn 'neb.durability.serv.core/finish-trunk-sync
+                      sid trunk-id tail-loc timestamp))
+        @server-sids))))
+
 (defn sync-trunk [^Trunk trunk]
   (.writeLock trunk)
   (try
     (defrag/scan-trunk-and-defragment trunk)
     (assert (empty? (.getFragments trunk)) "Defrag not succeed")
-    #_(let [dirty-ranges  (.clone (.getDirtyRanges trunk))
+
+    (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
           append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
-          timestamp (System/currentTimeMillis)]
+          timestamp (System/nanoTime)]
       (.clear (.getDirtyRanges trunk))
       (.writeUnlock trunk)
       (loop [pos 0]
         (let [d-range (.ceilingEntry dirty-ranges pos)]
           (if-not d-range
-            (.resetTail bs append-header)
-            (do (locking dirty-ranges
-                  (let [start (.getKey d-range)
-                        end (.getValue d-range)]
-                    (.syncRange bs start end)))
+            (finish-trunk-sync trunk append-header timestamp)
+            (do (let [start (.getKey d-range)
+                      end (min (.getValue d-range) append-header)]
+                  (sync-range trunk start end))
                 (recur (.getValue d-range))))))
       (.release mf))
     (finally

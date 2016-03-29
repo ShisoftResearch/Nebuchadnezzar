@@ -15,6 +15,7 @@ public class TrunkStore {
         trunks = new Trunk[trunkCount];
         for (int i = 0; i < trunkCount; i++){
             trunks[i] = new Trunk(trunkSize);
+            trunks[i].setId(i);
             if (durability){
                 trunks[i].enableDurability();
             }

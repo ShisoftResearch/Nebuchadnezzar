@@ -43,7 +43,8 @@
   (Thread/sleep 1))
 
 (defn backup-trunks []
-  )
+  (doseq [trunk (.getTrunks trunks)]
+    (sync-trunk trunk)))
 
 (defn start-defrag []
   (defrag/collecting-frags)

@@ -16,6 +16,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  * Created by shisoft on 18/1/2016.
  */
 public class Trunk {
+    private int id;
     private long storeAddress;
     private long size;
     private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
@@ -49,6 +50,12 @@ public class Trunk {
     }
     public void setMemoryFork(MemoryFork memoryFork) {
         this.memoryFork = memoryFork;
+    }
+    public int getId() {
+        return id;
+    }
+    public void setId(int id) {
+        this.id = id;
     }
     public Trunk(long size){
         this.size = size;
@@ -101,7 +108,7 @@ public class Trunk {
         if (prevPair != null && prevPair.getValue() >= endPos) return;
         if (prevPair != null && (prevPair.getValue() >= startPos || prevPair.getValue() == startPos - 1)) {
             addAndAutoMerge(map, prevPair.getKey(), endPos);
-        } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos +1)) {
+        } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos + 1)) {
             map.remove(forPair.getKey());
             if (forPair.getValue() < endPos){
                 addAndAutoMerge(map, startPos, endPos);
