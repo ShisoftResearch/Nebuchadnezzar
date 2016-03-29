@@ -93,6 +93,8 @@ public class Trunk {
     }
     public void copyMemForFork(long start, long end){
         if (memoryFork != null){
+            start += storeAddress;
+            end += storeAddress;
             memoryFork.copyMemory(start, end);
         }
     }
@@ -137,7 +139,7 @@ public class Trunk {
     public long getAppendHeaderValue (){
         return appendHeader.get();
     }
-    public void copyMemory(Long startPos, Long target, Long len){
+    public void copyMemory(long startPos, long target, long len){
         long dirtyEndPos = target + len - 1;
         copyMemForFork(target, dirtyEndPos);
         getUnsafe().copyMemory(storeAddress + startPos, storeAddress + target, len);

@@ -95,3 +95,6 @@
   (if (= -10 act)
     (close-appender appender)
     (l/append appender act timestamp cell-id data)))
+
+(defn recover-backup []
+  )
