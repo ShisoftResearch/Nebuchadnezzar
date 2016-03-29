@@ -6,7 +6,7 @@
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
-           (java.io OutputStream)))
+           (java.io OutputStream File)))
 
 (def start-time (System/nanoTime))
 (def data-path (atom nil))
@@ -17,8 +17,8 @@
 (declare collect-log)
 
 (defn prepare-backup-server [path]
-  (println "Starting backup server at:" @data-path)
   (reset! data-path (str path "/" start-time "/"))
+  (println "Starting backup server at:" @data-path)
   (a/go-loop [] (apply collect-log (a/<! pending-logs))))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))
@@ -30,9 +30,14 @@
 
 (defn register-client-trunks [timestamp server-name trunks]
   (let [sid (swap! ids inc)
-        base-path (file-base-path server-name timestamp)
-        replica-accessors (vec (map (fn [n] (BufferedRandomAccessFile.
-                                               (str base-path n ".dat") "rw"))
+        base-path (let [^String path (file-base-path server-name timestamp)
+                        file-ins (.getParentFile (File. path))]
+                    (when-not (.exists file-ins) (.mkdirs file-ins))
+                    path)
+        replica-accessors (vec (map (fn [n] (let [file-path (str base-path n ".dat")
+                                                  file-ins (File. file-path)]
+                                              (when-not (.exists file-ins) (.createNewFile file-ins))
+                                              (BufferedRandomAccessFile. file-path "rw")))
                                      (range trunks)))
         log-appenders (vec (map (fn [n] (atom (io/output-stream
                                                 (str base-path n "-" timestamp ".mlog"))))

@@ -71,9 +71,9 @@
           (s/load-schemas schemas)
           (init-trunks trunk-count trunks-size (boolean durability))
           (when data-path (dserv/prepare-backup-server data-path))
-          (when durability (init-durability-client (or replication 1)))
           (start-defrag)
           (register-as-master (* 50 trunk-count))
+          (when durability (init-durability-client (or replication 1)))
           (rfi/start-server port)))
       :expired-fn
       (fn []
