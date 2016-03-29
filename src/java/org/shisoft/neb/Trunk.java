@@ -94,21 +94,22 @@ public class Trunk {
         this.backendEnabled = true;
     }
     public void addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
-        Long seqFPos = endPos + 1;
-        Long seqBPos = startPos - 1;
-        Long seqFrag = map.get(seqFPos);
+        Map.Entry<Long, Long> prevPair = map.lowerEntry(startPos);
+        Map.Entry<Long, Long> forPair = map.higherEntry(startPos);
         Long dupLoc = map.get(startPos);
         if (dupLoc != null && dupLoc >= endPos) return;
-        if (seqFrag != null){
-            map.remove(seqFPos);
-            addAndAutoMerge(map, startPos, seqFrag);
-        } else {
-            Map.Entry<Long, Long> fe = map.floorEntry(seqBPos);
-            if (fe != null && fe.getValue().equals(seqBPos)){
-                addAndAutoMerge(map, fe.getKey(), endPos);
+        if (prevPair != null && prevPair.getValue() >= endPos) return;
+        if (prevPair != null && (prevPair.getValue() >= startPos || prevPair.getValue() == startPos - 1)) {
+            addAndAutoMerge(map, prevPair.getKey(), endPos);
+        } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos +1)) {
+            map.remove(forPair.getKey());
+            if (forPair.getValue() < endPos){
+                addAndAutoMerge(map, startPos, endPos);
             } else {
-                map.put(startPos, endPos);
+                addAndAutoMerge(map, startPos, forPair.getValue());
             }
+        } else {
+            map.put(startPos, endPos);
         }
     }
 
