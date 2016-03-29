@@ -7,7 +7,7 @@
             [neb.durability.serv.core :as dserv]
             [neb.utils :refer :all]
             [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag
-                                     init-durability-client]]
+                                     init-durability-client start-backup stop-backup]]
             [neb.base :refer [schemas-lock]]))
 
 (def cluster-config-fields [:trunks-size])
@@ -22,6 +22,7 @@
   (println "Shutdowning...")
   (try-all
     (rfi/stop-server)
+    (stop-backup)
     (stop-defrag)
     (dispose-trunks)
     (leave-cluster)
@@ -74,6 +75,7 @@
           (start-defrag)
           (register-as-master (* 50 trunk-count))
           (when durability (init-durability-client (or replication 1)))
+          (when (and durability auto-backsync) (start-backup))
           (rfi/start-server port)))
       :expired-fn
       (fn []

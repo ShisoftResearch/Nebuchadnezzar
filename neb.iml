@@ -33,6 +33,7 @@
     <orderEntry type="library" name="Leiningen: com.taoensso/truss:1.0.0" level="project" />
     <orderEntry type="library" name="Leiningen: com.yammer.metrics/metrics-core:2.2.0" level="project" />
     <orderEntry type="library" name="Leiningen: commons-codec:1.7" level="project" />
+    <orderEntry type="library" name="Leiningen: commons-io:2.4" level="project" />
     <orderEntry type="library" name="Leiningen: commons-lang:2.6" level="project" />
     <orderEntry type="library" name="Leiningen: environ:1.0.1" level="project" />
     <orderEntry type="library" name="Leiningen: flare:0.2.9" level="project" />

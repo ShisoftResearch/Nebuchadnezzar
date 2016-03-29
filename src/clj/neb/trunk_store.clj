@@ -14,6 +14,7 @@
 
 (def ^TrunkStore trunks (TrunkStore.))
 (def defrag-service (atom nil))
+(def backup-service (atom nil))
 
 (defn init-trunks [trunk-count trunks-size durability]
   (.init trunks trunk-count trunks-size durability))
@@ -21,7 +22,7 @@
 (defn init-durability-client [replication]
   (println "Registering to durability servers:" replication)
   (let [backup-servers (rep/select-random replication)
-        sids (into {}
+        sids (doall
                (map (fn [sn]
                       [sn (rfi/invoke sn 'neb.durability.serv.core/register-client-trunks
                                       (System/nanoTime) @ds/this-server-name (.getTrunkCount trunks))])
@@ -41,12 +42,21 @@
       (defrag/scan-trunk-and-defragment trunk)))
   (Thread/sleep 1))
 
+(defn backup-trunks []
+  )
+
 (defn start-defrag []
   (defrag/collecting-frags)
   (reset! defrag-service (ms/start-service defrag-store-trunks)))
 
 (defn stop-defrag []
   (ms/stop-service @defrag-service))
+
+(defn start-backup []
+  (reset! backup-service (ms/start-service backup-trunks)))
+
+(defn stop-backup []
+  (ms/stop-service @backup-service))
 
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)
