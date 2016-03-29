@@ -1,4 +1,4 @@
-(ns neb.durability.serv.logs
+(ns ^:deprecated  neb.durability.serv.logs
   (:require [neb.durability.serv.file-reader :refer [read-bytes]]
             [neb.core :refer [new-cell-by-raw* delete-cell* replace-cell*]]
             [clojure.java.io :as io])
