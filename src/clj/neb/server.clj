@@ -58,7 +58,8 @@
                                 (or (rfi/condinated-siblings-invoke 'neb.core/get-cluster-configures)
                                     cluster-configs))
               {:keys [trunks-size]} cluster-configs
-              {:keys [memory-size schema-file data-path durability auto-backsync replication]} config
+              {:keys [memory-size schema-file data-path durability auto-backsync replication
+                      keep-imported-backup recover-backup-at-startup]} config
               trunks-size (interpret-volume trunks-size)
               memory-size (interpret-volume memory-size)
               schemas (if is-first-node?
@@ -71,10 +72,11 @@
           (s/clear-schemas)
           (s/load-schemas schemas)
           (init-trunks trunk-count trunks-size (boolean durability))
-          (when data-path (dserv/prepare-backup-server data-path))
+          (when data-path (dserv/prepare-backup-server data-path keep-imported-backup))
           (start-defrag)
           (register-as-master (* 50 trunk-count))
           (when durability (init-durability-client (or replication 1)))
+          (when recover-backup-at-startup (dserv/recover-backup))
           (when (and durability auto-backsync) (start-backup))
           (rfi/start-server port)))
       :expired-fn

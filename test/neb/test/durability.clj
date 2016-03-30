@@ -100,5 +100,5 @@
             (clear-zk) => anything)
       (fact "Stop Server"
             (stop-server)  => anything)
-      ;(FileUtils/deleteDirectory (File. "data"))
+      (FileUtils/deleteDirectory (File. "data"))
       (.stopZookeeper zk))))

@@ -7,7 +7,8 @@
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
-           (java.io OutputStream File)))
+           (java.io OutputStream File)
+           (org.apache.commons.io FileUtils)))
 
 (def start-time (System/nanoTime))
 (def data-path (atom nil))
@@ -18,9 +19,17 @@
 
 (declare collect-log)
 
-(defn prepare-backup-server [path]
+(defn remove-imported []
+  (let [path-file (File. ^String @defed-path)
+        dir-files (.listFiles path-file)]
+    (doseq [fdir dir-files]
+        (when (.exists (File. (str (.getAbsolutePath fdir) "/imported")))
+          (FileUtils/deleteDirectory fdir)))))
+
+(defn prepare-backup-server [path keep-imported?]
   (reset! defed-path path)
   (reset! data-path (str path "/" start-time "/"))
+  (when keep-imported? (remove-imported))
   (println "Starting backup server at:" @data-path)
   #_(a/go-loop [] (apply collect-log (a/<! pending-logs))))
 
@@ -113,7 +122,8 @@
         dir-files (.listFiles path-file)]
     (->> (filter
            (fn [fdir]
-             (not (.exists (File. (str (.getAbsolutePath fdir) "/imported")))))
+             (let [imported? (.exists (File. (str (.getAbsolutePath fdir) "/imported")))]
+               (not imported?)))
            dir-files)
          (sort-by #(.getName %)))))
 
