@@ -37,7 +37,7 @@
     (try
       (while (> (.available reader) 0)
         (let [header-bytes (read-bytes reader cell-head-len)
-              {:keys [partition hash cell-length schema-id]} (read-header-bytes header-bytes)
+              {:keys [partition hash cell-length]} (read-header-bytes header-bytes)
               cell-id (UUID. partition hash)
               body-bytes (read-bytes reader cell-length)
               cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
