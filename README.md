@@ -13,7 +13,7 @@ RAMCloud implementation for Clojure applications.
 * Shard-nothing distributed architecture
 * Rich data type support, including text, geo coordinate, bytes, java objects, and arrays
 * Array, Map and nested schemas. Use the DSL to describe your documents
-* Optional Durability. Backup memory data into multiply replications of on-disk copy, in (nearly) real-time, recover them when needed.
+* Optional durability. Backup memory data into multiply replications of on-disk copy, in (nearly) real-time, recover them when needed.
 
 ## Usage
 

@@ -19,17 +19,19 @@
 
 (declare collect-log)
 
-(defn remove-imported []
+(defn remove-imported [^String current-path]
   (let [path-file (File. ^String @defed-path)
-        dir-files (.listFiles path-file)]
+        dir-files (.listFiles path-file)
+        current-file (File. current-path)]
     (doseq [fdir dir-files]
-        (when (.exists (File. (str (.getAbsolutePath fdir) "/imported")))
+        (when (and (.exists (File. (str (.getAbsolutePath fdir) "/imported")))
+                   (not (= current-file fdir)))
           (FileUtils/deleteDirectory fdir)))))
 
 (defn prepare-backup-server [path keep-imported?]
   (reset! defed-path path)
   (reset! data-path (str path "/" start-time "/"))
-  (when keep-imported? (remove-imported))
+  (when keep-imported? (remove-imported @data-path))
   (println "Starting backup server at:" @data-path)
   #_(a/go-loop [] (apply collect-log (a/<! pending-logs))))
 
