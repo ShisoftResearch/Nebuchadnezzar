@@ -1,33 +1,39 @@
 package org.shisoft.neb.io;
 
-import org.shisoft.neb.trunk;
+import org.shisoft.neb.Trunk;
+
+import java.io.IOException;
 
 /**
  * Created by shisoft on 14/2/2016.
  */
-public class trunkStore {
+public class TrunkStore {
 
-    trunk[] trunks;
+    Trunk[] trunks;
 
-    public void init(int trunkCount, long trunkSize) {
-        trunks = new trunk[trunkCount];
+    public void init(int trunkCount, long trunkSize, boolean durability) {
+        trunks = new Trunk[trunkCount];
         for (int i = 0; i < trunkCount; i++){
-            trunks[i] = new trunk(trunkSize);
+            trunks[i] = new Trunk(trunkSize);
+            trunks[i].setId(i);
+            if (durability){
+                trunks[i].enableDurability();
+            }
         }
     }
 
-    public void dispose (){
+    public void dispose () throws IOException {
         for (int i = 0; i < getTrunkCount(); i++){
             trunks[i].dispose();
             trunks[i] = null;
         }
     }
 
-    public trunk[] getTrunks() {
+    public Trunk[] getTrunks() {
         return trunks;
     }
 
-    public trunk getTrunk (int id){
+    public Trunk getTrunk (int id){
         return trunks[id];
     }
 
@@ -46,5 +52,4 @@ public class trunkStore {
         }
         return r;
     }
-
 }

@@ -1,34 +1,24 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
+            [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
+            [neb.durability.serv.native :refer [read-int]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a])
-  (:import (org.shisoft.neb trunk)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths cellMeta)
+  (:import (org.shisoft.neb Trunk)
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta Writer)
            (java.util UUID)))
 
 (set! *warn-on-reflection* true)
 
-(def ^:dynamic ^cellMeta *cell-meta* nil)
+(def ^:dynamic ^CellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
-(def ^:dynamic ^trunk *cell-trunk* nil)
+(def ^:dynamic ^Trunk *cell-trunk* nil)
 
 (def pending-frags (a/chan))
 
-(def cell-head-struc
-  [[:partition :long :partition]
-   [:hash :long :hash]
-   [:schema-id :int :schema]
-   [:cell-length :int :length]])
-
-(def cell-head-len
-  (reduce + (map
-              (fn [[_ type]]
-                (get-in @data-types [type :length]))
-              cell-head-struc)))
-
-(defmacro with-cell [^cellReader cell-reader & body]
+(defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
                 (fn [[n t]]
                   [(symbol (name n))
@@ -36,37 +26,21 @@
                        streamRead
                        (get-in @data-types [~t :reader])
                        ~(get-in @data-types [ t :length]))])
-                cell-head-struc))
+                cell-head-struct))
      ~@body))
 
-(defmacro gen-cell-header-offsets []
-  (let [loc-counter (atom 0)]
-    `(do ~@(map
-             (fn [[prop type]]
-               (let [{:keys [length]} (get @data-types type)
-                     out-code `(def ~(symbol (str (name prop) "-offset")) ~(deref loc-counter))]
-                 (swap! loc-counter (partial + length))
-                 out-code))
-             cell-head-struc)
-         ~(do (reset! loc-counter 0) nil)
-         (def cell-head-struc-map
-           ~(into {}
-                  (map
-                    (fn [[prop type]]
-                      (let [{:keys [length] :as fields} (get @data-types type)
-                            res [prop (assoc (select-keys fields [:reader :writer]) :offset @loc-counter)]]
-                        (swap! loc-counter (partial + length))
-                        res))
-                    cell-head-struc))))))
-
 (defn extract-cell-meta [ttrunk hash]
-  (.getCellMeta ^trunk ttrunk ^long hash))
+  (.getCellMeta ^Trunk ttrunk ^long hash))
 
 (defmacro with-cell-meta [trunk hash & body]
   `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
-     (when *cell-meta* ~@body)))
+     (.readLock ~trunk)
+     (try
+       (when *cell-meta* ~@body)
+       (finally
+         (.readUnLock ~trunk)))))
 
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
@@ -83,24 +57,23 @@
 (defn get-cell-location []
   (.getLocation *cell-meta*))
 
-(gen-cell-header-offsets)
 
-(defn read-cell-header-field [^trunk trunk loc field]
+(defn read-cell-header-field [^Trunk trunk loc field]
   (let [{:keys [reader offset]} (get cell-head-struc-map field)]
     (reader trunk (+ loc offset))))
 
-(defn write-cell-header-field [^trunk trunk loc field value]
+(defn write-cell-header-field [^Trunk trunk loc field value]
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
     (writer trunk value (+ loc offset))))
 
-(defn add-frag [^trunk ttrunk start end]
+(defn add-frag [^Trunk ttrunk start end]
   (a/go (a/>! pending-frags [ttrunk start end])))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
 
 (defn calc-dynamic-type-length [trunk unit-length field-loc]
-  (+ (* (reader/readInt trunk field-loc)
+  (+ (* (Reader/readInt trunk field-loc)
         unit-length)
      type_lengths/intLen))
 
@@ -113,7 +86,7 @@
 
 (def check-is-nested vector?)
 
-(defn walk-schema-for-read [schema-fields trunk ^cellReader cell-reader field-func map-func array-func]
+(defn walk-schema-for-read [schema-fields trunk ^CellReader cell-reader field-func map-func array-func]
   (let [recur-nested (fn [nested-schema & _]
                        (walk-schema-for-read
                          nested-schema trunk cell-reader
@@ -131,7 +104,7 @@
               field-result)
             (recur-nested (:f (schema-by-sname field-format))))))
       (fn [field-name array-format]
-        (let [array-len (reader/readInt trunk (.getCurrLoc cell-reader))
+        (let [array-len (Reader/readInt trunk (.getCurrLoc cell-reader))
               nested-format? (check-is-nested array-format)
               array-format? (and nested-format? (= :ARRAY (first array-format)))
               type-format? (and (keyword array-format) (get @data-types array-format))
@@ -230,7 +203,7 @@
 
 (def internal-cell-fields [:*schema* :*hash* :*id*])
 
-(defn read-cell** [^trunk trunk schema-fields ^cellReader cell-reader schema-id]
+(defn read-cell** [^Trunk trunk schema-fields ^CellReader cell-reader schema-id]
   (merge (walk-schema-for-read
            schema-fields trunk cell-reader
            (fn [_ _ type-props _]
@@ -246,21 +219,21 @@
          {:*schema* schema-id
           :*hash*   *cell-hash*}))
 
-(defn read-cell* [^trunk trunk]
+(defn read-cell* [^Trunk trunk]
   (when-let [loc (get-cell-location)]
-    (let [cell-reader (cellReader. trunk loc)]
+    (let [cell-reader (CellReader. trunk loc)]
       (with-cell
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
           (-> (read-cell** trunk (:f schema) cell-reader schema-id)
               (assoc :*id* (UUID. partition hash))))))))
 
-(defn read-cell [^trunk trunk ^Long hash]
+(defn read-cell [^Trunk trunk ^Long hash]
   (with-read-lock
     trunk hash
     (read-cell* trunk)))
 
-(defn delete-cell [^trunk ttrunk ^Long hash]
+(defn delete-cell [^Trunk ttrunk ^Long hash]
   (with-write-lock
     ttrunk hash
     (if-let [cell-loc (get-cell-location)]
@@ -280,23 +253,26 @@
                   (get-in @data-types [~head-type :writer])
                   (~head-data-func ~header-data)
                   ~length)))
-           cell-head-struc)))
+           cell-head-struct)))
 
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
-(defmacro locking-index [^trunk trunk & body]
+(defmacro locking-index [^Trunk trunk & body]
   `(locking (.getCellIndex ~trunk)
      ~@body))
 
-(defn write-cell [^trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn mark-dirty [^CellWriter cell-writer]
+  (.markDirty cell-writer))
+
+(defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
         fields-length (cell-len-by-fields fields)
         cell-length (+ cell-head-len fields-length)
         cell-writer (if loc
-                      (cellWriter. ttrunk ^Long cell-length loc)
-                      (cellWriter. ttrunk ^Long cell-length))
+                      (CellWriter. ttrunk cell-length loc)
+                      (CellWriter. ttrunk cell-length))
         header-data {:schema schema-id
                      :hash hash
                      :partition partition
@@ -309,15 +285,23 @@
         ttrunk
         (if update-cell?
           (.updateCellToTrunkIndex cell-writer hash)
-          (.addCellToTrunkIndex cell-writer hash))))))
+          (.addCellToTrunkIndex cell-writer hash))))
+    (mark-dirty cell-writer)))
 
-(defn new-cell [^trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
+(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
+  (let [cell-length (count bs)
+        cell-writer (CellWriter. ttrunk cell-length)
+        bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
+    (.streamWrite cell-writer bytes-writer bs cell-length)
+    (.addCellToTrunkIndex cell-writer hash)))
+
+(defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
   (when (.hasCell ttrunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
     (write-cell ttrunk hash partition schema data)))
 
-(defn replace-cell* [^trunk trunk ^Long hash data]
+(defn replace-cell* [^Trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]
     (let [cell-data-loc (+ cell-loc cell-head-len)
           schema-id (read-cell-header-field trunk cell-loc :schema-id)
@@ -336,12 +320,12 @@
         (do (write-cell trunk hash partition schema data :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
-(defn replace-cell [^trunk trunk ^Long hash data]
+(defn replace-cell [^Trunk trunk ^Long hash data]
   (with-write-lock
     trunk hash
     (replace-cell* trunk hash data)))
 
-(defn update-cell [^trunk trunk ^Long hash fn & params]  ;TODO Replace with less overhead function
+(defn update-cell [^Trunk trunk ^Long hash fn & params]  ;TODO Replace with less overhead function
   (with-write-lock
     trunk hash
     (when-let [cell-content (read-cell* trunk)]
@@ -382,13 +366,13 @@
           (recur (conj! committed curr-key)
                  (rest keys-remains)))))))
 
-(defn get-in-cell [^trunk trunk ^Long hash ks]
+(defn get-in-cell [^Trunk trunk ^Long hash ks]
   (if (keyword? ks)
     (get-in-cell trunk hash [ks])
     (with-read-lock
       trunk hash
       (when-let [loc (get-cell-location)]
-        (let [cell-reader (cellReader. trunk loc)]
+        (let [cell-reader (CellReader. trunk loc)]
           (with-cell
             cell-reader
             (when-let [schema (schema-by-id schema-id)]
@@ -410,11 +394,11 @@
                (disj keys-remains field-name)
                (rest fields-to-check))))))
 
-(defn select-keys-from-cell [^trunk trunk ^Long hash ks]
+(defn select-keys-from-cell [^Trunk trunk ^Long hash ks]
   (with-read-lock
     trunk hash
     (when-let [loc (get-cell-location)]
-      (let [cell-reader (cellReader. trunk loc)]
+      (let [cell-reader (CellReader. trunk loc)]
         (with-cell
           cell-reader
           (when-let [schema (schema-by-id schema-id)]
@@ -422,7 +406,7 @@
                   partical-cell (read-cell** trunk compiled-schema cell-reader schema-id)]
               (select-keys partical-cell ks))))))))
 
-(defn write-lock-exec [^trunk trunk ^Long hash func-sym & params]
+(defn write-lock-exec [^Trunk trunk ^Long hash func-sym & params]
   (with-write-lock
     trunk hash
     (apply (compiled-cache func-sym) (read-cell trunk hash) params)))

@@ -3,8 +3,8 @@
             [neb.schema :refer [add-schema]]
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
+  (:import (org.shisoft.neb Trunk SchemaStore)
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths)))
 
 (def ttrunk (atom nil))
 (def simple-scheme [[:int-value :int]])
@@ -31,7 +31,7 @@
 
 (facts "trunk test"
        (fact "memory init"
-             (reset! ttrunk (trunk. 5000000)) => anything)
+             (reset! ttrunk (Trunk. 5000000)) => anything)
        (fact "define simple scheme"
              (add-schema :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"

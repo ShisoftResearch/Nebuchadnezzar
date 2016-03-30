@@ -4,13 +4,13 @@
             [neb.cell :refer [new-cell read-cell]]
             [neb.types :refer [data-types]]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb trunk schemaStore)
-           (org.shisoft.neb.io cellReader cellWriter reader type_lengths)))
+  (:import (org.shisoft.neb Trunk SchemaStore)
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths)))
 
 (def ttrunk (atom nil))
 
 (defn rt []
-  (reset! ttrunk (trunk. 5000)))
+  (reset! ttrunk (Trunk. 5000)))
 
 (defn dt []
   (.dispose @ttrunk))

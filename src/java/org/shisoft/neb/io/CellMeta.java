@@ -3,11 +3,11 @@ package org.shisoft.neb.io;
 /**
  * Created by shisoft on 5/2/2016.
  */
-public class cellMeta {
+public class CellMeta {
 
     long location;
 
-    public cellMeta(long location) {
+    public CellMeta(long location) {
         this.location = location;
     }
 
@@ -19,4 +19,10 @@ public class cellMeta {
         this.location = location;
     }
 
+    @Override
+    public String toString() {
+        return "CellMeta{" +
+                "location=" + location +
+                '}';
+    }
 }

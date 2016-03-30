@@ -1,5 +1,6 @@
 (ns neb.test.server
   (:require [neb.core :refer :all]
+            [neb.server :refer :all]
             [neb.trunk-store :as ts]
             [neb.schema :as s]
             [midje.sweet :refer :all]
@@ -21,8 +22,7 @@
                      :port 5134
                      :zk  "127.0.0.1:21817"
                      :trunks-size trunks-size
-                     :memory-size memory-size
-                     :data-path   "data"}]
+                     :memory-size memory-size}]
          (.startZookeeper zk 21817)
          (try
            (fact "Start Server"

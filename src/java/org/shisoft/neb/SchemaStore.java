@@ -10,12 +10,12 @@ import java.util.Objects;
 /**
  * Created by shisoft on 19/1/2016.
  */
-public class schemaStore {
+public class SchemaStore {
 
     HashIntObjMap schemaIdMap = HashIntObjMaps.newMutableMap();
     HashObjIntMap snameIdMap = HashObjIntMaps.newMutableMap();
 
-    public schemaStore() {
+    public SchemaStore() {
     }
 
     public HashIntObjMap getSchemaIdMap() {
