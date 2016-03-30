@@ -26,20 +26,22 @@
               :auto-backsync false
               :replication 2}
       inserted-cell-ids (atom #{})
-      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry. Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, when an unknown printer took a galley of type and scrambled it to make a type specimen book. It has survived not only five centuries, but also the leap into electronic typesetting, remaining essentially unchanged. It was popularised in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages, and more recently with desktop publishing software like Aldus PageMaker including versions of Lorem Ipsum."]
+      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."]
   (.startZookeeper zk 21817)
   (try
     (facts "Durability"
            (fact "Start Server"
                  (start-server config) => anything)
            (fact "Prepare schemas"
-                 (add-schema :raw-data [[:data :obj]]) => 0)
+                 (add-schema :raw-data [[:data :obj]
+                                        [:num :int]]) => 0)
            (fact "Write something"
                  (dorun
                    (pmap
                      (fn [id]
                        (let [cell-id (new-cell (str "test" id)
-                                               :raw-data {:data {:str (str placr-holder id)}})]
+                                               :raw-data {:data {:str (str placr-holder id)}
+                                                          :num id})]
                          (swap! inserted-cell-ids conj cell-id)
                          cell-id => anything))
                      (range 300))))
@@ -50,6 +52,7 @@
                      (fn [id]
                        (let [str-key (str "test" id)]
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
+                                                           :num id
                                                            :*id* (to-id str-key)})))
                      (range 300))))
            (fact "Check dirty"
@@ -83,12 +86,13 @@
                        (doseq [[hash meta] cell-index]
                          (cell/read-cell trunk hash) => (contains {:data anything}))
                        (.size cell-index) => #(>= % 1)))))
-           (fact "Check Recover"
+           (fact "Check Recovery"
                  (dorun
                    (map
                      (fn [id]
                        (let [str-key (str "test" id)]
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
+                                                           :num id
                                                            :*id* (to-id str-key)})))
                      (range 300)))))
     (finally

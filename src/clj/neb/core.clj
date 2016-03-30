@@ -39,13 +39,8 @@
     (cell-id-by-key (name key))))
 
 (defn- dist-call [cell-id func & params]
-  (let [server-name (locate-cell-by-id cell-id)
-        result (apply rfi/invoke server-name func cell-id params)]
-    (cond
-      (map? result)
-      (assoc result :*id* cell-id)
-      :else
-      result)))
+  (let [server-name (locate-cell-by-id cell-id)]
+    (apply rfi/invoke server-name func cell-id params)))
 
 (defn delete-cell* [id]
   (dist-call id 'neb.trunk-store/delete-cell))
