@@ -23,5 +23,4 @@ Under heavy development, no docs at this time
 
 Copyright © 2016 Shisoft Research
 
-Distributed under the Eclipse Public License either version 1.0 or (at
-your option) any later version.
+Distributed under the Eclipse Public License either version 1.0 or BSD any later version.
