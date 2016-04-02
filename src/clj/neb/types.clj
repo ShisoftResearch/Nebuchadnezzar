@@ -125,6 +125,11 @@
              :encoder nippy/freeze
              :decoder nippy/thaw
              :dep :bytes
+             :example [{:a 1 :b 2}]}
+   :edn     {:id      21 :dynamic? true
+             :encoder (fn [obj] (.getBytes (pr-str obj) string-encoding))
+             :decoder (fn [^bytes byte-arr] (read-string (String. byte-arr string-encoding)))
+             :dep :bytes
              :example [{:a 1 :b 2}]}})
 
 (def int-writer (get-in @data-types [:int :writer]))
