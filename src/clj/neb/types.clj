@@ -1,5 +1,6 @@
 (ns neb.types
-  (:require [taoensso.nippy :as nippy])
+  (:require [taoensso.nippy :as nippy]
+            [clojure.edn :as edn])
   (:import [org.shisoft.neb.io Writer Reader type_lengths]
            (java.util UUID Date)
            (java.nio.charset Charset)))
@@ -128,7 +129,7 @@
              :example [{:a 1 :b 2}]}
    :edn     {:id      21 :dynamic? true
              :encoder (fn [obj] (.getBytes (pr-str obj) string-encoding))
-             :decoder (fn [^bytes byte-arr] (read-string (String. byte-arr string-encoding)))
+             :decoder (fn [^bytes byte-arr] (edn/read-string (String. byte-arr string-encoding)))
              :dep :bytes
              :example [{:a 1 :b 2}]}})
 
