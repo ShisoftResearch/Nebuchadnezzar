@@ -24,6 +24,7 @@ public class type_lengths {
     public static final short bytesUnitLen = byteLen;
     public static final short objUnitLen   = byteLen;
     public static final short textUnitLen  = byteLen;
+    public static final short ednUnitLen  = byteLen;
 
     public static int countBytes(byte[] bs){
         return bs.length;
@@ -32,6 +33,9 @@ public class type_lengths {
         return countBytes(bs);
     }
     public static int countText(byte[] bs){
+        return countBytes(bs);
+    }
+    public static int countEdn(byte[] bs){
         return countBytes(bs);
     }
 }
