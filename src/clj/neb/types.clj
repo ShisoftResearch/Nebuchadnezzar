@@ -79,6 +79,7 @@
              :checker char?
              :example [\a \测 \å \∫ \≤ \œ]}
    :text    {:id      3 :dynamic? true
+             :checker string?
              :example ["The morpueus engine" "这是一段测试文本 abc"]
              :encoder (fn [^String string] (.getBytes string string-encoding))
              :decoder (fn [^bytes byte-arr] (String. byte-arr string-encoding))
@@ -118,22 +119,27 @@
              :checker (fn [uuid] (instance? UUID uuid))
              :example [`(UUID/randomUUID) `(UUID/randomUUID)]}
    :pos2d   {:id      15
+             :checker (fn [p2d] (and (coll? p2d) (= 2 (count p2d))))
              :example [[1.0, 2.0] [3.0 4.0]]
              :encoder double-array
              :decoder vec}
    :pos3d   {:id      16
+             :checker (fn [p3d] (and (coll? p3d) (= 3 (count p3d))))
              :example [[1.0, 2.0 3.0] [3.0 4.0 5.0]]
              :encoder double-array
              :decoder vec}
    :pos4d   {:id      17
+             :checker (fn [p4d] (and (coll? p4d) (= 4 (count p4d))))
              :example [[1.0, 2.0 3.0 1024.0] [3.0 4.0 4096.0 12.0]]
              :encoder double-array
              :decoder vec}
    :geo     {:id      18
+             :checker (fn [p2d] (and (coll? p2d) (= 2 (count p2d))))
              :example [`(map float [31.12 121.30]) `(map float [40.30 71.51])]
              :encoder float-array
              :decoder vec}
    :date    {:id      19
+             :checker (fn [d] (instance? Date d))
              :example [`(Date.)]}
    :obj     {:id      20 :dynamic? true
              :encoder nippy/freeze
