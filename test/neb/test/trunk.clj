@@ -42,6 +42,8 @@
              (add-schema :test-schema2 compound-scheme 2) => anything)
        (fact "write cell with compound shceme"
              (new-cell @ttrunk 2 1 (int 2) compound-scheme-data) => anything)
+       (fact "Write cell with wrong data types"
+             (new-cell @ttrunk 3 1 (int 1) {:int-value "abc"}) => (throws IllegalArgumentException))
        (fact "read cell with compound scheme"
              (read-cell @ttrunk 2) => (contains compound-scheme-data))
        (fact "delete cell"
