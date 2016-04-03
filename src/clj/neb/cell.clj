@@ -178,8 +178,9 @@
                  dep (when dep (get @data-types dep))
                  writer (or writer (get dep :writer))]
              (when (and checker (not (checker field-data)))
-               (throw (IllegalArgumentException. (str "Data check failed. Expect: " (name field-format) " "
-                                                      "Actually: " (class field-data) " value:" field-data))))
+               (throw (IllegalArgumentException. (str "Data check failed for field: " field-name " "
+                                                      "Expect: " (name field-format) " "
+                                                      "Actually: " (class field-data) " value: " field-data))))
              (let [field-data (if encoder (encoder field-data) field-data)]
                (when (not (nil? field-data))
                  {:value field-data
