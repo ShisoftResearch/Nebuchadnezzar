@@ -76,6 +76,7 @@
   data-types
   {
    :char    {:id      1
+             :checker char?
              :example [\a \测 \å \∫ \≤ \œ]}
    :text    {:id      3 :dynamic? true
              :example ["The morpueus engine" "这是一段测试文本 abc"]
@@ -83,26 +84,38 @@
              :decoder (fn [^bytes byte-arr] (String. byte-arr string-encoding))
              :dep :bytes}
    :int     {:id      4
+             :checker integer?
              :example [`(int 1) `(int Integer/MIN_VALUE) `(int Integer/MAX_VALUE)]}
    :long    {:id      5
+             :checker number?
              :example [1 2 `Long/MIN_VALUE `Long/MAX_VALUE]}
    :boolean {:id      6
+             :checker (constantly true)
              :example [true false]}
    :short   {:id      7
+             :checker number?
+             :encoder short
              :example [`(short 1) `(short 2) `Short/MIN_VALUE `Short/MAX_VALUE]}
    :ushort  {:id      8
+             :checker integer?
              :example [`(int 1) `(int 2) 0 `(int (* 2 Short/MAX_VALUE))]}
    :byte    {:id      9
+             :checker (fn [b] (instance? Byte b))
              :example [`(byte 1) `(byte 2) `(byte (Byte/MIN_VALUE)) `(byte (Byte/MAX_VALUE))]}
    :bytes   {:id      10 :dynamic? true
+             :checker (fn [bs] (instance? bytes bs))
              :example []}
    :float   {:id      11
+             :checker float?
              :example [`(float 1) `(float 2) `Float/MIN_VALUE `Float/MAX_VALUE]}
    :double  {:id      12
+             :checker (fn [d] (instance? Double d))
              :example [`(double 1.0) `(double 2.0) `Double/MIN_VALUE `Double/MAX_VALUE]}
    :uuid    {:id      13
+             :checker (fn [uuid] (instance? UUID uuid))
              :example [`(UUID/randomUUID) `(UUID/randomUUID)]}
    :cid     {:id      14
+             :checker (fn [uuid] (instance? UUID uuid))
              :example [`(UUID/randomUUID) `(UUID/randomUUID)]}
    :pos2d   {:id      15
              :example [[1.0, 2.0] [3.0 4.0]]

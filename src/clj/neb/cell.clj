@@ -174,22 +174,25 @@
          (:f schema) data
          (fn [field-data field-name field-format field-props]
            (let [{:keys [length writer dep dynamic? encoder
-                         unit-length count-array-length count-length]} field-props
+                         unit-length count-array-length count-length checker]} field-props
                  dep (when dep (get @data-types dep))
-                 writer (or writer (get dep :writer))
-                 field-data (if encoder (encoder field-data) field-data)]
-             (when (not (nil? field-data))
-               {:value field-data
-                :writer writer
-                :length (if dynamic?
-                          (cond
-                            count-array-length
-                            (+ (* (count-array-length field-data)
-                                  unit-length)
-                               type_lengths/intLen)
-                            count-length
-                            (count-length field-data))
-                          length)})))
+                 writer (or writer (get dep :writer))]
+             (when (and checker (not (checker field-data)))
+               (throw (IllegalArgumentException. (str "Data check failed. Expect: " (name field-format) " "
+                                                      "Actually: " (class field-data) " value:" field-data))))
+             (let [field-data (if encoder (encoder field-data) field-data)]
+               (when (not (nil? field-data))
+                 {:value field-data
+                  :writer writer
+                  :length (if dynamic?
+                            (cond
+                              count-array-length
+                              (+ (* (count-array-length field-data)
+                                    unit-length)
+                                 type_lengths/intLen)
+                              count-length
+                              (count-length field-data))
+                            length)}))))
          (fn [& items]
            (map second items))
          (fn [_ _ array-header & array-content]
