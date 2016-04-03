@@ -180,7 +180,8 @@
              (when (and checker (not (checker field-data)))
                (throw (IllegalArgumentException. (str "Data check failed for field: " field-name " "
                                                       "Expect: " (name field-format) " "
-                                                      "Actually: " (class field-data) " value: " field-data))))
+                                                      "Actually: " (class field-data) " value: " field-data " "
+                                                      "data: " data))))
              (let [field-data (if encoder (encoder field-data) field-data)]
                (when (not (nil? field-data))
                  {:value field-data
