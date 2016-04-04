@@ -18,8 +18,9 @@
 (def server-sids (atom nil))
 
 (defn sync-range [^Trunk trunk start end]
-  (let [bs (UnsafeUtils/getBytes (+ (.getStoreAddress trunk) start)
-                                 (- end start))
+  (let [^MemoryFork mf (.getMemoryFork trunk)
+        store-addr (.getStoreAddress trunk)
+        bs (.getBytes mf (+ store-addr start) (+ store-addr end))
         trunk-id (.getId trunk)]
     (dorun
       (pmap

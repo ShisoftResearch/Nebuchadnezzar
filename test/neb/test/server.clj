@@ -7,8 +7,8 @@
             [cluster-connector.utils.for-debug :refer [$]])
   (:import [org.shisoft.neb.utils StandaloneZookeeper]))
 
-(def trunks-size (* Integer/MAX_VALUE 0.2))
-(def memory-size (* Integer/MAX_VALUE 4))
+(def trunks-size (* Integer/MAX_VALUE 0.1))
+(def memory-size (* Integer/MAX_VALUE 2))
 
 (defn calc-standard-deviation [coll]
   (let [ele-count (count coll)

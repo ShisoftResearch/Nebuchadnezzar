@@ -12,8 +12,8 @@
            (org.shisoft.neb Trunk)
            (java.util Map$Entry)))
 
-(def trunks-size (* Integer/MAX_VALUE 0.2))
-(def memory-size (* Integer/MAX_VALUE 4))
+(def trunks-size (* Integer/MAX_VALUE 1))
+(def memory-size (* Integer/MAX_VALUE 2))
 
 (let [zk (StandaloneZookeeper.)
       config {:server-name :test-server
