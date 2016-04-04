@@ -4,7 +4,8 @@
             [neb.durability.serv.native :refer [read-int read-long]]
             [neb.core :refer [new-cell-by-raw*]]
             [clojure.java.io :as io]
-            [cluster-connector.utils.for-debug :refer [spy $]])
+            [cluster-connector.utils.for-debug :refer [spy $]]
+            [com.climate.claypoole :as cp])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.io InputStream)
            (java.util UUID)))
@@ -33,7 +34,8 @@
     r))
 
 (defn recover [file-path]
-  (let [^InputStream reader (io/input-stream file-path)]
+  (let [^InputStream reader (io/input-stream file-path)
+        pool (cp/threadpool 10)]
     (try
       (while (> (.available reader) 0)
         (let [header-bytes (read-bytes reader cell-head-len)
@@ -41,9 +43,10 @@
               cell-id (UUID. partition hash)
               body-bytes (read-bytes reader cell-length)
               cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
-          (new-cell-by-raw* cell-id cell-bytes)))
+          (cp/future pool (new-cell-by-raw* cell-id cell-bytes))))
       (finally
-        (.close reader)))))
+        (.close reader)
+        (cp/shutdown pool)))))
 
 (defn list-ids [file-path]
   (let [^InputStream reader (io/input-stream file-path)]

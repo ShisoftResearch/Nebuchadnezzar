@@ -23,6 +23,7 @@
     <orderEntry type="library" name="Leiningen: cluster-connector:0.1.0-SNAPSHOT" level="project" />
     <orderEntry type="library" name="Leiningen: colorize:0.1.1" level="project" />
     <orderEntry type="library" name="Leiningen: com.101tec/zkclient:0.3" level="project" />
+    <orderEntry type="library" name="Leiningen: com.climate/claypoole:1.1.2" level="project" />
     <orderEntry type="library" name="Leiningen: com.github.jbellis/jamm:0.3.1" level="project" />
     <orderEntry type="library" name="Leiningen: com.google.guava/guava:19.0" level="project" />
     <orderEntry type="library" name="Leiningen: com.rpl/specter:0.9.0" level="project" />

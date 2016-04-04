@@ -133,6 +133,7 @@
          (sort-by #(.getName %)))))
 
 (defn recover-backup []
+  (println "Recovering Backups...")
   (let [dirs-to-recover (list-recover-dir)]
     (doseq [data-dir dirs-to-recover]
       (when (.isDirectory data-dir)
