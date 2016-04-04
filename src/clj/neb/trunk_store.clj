@@ -39,26 +39,24 @@
 (defn defrag-store-trunks []
   (locking defrag-service
     (doseq [trunk (.getTrunks trunks)]
-      (defrag/scan-trunk-and-defragment trunk)))
-  (Thread/sleep 1))
+      (defrag/scan-trunk-and-defragment trunk))))
 
 (defn backup-trunks []
   (doseq [trunk (.getTrunks trunks)]
     (try
       (sync-trunk trunk)
       (catch Exception ex
-        (clojure.stacktrace/print-cause-trace ex))))
-  (Thread/sleep 1000))
+        (clojure.stacktrace/print-cause-trace ex)))))
 
 (defn start-defrag []
   (defrag/collecting-frags)
-  (reset! defrag-service (ms/start-service defrag-store-trunks)))
+  (reset! defrag-service (ms/start-service defrag-store-trunks 10)))
 
 (defn stop-defrag []
   (ms/stop-service @defrag-service))
 
 (defn start-backup []
-  (reset! backup-service (ms/start-service backup-trunks)))
+  (reset! backup-service (ms/start-service backup-trunks 1000)))
 
 (defn stop-backup []
   (ms/stop-service @backup-service))
