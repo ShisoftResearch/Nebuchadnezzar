@@ -18,38 +18,44 @@ public class MemoryFork {
     }
 
     public void copyMemory (long start, long end){
-        byte[] saved = orignalBytes.get(start);
-        if (saved != null && saved.length >= (end - start + 1)){
-            return;
+        synchronized (orignalBytes) {
+            byte[] saved = orignalBytes.get(start);
+            if (saved != null && saved.length >= (end - start + 1)) {
+                return;
+            }
+            long bsLen = end - start;
+            byte[] bs = new byte[(int) bsLen];
+            for (long i = start; i < end; i++) {
+                bs[(int) (i - start)] = Trunk.getUnsafe().getByte(i);
+            }
+            orignalBytes.put(start, bs);
         }
-        long bsLen = end - start;
-        byte[] bs = new byte[(int) bsLen];
-        for (long i = start; i < end; i++){
-            bs[(int) (i - start)] = Trunk.getUnsafe().getByte(i);
-        }
-        orignalBytes.put(start, bs);
     }
 
     public byte[] getBytes(long start, long end){
-        byte[] saved = orignalBytes.get(start);
-        int fetchLen = (int) (end - start + 1);
-        if (saved == null){
-            return UnsafeUtils.getBytes(start, fetchLen);
-        } else {
-            if (saved.length >= fetchLen){
-                return UnsafeUtils.subBytes(saved, 0, fetchLen);
+        synchronized (orignalBytes) {
+            byte[] saved = orignalBytes.get(start);
+            int fetchLen = (int) (end - start + 1);
+            if (saved == null) {
+                return UnsafeUtils.getBytes(start, fetchLen);
             } else {
-                byte[] r = new byte[fetchLen];
-                byte[] t = UnsafeUtils.getBytes(start + saved.length, fetchLen - saved.length);
-                System.arraycopy(saved, 0, r, 0, saved.length);
-                System.arraycopy(t, 0, r, saved.length, t.length);
-                return r;
+                if (saved.length >= fetchLen) {
+                    return UnsafeUtils.subBytes(saved, 0, fetchLen);
+                } else {
+                    byte[] r = new byte[fetchLen];
+                    byte[] t = UnsafeUtils.getBytes(start + saved.length, fetchLen - saved.length);
+                    System.arraycopy(saved, 0, r, 0, saved.length);
+                    System.arraycopy(t, 0, r, saved.length, t.length);
+                    return r;
+                }
             }
         }
     }
 
     public void release(){
-        orignalBytes.clear();
-        trunk.setMemoryFork(null);
+        synchronized (orignalBytes){
+            orignalBytes.clear();
+            trunk.setMemoryFork(null);
+        }
     }
 }

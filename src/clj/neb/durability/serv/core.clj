@@ -64,10 +64,13 @@
     (a/go-loop []
       (let [[act trunk-id loc ^bytes bs] (a/<! pending-chan)
             accessor (replica-accessors trunk-id)]
-        (case act
-          0 (t/sync-to-disk accessor loc bs)
-          1 (do (.truncate (.getChannel accessor) loc)
-                (.flush accessor))))
+        (try
+          (case act
+            0 (t/sync-to-disk accessor loc bs)
+            1 (do (.truncate (.getChannel accessor) loc)
+                  (.flush accessor)))
+          (catch Exception ex
+            (clojure.stacktrace/print-cause-trace ex))))
       (recur))
     (swap! clients assoc sid
            {:server-name server-name

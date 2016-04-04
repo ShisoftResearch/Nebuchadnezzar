@@ -202,7 +202,8 @@
          (fn [len]
            (WritePlan. len int-writer type_lengths/intLen)))
        (flatten)
-       (filter identity)))
+       (filter identity)
+       (doall)))
 
 (def internal-cell-fields [:*schema* :*hash* :*id*])
 

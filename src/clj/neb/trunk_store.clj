@@ -44,7 +44,10 @@
 
 (defn backup-trunks []
   (doseq [trunk (.getTrunks trunks)]
-    (sync-trunk trunk))
+    (try
+      (sync-trunk trunk)
+      (catch Exception ex
+        (clojure.stacktrace/print-cause-trace ex))))
   (Thread/sleep 1000))
 
 (defn start-defrag []
