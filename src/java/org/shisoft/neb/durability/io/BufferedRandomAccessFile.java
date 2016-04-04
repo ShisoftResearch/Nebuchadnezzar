@@ -18,10 +18,13 @@
 
 package org.shisoft.neb.durability.io;
 
-import java.io.*;
-import java.util.Arrays;
-
-import org.apache.log4j.Logger;
+import java.io.EOFException;
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.FileChannel;
 
 /**
  * A <code>BufferedRandomAccessFile</code> is like a
@@ -33,343 +36,358 @@ import org.apache.log4j.Logger;
  * functioning of the <code>RandomAccessFile</code> methods that are not
  * overridden here relies on the implementation of those methods in the
  * superclass.
- * Author : Avinash Lakshman ( alakshman@facebook.com) & Prashant Malik ( pmalik@facebook.com )
  */
+public class BufferedRandomAccessFile extends RandomAccessFile {
 
-public final class BufferedRandomAccessFile extends RandomAccessFile
-{
-    private static final Logger logger_ = Logger.getLogger(BufferedRandomAccessFile.class);
-    static final int LogBuffSz_ = 16; // 64K buffer
-    public static final int BuffSz_ = (1 << LogBuffSz_);
-    static final long BuffMask_ = ~(((long) BuffSz_) - 1L);
+    private static final long MAX_BYTES_IN_PAGE_CACHE = (long) Math.pow(2, 27); // 128mb
+
+    // absolute filesystem path to the file
+    private final String filePath;
+
+    // default buffer size, 64Kb
+    public static final int DEFAULT_BUFFER_SIZE = 65535;
+
+    // isDirty - true if this.buffer contains any un-synced bytes
+    private boolean isDirty, syncNeeded;
+
+    // buffer which will cache file blocks
+    private byte[] buffer;
+
+    // `current` as current position in file
+    // `bufferOffset` is the offset of the beginning of the buffer
+    // `validBufferBytes` is the number of bytes in the buffer that are actually valid; this will be LESS than buffer capacity if buffer is not full!
+    private long bufferOffset, current = 0;
+    private int validBufferBytes = 0;
+
+    // constant, used for caching purpose, -1 if file is open in "rw" mode
+    // otherwise this will hold cached file length
+    private final long fileLength;
+
+    // channel liked with the file, used to retrieve data and force updates.
+    private final FileChannel channel;
+
+    private long markedPointer;
+
+    private long bytesSinceCacheFlush = 0;
+    private long minBufferOffset = Long.MAX_VALUE;
 
     /*
-     * This implementation is based on the buffer implementation in Modula-3's
-     * "Rd", "Wr", "RdClass", and "WrClass" interfaces.
-     */
-    private boolean dirty_; // true iff unflushed bytes exist
-    private boolean closed_; // true iff the file is closed
-    private long curr_; // current position in file
-    private long lo_, hi_; // bounds on characters in "buff"
-    private byte[] buff_; // local buffer
-    private long maxHi_; // this.lo + this.buff.length
-    private boolean hitEOF_; // buffer contains last file block?
-    private long diskPos_; // disk position
-
-    /*
-     * To describe the above fields, we introduce the following abstractions for
-     * the file "f":
-     *
-     * len(f) the length of the file curr(f) the current position in the file
-     * c(f) the abstract contents of the file disk(f) the contents of f's
-     * backing disk file closed(f) true iff the file is closed
-     *
-     * "curr(f)" is an index in the closed interval [0, len(f)]. "c(f)" is a
-     * character sequence of length "len(f)". "c(f)" and "disk(f)" may differ if
-     * "c(f)" contains unflushed writes not reflected in "disk(f)". The flush
-     * operation has the effect of making "disk(f)" identical to "c(f)".
-     *
-     * A file is said to be *valid* if the following conditions hold:
-     *
-     * V1. The "closed" and "curr" fields are correct:
-     *
-     * f.closed == closed(f) f.curr == curr(f)
-     *
-     * V2. The current position is either contained in the buffer, or just past
-     * the buffer:
-     *
-     * f.lo <= f.curr <= f.hi
-     *
-     * V3. Any (possibly) unflushed characters are stored in "f.buff":
-     *
-     * (forall i in [f.lo, f.curr): c(f)[i] == f.buff[i - f.lo])
-     *
-     * V4. For all characters not covered by V3, c(f) and disk(f) agree:
-     *
-     * (forall i in [f.lo, len(f)): i not in [f.lo, f.curr) => c(f)[i] ==
-     * disk(f)[i])
-     *
-     * V5. "f.dirty" is true iff the buffer contains bytes that should be
-     * flushed to the file; by V3 and V4, only part of the buffer can be dirty.
-     *
-     * f.dirty == (exists i in [f.lo, f.curr): c(f)[i] != f.buff[i - f.lo])
-     *
-     * V6. this.maxHi == this.lo + this.buff.length
-     *
-     * Note that "f.buff" can be "null" in a valid file, since the range of
-     * characters in V3 is empty when "f.lo == f.curr".
-     *
-     * A file is said to be *ready* if the buffer contains the current position,
-     * i.e., when:
-     *
-     * R1. !f.closed && f.buff != null && f.lo <= f.curr && f.curr < f.hi
-     *
-     * When a file is ready, reading or writing a single byte can be performed
-     * by reading or writing the in-memory buffer without performing a disk
-     * operation.
-     */
-
-    /**
-     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code>
-     * in mode <code>mode</code>, which should be "r" for reading only, or
-     * "rw" for reading and writing.
-     */
-    public BufferedRandomAccessFile(File file, String mode) throws IOException
-    {
-        super(file, mode);
-        this.init(0);
-    }
-
-    public BufferedRandomAccessFile(File file, String mode, int size) throws IOException
-    {
-        super(file, mode);
-        this.init(size);
-    }
-
-    /**
      * Open a new <code>BufferedRandomAccessFile</code> on the file named
      * <code>name</code> in mode <code>mode</code>, which should be "r" for
      * reading only, or "rw" for reading and writing.
      */
     public BufferedRandomAccessFile(String name, String mode) throws IOException
     {
-        super(name, mode);
-        this.init(0);
+        this(new File(name), mode, DEFAULT_BUFFER_SIZE);
     }
 
-    public BufferedRandomAccessFile(String name, String mode, int size) throws FileNotFoundException
+    public BufferedRandomAccessFile(String name, String mode, int bufferSize) throws IOException
     {
-        super(name, mode);
-        this.init(size);
+        this(new File(name), mode, bufferSize);
     }
 
-    private void init(int size)
-    {
-        this.dirty_ = this.closed_ = false;
-        this.lo_ = this.curr_ = this.hi_ = 0;
-        this.buff_ = (size > BuffSz_) ? new byte[size] : new byte[BuffSz_];
-        this.maxHi_ = (long) BuffSz_;
-        this.hitEOF_ = false;
-        this.diskPos_ = 0L;
-    }
-
-    public void close() throws IOException
-    {
-        this.flush();
-        this.closed_ = true;
-        super.close();
-    }
-
-    /**
-     * Flush any bytes in the file's buffer that have not yet been written to
-     * disk. If the file was created read-only, this method is a no-op.
+    /*
+     * Open a new <code>BufferedRandomAccessFile</code> on <code>file</code> in
+     * mode <code>mode</code>, which should be "r" for reading only, or "rw" for
+     * reading and writing.
      */
+    public BufferedRandomAccessFile(File file, String mode) throws IOException
+    {
+        this(file, mode, DEFAULT_BUFFER_SIZE);
+    }
+
+    public BufferedRandomAccessFile(File file, String mode, int bufferSize) throws IOException
+    {
+        super(file, mode);
+
+        channel = super.getChannel();
+        filePath = file.getAbsolutePath();
+
+        // allocating required size of the buffer
+        if (bufferSize <= 0)
+            throw new IllegalArgumentException("bufferSize must be positive");
+        buffer = new byte[bufferSize];
+        reBuffer();
+
+        // if in read-only mode, caching file size
+        fileLength = (mode.equals("r")) ? this.channel.size() : -1;
+    }
+
+    public void sync() throws IOException
+    {
+        if (syncNeeded)
+        {
+            flush();
+
+            channel.force(true); // true, because file length counts as
+            // "meta-data"
+            syncNeeded = false;
+        }
+    }
+
     public void flush() throws IOException
     {
-        this.flushBuffer();
-    }
-
-    /* Flush any dirty bytes in the buffer to disk. */
-    private void flushBuffer() throws IOException
-    {
-        if (this.dirty_)
+        if (isDirty)
         {
-            if (this.diskPos_ != this.lo_)
-                super.seek(this.lo_);
-            int len = (int) (this.curr_ - this.lo_);
-            super.write(this.buff_, 0, len);
-            this.diskPos_ = this.curr_;
-            this.dirty_ = false;
+            if (channel.position() != bufferOffset)
+                channel.position(bufferOffset);
+            super.write(buffer, 0, validBufferBytes);
+            isDirty = false;
         }
     }
 
-    /*
-     * Read at most "this.buff.length" bytes into "this.buff", returning the
-     * number of bytes read. If the return result is less than
-     * "this.buff.length", then EOF was read.
-     */
-    private int fillBuffer() throws IOException
+    @Override
+    public void setLength(long newLength) throws IOException
     {
-        int cnt = 0;
-        int rem = this.buff_.length;
-        while (rem > 0)
+        if (newLength < 0)
+            throw new IllegalArgumentException();
+
+        // account for dirty data in buffers
+        if (isDirty)
         {
-            int n = super.read(this.buff_, cnt, rem);
+            if (newLength < bufferOffset)
+            {
+                // buffer is garbage
+                validBufferBytes = 0;
+            }
+            else if (newLength > (bufferOffset + validBufferBytes))
+            {
+                // flush everything in buffer
+                flush();
+            }
+            else // buffer within range
+            {
+                // truncate buffer and flush
+                validBufferBytes = (int)(newLength - bufferOffset);
+                flush();
+            }
+        }
+
+        // at this point all dirty buffer data is flushed
+        super.setLength(newLength);
+
+        validBufferBytes = 0;
+        current = newLength;
+        reBuffer();
+    }
+
+    private void reBuffer() throws IOException
+    {
+        flush(); // synchronizing buffer and file on disk
+
+        bufferOffset = current;
+        if (bufferOffset >= channel.size())
+        {
+            validBufferBytes = 0;
+            return;
+        }
+
+        if (bufferOffset < minBufferOffset)
+            minBufferOffset = bufferOffset;
+
+        channel.position(bufferOffset); // setting channel position
+        int read = 0;
+        while (read < buffer.length)
+        {
+            int n = super.read(buffer, read, buffer.length - read);
             if (n < 0)
                 break;
-            cnt += n;
-            rem -= n;
+            read += n;
         }
-        if ( (cnt < 0) && (this.hitEOF_ = (cnt < this.buff_.length)) )
+        validBufferBytes = read;
+
+        bytesSinceCacheFlush += read;
+    }
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read() throws IOException
+    {
+        if (isEOF())
+            return -1; // required by RandomAccessFile
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        return ((int) buffer[(int) (current++ - bufferOffset)]) & 0xFF;
+    }
+
+    @Override
+    public int read(byte[] buffer) throws IOException
+    {
+        return read(buffer, 0, buffer.length);
+    }
+
+    @Override
+    // -1 will be returned if there is nothing to read; higher-level methods like readInt
+    // or readFully (from RandomAccessFile) will throw EOFException but this should not
+    public int read(byte[] buff, int offset, int length) throws IOException
+    {
+        if (length == 0)
+            return 0;
+
+        if (isEOF())
+            return -1;
+
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current >= bufferOffset && current < bufferOffset + validBufferBytes;
+
+        int toCopy = Math.min(length, validBufferBytes - (int) (current - bufferOffset));
+        System.arraycopy(buffer, (int) (current - bufferOffset), buff, offset, toCopy);
+        current += toCopy;
+
+        return toCopy;
+    }
+
+    public ByteBuffer readBytes(int length) throws IOException
+    {
+        assert length >= 0 : "buffer length should not be negative: " + length;
+
+        byte[] buff = new byte[length];
+        readFully(buff); // reading data buffer
+
+        return ByteBuffer.wrap(buff);
+    }
+
+    private final byte[] singleByteBuffer = new byte[1]; // so we can use the write(byte[]) path w/o tons of new byte[] allocations
+    @Override
+    public void write(int val) throws IOException
+    {
+        singleByteBuffer[0] = (byte) val;
+        this.write(singleByteBuffer, 0, 1);
+    }
+
+    @Override
+    public void write(byte[] b) throws IOException
+    {
+        write(b, 0, b.length);
+    }
+
+    @Override
+    public void write(byte[] buff, int offset, int length) throws IOException
+    {
+        if (buffer == null)
+            throw new ClosedChannelException();
+
+        if (isReadOnly())
+            throw new IOException("Unable to write: file is in the read-only mode.");
+
+        while (length > 0)
         {
-            // make sure buffer that wasn't read is initialized with -1
-            Arrays.fill(this.buff_, cnt, this.buff_.length, (byte) 0xff);
+            int n = writeAtMost(buff, offset, length);
+            offset += n;
+            length -= n;
+            isDirty = true;
+            syncNeeded = true;
         }
-        this.diskPos_ += cnt;
-        return cnt;
+    }
+
+    private boolean isReadOnly()
+    {
+        return fileLength != -1;
     }
 
     /*
-     * This method positions <code>this.curr</code> at position <code>pos</code>.
-     * If <code>pos</code> does not fall in the current buffer, it flushes the
-     * current buffer and loads the correct one.<p>
-     *
-     * On exit from this routine <code>this.curr == this.hi</code> iff <code>pos</code>
-     * is at or past the end-of-file, which can only happen if the file was
-     * opened in read-only mode.
+     * Write at most "length" bytes from "b" starting at position "offset", and
+     * return the number of bytes written. caller is responsible for setting
+     * isDirty.
      */
-    public void seek(long pos) throws IOException
+    private int writeAtMost(byte[] buff, int offset, int length) throws IOException
     {
-        if (pos >= this.hi_ || pos < this.lo_)
-        {
-            // seeking outside of current buffer -- flush and read
-            this.flushBuffer();
-            this.lo_ = pos & BuffMask_; // start at BuffSz boundary
-            this.maxHi_ = this.lo_ + (long) this.buff_.length;
-            if (this.diskPos_ != this.lo_)
-            {
-                super.seek(this.lo_);
-                this.diskPos_ = this.lo_;
-            }
-            int n = this.fillBuffer();
-            this.hi_ = this.lo_ + (long) n;
-        }
-        else
-        {
-            // seeking inside current buffer -- no read required
-            if (pos < this.curr_)
-            {
-                // if seeking backwards, we must flush to maintain V4
-                this.flushBuffer();
-            }
-        }
-        this.curr_ = pos;
+        if (current >= bufferOffset + buffer.length)
+            reBuffer();
+        assert current < bufferOffset + buffer.length;
+
+        int positionWithinBuffer = (int) (current - bufferOffset);
+        int toCopy = Math.min(length, buffer.length - positionWithinBuffer);
+        System.arraycopy(buff, offset, buffer, positionWithinBuffer, toCopy);
+        current += toCopy;
+        validBufferBytes = Math.max(validBufferBytes, positionWithinBuffer + toCopy);
+        assert current <= bufferOffset + buffer.length;
+
+        return toCopy;
     }
 
-    public long getFilePointer()
+    @Override
+    public void seek(long newPosition) throws IOException
     {
-        return this.curr_;
+        if (newPosition < 0)
+            throw new IllegalArgumentException("new position should not be negative");
+
+        if (isReadOnly() && newPosition > fileLength)
+            throw new EOFException(String.format("unable to seek to position %d in %s (%d bytes) in read-only mode",
+                    newPosition, filePath, fileLength));
+
+        current = newPosition;
+
+        if (newPosition > (bufferOffset + validBufferBytes) || newPosition < bufferOffset)
+            reBuffer(); // this will set bufferEnd for us
+    }
+
+    @Override
+    public int skipBytes(int count) throws IOException
+    {
+        if (count > 0)
+        {
+            long currentPos = getFilePointer(), eof = length();
+            int newCount = (int) ((currentPos + count > eof) ? eof - currentPos : count);
+
+            seek(currentPos + newCount);
+            return newCount;
+        }
+
+        return 0;
     }
 
     public long length() throws IOException
     {
-        return Math.max(this.curr_, super.length());
+        return (fileLength == -1) ? Math.max(Math.max(current, channel.size()), bufferOffset + validBufferBytes) : fileLength;
     }
 
-    public int read() throws IOException
+    public long getFilePointer()
     {
-        if (this.curr_ >= this.hi_)
-        {
-            // test for EOF
-            // if (this.hi < this.maxHi) return -1;
-            if (this.hitEOF_)
-                return -1;
-
-            // slow path -- read another buffer
-            this.seek(this.curr_);
-            if (this.curr_ == this.hi_)
-                return -1;
-        }
-        byte res = this.buff_[(int) (this.curr_ - this.lo_)];
-        this.curr_++;
-        return ((int) res) & 0xFF; // convert byte -> int
+        return current;
     }
 
-    public int read(byte[] b) throws IOException
+    public String getPath()
     {
-        return this.read(b, 0, b.length);
+        return filePath;
     }
 
-    public int read(byte[] b, int off, int len) throws IOException
-    {
-        if (this.curr_ >= this.hi_)
-        {
-            // test for EOF
-            // if (this.hi < this.maxHi) return -1;
-            if (this.hitEOF_)
-                return -1;
-
-            // slow path -- read another buffer
-            this.seek(this.curr_);
-            if (this.curr_ == this.hi_)
-                return -1;
-        }
-        len = Math.min(len, (int) (this.hi_ - this.curr_));
-        int buffOff = (int) (this.curr_ - this.lo_);
-        System.arraycopy(this.buff_, buffOff, b, off, len);
-        this.curr_ += len;
-        return len;
-    }
-
-    public void write(int b) throws IOException
-    {
-        if (this.curr_ >= this.hi_)
-        {
-            if (this.hitEOF_ && this.hi_ < this.maxHi_)
-            {
-                // at EOF -- bump "hi"
-                this.hi_++;
-            }
-            else
-            {
-                // slow path -- write current buffer; read next one
-                this.seek(this.curr_);
-                if (this.curr_ == this.hi_)
-                {
-                    // appending to EOF -- bump "hi"
-                    this.hi_++;
-                }
-            }
-        }
-        this.buff_[(int) (this.curr_ - this.lo_)] = (byte) b;
-        this.curr_++;
-        this.dirty_ = true;
-    }
-
-    public void write(byte[] b) throws IOException
-    {
-        this.write(b, 0, b.length);
-    }
-
-    public void write(byte[] b, int off, int len) throws IOException
-    {
-        while (len > 0)
-        {
-            int n = this.writeAtMost(b, off, len);
-            off += n;
-            len -= n;
-            this.dirty_ = true;
-        }
-    }
-
-    /*
-     * Write at most "len" bytes to "b" starting at position "off", and return
-     * the number of bytes written.
+    /**
+     * @return true if there is no more data to read
      */
-    private int writeAtMost(byte[] b, int off, int len) throws IOException
+    public boolean isEOF() throws IOException
     {
-        if (this.curr_ >= this.hi_)
-        {
-            if (this.hitEOF_ && this.hi_ < this.maxHi_)
-            {
-                // at EOF -- bump "hi"
-                this.hi_ = this.maxHi_;
-            }
-            else
-            {
-                // slow path -- write current buffer; read next one
-                this.seek(this.curr_);
-                if (this.curr_ == this.hi_)
-                {
-                    // appending to EOF -- bump "hi"
-                    this.hi_ = this.maxHi_;
-                }
-            }
-        }
-        len = Math.min(len, (int) (this.hi_ - this.curr_));
-        int buffOff = (int) (this.curr_ - this.lo_);
-        System.arraycopy(b, off, this.buff_, buffOff, len);
-        this.curr_ += len;
-        return len;
+        return getFilePointer() == length();
     }
+
+    public long bytesRemaining() throws IOException
+    {
+        return length() - getFilePointer();
+    }
+
+    @Override
+    public void close() throws IOException
+    {
+        sync();
+        buffer = null;
+        super.close();
+    }
+
+    public void reset() throws IOException
+    {
+        seek(markedPointer);
+    }
+
+    public long bytesPastMark()
+    {
+        long bytes = getFilePointer() - markedPointer;
+        assert bytes >= 0;
+        return bytes;
+    }
+
 }
