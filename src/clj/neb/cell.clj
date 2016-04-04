@@ -169,6 +169,8 @@
                  (recur-nested (:f (schema-by-sname field-format)) (get data field-name)))))])
         schema-fields))))
 
+(defrecord WritePlan [value writer length])
+
 (defn plan-data-write [data schema]
   (->> (walk-schema-for-write
          (:f schema) data
@@ -184,25 +186,22 @@
                                                       "data: " data))))
              (let [field-data (if encoder (encoder field-data) field-data)]
                (when (not (nil? field-data))
-                 {:value field-data
-                  :writer writer
-                  :length (if dynamic?
-                            (cond
-                              count-array-length
-                              (+ (* (count-array-length field-data)
-                                    unit-length)
-                                 type_lengths/intLen)
-                              count-length
-                              (count-length field-data))
-                            length)}))))
+                 (WritePlan. field-data writer
+                             (if dynamic?
+                               (cond
+                                 count-array-length
+                                 (+ (* (count-array-length field-data)
+                                       unit-length)
+                                    type_lengths/intLen)
+                                 count-length
+                                 (count-length field-data))
+                               length))))))
          (fn [& items]
            (map second items))
          (fn [_ _ array-header & array-content]
            [array-header array-content])
          (fn [len]
-           {:value len
-            :writer int-writer
-            :length type_lengths/intLen}))
+           (WritePlan. len int-writer type_lengths/intLen)))
        (flatten)
        (filter identity)))
 
