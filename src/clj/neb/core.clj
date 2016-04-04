@@ -28,7 +28,7 @@
     (hash-str cell-key (Hashing/sha1))
     (hash-str cell-key (Hashing/sha256))))
 
-(defcache cell-id-by-key {:expire-after-access-secs :600} cell-id-by-key*)
+(defcache cell-id-by-key {:expire-after-access-secs :60} cell-id-by-key*)
 
 (defn locate-cell-by-id [^UUID cell-id]
   (get-server-for-name cell-id :hashing (fn [^UUID id] (.getMostSignificantBits id))))
