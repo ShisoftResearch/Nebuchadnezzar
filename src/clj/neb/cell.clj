@@ -119,55 +119,54 @@
                             require-packing?
                             (fn [] (:d (recur-nested [[:d array-format]]))))]
           (.advancePointer cell-reader type_lengths/intLen)
-          (apply
-            array-func
-            (doall (repeatedly array-len repeat-func))))))))
+          (array-func (doall (repeatedly array-len repeat-func))))))))
 
 (defn walk-schema-for-write
   "It was assumed to have some side effect"
   [schema-fields data field-func map-func array-func array-header-func]
-  (apply
-    map-func
-    (doall
-      (map
-        (fn [[field-name field-format]]
-          [field-name
-           (let [is-type? keyword?
-                 is-nested? vector?
-                 recur-nested (fn [nested-schema data & _]
-                                (walk-schema-for-write
-                                  nested-schema data field-func map-func
-                                  array-func array-header-func))]
-             (cond
-               (is-nested? field-format)
-               (if (= :ARRAY (first field-format))
-                 (let [array-name field-name
-                       array-format (second field-format)
-                       array-items (get data array-name)
-                       array-length (count array-items)
-                       array-header (array-header-func array-length)
-                       nested-format? (check-is-nested array-format)
-                       array-format? (and nested-format? (= :ARRAY (first array-format)))
-                       type-format? (and (keyword array-format) (get @data-types array-format))
-                       nested-map-format? (and nested-format? (not array-format?))
-                       require-packing? (or array-format? type-format?)
-                       nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
-                       map-func (cond
-                                  nested-map-format?
-                                  (fn [x] (recur-nested array-format x))
-                                  nested-schema
-                                  (fn [x] (recur-nested nested-schema x))
-                                  require-packing?
-                                  (fn [x] (recur-nested [[:d array-format]] {:d x})))
-                       array-content
-                       (doall (map map-func array-items))]
-                   (apply array-func array-name array-format array-header array-content))
-                 (recur-nested field-format (get data field-name)))
-               (is-type? field-format)
-               (if (get @data-types field-format)
-                 (field-func (get data field-name) field-name field-format (get @data-types field-format))
-                 (recur-nested (:f (schema-by-sname field-format)) (get data field-name)))))])
-        schema-fields))))
+  (let [is-type? keyword?
+        is-nested? vector?
+        recur-nested (fn [nested-schema data & _]
+                       (walk-schema-for-write
+                         nested-schema data field-func map-func
+                         array-func array-header-func))]
+    (map-func
+      (doall
+        (map
+          (fn [pvec]
+            (let [field-name (pvec 0)
+                  field-format (pvec 1)]
+              [field-name
+               (cond
+                 (is-nested? field-format)
+                 (if (= :ARRAY (first field-format))
+                   (let [array-name field-name
+                         array-format (second field-format)
+                         array-items (get data array-name)
+                         array-length (count array-items)
+                         array-header (array-header-func array-length)
+                         nested-format? (check-is-nested array-format)
+                         array-format? (and nested-format? (= :ARRAY (first array-format)))
+                         type-format? (and (keyword array-format) (get @data-types array-format))
+                         nested-map-format? (and nested-format? (not array-format?))
+                         require-packing? (or array-format? type-format?)
+                         nested-schema (when (and (not nested-map-format?) (not require-packing?)) (:f (schema-by-sname array-format)))
+                         map-func (cond
+                                    nested-map-format?
+                                    (fn [x] (recur-nested array-format x))
+                                    nested-schema
+                                    (fn [x] (recur-nested nested-schema x))
+                                    require-packing?
+                                    (fn [x] (recur-nested [[:d array-format]] {:d x})))
+                         array-content
+                         (doall (map map-func array-items))]
+                     (array-func array-name array-format array-header array-content))
+                   (recur-nested field-format (get data field-name)))
+                 (is-type? field-format)
+                 (if (get @data-types field-format)
+                   (field-func (get data field-name) field-name field-format (get @data-types field-format))
+                   (recur-nested (:f (schema-by-sname field-format)) (get data field-name))))]))
+          schema-fields)))))
 
 (defrecord WritePlan [value writer length])
 
@@ -196,9 +195,9 @@
                                  count-length
                                  (count-length field-data))
                                length))))))
-         (fn [& items]
+         (fn [items]
            (map second items))
-         (fn [_ _ array-header & array-content]
+         (fn [_ _ array-header array-content]
            [array-header array-content])
          (fn [len]
            (WritePlan. len int-writer type_lengths/intLen)))
@@ -216,9 +215,9 @@
                    reader (or reader (get dep :reader))
                    reader (if decoder (comp decoder reader) reader)]
                (.streamRead cell-reader reader)))
-           (fn [& items]
+           (fn [items]
              (into {} items))
-           (fn [& items]
+           (fn [items]
              (into [] items)))
          {:*schema* schema-id
           :*hash*   *cell-hash*}))

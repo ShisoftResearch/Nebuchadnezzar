@@ -65,8 +65,7 @@
         :append false))
 
 (defn walk-schema [schema-fields map-func field-func array-func]
-  (apply
-    map-func
+  (map-func
     (doall
       (map
         (fn [[field-name field-format]]
