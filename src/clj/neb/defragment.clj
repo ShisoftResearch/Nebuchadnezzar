@@ -2,8 +2,7 @@
   (:require [neb.cell :refer [read-cell-header-field pending-frags]]
             [neb.header :refer [cell-head-len]]
             [neb.schema :refer [schema-by-id]]
-            [cluster-connector.utils.for-debug :refer [spy $]]
-            [clojure.core.async :as a])
+            [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb Trunk)
            (org.shisoft.neb.io CellMeta)))
 

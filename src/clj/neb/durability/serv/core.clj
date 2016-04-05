@@ -60,7 +60,7 @@
         ;                         (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
-        pending-chan (a/chan)]
+        pending-chan (a/chan 500)]
     (a/go-loop []
       (let [[act trunk-id loc ^bytes bs] (a/<! pending-chan)
             accessor (replica-accessors trunk-id)]
@@ -84,11 +84,11 @@
 
 (defn sync-trunk [sid trunk-id loc bs]
   (let [client (get @clients sid)]
-    (a/go (a/>! (:pending-chan client) [0 trunk-id loc bs]))))
+    (a/>!! (:pending-chan client) [0 trunk-id loc bs])))
 
 (defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
   (let [client (get @clients sid)]
-    (a/go (a/>! (:pending-chan client) [1 trunk-id tail-loc])))
+    (a/>!! (:pending-chan client) [1 trunk-id tail-loc]))
   (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp)
   #_(switch-log sid trunk-id timestamp))
 
@@ -97,7 +97,7 @@
         ^OutputStream appender @(get-in client [:appenders trunk-id])
         act (get {:write 0
                   :delete 1} act)]
-    (a/go (a/>! pending-logs [appender act timestamp ^UUID cell-id data]))))
+    (a/>!! pending-logs [appender act timestamp ^UUID cell-id data])))
 
 (defn ^:deprecated  switch-log [sid trunk-id timestamp]
   (let [client (get @clients sid)
@@ -109,7 +109,7 @@
             ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
         (reset! (get-in client [:appenders trunk-id]) new-appender)
         ;close orignal appender
-        (a/go (a/>! pending-logs [appender -10 timestamp nil])))
+        (a/>!! pending-logs [appender -10 timestamp nil]))
       (finally
         (.unlock log-switch)))))
 
