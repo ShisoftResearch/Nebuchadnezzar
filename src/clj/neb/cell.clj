@@ -16,7 +16,7 @@
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^Trunk *cell-trunk* nil)
 
-(def pending-frags (a/chan 5000))
+(def pending-frags (a/chan 1000)) 
 
 (defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
