@@ -73,6 +73,9 @@
 (defn new-cell-by-raw* [id bs]
   (dist-call id 'neb.trunk-store/new-cell-by-raw bs))
 
+(defn cell-exists?* [id]
+  (dist-call id 'neb.trunk-store/cell-exists?))
+
 (defn get-batch-server-name [params-coll]
   (group-by
     first
@@ -144,6 +147,7 @@
 (op-fns select-keys-from-cell)
 (op-fns write-lock-exec)
 (op-fns new-cell-by-raw)
+(op-fns cell-exists?)
 
 (defn add-schema [sname fields]
   (d-lock/locking

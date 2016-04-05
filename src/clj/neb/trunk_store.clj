@@ -100,6 +100,9 @@
 (defn new-cell-by-raw [^UUID cell-id bs]
   (dispatch-trunk cell-id cell/new-cell-by-raw bs))
 
+(defn cell-exists? [^UUID cell-id]
+  (dispatch-trunk cell-id cell/cell-exists?))
+
 (defmacro batch-fn [func]
   `(do (defn ~(symbol (str "batch-" (name func))) [coll#]
          (into
@@ -118,3 +121,4 @@
 (batch-fn get-in-cell)
 (batch-fn select-keys-from-cell)
 (batch-fn new-cell-by-raw)
+(batch-fn cell-exists?)

@@ -299,8 +299,11 @@
     (.streamWrite cell-writer bytes-writer bs cell-length)
     (.addCellToTrunkIndex cell-writer hash)))
 
+(defn cell-exists? [^Trunk ttrunk ^Long hash]
+  (.hasCell ttrunk hash))
+
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
-  (when (.hasCell ttrunk hash)
+  (when (cell-exists? ttrunk hash)
     (throw (Exception. "Cell hash already exists")))
   (when-let [schema (schema-by-id schema-id)]
     (write-cell ttrunk hash partition schema data)))
