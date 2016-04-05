@@ -2,10 +2,11 @@
   (:require [midje.sweet :refer :all]
             [neb.core :refer :all]
             [neb.server :refer :all]
-            [neb.durability.serv.core :refer [recover-backup list-backup-ids]]
+            [neb.durability.serv.core :refer [recover-backup list-backup-ids plug-flushed-ch]]
             [neb.trunk-store :as ts :refer [backup-trunks]]
             [neb.cell :as cell]
-            [cluster-connector.utils.for-debug :refer [$ spy]])
+            [cluster-connector.utils.for-debug :refer [$ spy]]
+            [clojure.core.async :as a])
   (:import (org.shisoft.neb.utils StandaloneZookeeper)
            (java.io File)
            (org.apache.commons.io FileUtils)
@@ -26,9 +27,9 @@
               :auto-backsync false
               :replication 2}
       inserted-cell-ids (atom #{})
-      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."]
+      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
+      flush-chan (a/chan)]
   (.startZookeeper zk 21817)
-  (FileUtils/deleteDirectory (File. "data"))
   (try
     (facts "Durability"
            (fact "Start Server"
@@ -36,6 +37,8 @@
            (fact "Prepare schemas"
                  (add-schema :raw-data [[:data :obj]
                                         [:num :int]]) => 0)
+           (fact "Plug flush channel"
+                 (plug-flushed-ch flush-chan))
            (fact "Write something"
                  (dorun
                    (pmap
@@ -45,7 +48,7 @@
                                                           :num id})]
                          (swap! inserted-cell-ids conj cell-id)
                          cell-id => anything))
-                     (range 3000))))
+                     (range 300))))
            (swap! inserted-cell-ids sort)
            (fact "Check Recover"
                  (dorun
@@ -55,7 +58,7 @@
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
                                                            :num id
                                                            :*id* (to-id str-key)})))
-                     (range 3000))))
+                     (range 300))))
            (fact "Check dirty"
                  (let [trunks (.getTrunks ts/trunks)]
                    (doseq [trunk trunks]
@@ -64,7 +67,8 @@
                        (.getValue ^Map$Entry (first dirtyRanges)) => (dec (.getAppendHeaderValue trunk))))))
            (fact "Sync trunks"
                  (backup-trunks) => anything)
-           (Thread/sleep 10000)
+           (a/<!! flush-chan)
+           (a/<!! flush-chan)
            (fact "Check backedup ids"
                  (sort (set (list-backup-ids))) => (just @inserted-cell-ids :gaps-ok :in-any-order))
            (fact "Delete Everything"
@@ -72,7 +76,7 @@
                    (pmap
                      (fn [id]
                        (delete-cell (str "test" id)) => anything)
-                     (range 3000))))
+                     (range 300))))
            (fact "Check Deleted"
                  (let [trunks (.getTrunks ts/trunks)]
                    (doseq [trunk trunks]
@@ -95,11 +99,11 @@
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
                                                            :num id
                                                            :*id* (to-id str-key)})))
-                     (range 3000)))))
+                     (range 300)))))
     (finally
       (fact "Clear Zookeeper Server"
             (clear-zk) => anything)
       (fact "Stop Server"
             (stop-server)  => anything)
-      (FileUtils/deleteDirectory (File. "data"))
+      #_(FileUtils/deleteDirectory (File. "data"))
       (.stopZookeeper zk))))

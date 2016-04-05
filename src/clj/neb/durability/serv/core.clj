@@ -60,15 +60,19 @@
         ;                         (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
-        pending-chan (a/chan 500)]
+        pending-chan (a/chan 500)
+        flushed-ch (atom nil)]
     (a/go-loop []
       (let [[act trunk-id loc ^bytes bs] (a/<! pending-chan)
             accessor (replica-accessors trunk-id)]
         (try
           (case act
-            0 (t/sync-to-disk accessor loc bs)
+            0 (do (t/sync-to-disk accessor loc bs))
             1 (do (.truncate (.getChannel accessor) loc)
-                  (.flush accessor)))
+                  (.flush accessor)
+                  (when @flushed-ch
+                    (println "Flushed backup")
+                    (a/>!! @flushed-ch true))))
           (catch Exception ex
             (clojure.stacktrace/print-cause-trace ex))))
       (recur))
@@ -79,8 +83,13 @@
             ;:appenders   log-appenders
             :sync-time   sync-timestamps
             :log-switches  log-switches
-            :pending-chan pending-chan})
+            :pending-chan pending-chan
+            :flushed-ch flushed-ch})
     sid))
+
+(defn plug-flushed-ch [chan]
+  (doseq [[_ {:keys [flushed-ch]}] @clients]
+    (reset! flushed-ch chan)))
 
 (defn sync-trunk [sid trunk-id loc bs]
   (let [client (get @clients sid)]
@@ -136,7 +145,7 @@
   (println "Recovering Backups...")
   (let [dirs-to-recover (list-recover-dir)]
     (doseq [data-dir dirs-to-recover]
-      (when (.isDirectory data-dir)
+      (when (and (.isDirectory data-dir) (not= (.getName (File. ^String @data-path)) (.getName data-dir)))
         (doseq [data-file (sort-by #(.getName %) (.listFiles data-dir))]
           (t/recover data-file))
         (.createNewFile (File. (str (.getAbsolutePath data-dir) "/imported")))))))

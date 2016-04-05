@@ -53,11 +53,12 @@
       (loop [pos 0]
         (let [d-range (.ceilingEntry dirty-ranges pos)]
           (if-not d-range
-            (finish-trunk-sync trunk append-header timestamp)
+            (when (> (.size dirty-ranges) 0)
+              (finish-trunk-sync trunk append-header timestamp))
             (do (let [start (.getKey d-range)
-                      end (min (.getValue d-range) append-header)]
+                      end (min (.getValue d-range) (dec append-header))]
                   (sync-range trunk start end))
-                (recur (.getValue d-range))))))
+                (recur (inc (.getValue d-range)))))))
       (.release mf))
     (finally
       (.writeUnlock trunk))))
