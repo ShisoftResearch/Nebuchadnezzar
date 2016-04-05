@@ -28,6 +28,7 @@
       inserted-cell-ids (atom #{})
       placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."]
   (.startZookeeper zk 21817)
+  (FileUtils/deleteDirectory (File. "data"))
   (try
     (facts "Durability"
            (fact "Start Server"
@@ -44,7 +45,7 @@
                                                           :num id})]
                          (swap! inserted-cell-ids conj cell-id)
                          cell-id => anything))
-                     (range 300))))
+                     (range 3000))))
            (swap! inserted-cell-ids sort)
            (fact "Check Recover"
                  (dorun
@@ -54,7 +55,7 @@
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
                                                            :num id
                                                            :*id* (to-id str-key)})))
-                     (range 300))))
+                     (range 3000))))
            (fact "Check dirty"
                  (let [trunks (.getTrunks ts/trunks)]
                    (doseq [trunk trunks]
@@ -71,7 +72,7 @@
                    (pmap
                      (fn [id]
                        (delete-cell (str "test" id)) => anything)
-                     (range 300))))
+                     (range 3000))))
            (fact "Check Deleted"
                  (let [trunks (.getTrunks ts/trunks)]
                    (doseq [trunk trunks]
@@ -94,7 +95,7 @@
                          (read-cell str-key) => (contains {:data {:str (str placr-holder id)}
                                                            :num id
                                                            :*id* (to-id str-key)})))
-                     (range 300)))))
+                     (range 3000)))))
     (finally
       (fact "Clear Zookeeper Server"
             (clear-zk) => anything)

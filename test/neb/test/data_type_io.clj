@@ -39,4 +39,5 @@
            @data-types)))
 
 (facts "Data types io integrity test"
+       ()
        (gen-test-cases))

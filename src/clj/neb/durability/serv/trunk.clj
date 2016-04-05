@@ -10,6 +10,8 @@
            (java.io InputStream)
            (java.util UUID)))
 
+(set! *warn-on-reflection* true)
+
 (defn sync-to-disk [^BufferedRandomAccessFile accessor loc ^bytes bs]
   (locking accessor
     (.seek accessor loc)
@@ -34,8 +36,7 @@
     r))
 
 (defn recover [file-path]
-  (let [^InputStream reader (io/input-stream file-path)
-        pool (cp/threadpool 10)]
+  (let [^InputStream reader (io/input-stream file-path)]
     (try
       (while (> (.available reader) 0)
         (let [header-bytes (read-bytes reader cell-head-len)
@@ -43,10 +44,11 @@
               cell-id (UUID. partition hash)
               body-bytes (read-bytes reader cell-length)
               cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
-          (cp/future pool (new-cell-by-raw* cell-id cell-bytes))))
+          (new-cell-by-raw* cell-id cell-bytes)))
+      (catch Exception ex
+        (clojure.stacktrace/print-cause-trace ex))
       (finally
-        (.close reader)
-        (cp/shutdown pool)))))
+        (.close reader)))))
 
 (defn list-ids [file-path]
   (let [^InputStream reader (io/input-stream file-path)]

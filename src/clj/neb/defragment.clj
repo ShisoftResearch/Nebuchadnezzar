@@ -9,19 +9,6 @@
 
 (set! *warn-on-reflection* true)
 
-(defn collect-frag* [^Trunk ttrunk start end]
-  (locking (.getFragments ttrunk)
-    (.addFragment ttrunk start end)))
-
-(defn collecting-frags []
-  (a/go-loop []
-    (let [params (a/<! pending-frags)
-          ttrunk (params 0)
-          start (params 1)
-          end (params 2)]
-      (collect-frag* ttrunk start end))
-    (recur)))
-
 (defn scan-trunk-and-defragment [^Trunk ttrunk]
   (.readLock ttrunk)
   (try

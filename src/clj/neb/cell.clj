@@ -16,7 +16,7 @@
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^Trunk *cell-trunk* nil)
 
-(def pending-frags (a/chan))
+(def pending-frags (a/chan 5000))
 
 (defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
@@ -66,8 +66,20 @@
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
     (writer trunk value (+ loc offset))))
 
+(defn collect-frag* [^Trunk ttrunk start end]
+  (locking (.getFragments ttrunk)
+    (.addFragment ttrunk start end)))
+
+(a/go-loop []
+  (let [params (a/<! pending-frags)
+        ttrunk (params 0)
+        start (params 1)
+        end (params 2)]
+    (collect-frag* ttrunk start end))
+  (recur))
+
 (defn add-frag [^Trunk ttrunk start end]
-  (a/go (a/>! pending-frags [ttrunk start end])))
+  (a/>!! pending-frags [ttrunk start end]))
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))

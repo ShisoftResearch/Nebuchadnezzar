@@ -49,7 +49,6 @@
         (clojure.stacktrace/print-cause-trace ex)))))
 
 (defn start-defrag []
-  (defrag/collecting-frags)
   (reset! defrag-service (ms/start-service defrag-store-trunks 10)))
 
 (defn stop-defrag []
