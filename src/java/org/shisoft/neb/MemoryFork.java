@@ -28,7 +28,7 @@ public class MemoryFork {
             long bsLen = end - start;
             byte[] bs = new byte[(int) bsLen];
             for (long i = start; i < end; i++) {
-                bs[(int) (i - start)] = Trunk.getUnsafe().getByte(i);
+                bs[(int) (i - start)] = Trunk.getUnsafe().getByte(trunk.getStoreAddress() + i);
             }
             orignalBytes.put(start, bs);
         }
