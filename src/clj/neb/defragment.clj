@@ -24,7 +24,7 @@
                     ^CellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
                 (cond
                   cell-meta
-                  (let [new-frag-pos
+                  (let [^Long new-frag-pos
                         (locking cell-meta
                           (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
                                 cell-len        (+ cell-data-len cell-head-len)

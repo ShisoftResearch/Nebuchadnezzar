@@ -40,6 +40,7 @@
 
 (defn sync-trunk [^Trunk trunk]
   (.writeLock trunk)
+  (monitor-enter (.getFragments trunk))
   (try
     (defrag/scan-trunk-and-defragment trunk)
     (if-not (empty? (.getFragments trunk))
@@ -49,6 +50,7 @@
             ^MemoryFork mf (.fork trunk)
             timestamp (System/nanoTime)]
         (.clear (.getDirtyRanges trunk))
+        (monitor-exit (.getFragments trunk))
         (.writeUnlock trunk)
         (loop [pos 0]
           (let [d-range (.ceilingEntry dirty-ranges pos)]
@@ -63,4 +65,5 @@
     (catch Exception ex
       (clojure.stacktrace/print-cause-trace ex))
     (finally
+      (monitor-exit (.getFragments trunk))
       (.writeUnlock trunk))))
