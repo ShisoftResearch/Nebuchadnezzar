@@ -39,19 +39,17 @@
         @server-sids))))
 
 (defn sync-trunk [^Trunk trunk]
-  (try
-    (.writeLock trunk)
-    (when-let [frags (.getFragments trunk)]
-      (monitor-enter frags)
+  (when-let [frags (.getFragments trunk)]
+    (try
+      (.writeLock trunk)
       (defrag/scan-trunk-and-defragment trunk)
-      (if-not (empty? (.getFragments trunk))
+      (if-not (empty? frags)
         (println "WARNING: Defrag for sync not succeed")
         (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
               append-header (.getAppendHeaderValue trunk)
               ^MemoryFork mf (.fork trunk)
               timestamp (System/nanoTime)]
           (.clear (.getDirtyRanges trunk))
-          (monitor-exit frags)
           (.writeUnlock trunk)
           (loop [pos 0]
             (let [d-range (.ceilingEntry dirty-ranges pos)]
@@ -66,5 +64,4 @@
       (catch Exception ex
         (clojure.stacktrace/print-cause-trace ex))
       (finally
-        (monitor-exit frags)
         (.writeUnlock trunk)))))

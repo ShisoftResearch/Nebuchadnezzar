@@ -8,7 +8,8 @@
             [cluster-connector.remote-function-invocation.core :as rfi]
             [cluster-connector.distributed-store.core :as ds])
   (:import (org.shisoft.neb.io TrunkStore)
-           (java.util UUID)))
+           (java.util UUID)
+           (org.shisoft.neb Trunk)))
 
 (set! *warn-on-reflection* true)
 
@@ -38,8 +39,12 @@
 
 (defn defrag-store-trunks []
   (locking defrag-service
-    (doseq [trunk (.getTrunks trunks)]
-      (defrag/scan-trunk-and-defragment trunk))))
+    (doseq [^Trunk trunk (.getTrunks trunks)]
+      (try
+        (.readLock trunk)
+        (defrag/scan-trunk-and-defragment trunk)
+        (finally
+          (.readUnLock trunk))))))
 
 (defn backup-trunks []
   (doseq [trunk (.getTrunks trunks)]
