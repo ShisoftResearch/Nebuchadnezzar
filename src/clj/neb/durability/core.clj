@@ -39,31 +39,32 @@
         @server-sids))))
 
 (defn sync-trunk [^Trunk trunk]
-  (.writeLock trunk)
-  (monitor-enter (.getFragments trunk))
   (try
-    (defrag/scan-trunk-and-defragment trunk)
-    (if-not (empty? (.getFragments trunk))
-      (println "WARNING: Defrag for sync not succeed")
-      (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
-            append-header (.getAppendHeaderValue trunk)
-            ^MemoryFork mf (.fork trunk)
-            timestamp (System/nanoTime)]
-        (.clear (.getDirtyRanges trunk))
-        (monitor-exit (.getFragments trunk))
-        (.writeUnlock trunk)
-        (loop [pos 0]
-          (let [d-range (.ceilingEntry dirty-ranges pos)]
-            (if-not d-range
-              (when (> (.size dirty-ranges) 0)
-                (finish-trunk-sync trunk append-header timestamp))
-              (do (let [start (.getKey d-range)
-                        end (min (.getValue d-range) (dec append-header))]
-                    (sync-range trunk start end))
-                  (recur (inc (.getValue d-range)))))))
-        (.release mf)))
-    (catch Exception ex
-      (clojure.stacktrace/print-cause-trace ex))
-    (finally
-      (monitor-exit (.getFragments trunk))
-      (.writeUnlock trunk))))
+    (.writeLock trunk)
+    (when-let [frags (.getFragments trunk)]
+      (monitor-enter frags)
+      (defrag/scan-trunk-and-defragment trunk)
+      (if-not (empty? (.getFragments trunk))
+        (println "WARNING: Defrag for sync not succeed")
+        (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
+              append-header (.getAppendHeaderValue trunk)
+              ^MemoryFork mf (.fork trunk)
+              timestamp (System/nanoTime)]
+          (.clear (.getDirtyRanges trunk))
+          (monitor-exit frags)
+          (.writeUnlock trunk)
+          (loop [pos 0]
+            (let [d-range (.ceilingEntry dirty-ranges pos)]
+              (if-not d-range
+                (when (> (.size dirty-ranges) 0)
+                  (finish-trunk-sync trunk append-header timestamp))
+                (do (let [start (.getKey d-range)
+                          end (min (.getValue d-range) (dec append-header))]
+                      (sync-range trunk start end))
+                    (recur (inc (.getValue d-range)))))))
+          (.release mf)))
+      (catch Exception ex
+        (clojure.stacktrace/print-cause-trace ex))
+      (finally
+        (monitor-exit frags)
+        (.writeUnlock trunk)))))
