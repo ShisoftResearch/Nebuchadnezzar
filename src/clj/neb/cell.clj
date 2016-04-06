@@ -313,7 +313,8 @@
         cell-writer (CellWriter. ttrunk cell-length)
         bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
     (.streamWrite cell-writer bytes-writer bs cell-length)
-    (.addCellToTrunkIndex cell-writer hash)))
+    (.addCellToTrunkIndex cell-writer hash)
+    (mark-dirty cell-writer)))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
   (.hasCell ttrunk hash))
