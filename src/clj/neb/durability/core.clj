@@ -3,7 +3,8 @@
             [taoensso.nippy :as nippy]
             [clojure.java.io :as io]
             [cluster-connector.utils.for-debug :refer [$ spy]]
-            [cluster-connector.remote-function-invocation.core :as rfi])
+            [cluster-connector.remote-function-invocation.core :as rfi]
+            [com.climate.claypoole :as cp])
   (:import (org.shisoft.neb Trunk MemoryFork)
            (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (org.shisoft.neb.utils UnsafeUtils)))
@@ -19,15 +20,15 @@
 
 (defn sync-range [^Trunk trunk start end]
   (let [^MemoryFork mf (.getMemoryFork trunk)
-        store-addr (.getStoreAddress trunk)
-        bs (.getBytes mf (+ store-addr start) (+ store-addr end))
-        trunk-id (.getId trunk)]
-    (dorun
-      (pmap
-        (fn [[sn sid]]
+        trunk-id (.getId trunk)
+        pool (cp/threadpool (count @server-sids))]
+    (.syncBytes
+      mf start end
+      (fn [^bytes bs ^Long start]
+        (cp/pdoseq
+          pool [[sn sid] @server-sids]
           (rfi/invoke sn 'neb.durability.serv.core/sync-trunk
-                      sid trunk-id start bs))
-        @server-sids))))
+                      sid trunk-id start bs))))))
 
 (defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
   (let [trunk-id (.getId trunk)]

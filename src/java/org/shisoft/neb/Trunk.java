@@ -93,8 +93,6 @@ public class Trunk {
     }
     public void copyMemForFork(long start, long end){
         if (memoryFork != null){
-            start += storeAddress;
-            end += storeAddress;
             memoryFork.copyMemory(start, end);
         }
     }

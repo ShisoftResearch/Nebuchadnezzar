@@ -145,10 +145,15 @@
   (println "Recovering Backups...")
   (let [dirs-to-recover (list-recover-dir)]
     (doseq [data-dir dirs-to-recover]
-      (when (and (.isDirectory data-dir) (not= (.getName (File. ^String @data-path)) (.getName data-dir)))
+      (when (and (.isDirectory data-dir)
+                 #_(not= (.getName (File. ^String @data-path)) (.getName data-dir)))
         (doseq [data-file (sort-by #(.getName %) (.listFiles data-dir))]
           (t/recover data-file))
-        (.createNewFile (File. (str (.getAbsolutePath data-dir) "/imported")))))))
+        (.createNewFile (File. (str (.getAbsolutePath data-dir) "/imported"))))))
+  (println "Backups distributed"))
+
+(defn remove-imported-tag []
+  (.delete (File. (str @data-path "/imported"))))
 
 (defn list-backup-ids []
   (let [dirs-to-recover (list-recover-dir)]

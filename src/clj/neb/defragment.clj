@@ -8,7 +8,7 @@
 
 (set! *warn-on-reflection* true)
 
-(defn scan-trunk-and-defragment [^Trunk ttrunk]
+(defn scan-trunk-and-defragment* [^Trunk ttrunk]
   (try
     (.readLock ttrunk)
     (let [frags (.getFragments ttrunk)]
@@ -48,3 +48,7 @@
                   (recur pos))))))))
     (finally
       (.readUnLock ttrunk))))
+
+(defn scan-trunk-and-defragment [^Trunk ttrunk]
+  (let [frags (.getFragments ttrunk)]
+    (while (not (empty? frags)) (scan-trunk-and-defragment* ttrunk))))
