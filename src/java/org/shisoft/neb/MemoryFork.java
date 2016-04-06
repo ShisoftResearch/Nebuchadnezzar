@@ -1,17 +1,15 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.hash.HashLongByteMap;
-import net.openhft.koloboke.collect.map.hash.HashLongByteMaps;
-import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
-import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.utils.UnsafeUtils;
+
+import java.util.TreeMap;
 
 /**
  * Created by shisoft on 16-3-25.
  */
 public class MemoryFork {
     Trunk trunk;
-    HashLongObjMap<byte[]> orignalBytes = HashLongObjMaps.newMutableMap();
+    TreeMap<Long, byte[]> orignalBytes = new TreeMap<>();
 
     public MemoryFork(Trunk trunk) {
         this.trunk = trunk;
