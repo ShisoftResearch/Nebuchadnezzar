@@ -96,7 +96,9 @@ public class Trunk {
     public void addFragment (long startPos, long endPos) {
         synchronized (fragments) {
             Map.Entry<Long, Long> actualRange = addAndAutoMerge(fragments, startPos, endPos);
-            putTombstone(actualRange.getKey(), actualRange.getValue());
+            if (actualRange != null) {
+                putTombstone(actualRange.getKey(), actualRange.getValue());
+            }
         }
     }
     public void addDirtyRanges (long startPos, long endPos) {
