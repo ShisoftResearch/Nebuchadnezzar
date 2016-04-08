@@ -22,7 +22,8 @@
 (defn sync-range [^Trunk trunk start end]
   (let [^MemoryFork mf (.getMemoryFork trunk)
         trunk-id (.getId trunk)
-        pool (cp/threadpool (count @server-sids))]
+        pool (cp/threadpool (count @server-sids)
+                            :name "Range-Sync")]
     (.syncBytes
       mf start end
       (fn [^bytes bs ^Long start]
@@ -34,7 +35,8 @@
 
 (defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
   (let [trunk-id (.getId trunk)
-        pool (cp/threadpool (count @server-sids))]
+        pool (cp/threadpool (count @server-sids)
+                            :name "Finish-Sync")]
     (cp/pdoseq
       pool [[sn sid] @server-sids]
       (rfi/invoke sn 'neb.durability.serv.core/finish-trunk-sync

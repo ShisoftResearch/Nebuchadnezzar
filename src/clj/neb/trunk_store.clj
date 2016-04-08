@@ -42,7 +42,8 @@
 
 (defn defrag-store-trunks []
   (let [trunks (.getTrunks trunks)
-        pool (cp/threadpool (min (count trunks) ncpu))]
+        pool (cp/threadpool (min (count trunks) ncpu)
+                            :name "Defragmentation")]
     (cp/pdoseq
       pool [^Trunk trunk trunks]
       (defrag/scan-trunk-and-defragment* trunk))
@@ -50,7 +51,8 @@
 
 (defn backup-trunks []
   (let [trunks (.getTrunks trunks)
-        pool (cp/threadpool (min (count trunks) ncpu))]
+        pool (cp/threadpool (min (count trunks) ncpu)
+                            :name "Backup")]
     (cp/pdoseq
       pool [trunk trunks]
       (sync-trunk trunk))
