@@ -43,16 +43,15 @@
 
 (defn sync-trunk [^Trunk trunk]
   (try
-    (.writeLock trunk)
-    (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
-          append-header (.getAppendHeaderValue trunk)
+    (let [append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
+          dirty-ranges  (.clone (.getDirtyRanges trunk))
           timestamp (System/nanoTime)]
       (.clear (.getDirtyRanges trunk))
-      (.writeUnlock trunk)
       (loop [pos 0]
         (let [d-range (.ceilingEntry dirty-ranges pos)]
-          (if-not d-range
+          (if (or (not d-range)
+                  (>= (.getKey d-range) append-header))
             (when (> (.size dirty-ranges) 0)
               (finish-trunk-sync trunk append-header timestamp))
             (do (let [start (.getKey d-range)
@@ -61,6 +60,4 @@
                 (recur (inc (.getValue d-range)))))))
       (.release mf))
     (catch Exception ex
-      (clojure.stacktrace/print-cause-trace ex))
-    (finally
-      (.writeUnlock trunk))))
+      (clojure.stacktrace/print-cause-trace ex))))
