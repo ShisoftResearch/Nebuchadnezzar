@@ -26,7 +26,6 @@ public class CellWriter {
     }
 
     public void tryAllocate(Trunk trunk, long length, boolean defraged){
-        trunk.getCellWriterLock().lock();
         try {
             long loc = trunk.getAppendHeader().getAndAdd(length);
             if (loc + length > trunk.getSize()){
@@ -42,8 +41,6 @@ public class CellWriter {
             }
         } catch (Exception e) {
             e.printStackTrace();
-        } finally {
-            trunk.getCellWriterLock().unlock();
         }
     }
 

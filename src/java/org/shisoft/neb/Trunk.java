@@ -25,7 +25,6 @@ public class Trunk {
     private AtomicLong appendHeader = new AtomicLong(0);
     private final ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
-    private ReentrantLock cellWriterLock = new ReentrantLock();
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
     public boolean isBackendEnabled() {
@@ -33,9 +32,6 @@ public class Trunk {
     }
     public long getSize() {
         return size;
-    }
-    public ReentrantLock getCellWriterLock() {
-        return cellWriterLock;
     }
     public AtomicLong getAppendHeader() {
         return appendHeader;
