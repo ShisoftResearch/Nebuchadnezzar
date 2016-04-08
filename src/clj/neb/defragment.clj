@@ -25,18 +25,20 @@
               (cond
                 cell-meta
                 (let [^Long new-frag-pos
-                      (locking cell-meta
-                        (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
-                              cell-len        (+ cell-data-len cell-head-len)
-                              cell-end-pos    (dec (+ hn-pos cell-len))
-                              new-frag-pos    (long (+ lw-pos cell-len))]
-                          (when (= hn-pos (.getLocation cell-meta))
-                            ;(println "Deal With Cell" lw-pos hi-pos cell-hash)
+                      (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
+                            cell-len        (+ cell-data-len cell-head-len)
+                            cell-end-pos    (dec (+ hn-pos cell-len))
+                            new-frag-pos    (long (+ lw-pos cell-len))
+                            location-confirmed (atom false)]
+                        (locking cell-meta
+                          (reset! location-confirmed (= hn-pos (.getLocation cell-meta)))
+                          (when @location-confirmed
                             (.copyMemory ttrunk hn-pos lw-pos cell-len)
-                            (.setLocation cell-meta lw-pos)
-                            (.removeFrag ttrunk lw-pos)
-                            (.addFragment ttrunk new-frag-pos cell-end-pos)
-                            new-frag-pos)))]
+                            (.setLocation cell-meta lw-pos)))
+                        (when @location-confirmed
+                          (.removeFrag ttrunk lw-pos)
+                          (.addFragment ttrunk new-frag-pos cell-end-pos)
+                          new-frag-pos))]
                   (when new-frag-pos (recur new-frag-pos)))
                 (and (<= append-header (inc hi-pos))
                      (>= append-header lw-pos))

@@ -3,6 +3,8 @@ package org.shisoft.neb;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.CellMeta;
+import org.shisoft.neb.io.Writer;
+import org.shisoft.neb.io.type_lengths;
 import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
@@ -83,9 +85,17 @@ public class Trunk {
     public MemoryFork getMemoryFork() {
         return memoryFork;
     }
+    public void putTombstone (long startPos, long endPos){
+        long size = endPos - startPos + 1;
+        assert  size > (type_lengths.intLen + 1) : "frag length is too small to put a tombstone";
+        Writer.writeByte(this, (byte) 1, startPos);
+        Writer.writeLong(this, size, startPos + type_lengths.byteLen);
+        addDirtyRanges(startPos, startPos + type_lengths.byteLen + type_lengths.longLen - 1);
+    }
     public void addFragment (long startPos, long endPos) {
         synchronized (fragments) {
-            addAndAutoMerge(fragments, startPos, endPos);
+            Map.Entry<Long, Long> actualRange = addAndAutoMerge(fragments, startPos, endPos);
+            putTombstone(actualRange.getKey(), actualRange.getValue());
         }
     }
     public void addDirtyRanges (long startPos, long endPos) {
@@ -104,23 +114,34 @@ public class Trunk {
         this.dirtyRanges = new ConcurrentSkipListMap<>();
         this.backendEnabled = true;
     }
-    public void addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
+    public Map.Entry<Long, Long> addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
         Map.Entry<Long, Long> prevPair = map.lowerEntry(startPos);
         Map.Entry<Long, Long> forPair = map.higherEntry(startPos);
         Long dupLoc = map.get(startPos);
-        if (dupLoc != null && dupLoc >= endPos) return;
-        if (prevPair != null && prevPair.getValue() >= endPos) return;
+        if (dupLoc != null && dupLoc >= endPos) return null;
+        if (prevPair != null && prevPair.getValue() >= endPos) return null;
         if (prevPair != null && (prevPair.getValue() >= startPos || prevPair.getValue() == startPos - 1)) {
-            addAndAutoMerge(map, prevPair.getKey(), endPos);
+            return addAndAutoMerge(map, prevPair.getKey(), endPos);
         } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos + 1)) {
             map.remove(forPair.getKey());
             if (forPair.getValue() < endPos){
-                addAndAutoMerge(map, startPos, endPos);
+                return addAndAutoMerge(map, startPos, endPos);
             } else {
-                addAndAutoMerge(map, startPos, forPair.getValue());
+                return addAndAutoMerge(map, startPos, forPair.getValue());
             }
         } else {
             map.put(startPos, endPos);
+            return new Map.Entry<Long, Long>() {
+                public Long getKey() {
+                    return startPos;
+                }
+                public Long getValue() {
+                    return endPos;
+                }
+                public Long setValue(Long value) {
+                    return null;
+                }
+            };
         }
     }
 

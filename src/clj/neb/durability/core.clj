@@ -32,24 +32,19 @@
                       sid trunk-id start bs))))
     (cp/shutdown pool)))
 
-(defn preproc-frags [^ConcurrentSkipListMap frags]
-  (map identity frags))
-
-(defn finish-trunk-sync [^Trunk trunk tail-loc frags timestamp]
+(defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
   (let [trunk-id (.getId trunk)
-        pool (cp/threadpool (count @server-sids))
-        frags (preproc-frags frags)]
+        pool (cp/threadpool (count @server-sids))]
     (cp/pdoseq
       pool [[sn sid] @server-sids]
       (rfi/invoke sn 'neb.durability.serv.core/finish-trunk-sync
-                  sid trunk-id tail-loc frags timestamp))
+                  sid trunk-id tail-loc timestamp))
     (cp/shutdown pool)))
 
 (defn sync-trunk [^Trunk trunk]
   (try
     (.writeLock trunk)
-    (let [frags         (.clone (.getFragments trunk))
-          dirty-ranges  (.clone (.getDirtyRanges trunk))
+    (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
           append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
           timestamp (System/nanoTime)]
@@ -59,7 +54,7 @@
         (let [d-range (.ceilingEntry dirty-ranges pos)]
           (if-not d-range
             (when (> (.size dirty-ranges) 0)
-              (finish-trunk-sync trunk append-header frags timestamp))
+              (finish-trunk-sync trunk append-header timestamp))
             (do (let [start (.getKey d-range)
                       end (min (.getValue d-range) (dec append-header))]
                   (sync-range trunk start end))

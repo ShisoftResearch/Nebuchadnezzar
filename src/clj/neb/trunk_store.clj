@@ -45,7 +45,7 @@
         pool (cp/threadpool (min (count trunks) ncpu))]
     (cp/pdoseq
       pool [^Trunk trunk trunks]
-      (defrag/scan-trunk-and-defragment trunk))
+      (defrag/scan-trunk-and-defragment* trunk))
     (cp/shutdown pool)))
 
 (defn backup-trunks []
@@ -57,7 +57,7 @@
     (cp/shutdown pool)))
 
 (defn start-defrag []
-  (reset! defrag-service (ms/start-service defrag-store-trunks 5000)))
+  (reset! defrag-service (ms/start-service defrag-store-trunks 60000)))
 
 (defn stop-defrag []
   (ms/stop-service @defrag-service))

@@ -2,10 +2,14 @@
   (:require [neb.types :refer [data-types]]))
 
 (def cell-head-struct
-  [[:partition :long :partition]
+  [[:cell-type :byte :type]
+   [:partition :long :partition]
    [:hash :long :hash]
    [:cell-length :int :length]
    [:schema-id :int :schema]])
+
+(assert (and (= :byte (second (first cell-head-struct)))
+             (= :long (second (second cell-head-struct)))) "second prop in header must be an integer for tombstone")
 
 (defmacro gen-cell-header-offsets []
   (let [loc-counter (atom 0)]

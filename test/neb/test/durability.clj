@@ -31,7 +31,7 @@
       flush-chan (a/chan)]
   (.startZookeeper zk 21817)
   (try
-    (facts "Durability"
+    #_(facts "Durability"
            (fact "Start Server"
                  (start-server config) => anything)
            (fact "Prepare schemas"

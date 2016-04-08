@@ -70,18 +70,19 @@
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
     (writer trunk value (+ loc offset))))
 
-(defn collect-frag* [^Trunk ttrunk start end]
+(defn get-header-field-offset-length [field]
+  (let [{:keys [length offset]} (get cell-head-struc-map field)]
+    [offset length]))
+
+(defn put-tombstone [^Trunk ttrunk start end]
+  (let [size (inc (- start end))
+        tombstone-size (apply + (get-header-field-offset-length :cell-length))]
+    (assert (> size tombstone-size) "Range is too small to put a tombstone")
+    (write-cell-header-field ttrunk start :cell-length (* -1 size))
+    (.addDirtyRanges ttrunk start (dec (+ start tombstone-size)))))
+
+(defn add-frag [^Trunk ttrunk start end]
   (.addFragment ttrunk start end))
-
-;(a/go-loop []
-;  (let [params (a/<! pending-frags)
-;        ttrunk (params 0)
-;        start (params 1)
-;        end (params 2)]
-;    (collect-frag* ttrunk start end))
-;  (recur))
-
-(def add-frag collect-frag*)
 
 (defn mark-cell-deleted [trunk cell-loc data-length]
   (add-frag trunk cell-loc (dec (+ cell-loc cell-head-len data-length))))
@@ -283,6 +284,8 @@
 (defn mark-dirty [^CellWriter cell-writer]
   (.markDirty cell-writer))
 
+(def normal-cell-type (byte 0))
+
 (defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
         fields (plan-data-write data schema)
@@ -294,7 +297,8 @@
         header-data {:schema schema-id
                      :hash hash
                      :partition partition
-                     :length fields-length}]
+                     :length fields-length
+                     :type normal-cell-type}]
     (write-cell-header cell-writer header-data)
     (doseq [{:keys [value writer length]} fields]
       (.streamWrite cell-writer writer value length))
@@ -334,13 +338,8 @@
           partition (read-cell-header-field trunk cell-loc :partition)
           fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
-      (if (>= data-len new-data-length)
-        (do (write-cell trunk hash partition schema data :loc cell-loc :update-hash-index? false)
-            (when (< new-data-length data-len)
-              (add-frag
-                trunk
-                (+ cell-data-loc new-data-length 1)
-                (+ cell-data-loc data-len))))
+      (if (= data-len new-data-length)
+        (write-cell trunk hash partition schema data :loc cell-loc :update-hash-index? false)
         (do (write-cell trunk hash partition schema data :update-cell? true)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
