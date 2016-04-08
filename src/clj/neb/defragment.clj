@@ -50,7 +50,8 @@
                   (.removeFrag ttrunk lw-pos)
                   (recur pos)))))))
       (finally
-        (.unlockDefrag ttrunk)))))
+        (.unlockDefrag ttrunk)
+        (.setLastDefraged ttrunk (System/currentTimeMillis))))))
 
 (defn scan-trunk-and-defragment [^Trunk ttrunk]
   (let [frags (.getFragments ttrunk)]

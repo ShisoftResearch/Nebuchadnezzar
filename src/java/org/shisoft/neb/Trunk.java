@@ -28,6 +28,7 @@ public class Trunk {
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
     private ReentrantLock defragLock = new ReentrantLock();
+    private long lastDefraged = 0;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -54,6 +55,12 @@ public class Trunk {
     }
     public void setId(int id) {
         this.id = id;
+    }
+    public long getLastDefraged() {
+        return lastDefraged;
+    }
+    public void setLastDefraged(long lastDefraged) {
+        this.lastDefraged = lastDefraged;
     }
     public Trunk(long size){
         this.size = size;

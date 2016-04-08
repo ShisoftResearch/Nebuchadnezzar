@@ -33,7 +33,8 @@ public class CellWriter {
                 if (defraged){
                     throw new Exception("Store full, expected length:" + length + " remains:" + (trunk.getSize() - loc));
                 } else {
-                    defragFn.invoke(trunk);
+                    long currentMills = System.currentTimeMillis();
+                    while (trunk.getLastDefraged() < currentMills){Thread.sleep(1);}
                     tryAllocate(trunk, length, true);
                 }
             }  else {
