@@ -32,19 +32,12 @@
 (defn extract-cell-meta [ttrunk hash]
   (.getCellMeta ^Trunk ttrunk ^long hash))
 
-(defmacro with-trunk-lock [trunk & body]
-  `(do (.readLock ~trunk)
-       (try
-         ~@body
-         (finally
-           (.readUnLock ~trunk)))))
-
 (defmacro with-cell-meta [trunk hash & body]
   `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
      (when *cell-meta*
-       (with-trunk-lock ~trunk ~@body))))
+       ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
@@ -322,12 +315,10 @@
   (.hasCell ttrunk hash))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
-  (with-trunk-lock
-    ttrunk
-    (when (cell-exists? ttrunk hash)
-      (throw (Exception. "Cell hash already exists")))
-    (when-let [schema (schema-by-id schema-id)]
-      (write-cell ttrunk hash partition schema data))))
+  (when (cell-exists? ttrunk hash)
+    (throw (Exception. "Cell hash already exists")))
+  (when-let [schema (schema-by-id schema-id)]
+    (write-cell ttrunk hash partition schema data)))
 
 (defn replace-cell* [^Trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]

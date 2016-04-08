@@ -27,7 +27,6 @@ public class Trunk {
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private ReentrantLock cellWriterLock = new ReentrantLock();
     private MemoryFork memoryFork;
-    private ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private boolean backendEnabled = false;
     public boolean isBackendEnabled() {
         return backendEnabled;
@@ -174,19 +173,5 @@ public class Trunk {
         assert memoryFork == null : "Only one folk allowed";
         memoryFork = new MemoryFork(this);
         return memoryFork;
-    }
-    public void readLock(){
-        this.lock.readLock().lock();
-    }
-    public void readUnLock(){
-        this.lock.readLock().unlock();
-    }
-    public void writeLock(){
-        this.lock.writeLock().lock();
-    }
-    public void writeUnlock(){
-        if (this.lock.writeLock().isHeldByCurrentThread()) {
-            this.lock.writeLock().unlock();
-        }
     }
 }
