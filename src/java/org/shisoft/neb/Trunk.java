@@ -21,7 +21,7 @@ public class Trunk {
     private long size;
     private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
     private AtomicLong appendHeader = new AtomicLong(0);
-    private ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
+    private final ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private ReentrantLock cellWriterLock = new ReentrantLock();
     private MemoryFork memoryFork;
@@ -83,12 +83,16 @@ public class Trunk {
     public MemoryFork getMemoryFork() {
         return memoryFork;
     }
-    public synchronized void addFragment (long startPos, long endPos) {
-        addAndAutoMerge(fragments, startPos, endPos);
+    public void addFragment (long startPos, long endPos) {
+        synchronized (fragments) {
+            addAndAutoMerge(fragments, startPos, endPos);
+        }
     }
-    public synchronized void addDirtyRanges (long startPos, long endPos) {
+    public void addDirtyRanges (long startPos, long endPos) {
         if (backendEnabled) {
-            addAndAutoMerge(dirtyRanges, startPos, endPos);
+            synchronized (dirtyRanges) {
+                addAndAutoMerge(dirtyRanges, startPos, endPos);
+            }
         }
     }
     public void copyMemForFork(long start, long end){

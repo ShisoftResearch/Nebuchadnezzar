@@ -8,6 +8,7 @@
 
 (set! *warn-on-reflection* true)
 
+;TODO: Rewrite this in Java
 (defn scan-trunk-and-defragment* [^Trunk ttrunk]
   (try
     (.readLock ttrunk)

@@ -6,7 +6,8 @@
             [cluster-connector.microservice.circular :as ms]
             [cluster-connector.replication.core :as rep]
             [cluster-connector.remote-function-invocation.core :as rfi]
-            [cluster-connector.distributed-store.core :as ds])
+            [cluster-connector.distributed-store.core :as ds]
+            [com.climate.claypoole :as  cp])
   (:import (org.shisoft.neb.io TrunkStore)
            (java.util UUID)
            (org.shisoft.neb Trunk)))
@@ -37,24 +38,26 @@
 (defn trunks-cell-count []
   (.getTrunksCellCount trunks))
 
+(def ncpu (cp/ncpus))
+
 (defn defrag-store-trunks []
-  (locking defrag-service
-    (doseq [^Trunk trunk (.getTrunks trunks)]
-      (try
-        (.readLock trunk)
-        (defrag/scan-trunk-and-defragment trunk)
-        (finally
-          (.readUnLock trunk))))))
+  (let [trunks (.getTrunks trunks)
+        pool (cp/threadpool (min (count trunks) ncpu))]
+    (cp/pdoseq
+      pool [^Trunk trunk trunks]
+      (defrag/scan-trunk-and-defragment trunk))
+    (cp/shutdown pool)))
 
 (defn backup-trunks []
-  (doseq [trunk (.getTrunks trunks)]
-    (try
-      (sync-trunk trunk)
-      (catch Exception ex
-        (clojure.stacktrace/print-cause-trace ex)))))
+  (let [trunks (.getTrunks trunks)
+        pool (cp/threadpool (min (count trunks) ncpu))]
+    (cp/pdoseq
+      pool [trunk trunks]
+      (sync-trunk trunk))
+    (cp/shutdown pool)))
 
 (defn start-defrag []
-  (reset! defrag-service (ms/start-service defrag-store-trunks 10)))
+  (reset! defrag-service (ms/start-service defrag-store-trunks 5000)))
 
 (defn stop-defrag []
   (ms/stop-service @defrag-service))

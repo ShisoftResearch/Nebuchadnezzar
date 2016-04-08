@@ -3,11 +3,12 @@
             [neb.durability.serv.trunk :as t]
             [clojure.java.io :as io]
             [clojure.core.async :as a]
-            [cluster-connector.utils.for-debug :refer [$ spy]])
+            [cluster-connector.utils.for-debug :refer [$ spy]]
+            [taoensso.nippy :as nippy])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
-           (java.io OutputStream File)
+           (java.io OutputStream File DataOutputStream)
            (org.apache.commons.io FileUtils)))
 
 (def start-time (System/nanoTime))
@@ -55,6 +56,7 @@
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
                                               (BufferedRandomAccessFile. file-path "rw")))
                                      (range trunks)))
+        frag-file-paths (vec (map (fn [n] (str base-path n ".frags")) (range trunks)))
         ;log-appenders (vec (map (fn [n] (atom (io/output-stream
         ;                                        (str base-path n "-" timestamp ".mlog"))))
         ;                         (range trunks)))
@@ -63,13 +65,16 @@
         pending-chan (a/chan 500)
         flushed-ch (atom nil)]
     (a/go-loop []
-      (let [[act trunk-id loc ^bytes bs] (a/<! pending-chan)
-            accessor (replica-accessors trunk-id)]
+      (let [[act trunk-id loc data] (a/<! pending-chan)
+            accessor (replica-accessors trunk-id)
+            frags-path (frag-file-paths trunk-id)]
         (try
           (case act
-            0 (do (t/sync-to-disk accessor loc bs))
+            0 (do (t/sync-to-disk accessor loc ^bytes data))
             1 (do (.truncate (.getChannel accessor) loc)
                   (.flush accessor)
+                  (with-open [w (io/output-stream frags-path :append false)]
+                    (nippy/freeze-to-out! (DataOutputStream. w) data))
                   (when @flushed-ch
                     (println "Flushed backup")
                     (a/>!! @flushed-ch true))))
@@ -95,9 +100,9 @@
   (let [client (get @clients sid)]
     (a/>!! (:pending-chan client) [0 trunk-id loc bs])))
 
-(defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
+(defn finish-trunk-sync [sid trunk-id tail-loc frags timestamp]
   (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [1 trunk-id tail-loc]))
+    (a/>!! (:pending-chan client) [1 trunk-id tail-loc frags]))
   (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp)
   #_(switch-log sid trunk-id timestamp))
 

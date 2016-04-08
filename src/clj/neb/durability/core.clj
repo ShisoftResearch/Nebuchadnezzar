@@ -7,7 +7,8 @@
             [com.climate.claypoole :as cp])
   (:import (org.shisoft.neb Trunk MemoryFork)
            (org.shisoft.neb.durability.io BufferedRandomAccessFile)
-           (org.shisoft.neb.utils UnsafeUtils)))
+           (org.shisoft.neb.utils UnsafeUtils)
+           (java.util.concurrent ConcurrentSkipListMap)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
 ;      The ideal design is to provide multi-master replication backend. Right now, there will be no replication.
@@ -28,41 +29,43 @@
         (cp/pdoseq
           pool [[sn sid] @server-sids]
           (rfi/invoke sn 'neb.durability.serv.core/sync-trunk
-                      sid trunk-id start bs))))))
+                      sid trunk-id start bs))))
+    (cp/shutdown pool)))
 
-(defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
-  (let [trunk-id (.getId trunk)]
-    (dorun
-      (pmap
-        (fn [[sn sid]]
-          (rfi/invoke sn 'neb.durability.serv.core/finish-trunk-sync
-                      sid trunk-id tail-loc timestamp))
-        @server-sids))))
+(defn preproc-frags [^ConcurrentSkipListMap frags]
+  (map identity frags))
+
+(defn finish-trunk-sync [^Trunk trunk tail-loc frags timestamp]
+  (let [trunk-id (.getId trunk)
+        pool (cp/threadpool (count @server-sids))
+        frags (preproc-frags frags)]
+    (cp/pdoseq
+      pool [[sn sid] @server-sids]
+      (rfi/invoke sn 'neb.durability.serv.core/finish-trunk-sync
+                  sid trunk-id tail-loc frags timestamp))
+    (cp/shutdown pool)))
 
 (defn sync-trunk [^Trunk trunk]
-  (when-let [frags (.getFragments trunk)]
-    (try
-      (.writeLock trunk)
-      (defrag/scan-trunk-and-defragment trunk)
-      (if-not (empty? frags)
-        (println "WARNING: Defrag for sync not succeed")
-        (let [dirty-ranges  (.clone (.getDirtyRanges trunk))
-              append-header (.getAppendHeaderValue trunk)
-              ^MemoryFork mf (.fork trunk)
-              timestamp (System/nanoTime)]
-          (.clear (.getDirtyRanges trunk))
-          (.writeUnlock trunk)
-          (loop [pos 0]
-            (let [d-range (.ceilingEntry dirty-ranges pos)]
-              (if-not d-range
-                (when (> (.size dirty-ranges) 0)
-                  (finish-trunk-sync trunk append-header timestamp))
-                (do (let [start (.getKey d-range)
-                          end (min (.getValue d-range) (dec append-header))]
-                      (sync-range trunk start end))
-                    (recur (inc (.getValue d-range)))))))
-          (.release mf)))
-      (catch Exception ex
-        (clojure.stacktrace/print-cause-trace ex))
-      (finally
-        (.writeUnlock trunk)))))
+  (try
+    (.writeLock trunk)
+    (let [frags         (.clone (.getFragments trunk))
+          dirty-ranges  (.clone (.getDirtyRanges trunk))
+          append-header (.getAppendHeaderValue trunk)
+          ^MemoryFork mf (.fork trunk)
+          timestamp (System/nanoTime)]
+      (.clear (.getDirtyRanges trunk))
+      (.writeUnlock trunk)
+      (loop [pos 0]
+        (let [d-range (.ceilingEntry dirty-ranges pos)]
+          (if-not d-range
+            (when (> (.size dirty-ranges) 0)
+              (finish-trunk-sync trunk append-header frags timestamp))
+            (do (let [start (.getKey d-range)
+                      end (min (.getValue d-range) (dec append-header))]
+                  (sync-range trunk start end))
+                (recur (inc (.getValue d-range)))))))
+      (.release mf))
+    (catch Exception ex
+      (clojure.stacktrace/print-cause-trace ex))
+    (finally
+      (.writeUnlock trunk))))
