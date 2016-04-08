@@ -87,10 +87,12 @@ public class Trunk {
     }
     public void putTombstone (long startPos, long endPos){
         long size = endPos - startPos + 1;
+        long tombstoneEnds = startPos + type_lengths.byteLen + type_lengths.longLen - 1;
         assert  size > (type_lengths.intLen + 1) : "frag length is too small to put a tombstone";
+        copyMemForFork(startPos, tombstoneEnds);
         Writer.writeByte(this, (byte) 1, startPos);
         Writer.writeLong(this, size, startPos + type_lengths.byteLen);
-        addDirtyRanges(startPos, startPos + type_lengths.byteLen + type_lengths.longLen - 1);
+        addDirtyRanges(startPos, tombstoneEnds);
     }
     public void addFragment (long startPos, long endPos) {
         synchronized (fragments) {
