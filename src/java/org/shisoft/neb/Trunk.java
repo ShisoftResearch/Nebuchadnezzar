@@ -27,6 +27,7 @@ public class Trunk {
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
+    private ReentrantLock defragLock = new ReentrantLock();
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -79,6 +80,9 @@ public class Trunk {
     }
     public MemoryFork getMemoryFork() {
         return memoryFork;
+    }
+    public ReentrantLock getDefragLock() {
+        return defragLock;
     }
     public void putTombstone (long startPos, long endPos){
         long size = endPos - startPos + 1;
@@ -169,5 +173,11 @@ public class Trunk {
         assert memoryFork == null : "Only one folk allowed";
         memoryFork = new MemoryFork(this);
         return memoryFork;
+    }
+    public void lockDefrag(){
+        this.defragLock.lock();
+    }
+    public void unlockDefrag(){
+        this.defragLock.unlock();
     }
 }

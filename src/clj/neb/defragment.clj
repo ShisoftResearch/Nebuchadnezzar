@@ -11,42 +11,46 @@
 ;TODO: Rewrite this in Java
 (defn scan-trunk-and-defragment* [^Trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
-    (loop [pos 0]
-      (let [frag (.ceilingEntry frags pos)
-            append-header (.getAppendHeaderValue ttrunk)]
-        (when frag
-          (let [lw-pos (.getKey frag)
-                hi-pos (.getValue frag)
-                hn-pos (inc hi-pos)
-                cell-hash (read-cell-header-field ttrunk hn-pos :hash)
-                ^CellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
-            (cond
-              cell-meta
-              (let [^Long new-frag-pos
-                    (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
-                          cell-len        (+ cell-data-len cell-head-len)
-                          cell-end-pos    (dec (+ hn-pos cell-len))
-                          new-frag-pos    (long (+ lw-pos cell-len))
-                          location-confirmed (atom false)]
-                      (locking cell-meta
-                        (reset! location-confirmed (= hn-pos (.getLocation cell-meta)))
+    (try
+      (.lockDefrag ttrunk)
+      (loop [pos 0]
+        (let [frag (.ceilingEntry frags pos)
+              append-header (.getAppendHeaderValue ttrunk)]
+          (when frag
+            (let [lw-pos (.getKey frag)
+                  hi-pos (.getValue frag)
+                  hn-pos (inc hi-pos)
+                  cell-hash (read-cell-header-field ttrunk hn-pos :hash)
+                  ^CellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
+              (cond
+                cell-meta
+                (let [^Long new-frag-pos
+                      (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
+                            cell-len        (+ cell-data-len cell-head-len)
+                            cell-end-pos    (dec (+ hn-pos cell-len))
+                            new-frag-pos    (long (+ lw-pos cell-len))
+                            location-confirmed (atom false)]
+                        (locking cell-meta
+                          (reset! location-confirmed (= hn-pos (.getLocation cell-meta)))
+                          (when @location-confirmed
+                            (.copyMemory ttrunk hn-pos lw-pos cell-len)
+                            (.setLocation cell-meta lw-pos)))
                         (when @location-confirmed
-                          (.copyMemory ttrunk hn-pos lw-pos cell-len)
-                          (.setLocation cell-meta lw-pos)))
-                      (when @location-confirmed
-                        (.removeFrag ttrunk lw-pos)
-                        (.addFragment ttrunk new-frag-pos cell-end-pos)
-                        new-frag-pos))]
-                (when new-frag-pos (recur new-frag-pos)))
-              (and (<= append-header (inc hi-pos))
-                   (>= append-header lw-pos))
-              (do                                         ;(println "Hit tail" lw-pos hi-pos cell-hash)
-                (.resetAppendHeader ttrunk lw-pos)
-                (.removeFrag ttrunk lw-pos))
-              :else
-              (do                                         ;(println "Unknown Frag:" lw-pos hi-pos cell-hash)
-                (.removeFrag ttrunk lw-pos)
-                (recur pos)))))))))
+                          (.removeFrag ttrunk lw-pos)
+                          (.addFragment ttrunk new-frag-pos cell-end-pos)
+                          new-frag-pos))]
+                  (when new-frag-pos (recur new-frag-pos)))
+                (and (<= append-header (inc hi-pos))
+                     (>= append-header lw-pos))
+                (do                                         ;(println "Hit tail" lw-pos hi-pos cell-hash)
+                  (.resetAppendHeader ttrunk lw-pos)
+                  (.removeFrag ttrunk lw-pos))
+                :else
+                (do                                         ;(println "Unknown Frag:" lw-pos hi-pos cell-hash)
+                  (.removeFrag ttrunk lw-pos)
+                  (recur pos)))))))
+      (finally
+        (.unlockDefrag ttrunk)))))
 
 (defn scan-trunk-and-defragment [^Trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
