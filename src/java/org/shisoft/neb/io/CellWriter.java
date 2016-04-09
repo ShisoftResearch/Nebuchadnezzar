@@ -3,6 +3,7 @@ package org.shisoft.neb.io;
 import clojure.java.api.Clojure;
 import clojure.lang.IFn;
 import org.shisoft.neb.Trunk;
+import org.shisoft.neb.exceptions.StoreFullException;
 
 /**
  * Created by shisoft on 21/1/2016.
@@ -22,21 +23,15 @@ public class CellWriter {
     }
 
     public CellWriter(Trunk trunk, long length) throws Exception {
-        tryAllocate(trunk, length, false);
+        tryAllocate(trunk, length);
     }
 
-    public void tryAllocate(Trunk trunk, long length, boolean defraged){
+    public void tryAllocate(Trunk trunk, long length){
         try {
             long loc = trunk.getAppendHeader().getAndAdd(length);
             if (loc + length > trunk.getSize()){
                 trunk.getAppendHeader().set(loc);
-                if (defraged){
-                    throw new Exception("Store full, expected length:" + length + " remains:" + (trunk.getSize() - loc));
-                } else {
-                    long currentMills = System.currentTimeMillis();
-                    while (trunk.getLastDefraged() < currentMills){Thread.sleep(1);}
-                    tryAllocate(trunk, length, true);
-                }
+                throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
             }  else {
                 init(trunk, length, loc);
             }

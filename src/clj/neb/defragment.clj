@@ -1,6 +1,5 @@
 (ns neb.defragment
-  (:require [neb.cell :refer [read-cell-header-field pending-frags]]
-            [neb.header :refer [cell-head-len]]
+  (:require [neb.header :refer [cell-head-len read-cell-header-field]]
             [neb.schema :refer [schema-by-id]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb Trunk)

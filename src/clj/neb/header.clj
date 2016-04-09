@@ -1,5 +1,6 @@
 (ns neb.header
-  (:require [neb.types :refer [data-types]]))
+  (:require [neb.types :refer [data-types]])
+  (:import (org.shisoft.neb Trunk)))
 
 (def cell-head-struct
   [[:cell-type :byte :type]
@@ -38,3 +39,15 @@
               (fn [[_ type]]
                 (get-in @data-types [type :length]))
               cell-head-struct)))
+
+(defn read-cell-header-field [^Trunk trunk loc field]
+  (let [{:keys [reader offset]} (get cell-head-struc-map field)]
+    (reader trunk (+ loc offset))))
+
+(defn write-cell-header-field [^Trunk trunk loc field value]
+  (let [{:keys [writer offset]} (get cell-head-struc-map field)]
+    (writer trunk value (+ loc offset))))
+
+(defn get-header-field-offset-length [field]
+  (let [{:keys [length offset]} (get cell-head-struc-map field)]
+    [offset length]))

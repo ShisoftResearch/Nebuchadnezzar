@@ -29,6 +29,7 @@ public class Trunk {
     private boolean backendEnabled = false;
     private ReentrantLock defragLock = new ReentrantLock();
     private AtomicLong lastDefraged = new AtomicLong(0);
+    private ReentrantReadWriteLock cellWriteLock = new ReentrantReadWriteLock();
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -61,6 +62,9 @@ public class Trunk {
     }
     public void setLastDefraged(long lastDefraged) {
         this.lastDefraged.set(lastDefraged);
+    }
+    public ReentrantReadWriteLock getCellWriteLock() {
+        return cellWriteLock;
     }
     public Trunk(long size){
         this.size = size;
@@ -121,26 +125,26 @@ public class Trunk {
         }
     }
     public void enableDurability () {
-        this.dirtyRanges = new ConcurrentSkipListMap<>();
+        this.dirtyRanges = new ConcurrentSkipListMap<Long, Long>();
         this.backendEnabled = true;
     }
-    public Map.Entry<Long, Long> addAndAutoMerge (ConcurrentSkipListMap<Long, Long> map, long startPos, long endPos) {
-        Map.Entry<Long, Long> prevPair = map.lowerEntry(startPos);
-        Map.Entry<Long, Long> forPair = map.higherEntry(startPos);
-        Long dupLoc = map.get(startPos);
+    public Map.Entry<Long, Long> addAndAutoMerge (ConcurrentSkipListMap<Long, Long> mapToMerge, final long startPos, final long endPos) {
+        Map.Entry<Long, Long> prevPair = mapToMerge.lowerEntry(startPos);
+        Map.Entry<Long, Long> forPair = mapToMerge.higherEntry(startPos);
+        Long dupLoc = mapToMerge.get(startPos);
         if (dupLoc != null && dupLoc >= endPos) return null;
         if (prevPair != null && prevPair.getValue() >= endPos) return null;
         if (prevPair != null && (prevPair.getValue() >= startPos || prevPair.getValue() == startPos - 1)) {
-            return addAndAutoMerge(map, prevPair.getKey(), endPos);
+            return addAndAutoMerge(mapToMerge, prevPair.getKey(), endPos);
         } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos + 1)) {
-            map.remove(forPair.getKey());
+            mapToMerge.remove(forPair.getKey());
             if (forPair.getValue() < endPos){
-                return addAndAutoMerge(map, startPos, endPos);
+                return addAndAutoMerge(mapToMerge, startPos, endPos);
             } else {
-                return addAndAutoMerge(map, startPos, forPair.getValue());
+                return addAndAutoMerge(mapToMerge, startPos, forPair.getValue());
             }
         } else {
-            map.put(startPos, endPos);
+            mapToMerge.put(startPos, endPos);
             return new Map.Entry<Long, Long>() {
                 public Long getKey() {
                     return startPos;

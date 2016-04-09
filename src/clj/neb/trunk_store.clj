@@ -59,7 +59,7 @@
     (cp/shutdown pool)))
 
 (defn start-defrag []
-  (reset! defrag-service (ms/start-service defrag-store-trunks 60000)))
+  (reset! defrag-service (ms/start-service defrag-store-trunks 10000)))
 
 (defn stop-defrag []
   (ms/stop-service @defrag-service))

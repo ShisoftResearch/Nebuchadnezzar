@@ -1,22 +1,23 @@
 (ns neb.cell
   (:require [neb.types :refer [data-types int-writer]]
             [neb.schema :refer [schema-store schema-by-id schema-id-by-sname walk-schema schema-by-sname]]
-            [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
+            [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len
+                                read-cell-header-field write-cell-header-field get-header-field-offset-length]]
             [neb.durability.serv.native :refer [read-int]]
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
-            [clojure.core.async :as a])
+            [clojure.core.async :as a]
+            [neb.defragment :as defrag])
   (:import (org.shisoft.neb Trunk)
            (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta Writer)
-           (java.util UUID)))
+           (java.util UUID)
+           (org.shisoft.neb.exceptions StoreFullException)))
 
 (set! *warn-on-reflection* true)
 
 (def ^:dynamic ^CellMeta *cell-meta* nil)
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^Trunk *cell-trunk* nil)
-
-(def pending-frags (a/chan 1000))
 
 (defmacro with-cell [^CellReader cell-reader & body]
   `(let ~(vec (mapcat
@@ -42,8 +43,21 @@
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta*
-       ~@body)))
+     (let [write-lock# (.getCellWriteLock ~trunk)
+           exec# (fn []
+                   (.lock (.readLock write-lock#))
+                   (try
+                     (locking *cell-meta* ~@body)
+                     (catch Exception ex# (.unlock (.readLock write-lock#)))))
+           exec-retry# (fn []
+                         (.lock (.writeLock write-lock#))
+                         (defrag/scan-trunk-and-defragment ~trunk)
+                         (.unlock (.writeLock write-lock#))
+                         (exec#))]
+       (try
+         (exec#)
+         (catch StoreFullException sfe#
+           (exec-retry#))))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
@@ -53,19 +67,6 @@
 
 (defn get-cell-location []
   (.getLocation *cell-meta*))
-
-
-(defn read-cell-header-field [^Trunk trunk loc field]
-  (let [{:keys [reader offset]} (get cell-head-struc-map field)]
-    (reader trunk (+ loc offset))))
-
-(defn write-cell-header-field [^Trunk trunk loc field value]
-  (let [{:keys [writer offset]} (get cell-head-struc-map field)]
-    (writer trunk value (+ loc offset))))
-
-(defn get-header-field-offset-length [field]
-  (let [{:keys [length offset]} (get cell-head-struc-map field)]
-    [offset length]))
 
 (defn put-tombstone [^Trunk ttrunk start end]
   (let [size (inc (- start end))
