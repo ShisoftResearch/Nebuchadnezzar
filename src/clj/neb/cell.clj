@@ -45,14 +45,15 @@
      ~trunk ~hash
      (let [write-lock# (.getCellWriteLock ~trunk)
            exec# (fn []
-                   (.lock (.readLock write-lock#))
                    (try
+                     (.lock (.readLock write-lock#))
                      (locking *cell-meta* ~@body)
-                     (catch Exception ex# (.unlock (.readLock write-lock#)))))
+                     (finally (.unlock (.readLock write-lock#)))))
            exec-retry# (fn []
-                         (.lock (.writeLock write-lock#))
-                         (defrag/scan-trunk-and-defragment ~trunk)
-                         (.unlock (.writeLock write-lock#))
+                         (try
+                           (.lock (.writeLock write-lock#))
+                           (defrag/scan-trunk-and-defragment ~trunk)
+                           (finally (.unlock (.writeLock write-lock#))))
                          (exec#))]
        (try
          (exec#)
