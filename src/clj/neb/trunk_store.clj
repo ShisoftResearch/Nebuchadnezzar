@@ -73,10 +73,10 @@
   (reset! @defrag-service true))
 
 (defn start-backup []
-  (reset! backup-service (ms/start-service backup-trunks 1000)))
+  (reset! backup-service (backup-trunks (atom false))))
 
 (defn stop-backup []
-  (ms/stop-service @backup-service))
+  (reset! @backup-service true))
 
 (defn dispatch-trunk [^UUID cell-id func & params]
   (let [hash (.getLeastSignificantBits cell-id)
