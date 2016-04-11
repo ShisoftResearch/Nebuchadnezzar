@@ -23,29 +23,28 @@
                   ^CellMeta cell-meta (-> ttrunk (.getCellIndex) (.get cell-hash))]
               (cond
                 cell-meta
-                (let [^Long new-frag-pos
-                      (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
-                            cell-len        (+ cell-data-len cell-head-len)
-                            cell-end-pos    (dec (+ hn-pos cell-len))
-                            new-frag-pos    (long (+ lw-pos cell-len))
-                            location-confirmed (atom false)]
-                        (locking cell-meta
-                          (reset! location-confirmed (= hn-pos (.getLocation cell-meta)))
-                          (when @location-confirmed
-                            (.copyMemory ttrunk hn-pos lw-pos cell-len)
-                            (.setLocation cell-meta lw-pos)))
-                        (when @location-confirmed
-                          (.removeFrag ttrunk lw-pos)
-                          (.addFragment ttrunk new-frag-pos cell-end-pos)
-                          new-frag-pos))]
-                  (when new-frag-pos (recur new-frag-pos)))
+                (let [cell-data-len   (read-cell-header-field ttrunk hn-pos :cell-length)
+                      cell-len        (+ cell-data-len cell-head-len)
+                      cell-end-pos    (dec (+ hn-pos cell-len))
+                      new-frag-pos    (long (+ lw-pos cell-len))
+                      location-confirmed (atom false)]
+                  (locking cell-meta
+                    (when (reset! location-confirmed (= hn-pos (.getLocation cell-meta)))
+                      (.copyMemory ttrunk hn-pos lw-pos cell-len)
+                      (.setLocation cell-meta lw-pos)))
+                  (when @location-confirmed
+                    (.removeFrag ttrunk lw-pos)
+                    (.addFragment ttrunk new-frag-pos cell-end-pos))
+                  (recur new-frag-pos))
                 (and (<= append-header (inc hi-pos))
                      (>= append-header lw-pos))
                 (do                                         ;(println "Hit tail" lw-pos hi-pos cell-hash)
                   (.resetAppendHeader ttrunk lw-pos)
-                  (.removeFrag ttrunk lw-pos))
+                  (.removeFrag ttrunk lw-pos)
+                  (recur lw-pos))
                 :else
-                (do                                         ;(println "Unknown Frag:" lw-pos hi-pos cell-hash)
+                (do
+                  (println "Unknown Frag:" lw-pos hi-pos cell-hash)
                   (.removeFrag ttrunk lw-pos)
                   (recur pos)))))))
       (finally
@@ -54,4 +53,8 @@
 
 (defn scan-trunk-and-defragment [^Trunk ttrunk]
   (let [frags (.getFragments ttrunk)]
-    (while (not (empty? frags)) (scan-trunk-and-defragment* ttrunk))))
+    (try
+      (.lockDefrag ttrunk)
+      (while (not (empty? frags)) (scan-trunk-and-defragment* ttrunk))
+      (finally
+        (.unlockDefrag ttrunk)))))

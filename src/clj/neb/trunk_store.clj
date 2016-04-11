@@ -40,18 +40,22 @@
 
 (def ncpu (cp/ncpus))
 
-(defn defrag-store-trunks []
+(defn defrag-store-trunks [stopped-atom]
   (let [trunks (.getTrunks trunks)
-        pool (cp/threadpool (min (count trunks) ncpu)
-                            :name "Defragmentation")]
-    (cp/pdoseq
-      pool [^Trunk trunk trunks]
-      (defrag/scan-trunk-and-defragment* trunk))
-    (cp/shutdown pool)))
+        pool (cp/threadpool (count trunks)
+                            :name "Defragmentation")
+        defrag-trunk (fn [^Trunk trunk]
+                       (while (not @stopped-atom)
+                         (defrag/scan-trunk-and-defragment trunk)
+                         (Thread/sleep 1000))
+                       (cp/shutdown pool))]
+    (doseq [^Trunk trunk trunks]
+      (cp/future pool (defrag-trunk trunk)))
+    stopped-atom))
 
 (defn backup-trunks []
   (let [trunks (.getTrunks trunks)
-        pool (cp/threadpool (min (count trunks) ncpu)
+        pool (cp/threadpool (count trunks)
                             :name "Backup")]
     (cp/pdoseq
       pool [trunk trunks]
@@ -59,10 +63,10 @@
     (cp/shutdown pool)))
 
 (defn start-defrag []
-  (reset! defrag-service (ms/start-service defrag-store-trunks 10000)))
+  (reset! defrag-service (defrag-store-trunks (atom false))))
 
 (defn stop-defrag []
-  (ms/stop-service @defrag-service))
+  (reset! @defrag-service true))
 
 (defn start-backup []
   (reset! backup-service (ms/start-service backup-trunks 1000)))
