@@ -53,14 +53,18 @@
       (cp/future pool (defrag-trunk trunk)))
     stopped-atom))
 
-(defn backup-trunks []
+(defn backup-trunks [stopped-atom]
   (let [trunks (.getTrunks trunks)
         pool (cp/threadpool (count trunks)
-                            :name "Backup")]
-    (cp/pdoseq
-      pool [trunk trunks]
-      (sync-trunk trunk))
-    (cp/shutdown pool)))
+                            :name "Backup")
+        backup (fn [^Trunk trunk]
+                 (while (not @stopped-atom)
+                   (sync-trunk trunk)
+                   (Thread/sleep 1000))
+                 (cp/shutdown pool))]
+    (doseq [trunk trunks]
+      (cp/future pool (backup trunk)))
+    stopped-atom))
 
 (defn start-defrag []
   (reset! defrag-service (defrag-store-trunks (atom false))))
