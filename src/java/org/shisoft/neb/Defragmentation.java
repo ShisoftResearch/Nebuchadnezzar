@@ -18,7 +18,7 @@ public class Defragmentation {
     private volatile long lastDefraged = 0;
     private ReentrantLock defragLock = new ReentrantLock();
     private ReentrantLock opLock = new ReentrantLock();
-    private int cellHeadLen = (int) Bindings.cellHeadLen.invoke();
+    private long cellHeadLen = (long) Bindings.cellHeadLen.invoke();
     private final ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     public Defragmentation(Trunk trunk) {
         this.trunk = trunk;
@@ -58,11 +58,11 @@ public class Defragmentation {
                     lwPos = frag.getKey();hiPos = frag.getValue();hnPos = hiPos + 1;
                     if (!fragments.remove(lwPos, hiPos)) continue;
                     if (appendHeader >= lwPos && appendHeader <= hiPos + 1) {
-                        boolean reseted = trunk.getAppendHeader().compareAndSet(appendHeader, frag.getKey());
-                        if (reseted) break;
+                        boolean rested = trunk.getAppendHeader().compareAndSet(appendHeader, frag.getKey());
+                        if (rested) break;
                     } else {
                         long cellHash = (long) Bindings.readCellHash.invoke(trunk, hnPos);
-                        long cellLen = (long) Bindings.readCellLength.invoke(trunk, hnPos);
+                        long cellLen = (int) Bindings.readCellLength.invoke(trunk, hnPos);
                         cellLen += cellHeadLen;
                         CellMeta meta = trunk.getCellIndex().get(cellHash);
                         if (meta != null) {

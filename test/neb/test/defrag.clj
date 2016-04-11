@@ -10,7 +10,7 @@
 
 ;; We cannot test this feature right now because the defrag is async
 
-#_(facts "Defragmentation"
+(facts "Defragmentation"
        (let [trunk (Trunk. 5000000)
              a-d {:i (int 123)}
              b-d {:l 456}
@@ -26,9 +26,9 @@
                (new-cell trunk 5 1 (int 3) c-d) => anything
                (new-cell trunk 6 1 (int 2) b-d) => anything)
          (fact "make some frags"
-               @(delete-cell trunk 2) => anything
-               @(delete-cell trunk 3) => anything
-               @(delete-cell trunk 5) => anything)
+               (delete-cell trunk 2) => anything
+               (delete-cell trunk 3) => anything
+               (delete-cell trunk 5) => anything)
          (fact "check frag count for auto merge"
                (.countFragments trunk) => 2)
          (let [frag-append-head (.getAppendHeaderValue trunk)]
@@ -36,7 +36,7 @@
                  (scan-trunk-and-defragment trunk) => anything)
            (fact "space reclaimed"
                  (< (.getAppendHeaderValue trunk) frag-append-head) => true
-                 (- (.getAppendHeaderValue trunk) frag-append-head) => -96))
+                 (- (.getAppendHeaderValue trunk) frag-append-head) => -99))
          (fact "data did not corrupted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)
