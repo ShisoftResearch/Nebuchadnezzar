@@ -5,10 +5,10 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.io.type_lengths;
+import org.shisoft.neb.utils.Collection;
 import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
-import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -23,13 +23,11 @@ public class Trunk {
     private long size;
     private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
     private AtomicLong appendHeader = new AtomicLong(0);
-    private final ConcurrentSkipListMap<Long, Long> fragments = new ConcurrentSkipListMap<>();
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
-    private ReentrantLock defragLock = new ReentrantLock();
-    private AtomicLong lastDefraged = new AtomicLong(0);
     private ReentrantReadWriteLock cellWriteLock = new ReentrantReadWriteLock();
+    private Defragmentation defrag;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -38,9 +36,6 @@ public class Trunk {
     }
     public AtomicLong getAppendHeader() {
         return appendHeader;
-    }
-    public ConcurrentSkipListMap getFragments() {
-        return fragments;
     }
     public HashLongObjMap<CellMeta> getCellIndex() {
         return cellIndex;
@@ -57,18 +52,16 @@ public class Trunk {
     public void setId(int id) {
         this.id = id;
     }
-    public long getLastDefraged() {
-        return lastDefraged.get();
-    }
-    public void setLastDefraged(long lastDefraged) {
-        this.lastDefraged.set(lastDefraged);
-    }
     public ReentrantReadWriteLock getCellWriteLock() {
         return cellWriteLock;
+    }
+    public Defragmentation getDefrag() {
+        return defrag;
     }
     public Trunk(long size){
         this.size = size;
         storeAddress = getUnsafe().allocateMemory(size);
+        defrag = new Defragmentation(this);
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
@@ -81,7 +74,9 @@ public class Trunk {
         return storeAddress;
     }
     public void removeCellFromIndex(long hash){
-        getCellIndex().remove(hash);
+        synchronized (cellIndex) {
+            cellIndex.remove(hash);
+        }
     }
     public boolean hasCell (long hash){
         return getCellIndex().containsKey(hash);
@@ -91,9 +86,6 @@ public class Trunk {
     }
     public MemoryFork getMemoryFork() {
         return memoryFork;
-    }
-    public ReentrantLock getDefragLock() {
-        return defragLock;
     }
     public void putTombstone (long startPos, long endPos){
         long size = endPos - startPos + 1;
@@ -105,17 +97,12 @@ public class Trunk {
         addDirtyRanges(startPos, tombstoneEnds);
     }
     public void addFragment (long startPos, long endPos) {
-        synchronized (fragments) {
-            Map.Entry<Long, Long> actualRange = addAndAutoMerge(fragments, startPos, endPos);
-            if (actualRange != null) {
-                putTombstone(actualRange.getKey(), actualRange.getValue());
-            }
-        }
+        defrag.addFragment(startPos, endPos);
     }
     public void addDirtyRanges (long startPos, long endPos) {
         if (backendEnabled) {
             synchronized (dirtyRanges) {
-                addAndAutoMerge(dirtyRanges, startPos, endPos);
+                Collection.addAndAutoMerge(dirtyRanges, startPos, endPos);
             }
         }
     }
@@ -128,50 +115,17 @@ public class Trunk {
         this.dirtyRanges = new ConcurrentSkipListMap<Long, Long>();
         this.backendEnabled = true;
     }
-    public Map.Entry<Long, Long> addAndAutoMerge (ConcurrentSkipListMap<Long, Long> mapToMerge, final long startPos, final long endPos) {
-        Map.Entry<Long, Long> prevPair = mapToMerge.lowerEntry(startPos);
-        Map.Entry<Long, Long> forPair = mapToMerge.higherEntry(startPos);
-        Long dupLoc = mapToMerge.get(startPos);
-        if (dupLoc != null && dupLoc >= endPos) return null;
-        if (prevPair != null && prevPair.getValue() >= endPos) return null;
-        if (prevPair != null && (prevPair.getValue() >= startPos || prevPair.getValue() == startPos - 1)) {
-            return addAndAutoMerge(mapToMerge, prevPair.getKey(), endPos);
-        } else if (forPair != null && (forPair.getKey() < endPos || forPair.getKey() == endPos + 1)) {
-            mapToMerge.remove(forPair.getKey());
-            if (forPair.getValue() < endPos){
-                return addAndAutoMerge(mapToMerge, startPos, endPos);
-            } else {
-                return addAndAutoMerge(mapToMerge, startPos, forPair.getValue());
-            }
-        } else {
-            mapToMerge.put(startPos, endPos);
-            return new Map.Entry<Long, Long>() {
-                public Long getKey() {
-                    return startPos;
-                }
-                public Long getValue() {
-                    return endPos;
-                }
-                public Long setValue(Long value) {
-                    return null;
-                }
-            };
-        }
-    }
 
     public int countFragments (){
-        return fragments.size();
+        return defrag.countFragments();
     }
 
     public ConcurrentSkipListMap<Long, Long> getDirtyRanges() {
         return dirtyRanges;
     }
 
-    public void removeFrag (long startPos){
-        fragments.remove(startPos);
-    }
-    public void resetAppendHeader(Long loc){
-        appendHeader.set(loc);
+    public void removeFrag (long startPos, long endPos){
+        defrag.removeFrag(startPos, endPos);
     }
     public long getAppendHeaderValue (){
         return appendHeader.get();
@@ -186,11 +140,5 @@ public class Trunk {
         assert memoryFork == null : "Only one folk allowed";
         memoryFork = new MemoryFork(this);
         return memoryFork;
-    }
-    public void lockDefrag(){
-        this.defragLock.lock();
-    }
-    public void unlockDefrag(){
-        this.defragLock.unlock();
     }
 }

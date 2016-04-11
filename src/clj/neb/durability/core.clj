@@ -45,13 +45,16 @@
 
 (defn sync-trunk [^Trunk trunk]
   (try
-    (let [append-header (.getAppendHeaderValue trunk)
+    (let [^ConcurrentSkipListMap trunk-dirty-ranges (.getDirtyRanges trunk)
+          append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
-          dirty-ranges  (.clone (.getDirtyRanges trunk))
+          dirty-ranges  (.clone trunk-dirty-ranges)
           timestamp (System/nanoTime)]
-      (.clear (.getDirtyRanges trunk))
       (loop [pos 0]
         (let [d-range (.ceilingEntry dirty-ranges pos)]
+          (when d-range
+            (.remove trunk-dirty-ranges
+                     (.getKey d-range) (.getValue d-range)))
           (if (or (not d-range)
                   (>= (.getKey d-range) append-header))
             (when (> (.size dirty-ranges) 0)

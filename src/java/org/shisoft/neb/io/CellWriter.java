@@ -2,6 +2,7 @@ package org.shisoft.neb.io;
 
 import clojure.java.api.Clojure;
 import clojure.lang.IFn;
+import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.StoreFullException;
 
@@ -50,7 +51,10 @@ public class CellWriter {
     }
 
     public void addCellToTrunkIndex(long hash){
-        trunk.getCellIndex().put(hash, new CellMeta(startLoc));
+        HashLongObjMap<CellMeta> index = trunk.getCellIndex();
+        synchronized (index) {
+            index.put(hash, new CellMeta(startLoc));
+        }
     }
 
     public void updateCellToTrunkIndex(long hash){

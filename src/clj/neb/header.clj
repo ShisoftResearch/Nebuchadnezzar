@@ -40,6 +40,8 @@
                 (get-in @data-types [type :length]))
               cell-head-struct)))
 
+(defn get-cell-head-len [] cell-head-len)
+
 (defn read-cell-header-field [^Trunk trunk loc field]
   (let [{:keys [reader offset]} (get cell-head-struc-map field)]
     (reader trunk (+ loc offset))))
@@ -51,3 +53,9 @@
 (defn get-header-field-offset-length [field]
   (let [{:keys [length offset]} (get cell-head-struc-map field)]
     [offset length]))
+
+(defn read-cell-hash [^Trunk trunk loc]
+  (read-cell-header-field trunk loc :hash))
+
+(defn read-cell-length [^Trunk trunk loc]
+  (read-cell-header-field trunk loc :cell-length))

@@ -272,10 +272,6 @@
 (defn cell-len-by-fields [fields-to-write]
   (reduce + (map :length fields-to-write)))
 
-(defmacro locking-index [^Trunk trunk & body]
-  `(locking (.getCellIndex ~trunk)
-     ~@body))
-
 (defn mark-dirty [^CellWriter cell-writer]
   (.markDirty cell-writer))
 
@@ -298,11 +294,9 @@
     (doseq [{:keys [value writer length]} fields]
       (.streamWrite cell-writer writer value length))
     (when update-hash-index?
-      (locking-index
-        ttrunk
-        (if update-cell?
-          (.updateCellToTrunkIndex cell-writer hash)
-          (.addCellToTrunkIndex cell-writer hash))))
+      (if update-cell?
+        (.updateCellToTrunkIndex cell-writer hash)
+        (.addCellToTrunkIndex cell-writer hash)))
     (mark-dirty cell-writer)))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]

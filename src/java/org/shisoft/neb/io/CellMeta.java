@@ -5,7 +5,7 @@ package org.shisoft.neb.io;
  */
 public class CellMeta {
 
-    long location;
+    private volatile long location;
 
     public CellMeta(long location) {
         this.location = location;
