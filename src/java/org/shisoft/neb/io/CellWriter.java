@@ -6,6 +6,8 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.StoreFullException;
 
+import java.util.function.LongUnaryOperator;
+
 /**
  * Created by shisoft on 21/1/2016.
  */
@@ -27,14 +29,34 @@ public class CellWriter {
         tryAllocate(trunk, length);
     }
 
-    public void tryAllocate(Trunk trunk, long length){
+    private void tryAllocate(Trunk trunk, long length){
         try {
-            long loc = trunk.getAppendHeader().getAndAdd(length);
-            if (loc + length > trunk.getSize()){
-                trunk.getAppendHeader().set(loc);
-                throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
-            }  else {
-                init(trunk, length, loc);
+            long trunkSize = trunk.getSize();
+            long appendHeader = trunk.getAppendHeaderValue();
+            float filledRatio = appendHeader / trunkSize;
+            Long fragSpaceLoc = null;
+            if (filledRatio > 0.8) {
+                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length);
+            }
+            if (fragSpaceLoc != null) {
+                init(trunk, length, fragSpaceLoc);
+            } else {
+                final boolean[] overflowed = {false};
+                long loc = trunk.getAppendHeader().getAndUpdate(appenderLoc -> {
+                    long expectedLoc = appenderLoc + length;
+                    if (expectedLoc > trunkSize) {
+                        overflowed[0] = true;
+                        return appenderLoc;
+                    } else {
+                        overflowed[0] = false;
+                        return expectedLoc;
+                    }
+                });
+                if (overflowed[0]){
+                    throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
+                }  else {
+                    init(trunk, length, loc);
+                }
             }
         } catch (Exception e) {
             e.printStackTrace();

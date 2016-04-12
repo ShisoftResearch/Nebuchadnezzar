@@ -11,13 +11,17 @@ import org.shisoft.neb.utils.UnsafeUtils;
 import java.io.IOException;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+
+import static org.shisoft.neb.io.type_lengths.*;
 
 /**
  * Created by shisoft on 18/1/2016.
  */
 public class Trunk {
+
+    public final static int tombstoneSize = intLen + 1;
+
     private int id;
     private long storeAddress;
     private long size;
@@ -89,11 +93,11 @@ public class Trunk {
     }
     public void putTombstone (long startPos, long endPos){
         long size = endPos - startPos + 1;
-        long tombstoneEnds = startPos + type_lengths.byteLen + type_lengths.longLen - 1;
-        assert  size > (type_lengths.intLen + 1) : "frag length is too small to put a tombstone";
+        long tombstoneEnds = startPos + byteLen + longLen - 1;
+        assert  size > tombstoneSize : "frag length is too small to put a tombstone";
         copyMemForFork(startPos, tombstoneEnds);
         Writer.writeByte(this, (byte) 1, startPos);
-        Writer.writeLong(this, size, startPos + type_lengths.byteLen);
+        Writer.writeLong(this, size, startPos + byteLen);
         addDirtyRanges(startPos, tombstoneEnds);
     }
     public void addFragment (long startPos, long endPos) {

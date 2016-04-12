@@ -43,22 +43,11 @@
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (let [write-lock# (.getCellWriteLock ~trunk)
-           exec# (fn []
-                   (try
-                     (.lock (.readLock write-lock#))
-                     (locking *cell-meta* ~@body)
-                     (finally (.unlock (.readLock write-lock#)))))
-           exec-retry# (fn []
-                         (try
-                           (.lock (.writeLock write-lock#))
-                           (defrag/scan-trunk-and-defragment ~trunk)
-                           (finally (.unlock (.writeLock write-lock#))))
-                         (exec#))]
+     (let [write-lock# (.getCellWriteLock ~trunk)]
        (try
-         (exec#)
-         (catch StoreFullException sfe#
-           (exec-retry#))))))
+         (.lock (.readLock write-lock#))
+         (locking *cell-meta* ~@body)
+         (finally (.unlock (.readLock write-lock#)))))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
