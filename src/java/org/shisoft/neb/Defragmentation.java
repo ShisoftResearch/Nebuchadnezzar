@@ -53,15 +53,17 @@ public class Defragmentation {
     public void defrag (){
         lockDefrag();
         AtomicBoolean headerMoved = new AtomicBoolean(false);
+        Map.Entry<Long, Long> lastFrag = null;
         try {
             if (fragments.isEmpty()) return;
             long lwPos, hnPos;
-            long currentAppendHeader;
+            long currentAppendHeader = 0;
             while (true) {
                 try {
                     opLock.lock();
                     final Map.Entry<Long, Long> frag = fragments.ceilingEntry(currentDefragLoc);
                     if (frag == null) break;
+                    lastFrag = frag;
                     final long hiPos = frag.getValue();
                     lwPos = frag.getKey();hnPos = hiPos + 1;
                     if (!fragments.remove(lwPos, hiPos)) continue;
@@ -107,7 +109,11 @@ public class Defragmentation {
             }
             currentDefragLoc = 0;
             if (!headerMoved.get()) {
-                System.out.println("WARNING: Defrag finished without moving header");
+                assert lastFrag != null;
+                System.out.println("WARNING: Defrag finished without moving header " +
+                        lastFrag.getKey() + "," + lastFrag.getValue() + " " +
+                        currentAppendHeader
+                );
             }
         } catch (Exception ex) {
             ex.printStackTrace();

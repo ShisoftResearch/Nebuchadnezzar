@@ -16,12 +16,14 @@ public class CellWriter {
     static IFn defragFn = Clojure.var("neb.defragment", "scan-trunk-and-defragment");
     long startLoc;
     long currLoc;
+    long length;
     Trunk trunk;
 
     private void init(Trunk trunk, long length, long currLoc){
         this.trunk = trunk;
         this.currLoc = currLoc;
         this.startLoc = currLoc;
+        this.length = length;
         trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
@@ -77,6 +79,10 @@ public class CellWriter {
         synchronized (index) {
             index.put(hash, new CellMeta(startLoc));
         }
+    }
+
+    public void rollBack () {
+        trunk.getDefrag().addFragment(startLoc, startLoc + length -1);
     }
 
     public void updateCellToTrunkIndex(long hash){

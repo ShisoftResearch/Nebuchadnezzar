@@ -266,9 +266,9 @@
 
 (def normal-cell-type (byte 0))
 
-(defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index?] :or {update-hash-index? true}}]
+(defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [loc update-cell? update-hash-index? planned-data] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
-        fields (plan-data-write data schema)
+        fields (or planned-data (plan-data-write data schema))
         fields-length (cell-len-by-fields fields)
         cell-length (+ cell-head-len fields-length)
         cell-writer (if loc
@@ -279,14 +279,18 @@
                      :partition partition
                      :length fields-length
                      :type normal-cell-type}]
-    (write-cell-header cell-writer header-data)
-    (doseq [{:keys [value writer length]} fields]
-      (.streamWrite cell-writer writer value length))
-    (when update-hash-index?
-      (if update-cell?
-        (.updateCellToTrunkIndex cell-writer hash)
-        (.addCellToTrunkIndex cell-writer hash)))
-    (mark-dirty cell-writer)))
+    (try
+      (write-cell-header cell-writer header-data)
+      (doseq [{:keys [value writer length]} fields]
+        (.streamWrite cell-writer writer value length))
+      (when update-hash-index?
+        (if update-cell?
+          (.updateCellToTrunkIndex cell-writer hash)
+          (.addCellToTrunkIndex cell-writer hash)))
+      (mark-dirty cell-writer)
+      (catch Exception ex
+        (.rollBack cell-writer)
+        (throw ex)))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (let [cell-length (count bs)
@@ -315,8 +319,8 @@
           fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
       (if (= data-len new-data-length)
-        (write-cell trunk hash partition schema data :loc cell-loc :update-hash-index? false)
-        (do (write-cell trunk hash partition schema data :update-cell? true)
+        (write-cell trunk hash partition schema data :loc cell-loc :update-hash-index? false :planned-data fields)
+        (do (write-cell trunk hash partition schema data :update-cell? true :planned-data fields)
             (mark-cell-deleted trunk cell-loc data-len))))))
 
 (defn replace-cell [^Trunk trunk ^Long hash data]
