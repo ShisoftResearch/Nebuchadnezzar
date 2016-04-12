@@ -6,6 +6,7 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.StoreFullException;
 
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongUnaryOperator;
 
 /**
@@ -43,18 +44,9 @@ public class CellWriter {
             if (fragSpaceLoc != null) {
                 init(trunk, length, fragSpaceLoc);
             } else {
-                final boolean[] overflowed = {false};
-                long loc = trunk.getAppendHeader().getAndUpdate(appenderLoc -> {
-                    long expectedLoc = appenderLoc + length;
-                    if (expectedLoc > trunkSize) {
-                        overflowed[0] = true;
-                        return appenderLoc;
-                    } else {
-                        overflowed[0] = false;
-                        return expectedLoc;
-                    }
-                });
-                if (overflowed[0]){
+                AtomicBoolean overflowed = new AtomicBoolean(false);
+                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed);
+                if (overflowed.get()){
                     throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
                 }  else {
                     init(trunk, length, loc);
@@ -82,7 +74,7 @@ public class CellWriter {
     }
 
     public void rollBack () {
-        trunk.getDefrag().addFragment(startLoc, startLoc + length -1);
+        trunk.getDefrag().addFragment(startLoc, startLoc + length - 1);
     }
 
     public void updateCellToTrunkIndex(long hash){

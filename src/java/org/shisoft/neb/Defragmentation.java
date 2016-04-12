@@ -8,7 +8,9 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.LongBinaryOperator;
 import java.util.function.LongUnaryOperator;
+import java.util.function.ToLongFunction;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -121,6 +123,13 @@ public class Defragmentation {
             unlockDefrag();
         }
     }
+
+    public boolean checkFragSpace (long expected) {
+        return expected <= fragments.entrySet().stream()
+                .mapToLong(value -> value.getValue() - value.getKey())
+                .reduce((left, right) -> left + right).getAsLong();
+    }
+
     public Long tryAcquireFromFrag(long size){
         try {
             opLock.lock();
@@ -135,16 +144,15 @@ public class Defragmentation {
                 }
                 totalFragSize += fsize;
             }
-//            if (frag == null && totalFragSize >= requiredSize) {
-//                opLock.unlock();
-//                defrag();
-//                try {
-//                    return tryAcquireFromFrag(size);
-//                } catch (StackOverflowError se) {
-//                    System.out.println("Failed to acquire frag after defrag due to frequent changes");
-//                    return null;
-//                }
-//            }
+            if (totalFragSize >= requiredSize) {
+                defrag();
+                try {
+                    opLock.unlock();
+                    return tryAcquireFromFrag(size);
+                } catch (StackOverflowError ex) {
+                    return null;
+                }
+            }
             if (frag != null) {
                 long start = frag.getKey();
                 long end = frag.getValue();
@@ -170,6 +178,10 @@ public class Defragmentation {
             } else {
                 return null;
             }
-        } finally {opLock.unlock();}
+        } finally {
+            if (opLock.isHeldByCurrentThread()) {
+                opLock.unlock();
+            }
+        }
     }
 }

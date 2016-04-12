@@ -10,6 +10,7 @@ import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -144,5 +145,18 @@ public class Trunk {
         assert memoryFork == null : "Only one folk allowed";
         memoryFork = new MemoryFork(this);
         return memoryFork;
+    }
+
+    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed){
+        return getAppendHeader().getAndUpdate(appenderLoc -> {
+            long expectedLoc = appenderLoc + length;
+            if (expectedLoc > size) {
+                overflowed.set(true);
+                return appenderLoc;
+            } else {
+                overflowed.set(false);
+                return expectedLoc;
+            }
+        });
     }
 }

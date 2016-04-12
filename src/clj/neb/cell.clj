@@ -288,9 +288,9 @@
           (.updateCellToTrunkIndex cell-writer hash)
           (.addCellToTrunkIndex cell-writer hash)))
       (mark-dirty cell-writer)
-      (catch Exception ex
+      (catch Throwable tr
         (.rollBack cell-writer)
-        (throw ex)))))
+        (throw tr)))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (let [cell-length (count bs)
