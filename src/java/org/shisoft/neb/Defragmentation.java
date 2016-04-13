@@ -1,5 +1,6 @@
 package org.shisoft.neb;
 
+import clojure.lang.IFn;
 import javafx.scene.control.Cell;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.apache.commons.lang.builder.CompareToBuilder;
@@ -206,7 +207,9 @@ public class Defragmentation {
                             long newFragStart = start + size;
                             addFragment(newFragStart, end);
                         }
-                        if (meta != null) {meta.setLocation(start);}
+                        if (meta != null && meta.getLocation() < 0) {
+                            meta.setLocation(start);
+                        }
                         return start;
                     } else {
                         try {

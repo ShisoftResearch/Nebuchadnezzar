@@ -57,13 +57,6 @@
 (defn get-cell-location []
   (.getLocation *cell-meta*))
 
-(defn put-tombstone [^Trunk ttrunk start end]
-  (let [size (inc (- start end))
-        tombstone-size (apply + (get-header-field-offset-length :cell-length))]
-    (assert (> size tombstone-size) "Range is too small to put a tombstone")
-    (write-cell-header-field ttrunk start :cell-length (* -1 size))
-    (.addDirtyRanges ttrunk start (dec (+ start tombstone-size)))))
-
 (defn add-frag [^Trunk ttrunk start end]
   (.addFragment ttrunk start end))
 
@@ -276,22 +269,21 @@
                      :length fields-length
                      :type normal-cell-type}
         require-new-cell-meta? (not (or update-hash-index? loc))
-        ^CellMeta new-cell-meta (when require-new-cell-meta? (CellMeta. -1))]
-    (locking (or new-cell-meta *cell-meta*)
+        ^CellMeta new-cell-meta (when require-new-cell-meta? (CellMeta. -1))
+        ^CellMeta cell-meta (or new-cell-meta *cell-meta*)]
+    (locking cell-meta
       (.tryWriteCell ttrunk)
       (let [new-cell-meta(when require-new-cell-meta?
                            (.addCellMetaToTrunkIndex ttrunk hash new-cell-meta))
             ^CellWriter cell-writer (cond
                                       loc (CellWriter. ttrunk cell-length loc)
-                                      update-hash-index? (CellWriter. ttrunk cell-length *cell-meta*)
-                                      new-cell-meta (CellWriter. ttrunk cell-length new-cell-meta)
+                                      (or new-cell-meta update-hash-index?) (CellWriter. ttrunk cell-length cell-meta)
                                       :else (throw (IllegalArgumentException.)))]
         (try
           (write-cell-header cell-writer header-data)
           (doseq [{:keys [value writer length]} fields]
             (.streamWrite cell-writer writer value length))
-          (when update-hash-index?
-            (.updateCellToTrunkIndex cell-writer hash))
+          (.updateCellToTrunkIndex cell-writer cell-meta)
           (mark-dirty cell-writer)
           (catch Throwable tr
             (.rollBack cell-writer)
@@ -343,9 +335,9 @@
     (when-let [cell-content (read-cell* trunk)]
       (let [replacement  (apply (compiled-cache fn) cell-content params)]
         (assert replacement)
-        (when-not (= cell-content replacement)
-          (replace-cell* trunk hash replacement))
-        replacement))))
+        (if-not (= cell-content replacement)
+          (replace-cell* trunk hash replacement)
+          cell-content)))))
 
 (defn- compile-schema-for-get-in* [schema-fields ks]
   (loop [commetted-fields (transient [])

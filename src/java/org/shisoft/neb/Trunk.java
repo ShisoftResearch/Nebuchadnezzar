@@ -1,5 +1,6 @@
 package org.shisoft.neb;
 
+import clojure.lang.IFn;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.CellMeta;
@@ -151,7 +152,7 @@ public class Trunk {
         try {
             cellWriteLock.lock();
             Long cellLoc = meta != null ? meta.getLocation() : null;
-            return getAppendHeader().getAndUpdate(appenderLoc -> {
+            long r = getAppendHeader().getAndUpdate(appenderLoc -> {
                 long expectedLoc = appenderLoc + length;
                 if (expectedLoc > size) {
                     overflowed.set(true);
@@ -159,10 +160,11 @@ public class Trunk {
                     return appenderLoc;
                 } else {
                     overflowed.set(false);
-                    if (meta != null) {meta.setLocation(appenderLoc);}
+                    if (meta != null && meta.getLocation() < 0) {meta.setLocation(appenderLoc);}
                     return expectedLoc;
                 }
             });
+            return r;
         } finally {
             cellWriteLock.unlock();
         }

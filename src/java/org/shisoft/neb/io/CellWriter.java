@@ -69,8 +69,8 @@ public class CellWriter {
         trunk.getDefrag().addFragment(startLoc, startLoc + length - 1);
     }
 
-    public void updateCellToTrunkIndex(long hash){
-        trunk.getCellIndex().get(hash).setLocation(startLoc);
+    public void updateCellToTrunkIndex(CellMeta meta){
+        meta.setLocation(startLoc);
     }
 
     public long getCurrLoc() {
