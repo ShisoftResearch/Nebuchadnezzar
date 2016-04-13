@@ -6,15 +6,18 @@ package org.shisoft.neb.io;
 
 import clojure.lang.IFn;
 import org.shisoft.neb.Trunk;
+import org.shisoft.neb.exceptions.CellFormatErrorException;
 
 public class CellReader {
 
     long currLoc;
     Trunk trunk;
 
-    public CellReader(Trunk trunk, long currLoc) {
+    public CellReader(Trunk trunk, long currLoc) throws CellFormatErrorException {
         this.currLoc = currLoc;
         this.trunk = trunk;
+        if (Reader.readByte(trunk, currLoc) != 0) // cell type field, 0 for cell
+            throw new CellFormatErrorException();
     }
 
     public Object streamRead (IFn fn){

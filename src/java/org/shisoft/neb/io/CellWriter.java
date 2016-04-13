@@ -28,24 +28,23 @@ public class CellWriter {
         trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
-    public CellWriter(Trunk trunk, long length) throws Exception {
-        tryAllocate(trunk, length);
+    public CellWriter(Trunk trunk, long length, CellMeta meta) throws Exception {
+        tryAllocate(trunk, length, meta);
     }
 
-    private void tryAllocate(Trunk trunk, long length){
+    private void tryAllocate(Trunk trunk, long length, CellMeta meta){
         try {
-            long trunkSize = trunk.getSize();
-            long appendHeader = trunk.getAppendHeaderValue();
-            float filledRatio = appendHeader / trunkSize;
             Long fragSpaceLoc = null;
-            if (filledRatio > 0.8) {
-                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length);
+            float fillRatio = trunk.computeFillRatio();
+            trunk.checkShouldInSlowMode(fillRatio);
+            if (fillRatio > 0.8) {
+                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length, meta);
             }
             if (fragSpaceLoc != null) {
                 init(trunk, length, fragSpaceLoc);
             } else {
                 AtomicBoolean overflowed = new AtomicBoolean(false);
-                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed);
+                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed, meta);
                 if (overflowed.get()){
                     throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
                 }  else {
@@ -64,13 +63,6 @@ public class CellWriter {
     public void streamWrite (IFn fn, Object value, long length){
         fn.invoke(trunk, value, currLoc);
         currLoc += length;
-    }
-
-    public void addCellToTrunkIndex(long hash){
-        HashLongObjMap<CellMeta> index = trunk.getCellIndex();
-        synchronized (index) {
-            index.put(hash, new CellMeta(startLoc));
-        }
     }
 
     public void rollBack () {

@@ -51,16 +51,16 @@
        (fact "deleted cell cannot been read"
              (read-cell @ttrunk 2) => nil)
        (fact "replace cell"
-             (replace-cell @ttrunk 1 simple-scheme-data-replacement) => anything)
+             (replace-cell @ttrunk 1 simple-scheme-data-replacement) => simple-scheme-data-replacement)
        (fact "cell should been replaced"
              (read-cell @ttrunk 1) => (contains simple-scheme-data-replacement))
        (fact "shrinked replace cell"
              (new-cell @ttrunk 2 1 (int 2) compound-scheme-data) => anything
-             (replace-cell @ttrunk 2 compound-scheme-data-shrinked-replacement) => anything)
+             (replace-cell @ttrunk 2 compound-scheme-data-shrinked-replacement) => compound-scheme-data-shrinked-replacement)
        (fact "shrinked cell should been replaced"
              (read-cell @ttrunk 2) => (contains compound-scheme-data-shrinked-replacement))
        (fact "overflow replace cell"
-             (replace-cell @ttrunk 2 compound-scheme-data-replacement) => anything)
+             (replace-cell @ttrunk 2 compound-scheme-data-replacement) => compound-scheme-data-replacement)
        (fact "overflow cell should been replaced"
              (read-cell @ttrunk 2) => (contains compound-scheme-data-replacement))
        (fact "update cell"

@@ -39,7 +39,7 @@ public class MemoryFork {
     final static int segLength = 128 * 1024; // 32K segment
 
     // start and end are relative address
-    public void syncBytes(long start, long end, IFn syncFn){
+    public synchronized void syncBytes(long start, long end, IFn syncFn){
         NavigableMap<Long, byte[]> es = orignalBytes.subMap(start, true, start, true);
         Map.Entry<Long, byte[]> e = new Map.Entry<Long, byte[]>() {
             public Long getKey() {
@@ -80,7 +80,7 @@ public class MemoryFork {
         }
     }
 
-    public void release(){
+    public synchronized void release(){
         orignalBytes.clear();
         trunk.setMemoryFork(null);
     }

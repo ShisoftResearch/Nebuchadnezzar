@@ -1,16 +1,23 @@
 package org.shisoft.neb;
 
+import javafx.scene.control.Cell;
+import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
+import org.apache.commons.lang.builder.CompareToBuilder;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.utils.Bindings;
 import org.shisoft.neb.utils.Collection;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.LongBinaryOperator;
-import java.util.function.LongUnaryOperator;
-import java.util.function.ToLongFunction;
+import java.util.function.*;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -52,6 +59,43 @@ public class Defragmentation {
         putTombstone(actualRange);
         opLock.unlock();
     }
+    public void rebuildFrags() {
+        trunk.getCellWriteLock().lock();
+        opLock.lock();
+        this.fragments.clear();
+        AtomicLong pos = new AtomicLong(0);
+        long originalHeader = trunk.getAppendHeaderValue();
+        try {
+            HashLongObjMap<CellMeta> index = trunk.getCellIndex();
+            synchronized (index) {
+                trunk.getCellIndex().values().stream()
+                        .mapToLong(CellMeta::getLocation)
+                        .sorted()
+                        .filter(loc -> loc > 0)
+                        .mapToObj(base -> {
+                            long leng = (int) Bindings.readCellLength.invoke(trunk, base) + cellHeadLen;
+                            long ends = base + leng - 1;
+                            assert leng > 0;
+                            return new long[]{base, ends};
+                        })
+                        .forEachOrdered(longs -> {
+                            long starts = longs[0];
+                            long ends = longs[1];
+                            long currPos = pos.get();
+                            assert currPos <= starts;
+                            if (currPos != starts) {
+                                addFragment(currPos, starts - 1);
+                            }
+                            pos.set(ends + 1);
+                        });
+                assert trunk.getAppendHeader().compareAndSet(originalHeader, pos.get());
+                System.out.println("Append header reset to " + pos.get());
+            }
+        } finally {
+            opLock.unlock();
+            trunk.getCellWriteLock().unlock();
+        }
+    }
     public void defrag (){
         lockDefrag();
         AtomicBoolean headerMoved = new AtomicBoolean(false);
@@ -62,6 +106,7 @@ public class Defragmentation {
             long currentAppendHeader = 0;
             while (true) {
                 try {
+                    trunk.checkShouldInSlowMode();
                     opLock.lock();
                     final Map.Entry<Long, Long> frag = fragments.ceilingEntry(currentDefragLoc);
                     if (frag == null) break;
@@ -112,10 +157,11 @@ public class Defragmentation {
             currentDefragLoc = 0;
             if (!headerMoved.get()) {
                 assert lastFrag != null;
-                System.out.println("WARNING: Defrag finished without moving header " +
+                System.out.println("WARNING:s Defrag finished without moving header " +
                         lastFrag.getKey() + "," + lastFrag.getValue() + " " +
-                        currentAppendHeader
+                        currentAppendHeader + " starting rebuild"
                 );
+                rebuildFrags();
             }
         } catch (Exception ex) {
             ex.printStackTrace();
@@ -130,7 +176,7 @@ public class Defragmentation {
                 .reduce((left, right) -> left + right).getAsLong();
     }
 
-    public Long tryAcquireFromFrag(long size){
+    public Long tryAcquireFromFrag(long size, CellMeta meta){
         try {
             opLock.lock();
             Map.Entry<Long, Long> frag = null;
@@ -144,14 +190,9 @@ public class Defragmentation {
                 }
                 totalFragSize += fsize;
             }
-            if (totalFragSize >= requiredSize) {
+            if (frag == null && totalFragSize >= requiredSize && trunk.isCurrentOpSlowMode()) {
                 defrag();
-                try {
-                    opLock.unlock();
-                    return tryAcquireFromFrag(size);
-                } catch (StackOverflowError ex) {
-                    return null;
-                }
+                return null;
             }
             if (frag != null) {
                 long start = frag.getKey();
@@ -165,10 +206,11 @@ public class Defragmentation {
                             long newFragStart = start + size;
                             addFragment(newFragStart, end);
                         }
+                        if (meta != null) {meta.setLocation(start);}
                         return start;
                     } else {
                         try {
-                            return tryAcquireFromFrag(size);
+                            return tryAcquireFromFrag(size, meta);
                         } catch (StackOverflowError se) {
                             System.out.println("Failed to acquire frag due to frequent changes");
                             return null;
@@ -179,9 +221,7 @@ public class Defragmentation {
                 return null;
             }
         } finally {
-            if (opLock.isHeldByCurrentThread()) {
-                opLock.unlock();
-            }
+            opLock.unlock();
         }
     }
 }

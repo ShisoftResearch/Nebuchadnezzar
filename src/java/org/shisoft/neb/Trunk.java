@@ -4,7 +4,6 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
-import org.shisoft.neb.io.type_lengths;
 import org.shisoft.neb.utils.Collection;
 import org.shisoft.neb.utils.UnsafeUtils;
 
@@ -12,7 +11,7 @@ import java.io.IOException;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 
 import static org.shisoft.neb.io.type_lengths.*;
 
@@ -31,8 +30,9 @@ public class Trunk {
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
-    private ReentrantReadWriteLock cellWriteLock = new ReentrantReadWriteLock();
+    private ReentrantLock cellWriteLock = new ReentrantLock();
     private Defragmentation defrag;
+    private volatile boolean slowMode = false;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -57,7 +57,7 @@ public class Trunk {
     public void setId(int id) {
         this.id = id;
     }
-    public ReentrantReadWriteLock getCellWriteLock() {
+    public ReentrantLock getCellWriteLock() {
         return cellWriteLock;
     }
     public Defragmentation getDefrag() {
@@ -147,16 +147,74 @@ public class Trunk {
         return memoryFork;
     }
 
-    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed){
-        return getAppendHeader().getAndUpdate(appenderLoc -> {
-            long expectedLoc = appenderLoc + length;
-            if (expectedLoc > size) {
-                overflowed.set(true);
-                return appenderLoc;
-            } else {
-                overflowed.set(false);
-                return expectedLoc;
+    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed, CellMeta meta){
+        try {
+            cellWriteLock.lock();
+            Long cellLoc = meta != null ? meta.getLocation() : null;
+            return getAppendHeader().getAndUpdate(appenderLoc -> {
+                long expectedLoc = appenderLoc + length;
+                if (expectedLoc > size) {
+                    overflowed.set(true);
+                    if (meta != null) {meta.setLocation(cellLoc);}
+                    return appenderLoc;
+                } else {
+                    overflowed.set(false);
+                    if (meta != null) {meta.setLocation(appenderLoc);}
+                    return expectedLoc;
+                }
+            });
+        } finally {
+            cellWriteLock.unlock();
+        }
+    }
+
+    public void enterSlowMode () {
+        this.slowMode = true;
+    }
+    public void leaveSlowMode () {
+        this.slowMode = false;
+    }
+    public boolean isSlowMode() {
+        return slowMode;
+    }
+    public boolean isCurrentOpSlowMode() {
+        return slowMode && cellWriteLock.isHeldByCurrentThread();
+    }
+    public void tryWriteCell () {
+        if (slowMode && !this.cellWriteLock.isHeldByCurrentThread()) this.cellWriteLock.lock();
+    }
+    public void endWriteCell () {
+        if (this.cellWriteLock.isHeldByCurrentThread()) this.cellWriteLock.unlock();
+    }
+    public float computeFillRatio () {
+        long trunkSize = getSize();
+        long appendHeader = getAppendHeaderValue();
+        float r = (float) appendHeader / (float) trunkSize;
+        return r;
+    }
+    public boolean checkShouldInSlowMode (float fillRate) {
+        boolean almostFull = fillRate > 0.9;
+        boolean originalMode = isSlowMode();
+        if (almostFull) {
+            enterSlowMode();
+        } else {
+            leaveSlowMode();
+        }
+        if (isSlowMode() != originalMode) {
+            System.out.println(isSlowMode() ? "In Slow Mode" : "Leave Slow Mode");
+        }
+        return almostFull;
+    }
+    public boolean checkShouldInSlowMode () {
+        return checkShouldInSlowMode(computeFillRatio());
+    }
+
+    public CellMeta addCellMetaToTrunkIndex(long hash, CellMeta meta) throws Exception {
+        synchronized (cellIndex) {
+            if (cellIndex.putIfAbsent(hash, meta) != null) {
+                throw new Exception("Cell hash already exists");
             }
-        });
+        }
+        return meta;
     }
 }
