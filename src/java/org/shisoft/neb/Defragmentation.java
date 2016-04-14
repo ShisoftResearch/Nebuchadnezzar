@@ -90,7 +90,7 @@ public class Defragmentation {
                             pos.set(ends + 1);
                         });
                 assert trunk.getAppendHeader().compareAndSet(originalHeader, pos.get());
-                System.out.println("Append header reset to " + pos.get());
+                System.out.println("Append header reset to " + pos.get() + " for " + trunk.getId());
             }
         } finally {
             opLock.unlock();
@@ -129,8 +129,6 @@ public class Defragmentation {
                         cellLen += cellHeadLen;
                         CellMeta meta = trunk.getCellIndex().get(cellHash);
                         if (meta != null) {
-                            currentDefragLoc = lwPos + cellLen;
-                            Map.Entry<Long, Long> fragRange = addFragment_(currentDefragLoc, hnPos + cellLen -1);
                             opLock.unlock();
                             boolean cellUpdated = false;
                             synchronized (meta) {
@@ -140,10 +138,11 @@ public class Defragmentation {
                                     cellUpdated = true;
                                 }
                             }
-                            putTombstone(fragRange);
                             if (!cellUpdated) {
-                                //System.out.println("WARNING: Cell changed when defrag " + cellHash);
-                                addFragment(lwPos, currentDefragLoc);
+                                addFragment(lwPos, hiPos);
+                            } else {
+                                currentDefragLoc = lwPos + cellLen;
+                                addFragment(currentDefragLoc, hnPos + cellLen -1);
                             }
                         }
                     }
@@ -160,7 +159,7 @@ public class Defragmentation {
                 assert lastFrag != null;
                 System.out.println("WARNING:s Defrag finished without moving header " +
                         lastFrag.getKey() + "," + lastFrag.getValue() + " " +
-                        currentAppendHeader + " starting rebuild"
+                        currentAppendHeader + " starting rebuild for " + trunk.getId()
                 );
                 rebuildFrags();
             }

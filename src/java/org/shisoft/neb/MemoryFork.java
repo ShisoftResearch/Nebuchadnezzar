@@ -36,10 +36,11 @@ public class MemoryFork {
         });
     }
 
-    final static int segLength = 128 * 1024; // 32K segment
+    final static int segLength = 2 * 1024 * 1024; // 2M segment
 
     // start and end are relative address
     public synchronized void syncBytes(long start, long end, IFn syncFn){
+        assert start <= end;
         NavigableMap<Long, byte[]> es = orignalBytes.subMap(start, true, start, true);
         Map.Entry<Long, byte[]> e = new Map.Entry<Long, byte[]>() {
             public Long getKey() {
