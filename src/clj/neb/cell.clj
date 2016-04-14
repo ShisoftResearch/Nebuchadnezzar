@@ -40,13 +40,18 @@
      (when *cell-meta*
        ~@body)))
 
+(defmacro with-trunk-write-lock [trunk & body]
+  `(try
+     (.tryWriteCell ~trunk)
+     ~@body
+     (finally (.endWriteCell ~trunk))))
+
 (defmacro with-write-lock [trunk hash & body]
-  `(with-cell-meta
-     ~trunk ~hash
-     (try
-       (.tryWriteCell ~trunk)
-       (locking *cell-meta* ~@body)
-       (finally (.endWriteCell ~trunk)))))
+  `(with-trunk-write-lock
+     ~trunk
+     (with-cell-meta
+       ~trunk ~hash
+       (locking *cell-meta* ~@body))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
@@ -271,43 +276,46 @@
         require-new-cell-meta? (not (or update-hash-index? loc))
         ^CellMeta new-cell-meta (when require-new-cell-meta? (CellMeta. -1))
         ^CellMeta cell-meta (or new-cell-meta *cell-meta*)]
-    (locking cell-meta
-      (.tryWriteCell ttrunk)
-      (let [new-cell-meta(when require-new-cell-meta?
-                           (.addCellMetaToTrunkIndex ttrunk hash new-cell-meta))
-            ^CellWriter cell-writer (cond
-                                      loc (CellWriter. ttrunk cell-length loc)
-                                      (or new-cell-meta update-hash-index?) (CellWriter. ttrunk cell-length cell-meta)
-                                      :else (throw (IllegalArgumentException.)))]
-        (try
-          (write-cell-header cell-writer header-data)
-          (doseq [{:keys [value writer length]} fields]
-            (.streamWrite cell-writer writer value length))
-          (.updateCellToTrunkIndex cell-writer cell-meta)
-          (mark-dirty cell-writer)
-          (catch Throwable tr
-            (.rollBack cell-writer)
-            (throw tr))
-          (finally
-            (.endWriteCell ttrunk)))))))
+    (when new-cell-meta (monitor-enter new-cell-meta))
+    (let [new-cell-meta(when require-new-cell-meta?
+                         (.addCellMetaToTrunkIndex ttrunk hash new-cell-meta))
+          ^CellWriter cell-writer (cond
+                                    loc (CellWriter. ttrunk cell-length loc)
+                                    (or new-cell-meta update-hash-index?) (CellWriter. ttrunk cell-length cell-meta)
+                                    :else (throw (IllegalArgumentException.)))]
+      (try
+        (write-cell-header cell-writer header-data)
+        (doseq [{:keys [value writer length]} fields]
+          (.streamWrite cell-writer writer value length))
+        (.updateCellToTrunkIndex cell-writer cell-meta)
+        (mark-dirty cell-writer)
+        (catch Throwable tr
+          (.rollBack cell-writer)
+          (throw tr))
+        (finally
+          (when new-cell-meta (monitor-exit new-cell-meta)))))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
-  (let [cell-length (count bs)
-        ^CellMeta cell-meta (.addCellMetaToTrunkIndex ttrunk hash (CellMeta. -1))
-        cell-writer (CellWriter. ttrunk cell-length cell-meta)
-        bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
-    (locking cell-meta
-      (.streamWrite cell-writer bytes-writer bs cell-length)
-      (mark-dirty cell-writer))))
+  (with-trunk-write-lock
+    ttrunk
+    (let [cell-length (count bs)
+          ^CellMeta cell-meta (.addCellMetaToTrunkIndex ttrunk hash (CellMeta. -1))
+          cell-writer (CellWriter. ttrunk cell-length cell-meta)
+          bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
+      (locking cell-meta
+        (.streamWrite cell-writer bytes-writer bs cell-length)
+        (mark-dirty cell-writer)))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
   (.hasCell ttrunk hash))
 
 (defn new-cell [^Trunk ttrunk ^Long hash ^Long partition ^Integer schema-id data]
-  (when (cell-exists? ttrunk hash)
-    (throw (Exception. "Cell hash already exists")))
-  (when-let [schema (schema-by-id schema-id)]
-    (write-cell ttrunk hash partition schema data :update-hash-index? false)))
+  (with-trunk-write-lock
+    ttrunk
+    (when (cell-exists? ttrunk hash)
+      (throw (Exception. "Cell hash already exists")))
+    (when-let [schema (schema-by-id schema-id)]
+      (write-cell ttrunk hash partition schema data :update-hash-index? false))))
 
 (defn replace-cell* [^Trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]

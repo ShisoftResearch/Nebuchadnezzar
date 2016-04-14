@@ -1,24 +1,15 @@
 package org.shisoft.neb;
 
-import clojure.lang.IFn;
-import javafx.scene.control.Cell;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
-import org.apache.commons.lang.builder.CompareToBuilder;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.utils.Bindings;
 import org.shisoft.neb.utils.Collection;
 
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.*;
-import java.util.stream.Collector;
-import java.util.stream.Collectors;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -61,40 +52,40 @@ public class Defragmentation {
         opLock.unlock();
     }
     public void rebuildFrags() {
-        trunk.getCellWriteLock().lock();
+        HashLongObjMap<CellMeta> index = trunk.getCellIndex();
+        trunk.getCellWriteLock().writeLock().lock();
         opLock.lock();
         this.fragments.clear();
         AtomicLong pos = new AtomicLong(0);
         long originalHeader = trunk.getAppendHeaderValue();
         try {
-            HashLongObjMap<CellMeta> index = trunk.getCellIndex();
-            synchronized (index) {
-                trunk.getCellIndex().values().stream()
-                        .mapToLong(CellMeta::getLocation)
-                        .sorted()
-                        .filter(loc -> loc > 0)
-                        .mapToObj(base -> {
-                            long leng = (int) Bindings.readCellLength.invoke(trunk, base) + cellHeadLen;
-                            long ends = base + leng - 1;
-                            assert leng > 0;
-                            return new long[]{base, ends};
-                        })
-                        .forEachOrdered(longs -> {
-                            long starts = longs[0];
-                            long ends = longs[1];
-                            long currPos = pos.get();
-                            assert currPos <= starts;
-                            if (currPos != starts) {
-                                addFragment(currPos, starts - 1);
+            trunk.getCellIndex().values().stream()
+                    .mapToLong(CellMeta::getLocation)
+                    .sorted()
+                    .filter(loc -> loc > 0)
+                    .forEachOrdered(starts -> {
+                        long hash = (long) Bindings.readCellHash.invoke(trunk, starts);
+                        CellMeta meta = index.get(hash);
+                        if (meta != null && meta.getLocation() == starts) {
+                            synchronized (meta) {
+                                long len = (int) Bindings.readCellLength.invoke(trunk, starts) + cellHeadLen;
+                                long ends = starts + len - 1;
+                                long currPos = pos.get();
+                                assert currPos <= starts;
+                                if (currPos != starts) {
+                                    addFragment(currPos, starts - 1);
+                                }
+                                pos.set(ends + 1);
                             }
-                            pos.set(ends + 1);
-                        });
-                assert trunk.getAppendHeader().compareAndSet(originalHeader, pos.get());
-                System.out.println("Append header reset to " + pos.get() + " for " + trunk.getId());
-            }
+                        } else {
+                            System.out.println("WARNING: Meta is not stable");
+                        }
+                    });
+            assert trunk.getAppendHeader().compareAndSet(originalHeader, pos.get());
+            System.out.println("Append header reset to " + pos.get() + " for " + trunk.getId());
         } finally {
             opLock.unlock();
-            trunk.getCellWriteLock().unlock();
+            trunk.getCellWriteLock().writeLock().unlock();
         }
     }
     public void defrag (){

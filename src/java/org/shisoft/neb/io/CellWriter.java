@@ -38,7 +38,7 @@ public class CellWriter {
             float fillRatio = trunk.computeFillRatio();
             trunk.checkShouldInSlowMode(fillRatio);
             if (fillRatio > 0.8) {
-                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length, meta);
+                //fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length, meta);
             }
             if (fragSpaceLoc != null) {
                 init(trunk, length, fragSpaceLoc);

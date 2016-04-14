@@ -1,6 +1,5 @@
 package org.shisoft.neb;
 
-import clojure.lang.IFn;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.io.CellMeta;
@@ -13,6 +12,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.shisoft.neb.io.type_lengths.*;
 
@@ -31,7 +31,8 @@ public class Trunk {
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
-    private ReentrantLock cellWriteLock = new ReentrantLock();
+    private ReentrantLock cellSlowWriteLock = new ReentrantLock();
+    private ReentrantReadWriteLock cellWriteLock = new ReentrantReadWriteLock();
     private Defragmentation defrag;
     private volatile boolean slowMode = false;
     public boolean isBackendEnabled() {
@@ -58,7 +59,10 @@ public class Trunk {
     public void setId(int id) {
         this.id = id;
     }
-    public ReentrantLock getCellWriteLock() {
+    public ReentrantLock getCellSlowWriteLock() {
+        return cellSlowWriteLock;
+    }
+    public ReentrantReadWriteLock getCellWriteLock() {
         return cellWriteLock;
     }
     public Defragmentation getDefrag() {
@@ -149,25 +153,19 @@ public class Trunk {
     }
 
     public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed, CellMeta meta){
-        try {
-            cellWriteLock.lock();
-            Long cellLoc = meta != null ? meta.getLocation() : null;
-            long r = getAppendHeader().getAndUpdate(appenderLoc -> {
-                long expectedLoc = appenderLoc + length;
-                if (expectedLoc > size) {
-                    overflowed.set(true);
-                    if (meta != null) {meta.setLocation(cellLoc);}
-                    return appenderLoc;
-                } else {
-                    overflowed.set(false);
-                    if (meta != null && meta.getLocation() < 0) {meta.setLocation(appenderLoc);}
-                    return expectedLoc;
-                }
-            });
-            return r;
-        } finally {
-            cellWriteLock.unlock();
-        }
+        Long cellLoc = meta != null ? meta.getLocation() : null;
+        return getAppendHeader().getAndUpdate(appenderLoc -> {
+            long expectedLoc = appenderLoc + length;
+            if (expectedLoc > size) {
+                overflowed.set(true);
+                if (meta != null) {meta.setLocation(cellLoc);}
+                return appenderLoc;
+            } else {
+                overflowed.set(false);
+                if (meta != null && meta.getLocation() < 0) {meta.setLocation(appenderLoc);}
+                return expectedLoc;
+            }
+        });
     }
 
     public void enterSlowMode () {
@@ -180,13 +178,15 @@ public class Trunk {
         return slowMode;
     }
     public boolean isCurrentOpSlowMode() {
-        return slowMode && cellWriteLock.isHeldByCurrentThread();
+        return slowMode && cellSlowWriteLock.isHeldByCurrentThread();
     }
     public void tryWriteCell () {
-        if (slowMode && !this.cellWriteLock.isHeldByCurrentThread()) this.cellWriteLock.lock();
+        this.getCellWriteLock().readLock().lock();
+        if (slowMode && !this.cellSlowWriteLock.isHeldByCurrentThread()) this.cellSlowWriteLock.lock();
     }
     public void endWriteCell () {
-        if (this.cellWriteLock.isHeldByCurrentThread()) this.cellWriteLock.unlock();
+        if (this.cellSlowWriteLock.isHeldByCurrentThread()) this.cellSlowWriteLock.unlock();
+        this.getCellWriteLock().readLock().unlock();
     }
     public float computeFillRatio () {
         long trunkSize = getSize();
@@ -195,7 +195,7 @@ public class Trunk {
         return r;
     }
     public boolean checkShouldInSlowMode (float fillRate) {
-        boolean almostFull = fillRate > 0.9;
+        boolean almostFull = fillRate > 0.8;
         boolean originalMode = isSlowMode();
         if (almostFull) {
             enterSlowMode();
@@ -203,7 +203,7 @@ public class Trunk {
             leaveSlowMode();
         }
         if (isSlowMode() != originalMode) {
-            System.out.println(isSlowMode() ? "In Slow Mode" : "Leave Slow Mode");
+            System.out.println((isSlowMode() ? "In Slow Mode" : "Leave Slow Mode")  + " for trunk: " + getId());
         }
         return almostFull;
     }
