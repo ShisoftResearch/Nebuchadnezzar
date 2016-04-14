@@ -148,6 +148,7 @@ public class Defragmentation {
                             }
                         }
                         addFragment(lwPos, hiPos);
+                        currentDefragLoc = hiPos;
                     }
                 } catch (Exception ex) {
                     ex.printStackTrace();
@@ -188,40 +189,26 @@ public class Defragmentation {
             for (Map.Entry<Long, Long> fragc : fragments.entrySet()) {
                 long fsize = fragc.getValue() - fragc.getKey();
                 if (fsize == size || fsize >= requiredSize) {
-                    frag = fragments.floorEntry(fragc.getKey());
+                    frag = fragc;
                     break;
                 }
                 totalFragSize += fsize;
             }
-            if (frag == null && totalFragSize >= requiredSize && trunk.isCurrentOpSlowMode()) {
-                defrag();
-                return null;
-            }
             if (frag != null) {
+                if (!fragments.remove(frag.getKey(), frag.getValue())) {
+                    return null;
+                }
                 long start = frag.getKey();
                 long end = frag.getValue();
                 long fragSize = end - start;
-                if (fragSize != size && fragSize < requiredSize) {
-                    return null;
-                } else {
-                    if (fragments.remove(start, end)) {
-                        if (fragSize != size){
-                            long newFragStart = start + size;
-                            addFragment(newFragStart, end);
-                        }
-                        if (meta != null && meta.getLocation() < 0) {
-                            meta.setLocation(start);
-                        }
-                        return start;
-                    } else {
-                        try {
-                            return tryAcquireFromFrag(size, meta);
-                        } catch (StackOverflowError se) {
-                            System.out.println("Failed to acquire frag due to frequent changes");
-                            return null;
-                        }
-                    }
+                if (fragSize != size){
+                    long newFragStart = start + size;
+                    addFragment(newFragStart, end);
                 }
+                if (meta != null && meta.getLocation() < 0) {
+                    meta.setLocation(start);
+                }
+                return start;
             } else {
                 return null;
             }
