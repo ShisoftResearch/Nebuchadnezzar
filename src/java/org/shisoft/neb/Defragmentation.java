@@ -125,26 +125,29 @@ public class Defragmentation {
                     });
                     if (currentAppendHeader != frag.getKey() && frag.getKey() < currentAppendHeader) {
                         long cellHash = (long) Bindings.readCellHash.invoke(trunk, hnPos);
-                        long cellLen = (int) Bindings.readCellLength.invoke(trunk, hnPos);
-                        cellLen += cellHeadLen;
+                        opLock.unlock();
+                        Long cellLen = null;
                         CellMeta meta = trunk.getCellIndex().get(cellHash);
                         if (meta != null) {
-                            opLock.unlock();
                             boolean cellUpdated = false;
                             synchronized (meta) {
                                 if (meta.getLocation() == hnPos) {
+                                    cellLen = ((Integer) Bindings.readCellLength.invoke(trunk, hnPos)).longValue();
+                                    assert cellLen > 0;
+                                    cellLen += cellHeadLen;
                                     trunk.copyMemory(hnPos, lwPos, cellLen);
                                     meta.setLocation(lwPos);
                                     cellUpdated = true;
                                 }
                             }
-                            if (!cellUpdated) {
-                                addFragment(lwPos, hiPos);
-                            } else {
+                            if (cellUpdated) {
+                                assert cellLen != null;
                                 currentDefragLoc = lwPos + cellLen;
                                 addFragment(currentDefragLoc, hnPos + cellLen -1);
+                                continue;
                             }
                         }
+                        addFragment(lwPos, hiPos);
                     }
                 } catch (Exception ex) {
                     ex.printStackTrace();

@@ -11,7 +11,7 @@
            (java.io OutputStream File DataOutputStream)
            (org.apache.commons.io FileUtils)))
 
-(def start-time (System/nanoTime))
+(def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
 (def defed-path (atom nil))
 (def clients (atom {}))

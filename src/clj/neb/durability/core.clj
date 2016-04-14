@@ -49,7 +49,7 @@
           append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
           dirty-ranges  (.clone trunk-dirty-ranges)
-          timestamp (System/nanoTime)]
+          timestamp (System/currentTimeMillis)]
       (loop [pos 0]
         (let [d-range (.ceilingEntry dirty-ranges pos)]
           (when d-range
