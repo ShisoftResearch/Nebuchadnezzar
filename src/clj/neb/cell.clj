@@ -272,39 +272,31 @@
                      :hash hash
                      :partition partition
                      :length fields-length
-                     :type normal-cell-type}
-        require-new-cell-meta? (not (or update-hash-index? loc))
-        ^CellMeta new-cell-meta (when require-new-cell-meta? (CellMeta. -1))
-        ^CellMeta cell-meta (or new-cell-meta *cell-meta*)]
-    (when new-cell-meta (monitor-enter new-cell-meta))
-    (let [new-cell-meta(when require-new-cell-meta?
-                         (.addCellMetaToTrunkIndex ttrunk hash new-cell-meta))
-          ^CellWriter cell-writer (cond
-                                    loc (CellWriter. ttrunk cell-length loc)
-                                    (or new-cell-meta update-hash-index?) (CellWriter. ttrunk cell-length cell-meta)
-                                    :else (throw (IllegalArgumentException.)))]
+                     :type normal-cell-type}]
+    (let [^CellWriter cell-writer (if loc
+                                    (CellWriter. ttrunk cell-length loc)
+                                    (CellWriter. ttrunk cell-length))]
       (try
         (write-cell-header cell-writer header-data)
         (doseq [{:keys [value writer length]} fields]
           (.streamWrite cell-writer writer value length))
-        (.updateCellToTrunkIndex cell-writer cell-meta)
+        (if update-hash-index?
+          (.updateCellToTrunkIndex cell-writer *cell-meta*)
+          (.addCellMetaToTrunkIndex cell-writer hash))
         (mark-dirty cell-writer)
         (catch Throwable tr
           (.rollBack cell-writer)
-          (throw tr))
-        (finally
-          (when new-cell-meta (monitor-exit new-cell-meta)))))))
+          (throw tr))))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (with-trunk-write-lock
     ttrunk
     (let [cell-length (count bs)
-          ^CellMeta cell-meta (.addCellMetaToTrunkIndex ttrunk hash (CellMeta. -1))
-          cell-writer (CellWriter. ttrunk cell-length cell-meta)
+          cell-writer (CellWriter. ttrunk cell-length)
           bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes trunk value curr-loc))]
-      (locking cell-meta
-        (.streamWrite cell-writer bytes-writer bs cell-length)
-        (mark-dirty cell-writer)))))
+      (.streamWrite cell-writer bytes-writer bs cell-length)
+      (mark-dirty cell-writer)
+      (.addCellMetaToTrunkIndex cell-writer hash))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
   (.hasCell ttrunk hash))

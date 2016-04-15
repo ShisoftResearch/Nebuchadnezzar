@@ -22,36 +22,38 @@ public class SchemaStore {
         return schemaIdMap;
     }
 
-    public void setSchemaIdMap(HashIntObjMap schemaIdMap) {
-        this.schemaIdMap = schemaIdMap;
-    }
-
-    public int put(int id, Object sname, Object schema){
+    public synchronized int put(int id, Object sname, Object schema){
         this.schemaIdMap.put(id, schema);
         this.snameIdMap.put(sname, id);
         return  id;
     }
 
-    public Object getById (int id){
+    public synchronized Object getById (int id){
         return schemaIdMap.get(id);
     }
 
-    public boolean snameExists (Object sname){
+    public synchronized boolean snameExists (Object sname){
         return this.snameIdMap.containsKey(sname);
     }
 
-    public void clear (){
+    public synchronized void clear (){
         this.schemaIdMap.clear();
         this.snameIdMap.clear();
     }
 
-    public int sname2Id(Object sname){
+    public synchronized int sname2Id(Object sname){
         return snameIdMap.getInt(sname);
     }
 
-    public  void remove (int id, Object kw){
+    public synchronized void remove (int id, Object kw){
         schemaIdMap.remove(id);
         snameIdMap.remove(kw, id);
     }
 
+    @Override
+    public String toString() {
+        return "SchemaStore{" +
+                "schemaIdMap=" + schemaIdMap +
+                '}';
+    }
 }

@@ -28,23 +28,23 @@ public class CellWriter {
         trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
-    public CellWriter(Trunk trunk, long length, CellMeta meta) throws Exception {
-        tryAllocate(trunk, length, meta);
+    public CellWriter(Trunk trunk, long length) throws Exception {
+        tryAllocate(trunk, length);
     }
 
-    private void tryAllocate(Trunk trunk, long length, CellMeta meta){
+    private void tryAllocate(Trunk trunk, long length){
         try {
             Long fragSpaceLoc = null;
             float fillRatio = trunk.computeFillRatio();
             trunk.checkShouldInSlowMode(fillRatio);
-            if (fillRatio > 0.8) {
-                //fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length, meta);
+            if (fillRatio > 0.5) {
+                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length);
             }
             if (fragSpaceLoc != null) {
                 init(trunk, length, fragSpaceLoc);
             } else {
                 AtomicBoolean overflowed = new AtomicBoolean(false);
-                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed, meta);
+                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed);
                 if (overflowed.get()){
                     throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
                 }  else {
@@ -66,11 +66,22 @@ public class CellWriter {
     }
 
     public void rollBack () {
+        System.out.println("Rolling back for trunk: " + trunk.getId());
         trunk.getDefrag().addFragment(startLoc, startLoc + length - 1);
     }
 
     public void updateCellToTrunkIndex(CellMeta meta){
         meta.setLocation(startLoc);
+    }
+
+    public CellMeta addCellMetaToTrunkIndex(long hash) throws Exception {
+        CellMeta meta = new CellMeta(startLoc);
+        synchronized (trunk.getCellIndex()) {
+            if (trunk.getCellIndex().putIfAbsent(hash, meta) != null) {
+                throw new Exception("Cell hash already exists");
+            }
+        }
+        return meta;
     }
 
     public long getCurrLoc() {

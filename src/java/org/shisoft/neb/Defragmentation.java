@@ -88,6 +88,22 @@ public class Defragmentation {
             trunk.getCellWriteLock().writeLock().unlock();
         }
     }
+
+    private void checkAndAddFragment (long starts, long ends) {
+        opLock.lock();
+        try {
+            long cellHash = (long) Bindings.readCellHash.invoke(trunk, starts);
+            CellMeta meta = trunk.getCellIndex().get(cellHash);
+            if (meta != null && meta.getLocation() == starts) {
+                System.out.println("Frag space occupied at: " + starts + " hash: " + cellHash + " at trunk: " + trunk.getId());
+                return;
+            }
+            addFragment(starts, ends);
+        } finally {
+            opLock.unlock();
+        }
+    }
+
     public void defrag (){
         lockDefrag();
         AtomicBoolean headerMoved = new AtomicBoolean(false);
@@ -129,16 +145,15 @@ public class Defragmentation {
                                     trunk.copyMemory(hnPos, lwPos, cellLen);
                                     meta.setLocation(lwPos);
                                     cellUpdated = true;
+                                    currentDefragLoc = lwPos + cellLen;
                                 }
                             }
                             if (cellUpdated) {
-                                assert cellLen != null;
-                                currentDefragLoc = lwPos + cellLen;
                                 addFragment(currentDefragLoc, hnPos + cellLen -1);
                                 continue;
                             }
                         }
-                        addFragment(lwPos, hiPos);
+                        checkAndAddFragment(lwPos, hiPos);
                         currentDefragLoc = hiPos;
                     }
                 } catch (Exception ex) {
@@ -171,7 +186,7 @@ public class Defragmentation {
                 .reduce((left, right) -> left + right).getAsLong();
     }
 
-    public Long tryAcquireFromFrag(long size, CellMeta meta){
+    public Long tryAcquireFromFrag(long size){
         try {
             opLock.lock();
             Map.Entry<Long, Long> frag = null;
@@ -185,19 +200,13 @@ public class Defragmentation {
                 }
                 totalFragSize += fsize;
             }
-            if (frag != null) {
-                if (!fragments.remove(frag.getKey(), frag.getValue())) {
-                    return null;
-                }
+            if (frag != null && fragments.remove(frag.getKey(), frag.getValue())) {
                 long start = frag.getKey();
                 long end = frag.getValue();
                 long fragSize = end - start;
                 if (fragSize != size){
                     long newFragStart = start + size;
                     addFragment(newFragStart, end);
-                }
-                if (meta != null && meta.getLocation() < 0) {
-                    meta.setLocation(start);
                 }
                 return start;
             } else {

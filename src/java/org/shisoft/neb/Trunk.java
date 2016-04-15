@@ -9,6 +9,7 @@ import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
@@ -152,17 +153,14 @@ public class Trunk {
         return memoryFork;
     }
 
-    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed, CellMeta meta){
-        Long cellLoc = meta != null ? meta.getLocation() : null;
+    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed){
         return getAppendHeader().getAndUpdate(appenderLoc -> {
             long expectedLoc = appenderLoc + length;
             if (expectedLoc > size) {
                 overflowed.set(true);
-                if (meta != null) {meta.setLocation(cellLoc);}
                 return appenderLoc;
             } else {
                 overflowed.set(false);
-                if (meta != null && meta.getLocation() < 0) {meta.setLocation(appenderLoc);}
                 return expectedLoc;
             }
         });
@@ -180,9 +178,12 @@ public class Trunk {
     public boolean isCurrentOpSlowMode() {
         return slowMode && cellSlowWriteLock.isHeldByCurrentThread();
     }
-    public void tryWriteCell () {
+    public void tryWriteCell () throws InterruptedException {
         this.getCellWriteLock().readLock().lock();
-        if (slowMode && !this.cellSlowWriteLock.isHeldByCurrentThread()) this.cellSlowWriteLock.lock();
+        if (slowMode && !this.cellSlowWriteLock.isHeldByCurrentThread()) {
+            this.cellSlowWriteLock.lock();
+            Thread.currentThread().sleep(1);
+        }
     }
     public void endWriteCell () {
         if (this.cellSlowWriteLock.isHeldByCurrentThread()) this.cellSlowWriteLock.unlock();
@@ -195,7 +196,7 @@ public class Trunk {
         return r;
     }
     public boolean checkShouldInSlowMode (float fillRate) {
-        boolean almostFull = fillRate > 0.8;
+        boolean almostFull = fillRate > 0.9;
         boolean originalMode = isSlowMode();
         if (almostFull) {
             enterSlowMode();
@@ -209,14 +210,5 @@ public class Trunk {
     }
     public boolean checkShouldInSlowMode () {
         return checkShouldInSlowMode(computeFillRatio());
-    }
-
-    public CellMeta addCellMetaToTrunkIndex(long hash, CellMeta meta) throws Exception {
-        synchronized (cellIndex) {
-            if (cellIndex.putIfAbsent(hash, meta) != null) {
-                throw new Exception("Cell hash already exists");
-            }
-        }
-        return meta;
     }
 }
