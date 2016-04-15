@@ -4,7 +4,7 @@
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
             [neb.defragment :refer [scan-trunk-and-defragment]]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb Trunk)))
+  (:import (org.shisoft.neb Trunk Segment)))
 
 (facts "Defragmentation"
        (let [trunk (Trunk. 8388608)
@@ -25,14 +25,12 @@
                (delete-cell trunk 2) => anything
                (delete-cell trunk 3) => anything
                (delete-cell trunk 5) => anything)
-         (fact "check frag count for auto merge"
-               (.countFragments trunk) => 2)
-         (let [frag-append-head (.getAppendHeaderValue trunk)]
+         (let [frag-append-head (.getCurrentLoc (first (.getSegments trunk)))]
            (fact "defrag"
                  (scan-trunk-and-defragment trunk) => anything)
            (fact "space reclaimed"
-                 (< (.getAppendHeaderValue trunk) frag-append-head) => true
-                 (- (.getAppendHeaderValue trunk) frag-append-head) => -99))
+                 (< (.getCurrentLoc (first (.getSegments trunk))) frag-append-head) => true
+                 (- (.getCurrentLoc (first (.getSegments trunk))) frag-append-head) => -99))
          (fact "data did not corrupted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)

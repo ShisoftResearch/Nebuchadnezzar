@@ -81,7 +81,7 @@ public class Trunk {
     private void initSegments (int size) {
         int segCount = (int) Math.floor((double) this.size / size);
         segmentsQueue = new ConcurrentLinkedQueue<>();
-        segments = new Segment[size];
+        segments = new Segment[segCount];
         for (int i = 0; i < segCount; i++){
             Segment seg = new Segment(storeAddress + size * i, this);
             segmentsQueue.add(seg);
@@ -94,9 +94,6 @@ public class Trunk {
     }
     public static sun.misc.Unsafe getUnsafe() {
         return UnsafeUtils.unsafe;
-    }
-    public long getStoreAddress() {
-        return storeAddress;
     }
     public void removeCellFromIndex(long hash){
         synchronized (cellIndex) {
@@ -148,7 +145,7 @@ public class Trunk {
     public void copyMemory(long startPos, long target, long len){
         long dirtyEndPos = target + len - 1;
         copyMemForFork(target, dirtyEndPos);
-        getUnsafe().copyMemory(storeAddress + startPos, storeAddress + target, len);
+        getUnsafe().copyMemory(startPos, target, len);
         addDirtyRanges(target, dirtyEndPos);
     }
     public MemoryFork fork(){
@@ -172,7 +169,7 @@ public class Trunk {
     }
 
     public Segment locateSegment (long starts) {
-        long relativeLoc = starts - getStoreAddress();
+        long relativeLoc = starts - storeAddress;
         int segId = (int) Math.floor(relativeLoc / Trunk.segSize);
         return segments[segId];
     }
