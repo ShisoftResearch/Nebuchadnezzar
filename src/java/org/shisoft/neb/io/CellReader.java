@@ -16,7 +16,7 @@ public class CellReader {
     public CellReader(Trunk trunk, long currLoc) throws CellFormatErrorException {
         this.currLoc = currLoc;
         this.trunk = trunk;
-        byte tag = Reader.readByte(trunk, currLoc);
+        byte tag = Reader.readByte(currLoc);
         if (tag == 1) { // cell type field, 0 for cell, 1 for tombstone
             throw new CellFormatErrorException("is a tombstone, for trunk: " + String.valueOf(trunk.getId()));
         } else if (tag != 0) {
@@ -25,7 +25,7 @@ public class CellReader {
     }
 
     public Object streamRead (IFn fn){
-        return fn.invoke(trunk, currLoc);
+        return fn.invoke(currLoc);
     }
 
     public Object streamRead (IFn fn, long len){

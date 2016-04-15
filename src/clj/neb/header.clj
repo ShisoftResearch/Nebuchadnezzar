@@ -4,13 +4,13 @@
 
 (def cell-head-struct
   [[:cell-type :byte :type]
+   [:cell-length :int :length]
    [:partition :long :partition]
    [:hash :long :hash]
-   [:cell-length :int :length]
    [:schema-id :int :schema]])
 
 (assert (and (= :byte (second (first cell-head-struct)))
-             (= :long (second (second cell-head-struct)))) "second prop in header must be an integer for tombstone")
+             (= :int (second (second cell-head-struct)))) "second prop in header must be an integer for tombstone")
 
 (defmacro gen-cell-header-offsets []
   (let [loc-counter (atom 0)]
@@ -44,11 +44,11 @@
 
 (defn read-cell-header-field [^Trunk trunk loc field]
   (let [{:keys [reader offset]} (get cell-head-struc-map field)]
-    (reader trunk (+ loc offset))))
+    (reader (+ loc offset))))
 
 (defn write-cell-header-field [^Trunk trunk loc field value]
   (let [{:keys [writer offset]} (get cell-head-struc-map field)]
-    (writer trunk value (+ loc offset))))
+    (writer value (+ loc offset))))
 
 (defn get-header-field-offset-length [field]
   (let [{:keys [length offset]} (get cell-head-struc-map field)]

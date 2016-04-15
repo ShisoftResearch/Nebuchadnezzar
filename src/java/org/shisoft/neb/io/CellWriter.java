@@ -2,12 +2,11 @@ package org.shisoft.neb.io;
 
 import clojure.java.api.Clojure;
 import clojure.lang.IFn;
-import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.shisoft.neb.Trunk;
+import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.exceptions.StoreFullException;
 
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.LongUnaryOperator;
 
 /**
  * Created by shisoft on 21/1/2016.
@@ -28,31 +27,16 @@ public class CellWriter {
         trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
-    public CellWriter(Trunk trunk, long length) throws Exception {
+    public CellWriter(Trunk trunk, int length) throws Exception {
         tryAllocate(trunk, length);
     }
 
-    private void tryAllocate(Trunk trunk, long length){
-        try {
-            Long fragSpaceLoc = null;
-            float fillRatio = trunk.computeFillRatio();
-            trunk.checkShouldInSlowMode(fillRatio);
-            if (fillRatio > 0.5) {
-                fragSpaceLoc = trunk.getDefrag().tryAcquireFromFrag(length);
-            }
-            if (fragSpaceLoc != null) {
-                init(trunk, length, fragSpaceLoc);
-            } else {
-                AtomicBoolean overflowed = new AtomicBoolean(false);
-                long loc = trunk.tryAcquireFromAppendHeader(length, overflowed);
-                if (overflowed.get()){
-                    throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
-                }  else {
-                    init(trunk, length, loc);
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
+    private void tryAllocate(Trunk trunk, int length) throws ObjectTooLargeException, StoreFullException {
+        long loc = trunk.tryAcquireSpace(length);
+        if (loc < 0){
+            throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
+        }  else {
+            init(trunk, length, loc);
         }
     }
 
@@ -61,13 +45,13 @@ public class CellWriter {
     }
 
     public void streamWrite (IFn fn, Object value, long length){
-        fn.invoke(trunk, value, currLoc);
+        fn.invoke(value, currLoc);
         currLoc += length;
     }
 
     public void rollBack () {
         System.out.println("Rolling back for trunk: " + trunk.getId());
-        trunk.getDefrag().addFragment(startLoc, startLoc + length - 1);
+        trunk.getCleaner().addFragment(startLoc, startLoc + length - 1);
     }
 
     public void updateCellToTrunkIndex(CellMeta meta){

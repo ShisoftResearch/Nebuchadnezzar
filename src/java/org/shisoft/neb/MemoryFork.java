@@ -22,7 +22,7 @@ public class MemoryFork {
     }
 
     public void copyMemory (long start, long end){
-        long bsLen = end - start;
+        long bsLen = end - start + 1;
         byte[] bs = new byte[(int) bsLen];
         for (long i = start; i < end; i++) {
             bs[(int) (i - start)] = Trunk.getUnsafe().getByte(trunk.getStoreAddress() + i);

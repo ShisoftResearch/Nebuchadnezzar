@@ -25,14 +25,12 @@
                      (concat
                        [k (merge v
                                  {:reader             (when-not dep
-                                                        `(fn [trunk# offset#]
+                                                        `(fn [offset#]
                                                            (~reader-sym
-                                                             trunk#
                                                              offset#)))
                                   :writer             (when-not dep
-                                                        `(fn [trunk# value# offset#]
+                                                        `(fn [value# offset#]
                                                            (~writer-sym
-                                                             trunk#
                                                              value#
                                                              offset#)))
                                   :length             length
@@ -47,22 +45,21 @@
                          [(keyword  (str (name k) "-array"))
                           {:id                 (int (* id 100))
                            :dynamic?           true
-                           :reader             `(fn [trunk# offset#]
-                                                  (let [arr-len# (Reader/readInt trunk# offset#)
+                           :reader             `(fn [offset#]
+                                                  (let [arr-len# (Reader/readInt offset#)
                                                         offset# (+ offset# type_lengths/intLen)]
                                                     (vec
                                                       (map
                                                         (fn [i#]
-                                                          (~reader-sym trunk# (+ offset# (* i# ~length))))
+                                                          (~reader-sym (+ offset# (* i# ~length))))
                                                         (range arr-len#)))))
-                           :writer             `(fn [trunk# value# offset#]
+                           :writer             `(fn [value# offset#]
                                                   (let [value# (vec value#)
                                                         arr-len# (count value#)]
-                                                    (Writer/writeInt trunk# (int arr-len#) offset#)
+                                                    (Writer/writeInt (int arr-len#) offset#)
                                                     (let [offset# (+ offset# type_lengths/intLen)]
                                                       (doseq [i# (range arr-len#)]
                                                         (~writer-sym
-                                                          trunk#
                                                           (get value# i#)
                                                           (+ offset# (* i# ~length)))))))
                            :unit-length        length

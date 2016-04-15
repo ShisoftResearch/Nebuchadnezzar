@@ -6,7 +6,7 @@
   (:import (org.shisoft.neb Trunk)))
 
 (fact "Test Internal Array"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Array Schema"
               (add-schema :array-schema [[:arr :long-array]] 1) => anything)
         (fact "Write Cell With Array"
@@ -16,7 +16,7 @@
         (.dispose trunk)))
 
 (fact "Test Array"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Array Schema"
               (add-schema :array-schema [[:arr [:ARRAY :long]]] 1) => anything)
         (fact "Write Cell With Array"
@@ -26,7 +26,7 @@
         (.dispose trunk)))
 
 (fact "Test Nested Array"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Array Schema"
               (add-schema :array-schema [[:arr [:ARRAY [:ARRAY :long]]]] 1) => anything)
         (fact "Write Cell With Array"
@@ -36,7 +36,7 @@
         (.dispose trunk)))
 
 (fact "Test Map"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Map Schema"
               (add-schema :array-schema [[:map [[:a :long] [:b :long]]]] 1) => anything)
         (fact "Write Cell With Map"
@@ -46,7 +46,7 @@
         (.dispose trunk)))
 
 (fact "Test Map Array"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Map Schema"
               (add-schema :array-schema [[:map [[:a :long] [:b [:ARRAY :long]]]]] 1) => anything)
         (fact "Write Cell With Map"
@@ -56,7 +56,7 @@
         (.dispose trunk)))
 
 (fact "Test Array Map"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Map Schema"
               (add-schema :array-schema [[:map [[:a :long] [:b [:ARRAY [[:arr-map :long]]]]]]] 1) => anything)
         (fact "Write Cell With Map"
@@ -66,7 +66,7 @@
         (.dispose trunk)))
 
 (fact "Test Schema Type"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Schemas"
               (add-schema :item-schema [[:id :long] [:val :long]] 2) => anything
               (add-schema :array-schema [[:data :item-schema]] 1) => anything)
@@ -77,7 +77,7 @@
         (.dispose trunk)))
 
 (fact "Test Schema Type in array"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Schemas"
               (add-schema :item-schema [[:id :long] [:val :long]] 2) => anything
               (add-schema :array-schema [[:data [:ARRAY :item-schema]]] 1) => anything)
@@ -88,7 +88,7 @@
         (.dispose trunk)))
 
 (fact "Test get-in and select-keys"
-      (let [trunk (Trunk. 5000000)]
+      (let [trunk (Trunk. 8388608)]
         (fact "Map Schema"
               (add-schema :array-schema [[:a :int]
                                          [:b :int]

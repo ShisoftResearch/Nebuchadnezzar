@@ -7,7 +7,7 @@
   (:import (org.shisoft.neb Trunk)))
 
 (facts "Defragmentation"
-       (let [trunk (Trunk. 5000000)
+       (let [trunk (Trunk. 8388608)
              a-d {:i (int 123)}
              b-d {:l 456}
              c-d  {:f (float 1.23) :i (int 101112)}]
