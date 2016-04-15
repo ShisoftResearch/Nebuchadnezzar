@@ -61,7 +61,6 @@ public class Cleaner {
                         if (!segment.resetCurrentLoc(adjPos, fragLoc)) {
                             System.out.println("Seg curr pos moved");
                         } else {
-                            segment.decDeadObjectBytes(fragLen);
                             if (segment.getDeadObjectBytes() != 0) {
                                 System.out.println("Segment is not totally clean: " + segment.getDeadObjectBytes() + " " + fragLen);
                             }

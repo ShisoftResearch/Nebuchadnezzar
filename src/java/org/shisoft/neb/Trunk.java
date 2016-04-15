@@ -160,10 +160,8 @@ public class Trunk {
         }
         long r = -1;
         for (Segment seg : segmentsQueue) {
-            try {
-                r = seg.tryAcquireSpace(length);
-                break;
-            } catch (StoreFullException ignored) {}
+            r = seg.tryAcquireSpace(length);
+            if (r > 0) break;
         }
         return r;
     }
@@ -172,6 +170,10 @@ public class Trunk {
         long relativeLoc = starts - storeAddress;
         int segId = (int) Math.floor(relativeLoc / Trunk.segSize);
         return segments[segId];
+    }
+
+    public long getStoreAddress() {
+        return storeAddress;
     }
 
     public void readLockSegment (CellMeta meta) {

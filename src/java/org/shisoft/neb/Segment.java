@@ -70,7 +70,7 @@ public class Segment {
         return frags;
     }
 
-    public long tryAcquireSpace (int len) throws StoreFullException {
+    public long tryAcquireSpace (int len) {
         try {
             lock.readLock().lock();
             AtomicBoolean updated = new AtomicBoolean(false);
@@ -88,7 +88,7 @@ public class Segment {
             if (updated.get()) {
                 return r;
             } else {
-                throw new StoreFullException("Segment Full");
+                return -1;
             }
         } finally {
             lock.readLock().unlock();
