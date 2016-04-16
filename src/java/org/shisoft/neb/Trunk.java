@@ -3,7 +3,6 @@ package org.shisoft.neb;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
-import org.shisoft.neb.exceptions.StoreFullException;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.utils.Collection;
@@ -21,8 +20,8 @@ import static org.shisoft.neb.io.type_lengths.*;
 public class Trunk {
 
     final static int tombstoneSize = intLen + 1;
-    final static int maxObjSize = 2 * 1024 * 1024;
-    final static int segSize    = 8 * 1024 * 1024;
+    final static int maxObjSize = 8 * 1024 * 1024;
+    final static int segSize    = 64 * 1024 * 1024;
 
     private int id;
     private long storeAddress;
@@ -114,7 +113,7 @@ public class Trunk {
         long tombstoneEnds = startPos + byteLen + longLen - 1;
         assert  size > tombstoneSize : "frag length is too small to put a tombstone";
         copyMemForFork(startPos, tombstoneEnds);
-        Writer.writeByte((byte) 1, startPos);
+        Writer.writeByte((byte) 2, startPos);
         Writer.writeInt(size, startPos + byteLen);
         addDirtyRanges(startPos, tombstoneEnds);
     }
@@ -134,7 +133,7 @@ public class Trunk {
         }
     }
     public void enableDurability () {
-        this.dirtyRanges = new ConcurrentSkipListMap<Long, Long>();
+        this.dirtyRanges = new ConcurrentSkipListMap<>();
         this.backendEnabled = true;
     }
 
@@ -154,7 +153,7 @@ public class Trunk {
         return memoryFork;
     }
 
-    public long tryAcquireSpace (int length) throws ObjectTooLargeException {
+    public long tryAcquireSpace (long length) throws ObjectTooLargeException {
         if (length > maxObjSize) {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
         }
@@ -173,19 +172,28 @@ public class Trunk {
 
     public Segment locateSegment (long starts) {
         long relativeLoc = starts - storeAddress;
+        assert relativeLoc >= 0;
         int segId = (int) Math.floor(relativeLoc / Trunk.segSize);
-        return segments[segId];
+        assert segId >= 0;
+        Segment seg = null;
+        try {
+            seg = segments[segId];
+        } catch (ArrayIndexOutOfBoundsException ex) {
+            System.out.println("Cannot locate seg: " + starts + " " + storeAddress + " " + relativeLoc + " " + segId);
+            throw ex;
+        }
+        return seg;
     }
 
     public long getStoreAddress() {
         return storeAddress;
     }
 
-    public void readLockSegment (CellMeta meta) {
+    public void readMetaLockSegment(CellMeta meta) {
         locateSegment(meta.getLocation()).getLock().readLock().lock();
     }
 
-    public void readUnlockSegment (CellMeta meta) {
+    public void readUnlockMetaSegment(CellMeta meta) {
         locateSegment(meta.getLocation()).getLock().readLock().unlock();
     }
 }

@@ -27,15 +27,16 @@ public class CellWriter {
         trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
-    public CellWriter(Trunk trunk, int length) throws Exception {
+    public CellWriter(Trunk trunk, long length) throws Exception {
         tryAllocate(trunk, length);
     }
 
-    private void tryAllocate(Trunk trunk, int length) throws ObjectTooLargeException, StoreFullException {
+    private void tryAllocate(Trunk trunk, long length) throws ObjectTooLargeException, StoreFullException {
         long loc = trunk.tryAcquireSpace(length);
         if (loc < 0){
             throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
         }  else {
+            assert loc >= trunk.getStoreAddress();
             init(trunk, length, loc);
         }
     }
@@ -54,11 +55,12 @@ public class CellWriter {
         trunk.getCleaner().addFragment(startLoc, startLoc + length - 1);
     }
 
-    public void updateCellToTrunkIndex(CellMeta meta){
-        meta.setLocation(startLoc);
+    public void updateCellToTrunkIndex(CellMeta meta, Trunk trunk){
+        meta.setLocation(startLoc, trunk);
     }
 
-    public CellMeta addCellMetaToTrunkIndex(long hash) throws Exception {
+    public CellMeta addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
+        assert startLoc >= trunk.getStoreAddress();
         CellMeta meta = new CellMeta(startLoc);
         synchronized (trunk.getCellIndex()) {
             if (trunk.getCellIndex().putIfAbsent(hash, meta) != null) {

@@ -10,8 +10,7 @@
             [neb.defragment :as defrag])
   (:import (org.shisoft.neb Trunk)
            (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta Writer)
-           (java.util UUID)
-           (org.shisoft.neb.exceptions StoreFullException)))
+           (java.util UUID)))
 
 (set! *warn-on-reflection* true)
 
@@ -43,7 +42,8 @@
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta* ~@body)))
+     (locking *cell-meta*
+       ~@body)))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
@@ -52,7 +52,8 @@
        ~@body)))
 
 (defn get-cell-location []
-  (.getLocation *cell-meta*))
+  (let [loc (.getLocation *cell-meta*)]
+    (assert (>= loc (.getStoreAddress *cell-trunk*))) loc))
 
 (defn add-frag [^Trunk ttrunk start end]
   (.addFragment ttrunk start end))
@@ -253,7 +254,7 @@
 (defn mark-dirty [^CellWriter cell-writer]
   (.markDirty cell-writer))
 
-(def normal-cell-type (byte 0))
+(def normal-cell-type (byte 1))
 
 (defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [^Long loc update-hash-index?  planned-data] :or {update-hash-index? true}}]
   (let [schema-id (:i schema)
@@ -273,20 +274,20 @@
         (doseq [{:keys [value writer length]} fields]
           (.streamWrite cell-writer writer value length))
         (if update-hash-index?
-          (.updateCellToTrunkIndex cell-writer *cell-meta*)
-          (.addCellMetaToTrunkIndex cell-writer hash))
+          (.updateCellToTrunkIndex cell-writer *cell-meta* ttrunk)
+          (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
         (mark-dirty cell-writer)
         (catch Throwable tr
           (.rollBack cell-writer)
-          (throw tr))))))
+          (clojure.stacktrace/print-cause-trace tr))))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
   (let [cell-length (count bs)
         cell-writer (CellWriter. ttrunk cell-length)
-        bytes-writer (fn [trunk value curr-loc] (Writer/writeRawBytes value curr-loc))]
+        bytes-writer (fn [value curr-loc] (Writer/writeRawBytes value curr-loc))]
     (.streamWrite cell-writer bytes-writer bs cell-length)
     (mark-dirty cell-writer)
-    (.addCellMetaToTrunkIndex cell-writer hash)))
+    (.addCellMetaToTrunkIndex cell-writer hash ttrunk)))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
   (.hasCell ttrunk hash))
@@ -299,13 +300,13 @@
 
 (defn replace-cell* [^Trunk trunk ^Long hash data]
   (when-let [cell-loc (get-cell-location)]
-    (let [cell-data-loc (+ cell-loc cell-head-len)
-          schema-id (read-cell-header-field trunk cell-loc :schema-id)
+    (let [schema-id (read-cell-header-field trunk cell-loc :schema-id)
           schema (schema-by-id schema-id)
           data-len (read-cell-header-field trunk cell-loc :cell-length)
           partition (read-cell-header-field trunk cell-loc :partition)
           fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
+      (assert (> data-len 0))
       (if (= data-len new-data-length)
         (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields)
         (do (write-cell trunk hash partition schema data :planned-data fields)

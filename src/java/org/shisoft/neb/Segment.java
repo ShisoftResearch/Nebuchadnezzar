@@ -70,14 +70,14 @@ public class Segment {
         return frags;
     }
 
-    public long tryAcquireSpace (int len) {
+    public long tryAcquireSpace (long len) {
         try {
             lock.readLock().lock();
             AtomicBoolean updated = new AtomicBoolean(false);
             long r = this.currentLoc.getAndUpdate(originalLoc -> {
                 long expectedLoc = originalLoc + len;
                 long expectedPos = expectedLoc - baseAddr;
-                if (expectedPos > Trunk.getSegSize()) {
+                if (expectedPos >= Trunk.getSegSize()) {
                     updated.set(false);
                     return originalLoc;
                 } else {

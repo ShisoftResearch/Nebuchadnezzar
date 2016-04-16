@@ -31,23 +31,25 @@ public class Cleaner {
 
     public void addFragment (long startPos, long endPos) {
         Segment seg = trunk.locateSegment(startPos);
-        seg.getLock().readLock().lock();
+        seg.getLock().writeLock().lock();
         try {
+            assert startPos >= seg.getBaseAddr() && endPos < seg.getBaseAddr() + Trunk.getSegSize();
             seg.getFrags().add(startPos);
             seg.incDeadObjectBytes((int) (endPos - startPos + 1));
             trunk.putTombstone(startPos, endPos);
         } finally {
-            seg.getLock().readLock().unlock();
+            seg.getLock().writeLock().unlock();
         }
     }
 
     public void removeFragment (Segment seg, long startPos, int length) {
-        seg.getLock().readLock().lock();
+        seg.getLock().writeLock().lock();
         try {
+            assert startPos >= seg.getBaseAddr() && length + startPos - 1 < seg.getBaseAddr() + Trunk.getSegSize();
             seg.getFrags().remove(startPos);
             seg.decDeadObjectBytes(length);
         } finally {
-            seg.getLock().readLock().unlock();
+            seg.getLock().writeLock().unlock();
         }
     }
 
@@ -58,42 +60,44 @@ public class Cleaner {
             try {
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
-                if (Reader.readByte(fragLoc) == 1) {
+                if (Reader.readByte(fragLoc) == 2) {
                     int fragLen = Reader.readInt(fragLoc + type_lengths.byteLen);
                     long adjPos = fragLoc + fragLen;
-                    removeFragment(segment, fragLoc, fragLen);
                     if (adjPos == segment.getCurrentLoc()) {
                         if (!segment.resetCurrentLoc(adjPos, fragLoc)) {
                             System.out.println("Seg curr pos moved");
                         } else {
-                            if (segment.getDeadObjectBytes() != 0) {
-                                System.out.println("Segment is not totally clean: " + segment.getDeadObjectBytes() + " " + fragLen);
-                            }
+//                            if (segment.getDeadObjectBytes() != 0) {
+//                                System.out.println("Segment is not totally clean: " + segment.getDeadObjectBytes() + " " + fragLen);
+//                            }
+                            removeFragment(segment, fragLoc, fragLen);
                         }
                     } else {
-                        if (Reader.readByte(adjPos) == 0) {
+                        if (Reader.readByte(adjPos) == 1) {
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             CellMeta meta = trunk.getCellIndex().get(cellHash);
                             if (meta != null) {
                                 segment.getLock().writeLock().unlock();
                                 synchronized (meta) {
                                     if (meta.getLocation() == adjPos) {
-                                        int cellLen = (Integer) Bindings.readCellLength.invoke(trunk, adjPos);
+                                        int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemory(adjPos, fragLoc, cellLen);
-                                        meta.setLocation(fragLoc);
+                                        meta.setLocation(fragLoc, trunk);
+                                        removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         pos = fragLoc + cellLen;
                                     } else {
-                                        System.out.println("Cell meta modified in frag adj");
+                                        //System.out.println("Cell meta modified in frag adj");
                                     }
                                 }
                             } else {
                                 System.out.println("Cell cannot been found in frag adj");
                             }
-                        } else if (Reader.readByte(adjPos) == 1) {
+                        } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
                                 int adjFragLen = Reader.readInt(adjPos + type_lengths.byteLen);
+                                removeFragment(segment, fragLoc, fragLen);
                                 removeFragment(segment, adjPos, adjFragLen);
                                 addFragment(fragLoc, adjPos + adjFragLen - 1);
                             } else {
