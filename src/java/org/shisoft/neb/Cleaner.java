@@ -31,19 +31,24 @@ public class Cleaner {
 
     public void addFragment (long startPos, long endPos) {
         Segment seg = trunk.locateSegment(startPos);
-        seg.getLock().writeLock().lock();
+        seg.getLock().readLock().lock();
         try {
             seg.getFrags().add(startPos);
             seg.incDeadObjectBytes((int) (endPos - startPos + 1));
             trunk.putTombstone(startPos, endPos);
         } finally {
-            seg.getLock().writeLock().unlock();
+            seg.getLock().readLock().unlock();
         }
     }
 
     public void removeFragment (Segment seg, long startPos, int length) {
-        seg.getFrags().remove(startPos);
-        seg.decDeadObjectBytes(length);
+        seg.getLock().readLock().lock();
+        try {
+            seg.getFrags().remove(startPos);
+            seg.decDeadObjectBytes(length);
+        } finally {
+            seg.getLock().readLock().unlock();
+        }
     }
 
     private void phaseOneCleanSegment(Segment segment) {
@@ -70,6 +75,7 @@ public class Cleaner {
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             CellMeta meta = trunk.getCellIndex().get(cellHash);
                             if (meta != null) {
+                                segment.getLock().writeLock().unlock();
                                 synchronized (meta) {
                                     if (meta.getLocation() == adjPos) {
                                         int cellLen = (Integer) Bindings.readCellLength.invoke(trunk, adjPos);
@@ -101,7 +107,9 @@ public class Cleaner {
                     System.out.println("Location is not a frag");
                 }
             } finally {
-                segment.getLock().writeLock().unlock();
+                if (segment.getLock().writeLock().isHeldByCurrentThread()) {
+                    segment.getLock().writeLock().unlock();
+                }
             }
         }
     }

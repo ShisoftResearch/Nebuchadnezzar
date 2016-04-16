@@ -161,7 +161,12 @@ public class Trunk {
         long r = -1;
         for (Segment seg : segmentsQueue) {
             r = seg.tryAcquireSpace(length);
-            if (r > 0) break;
+            if (r > 0) {
+                break;
+            } else {
+                segmentsQueue.remove(seg);
+                segmentsQueue.offer(seg);
+            }
         }
         return r;
     }
