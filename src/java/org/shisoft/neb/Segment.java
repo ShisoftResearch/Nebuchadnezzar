@@ -20,6 +20,7 @@ public class Segment {
     private AtomicInteger deadObjectBytes;
     private ReentrantReadWriteLock lock;
     private ConcurrentSkipListSet<Long> frags;
+    private volatile boolean isDirty;
 
     public Segment(long baseAddr, Trunk trunk) {
         assert baseAddr >= trunk.getStoreAddress();
@@ -29,6 +30,7 @@ public class Segment {
         this.deadObjectBytes = new AtomicInteger(0);
         this.lock = new ReentrantReadWriteLock();
         this.frags = new ConcurrentSkipListSet<>();
+        this.isDirty = false;
     }
 
     public ReentrantReadWriteLock getLock() {
@@ -66,6 +68,12 @@ public class Segment {
     public int getAliveObjectBytes () {
         return (int) (currentLoc.get() - baseAddr - deadObjectBytes.get());
     }
+
+    public void setDirty () {this.isDirty = true;}
+
+    public void setClean () {this.isDirty = false;}
+
+    public boolean isDirty () {return this.isDirty;}
 
     public ConcurrentSkipListSet<Long> getFrags() {
         return frags;

@@ -1,8 +1,9 @@
 (ns neb.durability.serv.trunk
   (:require [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
-            [neb.durability.serv.file-reader :refer [read-bytes]]
+            [neb.durability.serv.file-reader :refer [read-bytes skip-bytes]]
             [neb.durability.serv.native :refer [read-int read-long]]
             [neb.core :refer [new-cell-by-raw*]]
+            [neb.cell :refer [normal-cell-type]]
             [clojure.java.io :as io]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [com.climate.claypoole :as cp])
@@ -40,11 +41,13 @@
     (try
       (while (> (.available reader) 0)
         (let [header-bytes (read-bytes reader cell-head-len)
-              {:keys [partition hash cell-length]} (read-header-bytes header-bytes)
-              cell-id (UUID. partition hash)
-              body-bytes (read-bytes reader cell-length)
-              cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
-          (new-cell-by-raw* cell-id cell-bytes)))
+              {:keys [partition hash cell-length cell-type]} (read-header-bytes header-bytes)]
+          (if (= cell-type normal-cell-type)
+            (let [cell-id (UUID. partition hash)
+                  body-bytes (read-bytes reader cell-length)
+                  cell-bytes (assemble-cell-bytes header-bytes body-bytes)]
+              (new-cell-by-raw* cell-id cell-bytes))
+            (skip-bytes reader (- cell-length cell-head-len)))))
       (catch Exception ex
         (clojure.stacktrace/print-cause-trace ex))
       (finally
