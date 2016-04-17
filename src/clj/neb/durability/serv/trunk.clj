@@ -9,14 +9,24 @@
             [com.climate.claypoole :as cp])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.io InputStream)
-           (java.util UUID)))
+           (org.shisoft.neb.io type_lengths)
+           (java.util UUID)
+           (com.google.common.primitives Ints)))
 
 (set! *warn-on-reflection* true)
 
-(defn sync-to-disk [^BufferedRandomAccessFile accessor loc ^bytes bs]
-  (locking accessor
-    (.seek accessor loc)
-    (.write accessor bs)))
+(def file-header-size (+ type_lengths/intLen ;segment size
+                         ))
+(def seg-header-size (+ type_lengths/intLen ;segment append header
+                        ))
+
+(defn sync-seg-to-disk [^BufferedRandomAccessFile accessor seg-id seg-size base-addr current-addr ^bytes bs]
+  (let [loc (+ base-addr (* seg-header-size seg-size))]
+    (locking accessor
+      (.seek accessor loc)
+      (.write accessor (Ints/toByteArray (- current-addr base-addr)))
+      (.seek accessor (+ loc type_lengths/intLen))
+      (.write accessor bs))))
 
 (def num-readers {:int read-int
                   :long read-long})

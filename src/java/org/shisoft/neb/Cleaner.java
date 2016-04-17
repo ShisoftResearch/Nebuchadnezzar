@@ -53,10 +53,17 @@ public class Cleaner {
         }
     }
 
+    private void checkTooManyRetry(String message, int retry) {
+        if (retry > 100) {
+            System.out.println(message); // Will use logging later
+        }
+    }
+
     private void phaseOneCleanSegment(Segment segment) {
         long pos = segment.getBaseAddr();
+        int retry = 0;
         while (true) {
-            segment.getLock().writeLock().lock();
+            segment.lockWrite();
             try {
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
@@ -65,19 +72,18 @@ public class Cleaner {
                     long adjPos = fragLoc + fragLen;
                     if (adjPos == segment.getCurrentLoc()) {
                         if (!segment.resetCurrentLoc(adjPos, fragLoc)) {
-                            System.out.println("Seg curr pos moved");
+                            retry++;
+                            checkTooManyRetry("Seg curr pos moved", retry);
                         } else {
-//                            if (segment.getDeadObjectBytes() != 0) {
-//                                System.out.println("Segment is not totally clean: " + segment.getDeadObjectBytes() + " " + fragLen);
-//                            }
                             removeFragment(segment, fragLoc, fragLen);
+                            retry = 0;
                         }
                     } else {
                         if (Reader.readByte(adjPos) == 1) {
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             CellMeta meta = trunk.getCellIndex().get(cellHash);
                             if (meta != null) {
-                                segment.getLock().writeLock().unlock();
+                                segment.unlockWrite();
                                 synchronized (meta) {
                                     if (meta.getLocation() == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
@@ -87,12 +93,15 @@ public class Cleaner {
                                         removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         pos = fragLoc + cellLen;
+                                        retry = 0;
                                     } else {
-                                        //System.out.println("Cell meta modified in frag adj");
+                                        retry++;
+                                        checkTooManyRetry("Cell meta modified in frag adj", retry);
                                     }
                                 }
                             } else {
-                                System.out.println("Cell cannot been found in frag adj");
+                                retry++;
+                                checkTooManyRetry("Cell cannot been found in frag adj", retry);
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
@@ -100,20 +109,22 @@ public class Cleaner {
                                 removeFragment(segment, fragLoc, fragLen);
                                 removeFragment(segment, adjPos, adjFragLen);
                                 addFragment(fragLoc, adjPos + adjFragLen - 1);
+                                retry = 0;
                             } else {
-                                System.out.println("Adj frag does not on record");
+                                retry++;
+                                checkTooManyRetry("Adj frag does not on record", retry);
                             }
                         } else {
-                            System.out.println("Adj pos cannot been recognized");
+                            retry++;
+                            checkTooManyRetry("Adj pos cannot been recognized", retry);
                         }
                     }
                 } else {
-                    System.out.println("Location is not a frag");
+                    retry++;
+                    checkTooManyRetry("Location is not a frag", retry);
                 }
             } finally {
-                if (segment.getLock().writeLock().isHeldByCurrentThread()) {
-                    segment.getLock().writeLock().unlock();
-                }
+                segment.unlockWrite();
             }
         }
     }

@@ -5,10 +5,10 @@ import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
-import org.shisoft.neb.utils.Collection;
 import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import static org.shisoft.neb.io.type_lengths.*;
@@ -80,7 +80,7 @@ public class Trunk {
         segmentsQueue = new ConcurrentLinkedQueue<>();
         segments = new Segment[segCount];
         for (int i = 0; i < segCount; i++){
-            Segment seg = new Segment(storeAddress + segSize * i, this);
+            Segment seg = new Segment(i, storeAddress + segSize * i, this);
             segmentsQueue.add(seg);
             segments[i] = seg;
         }
@@ -166,6 +166,10 @@ public class Trunk {
             throw ex;
         }
         return seg;
+    }
+
+    public Segment[] getDirtySegments () {
+        return (Segment[]) Arrays.stream(segments).filter(Segment::isDirty).toArray();
     }
 
     public long getStoreAddress() {

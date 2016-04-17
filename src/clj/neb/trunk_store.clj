@@ -27,7 +27,8 @@
         sids (doall
                (map (fn [sn]
                       [sn (rfi/invoke sn 'neb.durability.serv.core/register-client-trunks
-                                      (System/currentTimeMillis) @ds/this-server-name (.getTrunkCount trunks))])
+                                      (System/currentTimeMillis) @ds/this-server-name (.getTrunkCount trunks)
+                                      )])
                     backup-servers))]
     (println "Wil replicate to:" sids)
     (reset! server-sids sids)))

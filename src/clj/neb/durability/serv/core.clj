@@ -1,23 +1,19 @@
 (ns neb.durability.serv.core
-  (:require [neb.durability.serv.logs :as l]
-            [neb.durability.serv.trunk :as t]
-            [clojure.java.io :as io]
+  (:require [neb.durability.serv.trunk :as t]
             [clojure.core.async :as a]
-            [cluster-connector.utils.for-debug :refer [$ spy]]
-            [taoensso.nippy :as nippy])
+            [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
-           (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
-           (java.io OutputStream File DataOutputStream)
+           (java.io File)
            (org.apache.commons.io FileUtils)
-           (org.shisoft.neb Trunk)))
+           (org.shisoft.neb Trunk)
+           (com.google.common.primitives Ints)))
 
 (def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
 (def defed-path (atom nil))
 (def clients (atom {}))
 (def ids (atom 0))
-(def ^:deprecated pending-logs (a/chan))
 
 (declare collect-log)
 
@@ -43,7 +39,13 @@
        (convert-server-name-for-file server-name) "-"
        timestamp "-"))
 
-(defn register-client-trunks [timestamp server-name trunks]
+(defn prepare-replica [^BufferedRandomAccessFile accessor seg-size]
+  (doto accessor
+    (.seek 0)
+    (.write (Ints/toByteArray seg-size))
+    ))
+
+(defn register-client-trunks [timestamp server-name trunks seg-size]
   (let [sid (swap! ids inc)
         base-path (let [^String path (file-base-path server-name timestamp)
                         file-ins (.getParentFile (File. path))
@@ -54,20 +56,21 @@
         replica-accessors (vec (map (fn [n] (let [file-path (str base-path n ".dat")
                                                   file-ins (File. file-path)]
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
-                                              (BufferedRandomAccessFile. file-path "rw" (Trunk/getSegSize))))
+                                              (prepare-replica
+                                                (BufferedRandomAccessFile. file-path "rw" (Trunk/getSegSize))
+                                                seg-size)))
                                      (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
-        pending-chan (a/chan 500)
+        pending-chan (a/chan 50)
         flushed-ch (atom nil)]
     (a/go-loop []
-      (let [[act trunk-id loc data] (a/<! pending-chan)
+      (let [[act trunk-id seg-id base-addr current-addr bs] (a/<! pending-chan)
             accessor (replica-accessors trunk-id)]
         (try
           (case act
-            0 (do (t/sync-to-disk accessor loc ^bytes data))
-            1 (do (.truncate (.getChannel accessor) loc)
-                  (.flush accessor)
+            0 (do (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs))
+            1 (do (.flush accessor)
                   (when @flushed-ch
                     (println "Flushed backup")
                     (a/>!! @flushed-ch true))))
@@ -89,14 +92,13 @@
   (doseq [[_ {:keys [flushed-ch]}] @clients]
     (reset! flushed-ch chan)))
 
-(defn sync-trunk [sid trunk-id loc bs]
+(defn sync-trunk-segment [sid trunk-id seg-id base-addr currend-addr bs]
   (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [0 trunk-id loc bs])))
+    (a/>!! (:pending-chan client) [0 trunk-id seg-id base-addr currend-addr bs])))
 
-(defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
+(defn sync-trunk-completed [sid trunk-id]
   (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [1 trunk-id tail-loc]))
-  (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp))
+    (a/>!! (:pending-chan client) [1 trunk-id])))
 
 (defn list-recover-dir []
   (let [path-file (File. ^String @defed-path)

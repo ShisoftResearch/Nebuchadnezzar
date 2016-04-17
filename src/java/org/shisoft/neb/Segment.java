@@ -1,6 +1,7 @@
 package org.shisoft.neb;
 
 import org.shisoft.neb.exceptions.StoreFullException;
+import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.Writer;
 
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -16,14 +17,16 @@ public class Segment {
 
     Trunk trunk;
     private long baseAddr;
+    private int id;
     private AtomicLong currentLoc;
     private AtomicInteger deadObjectBytes;
     private ReentrantReadWriteLock lock;
     private ConcurrentSkipListSet<Long> frags;
     private volatile boolean isDirty;
 
-    public Segment(long baseAddr, Trunk trunk) {
+    public Segment(int id, long baseAddr, Trunk trunk) {
         assert baseAddr >= trunk.getStoreAddress();
+        this.id = id;
         this.baseAddr = baseAddr;
         this.trunk = trunk;
         this.currentLoc = new AtomicLong(baseAddr);
@@ -79,10 +82,27 @@ public class Segment {
         return frags;
     }
 
+    public void lockWrite () {
+        this.lock.writeLock().lock();
+    }
+    public void unlockWrite () {
+        if (this.lock.writeLock().isHeldByCurrentThread()) {
+            this.lock.writeLock().unlock();
+        }
+    }
+    public void lockRead () {
+        this.lock.writeLock().lock();
+    }
+    public void unlockRead () {
+        if (this.lock.writeLock().isHeldByCurrentThread()) {
+            this.lock.writeLock().unlock();
+        }
+    }
+
     public long tryAcquireSpace (long len) {
         assert len > 0;
         try {
-            lock.readLock().lock();
+            lockRead();
             AtomicBoolean updated = new AtomicBoolean(false);
             long r = this.currentLoc.getAndUpdate(originalLoc -> {
                 long expectedLoc = originalLoc + len;
@@ -100,7 +120,7 @@ public class Segment {
                 return -1;
             }
         } finally {
-            lock.readLock().unlock();
+            unlockRead();
         }
     }
 
@@ -108,6 +128,10 @@ public class Segment {
         for (long i = baseAddr; i < Trunk.segSize; i ++){
             Writer.writeByte((byte) 0, i);
         }
+    }
+
+    public byte[] getData () {
+        return Reader.readBytes(this.baseAddr, Trunk.getSegSize());
     }
 
     @Override
