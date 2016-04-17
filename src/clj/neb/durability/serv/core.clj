@@ -9,7 +9,8 @@
            (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
            (java.io OutputStream File DataOutputStream)
-           (org.apache.commons.io FileUtils)))
+           (org.apache.commons.io FileUtils)
+           (org.shisoft.neb Trunk)))
 
 (def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
@@ -33,8 +34,7 @@
   (reset! defed-path path)
   (reset! data-path (str path "/" start-time "/"))
   (when keep-imported? (remove-imported @data-path))
-  (println "Starting backup server at:" @data-path)
-  #_(a/go-loop [] (apply collect-log (a/<! pending-logs))))
+  (println "Starting backup server at:" @data-path))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))
 
@@ -54,11 +54,8 @@
         replica-accessors (vec (map (fn [n] (let [file-path (str base-path n ".dat")
                                                   file-ins (File. file-path)]
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
-                                              (BufferedRandomAccessFile. file-path "rw")))
+                                              (BufferedRandomAccessFile. file-path "rw" (Trunk/getSegSize))))
                                      (range trunks)))
-        ;log-appenders (vec (map (fn [n] (atom (io/output-stream
-        ;                                        (str base-path n "-" timestamp ".mlog"))))
-        ;                         (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
         pending-chan (a/chan 500)
@@ -99,38 +96,7 @@
 (defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
   (let [client (get @clients sid)]
     (a/>!! (:pending-chan client) [1 trunk-id tail-loc]))
-  (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp)
-  #_(switch-log sid trunk-id timestamp))
-
-(defn ^:deprecated  append-log [sid trunk-id act timestamp ^UUID cell-id & [data]]
-  (let [client (get @clients sid)
-        ^OutputStream appender @(get-in client [:appenders trunk-id])
-        act (get {:write 0
-                  :delete 1} act)]
-    (a/>!! pending-logs [appender act timestamp ^UUID cell-id data])))
-
-(defn ^:deprecated  switch-log [sid trunk-id timestamp]
-  (let [client (get @clients sid)
-        log-switch (get-in client [:log-switches trunk-id])
-        base-path (:base-path client)]
-    (.lock log-switch)
-    (try
-      (let [^OutputStream appender @(get-in client [:appenders trunk-id])
-            ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
-        (reset! (get-in client [:appenders trunk-id]) new-appender)
-        ;close orignal appender
-        (a/>!! pending-logs [appender -10 timestamp nil]))
-      (finally
-        (.unlock log-switch)))))
-
-(defn ^:deprecated  close-appender [appender]
-  (.flush appender)
-  (.close appender))
-
-(defn ^:deprecated  collect-log [^OutputStream appender act timestamp ^UUID cell-id & [data]]
-  (if (= -10 act)
-    (close-appender appender)
-    (l/append appender act timestamp cell-id data)))
+  (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp))
 
 (defn list-recover-dir []
   (let [path-file (File. ^String @defed-path)
