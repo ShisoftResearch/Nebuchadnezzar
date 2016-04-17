@@ -30,7 +30,7 @@
         (cp/pdoseq
           pool [[sn sid] @server-sids]
           (rfi/invoke sn 'neb.durability.serv.core/sync-trunk
-                      sid trunk-id start bs))))
+                      sid trunk-id (- start (.getStoreAddress trunk)) bs))))
     (cp/shutdown pool)))
 
 (defn finish-trunk-sync [^Trunk trunk tail-loc timestamp]
@@ -46,7 +46,6 @@
 (defn sync-trunk [^Trunk trunk]
   (try
     (let [^ConcurrentSkipListMap trunk-dirty-ranges (.getDirtyRanges trunk)
-          append-header (.getAppendHeaderValue trunk)
           ^MemoryFork mf (.fork trunk)
           dirty-ranges  (.clone trunk-dirty-ranges)
           timestamp (System/currentTimeMillis)]
@@ -55,12 +54,11 @@
           (when d-range
             (.remove trunk-dirty-ranges
                      (.getKey d-range) (.getValue d-range)))
-          (if (or (not d-range)
-                  (>= (.getKey d-range) append-header))
+          (if (not d-range)
             (when (> (.size dirty-ranges) 0)
-              (finish-trunk-sync trunk append-header timestamp))
+              #_(finish-trunk-sync trunk append-header timestamp))
             (do (let [start (.getKey d-range)
-                      end (min (.getValue d-range) (dec append-header))]
+                      end (.getValue d-range)]
                   (sync-range trunk start end))
                 (recur (inc (.getValue d-range)))))))
       (.release mf))

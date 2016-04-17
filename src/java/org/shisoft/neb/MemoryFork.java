@@ -5,10 +5,7 @@ import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.util.Map;
 import java.util.NavigableMap;
-import java.util.SortedMap;
-import java.util.TreeMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.function.BiFunction;
 
 /**
  * Created by shisoft on 16-3-25.
@@ -22,10 +19,10 @@ public class MemoryFork {
     }
 
     public void copyMemory (long start, long end){
-        long bsLen = end - start;
+        long bsLen = end - start + 1;
         byte[] bs = new byte[(int) bsLen];
         for (long i = start; i < end; i++) {
-            bs[(int) (i - start)] = Trunk.getUnsafe().getByte(trunk.getStoreAddress() + i);
+            bs[(int) (i - start)] = Trunk.getUnsafe().getByte(i);
         }
         orignalBytes.compute(start, (aLong, saved) -> {
             if (saved != null && saved.length >= (end - start + 1)) {
@@ -69,7 +66,7 @@ public class MemoryFork {
             }
             long segEnd = Math.min(Math.min(start + segLength - 1, bufferBound - 1), end);
             byte[] bs = UnsafeUtils.getBytes(
-                    trunk.getStoreAddress() + currentPos,
+                    currentPos,
                     (int) (segEnd - currentPos + 1)
             );
             if (bs.length > 0) {

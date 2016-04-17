@@ -7,4 +7,4 @@
 (set! *warn-on-reflection* true)
 
 (defn scan-trunk-and-defragment [^Trunk ttrunk]
-  (.defrag (.getDefrag ttrunk)))
+  (.clean (.getCleaner ttrunk)))

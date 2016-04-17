@@ -2,18 +2,15 @@ package org.shisoft.neb;
 
 import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
+import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.utils.Collection;
 import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.shisoft.neb.io.type_lengths.*;
 
@@ -22,28 +19,29 @@ import static org.shisoft.neb.io.type_lengths.*;
  */
 public class Trunk {
 
-    public final static int tombstoneSize = intLen + 1;
+    final static int tombstoneSize = intLen + 1;
+    final static int maxObjSize = 8 * 1024 * 1024;
+    final static int segSize    = 64 * 1024 * 1024;
 
     private int id;
     private long storeAddress;
     private long size;
     private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
-    private AtomicLong appendHeader = new AtomicLong(0);
     private ConcurrentSkipListMap<Long, Long> dirtyRanges;
     private MemoryFork memoryFork;
     private boolean backendEnabled = false;
-    private ReentrantLock cellSlowWriteLock = new ReentrantLock();
-    private ReentrantReadWriteLock cellWriteLock = new ReentrantReadWriteLock();
-    private Defragmentation defrag;
+    private Cleaner cleaner;
     private volatile boolean slowMode = false;
+    private ConcurrentLinkedQueue<Segment> segmentsQueue;
+    private Segment[] segments;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
+    public ConcurrentLinkedQueue<Segment> getSegmentsQueue() {
+        return segmentsQueue;
+    }
     public long getSize() {
         return size;
-    }
-    public AtomicLong getAppendHeader() {
-        return appendHeader;
     }
     public HashLongObjMap<CellMeta> getCellIndex() {
         return cellIndex;
@@ -60,19 +58,38 @@ public class Trunk {
     public void setId(int id) {
         this.id = id;
     }
-    public ReentrantLock getCellSlowWriteLock() {
-        return cellSlowWriteLock;
+    public Cleaner getCleaner() {
+        return cleaner;
     }
-    public ReentrantReadWriteLock getCellWriteLock() {
-        return cellWriteLock;
+    public static int getSegSize() {
+        return segSize;
     }
-    public Defragmentation getDefrag() {
-        return defrag;
+    public static int getMaxObjSize() {
+        return maxObjSize;
     }
+    public Segment[] getSegments() {
+        return segments;
+    }
+    public void setSegments(Segment[] segments) {
+        this.segments = segments;
+    }
+
     public Trunk(long size){
         this.size = size;
         storeAddress = getUnsafe().allocateMemory(size);
-        defrag = new Defragmentation(this);
+        cleaner = new Cleaner(this);
+        initSegments(segSize);
+    }
+    private void initSegments (long segSize) {
+        int segCount = (int) Math.floor((double) this.size / segSize);
+        assert segCount > 0;
+        segmentsQueue = new ConcurrentLinkedQueue<>();
+        segments = new Segment[segCount];
+        for (int i = 0; i < segCount; i++){
+            Segment seg = new Segment(storeAddress + segSize * i, this);
+            segmentsQueue.add(seg);
+            segments[i] = seg;
+        }
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
@@ -80,9 +97,6 @@ public class Trunk {
     }
     public static sun.misc.Unsafe getUnsafe() {
         return UnsafeUtils.unsafe;
-    }
-    public long getStoreAddress() {
-        return storeAddress;
     }
     public void removeCellFromIndex(long hash){
         synchronized (cellIndex) {
@@ -99,16 +113,16 @@ public class Trunk {
         return memoryFork;
     }
     public void putTombstone (long startPos, long endPos){
-        long size = endPos - startPos + 1;
+        int size = (int) (endPos - startPos + 1);
         long tombstoneEnds = startPos + byteLen + longLen - 1;
         assert  size > tombstoneSize : "frag length is too small to put a tombstone";
         copyMemForFork(startPos, tombstoneEnds);
-        Writer.writeByte(this, (byte) 1, startPos);
-        Writer.writeLong(this, size, startPos + byteLen);
+        Writer.writeByte((byte) 2, startPos);
+        Writer.writeInt(size, startPos + byteLen);
         addDirtyRanges(startPos, tombstoneEnds);
     }
     public void addFragment (long startPos, long endPos) {
-        defrag.addFragment(startPos, endPos);
+        cleaner.addFragment(startPos, endPos);
     }
     public void addDirtyRanges (long startPos, long endPos) {
         if (backendEnabled) {
@@ -123,28 +137,18 @@ public class Trunk {
         }
     }
     public void enableDurability () {
-        this.dirtyRanges = new ConcurrentSkipListMap<Long, Long>();
+        this.dirtyRanges = new ConcurrentSkipListMap<>();
         this.backendEnabled = true;
-    }
-
-    public int countFragments (){
-        return defrag.countFragments();
     }
 
     public ConcurrentSkipListMap<Long, Long> getDirtyRanges() {
         return dirtyRanges;
     }
 
-    public void removeFrag (long startPos, long endPos){
-        defrag.removeFrag(startPos, endPos);
-    }
-    public long getAppendHeaderValue (){
-        return appendHeader.get();
-    }
     public void copyMemory(long startPos, long target, long len){
         long dirtyEndPos = target + len - 1;
         copyMemForFork(target, dirtyEndPos);
-        getUnsafe().copyMemory(storeAddress + startPos, storeAddress + target, len);
+        getUnsafe().copyMemory(startPos, target, len);
         addDirtyRanges(target, dirtyEndPos);
     }
     public MemoryFork fork(){
@@ -153,62 +157,53 @@ public class Trunk {
         return memoryFork;
     }
 
-    public long tryAcquireFromAppendHeader (long length, AtomicBoolean overflowed){
-        return getAppendHeader().getAndUpdate(appenderLoc -> {
-            long expectedLoc = appenderLoc + length;
-            if (expectedLoc > size) {
-                overflowed.set(true);
-                return appenderLoc;
-            } else {
-                overflowed.set(false);
-                return expectedLoc;
-            }
-        });
-    }
-
-    public void enterSlowMode () {
-        this.slowMode = true;
-    }
-    public void leaveSlowMode () {
-        this.slowMode = false;
-    }
-    public boolean isSlowMode() {
-        return slowMode;
-    }
-    public boolean isCurrentOpSlowMode() {
-        return slowMode && cellSlowWriteLock.isHeldByCurrentThread();
-    }
-    public void tryWriteCell () throws InterruptedException {
-        this.getCellWriteLock().readLock().lock();
-        if (slowMode && !this.cellSlowWriteLock.isHeldByCurrentThread()) {
-            this.cellSlowWriteLock.lock();
-            Thread.currentThread().sleep(1);
+    public long tryAcquireSpace (long length) throws ObjectTooLargeException {
+        if (length > maxObjSize) {
+            throw new ObjectTooLargeException(length + " of " + maxObjSize);
         }
-    }
-    public void endWriteCell () {
-        if (this.cellSlowWriteLock.isHeldByCurrentThread()) this.cellSlowWriteLock.unlock();
-        this.getCellWriteLock().readLock().unlock();
-    }
-    public float computeFillRatio () {
-        long trunkSize = getSize();
-        long appendHeader = getAppendHeaderValue();
-        float r = (float) appendHeader / (float) trunkSize;
+        long r = -1;
+        int turn = 0;
+        Segment firstSeg = segmentsQueue.peek();
+        for (Segment seg : segmentsQueue) {
+            r = seg.tryAcquireSpace(length);
+            if (r > 0) {
+                break;
+            } else {
+                segmentsQueue.remove(seg);
+                segmentsQueue.offer(seg);
+                if (turn > 0 && seg == firstSeg) {
+                    break;
+                }
+            }
+            turn ++;
+        }
         return r;
     }
-    public boolean checkShouldInSlowMode (float fillRate) {
-        boolean almostFull = fillRate > 0.9;
-        boolean originalMode = isSlowMode();
-        if (almostFull) {
-            enterSlowMode();
-        } else {
-            leaveSlowMode();
+
+    public Segment locateSegment (long starts) {
+        long relativeLoc = starts - storeAddress;
+        assert relativeLoc >= 0;
+        int segId = (int) Math.floor(relativeLoc / Trunk.segSize);
+        assert segId >= 0;
+        Segment seg = null;
+        try {
+            seg = segments[segId];
+        } catch (ArrayIndexOutOfBoundsException ex) {
+            System.out.println("Cannot locate seg: " + starts + " " + storeAddress + " " + relativeLoc + " " + segId);
+            throw ex;
         }
-        if (isSlowMode() != originalMode) {
-            System.out.println((isSlowMode() ? "In Slow Mode" : "Leave Slow Mode")  + " for trunk: " + getId());
-        }
-        return almostFull;
+        return seg;
     }
-    public boolean checkShouldInSlowMode () {
-        return checkShouldInSlowMode(computeFillRatio());
+
+    public long getStoreAddress() {
+        return storeAddress;
+    }
+
+    public void readMetaLockSegment(CellMeta meta) {
+        locateSegment(meta.getLocation()).getLock().readLock().lock();
+    }
+
+    public void readUnlockMetaSegment(CellMeta meta) {
+        locateSegment(meta.getLocation()).getLock().readLock().unlock();
     }
 }
