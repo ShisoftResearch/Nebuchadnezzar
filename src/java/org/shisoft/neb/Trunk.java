@@ -162,6 +162,8 @@ public class Trunk {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
         }
         long r = -1;
+        int turn = 0;
+        Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
             r = seg.tryAcquireSpace(length);
             if (r > 0) {
@@ -169,7 +171,11 @@ public class Trunk {
             } else {
                 segmentsQueue.remove(seg);
                 segmentsQueue.offer(seg);
+                if (turn > 0 && seg == firstSeg) {
+                    break;
+                }
             }
+            turn ++;
         }
         return r;
     }
