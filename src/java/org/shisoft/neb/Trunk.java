@@ -64,6 +64,9 @@ public class Trunk {
     public static int getSegSize() {
         return segSize;
     }
+    public static int getMaxObjSize() {
+        return maxObjSize;
+    }
     public Segment[] getSegments() {
         return segments;
     }
@@ -77,12 +80,13 @@ public class Trunk {
         cleaner = new Cleaner(this);
         initSegments(segSize);
     }
-    private void initSegments (int size) {
-        int segCount = (int) Math.floor((double) this.size / size);
+    private void initSegments (long segSize) {
+        int segCount = (int) Math.floor((double) this.size / segSize);
+        assert segCount > 0;
         segmentsQueue = new ConcurrentLinkedQueue<>();
         segments = new Segment[segCount];
         for (int i = 0; i < segCount; i++){
-            Segment seg = new Segment(storeAddress + size * i, this);
+            Segment seg = new Segment(storeAddress + segSize * i, this);
             segmentsQueue.add(seg);
             segments[i] = seg;
         }

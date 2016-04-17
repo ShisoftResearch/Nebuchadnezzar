@@ -22,6 +22,7 @@ public class Segment {
     private ConcurrentSkipListSet<Long> frags;
 
     public Segment(long baseAddr, Trunk trunk) {
+        assert baseAddr >= trunk.getStoreAddress();
         this.baseAddr = baseAddr;
         this.trunk = trunk;
         this.currentLoc = new AtomicLong(baseAddr);
@@ -71,13 +72,13 @@ public class Segment {
     }
 
     public long tryAcquireSpace (long len) {
+        assert len > 0;
         try {
             lock.readLock().lock();
             AtomicBoolean updated = new AtomicBoolean(false);
             long r = this.currentLoc.getAndUpdate(originalLoc -> {
                 long expectedLoc = originalLoc + len;
-                long expectedPos = expectedLoc - baseAddr;
-                if (expectedPos >= Trunk.getSegSize()) {
+                if (expectedLoc >= this.getBaseAddr() + Trunk.getSegSize()) {
                     updated.set(false);
                     return originalLoc;
                 } else {
