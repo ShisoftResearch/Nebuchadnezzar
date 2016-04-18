@@ -1,6 +1,5 @@
 package org.shisoft.neb;
 
-import org.shisoft.neb.exceptions.StoreFullException;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.Writer;
 
@@ -38,6 +37,10 @@ public class Segment {
 
     public ReentrantReadWriteLock getLock() {
         return lock;
+    }
+
+    public int getId() {
+        return id;
     }
 
     public long getBaseAddr() {
