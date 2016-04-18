@@ -13,7 +13,7 @@
 (def data-path (atom nil))
 (def defed-path (atom nil))
 (def clients (atom {}))
-(def ids (atom 0))
+(def ids (atom (int 0)))
 
 (declare collect-log)
 
@@ -57,7 +57,7 @@
                                                   file-ins (File. file-path)]
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
                                               (prepare-replica
-                                                (BufferedRandomAccessFile. file-path "rw" (Trunk/getSegSize))
+                                                (BufferedRandomAccessFile. file-path "rw" (+ (Trunk/getSegSize) t/seg-header-size))
                                                 seg-size)))
                                      (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
