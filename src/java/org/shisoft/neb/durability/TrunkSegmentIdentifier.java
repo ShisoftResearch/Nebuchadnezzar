@@ -5,14 +5,24 @@ package org.shisoft.neb.durability;
  */
 public class TrunkSegmentIdentifier {
 
+    private long msgId;
     private int sid;
     private int trunkId;
     private int segId;
 
-    public TrunkSegmentIdentifier(int sid, int trunkId, int segId) {
+    public TrunkSegmentIdentifier(long msgId, int sid, int trunkId, int segId) {
+        this.msgId = msgId;
         this.sid = sid;
         this.trunkId = trunkId;
         this.segId = segId;
+    }
+
+    public long getMsgId() {
+        return msgId;
+    }
+
+    public void setMsgId(long msgId) {
+        this.msgId = msgId;
     }
 
     public int getSid() {

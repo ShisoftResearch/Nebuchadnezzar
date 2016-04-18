@@ -21,12 +21,13 @@
                         ))
 
 (defn sync-seg-to-disk [^BufferedRandomAccessFile accessor seg-id seg-size base-addr current-addr ^bytes bs]
-  (let [loc (+ base-addr file-header-size (* seg-header-size seg-size))]
+  (let [loc (+ base-addr file-header-size (* seg-header-size seg-id))]
     (locking accessor
       (.seek accessor loc)
       (.write accessor (Ints/toByteArray (- current-addr base-addr)))
       (.seek accessor (+ loc type_lengths/intLen))
-      (.write accessor bs))))
+      (.write accessor bs)
+      (.flush))))
 
 (def num-readers {:int read-int
                   :long read-long})
