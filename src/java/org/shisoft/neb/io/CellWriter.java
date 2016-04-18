@@ -24,7 +24,6 @@ public class CellWriter {
         this.currLoc = currLoc;
         this.startLoc = currLoc;
         this.length = length;
-        trunk.copyMemForFork(startLoc, startLoc + length -1);
     }
 
     public CellWriter(Trunk trunk, long length) throws Exception {

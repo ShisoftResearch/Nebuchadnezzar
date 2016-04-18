@@ -28,7 +28,7 @@
         (try
           (.lockWrite seg)
           (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
-                curr-addr (- (.getCurrentLoc seg) (.getStoreAddress trunk))
+                curr-addr (int (- (.getCurrentLoc seg) (.getBaseAddr seg)))
                 seg-id (.getId seg)
                 data (.getData seg)]
             (.unlockWrite seg)

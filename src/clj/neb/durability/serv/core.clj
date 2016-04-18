@@ -81,7 +81,6 @@
            {:server-name server-name
             :base-path   base-path
             :accessors   replica-accessors
-            ;:appenders   log-appenders
             :sync-time   sync-timestamps
             :log-switches  log-switches
             :pending-chan pending-chan

@@ -1,7 +1,8 @@
 (ns neb.durability.serv.trunk
   (:require [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
             [neb.durability.serv.file-reader :refer [read-bytes skip-bytes]]
-            [neb.durability.serv.native :refer [read-int read-long]]
+            [neb.durability.serv.native :refer [read-int read-long read-int-from-bytes read-long-from-bytes
+                                                read-int-from-stream read-long-from-stream]]
             [neb.core :refer [new-cell-by-raw*]]
             [neb.cell :refer [normal-cell-type]]
             [clojure.java.io :as io]
@@ -21,7 +22,7 @@
                         ))
 
 (defn sync-seg-to-disk [^BufferedRandomAccessFile accessor seg-id seg-size base-addr current-addr ^bytes bs]
-  (let [loc (+ base-addr file-header-size (* seg-header-size seg-size))]
+  (let [loc (+ base-addr file-header-size (* seg-header-size seg-id))]
     (locking accessor
       (.seek accessor loc)
       (.write accessor (Ints/toByteArray (- current-addr base-addr)))
@@ -47,11 +48,15 @@
     r))
 
 (defn recover [file-path]
-  (let [^InputStream reader (io/input-stream file-path)]
+  (let [^InputStream reader (io/input-stream file-path)
+        seg-size (read-int-from-stream reader)]
     (try
       (while (> (.available reader) 0)
-        (let [header-bytes (read-bytes reader cell-head-len)
-              {:keys [partition hash cell-length cell-type]} (read-header-bytes header-bytes)]
+        (let [seg-append-header (read-int-from-stream reader)
+              seg-data (read-bytes reader seg-size)]
+          (loop []
+            (let [header-bytes (read-bytes reader cell-head-len)
+                  {:keys [partition hash cell-length cell-type]} (read-header-bytes header-bytes)]))
           (if (= cell-type normal-cell-type)
             (let [cell-id (UUID. partition hash)
                   body-bytes (read-bytes reader cell-length)
