@@ -1,6 +1,7 @@
 package org.shisoft.neb.durability;
 
 import java.util.Comparator;
+import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 /**
@@ -17,7 +18,12 @@ public class BackupCache {
     }
 
     public Object pop () {
-        return cacheQueue.pollFirstEntry().getValue();
+        Map.Entry e = cacheQueue.pollFirstEntry();
+        if (e != null) {
+            return e.getValue();
+        } else {
+            return null;
+        }
     }
 
 }

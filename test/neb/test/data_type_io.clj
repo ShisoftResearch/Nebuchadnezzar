@@ -9,7 +9,7 @@
 (def ttrunk (atom nil))
 
 (defn rt []
-  (reset! ttrunk (Trunk. 8388608)))
+  (reset! ttrunk (Trunk. (Trunk/getSegSize))))
 
 (defn dt []
   (.dispose @ttrunk))

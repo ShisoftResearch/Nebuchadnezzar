@@ -66,16 +66,16 @@
         flushed-ch (atom nil)
         backup-cache (BackupCache.)]
     (a/go-loop []
-      (let [seg-block (.pop backup-cache)
-            [act trunk-id seg-id base-addr current-addr bs] seg-block
-            accessor (replica-accessors trunk-id)]
+      (let [seg-block (.pop backup-cache)]
         (if seg-block
-          (case act
-            0 (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs)
-            1 (do (.flush accessor)
-                  (when @flushed-ch
-                    (println "Flushed backup")
-                    (a/>!! @flushed-ch true))))
+          (let [[act trunk-id seg-id base-addr current-addr bs] seg-block
+                accessor (replica-accessors trunk-id)]
+            (case act
+              0 (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs)
+              1 (do (.flush accessor)
+                    (when @flushed-ch
+                      (println "Flushed backup")
+                      (a/>!! @flushed-ch true)))))
           (a/<! (a/timeout 10))))
       (recur))
     (swap! clients assoc sid

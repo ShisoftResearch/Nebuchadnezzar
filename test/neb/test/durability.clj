@@ -8,8 +8,6 @@
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [clojure.core.async :as a])
   (:import (org.shisoft.neb.utils StandaloneZookeeper)
-           (java.io File)
-           (org.apache.commons.io FileUtils)
            (org.shisoft.neb Trunk)
            (java.util Map$Entry)))
 
@@ -31,7 +29,7 @@
       flush-chan (a/chan)]
   (.startZookeeper zk 21817)
   (try
-    #_(facts "Durability"
+    (facts "Durability"
            (fact "Start Server"
                  (start-server config) => anything)
            (fact "Prepare schemas"
@@ -62,11 +60,10 @@
            (fact "Check dirty"
                  (let [trunks (.getTrunks ts/trunks)]
                    (doseq [trunk trunks]
-                     (let [dirtyRanges (.getDirtyRanges ^Trunk trunk)]
-                       (.size dirtyRanges) => 1
-                       (.getValue ^Map$Entry (first dirtyRanges)) => (dec (.getAppendHeaderValue trunk))))))
+                     (let [dirtySegments (.getDirtySegments ^Trunk trunk)]
+                       (count dirtySegments) => 1))))
            (fact "Sync trunks"
-                 (backup-trunks) => anything)
+                 (backup-trunks (atom false)) => anything)
            (a/<!! flush-chan)
            (a/<!! flush-chan)
            (fact "Check backedup ids"
@@ -112,7 +109,7 @@
                            (range 50)))
                        (println "Test with frags - Delete"))
                  (fact "Sync trunks"
-                       (backup-trunks) => anything
+                       (backup-trunks (atom false)) => anything
                        (println "Test with frags - Sync trunks"))
                  (a/<!! flush-chan)
                  (a/<!! flush-chan)
@@ -164,5 +161,5 @@
             (clear-zk) => anything)
       (fact "Stop Server"
             (stop-server)  => anything)
-      (FileUtils/deleteDirectory (File. "data"))
+      #_(FileUtils/deleteDirectory (File. "data"))
       (.stopZookeeper zk))))

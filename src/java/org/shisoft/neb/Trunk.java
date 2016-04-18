@@ -9,7 +9,9 @@ import org.shisoft.neb.utils.UnsafeUtils;
 
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.stream.Collectors;
 
 import static org.shisoft.neb.io.type_lengths.*;
 
@@ -168,8 +170,8 @@ public class Trunk {
         return seg;
     }
 
-    public Segment[] getDirtySegments () {
-        return (Segment[]) Arrays.stream(segments).filter(Segment::isDirty).toArray();
+    public List<Segment> getDirtySegments () {
+        return Arrays.asList(segments).stream().filter(Segment::isDirty).collect(Collectors.toList());
     }
 
     public long getStoreAddress() {
