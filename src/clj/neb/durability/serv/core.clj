@@ -7,7 +7,8 @@
            (java.io File)
            (org.apache.commons.io FileUtils)
            (org.shisoft.neb Trunk)
-           (com.google.common.primitives Ints)))
+           (com.google.common.primitives Ints)
+           (org.shisoft.neb.durability BackupCache)))
 
 (def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
@@ -61,29 +62,28 @@
                                                 seg-size)))
                                      (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
-        log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
         pending-chan (a/chan 50)
-        flushed-ch (atom nil)]
+        flushed-ch (atom nil)
+        backup-cache (BackupCache.)]
     (a/go-loop []
-      (let [[act trunk-id seg-id base-addr current-addr bs] (a/<! pending-chan)
+      (let [seg-block (.pop backup-cache)
+            [act trunk-id seg-id base-addr current-addr bs] seg-block
             accessor (replica-accessors trunk-id)]
-        (try
+        (if seg-block
           (case act
-            0 (do (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs))
+            0 (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs)
             1 (do (.flush accessor)
                   (when @flushed-ch
                     (println "Flushed backup")
                     (a/>!! @flushed-ch true))))
-          (catch Exception ex
-            (clojure.stacktrace/print-cause-trace ex))))
+          (a/<! (a/timeout 10))))
       (recur))
     (swap! clients assoc sid
            {:server-name server-name
             :base-path   base-path
             :accessors   replica-accessors
             :sync-time   sync-timestamps
-            :log-switches  log-switches
-            :pending-chan pending-chan
+            :cache backup-cache
             :flushed-ch flushed-ch})
     sid))
 
@@ -91,13 +91,13 @@
   (doseq [[_ {:keys [flushed-ch]}] @clients]
     (reset! flushed-ch chan)))
 
-(defn sync-trunk-segment [sid trunk-id seg-id base-addr currend-addr bs]
-  (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [0 trunk-id seg-id base-addr currend-addr bs])))
+(defn sync-trunk-segment [sid trunk-id seg-id base-addr current-addr bs]
+  (let [^BackupCache cache (get-in @clients [sid :cache])]
+    (.offer cache sid trunk-id seg-id [0 trunk-id seg-id base-addr current-addr bs])))
 
 (defn sync-trunk-completed [sid trunk-id]
-  (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [1 trunk-id])))
+  (let [^BackupCache cache (get-in @clients [sid :cache])]
+    (.offer cache sid trunk-id -1 [1 trunk-id])))
 
 (defn list-recover-dir []
   (let [path-file (File. ^String @defed-path)

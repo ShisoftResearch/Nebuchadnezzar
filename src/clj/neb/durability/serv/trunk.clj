@@ -27,7 +27,8 @@
       (.seek accessor loc)
       (.write accessor (Ints/toByteArray (- current-addr base-addr)))
       (.seek accessor (+ loc type_lengths/intLen))
-      (.write accessor bs))))
+      (.write accessor bs)
+      (.flush))))
 
 (def num-readers {:int read-int
                   :long read-long})
