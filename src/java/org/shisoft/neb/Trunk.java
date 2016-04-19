@@ -21,8 +21,8 @@ import static org.shisoft.neb.io.type_lengths.*;
 public class Trunk {
 
     final static int tombstoneSize = intLen + 1;
-    final static int maxObjSize = 2 * 1024 * 1024;
-    final static int segSize    = 8 * 1024 * 1024;
+    final static int maxObjSize = 8 * 1024 * 1024;
+    final static int segSize    = 1 * 1024 * 1024;
 
     private int id;
     private long storeAddress;
@@ -107,11 +107,10 @@ public class Trunk {
     }
     public void putTombstone (long startPos, long endPos){
         int size = (int) (endPos - startPos + 1);
-        long tombstoneEnds = startPos + byteLen + longLen - 1;
         assert  size > tombstoneSize : "frag length is too small to put a tombstone";
         Writer.writeByte((byte) 2, startPos);
         Writer.writeInt(size, startPos + byteLen);
-        addDirtyRanges(startPos, tombstoneEnds);
+
     }
     public void addFragment (long startPos, long endPos) {
         cleaner.addFragment(startPos, endPos);
@@ -171,7 +170,7 @@ public class Trunk {
     }
 
     public List<Segment> getDirtySegments () {
-        return Arrays.asList(segments).stream().filter(Segment::isDirty).collect(Collectors.toList());
+        return Arrays.asList(segments).stream().filter(seg -> seg.containsTombstone() || seg.isDirty()).collect(Collectors.toList());
     }
 
     public long getStoreAddress() {

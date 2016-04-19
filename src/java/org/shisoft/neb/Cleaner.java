@@ -1,20 +1,12 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.type_lengths;
 import org.shisoft.neb.utils.Bindings;
-import org.shisoft.neb.utils.Collection;
 
 import java.util.Arrays;
-import java.util.Comparator;
-import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Consumer;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -31,33 +23,30 @@ public class Cleaner {
 
     public void addFragment (long startPos, long endPos) {
         Segment seg = trunk.locateSegment(startPos);
-        seg.getLock().writeLock().lock();
+        seg.lockWrite();
         try {
-            if (startPos >= seg.getBaseAddr() && endPos < seg.getBaseAddr() + Trunk.getSegSize()) {
-                seg.getFrags().add(startPos);
-                seg.incDeadObjectBytes((int) (endPos - startPos + 1));
-                trunk.putTombstone(startPos, endPos);
-            }
+            assert startPos >= seg.getBaseAddr() && endPos < seg.getBaseAddr() + Trunk.getSegSize();
+            seg.getFrags().add(startPos);
+            seg.incDeadObjectBytes((int) (endPos - startPos + 1));
+            trunk.putTombstone(startPos, endPos);
         } finally {
-            seg.getLock().writeLock().unlock();
+            seg.unlockWrite();
         }
     }
 
     public void removeFragment (Segment seg, long startPos, int length) {
-        seg.getLock().writeLock().lock();
+        seg.lockWrite();
         try {
             assert startPos >= seg.getBaseAddr() && length + startPos - 1 < seg.getBaseAddr() + Trunk.getSegSize();
-            seg.getFrags().remove(startPos);
+            seg.appendTombstones(startPos);
             seg.decDeadObjectBytes(length);
         } finally {
-            seg.getLock().writeLock().unlock();
+            seg.unlockWrite();
         }
     }
 
     private void checkTooManyRetry(String message, int retry) {
-        if (retry > 100) {
-            System.out.println(message); // Will use logging later
-        }
+        System.out.println(message + " " + retry);
     }
 
     private void phaseOneCleanSegment(Segment segment) {
@@ -131,7 +120,7 @@ public class Cleaner {
     }
 
     public void phaseOneCleaning () {
-        Arrays.stream(trunk.getSegments())
+        Arrays.stream(trunk.getSegments()).parallel()
                 .sorted((o1, o2) -> Float.valueOf(o1.aliveDataRatio()).compareTo(o2.aliveDataRatio()))
                 .limit((long) (Math.max(1, trunk.getSegments().length * 0.5)))
                 .forEach(this::phaseOneCleanSegment);

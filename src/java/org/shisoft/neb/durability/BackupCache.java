@@ -9,7 +9,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
  */
 public class BackupCache {
 
-    static final int maxQueueItems = 100;
+    static final int maxQueueItems = 10;
     long msgId = 0;
     ConcurrentSkipListMap cacheQueue = new ConcurrentSkipListMap<>(Comparator.comparing(TrunkSegmentIdentifier::getMsgId));
 

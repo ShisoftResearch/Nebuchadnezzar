@@ -94,6 +94,10 @@
   (let [^BackupCache cache (get-in @clients [sid :cache])]
     (.offer cache sid trunk-id seg-id [0 trunk-id seg-id base-addr current-addr bs])))
 
+(defn sync-trunk-tombstones [sid trunk-id seg-id loc bss]
+  (let [^BackupCache cache (get-in @clients [sid :cache])]
+    (.offer cache sid trunk-id seg-id [2 trunk-id seg-id loc nil bss])))
+
 (defn sync-trunk-completed [sid trunk-id]
   (let [^BackupCache cache (get-in @clients [sid :cache])]
     (.offer cache sid trunk-id -1 [1 trunk-id])))

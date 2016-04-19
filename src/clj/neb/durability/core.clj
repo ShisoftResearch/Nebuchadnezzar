@@ -27,13 +27,22 @@
           (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
                 curr-addr (int (- (.getCurrentLoc seg) (.getBaseAddr seg)))
                 seg-id (.getId seg)
-                data (.getData seg)]
+                data (.getData seg)
+                tombstones (vec (.getUnsyncedTombstones seg))
+                is-dirty? (.isDirty seg)]
             (.setClean seg)
             (.unlockWrite seg)
-            (cp/pdoseq
-              sync-pool [[sn sid] @server-sids]
-              (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-                          sid trunk-id seg-id  base-addr curr-addr data)))
+            (cond
+              (> (count tombstones) 0)
+              (cp/pdoseq
+                sync-pool [[sn sid] @server-sids]
+                (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+                            sid trunk-id seg-id  base-addr curr-addr data))
+              is-dirty?
+              (cp/pdoseq
+                sync-pool [[sn sid] @server-sids]
+                (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+                            sid trunk-id seg-id  base-addr curr-addr data))))
           (finally (.unlockWrite seg))))
       (cp/pdoseq
         sync-pool [[sn sid] @server-sids]

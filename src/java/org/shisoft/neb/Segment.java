@@ -3,6 +3,7 @@ package org.shisoft.neb;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.Writer;
 
+import java.util.Set;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,6 +22,7 @@ public class Segment {
     private AtomicInteger deadObjectBytes;
     private ReentrantReadWriteLock lock;
     private ConcurrentSkipListSet<Long> frags;
+    public ConcurrentSkipListSet<Long> tombstones;
     private volatile boolean isDirty;
 
     public Segment(int id, long baseAddr, Trunk trunk) {
@@ -32,6 +34,7 @@ public class Segment {
         this.deadObjectBytes = new AtomicInteger(0);
         this.lock = new ReentrantReadWriteLock();
         this.frags = new ConcurrentSkipListSet<>();
+        this.tombstones = new ConcurrentSkipListSet<>();
         this.isDirty = false;
     }
 
@@ -50,6 +53,20 @@ public class Segment {
     public long getCurrentLoc() {
         return currentLoc.get();
     }
+
+    public void appendTombstones(long lc) {
+        this.tombstones.add(lc);
+    }
+
+    public void setTombstoneSynced() {
+        this.tombstones.clear();
+    }
+
+    public Set<Long> getUnsyncedTombstones () {
+        return this.tombstones;
+    }
+
+    public boolean containsTombstone() {return !this.tombstones.isEmpty();}
 
     public boolean resetCurrentLoc (long expected, long update) {
         return currentLoc.compareAndSet(expected, update);
@@ -77,7 +94,10 @@ public class Segment {
 
     public void setDirty () {this.isDirty = true;}
 
-    public void setClean () {this.isDirty = false;}
+    public void setClean () {
+        this.isDirty = false;
+        this.setTombstoneSynced();
+    }
 
     public boolean isDirty () {return this.isDirty;}
 
@@ -109,7 +129,8 @@ public class Segment {
             AtomicBoolean updated = new AtomicBoolean(false);
             long r = this.currentLoc.getAndUpdate(originalLoc -> {
                 long expectedLoc = originalLoc + len;
-                if (expectedLoc >= this.getBaseAddr() + Trunk.getSegSize()) {
+                long expectedPos = expectedLoc - baseAddr;
+                if (expectedPos >= Trunk.getSegSize()) {
                     updated.set(false);
                     return originalLoc;
                 } else {
