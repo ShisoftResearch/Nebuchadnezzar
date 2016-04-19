@@ -27,7 +27,8 @@
         sids (doall
                (map (fn [sn]
                       [sn (rfi/invoke sn 'neb.durability.serv.core/register-client-trunks
-                                      (System/currentTimeMillis) @ds/this-server-name (.getTrunkCount trunks))])
+                                      (System/currentTimeMillis) @ds/this-server-name (.getTrunkCount trunks)
+                                      (Trunk/getSegSize))])
                     backup-servers))]
     (println "Wil replicate to:" sids)
     (reset! server-sids sids)))
@@ -46,7 +47,9 @@
                             :name "Defragmentation")
         defrag-trunk (fn [^Trunk trunk]
                        (while (not @stopped-atom)
-                         (defrag/scan-trunk-and-defragment trunk)
+                         (try
+                           (defrag/scan-trunk-and-defragment trunk)
+                           (catch Throwable tr (clojure.stacktrace/print-cause-trace tr)))
                          (Thread/sleep 1000))
                        (cp/shutdown pool))]
     (doseq [^Trunk trunk trunks]
@@ -59,7 +62,9 @@
                             :name "Backup")
         backup (fn [^Trunk trunk]
                  (while (not @stopped-atom)
-                   (sync-trunk trunk)
+                   (try
+                     (sync-trunk trunk)
+                     (catch Throwable tr (clojure.stacktrace/print-cause-trace tr)))
                    (Thread/sleep 1000))
                  (cp/shutdown pool))]
     (doseq [trunk trunks]

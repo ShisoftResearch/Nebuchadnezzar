@@ -10,6 +10,7 @@ import java.util.concurrent.ConcurrentSkipListMap;
 /**
  * Created by shisoft on 16-3-25.
  */
+@Deprecated
 public class MemoryFork {
     Trunk trunk;
     ConcurrentSkipListMap<Long, byte[]> orignalBytes = new ConcurrentSkipListMap<>();
@@ -80,6 +81,5 @@ public class MemoryFork {
 
     public synchronized void release(){
         orignalBytes.clear();
-        trunk.setMemoryFork(null);
     }
 }

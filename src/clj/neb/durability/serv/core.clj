@@ -1,22 +1,20 @@
 (ns neb.durability.serv.core
-  (:require [neb.durability.serv.logs :as l]
-            [neb.durability.serv.trunk :as t]
-            [clojure.java.io :as io]
+  (:require [neb.durability.serv.trunk :as t]
             [clojure.core.async :as a]
             [cluster-connector.utils.for-debug :refer [$ spy]]
-            [taoensso.nippy :as nippy])
+            [neb.durability.serv.native :refer [from-int from-long]])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
-           (java.util UUID)
            (java.util.concurrent.locks ReentrantLock)
-           (java.io OutputStream File DataOutputStream)
-           (org.apache.commons.io FileUtils)))
+           (java.io File)
+           (org.apache.commons.io FileUtils)
+           (org.shisoft.neb Trunk)
+           (org.shisoft.neb.durability BackupCache)))
 
 (def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
 (def defed-path (atom nil))
 (def clients (atom {}))
-(def ids (atom 0))
-(def ^:deprecated pending-logs (a/chan))
+(def ids (atom (int 0)))
 
 (declare collect-log)
 
@@ -33,8 +31,7 @@
   (reset! defed-path path)
   (reset! data-path (str path "/" start-time "/"))
   (when keep-imported? (remove-imported @data-path))
-  (println "Starting backup server at:" @data-path)
-  #_(a/go-loop [] (apply collect-log (a/<! pending-logs))))
+  (println "Starting backup server at:" @data-path))
 
 (defn convert-server-name-for-file [^String str] (.replace str ":" "-"))
 
@@ -43,7 +40,13 @@
        (convert-server-name-for-file server-name) "-"
        timestamp "-"))
 
-(defn register-client-trunks [timestamp server-name trunks]
+(defn prepare-replica [^BufferedRandomAccessFile accessor seg-size]
+  (doto accessor
+    (.seek 0)
+    (.write ^bytes (from-int seg-size))
+    ))
+
+(defn register-client-trunks [timestamp server-name trunks seg-size]
   (let [sid (swap! ids inc)
         base-path (let [^String path (file-base-path server-name timestamp)
                         file-ins (.getParentFile (File. path))
@@ -54,37 +57,32 @@
         replica-accessors (vec (map (fn [n] (let [file-path (str base-path n ".dat")
                                                   file-ins (File. file-path)]
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
-                                              (BufferedRandomAccessFile. file-path "rw")))
+                                              (prepare-replica
+                                                (BufferedRandomAccessFile. file-path "rw" (+ (Trunk/getSegSize) t/seg-header-size)) seg-size)))
                                      (range trunks)))
-        ;log-appenders (vec (map (fn [n] (atom (io/output-stream
-        ;                                        (str base-path n "-" timestamp ".mlog"))))
-        ;                         (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
-        log-switches (vec (map (fn [_] (ReentrantLock.)) (range trunks)))
-        pending-chan (a/chan 500)
-        flushed-ch (atom nil)]
+        pending-chan (a/chan 50)
+        flushed-ch (atom nil)
+        backup-cache (BackupCache.)]
     (a/go-loop []
-      (let [[act trunk-id loc data] (a/<! pending-chan)
-            accessor (replica-accessors trunk-id)]
-        (try
-          (case act
-            0 (do (t/sync-to-disk accessor loc ^bytes data))
-            1 (do (.truncate (.getChannel accessor) loc)
-                  (.flush accessor)
-                  (when @flushed-ch
-                    (println "Flushed backup")
-                    (a/>!! @flushed-ch true))))
-          (catch Exception ex
-            (clojure.stacktrace/print-cause-trace ex))))
+      (let [seg-block (.pop backup-cache)]
+        (if seg-block
+          (let [[act trunk-id seg-id base-addr current-addr bs] seg-block
+                accessor (replica-accessors trunk-id)]
+            (case act
+              0 (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs)
+              1 (do (.flush accessor)
+                    (when @flushed-ch
+                      (println "Flushed backup")
+                      (a/>!! @flushed-ch true)))))
+          (a/<! (a/timeout 10))))
       (recur))
     (swap! clients assoc sid
            {:server-name server-name
             :base-path   base-path
             :accessors   replica-accessors
-            ;:appenders   log-appenders
             :sync-time   sync-timestamps
-            :log-switches  log-switches
-            :pending-chan pending-chan
+            :cache backup-cache
             :flushed-ch flushed-ch})
     sid))
 
@@ -92,45 +90,13 @@
   (doseq [[_ {:keys [flushed-ch]}] @clients]
     (reset! flushed-ch chan)))
 
-(defn sync-trunk [sid trunk-id loc bs]
-  (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [0 trunk-id loc bs])))
+(defn sync-trunk-segment [sid trunk-id seg-id base-addr current-addr bs]
+  (let [^BackupCache cache (get-in @clients [sid :cache])]
+    (.offer cache sid trunk-id seg-id [0 trunk-id seg-id base-addr current-addr bs])))
 
-(defn finish-trunk-sync [sid trunk-id tail-loc timestamp]
-  (let [client (get @clients sid)]
-    (a/>!! (:pending-chan client) [1 trunk-id tail-loc]))
-  (reset! (get-in (get @clients sid) [:sync-time trunk-id]) timestamp)
-  #_(switch-log sid trunk-id timestamp))
-
-(defn ^:deprecated  append-log [sid trunk-id act timestamp ^UUID cell-id & [data]]
-  (let [client (get @clients sid)
-        ^OutputStream appender @(get-in client [:appenders trunk-id])
-        act (get {:write 0
-                  :delete 1} act)]
-    (a/>!! pending-logs [appender act timestamp ^UUID cell-id data])))
-
-(defn ^:deprecated  switch-log [sid trunk-id timestamp]
-  (let [client (get @clients sid)
-        log-switch (get-in client [:log-switches trunk-id])
-        base-path (:base-path client)]
-    (.lock log-switch)
-    (try
-      (let [^OutputStream appender @(get-in client [:appenders trunk-id])
-            ^OutputStream new-appender (io/output-stream (str base-path trunk-id "-" timestamp ".mlog"))]
-        (reset! (get-in client [:appenders trunk-id]) new-appender)
-        ;close orignal appender
-        (a/>!! pending-logs [appender -10 timestamp nil]))
-      (finally
-        (.unlock log-switch)))))
-
-(defn ^:deprecated  close-appender [appender]
-  (.flush appender)
-  (.close appender))
-
-(defn ^:deprecated  collect-log [^OutputStream appender act timestamp ^UUID cell-id & [data]]
-  (if (= -10 act)
-    (close-appender appender)
-    (l/append appender act timestamp cell-id data)))
+(defn sync-trunk-completed [sid trunk-id]
+  (let [^BackupCache cache (get-in @clients [sid :cache])]
+    (.offer cache sid trunk-id -1 [1 trunk-id])))
 
 (defn list-recover-dir []
   (let [path-file (File. ^String @defed-path)
