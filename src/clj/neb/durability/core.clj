@@ -31,6 +31,7 @@
                 curr-addr (int (- (.getCurrentLoc seg) (.getBaseAddr seg)))
                 seg-id (.getId seg)
                 data (.getData seg)]
+            (.setClean seg)
             (.unlockWrite seg)
             (cp/pdoseq
               sync-pool [[sn sid] @server-sids]
