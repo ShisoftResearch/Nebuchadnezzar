@@ -21,8 +21,8 @@ import static org.shisoft.neb.io.type_lengths.*;
 public class Trunk {
 
     final static int tombstoneSize = intLen + 1;
-    final static int maxObjSize = 8 * 1024 * 1024;
-    final static int segSize    = 16 * 1024 * 1024;
+    final static int maxObjSize = 2 * 1024 * 1024;
+    final static int segSize    = 8 * 1024 * 1024;
 
     private int id;
     private long storeAddress;

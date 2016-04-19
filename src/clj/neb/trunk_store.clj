@@ -47,7 +47,9 @@
                             :name "Defragmentation")
         defrag-trunk (fn [^Trunk trunk]
                        (while (not @stopped-atom)
-                         (defrag/scan-trunk-and-defragment trunk)
+                         (try
+                           (defrag/scan-trunk-and-defragment trunk)
+                           (catch Throwable tr (clojure.stacktrace/print-cause-trace tr)))
                          (Thread/sleep 1000))
                        (cp/shutdown pool))]
     (doseq [^Trunk trunk trunks]
@@ -60,7 +62,9 @@
                             :name "Backup")
         backup (fn [^Trunk trunk]
                  (while (not @stopped-atom)
-                   (sync-trunk trunk)
+                   (try
+                     (sync-trunk trunk)
+                     (catch Throwable tr (clojure.stacktrace/print-cause-trace tr)))
                    (Thread/sleep 1000))
                  (cp/shutdown pool))]
     (doseq [trunk trunks]

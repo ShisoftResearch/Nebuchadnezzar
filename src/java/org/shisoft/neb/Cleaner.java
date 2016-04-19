@@ -33,10 +33,11 @@ public class Cleaner {
         Segment seg = trunk.locateSegment(startPos);
         seg.getLock().writeLock().lock();
         try {
-            assert startPos >= seg.getBaseAddr() && endPos < seg.getBaseAddr() + Trunk.getSegSize();
-            seg.getFrags().add(startPos);
-            seg.incDeadObjectBytes((int) (endPos - startPos + 1));
-            trunk.putTombstone(startPos, endPos);
+            if (startPos >= seg.getBaseAddr() && endPos < seg.getBaseAddr() + Trunk.getSegSize()) {
+                seg.getFrags().add(startPos);
+                seg.incDeadObjectBytes((int) (endPos - startPos + 1));
+                trunk.putTombstone(startPos, endPos);
+            }
         } finally {
             seg.getLock().writeLock().unlock();
         }

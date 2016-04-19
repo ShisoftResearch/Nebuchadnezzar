@@ -1,13 +1,13 @@
 (ns neb.durability.serv.core
   (:require [neb.durability.serv.trunk :as t]
             [clojure.core.async :as a]
-            [cluster-connector.utils.for-debug :refer [$ spy]])
+            [cluster-connector.utils.for-debug :refer [$ spy]]
+            [neb.durability.serv.native :refer [from-int from-long]])
   (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
            (java.util.concurrent.locks ReentrantLock)
            (java.io File)
            (org.apache.commons.io FileUtils)
            (org.shisoft.neb Trunk)
-           (com.google.common.primitives Ints)
            (org.shisoft.neb.durability BackupCache)))
 
 (def start-time (System/currentTimeMillis))
@@ -43,7 +43,7 @@
 (defn prepare-replica [^BufferedRandomAccessFile accessor seg-size]
   (doto accessor
     (.seek 0)
-    (.write (Ints/toByteArray seg-size))
+    (.write ^bytes (from-int seg-size))
     ))
 
 (defn register-client-trunks [timestamp server-name trunks seg-size]
@@ -58,8 +58,7 @@
                                                   file-ins (File. file-path)]
                                               (when-not (.exists file-ins) (.createNewFile file-ins))
                                               (prepare-replica
-                                                (BufferedRandomAccessFile. file-path "rw" (+ (Trunk/getSegSize) t/seg-header-size))
-                                                seg-size)))
+                                                (BufferedRandomAccessFile. file-path "rw" (+ (Trunk/getSegSize) t/seg-header-size)) seg-size)))
                                      (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         pending-chan (a/chan 50)
