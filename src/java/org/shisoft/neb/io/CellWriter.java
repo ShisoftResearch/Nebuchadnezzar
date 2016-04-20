@@ -55,7 +55,7 @@ public class CellWriter {
     }
 
     public void updateCellToTrunkIndex(CellMeta meta, Trunk trunk){
-        meta.setLocation(startLoc, trunk);
+        meta.setLocation(startLoc);
     }
 
     public CellMeta addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {

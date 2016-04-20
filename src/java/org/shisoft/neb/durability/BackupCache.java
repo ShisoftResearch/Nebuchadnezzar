@@ -1,5 +1,7 @@
 package org.shisoft.neb.durability;
 
+import org.shisoft.neb.Trunk;
+
 import java.util.Comparator;
 import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -14,14 +16,15 @@ public class BackupCache {
     ConcurrentSkipListMap cacheQueue = new ConcurrentSkipListMap<>(Comparator.comparing(TrunkSegmentIdentifier::getMsgId));
 
     public void offer (int sid, int trunkId, int segId, Object data) {
-        while (cacheQueue.size() > maxQueueItems) {
+        TrunkSegmentIdentifier id = new TrunkSegmentIdentifier(msgId, sid, trunkId, segId);
+        while (!cacheQueue.containsKey(id) && cacheQueue.size() > maxQueueItems) {
             try {
                 Thread.sleep(10);
             } catch (InterruptedException e) {
                 e.printStackTrace();
             }
         }
-        cacheQueue.put(new TrunkSegmentIdentifier(msgId, sid, trunkId, segId), data);
+        cacheQueue.put(id, data);
         msgId++;
     }
 

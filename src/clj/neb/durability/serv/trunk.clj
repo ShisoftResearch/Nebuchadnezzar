@@ -27,7 +27,7 @@
     (locking accessor
       (doto accessor
         (.seek loc)
-        (.write ^bytes (from-int (- current-addr base-addr)))
+        (.write ^bytes (from-int (int current-addr)))
         (.seek (+ loc type_lengths/intLen))
         (.write bs)
         (.flush)))))

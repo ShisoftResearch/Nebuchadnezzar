@@ -4,6 +4,7 @@ import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.Writer;
 
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,8 +22,8 @@ public class Segment {
     private AtomicLong currentLoc;
     private AtomicInteger deadObjectBytes;
     private ReentrantReadWriteLock lock;
-    private ConcurrentSkipListSet<Long> frags;
-    public ConcurrentSkipListSet<Long> tombstones;
+    private TreeSet<Long> frags;
+    private TreeSet<Long> tombstones;
     private volatile boolean isDirty;
 
     public Segment(int id, long baseAddr, Trunk trunk) {
@@ -33,8 +34,8 @@ public class Segment {
         this.currentLoc = new AtomicLong(baseAddr);
         this.deadObjectBytes = new AtomicInteger(0);
         this.lock = new ReentrantReadWriteLock();
-        this.frags = new ConcurrentSkipListSet<>();
-        this.tombstones = new ConcurrentSkipListSet<>();
+        this.frags = new TreeSet<>();
+        this.tombstones = new TreeSet<>();
         this.isDirty = false;
     }
 
@@ -101,7 +102,7 @@ public class Segment {
 
     public boolean isDirty () {return this.isDirty;}
 
-    public ConcurrentSkipListSet<Long> getFrags() {
+    public TreeSet<Long> getFrags() {
         return frags;
     }
 

@@ -38,23 +38,27 @@ public class Cleaner {
         seg.lockWrite();
         try {
             assert startPos >= seg.getBaseAddr() && length + startPos - 1 < seg.getBaseAddr() + Trunk.getSegSize();
-            seg.appendTombstones(startPos);
+            seg.getFrags().remove(startPos);
             seg.decDeadObjectBytes(length);
+            //seg.appendTombstones(startPos);
         } finally {
             seg.unlockWrite();
         }
     }
 
     private void checkTooManyRetry(String message, int retry) {
-        System.out.println(message + " " + retry);
+        if (retry > 1000) {
+            System.out.println(message + " " + retry);
+        }
     }
 
     private void phaseOneCleanSegment(Segment segment) {
         long pos = segment.getBaseAddr();
         int retry = 0;
         while (true) {
-            segment.lockWrite();
             try {
+                if (segment.getFrags().isEmpty()) break;
+                segment.lockWrite();
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
                 if (Reader.readByte(fragLoc) == 2) {
@@ -79,7 +83,7 @@ public class Cleaner {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemory(adjPos, fragLoc, cellLen);
-                                        meta.setLocation(fragLoc, trunk);
+                                        meta.setLocation(fragLoc);
                                         removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         pos = fragLoc + cellLen;
@@ -106,7 +110,8 @@ public class Cleaner {
                             }
                         } else {
                             retry++;
-                            checkTooManyRetry("Adj pos cannot been recognized", retry);
+                            checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
+                                    pos + " " + segment.getCurrentLoc(), retry);
                         }
                     }
                 } else {
@@ -120,9 +125,11 @@ public class Cleaner {
     }
 
     public void phaseOneCleaning () {
-        Arrays.stream(trunk.getSegments()).parallel()
+        Arrays.stream(trunk.getSegments())
+                .filter(seg -> seg.getFrags().size() > 0)
                 .sorted((o1, o2) -> Float.valueOf(o1.aliveDataRatio()).compareTo(o2.aliveDataRatio()))
                 .limit((long) (Math.max(1, trunk.getSegments().length * 0.5)))
+                .parallel()
                 .forEach(this::phaseOneCleanSegment);
     }
 

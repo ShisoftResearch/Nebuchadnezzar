@@ -17,8 +17,7 @@ public class CellMeta {
         return location;
     }
 
-    public void setLocation(long location, Trunk trunk) {
-        assert location >= trunk.getStoreAddress() && location < trunk.getStoreAddress() + trunk.getSize();
+    public void setLocation(long location) {
         this.location = location;
     }
 

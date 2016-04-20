@@ -70,7 +70,9 @@
           (let [[act trunk-id seg-id base-addr current-addr bs] seg-block
                 accessor (replica-accessors trunk-id)]
             (case act
-              0 (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs)
+              0 (do (assert (>= base-addr 0))
+                    (assert (>= current-addr 0))
+                    (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs))
               1 (do (.flush accessor)
                     (when @flushed-ch
                       (println "Flushed backup")

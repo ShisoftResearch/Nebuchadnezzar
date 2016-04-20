@@ -25,13 +25,15 @@
         (try
           (.lockWrite seg)
           (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
-                curr-addr (int (- (.getCurrentLoc seg) (.getBaseAddr seg)))
+                curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
                 seg-id (.getId seg)
                 data (.getData seg)
                 tombstones (vec (.getUnsyncedTombstones seg))
                 is-dirty? (.isDirty seg)]
             (.setClean seg)
             (.unlockWrite seg)
+            (assert (>= base-addr 0))
+            (assert (>= curr-addr 0))
             (cond
               (> (count tombstones) 0)
               (cp/pdoseq

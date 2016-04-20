@@ -57,6 +57,7 @@
     stopped-atom))
 
 (defn backup-trunks [stopped-atom]
+  (println "Starting Backup...")
   (let [trunks (.getTrunks trunks)
         pool (cp/threadpool (count trunks)
                             :name "Backup")

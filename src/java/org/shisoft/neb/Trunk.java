@@ -21,8 +21,8 @@ import static org.shisoft.neb.io.type_lengths.*;
 public class Trunk {
 
     final static int tombstoneSize = intLen + 1;
-    final static int maxObjSize = 8 * 1024 * 1024;
-    final static int segSize    = 1 * 1024 * 1024;
+    final static int maxObjSize = 64 * 1024 * 1024;
+    final static int segSize    = 8 * 1024 * 1024;
 
     private int id;
     private long storeAddress;
@@ -128,6 +128,9 @@ public class Trunk {
 
 
     public void copyMemory(long startPos, long target, long len){
+        assert startPos >= this.storeAddress && startPos < this.storeAddress + this.getSize();
+        assert target >= this.storeAddress && target < this.storeAddress + this.getSize();
+        assert target + len <= this.storeAddress + this.getSize();
         long dirtyEndPos = target + len - 1;
         getUnsafe().copyMemory(startPos, target, len);
         addDirtyRanges(target, dirtyEndPos);
@@ -170,7 +173,7 @@ public class Trunk {
     }
 
     public List<Segment> getDirtySegments () {
-        return Arrays.asList(segments).stream().filter(seg -> seg.containsTombstone() || seg.isDirty()).collect(Collectors.toList());
+        return Arrays.asList(segments).stream().filter(seg ->/* seg.containsTombstone() || */ seg.isDirty()).collect(Collectors.toList());
     }
 
     public long getStoreAddress() {
