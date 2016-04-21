@@ -1,5 +1,6 @@
 package org.shisoft.neb;
 
+import org.shisoft.neb.exceptions.MemoryOutOfBoundException;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.type_lengths;
@@ -61,9 +62,22 @@ public class Cleaner {
                 segment.lockWrite();
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
+                if (fragLoc < segment.getBaseAddr() || fragLoc >= segment.getBaseAddr() + Trunk.getSegSize()) {
+                    System.out.println("Frag out of segment range: " + segment.getBaseAddr() + " ~ " + (segment.getBaseAddr() + Trunk.getSegSize()) + ", " + fragLoc);
+                    segment.getFrags().remove(fragLoc);
+                    break;
+                }
                 if (Reader.readByte(fragLoc) == 2) {
                     int fragLen = Reader.readInt(fragLoc + type_lengths.byteLen);
                     long adjPos = fragLoc + fragLen;
+                    if (adjPos >= segment.getBaseAddr() + Trunk.getSegSize() ||
+                            adjPos >= trunk.getStoreAddress() + trunk.getSize() ||
+                            adjPos < segment.getBaseAddr() ||
+                            adjPos < trunk.getStoreAddress()) {
+                        System.out.println("out of boundary in cleaner, will ignore frag");
+                        segment.getFrags().remove(fragLoc);
+                        break;
+                    }
                     if (adjPos == segment.getCurrentLoc()) {
                         if (!segment.resetCurrentLoc(adjPos, fragLoc)) {
                             retry++;
