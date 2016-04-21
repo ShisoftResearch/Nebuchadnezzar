@@ -7,13 +7,18 @@ package org.shisoft.neb.io;
 import clojure.lang.IFn;
 import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.CellFormatErrorException;
+import org.shisoft.neb.exceptions.MemoryOutOfBoundException;
 
 public class CellReader {
 
     long currLoc;
     Trunk trunk;
 
-    public CellReader(Trunk trunk, long currLoc) throws CellFormatErrorException {
+    public CellReader(Trunk trunk, long currLoc) throws CellFormatErrorException, MemoryOutOfBoundException {
+        if (currLoc >= trunk.getStoreAddress() + trunk.getSize() || currLoc < trunk.getStoreAddress()) {
+            throw new MemoryOutOfBoundException(trunk.getStoreAddress() + " " + trunk.getSize() + " " +
+                    String.valueOf(trunk.getStoreAddress() + trunk.getSize()) + " " + currLoc);
+        }
         this.currLoc = currLoc;
         this.trunk = trunk;
         byte tag = Reader.readByte(currLoc);
