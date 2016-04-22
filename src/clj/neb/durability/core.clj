@@ -20,7 +20,7 @@
   (try
     (let [dirty-segments (.getDirtySegments trunk)
           sync-pool (cp/threadpool (* 2 (count @server-sids)) :name "Backup-Remote-Sync")
-          seg-pool (cp/threadpool 2 "Backup-Segment")
+          seg-pool (cp/threadpool 2 :name "Backup-Segment")
           trunk-id (.getId trunk)]
       (cp/pdoseq
         seg-pool [^Segment seg dirty-segments]
