@@ -256,7 +256,7 @@
 
 (def normal-cell-type (byte 1))
 
-(defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [^Long loc update-hash-index?  planned-data] :or {update-hash-index? true}}]
+(defn write-cell [^Trunk ttrunk ^Long hash ^Long partition schema data & {:keys [^Long loc update-hash-index?  planned-data version] :or {update-hash-index? true version 0}}]
   (let [schema-id (:i schema)
         fields (or planned-data (plan-data-write data schema))
         fields-length (cell-len-by-fields fields)
@@ -265,7 +265,8 @@
                      :hash hash
                      :partition partition
                      :length fields-length
-                     :type normal-cell-type}]
+                     :type normal-cell-type
+                     :version version}]
     (let [^CellWriter cell-writer (if loc
                                     (CellWriter. ttrunk cell-length loc)
                                     (CellWriter. ttrunk cell-length))]
@@ -304,12 +305,13 @@
           schema (schema-by-id schema-id)
           data-len (read-cell-header-field trunk cell-loc :cell-length)
           partition (read-cell-header-field trunk cell-loc :partition)
+          version (read-cell-header-field trunk cell-loc :version)
           fields (plan-data-write data schema)
           new-data-length (cell-len-by-fields fields)]
       (assert (> data-len 0))
       (if (= data-len new-data-length)
-        (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields)
-        (do (write-cell trunk hash partition schema data :planned-data fields)
+        (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version (inc version))
+        (do (write-cell trunk hash partition schema data :planned-data fields :version (inc version))
             (mark-cell-deleted trunk cell-loc data-len)))
       data)))
 

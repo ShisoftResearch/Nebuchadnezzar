@@ -30,7 +30,7 @@
                  (scan-trunk-and-defragment trunk) => anything)
            (fact "space reclaimed"
                  (< (.getCurrentLoc (first (.getSegments trunk))) frag-append-head) => true
-                 (- (.getCurrentLoc (first (.getSegments trunk))) frag-append-head) => -99))
+                 (- (.getCurrentLoc (first (.getSegments trunk))) frag-append-head) => -123))
          (fact "data did not corrupted"
                (read-cell trunk 1) => (contains a-d)
                (read-cell trunk 4) => (contains a-d)

@@ -7,7 +7,8 @@
    [:cell-length :int :length]
    [:partition :long :partition]
    [:hash :long :hash]
-   [:schema-id :int :schema]])
+   [:schema-id :int :schema]
+   [:version :long :version]])
 
 (assert (and (= :byte (second (first cell-head-struct)))
              (= :int (second (second cell-head-struct)))) "second prop in header must be an integer for tombstone")
