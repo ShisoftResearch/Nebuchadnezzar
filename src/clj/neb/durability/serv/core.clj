@@ -62,47 +62,33 @@
                                      (range trunks)))
         sync-timestamps (vec (map (fn [_] (atom 0)) (range trunks)))
         pending-chan (a/chan 50)
-        flushed-ch (atom nil)
-        backup-cache (BackupCache.)]
-    (a/go-loop []
-      (let [seg-block (.pop backup-cache)]
-        (if seg-block
-          (let [[act trunk-id seg-id base-addr current-addr bs] seg-block
-                accessor (replica-accessors trunk-id)]
-            (case act
-              0 (do (assert (>= base-addr 0))
-                    (assert (>= current-addr 0))
-                    (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs))
-              1 (do (.flush accessor)
-                    (when @flushed-ch
-                      (println "Flushed backup")
-                      (a/>!! @flushed-ch true)))))
-          (a/<! (a/timeout 10))))
-      (recur))
+        ;backup-cache (BackupCache.)
+        write-back (fn [[act trunk-id seg-id base-addr current-addr bs]]
+                     (let [accessor (replica-accessors trunk-id)]
+                       (case act
+                         0 (do (assert (>= base-addr 0))
+                               (assert (>= current-addr 0))
+                               (t/sync-seg-to-disk accessor seg-id seg-size base-addr current-addr bs))
+                         1 (do (.flush accessor)))))]
     (swap! clients assoc sid
            {:server-name server-name
             :base-path   base-path
             :accessors   replica-accessors
             :sync-time   sync-timestamps
-            :cache backup-cache
-            :flushed-ch flushed-ch})
+            :write-back write-back})
     sid))
 
-(defn plug-flushed-ch [chan]
-  (doseq [[_ {:keys [flushed-ch]}] @clients]
-    (reset! flushed-ch chan)))
-
 (defn sync-trunk-segment [sid trunk-id seg-id base-addr current-addr bs]
-  (let [^BackupCache cache (get-in @clients [sid :cache])]
-    (.offer cache sid trunk-id seg-id [0 trunk-id seg-id base-addr current-addr bs])))
+  (let [write-back (get-in @clients [sid :write-back])]
+    (write-back [0 trunk-id seg-id base-addr current-addr bs])))
 
 (defn sync-trunk-tombstones [sid trunk-id seg-id loc bss]
-  (let [^BackupCache cache (get-in @clients [sid :cache])]
-    (.offer cache sid trunk-id seg-id [2 trunk-id seg-id loc nil bss])))
+  (let [write-back (get-in @clients [sid :write-back])]
+    (write-back [2 trunk-id seg-id loc nil bss])))
 
 (defn sync-trunk-completed [sid trunk-id]
-  (let [^BackupCache cache (get-in @clients [sid :cache])]
-    (.offer cache sid trunk-id -1 [1 trunk-id])))
+  (let [write-back (get-in @clients [sid :write-back])]
+    (write-back [1 trunk-id])))
 
 (defn list-recover-dir []
   (let [path-file (File. ^String @defed-path)

@@ -19,9 +19,11 @@
 (defn sync-trunk [^Trunk trunk]
   (try
     (let [dirty-segments (.getDirtySegments trunk)
-          sync-pool (cp/threadpool (count @server-sids) :name "Range-Sync")
+          sync-pool (cp/threadpool (* 2 (count @server-sids)) :name "Range-Remote-Sync")
+          seg-pool (cp/threadpool 2)
           trunk-id (.getId trunk)]
-      (doseq [^Segment seg dirty-segments]
+      (cp/pdoseq
+        seg-pool [^Segment seg dirty-segments]
         (try
           (.lockWrite seg)
           (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
@@ -35,11 +37,11 @@
             (assert (>= base-addr 0))
             (assert (>= curr-addr 0))
             (cond
-              (> (count tombstones) 0)
-              (cp/pdoseq
-                sync-pool [[sn sid] @server-sids]
-                (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-                            sid trunk-id seg-id  base-addr curr-addr data))
+              ;(> (count tombstones) 0)
+              ;(cp/pdoseq
+              ;  sync-pool [[sn sid] @server-sids]
+              ;  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+              ;              sid trunk-id seg-id  base-addr curr-addr data))
               is-dirty?
               (cp/pdoseq
                 sync-pool [[sn sid] @server-sids]

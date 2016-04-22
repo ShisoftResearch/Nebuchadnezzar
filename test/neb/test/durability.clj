@@ -2,7 +2,7 @@
   (:require [midje.sweet :refer :all]
             [neb.core :refer :all]
             [neb.server :refer :all]
-            [neb.durability.serv.core :refer [recover-backup list-backup-ids plug-flushed-ch remove-imported-tag]]
+            [neb.durability.serv.core :refer [recover-backup list-backup-ids remove-imported-tag]]
             [neb.durability.core :refer [sync-trunk]]
             [neb.trunk-store :as ts :refer [defrag-store-trunks]]
             [neb.cell :as cell]
@@ -43,8 +43,6 @@
                  (fact "Prepare schemas"
                        (add-schema :raw-data [[:data :obj]
                                               [:num :int]]) => 0)
-                 (fact "Plug flush channel"
-                       (plug-flushed-ch flush-chan))
                  (fact "Write something"
                        (dorun
                          (pmap
@@ -73,8 +71,6 @@
                              (count dirtySegments) => 1))))
                  (fact "Sync trunks"
                        (sync-trunks) => anything)
-                 (a/<!! flush-chan)
-                 (a/<!! flush-chan)
                  (reset! stoped-atom true)
                  (Thread/sleep 5000)
                  (fact "Check backedup ids"
@@ -125,8 +121,6 @@
                  (fact "Sync trunks"
                        (sync-trunks) => anything
                        (println "Test with frags - Sync trunks"))
-                 (a/<!! flush-chan)
-                 (a/<!! flush-chan)
                  (Thread/sleep 5000)
                  (fact "Delete Everything"
                        (dorun

@@ -62,7 +62,7 @@
                         cell-bytes (UnsafeUtils/subBytes data 0 (+ cell-length cell-head-len))
                         cell-unit-len (count cell-bytes)
                         cell-tail (- data-len cell-unit-len)]
-                    (new-cell-by-raw* cell-id cell-bytes)
+                    (try (new-cell-by-raw* cell-id cell-bytes) (catch Exception _))
                     (recur (UnsafeUtils/subBytes data cell-unit-len cell-tail)
                            (+ pointer cell-unit-len)))
                   (do (assert (= cell-type 2))

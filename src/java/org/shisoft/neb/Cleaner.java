@@ -104,12 +104,12 @@ public class Cleaner {
                                         retry = 0;
                                     } else {
                                         retry++;
-                                        checkTooManyRetry("Cell meta modified in frag adj", retry);
+                                        //checkTooManyRetry("Cell meta modified in frag adj", retry);
                                     }
                                 }
                             } else {
                                 retry++;
-                                checkTooManyRetry("Cell cannot been found in frag adj", retry);
+                                //checkTooManyRetry("Cell cannot been found in frag adj", retry);
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
