@@ -141,7 +141,7 @@ public class Cleaner {
     public void phaseOneCleaning () {
         Arrays.stream(trunk.getSegments())
                 .filter(seg -> seg.getFrags().size() > 0)
-                .sorted((o1, o2) -> Integer.valueOf(o1.getDeadObjectBytes()).compareTo(o2.getDeadObjectBytes()))
+                .sorted((o1, o2) -> Integer.valueOf(o2.getDeadObjectBytes()).compareTo(o1.getDeadObjectBytes()))
                 .limit((long) (Math.max(1, trunk.getSegments().length * 0.5)))
                 .parallel()
                 .forEach(this::phaseOneCleanSegment);
