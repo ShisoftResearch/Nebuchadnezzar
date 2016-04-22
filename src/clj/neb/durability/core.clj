@@ -51,6 +51,7 @@
       (cp/pdoseq
         sync-pool [[sn sid] @server-sids]
         (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-completed sid trunk-id))
-      (cp/shutdown sync-pool))
+      (cp/shutdown sync-pool)
+      (cp/shutdown seg-pool))
     (catch Exception ex
       (clojure.stacktrace/print-cause-trace ex))))

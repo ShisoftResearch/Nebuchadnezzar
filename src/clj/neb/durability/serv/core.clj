@@ -7,8 +7,7 @@
            (java.util.concurrent.locks ReentrantLock)
            (java.io File)
            (org.apache.commons.io FileUtils)
-           (org.shisoft.neb Trunk)
-           (org.shisoft.neb.durability BackupCache)))
+           (org.shisoft.neb Trunk)))
 
 (def start-time (System/currentTimeMillis))
 (def data-path (atom nil))
