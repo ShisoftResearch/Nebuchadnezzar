@@ -19,11 +19,9 @@
 (defn sync-trunk [^Trunk trunk]
   (try
     (let [dirty-segments (.getDirtySegments trunk)
-          sync-pool (cp/threadpool (* 2 (count @server-sids)) :name "Backup-Remote-Sync")
-          seg-pool (cp/threadpool 2 :name "Backup-Segment")
+          sync-pool (cp/threadpool (count @server-sids) :name "Backup-Remote")
           trunk-id (.getId trunk)]
-      (cp/pdoseq
-        seg-pool [^Segment seg dirty-segments]
+      (doseq [^Segment seg dirty-segments]
         (try
           (.lockWrite seg)
           (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
@@ -51,7 +49,6 @@
       (cp/pdoseq
         sync-pool [[sn sid] @server-sids]
         (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-completed sid trunk-id))
-      (cp/shutdown sync-pool)
-      (cp/shutdown seg-pool))
+      (cp/shutdown sync-pool))
     (catch Exception ex
       (clojure.stacktrace/print-cause-trace ex))))
