@@ -136,6 +136,13 @@ public class Trunk {
         addDirtyRanges(target, dirtyEndPos);
     }
 
+    public boolean hasSpaces(long size) {
+        for (Segment segment : this.segments) {
+            if (segment.getDeadObjectBytes() >= size) return true;
+        }
+        return false;
+    }
+
     public long tryAcquireSpace (long length) throws ObjectTooLargeException {
         if (length > maxObjSize) {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
@@ -150,7 +157,7 @@ public class Trunk {
             } else {
                 segmentsQueue.remove(seg);
                 segmentsQueue.offer(seg);
-                if (turn > 0 && seg == firstSeg) {
+                if (turn > 0 && seg == firstSeg && !hasSpaces(length)) {
                     break;
                 }
             }
