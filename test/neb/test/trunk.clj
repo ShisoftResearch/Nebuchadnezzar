@@ -1,7 +1,7 @@
 (ns neb.test.trunk
   (:require [midje.sweet :refer :all]
             [neb.schema :refer [add-schema]]
-            [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell]]
+            [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell read-cell-headers]]
             [cluster-connector.utils.for-debug :refer [spy $]])
   (:import (org.shisoft.neb Trunk SchemaStore)
            (org.shisoft.neb.io CellReader CellWriter Reader type_lengths)))
@@ -36,6 +36,8 @@
              (add-schema :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"
              (new-cell @ttrunk 1 1 (int 1) simple-scheme-data) => anything)
+       (fact "cell headers"
+             (read-cell-headers @ttrunk 1) => {:cell-type 1, :cell-length 4, :partition 1, :hash 1, :schema-id 1, :version 0})
        (fact "read cell with simple scheme"
              (read-cell @ttrunk 1) => (contains simple-scheme-data))
        (fact "define compound scheme"
@@ -52,6 +54,8 @@
              (read-cell @ttrunk 2) => nil)
        (fact "replace cell"
              (replace-cell @ttrunk 1 simple-scheme-data-replacement) => simple-scheme-data-replacement)
+       (fact "cell headers"
+             (read-cell-headers @ttrunk 1) => {:cell-type 1, :cell-length 4, :partition 1, :hash 1, :schema-id 1, :version 1})
        (fact "cell should been replaced"
              (read-cell @ttrunk 1) => (contains simple-scheme-data-replacement))
        (fact "shrinked replace cell"

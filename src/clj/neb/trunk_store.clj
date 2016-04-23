@@ -126,6 +126,9 @@
 (defn cell-exists? [^UUID cell-id]
   (dispatch-trunk cell-id cell/cell-exists?))
 
+(defn read-cell-headers [^UUID cell-id]
+  (dispatch-trunk cell-id cell/read-cell-headers))
+
 (defmacro batch-fn [func]
   `(do (defn ~(symbol (str "batch-" (name func))) [coll#]
          (into
@@ -145,3 +148,4 @@
 (batch-fn select-keys-from-cell)
 (batch-fn new-cell-by-raw)
 (batch-fn cell-exists?)
+(batch-fn read-cell-headers)

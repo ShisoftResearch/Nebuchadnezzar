@@ -77,6 +77,9 @@
 (defn cell-exists?* [id]
   (dist-call id 'neb.trunk-store/cell-exists?))
 
+(defn read-cell-headers* [id]
+  (dist-call id 'neb.trunk-store/read-cell-headers))
+
 (defn get-batch-server-name [params-coll]
   (group-by
     first
@@ -149,6 +152,7 @@
 (op-fns write-lock-exec)
 (op-fns new-cell-by-raw)
 (op-fns cell-exists?)
+(op-fns read-cell-headers)
 
 (defn add-schema [sname fields]
   (d-lock/locking

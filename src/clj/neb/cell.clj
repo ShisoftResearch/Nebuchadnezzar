@@ -19,14 +19,19 @@
 (def ^:dynamic ^Trunk *cell-trunk* nil)
 
 (defmacro with-cell [^CellReader cell-reader & body]
-  `(let ~(vec (mapcat
-                (fn [[n t]]
-                  [(symbol (name n))
-                   `(. ~cell-reader
-                       streamRead
-                       (get-in @data-types [~t :reader])
-                       ~(get-in @data-types [ t :length]))])
-                cell-head-struct))
+  `(let ~(vec (concat [(symbol "cell-header-map")
+                       (into {}
+                             (map (fn [[n t]]
+                                    [n `(. ~cell-reader
+                                           streamRead
+                                           (get-in @data-types [~t :reader])
+                                           ~(get-in @data-types [ t :length]))])
+                                  cell-head-struct))]
+                      (mapcat
+                        (fn [[n t]]
+                          [(symbol (name n))
+                           `(get ~(symbol "cell-header-map") ~n)])
+                        cell-head-struct)))
      ~@body))
 
 (defn extract-cell-meta [ttrunk hash]
@@ -194,7 +199,7 @@
        (filter identity)
        (doall)))
 
-(def internal-cell-fields [:*schema* :*hash* :*id*])
+(def internal-cell-fields [:*schema* :*hash* :*id* :*version*])
 
 (defn read-cell** [^Trunk trunk schema-fields ^CellReader cell-reader schema-id]
   (merge (walk-schema-for-read
@@ -219,12 +224,20 @@
         cell-reader
         (when-let [schema (schema-by-id schema-id)]
           (-> (read-cell** trunk (:f schema) cell-reader schema-id)
-              (assoc :*id* (UUID. partition hash))))))))
+              (assoc :*id* (UUID. partition hash)
+                     :*version* version)))))))
 
 (defn read-cell [^Trunk trunk ^Long hash]
   (with-read-lock
     trunk hash
     (read-cell* trunk)))
+
+(defn read-cell-headers [^Trunk trunk ^Long hash]
+  (with-read-lock
+    trunk hash
+    (when-let [loc (get-cell-location)]
+      (let [cell-reader (CellReader. trunk loc)]
+        (with-cell cell-reader cell-header-map)))))
 
 (defn delete-cell [^Trunk ttrunk ^Long hash]
   (with-write-lock
