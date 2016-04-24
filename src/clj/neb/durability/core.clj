@@ -28,7 +28,6 @@
                 curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
                 seg-id (.getId seg)
                 data (.getData seg)
-                tombstones (vec (.getUnsyncedTombstones seg))
                 is-dirty? (.isDirty seg)]
             (.setClean seg)
             (.unlockWrite seg)

@@ -74,8 +74,7 @@ public class Cleaner {
                             adjPos >= trunk.getStoreAddress() + trunk.getSize() ||
                             adjPos < segment.getBaseAddr() ||
                             adjPos < trunk.getStoreAddress()) {
-                        System.out.println("out of boundary in cleaner, will ignore frag");
-                        segment.getFrags().remove(fragLoc);
+                        System.out.println("out of boundary in cleaner when reading frag");
                         break;
                     }
                     if (adjPos == segment.getCurrentLoc()) {
@@ -88,6 +87,13 @@ public class Cleaner {
                         }
                     } else {
                         if (Reader.readByte(adjPos) == 1) {
+                            if (adjPos + cellHeadLen > segment.getBaseAddr() + Trunk.getSegSize() ||
+                                    adjPos + cellHeadLen >= trunk.getStoreAddress() + trunk.getSize() ||
+                                    adjPos < segment.getBaseAddr() ||
+                                    adjPos < trunk.getStoreAddress()) {
+                                System.out.println("out of boundary in cleaner when reading cell");
+                                break;
+                            }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             CellMeta meta = trunk.getCellIndex().get(cellHash);
                             if (meta != null) {
