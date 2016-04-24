@@ -17,6 +17,7 @@
 (def ^TrunkStore trunks (TrunkStore.))
 (def defrag-service (atom nil))
 (def backup-service (atom nil))
+(def ^:dynamic *cell-id*)
 
 (defn init-trunks [trunk-count trunks-size durability]
   (.init trunks trunk-count trunks-size durability))
@@ -85,12 +86,13 @@
   (reset! @backup-service true))
 
 (defn dispatch-trunk [^UUID cell-id func & params]
-  (let [hash (.getLeastSignificantBits cell-id)
-        trunk-id (mod (.getMostSignificantBits cell-id)
-                      (.getTrunkCount trunks))
-        trunk (.getTrunk trunks (int trunk-id))]
-    (assert trunk "Cannot get trunk for dispatch")
-    (apply func trunk hash params)))
+  (with-bindings {#'*cell-id* cell-id}
+    (let [hash (.getLeastSignificantBits cell-id)
+          trunk-id (mod (.getMostSignificantBits cell-id)
+                        (.getTrunkCount trunks))
+          trunk (.getTrunk trunks (int trunk-id))]
+      (assert trunk "Cannot get trunk for dispatch")
+      (apply func trunk hash params))))
 
 (defn get-trunk-store-params []
   {:trunks-size (.getTrunkSize trunks)

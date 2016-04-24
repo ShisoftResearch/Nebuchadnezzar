@@ -37,7 +37,7 @@
 (defn extract-cell-meta [ttrunk hash]
   (.getCellMeta ^Trunk ttrunk ^long hash))
 
-(defmacro with-cell-meta [trunk hash & body]
+(defmacro *with-cell-meta [trunk hash & body]
   `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
                    #'*cell-hash* ~hash
                    #'*cell-trunk* ~trunk}
