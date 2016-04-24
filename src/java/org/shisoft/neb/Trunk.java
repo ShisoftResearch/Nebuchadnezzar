@@ -30,7 +30,6 @@ public class Trunk {
     private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
     private boolean backendEnabled = false;
     private Cleaner cleaner;
-    private volatile boolean slowMode = false;
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
     public boolean isBackendEnabled() {
@@ -180,7 +179,7 @@ public class Trunk {
     }
 
     public List<Segment> getDirtySegments () {
-        return Arrays.asList(segments).stream().filter(seg ->/* seg.containsTombstone() || */ seg.isDirty()).collect(Collectors.toList());
+        return Arrays.asList(segments).stream().filter(Segment::isDirty).collect(Collectors.toList());
     }
 
     public long getStoreAddress() {

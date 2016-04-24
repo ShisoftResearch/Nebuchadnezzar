@@ -23,7 +23,6 @@ public class Segment {
     private AtomicInteger deadObjectBytes;
     private ReentrantReadWriteLock lock;
     private TreeSet<Long> frags;
-    private TreeSet<Long> tombstones;
     private volatile boolean isDirty;
 
     public Segment(int id, long baseAddr, Trunk trunk) {
@@ -35,7 +34,6 @@ public class Segment {
         this.deadObjectBytes = new AtomicInteger(0);
         this.lock = new ReentrantReadWriteLock();
         this.frags = new TreeSet<>();
-        this.tombstones = new TreeSet<>();
         this.isDirty = false;
     }
 
@@ -54,20 +52,6 @@ public class Segment {
     public long getCurrentLoc() {
         return currentLoc.get();
     }
-
-    public void appendTombstones(long lc) {
-        this.tombstones.add(lc);
-    }
-
-    public void setTombstoneSynced() {
-        this.tombstones.clear();
-    }
-
-    public Set<Long> getUnsyncedTombstones () {
-        return this.tombstones;
-    }
-
-    public boolean containsTombstone() {return !this.tombstones.isEmpty();}
 
     public boolean resetCurrentLoc (long expected, long update) {
         return currentLoc.compareAndSet(expected, update);
@@ -97,7 +81,6 @@ public class Segment {
 
     public void setClean () {
         this.isDirty = false;
-        this.setTombstoneSynced();
     }
 
     public boolean isDirty () {return this.isDirty;}
