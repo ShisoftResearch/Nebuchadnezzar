@@ -343,8 +343,8 @@
           (replace-cell* trunk hash replacement)
           cell-content)))))
 
-(defn update-cell [^Trunk trunk ^Long hash fn & params]
-  (apply update-cell* trunk hash (compiled-cache fn) params))
+(defn update-cell [^Trunk trunk ^Long hash fn-sym & params]
+  (apply update-cell* trunk hash (compiled-cache fn-sym) params))
 
 (defn- compile-schema-for-get-in* [schema-fields ks]
   (loop [commetted-fields (transient [])
