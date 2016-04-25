@@ -418,4 +418,4 @@
 (defn write-lock-exec [^Trunk trunk ^Long hash func-sym & params]
   (with-write-lock
     trunk hash
-    (apply (compiled-cache func-sym) (read-cell trunk hash) params)))
+    (apply (compiled-cache func-sym) params)))
