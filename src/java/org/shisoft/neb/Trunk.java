@@ -137,7 +137,7 @@ public class Trunk {
 
     public boolean hasSpaces(long size) {
         for (Segment segment : this.segments) {
-            if (Trunk.getSegSize() - segment.getAliveObjectBytes() >= size) return true;
+            if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) return true;
         }
         return false;
     }

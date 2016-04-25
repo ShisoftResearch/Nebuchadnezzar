@@ -73,8 +73,8 @@ public class Segment {
         return 1 - ((float) getDeadObjectBytes()) / ((float) this.currentLoc.get());
     }
 
-    public int getAliveObjectBytes () {
-        return (int) (currentLoc.get() - baseAddr - deadObjectBytes.get());
+    public long getAliveObjectBytes () {
+        return currentLoc.get() - baseAddr - deadObjectBytes.get();
     }
 
     public void setDirty () {this.isDirty = true;}
