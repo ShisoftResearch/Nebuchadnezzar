@@ -333,15 +333,18 @@
     trunk hash
     (replace-cell* trunk hash data)))
 
-(defn update-cell [^Trunk trunk ^Long hash fn & params]  ;TODO Replace with less overhead function
+(defn update-cell* [^Trunk trunk ^Long hash fn & params]  ;TODO Replace with less overhead function
   (with-write-lock
     trunk hash
     (when-let [cell-content (read-cell* trunk)]
-      (let [replacement  (apply (compiled-cache fn) cell-content params)]
+      (let [replacement  (apply fn cell-content params)]
         (assert replacement)
         (if-not (= cell-content replacement)
           (replace-cell* trunk hash replacement)
           cell-content)))))
+
+(defn update-cell [^Trunk trunk ^Long hash fn & params]
+  (apply update-cell* trunk hash (compiled-cache fn) params))
 
 (defn- compile-schema-for-get-in* [schema-fields ks]
   (loop [commetted-fields (transient [])
