@@ -53,7 +53,7 @@ public class Cleaner {
         }
     }
 
-    private void phaseOneCleanSegment(Segment segment) {
+    public void phaseOneCleanSegment(Segment segment) {
         long pos = segment.getBaseAddr();
         int retry = 0;
         while (true) {

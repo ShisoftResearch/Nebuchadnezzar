@@ -137,7 +137,12 @@ public class Trunk {
 
     public boolean hasSpaces(long size) {
         for (Segment segment : this.segments) {
-            if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) return true;
+            if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) {
+                this.cleaner.phaseOneCleanSegment(segment);
+                if (Trunk.getSegSize() - (segment.getCurrentLoc() - segment.getBaseAddr()) > size) {
+                    return true;
+                }
+            }
         }
         return false;
     }
