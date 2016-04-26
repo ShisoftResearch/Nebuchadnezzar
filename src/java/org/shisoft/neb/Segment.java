@@ -106,7 +106,7 @@ public class Segment {
         }
     }
 
-    public long tryAcquireSpace (long len, Trunk trunk) {
+    public long tryAcquireSpace (long len) {
         assert len > 0;
         try {
             lockRead();
@@ -126,12 +126,6 @@ public class Segment {
             if (updated.get()) {
                 return r;
             } else {
-                if (Trunk.getSegSize() - getAliveObjectBytes() > len) {
-                    trunk.getCleaner().phaseOneCleanSegment(this);
-                    if (Trunk.getSegSize() - (getCurrentLoc() - getBaseAddr()) > len) {
-                        return tryAcquireSpace(len, trunk);
-                    }
-                }
                 return -1;
             }
         } finally {

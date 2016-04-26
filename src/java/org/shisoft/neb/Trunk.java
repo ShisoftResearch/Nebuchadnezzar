@@ -135,21 +135,34 @@ public class Trunk {
         addDirtyRanges(target, dirtyEndPos);
     }
 
-    public long tryAcquireSpace (long length) throws ObjectTooLargeException {
+    public boolean hasSpaces(long size) {
+        for (Segment segment : this.segments) {
+            if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) {
+                this.cleaner.phaseOneCleanSegment(segment);
+                if (Trunk.getSegSize() - (segment.getCurrentLoc() - segment.getBaseAddr()) > size) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    public long tryAcquireSpace (long length) throws ObjectTooLargeException, InterruptedException {
         if (length > maxObjSize) {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
         }
         long r = -1;
         int turn = 0;
+        long acquireTimeSpan = System.currentTimeMillis();
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
-            r = seg.tryAcquireSpace(length, this);
+            r = seg.tryAcquireSpace(length);
             if (r > 0) {
                 break;
             } else {
                 segmentsQueue.remove(seg);
                 segmentsQueue.offer(seg);
-                if (turn > 0 && seg == firstSeg) {
+                if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || acquireTimeSpan > 60000)) {
                     break;
                 }
             }
