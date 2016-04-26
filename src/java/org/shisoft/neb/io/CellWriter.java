@@ -33,7 +33,7 @@ public class CellWriter {
     private void tryAllocate(Trunk trunk, long length) throws ObjectTooLargeException, StoreFullException {
         long loc = trunk.tryAcquireSpace(length);
         if (loc < 0){
-            throw new StoreFullException("Expected length:" + length + " remains:" + (trunk.getSize() - loc));
+            throw new StoreFullException("Expected length:" + length);
         }  else {
             assert loc >= trunk.getStoreAddress();
             init(trunk, length, loc);
