@@ -6,7 +6,8 @@
             [cluster-connector.distributed-store.lock :as d-lock]
             [neb.schema :as s]
             [neb.utils :refer :all]
-            [neb.base :refer [schemas-lock]])
+            [neb.base :refer [schemas-lock]]
+            [neb.statistics])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode HashFunction)
            (java.nio.charset Charset)
