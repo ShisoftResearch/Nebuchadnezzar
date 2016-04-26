@@ -135,7 +135,7 @@ public class Trunk {
         addDirtyRanges(target, dirtyEndPos);
     }
 
-    public long tryAcquireSpace (long length) throws ObjectTooLargeException, InterruptedException {
+    public long tryAcquireSpace (long length) throws ObjectTooLargeException {
         if (length > maxObjSize) {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
         }
