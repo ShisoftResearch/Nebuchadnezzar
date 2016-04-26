@@ -162,7 +162,7 @@ public class Trunk {
             } else {
                 segmentsQueue.remove(seg);
                 segmentsQueue.offer(seg);
-                if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || acquireTimeSpan > 60000)) {
+                if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || System.currentTimeMillis() - acquireTimeSpan > 60000)) {
                     break;
                 }
             }
