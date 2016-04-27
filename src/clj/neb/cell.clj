@@ -422,3 +422,8 @@
   (with-write-lock
     trunk hash
     (apply (compiled-cache func-sym) params)))
+
+(defn read-lock-exec [^Trunk trunk ^Long hash func-sym & params]
+  (with-read-lock
+    trunk hash
+    (apply (compiled-cache func-sym) params)))

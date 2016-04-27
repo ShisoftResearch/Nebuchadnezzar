@@ -122,6 +122,9 @@
 (defn write-lock-exec [^UUID cell-id func-sym & params]
   (apply dispatch-trunk cell-id cell/write-lock-exec func-sym params))
 
+(defn read-lock-exec [^UUID cell-id func-sym & params]
+  (apply dispatch-trunk cell-id cell/read-lock-exec func-sym params))
+
 (defn new-cell-by-raw [^UUID cell-id bs]
   (dispatch-trunk cell-id cell/new-cell-by-raw bs))
 
@@ -151,3 +154,4 @@
 (batch-fn new-cell-by-raw)
 (batch-fn cell-exists?)
 (batch-fn read-cell-headers)
+(batch-fn read-lock-exec)
