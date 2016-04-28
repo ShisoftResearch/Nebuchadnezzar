@@ -156,15 +156,20 @@ public class Trunk {
         long acquireTimeSpan = System.currentTimeMillis();
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
-            r = seg.tryAcquireSpace(length);
-            if (r > 0) {
-                break;
-            } else {
-                segmentsQueue.remove(seg);
-                segmentsQueue.offer(seg);
-                if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || System.currentTimeMillis() - acquireTimeSpan > 60000)) {
+            try {
+                seg.lockWrite();
+                r = seg.tryAcquireSpace(length);
+                if (r > 0) {
                     break;
+                } else {
+                    segmentsQueue.remove(seg);
+                    segmentsQueue.offer(seg);
+                    if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || System.currentTimeMillis() - acquireTimeSpan > 60000)) {
+                        break;
+                    }
                 }
+            } finally {
+                seg.unlockWrite();
             }
             turn ++;
         }

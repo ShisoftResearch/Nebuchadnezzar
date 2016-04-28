@@ -108,28 +108,22 @@ public class Segment {
 
     public long tryAcquireSpace (long len) {
         assert len > 0;
-        try {
-            lockRead();
-            AtomicBoolean updated = new AtomicBoolean(false);
-            long r = this.currentLoc.getAndUpdate(originalLoc -> {
-                long expectedLoc = originalLoc + len;
-                long expectedPos = expectedLoc - baseAddr;
-                if (expectedPos >= Trunk.getSegSize()) {
-                    updated.set(false);
-                    return originalLoc;
-                } else {
-                    updated.set(true);
-                    return expectedLoc;
-                }
-            });
-            unlockRead();
-            if (updated.get()) {
-                return r;
+        AtomicBoolean updated = new AtomicBoolean(false);
+        long r = this.currentLoc.getAndUpdate(originalLoc -> {
+            long expectedLoc = originalLoc + len;
+            long expectedPos = expectedLoc - baseAddr;
+            if (expectedPos >= Trunk.getSegSize()) {
+                updated.set(false);
+                return originalLoc;
             } else {
-                return -1;
+                updated.set(true);
+                return expectedLoc;
             }
-        } finally {
-            unlockRead();
+        });
+        if (updated.get()) {
+            return r;
+        } else {
+            return -1;
         }
     }
 
