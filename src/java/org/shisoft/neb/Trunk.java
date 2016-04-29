@@ -126,13 +126,13 @@ public class Trunk {
     }
 
 
-    public void copyMemory(long startPos, long target, long len){
+    public void copyMemoryForCleaner(long startPos, long target, long len){
         assert startPos >= this.storeAddress && startPos < this.storeAddress + this.getSize();
         assert target >= this.storeAddress && target < this.storeAddress + this.getSize();
         assert target + len <= this.storeAddress + this.getSize();
-        long dirtyEndPos = target + len - 1;
         getUnsafe().copyMemory(startPos, target, len);
-        addDirtyRanges(target, dirtyEndPos);
+//        long dirtyEndPos = target + len - 1;
+//        addDirtyRanges(target, dirtyEndPos);
     }
 
     public boolean hasSpaces(long size) {

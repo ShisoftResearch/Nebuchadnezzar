@@ -1,6 +1,5 @@
 package org.shisoft.neb;
 
-import org.shisoft.neb.exceptions.MemoryOutOfBoundException;
 import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.type_lengths;
@@ -102,7 +101,7 @@ public class Cleaner {
                                     if (meta.getLocation() == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
-                                        trunk.copyMemory(adjPos, fragLoc, cellLen);
+                                        trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
                                         meta.setLocation(fragLoc);
                                         removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
