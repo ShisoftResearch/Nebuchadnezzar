@@ -8,18 +8,21 @@
             [neb.utils :refer :all]
             [neb.trunk-store :refer [init-trunks dispose-trunks start-defrag stop-defrag
                                      init-durability-client start-backup stop-backup]]
-            [neb.base :refer [schemas-lock]]))
+            [neb.base :refer [schemas-lock]]
+            [cluster-connector.sharding.DHT :as dht]))
 
 (def cluster-config-fields [:trunks-size])
 (def cluster-confiugres (atom nil))
 (def confiugres (atom nil))
+(def server-loaded (atom false))
 
 (defn shutdown []
   (let [{:keys [schema-file]} @confiugres]
     (when schema-file (s/save-schemas schema-file))))
 
 (defn stop-server []
-  (println "Shutdowning...")
+  (println "Shuting down...")
+  (reset! server-loaded false)
   (try-all
     (rfi/stop-server)
     (stop-backup)
@@ -51,37 +54,41 @@
       port zk meta
       :connected-fn
       (fn []
-        (let [is-first-node? (is-first-node?)
-              cluster-configs (select-keys config cluster-config-fields)
-              cluster-configs (if is-first-node?
-                                cluster-configs
-                                (or (rfi/condinated-siblings-invoke 'neb.core/get-cluster-configures)
-                                    cluster-configs))
-              {:keys [trunks-size]} cluster-configs
-              {:keys [memory-size schema-file data-path durability auto-backsync replication
-                      keep-imported-backup recover-backup-at-startup]} config
-              trunks-size (interpret-volume trunks-size)
-              memory-size (interpret-volume memory-size)
-              schemas (if is-first-node?
-                        (s/load-schemas-file schema-file)
-                        (rfi/condinated-siblings-invoke-with-lock schemas-lock 'neb.schema/get-schemas))
-              trunk-count (int (Math/floor (/ memory-size trunks-size)))]
-          (println "Loading Store...")
-          (reset! cluster-confiugres cluster-configs)
-          (reset! confiugres config)
-          (s/clear-schemas)
-          (s/load-schemas schemas)
-          (init-trunks trunk-count trunks-size (boolean durability))
-          (when data-path (dserv/prepare-backup-server data-path keep-imported-backup))
-          (start-defrag)
-          (register-as-master (* 50 trunk-count))
-          (when durability (init-durability-client (or replication 1)))
-          (when recover-backup-at-startup (dserv/recover-backup))
-          (when (and durability auto-backsync) (start-backup))
-          (rfi/start-server port)))
+        (when-not @server-loaded
+          (let [is-first-node? (is-first-node?)
+                cluster-configs (select-keys config cluster-config-fields)
+                cluster-configs (if is-first-node?
+                                  cluster-configs
+                                  (or (rfi/condinated-siblings-invoke 'neb.core/get-cluster-configures)
+                                      cluster-configs))
+                {:keys [trunks-size]} cluster-configs
+                {:keys [memory-size schema-file data-path durability auto-backsync replication
+                        keep-imported-backup recover-backup-at-startup]} config
+                trunks-size (interpret-volume trunks-size)
+                memory-size (interpret-volume memory-size)
+                schemas (if is-first-node?
+                          (s/load-schemas-file schema-file)
+                          (rfi/condinated-siblings-invoke-with-lock schemas-lock 'neb.schema/get-schemas))
+                trunk-count (int (Math/floor (/ memory-size trunks-size)))]
+            (println "Loading Store...")
+            (reset! cluster-confiugres cluster-configs)
+            (reset! confiugres config)
+            (s/clear-schemas)
+            (s/load-schemas schemas)
+            (init-trunks trunk-count trunks-size (boolean durability))
+            (when data-path (dserv/prepare-backup-server data-path keep-imported-backup))
+            (start-defrag)
+            (register-as-master (* 50 trunk-count))
+            (when durability (init-durability-client (or replication 1)))
+            (when recover-backup-at-startup (dserv/recover-backup))
+            (when (and durability auto-backsync) (start-backup))
+            (rfi/start-server port)
+            (reset! server-loaded true))))
       :expired-fn
       (fn []
-        (stop-server)))))
+        (if (> (count @dht/cluster-server-list) 1)
+          (stop-server)
+          (println "Zookeeper disconnected but it is the only server. Will not shutdown."))))))
 
 (defn clear-zk []
   (delete-configure :schemas)
