@@ -1,7 +1,5 @@
 package org.shisoft.neb.io;
 
-import org.shisoft.neb.Trunk;
-
 /**
  * Created by shisoft on 5/2/2016.
  */
