@@ -86,9 +86,12 @@
             (reset! server-loaded true))))
       :expired-fn
       (fn []
-        (if (> (count @dht/cluster-server-list) 1)
-          (stop-server)
-          (println "Zookeeper disconnected but it is the only server. Will not shutdown."))))))
+        (try
+          (if (> (count @dht/cluster-server-list) 1)
+            (stop-server)
+            (println "Zookeeper disconnected but it is the only server. Will not shutdown."))
+          (catch Exception ex
+            (clojure.stacktrace/print-cause-trace ex)))))))
 
 (defn clear-zk []
   (delete-configure :schemas)
