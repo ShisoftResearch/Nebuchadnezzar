@@ -47,9 +47,9 @@
   @cluster-confiugres)
 
 (defn start-server [config]
-  (let [{:keys [server-name port zk meta]} config]
+  (let [{:keys [server-group server-name port zk meta]} config]
     (join-cluster
-      :neb
+      (or server-group :neb)
       server-name
       port zk meta
       :connected-fn
