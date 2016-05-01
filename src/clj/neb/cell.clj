@@ -295,13 +295,27 @@
           (.rollBack cell-writer)
           (clojure.stacktrace/print-cause-trace tr))))))
 
-(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs]
+(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs & [cell-meta]]
   (let [cell-length (count bs)
         cell-writer (CellWriter. ttrunk cell-length)
         bytes-writer (fn [value curr-loc] (Writer/writeRawBytes value curr-loc))]
     (.streamWrite cell-writer bytes-writer bs cell-length)
-    (mark-dirty cell-writer)
-    (.addCellMetaToTrunkIndex cell-writer hash ttrunk)))
+    (if cell-meta
+      (.updateCellToTrunkIndex  cell-writer cell-meta ttrunk)
+      (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
+
+    (mark-dirty cell-writer)))
+
+(defn new-cell-by-raw-if-newer [^Trunk trunk ^Long hash ^Long version ^bytes bs]
+  (let [orig-meta (extract-cell-meta trunk hash)
+        new-cell (fn [cell-meta] (new-cell-by-raw trunk hash bs cell-meta))]
+    (if orig-meta
+      (with-write-lock
+        trunk hash
+        (let [orig-loc (get-cell-location)
+              orig-version (read-cell-header-field trunk orig-loc :version)]
+          (when (> version orig-version) (new-cell *cell-meta*))))
+      (new-cell nil))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
   (.hasCell ttrunk hash))

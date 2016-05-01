@@ -78,6 +78,9 @@
 (defn new-cell-by-raw* [id bs]
   (dist-call id 'neb.trunk-store/new-cell-by-raw bs))
 
+(defn new-cell-by-raw-if-newer* [id version bs]
+  (dist-call id 'neb.trunk-store/new-cell-by-raw-if-newer version bs))
+
 (defn cell-exists?* [id]
   (dist-call id 'neb.trunk-store/cell-exists?))
 
@@ -158,6 +161,7 @@
 (op-fns new-cell-by-raw)
 (op-fns cell-exists?)
 (op-fns read-cell-headers)
+(op-fns new-cell-by-raw-if-newer)
 
 (defn add-schema [sname fields]
   (d-lock/locking

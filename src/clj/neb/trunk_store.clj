@@ -128,6 +128,9 @@
 (defn new-cell-by-raw [^UUID cell-id bs]
   (dispatch-trunk cell-id cell/new-cell-by-raw bs))
 
+(defn new-cell-by-raw-if-newer [^UUID cell-id version bs]
+  (dispatch-trunk cell-id cell/new-cell-by-raw-if-newer version bs))
+
 (defn cell-exists? [^UUID cell-id]
   (dispatch-trunk cell-id cell/cell-exists?))
 
@@ -155,3 +158,4 @@
 (batch-fn cell-exists?)
 (batch-fn read-cell-headers)
 (batch-fn read-lock-exec)
+(batch-fn new-cell-by-raw-if-newer)
