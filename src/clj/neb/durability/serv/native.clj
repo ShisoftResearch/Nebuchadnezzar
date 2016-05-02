@@ -4,6 +4,8 @@
            (sun.misc Unsafe)
            (org.shisoft.neb.io type_lengths)))
 
+(set! *warn-on-reflection* true)
+
 (def ^Unsafe us UnsafeUtils/unsafe)
 
 (defn read-bytes [reader byte-count]
@@ -16,17 +18,28 @@
     (UnsafeUtils/setBytes addr bs)
     addr))
 
+(defn dealloc [addr]
+  (.freeMemory us addr))
+
+(defn read-long-from-mem [addr]
+  (.getLong us addr))
+
+(defn read-int-from-mem [addr]
+  (.getInt us addr))
+
+(defn read-byte-from-mem [addr] (.getByte us addr))
+
 (defn read-long [bs offset]
   (let [addr (-> (UnsafeUtils/subBytes bs offset type_lengths/longLen)
                  (malloc-bytes))
-        value (.getLong us addr)]
+        value (read-long-from-mem addr)]
     (.freeMemory us addr)
     value))
 
 (defn read-int [bs offset]
   (let [addr (-> (UnsafeUtils/subBytes bs offset type_lengths/intLen)
                  (malloc-bytes))
-        value (.getInt us addr)]
+        value (read-int-from-mem addr)]
     (.freeMemory us addr)
     value))
 

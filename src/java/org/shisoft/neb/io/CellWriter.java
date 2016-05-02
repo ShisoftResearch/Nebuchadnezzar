@@ -59,7 +59,6 @@ public class CellWriter {
     }
 
     public CellMeta addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
-        assert startLoc >= trunk.getStoreAddress();
         CellMeta meta = new CellMeta(startLoc);
         synchronized (trunk.getCellIndex()) {
             if (trunk.getCellIndex().putIfAbsent(hash, meta) != null) {

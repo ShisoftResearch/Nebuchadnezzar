@@ -2,10 +2,11 @@
   (:require [neb.header :refer [cell-head-struct cell-head-struc-map cell-head-len]]
             [neb.durability.serv.file-reader :refer [read-bytes skip-bytes]]
             [neb.durability.serv.native :refer [read-int read-long read-byte read-int-from-bytes read-long-from-bytes
-                                                read-int-from-stream read-long-from-stream]]
+                                                read-int-from-stream read-long-from-stream from-int
+                                                read-long-from-mem read-int-from-mem read-byte-from-mem
+                                                malloc-bytes dealloc]]
             [neb.core :refer [new-cell-by-raw-if-newer*]]
             [neb.cell :refer [normal-cell-type]]
-            [neb.durability.serv.native :refer [from-int from-long]]
             [clojure.java.io :as io]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [com.climate.claypoole :as cp]
@@ -17,7 +18,7 @@
            (org.shisoft.neb.io type_lengths)
            (java.util UUID)
            (org.shisoft.neb.utils UnsafeUtils)
-           (java.util.concurrent Phaser Semaphore)))
+           (java.util.concurrent ExecutorService Semaphore TimeUnit)))
 
 (set! *warn-on-reflection* true)
 
@@ -36,16 +37,16 @@
         (.write bs)
         (.flush)))))
 
-(def num-readers {:int read-int
-                  :long read-long
-                  :byte read-byte})
+(def num-readers {:int read-int-from-mem
+                  :long read-long-from-mem
+                  :byte read-byte-from-mem})
 
-(defn read-header-bytes [segment-bytes cell-offset]
+(defn read-header-bytes [seg-addr cell-offset]
   (into {}
         (map
           (fn [[prop type]]
             (let [{:keys [offset]} (get cell-head-struc-map prop)]
-              [prop ((get num-readers type) segment-bytes (+ offset cell-offset))]))
+              [prop ((get num-readers type) (+ seg-addr offset cell-offset))]))
           cell-head-struct)))
 
 (defn recover [file-path]
@@ -53,11 +54,13 @@
         seg-size (read-int-from-stream reader)
         thread-size (min (* 15 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
         recover-seg-semaphore (Semaphore. (int thread-size))
-        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")]
+        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")
+        recover-seg-dealloc-pool (cp/threadpool 1 :name "Recover-Seg-Dealloc")]
     (try
       (while (> (.available reader) 0)
         (let [seg-append-header (read-int-from-stream reader)
               seg-data (read-bytes reader seg-size)
+              seg-mem (malloc-bytes seg-data)
               recover-semaphore (Semaphore. (int thread-size))
               recover-pool (cp/threadpool 2 :name "Recover")]
           (.acquire recover-seg-semaphore)
@@ -66,7 +69,7 @@
             (try
               (loop [pointer 0]
                 (when-not (>= pointer seg-append-header)
-                  (let [{:keys [partition hash cell-length cell-type version]} (read-header-bytes seg-data pointer)]
+                  (let [{:keys [partition hash cell-length cell-type version]} (read-header-bytes seg-mem pointer)]
                     (if (= cell-type normal-cell-type)
                       (let [cell-id (UUID. partition hash)
                             cell-bytes (UnsafeUtils/subBytes seg-data pointer (+ cell-length cell-head-len))
@@ -81,11 +84,16 @@
                           (recur (+ pointer cell-length)))))))
               (finally
                 (cp/shutdown recover-pool)
-                (.release recover-seg-semaphore))))))
+                (.release recover-seg-semaphore))))
+          (cp/future
+            recover-seg-dealloc-pool
+            (.awaitTermination recover-pool Long/MAX_VALUE TimeUnit/NANOSECONDS)
+            (dealloc seg-mem))))
       (catch Exception ex
         (clojure.stacktrace/print-cause-trace ex))
       (finally
         (cp/shutdown recover-seg-pool)
+        (cp/shutdown recover-seg-dealloc-pool)
         (.close reader)))))
 
 (defn list-ids [file-path]
