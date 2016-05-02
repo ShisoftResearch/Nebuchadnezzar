@@ -51,9 +51,9 @@
 (defn recover [file-path]
   (let [^InputStream reader (io/input-stream file-path)
         seg-size (read-int-from-stream reader)
-        thread-size (min (* 10 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
+        thread-size (min (* 15 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
         recover-seg-semaphore (Semaphore. (int thread-size))
-        recover-seg-pool (min (cp/threadpool thread-size :name "Recover-Seg") 50)]
+        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")]
     (try
       (while (> (.available reader) 0)
         (let [seg-append-header (read-int-from-stream reader)

@@ -313,10 +313,11 @@
       (with-write-lock
         trunk hash
         (let [orig-loc (get-cell-location)
-              orig-version (read-cell-header-field trunk orig-loc :version)]
+              orig-version (read-cell-header-field trunk orig-loc :version)
+              data-len (read-cell-header-field trunk orig-loc :cell-length)]
           (when (> version orig-version)
-            (delete-cell trunk hash)
-            (new-cell *cell-meta*))))
+            (new-cell *cell-meta*)
+            (mark-cell-deleted trunk orig-loc data-len))))
       (new-cell nil))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
