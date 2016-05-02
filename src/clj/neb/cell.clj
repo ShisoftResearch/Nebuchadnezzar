@@ -314,7 +314,9 @@
         trunk hash
         (let [orig-loc (get-cell-location)
               orig-version (read-cell-header-field trunk orig-loc :version)]
-          (when (> version orig-version) (new-cell *cell-meta*))))
+          (when (> version orig-version)
+            (delete-cell trunk hash)
+            (new-cell *cell-meta*))))
       (new-cell nil))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]
