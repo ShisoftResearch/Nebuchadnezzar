@@ -53,7 +53,7 @@
         seg-size (read-int-from-stream reader)
         thread-size (min (* 10 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
         recover-seg-semaphore (Semaphore. (int thread-size))
-        recover-seg-pool (cp/threadpool thread-size :name "Recover-Seg")]
+        recover-seg-pool (min (cp/threadpool thread-size :name "Recover-Seg") 50)]
     (try
       (while (> (.available reader) 0)
         (let [seg-append-header (read-int-from-stream reader)
