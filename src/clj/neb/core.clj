@@ -1,12 +1,11 @@
 (ns neb.core
   (:require [cluster-connector.remote-function-invocation.core :as rfi]
             [cluster-connector.native-cache.core :refer :all]
-            [cluster-connector.sharding.DHT :refer :all]
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock]
             [neb.schema :as s]
             [neb.utils :refer :all]
-            [neb.base :refer [schemas-lock]]
+            [neb.base :refer [schemas-lock locate-cell-by-id]]
             [neb.statistics])
   (:import (java.util UUID)
            (com.google.common.hash Hashing MessageDigestHashFunction HashCode HashFunction)
@@ -31,9 +30,6 @@
 
 (defcache cell-id-by-key {:expire-after-access-secs 60
                           :soft-values? true} cell-id-by-key*)
-
-(defn locate-cell-by-id [^UUID cell-id]
-  (get-server-for-name cell-id :hashing (fn [^UUID id] (.getMostSignificantBits id))))
 
 (defn to-id [key]
   (if (= (class key) UUID)

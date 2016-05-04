@@ -33,14 +33,14 @@
   (let [addr (-> (UnsafeUtils/subBytes bs offset type_lengths/longLen)
                  (malloc-bytes))
         value (read-long-from-mem addr)]
-    (.freeMemory us addr)
+    (dealloc addr)
     value))
 
 (defn read-int [bs offset]
   (let [addr (-> (UnsafeUtils/subBytes bs offset type_lengths/intLen)
                  (malloc-bytes))
         value (read-int-from-mem addr)]
-    (.freeMemory us addr)
+    (dealloc addr)
     value))
 
 (defn read-byte [bs offset] (get bs offset))
@@ -57,12 +57,12 @@
         addr (.allocateMemory us type_lengths/intLen)
         _ (.putInt us addr i)
         bs (UnsafeUtils/getBytes addr type_lengths/intLen)]
-    (.freeMemory us addr)
+    (dealloc addr)
     bs))
 
 (defn from-long [l]
   (let [addr (.allocateMemory us type_lengths/longLen)
         _ (.putLong us addr l)
         bs (UnsafeUtils/getBytes addr type_lengths/longLen)]
-    (.freeMemory us addr)
+    (dealloc addr)
     bs))

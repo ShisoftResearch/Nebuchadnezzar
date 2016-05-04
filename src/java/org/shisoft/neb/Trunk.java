@@ -157,7 +157,7 @@ public class Trunk {
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
             try {
-                seg.lockWrite();
+                seg.lockRead();
                 r = seg.tryAcquireSpace(length);
                 if (r > 0) {
                     break;
@@ -169,7 +169,7 @@ public class Trunk {
                     }
                 }
             } finally {
-                seg.unlockWrite();
+                seg.unlockRead();
             }
             turn ++;
         }
