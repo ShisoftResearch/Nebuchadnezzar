@@ -8,7 +8,7 @@ It is a distributed in-memory Key-Value store, made to power the [Morpheus proje
 
 ## Features
 
-* In-memory compact key-value store, it can store the whole [Wikidata entity relation graph](https://dumps.wikimedia.org/wikidatawiki/entities/) (75.2GB) with only 16GB of RAM and 12GB of disk backup, for 103,205,212 objects.
+* In-memory compact key-value store, it can store the whole [Wikidata entity relation graph](https://dumps.wikimedia.org/wikidatawiki/entities/) (75.2GB) with only 16GB of RAM and 12GB of disk backup, for 103,205,212 cells.
 * Full off-heap, no GC impact and pauses, internal defragment mechanism
 * High concurrency, cell level lock
 * Able to allocate large amount of memory (TBs)
