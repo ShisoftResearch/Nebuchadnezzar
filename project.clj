@@ -1,6 +1,6 @@
 (defproject neb "0.1.0-SNAPSHOT"
-  :description "FIXME: write description"
-  :url "http://example.com/FIXME"
+  :description "RAMCloud implementation for Clojure applications."
+  :url "https://github.com/shisoft/Nebuchadnezzar"
   :license {:name "Eclipse Public License"
             :url "http://www.eclipse.org/legal/epl-v10.html"}
   :source-paths ["src/clj"]
