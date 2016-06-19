@@ -2,13 +2,14 @@
   (:require [cluster-connector.utils.for-debug :refer [$ spy]])
   (:import (org.shisoft.neb.utils UnsafeUtils)
            (sun.misc Unsafe)
-           (org.shisoft.neb.io type_lengths)))
+           (org.shisoft.neb.io type_lengths)
+           (java.io InputStream)))
 
 (set! *warn-on-reflection* true)
 
 (def ^Unsafe us UnsafeUtils/unsafe)
 
-(defn read-bytes [reader byte-count]
+(defn read-bytes [^InputStream reader byte-count]
   (let [^bytes byte-arr (byte-array byte-count)]
     (.read reader byte-arr)
     byte-arr))
