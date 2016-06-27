@@ -53,7 +53,8 @@
   (let [^InputStream reader (io/input-stream file-path)
         seg-size (read-int-from-stream reader)
         thread-size (min (* 15 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
-        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")]
+        recover-seg-pool (cp/threadpool thread-size :name "Recover-Seg")
+        recover-seg-semaphore (Semaphore. (int thread-size))]
     (try
       (while (> (.available reader) 0)
         (let [seg-append-header (read-int-from-stream reader)
@@ -62,6 +63,7 @@
           (cp/future
             recover-seg-pool
             (try
+              (.acquire recover-seg-semaphore)
               (loop [pointer 0]
                 (when-not (>= pointer seg-append-header)
                   (let [{:keys [partition hash cell-length cell-type version]} (read-header-bytes seg-mem pointer)]
@@ -74,7 +76,8 @@
                       (do (assert (= cell-type 2))
                           (recur (+ pointer cell-length)))))))
               (finally
-                (dealloc seg-mem))))))
+                (dealloc seg-mem)
+                (.release recover-seg-semaphore))))))
       (catch Exception ex
         (clojure.stacktrace/print-cause-trace ex))
       (finally
