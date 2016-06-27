@@ -53,17 +53,12 @@
   (let [^InputStream reader (io/input-stream file-path)
         seg-size (read-int-from-stream reader)
         thread-size (min (* 15 (count (ds/get-server-list @ds/node-server-group))) (cp/ncpus))
-        recover-seg-semaphore (Semaphore. (int thread-size))
-        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")
-        recover-seg-dealloc-pool (cp/threadpool 1 :name "Recover-Seg-Dealloc")]
+        recover-seg-pool (cp/threadpool (min thread-size 50) :name "Recover-Seg")]
     (try
       (while (> (.available reader) 0)
         (let [seg-append-header (read-int-from-stream reader)
               seg-data (read-bytes reader seg-size)
-              seg-mem (malloc-bytes seg-data)
-              recover-semaphore (Semaphore. (int thread-size))
-              recover-pool (cp/threadpool 2 :name "Recover")]
-          (.acquire recover-seg-semaphore)
+              seg-mem (malloc-bytes seg-data)]
           (cp/future
             recover-seg-pool
             (try
@@ -74,26 +69,17 @@
                       (let [cell-id (UUID. partition hash)
                             cell-bytes (UnsafeUtils/subBytes seg-data pointer (+ cell-length cell-head-len))
                             cell-unit-len (count cell-bytes)]
-                        (.acquire recover-semaphore)
-                        (try (cp/future recover-pool
-                                        (new-cell-by-raw-if-newer* cell-id version cell-bytes)
-                                        (.release recover-semaphore))
-                             (catch Exception ex (clojure.stacktrace/print-cause-trace ex)))
+                        (new-cell-by-raw-if-newer* cell-id version cell-bytes)
                         (recur (+ pointer cell-unit-len)))
                       (do (assert (= cell-type 2))
                           (recur (+ pointer cell-length)))))))
               (finally
-                (cp/shutdown recover-pool)
-                (.release recover-seg-semaphore))))
-          (cp/future
-            recover-seg-dealloc-pool
-            (.awaitTermination recover-pool Long/MAX_VALUE TimeUnit/NANOSECONDS)
-            (dealloc seg-mem))))
+                (dealloc seg-mem))))))
       (catch Exception ex
         (clojure.stacktrace/print-cause-trace ex))
       (finally
         (cp/shutdown recover-seg-pool)
-        (cp/shutdown recover-seg-dealloc-pool)
+        (.awaitTermination recover-seg-pool Long/MAX_VALUE TimeUnit/DAYS)
         (.close reader)))))
 
 (defn list-ids [file-path]
