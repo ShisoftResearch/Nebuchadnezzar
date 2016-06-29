@@ -13,7 +13,7 @@
             [cluster-connector.sharding.DHT :as dht]
             [clojure.core.async :as a]
             [cluster-connector.distributed-store.core :as ds])
-  (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
+  (:import (org.shisoft.hurricane BufferedRandomAccessFile)
            (java.io InputStream)
            (org.shisoft.neb.io type_lengths)
            (java.util UUID)

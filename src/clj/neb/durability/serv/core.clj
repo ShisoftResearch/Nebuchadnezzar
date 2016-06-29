@@ -3,8 +3,7 @@
             [clojure.core.async :as a]
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [neb.durability.serv.native :refer [from-int from-long]])
-  (:import (org.shisoft.neb.durability.io BufferedRandomAccessFile)
-           (java.util.concurrent.locks ReentrantLock)
+  (:import (org.shisoft.hurricane BufferedRandomAccessFile)
            (java.io File)
            (org.apache.commons.io FileUtils)
            (org.shisoft.neb Trunk)))
