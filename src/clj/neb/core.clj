@@ -8,9 +8,8 @@
             [neb.base :refer [schemas-lock locate-cell-by-id]]
             [neb.statistics])
   (:import (java.util UUID)
-           (com.google.common.hash Hashing MessageDigestHashFunction HashCode HashFunction)
-           (java.nio.charset Charset)
-           (org.shisoft.neb.exceptions SchemaAlreadyExistsException)))
+           (org.shisoft.neb.exceptions SchemaAlreadyExistsException)
+           (org.shisoft.neb.utils MurmurHash3 MurmurHash3$LongPair)))
 
 (set! *warn-on-reflection* true)
 
@@ -18,15 +17,19 @@
 
 (defn rand-cell-id [] (UUID/randomUUID))
 
-(defn hash-str [string ^HashFunction alog]
-  (-> alog
-      (.hashString string (Charset/forName "UTF-8"))
-      (.asLong)))
+(def hash-seed (int 1))
+(def hash-offset (int 0))
+
+(defn hash-str [k]
+  (let [pair (MurmurHash3$LongPair.)
+        ^bytes sbytes (.getBytes k)]
+    (MurmurHash3/murmurhash3_x64_128
+      sbytes hash-offset (count sbytes) hash-seed pair)
+    [(.-val1 pair) (.-val2 pair)]))
 
 (defn cell-id-by-key* [^String cell-key]
-  (UUID.
-    (hash-str cell-key (Hashing/sha1))
-    (hash-str cell-key (Hashing/sha256))))
+  (let [[v1 v2] (hash-str cell-key)]
+    (UUID. v1 v2)))
 
 (defcache cell-id-by-key {:expire-after-access-secs 60
                           :soft-values? true} cell-id-by-key*)
