@@ -3,13 +3,13 @@
             [cluster-connector.native-cache.core :refer :all]
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [cluster-connector.distributed-store.lock :as d-lock]
+            [cluster-connector.utils.hashing :as hashing]
             [neb.schema :as s]
             [neb.utils :refer :all]
             [neb.base :refer [schemas-lock locate-cell-by-id]]
             [neb.statistics])
   (:import (java.util UUID)
-           (org.shisoft.neb.exceptions SchemaAlreadyExistsException)
-           (org.shisoft.neb.utils MurmurHash3 MurmurHash3$LongPair)))
+           (org.shisoft.neb.exceptions SchemaAlreadyExistsException)))
 
 (set! *warn-on-reflection* true)
 
@@ -17,15 +17,8 @@
 
 (defn rand-cell-id [] (UUID/randomUUID))
 
-(def hash-seed (int 1))
-(def hash-offset (int 0))
-
 (defn hash-str [k]
-  (let [pair (MurmurHash3$LongPair.)
-        ^bytes sbytes (.getBytes k)]
-    (MurmurHash3/murmurhash3_x64_128
-      sbytes hash-offset (count sbytes) hash-seed pair)
-    [(.-val1 pair) (.-val2 pair)]))
+  (hashing/murmurhash3-x64-128 k))
 
 (defn cell-id-by-key* [^String cell-key]
   (let [[v1 v2] (hash-str cell-key)]
