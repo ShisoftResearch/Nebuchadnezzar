@@ -2,7 +2,7 @@
   (:require [midje.sweet :refer :all]
             [neb.core :refer :all]
             [neb.server :refer :all]
-            [neb.durability.serv.core :refer [recover-backup list-backup-ids remove-imported-tag]]
+            [neb.durability.serv.core :refer [recover-backup remove-imported-tag]]
             [neb.durability.core :refer [sync-trunk]]
             [neb.trunk-store :as ts :refer [defrag-store-trunks]]
             [neb.cell :as cell]
@@ -73,8 +73,6 @@
                        (sync-trunks) => anything)
                  (reset! stoped-atom true)
                  (Thread/sleep 5000)
-                 (fact "Check backedup ids"
-                       (sort (set (list-backup-ids))) => (just @inserted-cell-ids :gaps-ok :in-any-order))
                  (fact "Delete Everything"
                        (dorun
                          (pmap

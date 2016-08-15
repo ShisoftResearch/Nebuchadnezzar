@@ -16,8 +16,9 @@ import java.util.concurrent.locks.StampedLock;
 public class UnsafeConcurrentLongLongHashMap {
 
 
-    private static final int LONG_LEN = type_lengths.longLen;
     private static final int INITIAL_BUCKETS = 1024; // Must be power of 2
+
+    private static final int LONG_LEN = type_lengths.longLen;
     private static final int LOCKS = 32;
     private static final Unsafe u = UnsafeUtils.unsafe;
     private static final int KEY_LOC = 0;
@@ -34,7 +35,7 @@ public class UnsafeConcurrentLongLongHashMap {
 
     private void setBuckets (long buckets) {
         this.buckets = buckets;
-        this.bucketsT = 1 / buckets;
+        this.bucketsT = 1 / (float) buckets;
     }
 
     private long[] writeLockAll() {
@@ -53,31 +54,33 @@ public class UnsafeConcurrentLongLongHashMap {
     }
 
     private float getAvgBucketItems () {
-        return size.longValue() * bucketsT;
+        return (float) size.longValue() * bucketsT;
+    }
+
+    public boolean resizeRequired() {
+        return getAvgBucketItems() > 10 && buckets < INITIAL_BUCKETS * 1024;
     }
 
     private void checkResize() {
-        if (getAvgBucketItems() > 10) {
+        if (resizeRequired()) {
             long masterStamp = masterLock.writeLock();
-            if (getAvgBucketItems() < 10) return; // recheck for lock
             try {
+                if (!resizeRequired()) return; // recheck for lock
                 long originalBucketsIndex = bucketsIndex;
                 long originalBuckets = buckets;
                 long originalBucketsSize = originalBuckets * LONG_LEN;
                 long originalBucketsEnds = originalBucketsIndex + originalBucketsSize;
                 buckets = buckets * 2;
                 initBuckets();
-                for (long bucketAddr = originalBucketsIndex; bucketAddr < originalBucketsEnds; bucketsIndex += LONG_LEN) {
+                for (long bucketAddr = originalBucketsIndex; bucketAddr < originalBucketsEnds; bucketAddr += LONG_LEN) {
                     long cellLoc = u.getLong(bucketAddr);
                     while (true) {
+                        if (cellLoc < 0) break;
                         long next = u.getLong(cellLoc + NXT_LOC);
                         long k = u.getLong(cellLoc + KEY_LOC);
                         long v = u.getLong(cellLoc + VAL_LOC);
-                        put(k, v);
+                        put_lockfree(k, v);
                         u.freeMemory(cellLoc);
-                        if (next < 0) {
-                            break;
-                        }
                         cellLoc = next;
                     }
                 }
@@ -88,19 +91,9 @@ public class UnsafeConcurrentLongLongHashMap {
         }
     }
 
-    private void initBuckets(){
-        long bucketsSize = buckets * LONG_LEN;
-        long bucketsEnds = bucketsIndex + bucketsSize;
-        bucketsIndex = u.allocateMemory(bucketsSize);
-        int li = 0;
-        for (long i = bucketsIndex; i < bucketsEnds; i += LONG_LEN) {
-            u.putLong(i, -1L);
-            locks[li]= new StampedLock();
-            li++;
-        }
-    }
-
-    private long getFromBucket(long addr, long k) {
+    private long getFromBucket(long bucketLoc, long k) {
+        long addr = u.getLong(bucketLoc);
+        if (addr < 0) return  -1;
         while (true) {
             long key = u.getLong(addr + KEY_LOC);
             if (key == k) {
@@ -116,9 +109,9 @@ public class UnsafeConcurrentLongLongHashMap {
 
     private long writeBucket (long addr, long k, long v) {
         long head = u.allocateMemory(LONG_LEN * 3);
-        u.putLong(addr + KEY_LOC, k);
-        u.putLong(addr + VAL_LOC, v);
-        u.putLong(addr + NXT_LOC, addr);
+        u.putLong(head + KEY_LOC, k);
+        u.putLong(head + VAL_LOC, v);
+        u.putLong(head + NXT_LOC, addr);
         size.incrementAndGet();
         return head;
     }
@@ -133,41 +126,50 @@ public class UnsafeConcurrentLongLongHashMap {
         return root == addr ? next : root;
     }
 
-    private long removeBucketCellByKey (long addr, long k) {
+    private long removeBucketCellByKey (long bucketLoc, long k) {
+        long addr = u.getLong(bucketLoc);
         long parent = -1;
         long root = addr;
         while (true) {
-            long key = u.getLong(addr + KEY_LOC);
-            if (key == k) {
-                return removeBucketCell(root, parent, addr);
-            } else {
-                addr = u.getLong(addr + NXT_LOC);
-                if (addr < 0) {
-                    return -1;
+            if (addr > 0) {
+                long key = u.getLong(addr + KEY_LOC);
+                if (key == k) {
+                    long newHeader = removeBucketCell(root, parent, addr);
+                    u.putLong(bucketLoc, newHeader);
+                    return newHeader;
                 }
+                addr = u.getLong(addr + NXT_LOC);
+            }
+            if (addr < 0) {
+                return -1;
             }
             parent = addr;
         }
     }
 
-    private long setBucketByKeyValue (long addr, long k, long v) {
+    private long setBucketByKeyValue (long bucketLoc, long k, long v) {
+        long addr = u.getLong(bucketLoc);
         long root = addr;
         while (true) {
-            long key = u.getLong(addr + KEY_LOC);
-            if (key == k) {
-                u.putLong(addr + VAL_LOC, v);
-                return root;
-            } else {
-                addr = u.getLong(addr + NXT_LOC);
-                if (addr < 0) {
-                    break;
+            if (addr > 0) {
+                long key = u.getLong(addr + KEY_LOC);
+                if (key == k) {
+                    u.putLong(addr + VAL_LOC, v);
+                    return root;
                 }
+                addr = u.getLong(addr + NXT_LOC);
+            }
+            if (addr < 0) {
+                break;
             }
         }
-        return writeBucket(root, k, v);
+        long newHeader = writeBucket(root, k, v);
+        u.putLong(bucketLoc, newHeader);
+        return newHeader;
     }
 
-    private boolean containsBucketKey (long addr, long k) {
+    private boolean containsBucketKey (long bucketLoc, long k) {
+        long addr = u.getLong(bucketLoc);
         while (true) {
             long key = u.getLong(addr + KEY_LOC);
             if (key == k) {
@@ -189,12 +191,12 @@ public class UnsafeConcurrentLongLongHashMap {
         return locks[id & (LOCKS - 1)];
     }
 
-    public long getBucketHeaderByID (int bucketId) {
-        return buckets + bucketId * LONG_LEN;
+    private long getBucketLocationByID(int bucketId) {
+        return bucketsIndex + bucketId * LONG_LEN;
     }
 
-    public long getBucketsHeaderByKey (long key) {
-        return getBucketHeaderByID(locateBuckeyByKey(key));
+    private long getBucketsLocationByKey(long key) {
+        return getBucketLocationByID(locateBuckeyByKey(key));
     }
 
     public UnsafeConcurrentLongLongHashMap() {
@@ -203,6 +205,10 @@ public class UnsafeConcurrentLongLongHashMap {
         this.masterLock = new StampedLock();
         setBuckets(INITIAL_BUCKETS);
         initBuckets();
+
+        for (int li = 0; li < LOCKS; li++) {
+            locks[li]= new StampedLock();
+        }
     }
 
     public long size() {
@@ -215,7 +221,7 @@ public class UnsafeConcurrentLongLongHashMap {
     }
 
     public boolean containsKey(long key) {
-        return containsBucketKey(getBucketsHeaderByKey(key), key);
+        return containsBucketKey(getBucketsLocationByKey(key), key);
     }
 
     public long get(long key) {
@@ -224,7 +230,7 @@ public class UnsafeConcurrentLongLongHashMap {
         StampedLock lock = locateLockByBucketId(bucketId);
         long stamp = lock.readLock();
         try {
-            return getFromBucket(getBucketsHeaderByKey(key), key);
+            return getFromBucket(getBucketLocationByID(bucketId), key);
         } finally {
             lock.unlockRead(stamp);
             masterLock.unlockRead(masterStamp);
@@ -232,15 +238,28 @@ public class UnsafeConcurrentLongLongHashMap {
         }
     }
 
-    public long put(long key, long value) {
-        long masterStamp = masterLock.readLock();
+    public  long put_lockfree(long key, long value){
+        long bucketLoc = getBucketLocationByID(locateBuckeyByKey(key));
+        return setBucketByKeyValue(bucketLoc, key, value);
+    }
+
+    public long put_(long key, long value) {
         int bucketId = locateBuckeyByKey(key);
         StampedLock lock = locateLockByBucketId(bucketId);
         long stamp = lock.writeLock();
         try {
-            return setBucketByKeyValue(getBucketsHeaderByKey(key), key, value);
+            long bucketLoc = getBucketLocationByID(bucketId);
+            return setBucketByKeyValue(bucketLoc, key, value);
         } finally {
             lock.unlockWrite(stamp);
+        }
+    }
+
+    public long put(long key, long value) {
+        long masterStamp = masterLock.readLock();
+        try {
+            return put_(key, value);
+        } finally {
             masterLock.unlockRead(masterStamp);
             checkResize();
         }
@@ -252,7 +271,8 @@ public class UnsafeConcurrentLongLongHashMap {
         StampedLock lock = locateLockByBucketId(bucketId);
         long stamp = lock.writeLock();
         try {
-            return removeBucketCellByKey(getBucketsHeaderByKey(key), key);
+            long bucketLoc = getBucketLocationByID(bucketId);
+            return removeBucketCellByKey(bucketLoc, key);
         } finally {
             lock.unlockWrite(stamp);
             masterLock.unlockRead(masterStamp);
@@ -266,25 +286,56 @@ public class UnsafeConcurrentLongLongHashMap {
         }
     }
 
-    public void clear() {
-        long masterStamp = masterLock.writeLock();
+    private void initBuckets(){
+        long bucketsSize = buckets * LONG_LEN;
+        bucketsIndex = u.allocateMemory(bucketsSize);
+        long bucketsEnds = bucketsIndex + bucketsSize;
+        for (long i = bucketsIndex; i < bucketsEnds; i += LONG_LEN) {
+            u.putLong(i, -1L);
+        }
+    }
+
+    private void clear_(){
         long bucketsSize = buckets * LONG_LEN;
         long bucketsEnds = bucketsIndex + bucketsSize;
-        try {
-            for (long bucketAddr = bucketsIndex; bucketAddr < bucketsEnds; bucketsIndex += LONG_LEN) {
-                long cellLoc = u.getLong(bucketAddr);
-                while (true) {
-                    long next = u.getLong(cellLoc + NXT_LOC);
-                    u.freeMemory(cellLoc);
-                    if (next < 0) {
-                        break;
-                    }
-                    cellLoc = next;
-                }
+        for (long i = bucketsIndex; i < bucketsEnds; i += LONG_LEN) {
+            long cellLoc = u.getLong(i);
+            if (cellLoc < 0) continue;
+            while (true) {
+                if (cellLoc < 0) break;
+                long next = u.getLong(cellLoc + NXT_LOC);
+                u.freeMemory(cellLoc);
+                cellLoc = next;
             }
+            u.putLong(i, -1L);
+        }
+        size.set(0);
+    }
+
+    public void clear() {
+        long masterStamp = masterLock.writeLock();
+        try {
+            clear_();
         } finally {
             masterLock.unlockWrite(masterStamp);
         }
     }
 
+    public void dispose(){
+        long masterStamp = masterLock.writeLock();
+        try {
+            clear_();
+            u.freeMemory(bucketsIndex);
+        } finally {
+            masterLock.unlockWrite(masterStamp);
+        }
+    }
+
+    public long getBuckets() {
+        return buckets;
+    }
+
+    public long getInitialBuckets () {
+        return INITIAL_BUCKETS;
+    }
 }
