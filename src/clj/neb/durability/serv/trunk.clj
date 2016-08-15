@@ -84,32 +84,3 @@
         (cp/shutdown recover-seg-pool)
         (.awaitTermination recover-seg-pool Long/MAX_VALUE TimeUnit/DAYS)
         (.close reader)))))
-
-(defn list-ids [file-path]
-  (let [^InputStream reader (io/input-stream file-path)
-        seg-size (read-int-from-stream reader)]
-    (try
-      (loop [cids []]
-        (if (> (.available reader) 0)
-          (let [seg-append-header (read-int-from-stream reader)
-                seg-data (read-bytes reader seg-size)]
-            (recur (concat cids
-                           (loop [pointer 0
-                                  seg-cids []]
-                             (if (>= pointer seg-append-header)
-                               seg-cids
-                               (let [{:keys [partition hash cell-length cell-type]} (read-header-bytes seg-data pointer)]
-                                 (if (= cell-type normal-cell-type)
-                                   (let [cell-id (UUID. partition hash)
-                                         cell-bytes (UnsafeUtils/subBytes seg-data pointer (+ cell-length cell-head-len))
-                                         cell-unit-len (count cell-bytes)]
-                                     (recur (+ pointer cell-unit-len)
-                                            (conj seg-cids cell-id)))
-                                   (do (assert (= cell-type 2))
-                                       (recur (+ pointer cell-length)
-                                              seg-cids)))))))))
-          cids))
-      (catch Exception ex
-        (clojure.stacktrace/print-cause-trace ex))
-      (finally
-        (.close reader)))))

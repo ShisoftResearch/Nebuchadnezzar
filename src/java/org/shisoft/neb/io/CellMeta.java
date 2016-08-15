@@ -1,8 +1,5 @@
 package org.shisoft.neb.io;
 
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.locks.StampedLock;
-
 /**
  * Created by shisoft on 5/2/2016.
  */
@@ -27,6 +24,5 @@ public class CellMeta {
         return "CellMeta{" +
                 "location=" + location +
                 '}';
-        ConcurrentHashMap
     }
 }

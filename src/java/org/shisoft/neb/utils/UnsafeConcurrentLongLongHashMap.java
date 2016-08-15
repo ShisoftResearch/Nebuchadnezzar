@@ -267,7 +267,24 @@ public class UnsafeConcurrentLongLongHashMap {
     }
 
     public void clear() {
-
+        long masterStamp = masterLock.writeLock();
+        long bucketsSize = buckets * LONG_LEN;
+        long bucketsEnds = bucketsIndex + bucketsSize;
+        try {
+            for (long bucketAddr = bucketsIndex; bucketAddr < bucketsEnds; bucketsIndex += LONG_LEN) {
+                long cellLoc = u.getLong(bucketAddr);
+                while (true) {
+                    long next = u.getLong(cellLoc + NXT_LOC);
+                    u.freeMemory(cellLoc);
+                    if (next < 0) {
+                        break;
+                    }
+                    cellLoc = next;
+                }
+            }
+        } finally {
+            masterLock.unlockWrite(masterStamp);
+        }
     }
 
 }

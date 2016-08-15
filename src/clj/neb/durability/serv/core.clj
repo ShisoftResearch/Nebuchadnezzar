@@ -111,15 +111,3 @@
 
 (defn remove-imported-tag []
   (.delete (File. (str @data-path "/imported"))))
-
-(defn list-backup-ids []
-  (let [dirs-to-recover (list-recover-dir)]
-    (mapcat
-      (fn [data-dir]
-        (if (.isDirectory data-dir)
-          (mapcat
-            (fn [data-file]
-              (t/list-ids data-file))
-            (sort-by #(.getName %) (.listFiles data-dir)))
-          []))
-      dirs-to-recover)))
