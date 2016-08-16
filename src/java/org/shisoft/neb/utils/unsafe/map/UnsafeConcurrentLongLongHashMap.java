@@ -1,6 +1,7 @@
-package org.shisoft.neb.utils;
+package org.shisoft.neb.utils.unsafe.map;
 
 import org.shisoft.neb.io.type_lengths;
+import org.shisoft.neb.utils.UnsafeUtils;
 import sun.misc.Unsafe;
 
 import java.util.Map;
@@ -17,7 +18,7 @@ public class UnsafeConcurrentLongLongHashMap {
 
 
     private static final int INITIAL_BUCKETS = 1024; // Must be power of 2
-    private static final int MAXIMUM_BUCKETS = INITIAL_BUCKETS * 10240; // 80 MB total, must be power of 2 either
+    private static final int MAXIMUM_BUCKETS = INITIAL_BUCKETS * 102400; // 800 MB total, must be power of 2 either
 
     private static final int LONG_LEN = type_lengths.longLen;
     private static final int LOCKS = 32;
