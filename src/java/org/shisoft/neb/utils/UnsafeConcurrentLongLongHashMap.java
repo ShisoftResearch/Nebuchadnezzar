@@ -17,6 +17,7 @@ public class UnsafeConcurrentLongLongHashMap {
 
 
     private static final int INITIAL_BUCKETS = 1024; // Must be power of 2
+    private static final int MAXIMUM_BUCKETS = INITIAL_BUCKETS * 10240; // 80 MB total, must be power of 2 either
 
     private static final int LONG_LEN = type_lengths.longLen;
     private static final int LOCKS = 32;
@@ -58,7 +59,7 @@ public class UnsafeConcurrentLongLongHashMap {
     }
 
     public boolean resizeRequired() {
-        return getAvgBucketItems() > 10 && buckets < INITIAL_BUCKETS * 1024;
+        return getAvgBucketItems() > 10 && buckets < MAXIMUM_BUCKETS;
     }
 
     private void checkResize() {
