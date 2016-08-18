@@ -9,12 +9,13 @@
             [clojure.core.async :as a]
             [neb.defragment :as defrag])
   (:import (org.shisoft.neb Trunk)
-           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths CellMeta Writer)
-           (java.util UUID)))
+           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths Writer)
+           (java.util UUID)
+           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock)))
 
 (set! *warn-on-reflection* true)
 
-(def ^:dynamic ^CellMeta *cell-meta* nil)
+(def ^:dynamic ^Long *cell-addr* nil)
 (def ^:dynamic *cell-hash* nil)
 (def ^:dynamic ^Trunk *cell-trunk* nil)
 
@@ -34,30 +35,38 @@
                         cell-head-struct)))
      ~@body))
 
-(defn extract-cell-meta [ttrunk hash]
-  (.getCellMeta ^Trunk ttrunk ^long hash))
+(defn extract-cell-addr [ttrunk hash]
+  (.getCellAddr ^Trunk ttrunk ^long hash))
 
 (defmacro with-cell-meta [trunk hash & body]
-  `(with-bindings {#'*cell-meta* (extract-cell-meta ~trunk ~hash)
-                   #'*cell-hash* ~hash
+  `(with-bindings {#'*cell-addr*  (extract-cell-addr ~trunk ~hash)
+                   #'*cell-hash*  ~hash
                    #'*cell-trunk* ~trunk}
-     (when *cell-meta*
+     (when (pos? *cell-addr*)
        ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta*
-       ~@body)))
+     (let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
+           ^ReentrantReadWriteLock$WriteLock wlock# (.writeLock clock#)]
+       (.lock wlock#)
+       (try
+         ~@body
+         (finally (.unlock wlock#))))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(with-cell-meta
      ~trunk ~hash
-     (locking *cell-meta*
-       ~@body)))
+     (let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
+           ^ReentrantReadWriteLock$ReadLock rlock# (.readLock clock#)]
+       (.lock rlock#)
+       (try
+         ~@body
+         (finally (.unlock rlock#))))))
 
 (defn get-cell-location []
-  (let [loc (.getLocation *cell-meta*)]
+  (let [loc *cell-addr*]
     (assert (>= loc (.getStoreAddress *cell-trunk*))) loc))
 
 (defn add-frag [^Trunk ttrunk start end]
@@ -288,36 +297,37 @@
         (doseq [{:keys [value writer length]} fields]
           (.streamWrite cell-writer writer value length))
         (if update-hash-index?
-          (.updateCellToTrunkIndex cell-writer *cell-meta* ttrunk)
+          (.updateCellToTrunkIndex cell-writer hash ttrunk)
           (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
         (mark-dirty cell-writer)
         (catch Throwable tr
           (.rollBack cell-writer)
           (clojure.stacktrace/print-cause-trace tr))))))
 
-(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs & [cell-meta]]
+(defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs & [cell-addr]]
   (let [cell-length (count bs)
         cell-writer (CellWriter. ttrunk cell-length)
         bytes-writer (fn [value curr-loc] (Writer/writeRawBytes value curr-loc))]
     (.streamWrite cell-writer bytes-writer bs cell-length)
-    (if cell-meta
-      (.updateCellToTrunkIndex  cell-writer cell-meta ttrunk)
+    (if (and cell-addr (pos? cell-addr))
+      (.updateCellToTrunkIndex  cell-writer hash ttrunk)
       (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
 
     (mark-dirty cell-writer)))
 
 (defn new-cell-by-raw-if-newer [^Trunk trunk ^Long hash ^Long version ^bytes bs]
-  (let [orig-meta (extract-cell-meta trunk hash)
-        new-cell (fn [cell-meta] (new-cell-by-raw trunk hash bs cell-meta))]
-    (if orig-meta
-      (with-write-lock
-        trunk hash
-        (let [orig-loc (get-cell-location)
-              orig-version (read-cell-header-field trunk orig-loc :version)
-              data-len (read-cell-header-field trunk orig-loc :cell-length)]
-          (when (> version orig-version)
-            (new-cell *cell-meta*)
-            (mark-cell-deleted trunk orig-loc data-len))))
+  (let [orig-meta (extract-cell-addr trunk hash)
+        new-cell (fn [cell-addr] (new-cell-by-raw trunk hash bs cell-addr))]
+    (if (and orig-meta (pos? orig-meta))
+      (do (println "dup" hash version)
+          (with-write-lock
+            trunk hash
+            (let [orig-loc (get-cell-location)
+                  orig-version (read-cell-header-field trunk orig-loc :version)
+                  data-len (read-cell-header-field trunk orig-loc :cell-length)]
+              (when (> version orig-version)
+                (new-cell hash)
+                (mark-cell-deleted trunk orig-loc data-len)))))
       (new-cell nil))))
 
 (defn cell-exists? [^Trunk ttrunk ^Long hash]

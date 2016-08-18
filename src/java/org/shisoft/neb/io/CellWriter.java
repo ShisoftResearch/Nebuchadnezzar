@@ -6,8 +6,6 @@ import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.exceptions.StoreFullException;
 
-import java.util.concurrent.atomic.AtomicBoolean;
-
 /**
  * Created by shisoft on 21/1/2016.
  */
@@ -54,18 +52,16 @@ public class CellWriter {
         trunk.getCleaner().addFragment(startLoc, startLoc + length - 1);
     }
 
-    public void updateCellToTrunkIndex(CellMeta meta, Trunk trunk){
-        meta.setLocation(startLoc);
+    public void updateCellToTrunkIndex(long hash, Trunk trunk){
+        synchronized (trunk.getCellIndex()) {
+            trunk.getCellIndex().put(hash, startLoc);
+        }
     }
 
-    public CellMeta addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
-        CellMeta meta = new CellMeta(startLoc);
+    public void addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
         synchronized (trunk.getCellIndex()) {
-            if (trunk.getCellIndex().putIfAbsent(hash, meta) != null) {
-                throw new Exception("Cell hash already exists");
-            }
+            trunk.getCellIndex().put(hash, startLoc);
         }
-        return meta;
     }
 
     public long getCurrLoc() {

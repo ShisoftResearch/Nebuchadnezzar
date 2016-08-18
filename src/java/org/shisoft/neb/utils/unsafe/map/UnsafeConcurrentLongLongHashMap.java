@@ -94,17 +94,21 @@ public class UnsafeConcurrentLongLongHashMap {
     }
 
     private long getFromBucket(long bucketLoc, long k) {
+        //System.out.println(bucketLoc);
         long addr = u.getLong(bucketLoc);
-        if (addr < 0) return  -1;
+        //System.out.println(bucketLoc + "-a-" + addr);
         while (true) {
+            if (addr < 0) return -1;
+            //System.out.println(bucketLoc + "-rk-" + addr);
             long key = u.getLong(addr + KEY_LOC);
+            //System.out.println(bucketLoc + "-k-" + key);
             if (key == k) {
+                //.out.println(bucketLoc + "-ek-" + key);
                 return u.getLong(addr + VAL_LOC);
             } else {
+                //System.out.println(bucketLoc + "-addr-" + addr);
                 addr = u.getLong(addr + NXT_LOC);
-                if (addr < 0) {
-                    return -1;
-                }
+                //System.out.println(bucketLoc + "-saddr-" + addr);
             }
         }
     }
@@ -142,9 +146,7 @@ public class UnsafeConcurrentLongLongHashMap {
                 }
                 addr = u.getLong(addr + NXT_LOC);
             }
-            if (addr < 0) {
-                return -1;
-            }
+            if (addr < 0) return -1;
             parent = addr;
         }
     }
@@ -173,14 +175,12 @@ public class UnsafeConcurrentLongLongHashMap {
     private boolean containsBucketKey (long bucketLoc, long k) {
         long addr = u.getLong(bucketLoc);
         while (true) {
+            if (addr < 0) return false;
             long key = u.getLong(addr + KEY_LOC);
             if (key == k) {
                 return true;
             } else {
                 addr = u.getLong(addr + NXT_LOC);
-                if (addr < 0) {
-                    return false;
-                }
             }
         }
     }

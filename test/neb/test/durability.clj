@@ -9,7 +9,9 @@
             [cluster-connector.utils.for-debug :refer [$ spy]]
             [clojure.core.async :as a])
   (:import (org.shisoft.neb.utils StandaloneZookeeper)
-           (org.shisoft.neb Trunk)))
+           (org.shisoft.neb Trunk)
+           (org.apache.commons.io FileUtils)
+           (java.io File)))
 
 (def trunks-size (* Integer/MAX_VALUE 1))
 (def memory-size (* Integer/MAX_VALUE 2))
@@ -169,5 +171,5 @@
             (clear-zk) => anything)
       (fact "Stop Server"
             (stop-server)  => anything)
-      #_(FileUtils/deleteDirectory (File. "data"))
+      (FileUtils/deleteDirectory (File. "data"))
       (.stopZookeeper zk))))

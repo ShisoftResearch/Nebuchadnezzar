@@ -1,9 +1,8 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.hash.HashLongObjMap;
-import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
+import net.openhft.koloboke.collect.map.LongLongMap;
+import net.openhft.koloboke.collect.map.hash.HashLongLongMaps;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
-import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.utils.UnsafeUtils;
 
@@ -11,9 +10,11 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
-import static org.shisoft.neb.io.type_lengths.*;
+import static org.shisoft.neb.io.type_lengths.byteLen;
+import static org.shisoft.neb.io.type_lengths.intLen;
 
 /**
  * Created by shisoft on 18/1/2016.
@@ -23,15 +24,17 @@ public class Trunk {
     final static int tombstoneSize = intLen + 1;
     final static int segSize    = 8 * 1024 * 1024; //8M Segment
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
+    final static int cellLockCount = 256;
 
     private int id;
     private long storeAddress;
     private long size;
-    private HashLongObjMap<CellMeta> cellIndex = HashLongObjMaps.newMutableMap();
+    private LongLongMap cellIndex = HashLongLongMaps.newMutableMap();
     private boolean backendEnabled = false;
     private Cleaner cleaner;
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
+    private ReentrantReadWriteLock[] cellLocks;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -41,11 +44,8 @@ public class Trunk {
     public long getSize() {
         return size;
     }
-    public HashLongObjMap<CellMeta> getCellIndex() {
+    public LongLongMap getCellIndex() {
         return cellIndex;
-    }
-    public long getCellLoc(long hash){
-        return cellIndex.get(hash).getLocation();
     }
     public int getId() {
         return id;
@@ -73,8 +73,21 @@ public class Trunk {
         this.size = size;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
+        initLocks();
         initSegments(segSize);
     }
+
+    private void initLocks() {
+        cellLocks = new ReentrantReadWriteLock[cellLockCount];
+        for (int i = 0; i < cellLocks.length; i++) {
+            cellLocks[i] = new ReentrantReadWriteLock();
+        }
+    }
+
+    public ReentrantReadWriteLock locateLock(long hash) {
+        return cellLocks[(int) (hash & (cellLockCount - 1))];
+    }
+
     private void initSegments (long segSize) {
         int segCount = (int) Math.floor((double) this.size / segSize);
         assert segCount > 0;
@@ -101,7 +114,7 @@ public class Trunk {
     public boolean hasCell (long hash){
         return getCellIndex().containsKey(hash);
     }
-    public Object getCellMeta(long hash){
+    public long getCellAddr(long hash){
         return getCellIndex().get(hash);
     }
     public void putTombstone (long startPos, long endPos){
@@ -135,7 +148,7 @@ public class Trunk {
 //        addDirtyRanges(target, dirtyEndPos);
     }
 
-    public boolean hasSpaces(long size) {
+    private boolean hasSpaces(long size) {
         for (Segment segment : this.segments) {
             if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) {
                 this.cleaner.phaseOneCleanSegment(segment);
@@ -190,18 +203,10 @@ public class Trunk {
     }
 
     public List<Segment> getDirtySegments () {
-        return Arrays.asList(segments).stream().filter(Segment::isDirty).collect(Collectors.toList());
+        return Arrays.stream(segments).filter(Segment::isDirty).collect(Collectors.toList());
     }
 
     public long getStoreAddress() {
         return storeAddress;
-    }
-
-    public void readMetaLockSegment(CellMeta meta) {
-        locateSegment(meta.getLocation()).getLock().readLock().lock();
-    }
-
-    public void readUnlockMetaSegment(CellMeta meta) {
-        locateSegment(meta.getLocation()).getLock().readLock().unlock();
     }
 }

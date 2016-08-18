@@ -1,12 +1,12 @@
 package org.shisoft.neb;
 
-import org.shisoft.neb.io.CellMeta;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.type_lengths;
 import org.shisoft.neb.utils.Bindings;
 
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -94,15 +94,18 @@ public class Cleaner {
                                 break;
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
-                            CellMeta meta = trunk.getCellIndex().get(cellHash);
-                            if (meta != null) {
+                            long cellAddr = trunk.getCellIndex().get(cellHash);
+                            if (cellAddr > 0) {
                                 segment.unlockWrite();
-                                synchronized (meta) {
-                                    if (meta.getLocation() == adjPos) {
+                                ReentrantReadWriteLock l = trunk.locateLock(cellHash);
+                                l.writeLock().lock();
+                                try {
+                                    if (cellAddr == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
-                                        meta.setLocation(fragLoc);
+                                        trunk.getCellIndex().put(cellHash, (long) fragLoc);
+                                        //meta.setLocation(fragLoc);
                                         removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         pos = fragLoc + cellLen;
@@ -111,6 +114,8 @@ public class Cleaner {
                                         retry++;
                                         //checkTooManyRetry("Cell meta modified in frag adj", retry);
                                     }
+                                } finally {
+                                    l.writeLock().unlock();
                                 }
                             } else {
                                 retry++;

@@ -45,8 +45,8 @@ public class TrunkStore {
         return trunks[0].getSize();
     }
 
-    public int[] getTrunksCellCount (){
-        int[] r = new int[getTrunkCount()];
+    public long[] getTrunksCellCount (){
+        long[] r = new long[getTrunkCount()];
         for (int i = 0; i < getTrunkCount(); i++){
             r[i] = trunks[i].getCellIndex().size();
         }

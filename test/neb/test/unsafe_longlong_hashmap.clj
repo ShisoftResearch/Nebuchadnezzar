@@ -1,7 +1,7 @@
 (ns neb.test.unsafe-longlong-hashmap
   (:require [midje.sweet :refer :all]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb.utils UnsafeConcurrentLongLongHashMap)))
+  (:import (org.shisoft.neb.utils.unsafe.map UnsafeConcurrentLongLongHashMap)))
 
 (fact "Unsafe concurrent long->long hash map"
       (println "Testing ucllmap")
