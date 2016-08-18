@@ -1,7 +1,5 @@
 package org.shisoft.neb;
 
-import net.openhft.koloboke.collect.map.LongLongMap;
-import net.openhft.koloboke.collect.map.hash.HashLongLongMaps;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.utils.UnsafeUtils;
@@ -9,6 +7,7 @@ import org.shisoft.neb.utils.UnsafeUtils;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
@@ -29,7 +28,7 @@ public class Trunk {
     private int id;
     private long storeAddress;
     private long size;
-    private LongLongMap cellIndex = HashLongLongMaps.newMutableMap();
+    private ConcurrentHashMap<Long, Long> cellIndex = new ConcurrentHashMap<>();
     private boolean backendEnabled = false;
     private Cleaner cleaner;
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
@@ -44,7 +43,7 @@ public class Trunk {
     public long getSize() {
         return size;
     }
-    public LongLongMap getCellIndex() {
+    public ConcurrentHashMap<Long, Long>  getCellIndex() {
         return cellIndex;
     }
     public int getId() {

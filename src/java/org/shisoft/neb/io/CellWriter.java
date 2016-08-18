@@ -60,7 +60,7 @@ public class CellWriter {
 
     public void addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
         synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().addValue(hash, startLoc);
+            trunk.getCellIndex().put(hash, startLoc);
         }
     }
 
