@@ -54,13 +54,13 @@ public class CellWriter {
 
     public void updateCellToTrunkIndex(long hash, Trunk trunk){
         synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().put(hash, startLoc);
+            trunk.getCellIndex().replace(hash, startLoc);
         }
     }
 
     public void addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
         synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().put(hash, startLoc);
+            trunk.getCellIndex().addValue(hash, startLoc);
         }
     }
 
