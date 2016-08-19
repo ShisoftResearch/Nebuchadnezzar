@@ -46,24 +46,24 @@
        ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
-  `(with-cell-meta
-     ~trunk ~hash
-     (let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
-           ^ReentrantReadWriteLock$WriteLock wlock# (.writeLock clock#)]
-       (.lock wlock#)
-       (try
-         ~@body
-         (finally (.unlock wlock#))))))
+  `(let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
+         ^ReentrantReadWriteLock$WriteLock wlock# (.writeLock clock#)]
+     (.lock wlock#)
+     (try
+       (with-cell-meta
+         ~trunk ~hash
+         ~@body)
+       (finally (.unlock wlock#)))))
 
 (defmacro with-read-lock [trunk hash & body]
-  `(with-cell-meta
-     ~trunk ~hash
-     (let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
-           ^ReentrantReadWriteLock$ReadLock rlock# (.readLock clock#)]
-       (.lock rlock#)
-       (try
-         ~@body
-         (finally (.unlock rlock#))))))
+  `(let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
+         ^ReentrantReadWriteLock$ReadLock rlock# (.readLock clock#)]
+     (.lock rlock#)
+     (try
+       (with-cell-meta
+         ~trunk ~hash
+         ~@body)
+       (finally (.unlock rlock#)))))
 
 (defn get-cell-location []
   (let [loc *cell-addr*]
@@ -296,13 +296,16 @@
         (write-cell-header cell-writer header-data)
         (doseq [{:keys [value writer length]} fields]
           (.streamWrite cell-writer writer value length))
-        (if update-hash-index?
-          (.updateCellToTrunkIndex cell-writer hash ttrunk)
-          (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
-        (mark-dirty cell-writer)
+        (let [result (if update-hash-index?
+                       (.updateCellToTrunkIndex cell-writer hash ttrunk)
+                       (.addCellMetaToTrunkIndex cell-writer hash ttrunk))]
+          (mark-dirty cell-writer)
+          {:ok true
+           :addr result})
         (catch Throwable tr
           (.rollBack cell-writer)
-          (clojure.stacktrace/print-cause-trace tr))))))
+          (clojure.stacktrace/print-cause-trace tr)
+          {:ok false})))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs & [cell-addr]]
   (let [cell-length (count bs)
@@ -347,13 +350,20 @@
           partition (read-cell-header-field trunk cell-loc :partition)
           version (read-cell-header-field trunk cell-loc :version)
           fields (plan-data-write data schema)
-          new-data-length (cell-len-by-fields fields)]
+          new-data-length (cell-len-by-fields fields)
+          new-version (inc version)]
       (assert (> data-len 0))
-      (if (= data-len new-data-length)
-        (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version (inc version))
-        (do (write-cell trunk hash partition schema data :planned-data fields :version (inc version))
-            (mark-cell-deleted trunk cell-loc data-len)))
-      data)))
+      (assoc data
+        :*version* new-version
+        :*result*
+        (let [result (write-cell trunk hash partition schema data :planned-data fields :version new-version)]
+          (when result
+            (mark-cell-deleted trunk cell-loc data-len)
+            (assoc result
+              :orig-addr cell-loc)))
+        #_(if (= data-len new-data-length)
+          (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version new-version)
+          )))))
 
 (defn replace-cell [^Trunk trunk ^Long hash data]
   (with-write-lock

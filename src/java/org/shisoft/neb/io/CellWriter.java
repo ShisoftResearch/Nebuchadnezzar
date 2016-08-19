@@ -52,16 +52,18 @@ public class CellWriter {
         trunk.getCleaner().addFragment(startLoc, startLoc + length - 1);
     }
 
-    public void updateCellToTrunkIndex(long hash, Trunk trunk){
-        synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().replace(hash, startLoc);
-        }
-    }
-
-    public void addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
+    public long updateCellToTrunkIndex(long hash, Trunk trunk){
         synchronized (trunk.getCellIndex()) {
             trunk.getCellIndex().put(hash, startLoc);
         }
+        return startLoc;
+    }
+
+    public long addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
+        synchronized (trunk.getCellIndex()) {
+            trunk.getCellIndex().put(hash, startLoc);
+        }
+        return startLoc;
     }
 
     public long getCurrLoc() {
