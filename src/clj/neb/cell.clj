@@ -346,18 +346,17 @@
           partition (read-cell-header-field trunk cell-loc :partition)
           version (read-cell-header-field trunk cell-loc :version)
           fields (plan-data-write data schema)
-          new-version (inc version)]
+          new-version (inc version)
+          new-data-length (cell-len-by-fields fields)]
       (assert (> data-len 0))
-      (assoc data
-        :*version* new-version
-        :*result*
+      (if (= data-len new-data-length)
+        (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version new-version)
         (let [result (write-cell trunk hash partition schema data :planned-data fields :version new-version)]
           (when result
             (mark-cell-deleted trunk cell-loc data-len)
-            result))
-        #_(if (= data-len new-data-length)
-          (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version new-version)
-          )))))
+            result)))
+      (assoc data
+        :*version* new-version))))
 
 (defn replace-cell [^Trunk trunk ^Long hash data]
   (with-write-lock
