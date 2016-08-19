@@ -351,10 +351,8 @@
       (assert (> data-len 0))
       (if (= data-len new-data-length)
         (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version new-version)
-        (let [result (write-cell trunk hash partition schema data :planned-data fields :version new-version)]
-          (when result
-            (mark-cell-deleted trunk cell-loc data-len)
-            result)))
+        (do (write-cell trunk hash partition schema data :planned-data fields :version new-version)
+            (mark-cell-deleted trunk cell-loc data-len)))
       (assoc data
         :*version* new-version))))
 
