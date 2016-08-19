@@ -14,7 +14,7 @@
       (update :num inc)
       (assoc :str (str (rand-int Integer/MAX_VALUE)))))
 
-(fact "Concurrent test"
+#_(fact "Concurrent test"
       (let [trunk (Trunk. (Trunk/getSegSize))
             pool (cp/threadpool 64)]
 

@@ -296,16 +296,13 @@
         (write-cell-header cell-writer header-data)
         (doseq [{:keys [value writer length]} fields]
           (.streamWrite cell-writer writer value length))
-        (let [result (if update-hash-index?
-                       (.updateCellToTrunkIndex cell-writer hash ttrunk)
-                       (.addCellMetaToTrunkIndex cell-writer hash ttrunk))]
-          (mark-dirty cell-writer)
-          {:ok true
-           :addr result})
+        (if update-hash-index?
+          (.updateCellToTrunkIndex cell-writer hash ttrunk)
+          (.addCellMetaToTrunkIndex cell-writer hash ttrunk))
+        (mark-dirty cell-writer)
         (catch Throwable tr
           (.rollBack cell-writer)
-          (clojure.stacktrace/print-cause-trace tr)
-          {:ok false})))))
+          (clojure.stacktrace/print-cause-trace tr))))))
 
 (defn new-cell-by-raw [^Trunk ttrunk ^Long hash ^bytes bs & [cell-addr]]
   (let [cell-length (count bs)
@@ -322,8 +319,7 @@
   (let [orig-meta (extract-cell-addr trunk hash)
         new-cell (fn [cell-addr] (new-cell-by-raw trunk hash bs cell-addr))]
     (if (and orig-meta (pos? orig-meta))
-      (do (println "dup" hash version)
-          (with-write-lock
+      (do (with-write-lock
             trunk hash
             (let [orig-loc (get-cell-location)
                   orig-version (read-cell-header-field trunk orig-loc :version)
@@ -350,7 +346,6 @@
           partition (read-cell-header-field trunk cell-loc :partition)
           version (read-cell-header-field trunk cell-loc :version)
           fields (plan-data-write data schema)
-          new-data-length (cell-len-by-fields fields)
           new-version (inc version)]
       (assert (> data-len 0))
       (assoc data
@@ -359,8 +354,7 @@
         (let [result (write-cell trunk hash partition schema data :planned-data fields :version new-version)]
           (when result
             (mark-cell-deleted trunk cell-loc data-len)
-            (assoc result
-              :orig-addr cell-loc)))
+            result))
         #_(if (= data-len new-data-length)
           (write-cell trunk hash partition schema data :loc cell-loc :planned-data fields :version new-version)
           )))))
