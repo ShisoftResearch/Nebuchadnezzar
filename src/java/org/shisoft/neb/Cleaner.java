@@ -94,12 +94,12 @@ public class Cleaner {
                                 break;
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
-                            long cellAddr = trunk.getCellIndex().get(cellHash);
-                            if (cellAddr > 0) {
-                                segment.unlockWrite();
-                                ReentrantReadWriteLock l = trunk.locateLock(cellHash);
-                                l.writeLock().lock();
-                                try {
+                            ReentrantReadWriteLock l = trunk.locateLock(cellHash);
+                            l.writeLock().lock();
+                            try {
+                                long cellAddr = trunk.getCellIndex().get(cellHash);
+                                if (cellAddr > 0) {
+                                    segment.unlockWrite();
                                     if (cellAddr == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
@@ -114,12 +114,13 @@ public class Cleaner {
                                         retry++;
                                         //checkTooManyRetry("Cell meta modified in frag adj", retry);
                                     }
-                                } finally {
-                                    l.writeLock().unlock();
+
+                                } else {
+                                    retry++;
+                                    //checkTooManyRetry("Cell cannot been found in frag adj", retry);
                                 }
-                            } else {
-                                retry++;
-                                //checkTooManyRetry("Cell cannot been found in frag adj", retry);
+                            } finally {
+                                l.writeLock().unlock();
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
