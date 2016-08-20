@@ -32,13 +32,7 @@
                   is-dirty? (.isDirty seg)]
               (.setClean seg)
               (.unlockWrite seg)
-              (cond
-                ;(> (count tombstones) 0)
-                ;(cp/pdoseq
-                ;  sync-pool [[sn sid] @server-sids]
-                ;  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-                ;              sid trunk-id seg-id  base-addr curr-addr data))
-                is-dirty?
+              (when is-dirty?
                 (cp/pdoseq
                   sync-pool [[sn sid] @server-sids]
                   (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment

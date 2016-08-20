@@ -80,7 +80,7 @@ public class Trunk {
     private void initLocks() {
         cellLocks = new ReentrantLock[cellLockCount];
         for (int i = 0; i < cellLocks.length; i++) {
-            cellLocks[i] = new ReentrantLock();
+            cellLocks[i] = new ReentrantLock(true);
         }
     }
 
