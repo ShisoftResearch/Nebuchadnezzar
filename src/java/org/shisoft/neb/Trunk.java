@@ -166,7 +166,6 @@ public class Trunk {
         }
         long r = -1;
         int turn = 0;
-        long acquireTimeSpan = System.currentTimeMillis();
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
             try {
@@ -177,7 +176,7 @@ public class Trunk {
                 } else {
                     segmentsQueue.remove(seg);
                     segmentsQueue.offer(seg);
-                    if (turn > 0 && seg == firstSeg && (!hasSpaces(length) || System.currentTimeMillis() - acquireTimeSpan > 60000)) {
+                    if (turn > 1 && firstSeg == seg) {
                         break;
                     }
                 }
