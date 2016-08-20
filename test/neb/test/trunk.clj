@@ -31,7 +31,7 @@
 
 (facts "trunk test"
        (fact "memory init"
-             (reset! ttrunk (Trunk. (Trunk/getSegSize))) => anything)
+             (reset! ttrunk (Trunk. (Trunk/getSegSize) 0)) => anything)
        (fact "define simple scheme"
              (add-schema :test-schema simple-scheme 1) => anything)
        (fact "write cell with simple shceme"

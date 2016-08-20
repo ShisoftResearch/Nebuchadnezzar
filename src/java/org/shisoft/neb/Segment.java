@@ -3,9 +3,7 @@ package org.shisoft.neb;
 import org.shisoft.neb.io.Reader;
 import org.shisoft.neb.io.Writer;
 
-import java.util.Set;
 import java.util.TreeSet;
-import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,7 +30,7 @@ public class Segment {
         this.trunk = trunk;
         this.currentLoc = new AtomicLong(baseAddr);
         this.deadObjectBytes = new AtomicInteger(0);
-        this.lock = new ReentrantReadWriteLock();
+        this.lock = new ReentrantReadWriteLock(true);
         this.frags = new TreeSet<>();
         this.isDirty = false;
     }

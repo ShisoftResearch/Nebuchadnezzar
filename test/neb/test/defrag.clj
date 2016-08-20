@@ -7,7 +7,7 @@
   (:import (org.shisoft.neb Trunk Segment)))
 
 (facts "Defragmentation"
-       (let [trunk (Trunk. (Trunk/getSegSize))
+       (let [trunk (Trunk. (Trunk/getSegSize) 0)
              a-d {:i (int 123)}
              b-d {:l 456}
              c-d  {:f (float 1.23) :i (int 101112)}]

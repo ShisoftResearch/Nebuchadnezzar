@@ -7,11 +7,13 @@
             [cluster-connector.remote-function-invocation.core :refer [compiled-cache]]
             [cluster-connector.utils.for-debug :refer [spy $]]
             [clojure.core.async :as a]
-            [neb.defragment :as defrag])
+            [neb.defragment :as defrag]
+            [com.climate.claypoole :as cp])
   (:import (org.shisoft.neb Trunk)
            (org.shisoft.neb.io CellReader CellWriter Reader type_lengths Writer)
            (java.util UUID)
-           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock ReentrantLock)))
+           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock ReentrantLock)
+           (java.util.concurrent.atomic AtomicLong)))
 
 (set! *warn-on-reflection* true)
 
@@ -169,42 +171,47 @@
                    (recur-nested (:f (schema-by-sname field-format)) (get data field-name))))]))
           schema-fields)))))
 
-(defrecord WritePlan [value writer length])
+(defrecord WritePlan [value writer length offset])
 
 (defn plan-data-write [data schema]
-  (->> (walk-schema-for-write
-         (:f schema) data
-         (fn [field-data field-name field-format field-props]
-           (let [{:keys [length writer dep dynamic? encoder
-                         unit-length count-array-length count-length checker]} field-props
-                 dep (when dep (get @data-types dep))
-                 writer (or writer (get dep :writer))]
-             (when (and checker (not (checker field-data)))
-               (throw (IllegalArgumentException. (str "Data check failed for field: " field-name " "
-                                                      "Expect: " (name field-format) " "
-                                                      "Actually: " (class field-data) " value: " field-data " "
-                                                      "data: " data))))
-             (let [field-data (if encoder (encoder field-data) field-data)]
-               (when (not (nil? field-data))
-                 (WritePlan. field-data writer
-                             (if dynamic?
-                               (cond
-                                 count-array-length
-                                 (+ (* (count-array-length field-data)
-                                       unit-length)
-                                    type_lengths/intLen)
-                                 count-length
-                                 (count-length field-data))
-                               length))))))
-         (fn [items]
-           (map second items))
-         (fn [_ _ array-header array-content]
-           [array-header array-content])
-         (fn [len]
-           (WritePlan. len int-writer type_lengths/intLen)))
-       (flatten)
-       (filter identity)
-       (doall)))
+  (let [offset (AtomicLong. cell-head-len)
+        plans (walk-schema-for-write
+                (:f schema) data
+                (fn [field-data field-name field-format field-props]
+                  (let [{:keys [length writer dep dynamic? encoder
+                                unit-length count-array-length count-length checker]} field-props
+                        dep (when dep (get @data-types dep))
+                        writer (or writer (get dep :writer))]
+                    (when (and checker (not (checker field-data)))
+                      (throw (IllegalArgumentException. (str "Data check failed for field: " field-name " "
+                                                             "Expect: " (name field-format) " "
+                                                             "Actually: " (class field-data) " value: " field-data " "
+                                                             "data: " data))))
+                    (let [field-data (if encoder (encoder field-data) field-data)
+                          field-len (if dynamic?
+                                      (cond
+                                        count-array-length
+                                        (+ (* (count-array-length field-data)
+                                              unit-length)
+                                           type_lengths/intLen)
+                                        count-length
+                                        (count-length field-data))
+                                      length)]
+                      (when (not (nil? field-data))
+                        (WritePlan.
+                          field-data writer
+                          field-len (.getAndAdd offset field-len))))))
+                (fn [items]
+                  (map second items))
+                (fn [_ _ array-header array-content]
+                  [array-header array-content])
+                (fn [len]
+                  (WritePlan. len int-writer type_lengths/intLen
+                              (long (.getAndAdd offset type_lengths/intLen)))))]
+    (->> plans
+         (flatten)
+         (filter identity)
+         (doall))))
 
 (def internal-cell-fields [:*schema* :*hash* :*id* :*version*])
 
@@ -292,8 +299,10 @@
                                     (CellWriter. ttrunk cell-length))]
       (try
         (write-cell-header cell-writer header-data)
-        (doseq [{:keys [value writer length]} fields]
-          (.streamWrite cell-writer writer value length))
+        (cp/pdoseq
+          (.getWriterPool ttrunk)
+          [{:keys [value writer length offset]} fields]
+          (.streamWrite cell-writer writer value length offset))
         (if update-hash-index?
           (.updateCellToTrunkIndex cell-writer hash ttrunk)
           (.addCellMetaToTrunkIndex cell-writer hash ttrunk))

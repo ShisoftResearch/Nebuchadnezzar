@@ -10,6 +10,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -35,6 +37,7 @@ public class Trunk {
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
     private ReentrantLock[] cellLocks;
+    private ScheduledExecutorService writerPool;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -49,9 +52,6 @@ public class Trunk {
     }
     public int getId() {
         return id;
-    }
-    public void setId(int id) {
-        this.id = id;
     }
     public Cleaner getCleaner() {
         return cleaner;
@@ -68,11 +68,16 @@ public class Trunk {
     public void setSegments(Segment[] segments) {
         this.segments = segments;
     }
+    public ScheduledExecutorService getWriterPool() {
+        return writerPool;
+    }
 
-    public Trunk(long size){
+    public Trunk(long size, int id){
         this.size = size;
+        this.id = id;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
+        writerPool = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> new Thread(r, "Cell Writer - " + id));
         initLocks();
         initSegments(segSize);
     }
@@ -101,6 +106,7 @@ public class Trunk {
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
+        getWriterPool().shutdown();
         return true;
     }
     public static sun.misc.Unsafe getUnsafe() {

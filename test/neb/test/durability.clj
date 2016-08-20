@@ -33,8 +33,7 @@
               :replication 2}
       inserted-cell-ids (atom #{})
       stoped-atom (atom false)
-      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."
-      flush-chan (a/chan)]
+      placr-holder "Lorem Ipsum is simply dummy text of the printing and typesetting industry."]
   (.startZookeeper zk 21817)
   (try
     (facts "Durability"

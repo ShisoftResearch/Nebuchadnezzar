@@ -12,7 +12,7 @@
       (assoc :str (str (rand-int Integer/MAX_VALUE)))))
 
 (fact "Concurrent test"
-      (let [trunk (Trunk. (Trunk/getSegSize))
+      (let [trunk (Trunk. (Trunk/getSegSize) 0)
             pool (cp/threadpool 64)]
 
         (fact "Schema"

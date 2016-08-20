@@ -6,6 +6,8 @@ import org.shisoft.neb.Trunk;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.exceptions.StoreFullException;
 
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * Created by shisoft on 21/1/2016.
  */
@@ -13,13 +15,13 @@ public class CellWriter {
 
     static IFn defragFn = Clojure.var("neb.defragment", "scan-trunk-and-defragment");
     long startLoc;
-    long currLoc;
+    AtomicLong currLoc;
     long length;
     Trunk trunk;
 
     private void init(Trunk trunk, long length, long currLoc){
         this.trunk = trunk;
-        this.currLoc = currLoc;
+        this.currLoc = new AtomicLong(currLoc);
         this.startLoc = currLoc;
         this.length = length;
     }
@@ -44,7 +46,12 @@ public class CellWriter {
 
     public void streamWrite (IFn fn, Object value, long length){
         fn.invoke(value, currLoc);
-        currLoc += length;
+        currLoc.addAndGet(length);
+    }
+
+    public void streamWrite (IFn fn, Object value, long length, long offset){
+        fn.invoke(value, startLoc + offset);
+        currLoc.addAndGet(length);
     }
 
     public void rollBack () {
@@ -67,7 +74,7 @@ public class CellWriter {
     }
 
     public long getCurrLoc() {
-        return currLoc;
+        return currLoc.get();
     }
 
     public Trunk getTrunk() {
@@ -75,7 +82,7 @@ public class CellWriter {
     }
 
     public void markDirty () {
-        trunk.addDirtyRanges(startLoc, currLoc - 1);
+        trunk.addDirtyRanges(startLoc, currLoc.get() - 1);
     }
 
     public long getStartLoc() {
