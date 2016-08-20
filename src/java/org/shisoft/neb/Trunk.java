@@ -168,20 +168,15 @@ public class Trunk {
         int turn = 0;
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
-            try {
-                seg.lockRead();
-                r = seg.tryAcquireSpace(length);
-                if (r > 0) {
+            r = seg.tryAcquireSpace(length);
+            if (r > 0) {
+                break;
+            } else {
+                segmentsQueue.remove(seg);
+                segmentsQueue.offer(seg);
+                if (turn > 1 && firstSeg == seg) {
                     break;
-                } else {
-                    segmentsQueue.remove(seg);
-                    segmentsQueue.offer(seg);
-                    if (turn > 1 && firstSeg == seg) {
-                        break;
-                    }
                 }
-            } finally {
-                seg.unlockRead();
             }
             turn ++;
         }
