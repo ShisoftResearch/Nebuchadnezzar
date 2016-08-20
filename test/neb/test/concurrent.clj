@@ -4,10 +4,7 @@
             [neb.cell :refer [new-cell read-cell delete-cell replace-cell update-cell read-cell-headers]]
             [com.climate.claypoole :as cp]
             [cluster-connector.utils.for-debug :refer [spy $]])
-  (:import (org.shisoft.neb Trunk)
-           (org.shisoft.neb.io CellReader CellWriter Reader type_lengths Writer)
-           (java.util UUID)
-           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock)))
+  (:import (org.shisoft.neb Trunk)))
 
 (defn update-test [cell]
   (-> cell

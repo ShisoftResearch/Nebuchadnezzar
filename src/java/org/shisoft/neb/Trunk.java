@@ -10,7 +10,7 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.shisoft.neb.io.type_lengths.byteLen;
@@ -34,7 +34,7 @@ public class Trunk {
     private Cleaner cleaner;
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
-    private ReentrantReadWriteLock[] cellLocks;
+    private ReentrantLock[] cellLocks;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -78,13 +78,13 @@ public class Trunk {
     }
 
     private void initLocks() {
-        cellLocks = new ReentrantReadWriteLock[cellLockCount];
+        cellLocks = new ReentrantLock[cellLockCount];
         for (int i = 0; i < cellLocks.length; i++) {
-            cellLocks[i] = new ReentrantReadWriteLock();
+            cellLocks[i] = new ReentrantLock();
         }
     }
 
-    public ReentrantReadWriteLock locateLock(long hash) {
+    public ReentrantLock locateLock(long hash) {
         return cellLocks[(int) (hash & (cellLockCount - 1))];
     }
 
@@ -207,5 +207,17 @@ public class Trunk {
 
     public long getStoreAddress() {
         return storeAddress;
+    }
+
+    public static void lockIfNotOwned(ReentrantLock l) {
+        if (!l.isHeldByCurrentThread()){
+            l.lock();
+        }
+    }
+
+    public static void unlockIfOwned(ReentrantLock l){
+        if (l.isHeldByCurrentThread()){
+            l.unlock();
+        }
     }
 }

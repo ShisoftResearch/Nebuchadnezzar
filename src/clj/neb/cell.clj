@@ -11,7 +11,7 @@
   (:import (org.shisoft.neb Trunk)
            (org.shisoft.neb.io CellReader CellWriter Reader type_lengths Writer)
            (java.util UUID)
-           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock)))
+           (java.util.concurrent.locks ReentrantReadWriteLock$ReadLock ReentrantReadWriteLock ReentrantReadWriteLock$WriteLock ReentrantLock)))
 
 (set! *warn-on-reflection* true)
 
@@ -46,24 +46,22 @@
        ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
-  `(let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
-         ^ReentrantReadWriteLock$WriteLock wlock# (.writeLock clock#)]
-     (.lock wlock#)
+  `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
+     (Trunk/lockIfNotOwned lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (.unlock wlock#)))))
+       (finally (Trunk/unlockIfOwned lock#)))))
 
 (defmacro with-read-lock [trunk hash & body]
-  `(let [^ReentrantReadWriteLock clock# (.locateLock ~trunk ~hash)
-         ^ReentrantReadWriteLock$ReadLock rlock# (.readLock clock#)]
-     (.lock rlock#)
+  `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
+     (Trunk/lockIfNotOwned lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (.unlock rlock#)))))
+       (finally (Trunk/unlockIfOwned lock#)))))
 
 (defn get-cell-location []
   (let [loc *cell-addr*]
