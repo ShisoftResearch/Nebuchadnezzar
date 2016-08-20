@@ -22,29 +22,28 @@
           sync-pool (cp/threadpool (count @server-sids) :name "Backup-Remote")
           trunk-id (.getId trunk)]
       (doseq [^Segment seg dirty-segments]
-        (try
+        (when (.isDirty seg)
           (.lockWrite seg)
-          (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
-                curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
-                seg-id (.getId seg)
-                data (.getData seg)
-                is-dirty? (.isDirty seg)]
-            (.setClean seg)
-            (.unlockWrite seg)
-            (assert (>= base-addr 0))
-            (assert (>= curr-addr 0))
-            (cond
-              ;(> (count tombstones) 0)
-              ;(cp/pdoseq
-              ;  sync-pool [[sn sid] @server-sids]
-              ;  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-              ;              sid trunk-id seg-id  base-addr curr-addr data))
-              is-dirty?
-              (cp/pdoseq
-                sync-pool [[sn sid] @server-sids]
-                (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-                            sid trunk-id seg-id  base-addr curr-addr data))))
-          (finally (.unlockWrite seg))))
+          (try
+            (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
+                  curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
+                  seg-id (.getId seg)
+                  data (.getData seg)
+                  is-dirty? (.isDirty seg)]
+              (.setClean seg)
+              (.unlockWrite seg)
+              (cond
+                ;(> (count tombstones) 0)
+                ;(cp/pdoseq
+                ;  sync-pool [[sn sid] @server-sids]
+                ;  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+                ;              sid trunk-id seg-id  base-addr curr-addr data))
+                is-dirty?
+                (cp/pdoseq
+                  sync-pool [[sn sid] @server-sids]
+                  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+                              sid trunk-id seg-id  base-addr curr-addr data))))
+            (finally (.unlockWrite seg)))))
       (cp/pdoseq
         sync-pool [[sn sid] @server-sids]
         (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-completed sid trunk-id))

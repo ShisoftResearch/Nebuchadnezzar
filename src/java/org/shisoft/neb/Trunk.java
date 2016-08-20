@@ -24,7 +24,7 @@ public class Trunk {
     final static int tombstoneSize = intLen + 1;
     final static int segSize    = 8 * 1024 * 1024; //8M Segment
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
-    final static int cellLockCount = 256;
+    final static int cellLockCount = 2048;
 
     private int id;
     private long storeAddress;
