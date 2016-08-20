@@ -52,6 +52,10 @@ public class Cleaner {
         }
     }
 
+    private boolean isInSegment(long addr, Segment segment) {
+        return addr >= segment.getBaseAddr() && addr < segment.getBaseAddr() + Trunk.getSegSize();
+    }
+
     public void phaseOneCleanSegment(Segment segment) {
         long pos = segment.getBaseAddr();
         int retry = 0;
@@ -61,7 +65,7 @@ public class Cleaner {
                 segment.lockWrite();
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
-                if (fragLoc < segment.getBaseAddr() || fragLoc >= segment.getBaseAddr() + Trunk.getSegSize()) {
+                if (!isInSegment(fragLoc, segment)) {
                     System.out.println("Frag out of segment range: " + segment.getBaseAddr() + " ~ " + (segment.getBaseAddr() + Trunk.getSegSize()) + ", " + fragLoc);
                     segment.getFrags().remove(fragLoc);
                     break;
@@ -95,17 +99,16 @@ public class Cleaner {
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             ReentrantReadWriteLock l = trunk.locateLock(cellHash);
+                            segment.unlockWrite();
                             l.writeLock().lock();
                             try {
                                 long cellAddr = trunk.getCellIndex().get(cellHash);
-                                if (cellAddr > 0) {
-                                    segment.unlockWrite();
+                                if (cellAddr > 0 && isInSegment(cellAddr, segment)) {
                                     if (cellAddr == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
                                         trunk.getCellIndex().put(cellHash, (long) fragLoc);
-                                        //meta.setLocation(fragLoc);
                                         removeFragment(segment, fragLoc, fragLen);
                                         addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         pos = fragLoc + cellLen;
