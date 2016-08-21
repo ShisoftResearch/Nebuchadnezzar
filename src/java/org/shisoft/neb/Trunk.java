@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -28,6 +29,8 @@ public class Trunk {
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
     final static int cellLockCount = 2048;
 
+    static ScheduledExecutorService writerPool;
+
     private int id;
     private long storeAddress;
     private long size;
@@ -37,7 +40,6 @@ public class Trunk {
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
     private ReentrantLock[] cellLocks;
-    private ScheduledExecutorService writerPool;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -72,12 +74,23 @@ public class Trunk {
         return writerPool;
     }
 
+    public static void reloadWriterPool(){
+        AtomicInteger poolId = new AtomicInteger(0);
+        writerPool = Executors.newScheduledThreadPool(
+                Runtime.getRuntime().availableProcessors() * 2,
+                r -> new Thread(r, "Cell Writer - " + poolId.getAndIncrement())
+        );
+    }
+
+    static {
+        reloadWriterPool();
+    }
+
     public Trunk(long size, int id){
         this.size = size;
         this.id = id;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
-        writerPool = Executors.newScheduledThreadPool(Runtime.getRuntime().availableProcessors(), r -> new Thread(r, "Cell Writer - " + id));
         initLocks();
         initSegments(segSize);
     }
@@ -106,7 +119,6 @@ public class Trunk {
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
-        getWriterPool().shutdown();
         return true;
     }
     public static sun.misc.Unsafe getUnsafe() {
@@ -150,20 +162,18 @@ public class Trunk {
         assert target >= this.storeAddress && target < this.storeAddress + this.getSize();
         assert target + len <= this.storeAddress + this.getSize();
         getUnsafe().copyMemory(startPos, target, len);
-//        long dirtyEndPos = target + len - 1;
-//        addDirtyRanges(target, dirtyEndPos);
     }
 
-    private boolean hasSpaces(long size) {
+    private int[] hasSpaces(long size, Segment lockedSegment) {
         for (Segment segment : this.segments) {
             if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) {
+                lockedSegment.unlockRead();
                 this.cleaner.phaseOneCleanSegment(segment);
-                if (Trunk.getSegSize() - (segment.getCurrentLoc() - segment.getBaseAddr()) > size) {
-                    return true;
-                }
+                boolean hashSpace = Trunk.getSegSize() - (segment.getCurrentLoc() - segment.getBaseAddr()) > size;
+                return new int[]{hashSpace ? 1 : 0, 1};
             }
         }
-        return false;
+        return new int[]{0, 0};
     }
 
     public long tryAcquireSpace (long length) throws ObjectTooLargeException {
@@ -174,6 +184,7 @@ public class Trunk {
         int turn = 0;
         Segment firstSeg = segmentsQueue.peek();
         for (Segment seg : segmentsQueue) {
+            boolean lockReleased = false;
             try {
                 seg.lockRead();
                 r = seg.tryAcquireSpace(length);
@@ -183,11 +194,13 @@ public class Trunk {
                     segmentsQueue.remove(seg);
                     segmentsQueue.offer(seg);
                     if (turn > 1 && firstSeg == seg) {
-                        break;
+                        int[] hashSpace = hasSpaces(length, seg); //0 -> has space, 1 -> lock released
+                        if (hashSpace[1] == 1) lockReleased = true;
+                        if (hashSpace[0] == 1) break;
                     }
                 }
             } finally {
-                seg.unlockRead();
+                if (!lockReleased) seg.unlockRead();
             }
             turn ++;
         }
