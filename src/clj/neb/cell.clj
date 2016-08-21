@@ -299,9 +299,7 @@
                                     (CellWriter. ttrunk cell-length))]
       (try
         (write-cell-header cell-writer header-data)
-        (cp/pdoseq
-          (.getWriterPool ttrunk)
-          [{:keys [value writer length offset]} fields]
+        (doseq [{:keys [value writer length offset]} fields]
           (.streamWrite cell-writer writer value length offset))
         (if update-hash-index?
           (.updateCellToTrunkIndex cell-writer hash ttrunk)

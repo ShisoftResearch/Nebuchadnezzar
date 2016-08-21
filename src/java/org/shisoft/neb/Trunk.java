@@ -29,9 +29,6 @@ public class Trunk {
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
     final static int cellLockCount = 2048;
 
-    private ScheduledExecutorService writerPool;
-    private int writePoolSize;
-
     private int id;
     private long storeAddress;
     private long size;
@@ -71,17 +68,6 @@ public class Trunk {
     public void setSegments(Segment[] segments) {
         this.segments = segments;
     }
-    public ScheduledExecutorService getWriterPool() {
-        return writerPool;
-    }
-
-    public void initWriterPool(){
-        AtomicInteger poolId = new AtomicInteger(0);
-        writerPool = Executors.newScheduledThreadPool(
-                Math.max(writePoolSize, 2),
-                r -> new Thread(r, "Cell Writer - " + this.id + " - " + poolId.getAndIncrement())
-        );
-    }
 
     public Trunk(long size, int id){
         this(size, id, 8);
@@ -90,11 +76,9 @@ public class Trunk {
     public Trunk(long size, int id, int trunkCount){
         this.size = size;
         this.id = id;
-        this.writePoolSize = Runtime.getRuntime().availableProcessors() / trunkCount;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
         initLocks();
-        initWriterPool();
         initSegments(segSize);
     }
 
@@ -122,7 +106,6 @@ public class Trunk {
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
-        this.writerPool.shutdown();
         return true;
     }
     public static sun.misc.Unsafe getUnsafe() {
