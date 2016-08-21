@@ -14,7 +14,7 @@ public class TrunkStore {
     public void init(int trunkCount, long trunkSize, boolean durability) {
         trunks = new Trunk[trunkCount];
         for (int i = 0; i < trunkCount; i++){
-            trunks[i] = new Trunk(trunkSize, i);
+            trunks[i] = new Trunk(trunkSize, i, trunkCount);
             if (durability){
                 trunks[i].enableDurability();
             }

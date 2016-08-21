@@ -7,6 +7,7 @@ import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -88,20 +89,17 @@ public class Segment {
     }
 
     public void lockWrite () {
-        this.lock.writeLock().lock();
+        if (!this.lock.writeLock().isHeldByCurrentThread()) this.lock.writeLock().lock();
     }
     public void unlockWrite () {
-        if (this.lock.writeLock().isHeldByCurrentThread()) {
-            this.lock.writeLock().unlock();
-        }
+        if (this.lock.writeLock().isHeldByCurrentThread()) this.lock.writeLock().unlock();
     }
+
     public void lockRead () {
-        this.lock.writeLock().lock();
+        this.lock.readLock().lock();
     }
     public void unlockRead () {
-        if (this.lock.writeLock().isHeldByCurrentThread()) {
-            this.lock.writeLock().unlock();
-        }
+        this.lock.readLock().unlock();
     }
 
     public long tryAcquireSpace (long len) {

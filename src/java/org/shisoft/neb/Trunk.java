@@ -29,7 +29,8 @@ public class Trunk {
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
     final static int cellLockCount = 2048;
 
-    static ScheduledExecutorService writerPool;
+    private ScheduledExecutorService writerPool;
+    private int writePoolSize;
 
     private int id;
     private long storeAddress;
@@ -74,24 +75,26 @@ public class Trunk {
         return writerPool;
     }
 
-    public static void reloadWriterPool(){
+    public void initWriterPool(){
         AtomicInteger poolId = new AtomicInteger(0);
         writerPool = Executors.newScheduledThreadPool(
-                Runtime.getRuntime().availableProcessors() * 2,
-                r -> new Thread(r, "Cell Writer - " + poolId.getAndIncrement())
+                Math.max(writePoolSize, 2),
+                r -> new Thread(r, "Cell Writer - " + this.id + " - " + poolId.getAndIncrement())
         );
     }
 
-    static {
-        reloadWriterPool();
+    public Trunk(long size, int id){
+        this(size, id, 8);
     }
 
-    public Trunk(long size, int id){
+    public Trunk(long size, int id, int trunkCount){
         this.size = size;
         this.id = id;
+        this.writePoolSize = Runtime.getRuntime().availableProcessors() / trunkCount;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
         initLocks();
+        initWriterPool();
         initSegments(segSize);
     }
 
@@ -119,6 +122,7 @@ public class Trunk {
     }
     public boolean dispose () throws IOException {
         getUnsafe().freeMemory(storeAddress);
+        this.writerPool.shutdown();
         return true;
     }
     public static sun.misc.Unsafe getUnsafe() {
@@ -164,16 +168,15 @@ public class Trunk {
         getUnsafe().copyMemory(startPos, target, len);
     }
 
-    private int[] hasSpaces(long size, Segment lockedSegment) {
+    private boolean hasSpaces(long size, Segment lockedSegment) {
         for (Segment segment : this.segments) {
             if (Trunk.getSegSize() - segment.getAliveObjectBytes() > size) {
-                lockedSegment.unlockRead();
                 this.cleaner.phaseOneCleanSegment(segment);
                 boolean hashSpace = Trunk.getSegSize() - (segment.getCurrentLoc() - segment.getBaseAddr()) > size;
-                return new int[]{hashSpace ? 1 : 0, 1};
+                return true;
             }
         }
-        return new int[]{0, 0};
+        return false;
     }
 
     public long tryAcquireSpace (long length) throws ObjectTooLargeException {
@@ -183,26 +186,30 @@ public class Trunk {
         long r = -1;
         int turn = 0;
         Segment firstSeg = segmentsQueue.peek();
-        for (Segment seg : segmentsQueue) {
-            boolean lockReleased = false;
+        while (true) {
             try {
+                Segment seg = segmentsQueue.peek();
+                if (seg.getLock().writeLock().getHoldCount() > 0) continue;
                 seg.lockRead();
-                r = seg.tryAcquireSpace(length);
+                try {
+                    r = seg.tryAcquireSpace(length);
+                } finally {
+                    seg.unlockRead();
+                }
                 if (r > 0) {
                     break;
                 } else {
                     segmentsQueue.remove(seg);
                     segmentsQueue.offer(seg);
                     if (turn > 1 && firstSeg == seg) {
-                        int[] hashSpace = hasSpaces(length, seg); //0 -> has space, 1 -> lock released
-                        if (hashSpace[1] == 1) lockReleased = true;
-                        if (hashSpace[0] == 1) break;
+                        if (!hasSpaces(length, seg)) {
+                            break;
+                        }
                     }
                 }
             } finally {
-                if (!lockReleased) seg.unlockRead();
+                turn ++;
             }
-            turn ++;
         }
         return r;
     }

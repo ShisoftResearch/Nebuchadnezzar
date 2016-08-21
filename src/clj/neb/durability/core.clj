@@ -8,9 +8,6 @@
   (:import (org.shisoft.neb Trunk Segment)))
 
 ;TODO: Durability for Nebuchadnezzar is still a undetermined feature.
-;      The ideal design is to provide multi-master replication backend. Right now, there will be no replication.
-;      Each object will only have on copy on local hard drive.
-;      I thought about using memory map file, but it is uncontrolable and is also impossible to impelement replication in the future
 
 (set! *warn-on-reflection* true)
 
@@ -22,7 +19,7 @@
           sync-pool (cp/threadpool (count @server-sids) :name "Backup-Remote")
           trunk-id (.getId trunk)]
       (doseq [^Segment seg dirty-segments]
-        (when (.isDirty seg)
+        (when (and (.isDirty seg) (not (.isWriteLocked (.getLock seg))))
           (.lockWrite seg)
           (try
             (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))

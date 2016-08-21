@@ -57,12 +57,13 @@ public class Cleaner {
     }
 
     public void phaseOneCleanSegment(Segment segment) {
-        long pos = segment.getBaseAddr();
-        int retry = 0;
-        while (true) {
-            try {
+        segment.lockWrite();
+        try {
+            long pos = segment.getBaseAddr();
+            int retry = 0;
+            while (true) {
                 if (segment.getFrags().isEmpty()) break;
-                segment.lockWrite();
+
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
                 if (!isInSegment(fragLoc, segment)) {
@@ -100,6 +101,7 @@ public class Cleaner {
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             ReentrantLock l = trunk.locateLock(cellHash);
                             segment.unlockWrite();
+                            if (l.isLocked() && !l.isHeldByCurrentThread()) break;
                             Trunk.lockIfNotOwned(l);
                             try {
                                 long cellAddr = trunk.getCellIndex().get(cellHash);
@@ -115,12 +117,12 @@ public class Cleaner {
                                         retry = 0;
                                     } else {
                                         retry++;
-                                        //checkTooManyRetry("Cell meta modified in frag adj", retry);
+                                        checkTooManyRetry("Cell meta modified in frag adj", retry);
                                     }
 
                                 } else {
                                     retry++;
-                                    //checkTooManyRetry("Cell cannot been found in frag adj", retry);
+                                    checkTooManyRetry("Cell cannot been found in frag adj", retry);
                                 }
                             } finally {
                                 Trunk.unlockIfOwned(l);
@@ -134,21 +136,21 @@ public class Cleaner {
                                 retry = 0;
                             } else {
                                 retry++;
-                                checkTooManyRetry("Adj frag does not on record", retry);
+                                checkTooManyRetry("Adj frag does not on record " + adjPos, retry);
                             }
                         } else {
                             retry++;
-//                            checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
-//                                    pos + " " + segment.getCurrentLoc(), retry);
+                            checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
+                                    pos + " " + segment.getCurrentLoc(), retry);
                         }
                     }
                 } else {
                     retry++;
                     checkTooManyRetry("Location is not a frag", retry);
                 }
-            } finally {
-                segment.unlockWrite();
             }
+        } finally {
+            segment.unlockWrite();
         }
     }
 
