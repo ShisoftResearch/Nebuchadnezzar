@@ -47,7 +47,7 @@ public class Cleaner {
     }
 
     private void checkTooManyRetry(String message, int retry) {
-        if (retry > 1000) {
+        if (retry > 10000) {
             System.out.println(message + " " + retry);
         }
     }
