@@ -122,7 +122,7 @@ public class Cleaner {
 
                                 } else {
                                     retry++;
-                                    checkTooManyRetry("Cell cannot been found in frag adj", retry);
+                                    //checkTooManyRetry("Cell cannot been found in frag adj", retry);
                                 }
                             } finally {
                                 Trunk.unlockIfOwned(l);
@@ -140,8 +140,8 @@ public class Cleaner {
                             }
                         } else {
                             retry++;
-                            checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
-                                    pos + " " + segment.getCurrentLoc(), retry);
+                            //checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
+                            //        pos + " " + segment.getCurrentLoc(), retry);
                         }
                     }
                 } else {
