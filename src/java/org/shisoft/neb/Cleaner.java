@@ -141,7 +141,7 @@ public class Cleaner {
                         } else {
                             retry++;
                             //checkTooManyRetry("Adj pos cannot been recognized " + Reader.readByte(adjPos) + " " +
-                                    pos + " " + segment.getCurrentLoc(), retry);
+                            //        pos + " " + segment.getCurrentLoc(), retry);
                         }
                     }
                 } else {
