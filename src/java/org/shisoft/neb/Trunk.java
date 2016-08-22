@@ -1,7 +1,9 @@
 package org.shisoft.neb;
 
 import net.openhft.koloboke.collect.map.LongLongMap;
+import net.openhft.koloboke.collect.map.LongObjMap;
 import net.openhft.koloboke.collect.map.hash.HashLongLongMaps;
+import net.openhft.koloboke.collect.map.hash.HashLongObjMaps;
 import org.shisoft.neb.exceptions.ObjectTooLargeException;
 import org.shisoft.neb.io.Writer;
 import org.shisoft.neb.utils.UnsafeUtils;
@@ -10,7 +12,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 import static org.shisoft.neb.io.type_lengths.byteLen;
@@ -30,11 +31,11 @@ public class Trunk {
     private long storeAddress;
     private long size;
     private LongLongMap cellIndex = HashLongLongMaps.newMutableMap();
+    private LongObjMap<CellLock> cellLockCache = HashLongObjMaps.newMutableMap();
     private boolean backendEnabled = false;
     private Cleaner cleaner;
     private ConcurrentLinkedQueue<Segment> segmentsQueue;
     private Segment[] segments;
-    private ReentrantLock[] cellLocks;
     public boolean isBackendEnabled() {
         return backendEnabled;
     }
@@ -75,19 +76,7 @@ public class Trunk {
         this.id = id;
         storeAddress = getUnsafe().allocateMemory(size);
         cleaner = new Cleaner(this);
-        initLocks();
         initSegments(segSize);
-    }
-
-    private void initLocks() {
-        cellLocks = new ReentrantLock[cellLockCount];
-        for (int i = 0; i < cellLocks.length; i++) {
-            cellLocks[i] = new ReentrantLock(true);
-        }
-    }
-
-    public ReentrantLock locateLock(long hash) {
-        return cellLocks[(int) (hash & (cellLockCount - 1))];
     }
 
     private void initSegments (long segSize) {
@@ -211,15 +200,46 @@ public class Trunk {
         return Arrays.stream(segments).filter(Segment::isDirty).collect(Collectors.toList());
     }
 
-    public long getStoreAddress() {
+    public long getStoreAddress () {
         return storeAddress;
     }
 
-    public static void lockCell(ReentrantLock l) {
-        l.lock();
+    public CellLock getCellLock (long hash) {
+        synchronized (cellLockCache) {
+            CellLock cl = cellLockCache.get(hash);
+            if (cl == null) {
+                cl = new CellLock(hash);
+                cellLockCache.put(hash, cl);
+            }
+            cl.getAcquired().getAndIncrement();
+            return cl;
+        }
     }
 
-    public static void unlockCell(ReentrantLock l){
-        l.unlock();
+    public void releaseCellLock (CellLock cl) {
+        cl.getAcquired().updateAndGet(operand -> {
+            --operand;
+            if (operand == 0) {
+                synchronized (cellLockCache) {
+                    cellLockCache.remove(cl.getHash(), cl);
+                    return -1;
+                }
+            } else if (operand < 0) {
+                System.out.println("WARN: acquired lock below 0");
+            }
+            return operand;
+        });
     }
+
+    public CellLock lockWrite (long hash) {
+        CellLock cl = getCellLock(hash);
+        cl.getLock().writeLock().lock();
+        return cl;
+    }
+
+    public void unlockWrite (CellLock cl) {
+        cl.getLock().writeLock().unlock();
+        releaseCellLock(cl);
+    }
+
 }

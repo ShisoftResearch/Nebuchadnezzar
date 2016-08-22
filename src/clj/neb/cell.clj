@@ -48,22 +48,28 @@
        ~@body)))
 
 (defmacro with-write-lock [trunk hash & body]
-  `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
-     (Trunk/lockCell lock#)
+  `(let [clock# (.getCellLock ~trunk ~hash)
+         lock# (.writeLock  ^ReentrantReadWriteLock (.getLock clock#))]
+     (.lock lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (Trunk/unlockCell lock#)))))
+       (finally
+         (.unlock lock#)
+         (.releaseCellLock ~trunk clock#)))))
 
 (defmacro with-read-lock [trunk hash & body]
-  `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
-     (Trunk/lockCell lock#)
+  `(let [clock# (.getCellLock ~trunk ~hash)
+         lock# (.readLock  ^ReentrantReadWriteLock (.getLock clock#))]
+     (.lock lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (Trunk/unlockCell lock#)))))
+       (finally
+         (.unlock lock#)
+         (.releaseCellLock ~trunk clock#)))))
 
 (defn get-cell-location []
   (let [loc *cell-addr*]

@@ -6,7 +6,6 @@ import org.shisoft.neb.utils.Bindings;
 
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -99,10 +98,8 @@ public class Cleaner {
                                 break;
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
-                            ReentrantLock l = trunk.locateLock(cellHash);
                             segment.unlockWrite();
-                            if (l.isLocked() && !l.isHeldByCurrentThread()) break;
-                            Trunk.lockCell(l);
+                            CellLock cl = trunk.lockWrite(cellHash);
                             try {
                                 long cellAddr = trunk.getCellIndex().get(cellHash);
                                 if (cellAddr > 0 && isInSegment(cellAddr, segment)) {
@@ -125,7 +122,7 @@ public class Cleaner {
                                     //checkTooManyRetry("Cell cannot been found in frag adj", retry);
                                 }
                             } finally {
-                                Trunk.unlockCell(l);
+                                trunk.unlockWrite(cl);
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
