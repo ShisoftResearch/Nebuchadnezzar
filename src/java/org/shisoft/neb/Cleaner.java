@@ -99,7 +99,12 @@ public class Cleaner {
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
                             segment.unlockWrite();
-                            CellLock cl = trunk.lockWrite(cellHash);
+                            CellLock cl = trunk.getCellLock(cellHash);
+                            boolean locked = cl.getLock().writeLock().tryLock();
+                            if (!locked) {
+                                trunk.releaseCellLock(cl);
+                                break;
+                            }
                             try {
                                 long cellAddr = trunk.getCellIndex().get(cellHash);
                                 if (cellAddr > 0 && isInSegment(cellAddr, segment)) {

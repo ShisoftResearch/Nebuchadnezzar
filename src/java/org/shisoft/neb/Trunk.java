@@ -244,6 +244,7 @@ public class Trunk {
         return cl;
     }
 
+
     public void unlockWrite (CellLock cl) {
         cl.getLock().writeLock().unlock();
         releaseCellLock(cl);
