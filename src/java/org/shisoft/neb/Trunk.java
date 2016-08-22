@@ -148,6 +148,11 @@ public class Trunk {
         return false;
     }
 
+    public void putToBack(Segment seg) {
+        segmentsQueue.remove(seg);
+        segmentsQueue.offer(seg);
+    }
+
     public long tryAcquireSpace (long length) throws ObjectTooLargeException {
         if (length > maxObjSize) {
             throw new ObjectTooLargeException(length + " of " + maxObjSize);
@@ -158,7 +163,10 @@ public class Trunk {
         while (true) {
             try {
                 Segment seg = segmentsQueue.peek();
-                if (seg.getLock().writeLock().getHoldCount() > 0) continue;
+                if (seg.getLock().writeLock().getHoldCount() > 0) {
+                    putToBack(seg);
+                    continue;
+                }
                 seg.lockRead();
                 try {
                     r = seg.tryAcquireSpace(length);
@@ -168,8 +176,7 @@ public class Trunk {
                 if (r > 0) {
                     break;
                 } else {
-                    segmentsQueue.remove(seg);
-                    segmentsQueue.offer(seg);
+                    putToBack(seg);
                     if (turn > 1 && firstSeg == seg) {
                         if (!hasSpaces(length, seg)) {
                             break;
