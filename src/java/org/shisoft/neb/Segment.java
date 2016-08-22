@@ -1,13 +1,11 @@
 package org.shisoft.neb;
 
 import org.shisoft.neb.io.Reader;
-import org.shisoft.neb.io.Writer;
 
 import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
@@ -120,12 +118,6 @@ public class Segment {
             return r;
         } else {
             return -1;
-        }
-    }
-
-    public void fillZero () {
-        for (long i = baseAddr; i < Trunk.segSize; i ++){
-            Writer.writeByte((byte) 0, i);
         }
     }
 

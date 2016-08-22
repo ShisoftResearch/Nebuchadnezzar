@@ -10,9 +10,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
@@ -218,15 +215,11 @@ public class Trunk {
         return storeAddress;
     }
 
-    public static void lockIfNotOwned(ReentrantLock l) {
-        if (!l.isHeldByCurrentThread()){
-            l.lock();
-        }
+    public static void lockCell(ReentrantLock l) {
+        l.lock();
     }
 
-    public static void unlockIfOwned(ReentrantLock l){
-        if (l.isHeldByCurrentThread()){
-            l.unlock();
-        }
+    public static void unlockCell(ReentrantLock l){
+        l.unlock();
     }
 }

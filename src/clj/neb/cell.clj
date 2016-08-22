@@ -49,21 +49,21 @@
 
 (defmacro with-write-lock [trunk hash & body]
   `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
-     (Trunk/lockIfNotOwned lock#)
+     (Trunk/lockCell lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (Trunk/unlockIfOwned lock#)))))
+       (finally (Trunk/unlockCell lock#)))))
 
 (defmacro with-read-lock [trunk hash & body]
   `(let [^ReentrantLock lock# (.locateLock ~trunk ~hash)]
-     (Trunk/lockIfNotOwned lock#)
+     (Trunk/lockCell lock#)
      (try
        (with-cell-meta
          ~trunk ~hash
          ~@body)
-       (finally (Trunk/unlockIfOwned lock#)))))
+       (finally (Trunk/unlockCell lock#)))))
 
 (defn get-cell-location []
   (let [loc *cell-addr*]

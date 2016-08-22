@@ -102,7 +102,7 @@ public class Cleaner {
                             ReentrantLock l = trunk.locateLock(cellHash);
                             segment.unlockWrite();
                             if (l.isLocked() && !l.isHeldByCurrentThread()) break;
-                            Trunk.lockIfNotOwned(l);
+                            Trunk.lockCell(l);
                             try {
                                 long cellAddr = trunk.getCellIndex().get(cellHash);
                                 if (cellAddr > 0 && isInSegment(cellAddr, segment)) {
@@ -125,7 +125,7 @@ public class Cleaner {
                                     //checkTooManyRetry("Cell cannot been found in frag adj", retry);
                                 }
                             } finally {
-                                Trunk.unlockIfOwned(l);
+                                Trunk.unlockCell(l);
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
