@@ -6,6 +6,7 @@ import org.shisoft.neb.utils.Bindings;
 
 import java.util.Arrays;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Created by shisoft on 16-4-11.
@@ -56,13 +57,13 @@ public class Cleaner {
     }
 
     public void phaseOneCleanSegment(Segment segment) {
-        segment.lockWrite();
-        try {
-            long pos = segment.getBaseAddr();
-            int retry = 0;
-            while (true) {
+        long pos = segment.getBaseAddr();
+        int retry = 0;
+        ReentrantReadWriteLock.WriteLock segLock = segment.getLock().writeLock();
+        while (segLock.tryLock()) {
+            boolean lockPreLeased = false;
+            try {
                 if (segment.getFrags().isEmpty()) break;
-
                 Long fragLoc = segment.getFrags().ceiling(pos);
                 if (fragLoc == null) break;
                 if (!isInSegment(fragLoc, segment)) {
@@ -99,7 +100,8 @@ public class Cleaner {
                                 break;
                             }
                             long cellHash = (long) Bindings.readCellHash.invoke(trunk, adjPos);
-                            segment.unlockWrite();
+                            segLock.unlock();
+                            lockPreLeased = true;
                             CellLock cl = trunk.getCellLock(cellHash);
                             boolean locked = cl.getLock().writeLock().tryLock();
                             if (!locked) {
@@ -114,12 +116,12 @@ public class Cleaner {
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
                                         trunk.getCellIndex().replace(cellHash, (long) fragLoc);
-                                        segment.lockWrite();
+                                        segLock.lock();
                                         try {
                                             removeFragment(segment, fragLoc, fragLen);
                                             addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
                                         } finally {
-                                            segment.unlockWrite();
+                                            segLock.unlock();
                                         }
                                         pos = fragLoc + cellLen;
                                         retry = 0;
@@ -137,14 +139,14 @@ public class Cleaner {
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
-                                segment.lockWrite();
+                                segLock.lock();
                                 try {
                                     int adjFragLen = Reader.readInt(adjPos + type_lengths.byteLen);
                                     removeFragment(segment, fragLoc, fragLen);
                                     removeFragment(segment, adjPos, adjFragLen);
                                     addFragment(fragLoc, adjPos + adjFragLen - 1);
                                 } finally {
-                                    segment.unlockWrite();
+                                    segLock.unlock();
                                 }
                                 retry = 0;
                             } else {
@@ -161,9 +163,11 @@ public class Cleaner {
                     retry++;
                     checkTooManyRetry("Location is not a frag " + fragLocByte, retry);
                 }
+            } finally {
+                if (!lockPreLeased) {
+                    segLock.unlock();
+                }
             }
-        } finally {
-            segment.unlockWrite();
         }
     }
 

@@ -87,10 +87,10 @@ public class Segment {
     }
 
     public void lockWrite () {
-        if (!this.lock.writeLock().isHeldByCurrentThread()) this.lock.writeLock().lock();
+        this.lock.writeLock().lock();
     }
     public void unlockWrite () {
-        if (this.lock.writeLock().isHeldByCurrentThread()) this.lock.writeLock().unlock();
+        this.lock.writeLock().unlock();
     }
 
     public void lockRead () {

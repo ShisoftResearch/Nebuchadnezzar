@@ -20,20 +20,24 @@
           trunk-id (.getId trunk)]
       (doseq [^Segment seg dirty-segments]
         (when (and (.isDirty seg) (.tryLock (.writeLock (.getLock seg))))
-          (try
-            (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
-                  curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
-                  seg-id (.getId seg)
-                  data (.getData seg)
-                  is-dirty? (.isDirty seg)]
-              (.setClean seg)
-              (.unlockWrite seg)
-              (when is-dirty?
-                (cp/pdoseq
-                  sync-pool [[sn sid] @server-sids]
-                  (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
-                              sid trunk-id seg-id  base-addr curr-addr data))))
-            (finally (.unlockWrite seg)))))
+          (let [pre-unlocked (atom false)]
+            (try
+              (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
+                    curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))
+                    seg-id (.getId seg)
+                    data (.getData seg)
+                    is-dirty? (.isDirty seg)]
+                (.setClean seg)
+                (.unlockWrite seg)
+                (reset! pre-unlocked true)
+                (when is-dirty?
+                  (cp/pdoseq
+                    sync-pool [[sn sid] @server-sids]
+                    (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-segment
+                                sid trunk-id seg-id  base-addr curr-addr data))))
+              (finally
+                (when-not @pre-unlocked
+                  (.unlock (.writeLock (.getLock seg)))))))))
       (cp/pdoseq
         sync-pool [[sn sid] @server-sids]
         (rfi/invoke sn 'neb.durability.serv.core/sync-trunk-completed sid trunk-id))

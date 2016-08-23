@@ -22,10 +22,10 @@ public class CellReader {
         this.currLoc = currLoc;
         this.trunk = trunk;
         byte tag = Reader.readByte(currLoc);
-        if (tag == 2) { // cell type field, 0 for cell, 1 for tombstone
+        if (tag == 2) { // cell type field, 1 for cell, 2 for tombstone
             throw new CellFormatErrorException("is a tombstone, for trunk: " + String.valueOf(trunk.getId()));
         } else if (tag != 1) {
-            throw new CellFormatErrorException("for trunk:  " + String.valueOf(trunk.getId()));
+            throw new CellFormatErrorException("for trunk: " + String.valueOf(trunk.getId()) + ", tag: " + tag);
         }
     }
 
