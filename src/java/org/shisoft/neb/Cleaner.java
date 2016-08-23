@@ -114,8 +114,13 @@ public class Cleaner {
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
                                         trunk.getCellIndex().replace(cellHash, (long) fragLoc);
-                                        removeFragment(segment, fragLoc, fragLen);
-                                        addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
+                                        segment.lockWrite();
+                                        try {
+                                            removeFragment(segment, fragLoc, fragLen);
+                                            addFragment(fragLoc + cellLen, adjPos + cellLen - 1);
+                                        } finally {
+                                            segment.unlockWrite();
+                                        }
                                         pos = fragLoc + cellLen;
                                         retry = 0;
                                     } else {
@@ -132,10 +137,15 @@ public class Cleaner {
                             }
                         } else if (Reader.readByte(adjPos) == 2) {
                             if (segment.getFrags().contains(adjPos)) {
-                                int adjFragLen = Reader.readInt(adjPos + type_lengths.byteLen);
-                                removeFragment(segment, fragLoc, fragLen);
-                                removeFragment(segment, adjPos, adjFragLen);
-                                addFragment(fragLoc, adjPos + adjFragLen - 1);
+                                segment.lockWrite();
+                                try {
+                                    int adjFragLen = Reader.readInt(adjPos + type_lengths.byteLen);
+                                    removeFragment(segment, fragLoc, fragLen);
+                                    removeFragment(segment, adjPos, adjFragLen);
+                                    addFragment(fragLoc, adjPos + adjFragLen - 1);
+                                } finally {
+                                    segment.unlockWrite();
+                                }
                                 retry = 0;
                             } else {
                                 retry++;
