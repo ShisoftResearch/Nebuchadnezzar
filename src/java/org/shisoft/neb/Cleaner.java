@@ -70,7 +70,8 @@ public class Cleaner {
                     segment.getFrags().remove(fragLoc);
                     break;
                 }
-                if (Reader.readByte(fragLoc) == 2) {
+                byte fragLocByte = Reader.readByte(fragLoc);
+                if (fragLocByte == 2) {
                     int fragLen = Reader.readInt(fragLoc + type_lengths.byteLen);
                     long adjPos = fragLoc + fragLen;
                     if (adjPos >= segment.getBaseAddr() + Trunk.getSegSize() ||
@@ -148,7 +149,7 @@ public class Cleaner {
                     }
                 } else {
                     retry++;
-                    checkTooManyRetry("Location is not a frag", retry);
+                    checkTooManyRetry("Location is not a frag " + fragLocByte, retry);
                 }
             }
         } finally {

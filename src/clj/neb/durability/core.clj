@@ -19,8 +19,7 @@
           sync-pool (cp/threadpool (count @server-sids) :name "Backup-Remote")
           trunk-id (.getId trunk)]
       (doseq [^Segment seg dirty-segments]
-        (when (and (.isDirty seg) (not (.isWriteLocked (.getLock seg))))
-          (.lockWrite seg)
+        (when (and (.isDirty seg) (.tryLock (.writeLock (.getLock seg))))
           (try
             (let [base-addr (- (.getBaseAddr seg) (.getStoreAddress trunk))
                   curr-addr (- (.getCurrentLoc seg) (.getBaseAddr seg))

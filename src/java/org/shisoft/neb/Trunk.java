@@ -163,11 +163,10 @@ public class Trunk {
         while (true) {
             try {
                 Segment seg = segmentsQueue.peek();
-                if (seg.getLock().writeLock().getHoldCount() > 0) {
+                if (!seg.getLock().readLock().tryLock()) {
                     putToBack(seg);
                     continue;
                 }
-                seg.lockRead();
                 try {
                     r = seg.tryAcquireSpace(length);
                 } finally {
