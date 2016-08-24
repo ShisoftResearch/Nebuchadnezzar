@@ -164,7 +164,7 @@ public class Cleaner {
                     checkTooManyRetry("Location is not a frag " + fragLocByte, retry);
                 }
             } finally {
-                if (!lockPreLeased) {
+                if (!lockPreLeased ) {
                     segLock.unlock();
                 }
             }

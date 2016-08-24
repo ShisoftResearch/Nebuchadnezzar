@@ -223,18 +223,18 @@ public class Trunk {
     }
 
     public void releaseCellLock (CellLock cl) {
-        cl.getAcquired().updateAndGet(operand -> {
-            --operand;
-            if (operand == 0) {
-                synchronized (cellLockCache) {
+        synchronized (cellLockCache) {
+            cl.getAcquired().updateAndGet(operand -> {
+                --operand;
+                if (operand == 0) {
                     cellLockCache.remove(cl.getHash(), cl);
                     return -1;
+                } else if (operand < 0) {
+                    System.out.println("WARN: acquired lock below 0");
                 }
-            } else if (operand < 0) {
-                System.out.println("WARN: acquired lock below 0");
-            }
-            return operand;
-        });
+                return operand;
+            });
+        }
     }
 
     public CellLock lockWrite (long hash) {
