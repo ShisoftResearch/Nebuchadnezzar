@@ -125,6 +125,10 @@ public class Trunk {
             return cellIndex.size();
         }
     }
+    public LongLongMap getCellIndex() {
+        return cellIndex;
+    }
+
     public void putTombstone (long startPos, long endPos){
         int size = (int) (endPos - startPos + 1);
         assert  size > tombstoneSize : "frag length is too small to put a tombstone";

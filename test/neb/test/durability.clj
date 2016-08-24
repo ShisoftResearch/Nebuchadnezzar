@@ -83,8 +83,7 @@
                  (fact "Check Deleted"
                        (let [trunks (.getTrunks ts/trunks)]
                          (doseq [trunk trunks]
-                           (let [cell-index (.getCellIndex ^Trunk trunk)]
-                             (.size cell-index) => 0))))
+                           (.cellIndexSize trunk) => 0)))
                  (fact "Recover from backups"
                        (recover-backup) => anything)
                  (fact "New cells in comming"
