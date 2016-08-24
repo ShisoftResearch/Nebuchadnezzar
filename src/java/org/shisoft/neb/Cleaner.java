@@ -109,15 +109,13 @@ public class Cleaner {
                                 break;
                             }
                             try {
-                                long cellAddr = trunk.getCellIndex().get(cellHash);
+                                long cellAddr = trunk.getCellAddr(cellHash);
                                 if (cellAddr > 0 && isInSegment(cellAddr, segment)) {
                                     if (cellAddr == adjPos) {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
-                                        synchronized (trunk.getCellIndex()) {
-                                            trunk.getCellIndex().replace(cellHash, (long) fragLoc);
-                                        }
+                                        trunk.updateCellIndex(cellHash, fragLoc);
                                         segLock.lock();
                                         try {
                                             removeFragment(segment, fragLoc, fragLen);

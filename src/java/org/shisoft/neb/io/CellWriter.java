@@ -60,16 +60,12 @@ public class CellWriter {
     }
 
     public long updateCellToTrunkIndex(long hash, Trunk trunk){
-        synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().replace(hash, startLoc);
-        }
+        trunk.updateCellIndex(hash, startLoc);
         return startLoc;
     }
 
     public long addCellMetaToTrunkIndex(long hash, Trunk trunk) throws Exception {
-        synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().put(hash, startLoc);
-        }
+        trunk.addCellIndex(hash, startLoc);
         return startLoc;
     }
 

@@ -27,10 +27,11 @@ public class Trunk {
     final static int maxObjSize = 1 * 1024 * 1024; //1M Object
     final static int cellLockCount = 2048;
 
+    private LongLongMap cellIndex = HashLongLongMaps.newMutableMap();
+
     private int id;
     private long storeAddress;
     private long size;
-    private LongLongMap cellIndex = HashLongLongMaps.newMutableMap();
     private LongObjMap<CellLock> cellLockCache = HashLongObjMaps.newMutableMap();
     private boolean backendEnabled = false;
     private Cleaner cleaner;
@@ -44,9 +45,6 @@ public class Trunk {
     }
     public long getSize() {
         return size;
-    }
-    public LongLongMap  getCellIndex() {
-        return cellIndex;
     }
     public int getId() {
         return id;
@@ -103,10 +101,29 @@ public class Trunk {
         }
     }
     public boolean hasCell (long hash){
-        return getCellIndex().containsKey(hash);
+        synchronized (cellIndex) {
+            return cellIndex.containsKey(hash);
+        }
     }
     public long getCellAddr(long hash){
-        return getCellIndex().get(hash);
+        synchronized (cellIndex) {
+            return cellIndex.get(hash);
+        }
+    }
+    public void updateCellIndex (long hash, long addr) {
+        synchronized (cellIndex) {
+            cellIndex.replace(hash, addr);
+        }
+    }
+    public void addCellIndex(long hash, long addr) {
+        synchronized (cellIndex) {
+            cellIndex.put(hash, addr);
+        }
+    }
+    public int cellIndexSize() {
+        synchronized (cellIndex) {
+            return cellIndex.size();
+        }
     }
     public void putTombstone (long startPos, long endPos){
         int size = (int) (endPos - startPos + 1);
