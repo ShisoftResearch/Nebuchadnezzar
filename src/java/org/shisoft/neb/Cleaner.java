@@ -115,7 +115,9 @@ public class Cleaner {
                                         int cellLen = (int) Bindings.readCellLength.invoke(trunk, adjPos);
                                         cellLen += cellHeadLen;
                                         trunk.copyMemoryForCleaner(adjPos, fragLoc, cellLen);
-                                        trunk.getCellIndex().replace(cellHash, (long) fragLoc);
+                                        synchronized (trunk.getCellIndex()) {
+                                            trunk.getCellIndex().replace(cellHash, (long) fragLoc);
+                                        }
                                         segLock.lock();
                                         try {
                                             removeFragment(segment, fragLoc, fragLen);

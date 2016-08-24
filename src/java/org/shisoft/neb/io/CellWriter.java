@@ -61,7 +61,7 @@ public class CellWriter {
 
     public long updateCellToTrunkIndex(long hash, Trunk trunk){
         synchronized (trunk.getCellIndex()) {
-            trunk.getCellIndex().put(hash, startLoc);
+            trunk.getCellIndex().replace(hash, startLoc);
         }
         return startLoc;
     }
