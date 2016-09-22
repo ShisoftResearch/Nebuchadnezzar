@@ -1,0 +1,6 @@
+[package]
+name = "Nebuchadnezzar"
+version = "0.1.0"
+authors = ["Jack Shi <shisoftgenius@gmail.com>"]
+
+[dependencies]
