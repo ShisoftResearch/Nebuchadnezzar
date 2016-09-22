@@ -1,4 +1,6 @@
-# Nebuchadnezzar
+# Nebuchadnezzar (JVM based version)
+
+### WARNING: I found that building a storage system based on a JVM based language is not a good idea. To continue on this project and Morpheus for performance and memory efficacy, I am going to rewrite all of the code.
 
 > "This is my ship...the Nebuchadnezzar, it's a hovercraft."
 > ― Morpheus, The Matrix
