@@ -1,5 +1,4 @@
 target
-Cargo.lock
 
 ### CUDA template
 *.i
