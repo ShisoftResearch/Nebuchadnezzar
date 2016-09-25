@@ -1,7 +1,7 @@
 #![crate_type = "lib"]
 
-#![allow(module_inception)]
-
 extern crate libc;
 
 pub mod ram;
+#[macro_use]
+extern crate log;
