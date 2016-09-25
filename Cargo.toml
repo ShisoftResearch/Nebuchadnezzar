@@ -3,5 +3,11 @@ name = "neb"
 version = "0.1.0"
 authors = ["Jack Shi <shisoftgenius@gmail.com>"]
 
+[lib]
+name = "neb"
+
+[[test]]
+name = "tests"
+
 [dependencies]
-libc = "0.2.11"
+libc = "0.2.16"
