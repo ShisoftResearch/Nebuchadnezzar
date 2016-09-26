@@ -1,6 +1,7 @@
 extern crate neb;
 
 mod chunk;
+mod types;
 
 
 #[macro_use]
