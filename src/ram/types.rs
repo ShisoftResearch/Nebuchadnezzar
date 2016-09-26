@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::ptr::{read, write};
+use std::mem;
+use std::string;
 use libc;
 
 macro_rules! gen_primitive_types_io {
@@ -21,17 +23,53 @@ macro_rules! gen_primitive_types_io {
     );
 }
 
-macro_rules! define_primitive_types {
-    ( $( $name:expr,$reader:expr,$writer:expr,$size:expr );* ) => {
-        {
-            let types_vec = Vec::new();
-            let type_names = HashMap::new();
-            $(
-                let type_id = types_vec::len();
-                type_name::insert($name, type_id);
-            )*
+macro_rules! define_types {
+    (
+        $(
+            [ $( $name:expr ),* ], $id:expr, $reader:expr, $writer:expr, $size:expr
+         );*
+    ) => (
+        fn get_type_id (name: String) -> i32 {
+           match name.as_ref() {
+                $(
+                    $($name => $id,)*
+                )*
+                _ => -1,
+           }
         }
-    };
+        fn get_id_type (id: i32) -> &'static str {
+           match id {
+                $(
+                    $id => [$($name),*][0],
+                )*
+                _ => "N/A",
+           }
+        }
+    );
+}
+
+macro_rules! rc {
+    (
+        $read:ident
+    ) => (
+        {|pos| -> $read(pos)}
+    );
+}
+
+macro_rules! wc {
+    (
+        $rwrite:ident
+    ) => (
+        {|pos, val| -> $write(pos, val)}
+    );
+}
+
+macro_rules! size_of {
+    (
+        $t:ty
+    ) => (
+        {mem::size_of::<$t>()}
+    );
 }
 
 gen_primitive_types_io!(
@@ -49,4 +87,9 @@ gen_primitive_types_io!(
     usize:  read_usize, write_usize;
     f32:    read_f32,   write_f32;
     f64:    read_f64,   write_f64
+);
+
+define_types!(
+    ["bool", "bit"], 0, rc!(read_bool), wc!(write_bool), size_of!(bool);
+    ["char"], 1, rc!(read_char), wc!(write_cahr), size_of!(char)
 );
