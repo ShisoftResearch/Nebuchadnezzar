@@ -221,7 +221,7 @@ gen_compound_types_io! (
         }
     }, {
         use uuid::{UuidBytes, Uuid};
-        |val: uuid_, mem_ptr: usize| {
+        |val: uuid_, mem_ptr| {
             use std::ptr;
             unsafe {
                 ptr::write(mem_ptr as *mut &UuidBytes, val.as_bytes());
@@ -250,5 +250,6 @@ define_types!(
     ["pos2d32", "pos2d", "pos", "pos32"], 14, pos2d32   ,  pos2d32_io    ;
     ["pos2d64", "pos64"], 15, pos2d64                   ,  pos2d64_io    ;
     ["pos3d32", "pos3d"], 16, pos3d32                   ,  pos3d32_io    ;
-    ["pos3d64"], 17, pos3d64                            ,  pos3d64_io
+    ["pos3d64"], 17, pos3d64                            ,  pos3d64_io    ;
+    ["uuid"], 18, uuid_                                 ,  uuid_io
 );
