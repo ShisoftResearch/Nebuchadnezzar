@@ -1,6 +1,7 @@
 #![crate_type = "lib"]
 
 extern crate libc;
+extern crate uuid;
 
 pub mod ram;
 #[macro_use]

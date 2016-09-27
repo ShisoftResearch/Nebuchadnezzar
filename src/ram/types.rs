@@ -1,4 +1,5 @@
 use libc;
+use uuid::Uuid;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -137,6 +138,8 @@ pub struct pos3d64 {
     pub z: f64,
 }
 
+pub type uuid_ = Uuid;
+
 gen_compound_types_io! (
     pos2d32, pos2d32_io, {
         |mem_ptr| {
@@ -202,6 +205,30 @@ gen_compound_types_io! (
         }
     }, {
         f64_io::size() * 3
+    };
+
+    //////////////////////////////////////////////////////////
+
+    uuid_, uuid_io, {
+        |mem_ptr| {
+            use uuid::{UuidBytes, Uuid};
+            use std::ptr;
+            unsafe {
+                Uuid::from_bytes(
+                    ptr::read(mem_ptr as *mut &UuidBytes) as &[u8]
+                ).unwrap()
+            }
+        }
+    }, {
+        use uuid::{UuidBytes, Uuid};
+        |val: uuid_, mem_ptr: usize| {
+            use std::ptr;
+            unsafe {
+                ptr::write(mem_ptr as *mut &UuidBytes, val.as_bytes());
+            }
+        }
+    }, {
+        16
     }
 );
 
