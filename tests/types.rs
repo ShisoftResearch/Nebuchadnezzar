@@ -114,3 +114,23 @@ mod pos3d64 {
         }
     }
 }
+
+mod uuid {
+    use neb::ram::types;
+    use neb::ram::chunk;
+    use uuid::Uuid;
+    use uuid;
+    #[test]
+    fn test () {
+        let test_data = vec![
+            Uuid::parse_str("936DA01F9ABD4d9d80C702AF85C822A8").unwrap(),
+            Uuid::new_v4(),
+            Uuid::new_v5(&uuid::NAMESPACE_DNS, "foo")
+        ];
+        let chunk = &chunk::init(1, 2048).list[0];
+        for d in test_data {
+            types::uuid_io::write(&d, chunk.addr);
+            assert!(types::uuid_io::read(chunk.addr) == d);
+        }
+    }
+}

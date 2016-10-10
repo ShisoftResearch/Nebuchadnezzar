@@ -8,3 +8,4 @@ mod types;
 extern crate log;
 extern crate env_logger;
 extern crate rand;
+extern crate uuid;

@@ -13,7 +13,7 @@ name = "tests"
 libc = "0.2.16"
 log = "0.3"
 lazy_static = "*"
-uuid = "0.2"
+uuid = { version = "0.2", features = ["v4", "v5"] }
 
 [dev-dependencies]
 rand = "0.3"
