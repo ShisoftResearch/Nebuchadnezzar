@@ -1,6 +1,8 @@
 use neb::ram::types;
 use neb::ram::chunk;
 
+pub const CHUNK_SIZE: usize = 2048;
+
 macro_rules! test_nums {
     (
         $t:ident, $io:ident
@@ -10,14 +12,23 @@ macro_rules! test_nums {
             use neb::ram::chunk;
             use std;
             use rand;
+            use super::CHUNK_SIZE;
             #[test]
             fn test () {
                 let rand_num = rand::random::<$t>();
                 let test_data = vec![std::$t::MIN, std::$t::MAX, rand_num, 0 as $t, 1 as $t, 2 as $t, 127 as $t];
-                let chunk = &chunk::init(1, 2048).list[0];
+                let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+                let counts = CHUNK_SIZE / types::$io::size(0) as usize;
                 for d in test_data {
-                    types::$io::write(d, chunk.addr);
-                    assert!(types::$io::read(chunk.addr) == d);
+                    for i in 0..counts {
+                        let addr = chunk.addr + i * types::$io::size(0);
+                        types::$io::write(d, addr);
+                        assert!(types::$io::read(addr) == d);
+                    }
+                    for i in 0..counts {
+                        let addr = chunk.addr + i * types::$io::size(0);
+                        assert!(types::$io::read(addr) == d);
+                    }
                 }
             }
         }
@@ -44,13 +55,14 @@ mod pos2d32 {
     use neb::ram::chunk;
     use std;
     use rand;
+    use super::CHUNK_SIZE;
     #[test]
     fn test () {
         let test_data = vec![
             types::pos2d32 {x: std::f32::MIN, y: std::f32::MAX},
             types::pos2d32 {x: rand::random::<f32>(), y: rand::random::<f32>()}
         ];
-        let chunk = &chunk::init(1, 2048).list[0];
+        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
         for d in test_data {
             types::pos2d32_io::write(&d, chunk.addr);
             assert!(types::pos2d32_io::read(chunk.addr) == d);
@@ -131,6 +143,24 @@ mod uuid {
         for d in test_data {
             types::uuid_io::write(&d, chunk.addr);
             assert!(types::uuid_io::read(chunk.addr) == d);
+        }
+    }
+}
+
+mod string {
+    use neb::ram::types;
+    use neb::ram::chunk;
+    use std::string::String;
+    #[test]
+    fn test () {
+        let test_data = vec![
+            "", "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ", "中文测试文本", "Hello Test", "💖"
+        ];
+        let chunk = &chunk::init(1, 2048).list[0];
+        for d in test_data {
+            let test_str = String::from(d);
+            types::string_io::write(&test_str, chunk.addr);
+            assert!(types::string_io::read(chunk.addr) == test_str);
         }
     }
 }

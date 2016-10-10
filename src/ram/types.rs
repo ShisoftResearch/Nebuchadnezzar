@@ -1,6 +1,7 @@
 use libc;
 use uuid::Uuid;
 use std::cmp::PartialEq;
+use std::string::String;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -52,7 +53,27 @@ macro_rules! gen_compound_types_io {
 }
 
 macro_rules! gen_variable_types_io {
-    () => ();
+    (
+        $($t:ident, $tmod:ident, $reader:expr, $writer: expr, $size:expr);*
+    ) => (
+            $(
+                pub mod $tmod {
+                    use ram::types::*;
+                    pub fn read(mem_ptr: usize) -> $t {
+                        let read = $reader;
+                        read(mem_ptr)
+                    }
+                    pub fn write(val: &$t, mem_ptr: usize) {
+                        let write = $writer;
+                        write(val, mem_ptr)
+                    }
+                    pub fn size(mem_ptr: usize) -> usize {
+                        let size = $size;
+                        size(mem_ptr)
+                    }
+                }
+            )*
+    );
 }
 
 macro_rules! define_types {
@@ -262,14 +283,44 @@ gen_compound_types_io! (
         }
     }, {
         use uuid::{UuidBytes, Uuid};
+        use std::ptr;
         |val: &uuid_, mem_ptr| {
-            use std::ptr;
             unsafe {
                 ptr::write(mem_ptr as *mut &UuidBytes, val.as_bytes());
             }
         }
     }, {
         16
+    }
+);
+
+gen_variable_types_io! (
+    String, string_io, {
+        use std::ptr;
+        |mem_ptr| {
+            let len = u32_io::read(mem_ptr) as usize;
+            let smem_ptr = mem_ptr + u32_io::size(0);
+            let str_bytes = unsafe {
+                ptr::read(smem_ptr as *mut &[u8])
+            };
+            String::from_utf8_lossy(str_bytes).into_owned()
+        }
+    }, {
+        use std::ptr;
+        |val: &String, mem_ptr| {
+            let bytes = val.as_bytes();
+            u32_io::write(bytes.len() as u32, mem_ptr);
+            let smem_ptr = mem_ptr + u32_io::size(0);
+            unsafe {
+                ptr::write(smem_ptr as *mut &[u8], bytes);
+            }
+        }
+    }, {
+        |mem_ptr| {
+            let str_len = u32_io::read(mem_ptr) as usize;
+            str_len + u32_io::size(0)
+
+        }
     }
 );
 
@@ -292,5 +343,6 @@ define_types!(
     ["pos2d64", "pos64"], 15, pos2d64                   ,  pos2d64_io    ;
     ["pos3d32", "pos3d"], 16, pos3d32                   ,  pos3d32_io    ;
     ["pos3d64"], 17, pos3d64                            ,  pos3d64_io    ;
-    ["uuid"], 18, uuid_                                 ,  uuid_io
+    ["uuid"], 18, uuid_                                 ,  uuid_io       ;
+    ["string", "str"], 19, string::String               ,  string_io
 );
