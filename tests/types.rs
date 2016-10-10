@@ -202,10 +202,20 @@ mod string {
             "", "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ", "中文测试文本", "Hello Test", "💖"
         ];
         let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
-        for d in test_data {
+        let mut addr = chunk.addr;
+        for d in test_data.clone() {
             let test_str = String::from(d);
-            types::string_io::write(&test_str, chunk.addr);
-            assert!(types::string_io::read(chunk.addr) == test_str);
+            types::string_io::write(&test_str, addr);
+            let len = types::string_io::size(addr);
+            assert!(types::string_io::read(addr) == test_str);
+            addr += len;
+        }
+        addr = chunk.addr;
+        for d in test_data.clone() {
+            let test_str = String::from(d);
+            let len = types::string_io::size(addr);
+            assert!(types::string_io::read(addr) == test_str);
+            addr += len;
         }
     }
 }
