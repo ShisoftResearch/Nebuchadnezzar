@@ -20,7 +20,7 @@ macro_rules! gen_primitive_types_io {
                             ptr::write(mem_ptr as *mut $t, val)
                         }
                     }
-                    pub fn size() -> usize {
+                    pub fn size(mem_ptr: usize) -> usize {
                         mem::size_of::<$t>()
                     }
                 }
@@ -43,12 +43,16 @@ macro_rules! gen_compound_types_io {
                         let write = $writer;
                         write(val, mem_ptr)
                     }
-                    pub fn size() -> usize {
+                    pub fn size(mem_ptr: usize) -> usize {
                         $size
                     }
                 }
             )*
     );
+}
+
+macro_rules! gen_variable_types_io {
+    () => ();
 }
 
 macro_rules! define_types {
@@ -73,10 +77,10 @@ macro_rules! define_types {
                 _ => "N/A",
            }
         }
-        fn get_size (id: i32) -> usize {
+        fn get_size (id: i32, mem_ptr: usize) -> usize {
            match id {
                 $(
-                    $id => $io::size(),
+                    $id => $io::size(mem_ptr),
                 )*
                 _ => 0,
            }
@@ -181,31 +185,31 @@ gen_compound_types_io! (
     pos2d32, pos2d32_io, {
         |mem_ptr| {
             let x = f32_io::read(mem_ptr);
-            let y = f32_io::read(mem_ptr + f32_io::size());
+            let y = f32_io::read(mem_ptr + f32_io::size(0));
             pos2d32 {x: x, y: y}
         }
     }, {
         |val: &pos2d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
-            f32_io::write(val.y, mem_ptr + f32_io::size());
+            f32_io::write(val.y, mem_ptr + f32_io::size(0));
         }
     }, {
-        f32_io::size() * 2
+        f32_io::size(0) * 2
     };
 
     pos2d64, pos2d64_io, {
         |mem_ptr| {
             let x = f64_io::read(mem_ptr);
-            let y = f64_io::read(mem_ptr + f64_io::size());
+            let y = f64_io::read(mem_ptr + f64_io::size(0));
             pos2d64 {x: x, y: y}
         }
     }, {
         |val: &pos2d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
-            f64_io::write(val.y, mem_ptr + f64_io::size());
+            f64_io::write(val.y, mem_ptr + f64_io::size(0));
         }
     }, {
-        f64_io::size() * 2
+        f64_io::size(0) * 2
     };
 
     //////////////////////////////////////////////////////////////
@@ -213,35 +217,35 @@ gen_compound_types_io! (
     pos3d32, pos3d32_io, {
         |mem_ptr| {
             let x = f32_io::read(mem_ptr);
-            let y = f32_io::read(mem_ptr + f32_io::size());
-            let z = f32_io::read(mem_ptr + f32_io::size() * 2);
+            let y = f32_io::read(mem_ptr + f32_io::size(0));
+            let z = f32_io::read(mem_ptr + f32_io::size(0) * 2);
             pos3d32 {x: x, y: y, z: z}
         }
     }, {
         |val: &pos3d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
-            f32_io::write(val.y, mem_ptr + f32_io::size());
-            f32_io::write(val.z, mem_ptr + f32_io::size() * 2);
+            f32_io::write(val.y, mem_ptr + f32_io::size(0));
+            f32_io::write(val.z, mem_ptr + f32_io::size(0) * 2);
         }
     }, {
-        f32_io::size() * 3
+        f32_io::size(0) * 3
     };
 
     pos3d64, pos3d64_io, {
         |mem_ptr| {
             let x = f64_io::read(mem_ptr);
-            let y = f64_io::read(mem_ptr + f64_io::size());
-            let z = f64_io::read(mem_ptr + f64_io::size() * 2);
+            let y = f64_io::read(mem_ptr + f64_io::size(0));
+            let z = f64_io::read(mem_ptr + f64_io::size(0) * 2);
             pos3d64 {x: x, y: y, z: z}
         }
     }, {
         |val: &pos3d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
-            f64_io::write(val.y, mem_ptr + f64_io::size());
-            f64_io::write(val.z, mem_ptr + f64_io::size() * 2);
+            f64_io::write(val.y, mem_ptr + f64_io::size(0));
+            f64_io::write(val.z, mem_ptr + f64_io::size(0) * 2);
         }
     }, {
-        f64_io::size() * 3
+        f64_io::size(0) * 3
     };
 
     //////////////////////////////////////////////////////////
