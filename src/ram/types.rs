@@ -1,5 +1,6 @@
 use libc;
 use uuid::Uuid;
+use std::cmp::PartialEq;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -32,13 +33,13 @@ macro_rules! gen_compound_types_io {
         $($t:ident, $tmod:ident, $reader:expr, $writer: expr, $size:expr);*
     ) => (
             $(
-                mod $tmod {
+                pub mod $tmod {
                     use ram::types::*;
                     pub fn read(mem_ptr: usize) -> $t {
                         let read = $reader;
                         read(mem_ptr)
                     }
-                    pub fn write(val: $t, mem_ptr: usize) {
+                    pub fn write(val: &$t, mem_ptr: usize) {
                         let write = $writer;
                         write(val, mem_ptr)
                     }
@@ -138,6 +139,42 @@ pub struct pos3d64 {
     pub z: f64,
 }
 
+impl PartialEq for pos2d32 {
+    fn eq(&self, other: &pos2d32) -> bool {
+        self.x == other.x && self.y == other.y
+    }
+    fn ne(&self, other: &pos2d32) -> bool {
+        self.x != other.x || self.y != other.y
+    }
+}
+
+impl PartialEq for pos2d64 {
+    fn eq(&self, other: &pos2d64) -> bool {
+        self.x == other.x && self.y == other.y
+    }
+    fn ne(&self, other: &pos2d64) -> bool {
+        self.x != other.x || self.y != other.y
+    }
+}
+
+impl PartialEq for pos3d32 {
+    fn eq(&self, other: &pos3d32) -> bool {
+        self.x == other.x && self.y == other.y && self.z == other.z
+    }
+    fn ne(&self, other: &pos3d32) -> bool {
+        self.x != other.x || self.y != other.y || self.z != other.z
+    }
+}
+
+impl PartialEq for pos3d64 {
+    fn eq(&self, other: &pos3d64) -> bool {
+        self.x == other.x && self.y == other.y && self.z == other.z
+    }
+    fn ne(&self, other: &pos3d64) -> bool {
+        self.x != other.x || self.y != other.y || self.z != other.z
+    }
+}
+
 pub type uuid_ = Uuid;
 
 gen_compound_types_io! (
@@ -148,7 +185,7 @@ gen_compound_types_io! (
             pos2d32 {x: x, y: y}
         }
     }, {
-        |val: pos2d32, mem_ptr| {
+        |val: &pos2d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
             f32_io::write(val.y, mem_ptr + f32_io::size());
         }
@@ -163,7 +200,7 @@ gen_compound_types_io! (
             pos2d64 {x: x, y: y}
         }
     }, {
-        |val: pos2d64, mem_ptr| {
+        |val: &pos2d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
             f64_io::write(val.y, mem_ptr + f64_io::size());
         }
@@ -181,7 +218,7 @@ gen_compound_types_io! (
             pos3d32 {x: x, y: y, z: z}
         }
     }, {
-        |val: pos3d32, mem_ptr| {
+        |val: &pos3d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
             f32_io::write(val.y, mem_ptr + f32_io::size());
             f32_io::write(val.z, mem_ptr + f32_io::size() * 2);
@@ -198,7 +235,7 @@ gen_compound_types_io! (
             pos3d64 {x: x, y: y, z: z}
         }
     }, {
-        |val: pos3d64, mem_ptr| {
+        |val: &pos3d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
             f64_io::write(val.y, mem_ptr + f64_io::size());
             f64_io::write(val.z, mem_ptr + f64_io::size() * 2);
@@ -221,7 +258,7 @@ gen_compound_types_io! (
         }
     }, {
         use uuid::{UuidBytes, Uuid};
-        |val: uuid_, mem_ptr| {
+        |val: &uuid_, mem_ptr| {
             use std::ptr;
             unsafe {
                 ptr::write(mem_ptr as *mut &UuidBytes, val.as_bytes());

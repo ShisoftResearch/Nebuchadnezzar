@@ -24,11 +24,6 @@ macro_rules! test_nums {
     );
 }
 
-#[test]
-fn init () {
-
-}
-
 test_nums!(i8, i8_io);
 test_nums!(i16, i16_io);
 test_nums!(i32, i32_io);
@@ -43,4 +38,23 @@ test_nums!(isize, isize_io);
 test_nums!(usize, usize_io);
 test_nums!(f32, f32_io);
 test_nums!(f64, f64_io);
+
+mod pos2d32 {
+    use neb::ram::types;
+    use neb::ram::chunk;
+    use std;
+    use rand;
+    #[test]
+    fn test () {
+        let test_data = vec![
+            types::pos2d32 {x: std::f32::MIN, y: std::f32::MAX},
+            types::pos2d32 {x: rand::random::<f32>(), y: rand::random::<f32>()}
+        ];
+        let chunk = &chunk::init(1, 2048).list[0];
+        for d in test_data {
+            types::pos2d32_io::write(&d, chunk.addr);
+            assert!(types::pos2d32_io::read(chunk.addr) == d);
+        }
+    }
+}
 
