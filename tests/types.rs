@@ -176,9 +176,17 @@ mod uuid {
             Uuid::new_v5(&uuid::NAMESPACE_DNS, "foo")
         ];
         let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let counts = CHUNK_SIZE / types::uuid_io::size(0) as usize;
         for d in test_data {
-            types::uuid_io::write(&d, chunk.addr);
-            assert!(types::uuid_io::read(chunk.addr) == d);
+            for i in 0..counts {
+                let addr = chunk.addr + i * types::uuid_io::size(0);
+                types::uuid_io::write(&d, chunk.addr);
+                assert!(types::uuid_io::read(chunk.addr) == d);
+            }
+            for i in 0..counts {
+                let addr = chunk.addr + i * types::uuid_io::size(0);
+                assert!(types::uuid_io::read(chunk.addr) == d);
+            }
         }
     }
 }
