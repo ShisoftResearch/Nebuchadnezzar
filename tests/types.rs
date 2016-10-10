@@ -9,9 +9,11 @@ macro_rules! test_nums {
             use neb::ram::types;
             use neb::ram::chunk;
             use std;
+            use rand;
             #[test]
             fn test () {
-                let test_data = vec![std::$t::MIN, std::$t::MAX, 0 as $t, 1 as $t, 2 as $t, 255 as $t];
+                let rand_num = rand::random::<$t>();
+                let test_data = vec![std::$t::MIN, std::$t::MAX, rand_num, 0 as $t, 1 as $t, 2 as $t, 127 as $t];
                 let chunk = &chunk::init(1, 2048).list[0];
                 for d in test_data {
                     types::$io::write(d, chunk.addr);
@@ -41,3 +43,4 @@ test_nums!(isize, isize_io);
 test_nums!(usize, usize_io);
 test_nums!(f32, f32_io);
 test_nums!(f64, f64_io);
+
