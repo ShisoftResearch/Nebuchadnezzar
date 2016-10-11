@@ -180,12 +180,12 @@ mod uuid {
         for d in test_data {
             for i in 0..counts {
                 let addr = chunk.addr + i * types::uuid_io::size(0);
-                types::uuid_io::write(&d, chunk.addr);
-                assert!(types::uuid_io::read(chunk.addr) == d);
+                types::uuid_io::write(&d, addr);
+                assert!(types::uuid_io::read(addr) == d);
             }
             for i in 0..counts {
                 let addr = chunk.addr + i * types::uuid_io::size(0);
-                assert!(types::uuid_io::read(chunk.addr) == d);
+                assert!(types::uuid_io::read(addr) == d);
             }
         }
     }
