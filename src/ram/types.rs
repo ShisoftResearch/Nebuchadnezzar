@@ -77,12 +77,33 @@ macro_rules! gen_variable_types_io {
     );
 }
 
+macro_rules! gen_write_extractor {
+    (true, $e:ident, $d:ident) => (
+        match $d {
+            &Data::$e(ref v) => Some(v),
+            _ => None
+        }
+    );
+    (false, $e:ident, $d:ident) => (
+        match $d {
+            &Data::$e(v) => Some(v),
+            _ => None
+        }
+    )
+}
+
 macro_rules! define_types {
     (
         $(
-            [ $( $name:expr ),* ], $id:expr, $t:ty, $io:ident
+            [ $( $name:expr ),* ], $id:expr, $t:ty, $e:ident, $r:ident, $io:ident
          );*
     ) => (
+        pub enum Data {
+            $(
+                $e($t),
+            )*
+            NA
+        }
         fn get_type_id (name: String) -> i32 {
            match name.as_ref() {
                 $(
@@ -107,20 +128,20 @@ macro_rules! define_types {
                 _ => 0,
            }
         }
-        fn set_val (data: &Any, id:i32, mem_ptr: usize) {
+        fn get_val (id:i32, mem_ptr: usize) -> Data {
              match id {
                  $(
-                     $id => $io::write(*data.downcast_ref::<$t>().unwrap(), mem_ptr),
+                     $id => Data::$e($io::read(mem_ptr)),
                  )*
-                 _ => (),
+                 _ => Data::NA,
              }
         }
-        fn get_val (id:i32, mem_ptr: usize) -> Box<Any> {
+        fn set_val (data: &Data, id:i32, mem_ptr: usize) {
              match id {
                  $(
-                     $id => Box::new($io::read(mem_ptr)),
+                     $id => $io::write(gen_write_extractor!($r, $e, data).unwrap() , mem_ptr),
                  )*
-                 _ => Box::new(()),
+                 _ => (),
              }
         }
     );
@@ -349,24 +370,24 @@ gen_variable_types_io! (
 );
 
 define_types!(
-    ["bool", "bit"], 0, bool                            ,  bool_io       ;
-    ["char"], 1, char                                   ,  char_io       ;
-    ["i8"], 2, i8                                       ,  i8_io         ;
-    ["i16", "int"], 3, i16                              ,  i16_io        ;
-    ["i32", "long"], 4, i32                             ,  i32_io        ;
-    ["i64", "longlong"], 5, i64                         ,  i64_io        ;
-    ["u8", "byte"], 6, u8                               ,  u8_io         ;
-    ["u16"], 7, u16                                     ,  u16_io        ;
-    ["u32"], 8, u32                                     ,  u32_io        ;
-    ["u64"], 9, u64                                     ,  u64_io        ;
-    ["isize"], 10, isize                                ,  isize_io      ;
-    ["usize"], 11, usize                                ,  usize_io      ;
-    ["f32", "float"], 12, f32                           ,  f32_io        ;
-    ["f64", "double"], 13, f64                          ,  f64_io        ;
-    ["pos2d32", "pos2d", "pos", "pos32"], 14, &pos2d32  ,  pos2d32_io    ;
-    ["pos2d64", "pos64"], 15, &pos2d64                  ,  pos2d64_io    ;
-    ["pos3d32", "pos3d"], 16, &pos3d32                  ,  pos3d32_io    ;
-    ["pos3d64"], 17, &pos3d64                           ,  pos3d64_io    ;
-    ["uuid"], 18, &uuid_                                ,  uuid_io       ;
-    ["string", "str"], 19, &String                      ,  string_io
+    ["bool", "bit"], 0, bool                           ,bool     ,false ,  bool_io       ;
+    ["char"], 1, char                                  ,char     ,false ,  char_io       ;
+    ["i8"], 2, i8                                      ,i8       ,false ,  i8_io         ;
+    ["i16", "int"], 3, i16                             ,i16      ,false ,  i16_io        ;
+    ["i32", "long"], 4, i32                            ,i32      ,false ,  i32_io        ;
+    ["i64", "longlong"], 5, i64                        ,i64      ,false ,  i64_io        ;
+    ["u8", "byte"], 6, u8                              ,u8       ,false ,  u8_io         ;
+    ["u16"], 7, u16                                    ,u16      ,false ,  u16_io        ;
+    ["u32"], 8, u32                                    ,u32      ,false ,  u32_io        ;
+    ["u64"], 9, u64                                    ,u64      ,false ,  u64_io        ;
+    ["isize"], 10, isize                               ,isize    ,false ,  isize_io      ;
+    ["usize"], 11, usize                               ,usize    ,false ,  usize_io      ;
+    ["f32", "float"], 12, f32                          ,f32      ,false ,  f32_io        ;
+    ["f64", "double"], 13, f64                         ,f64      ,false ,  f64_io        ;
+    ["pos2d32", "pos2d", "pos", "pos32"], 14, pos2d32  ,pos2d32  ,true  ,  pos2d32_io    ;
+    ["pos2d64", "pos64"], 15, pos2d64                  ,pos2d64  ,true  ,  pos2d64_io    ;
+    ["pos3d32", "pos3d"], 16, pos3d32                  ,pos3d32  ,true  ,  pos3d32_io    ;
+    ["pos3d64"], 17, pos3d64                           ,pos3d64  ,true  ,  pos3d64_io    ;
+    ["uuid"], 18, uuid_                                ,uuid     ,true  ,  uuid_io       ;
+    ["string", "str"], 19, String                      ,string   ,true  ,  string_io
 );
