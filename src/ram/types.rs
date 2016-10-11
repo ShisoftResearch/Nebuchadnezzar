@@ -80,13 +80,13 @@ macro_rules! gen_variable_types_io {
 macro_rules! gen_write_extractor {
     (true, $e:ident, $d:ident) => (
         match $d {
-            &Data::$e(ref v) => Some(v),
+            &Value::$e(ref v) => Some(v),
             _ => None
         }
     );
     (false, $e:ident, $d:ident) => (
         match $d {
-            &Data::$e(v) => Some(v),
+            &Value::$e(v) => Some(v),
             _ => None
         }
     )
@@ -98,7 +98,7 @@ macro_rules! define_types {
             [ $( $name:expr ),* ], $id:expr, $t:ty, $e:ident, $r:ident, $io:ident
          );*
     ) => (
-        pub enum Data {
+        pub enum Value {
             $(
                 $e($t),
             )*
@@ -128,18 +128,18 @@ macro_rules! define_types {
                 _ => 0,
            }
         }
-        fn get_val (id:i32, mem_ptr: usize) -> Data {
+        fn get_val (id:i32, mem_ptr: usize) -> Value {
              match id {
                  $(
-                     $id => Data::$e($io::read(mem_ptr)),
+                     $id => Value::$e($io::read(mem_ptr)),
                  )*
-                 _ => Data::NA,
+                 _ => Value::NA,
              }
         }
-        fn set_val (data: &Data, id:i32, mem_ptr: usize) {
+        fn set_val (val: &Value, id:i32, mem_ptr: usize) {
              match id {
                  $(
-                     $id => $io::write(gen_write_extractor!($r, $e, data).unwrap() , mem_ptr),
+                     $id => $io::write(gen_write_extractor!($r, $e, val).unwrap() , mem_ptr),
                  )*
                  _ => (),
              }
