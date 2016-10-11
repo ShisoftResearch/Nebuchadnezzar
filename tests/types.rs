@@ -207,7 +207,9 @@ mod string {
             let test_str = String::from(d);
             types::string_io::write(&test_str, addr);
             let len = types::string_io::size(addr);
-            assert!(types::string_io::read(addr) == test_str);
+            let dec_str = types::string_io::read(addr);
+            assert!(dec_str == test_str);
+            println!("{}", dec_str);
             addr += len;
         }
         addr = chunk.addr;

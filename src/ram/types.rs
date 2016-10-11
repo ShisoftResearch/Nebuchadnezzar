@@ -300,19 +300,26 @@ gen_variable_types_io! (
         |mem_ptr| {
             let len = u32_io::read(mem_ptr) as usize;
             let smem_ptr = mem_ptr + u32_io::size(0);
-            let str_bytes = unsafe {
-                ptr::read(smem_ptr as *mut &[u8])
-            };
-            String::from_utf8_lossy(str_bytes).into_owned()
+            let mut bytes = Vec::with_capacity(len);
+            for i in 0..len {
+                let ptr = smem_ptr + i;
+                let b = unsafe {ptr::read(ptr as *mut u8)};
+                bytes.push(b);
+            }
+            String::from_utf8(bytes).unwrap()
         }
     }, {
         use std::ptr;
         |val: &String, mem_ptr| {
             let bytes = val.as_bytes();
-            u32_io::write(bytes.len() as u32, mem_ptr);
-            let smem_ptr = mem_ptr + u32_io::size(0);
+            let len = bytes.len();
+            u32_io::write(len as u32, mem_ptr);
+            let mut smem_ptr = mem_ptr + u32_io::size(0);
             unsafe {
-                ptr::write(smem_ptr as *mut &[u8], bytes);
+                for b in bytes {
+                    ptr::write(smem_ptr as *mut u8, *b);
+                    smem_ptr += 1;
+                }
             }
         }
     }, {
