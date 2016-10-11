@@ -15,6 +15,8 @@ log = "0.3"
 lazy_static = "*"
 uuid = { version = "0.2", features = ["v4", "v5"] }
 twox-hash = "*"
+serde = "0.8"
+serde_json = "0.8"
 
 [dev-dependencies]
 rand = "0.3"
