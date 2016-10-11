@@ -14,7 +14,3 @@ pub struct Field {
     pub name: String,
     pub sub: Option<Vec<Field>>
 }
-
-pub fn to_json (schema: Schema) -> String {
-
-}
