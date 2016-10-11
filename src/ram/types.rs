@@ -22,7 +22,7 @@ macro_rules! gen_primitive_types_io {
                             ptr::write(mem_ptr as *mut $t, val)
                         }
                     }
-                    pub fn size(mem_ptr: usize) -> usize {
+                    pub fn size(_: usize) -> usize {
                         mem::size_of::<$t>()
                     }
                 }
