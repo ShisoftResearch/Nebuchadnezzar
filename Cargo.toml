@@ -14,6 +14,7 @@ libc = "0.2.16"
 log = "0.3"
 lazy_static = "*"
 uuid = { version = "0.2", features = ["v4", "v5"] }
+twox-hash = "*"
 
 [dev-dependencies]
 rand = "0.3"

@@ -2,6 +2,7 @@ use libc;
 use uuid::Uuid;
 use std::cmp::PartialEq;
 use std::string::String;
+use std::any::Any;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -105,6 +106,22 @@ macro_rules! define_types {
                 )*
                 _ => 0,
            }
+        }
+        fn set_val (data: &Any, id:i32, mem_ptr: usize) {
+             match id {
+                 $(
+                     $id => $io::write(*data.downcast_ref::<$t>().unwrap(), mem_ptr),
+                 )*
+                 _ => (),
+             }
+        }
+        fn get_val (id:i32, mem_ptr: usize) -> Box<Any> {
+             match id {
+                 $(
+                     $id => Box::new($io::read(mem_ptr)),
+                 )*
+                 _ => Box::new(()),
+             }
         }
     );
 }
@@ -346,10 +363,10 @@ define_types!(
     ["usize"], 11, usize                                ,  usize_io      ;
     ["f32", "float"], 12, f32                           ,  f32_io        ;
     ["f64", "double"], 13, f64                          ,  f64_io        ;
-    ["pos2d32", "pos2d", "pos", "pos32"], 14, pos2d32   ,  pos2d32_io    ;
-    ["pos2d64", "pos64"], 15, pos2d64                   ,  pos2d64_io    ;
-    ["pos3d32", "pos3d"], 16, pos3d32                   ,  pos3d32_io    ;
-    ["pos3d64"], 17, pos3d64                            ,  pos3d64_io    ;
-    ["uuid"], 18, uuid_                                 ,  uuid_io       ;
-    ["string", "str"], 19, string::String               ,  string_io
+    ["pos2d32", "pos2d", "pos", "pos32"], 14, &pos2d32  ,  pos2d32_io    ;
+    ["pos2d64", "pos64"], 15, &pos2d64                  ,  pos2d64_io    ;
+    ["pos3d32", "pos3d"], 16, &pos3d32                  ,  pos3d32_io    ;
+    ["pos3d64"], 17, &pos3d64                           ,  pos3d64_io    ;
+    ["uuid"], 18, &uuid_                                ,  uuid_io       ;
+    ["string", "str"], 19, &String                      ,  string_io
 );
