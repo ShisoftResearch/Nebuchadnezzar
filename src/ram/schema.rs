@@ -6,7 +6,7 @@ use std::string::String;
 pub struct Schema {
     pub id: u32,
     pub name: String,
-    pub key_field: u16,
+    pub key_field: String,
     pub fields: Vec<Field>
 }
 
@@ -14,6 +14,13 @@ pub struct Schema {
 pub struct Field {
     pub type_id: u32,
     pub name: String,
+    pub nullable: bool,
+    pub is_array: bool,
     pub sub: Option<Vec<Field>>
+}
+
+pub struct Schemas {
+    pub schema_map: HashMap<u32, Schemas>,
+    pub name_map: HashMap<String, u32>,
 }
 

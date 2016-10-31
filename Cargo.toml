@@ -10,7 +10,7 @@ name = "neb"
 name = "tests"
 
 [dependencies]
-libc = "0.2.16"
+libc = "*"
 log = "0.3"
 lazy_static = "*"
 uuid = { version = "0.2", features = ["v4", "v5"] }
@@ -18,6 +18,7 @@ twox-hash = "*"
 serde = "0.8"
 serde_json = "0.8"
 serde_derive = "0.8"
+lfmap = { git = "https://github.com/shisoft/lfmap.rs", branch = "develop" }
 
 [dev-dependencies]
 rand = "0.3"

@@ -1,10 +1,13 @@
 use libc;
 use ram::segs::{Segment, SEGMENT_SIZE};
+use std::thread;
+use lfmap;
+use std::sync::{Arc, Mutex};
 
 pub struct Chunk {
     pub addr: usize,
     pub segs: Vec<Segment>,
-
+    pub index: lfmap::Map,
 }
 
 pub struct Chunks {
@@ -25,6 +28,7 @@ impl Chunk {
         Chunk {
             addr: mem_ptr,
             segs: segments,
+            index: lfmap::Map::new()
         }
 
     }
