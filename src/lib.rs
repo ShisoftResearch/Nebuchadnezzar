@@ -5,11 +5,13 @@ extern crate libc;
 extern crate uuid;
 extern crate serde;
 extern crate serde_json;
-extern crate lfmap;
 #[macro_use]
 extern crate serde_derive;
 
+extern crate concurrent_hashmap;
+
 pub mod ram;
+pub mod server;
 #[macro_use]
 extern crate log;
 #[macro_use]

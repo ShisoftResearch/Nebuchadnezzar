@@ -105,15 +105,15 @@ macro_rules! define_types {
             NA,
             Null
         }
-        fn get_type_id (name: String) -> i32 {
+        fn get_type_id (name: String) -> u32 {
            match name.as_ref() {
                 $(
                     $($name => $id,)*
                 )*
-                _ => -1,
+                _ => 0,
            }
         }
-        fn get_id_type (id: i32) -> &'static str {
+        fn get_id_type (id: u32) -> &'static str {
            match id {
                 $(
                     $id => [$($name),*][0],
@@ -121,7 +121,7 @@ macro_rules! define_types {
                 _ => "N/A",
            }
         }
-        fn get_size (id: i32, mem_ptr: usize) -> usize {
+        fn get_size (id: u32, mem_ptr: usize) -> usize {
            match id {
                 $(
                     $id => $io::size(mem_ptr),
@@ -129,7 +129,7 @@ macro_rules! define_types {
                 _ => 0,
            }
         }
-        fn get_val (id:i32, mem_ptr: usize) -> Value {
+        fn get_val (id:u32, mem_ptr: usize) -> Value {
              match id {
                  $(
                      $id => Value::$e($io::read(mem_ptr)),
@@ -137,7 +137,7 @@ macro_rules! define_types {
                  _ => Value::NA,
              }
         }
-        fn set_val (val: &Value, id:i32, mem_ptr: usize) {
+        fn set_val (val: &Value, id:u32, mem_ptr: usize) {
              match id {
                  $(
                      $id => $io::write(gen_write_extractor!($r, $e, val).unwrap() , mem_ptr),

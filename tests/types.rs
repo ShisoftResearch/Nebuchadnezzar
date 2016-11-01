@@ -9,7 +9,7 @@ macro_rules! test_nums {
     ) => (
         mod $t {
             use neb::ram::types;
-            use neb::ram::chunk;
+            use neb::ram::chunk::Chunks;
             use std;
             use rand;
             use super::CHUNK_SIZE;
@@ -17,7 +17,7 @@ macro_rules! test_nums {
             fn test () {
                 let rand_num = rand::random::<$t>();
                 let test_data = vec![std::$t::MIN, std::$t::MAX, rand_num, 0 as $t, 1 as $t, 2 as $t, 127 as $t];
-                let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+                let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
                 let counts = CHUNK_SIZE / types::$io::size(0) as usize;
                 for d in test_data {
                     for i in 0..counts {
@@ -52,7 +52,7 @@ test_nums!(f64, f64_io);
 
 mod pos2d32 {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use std;
     use rand;
     use super::CHUNK_SIZE;
@@ -62,7 +62,7 @@ mod pos2d32 {
             types::pos2d32 {x: std::f32::MIN, y: std::f32::MAX},
             types::pos2d32 {x: rand::random::<f32>(), y: rand::random::<f32>()}
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos2d32_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
@@ -80,7 +80,7 @@ mod pos2d32 {
 
 mod pos2d64 {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use std;
     use rand;
     use super::CHUNK_SIZE;
@@ -90,7 +90,7 @@ mod pos2d64 {
             types::pos2d64 {x: std::f64::MIN, y: std::f64::MAX},
             types::pos2d64 {x: rand::random::<f64>(), y: rand::random::<f64>()}
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos2d64_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
@@ -108,7 +108,7 @@ mod pos2d64 {
 
 mod pos3d32 {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use std;
     use rand;
     use super::CHUNK_SIZE;
@@ -118,7 +118,7 @@ mod pos3d32 {
             types::pos3d32 {x: std::f32::MIN, y: std::f32::MAX, z: rand::random::<f32>()},
             types::pos3d32 {x: rand::random::<f32>(), y: rand::random::<f32>(), z: rand::random::<f32>()}
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos3d32_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
@@ -136,7 +136,7 @@ mod pos3d32 {
 
 mod pos3d64 {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use std;
     use rand;
     use super::CHUNK_SIZE;
@@ -146,7 +146,7 @@ mod pos3d64 {
             types::pos3d64 {x: std::f64::MIN, y: std::f64::MAX, z: rand::random::<f64>()},
             types::pos3d64 {x: rand::random::<f64>(), y: rand::random::<f64>(), z: rand::random::<f64>()}
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos3d64_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
@@ -164,7 +164,7 @@ mod pos3d64 {
 
 mod uuid {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use uuid::Uuid;
     use uuid;
     use super::CHUNK_SIZE;
@@ -175,7 +175,7 @@ mod uuid {
             Uuid::new_v4(),
             Uuid::new_v5(&uuid::NAMESPACE_DNS, "foo")
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::uuid_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
@@ -193,7 +193,7 @@ mod uuid {
 
 mod string {
     use neb::ram::types;
-    use neb::ram::chunk;
+    use neb::ram::chunk::Chunks;
     use std::string::String;
     use super::CHUNK_SIZE;
     #[test]
@@ -201,7 +201,7 @@ mod string {
         let test_data = vec![
             "", "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ", "中文测试文本", "Hello Test", "💖"
         ];
-        let chunk = &chunk::init(1, CHUNK_SIZE).list[0];
+        let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let mut addr = chunk.addr;
         for d in test_data.clone() {
             let test_str = String::from(d);

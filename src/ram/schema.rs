@@ -1,6 +1,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::string::String;
+use concurrent_hashmap::ConcHashMap;
+use serde_json;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Schema {
@@ -20,7 +22,17 @@ pub struct Field {
 }
 
 pub struct Schemas {
-    pub schema_map: HashMap<u32, Schemas>,
-    pub name_map: HashMap<String, u32>,
+    pub schema_map: ConcHashMap<u32, Schema>,
+    pub name_map: ConcHashMap<String, u32>,
+}
+
+impl Schemas {
+    pub fn new() -> Schemas {
+        Schemas {
+            schema_map: ConcHashMap::<u32, Schema>::new(),
+            name_map: ConcHashMap::<String, u32>::new()
+        }
+    }
+
 }
 

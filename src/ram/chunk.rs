@@ -1,13 +1,17 @@
 use libc;
 use ram::segs::{Segment, SEGMENT_SIZE};
+use server::ServerMeta;
 use std::thread;
-use lfmap;
 use std::sync::{Arc, Mutex};
+use concurrent_hashmap::ConcHashMap;
+use std::rc::Rc;
+use ram::schema::Schemas;
 
 pub struct Chunk {
     pub addr: usize,
     pub segs: Vec<Segment>,
-    pub index: lfmap::Map,
+    pub index: ConcHashMap<u64, usize>,
+    pub meta: Rc<ServerMeta>
 }
 
 pub struct Chunks {
@@ -15,7 +19,7 @@ pub struct Chunks {
 }
 
 impl Chunk {
-    fn new (size: usize) -> Chunk {
+    fn new (size: usize, meta: Rc<ServerMeta>) -> Chunk {
         let mem_ptr = unsafe {libc::malloc(size)} as usize;
         let mut segments = Vec::new();
         let seg_count = size / SEGMENT_SIZE;
@@ -28,7 +32,8 @@ impl Chunk {
         Chunk {
             addr: mem_ptr,
             segs: segments,
-            index: lfmap::Map::new()
+            index: ConcHashMap::<u64, usize>::new(),
+            meta: meta
         }
 
     }
@@ -47,19 +52,21 @@ impl Drop for Chunk {
 }
 
 impl Chunks {
-    fn new (count: usize, size: usize) -> Chunks {
+    pub fn new (count: usize, size: usize, meta: Rc<ServerMeta>) -> Chunks {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         info!("Creating {} chunks, total {} bytes", count, size);
         for _ in 0..count {
-            chunks.push(Chunk::new(chunk_size));
+            chunks.push(Chunk::new(chunk_size, meta.clone()));
         }
         Chunks {
             list: chunks
         }
     }
-}
 
-pub fn init(count: usize, size: usize) -> Chunks {
-    Chunks::new(count, size)
+    pub fn new_dummy(count: usize, size: usize) -> Chunks {
+        Chunks::new(count, size, Rc::<ServerMeta>::new(ServerMeta {
+            schemas: Schemas::new()
+        }))
+    }
 }
