@@ -9,6 +9,7 @@ extern crate serde_json;
 extern crate serde_derive;
 
 extern crate concurrent_hashmap;
+extern crate linked_hash_map;
 
 pub mod ram;
 pub mod server;

@@ -4,3 +4,4 @@ pub mod cell;
 pub mod schema;
 
 mod segs;
+mod io;

@@ -9,10 +9,10 @@ pub struct Schema {
     pub id: u32,
     pub name: String,
     pub key_field: String,
-    pub fields: Vec<Field>
+    pub fields: Field
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     pub type_id: u32,
     pub name: String,
@@ -33,6 +33,11 @@ impl Schemas {
             name_map: ConcHashMap::<String, u32>::new()
         }
     }
-
+    pub fn new_schema(&self, schema: Schema) {
+        let name = schema.name.clone();
+        let id = schema.id;
+        self.schema_map.insert(id, schema);
+        self.name_map.insert(name, id);
+    }
 }
 

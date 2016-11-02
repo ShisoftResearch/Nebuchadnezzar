@@ -11,6 +11,7 @@ pub struct Chunk {
     pub addr: usize,
     pub segs: Vec<Segment>,
     pub index: ConcHashMap<u64, usize>,
+    pub locks: ConcHashMap<u64, Mutex<u16>>,
     pub meta: Rc<ServerMeta>
 }
 
@@ -33,6 +34,7 @@ impl Chunk {
             addr: mem_ptr,
             segs: segments,
             index: ConcHashMap::<u64, usize>::new(),
+            locks: ConcHashMap::<u64, Mutex<u16>>::new(),
             meta: meta
         }
 

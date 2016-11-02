@@ -3,6 +3,7 @@ extern crate neb;
 mod chunk;
 mod types;
 mod server;
+mod cell;
 
 
 #[macro_use]
