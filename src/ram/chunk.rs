@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 use concurrent_hashmap::ConcHashMap;
 use std::rc::Rc;
 use ram::schema::Schemas;
+use std::sync::atomic::AtomicUsize;
 
 pub struct Chunk {
     pub addr: usize,
     pub segs: Vec<Segment>,
     pub index: ConcHashMap<u64, usize>,
     pub locks: ConcHashMap<u64, Mutex<u16>>,
-    pub meta: Rc<ServerMeta>
+    pub meta: Rc<ServerMeta>,
 }
 
 pub struct Chunks {
@@ -25,8 +26,12 @@ impl Chunk {
         let mut segments = Vec::new();
         let seg_count = size / SEGMENT_SIZE;
         for seg_idx in 0..seg_count {
+            let seg_addr = seg_idx * SEGMENT_SIZE;
             segments.push(Segment {
-               addr: seg_idx * SEGMENT_SIZE
+                addr: seg_addr,
+                id: seg_idx,
+                bound: seg_addr + SEGMENT_SIZE,
+                last: AtomicUsize::new(seg_addr),
             });
         }
         info!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
@@ -35,10 +40,11 @@ impl Chunk {
             segs: segments,
             index: ConcHashMap::<u64, usize>::new(),
             locks: ConcHashMap::<u64, Mutex<u16>>::new(),
-            meta: meta
+            meta: meta,
         }
 
     }
+
     fn dispose (&mut self) {
         info!("disposing chunk at {}", self.addr);
         unsafe {

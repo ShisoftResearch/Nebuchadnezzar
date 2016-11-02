@@ -9,7 +9,7 @@ pub struct Instruction {
     offset: usize
 }
 
-fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue, mut ins: &mut Vec<Instruction>) {
+pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue, mut ins: &mut Vec<Instruction>) {
     let data_mismatch = "Data type does not match the schema for";
     if field.nullable {
         let  null_bit = match value {
@@ -60,7 +60,7 @@ fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue, mu
     }
 }
 
-fn execute_plan (ptr: usize, instructions: Vec<Instruction>) {
+pub fn execute_plan (ptr: usize, instructions: Vec<Instruction>) {
     for ins in instructions {
         types::set_val(ins.type_id, &ins.val, ptr + ins.offset);
     }

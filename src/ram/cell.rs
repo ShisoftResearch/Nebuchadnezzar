@@ -1,7 +1,8 @@
 use ram::schema::Schema;
+use ram::chunk::Chunk;
 use std::mem;
 use serde_json;
-use ram::io::reader;
+use ram::io::{reader, writer};
 use ram::types::{Map, Value};
 
 const MAX_CELL_SIZE :i32 = 1 * 1024 * 1024;
@@ -36,5 +37,12 @@ impl Cell {
             data: reader::read_by_schema(data_ptr, schema)
         }
     }
+
+//    pub fn to_raw(&self, chunk: Chunk, schema: Schema) -> usize {
+//        let mut offset: usize = 0;
+//        let mut instructions = Vec::<writer::Instruction>::new();
+//        let plan = writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions);
+//        let ptr = chunk.
+//    }
 
 }
