@@ -221,3 +221,13 @@ mod string {
         }
     }
 }
+
+#[test]
+fn array_len_type () {
+    assert_eq!(types::u16_io::size(0), types::get_size(types::ARRAY_LEN_TYPE_ID, 0))
+}
+
+#[test]
+fn null_type () {
+    assert_eq!(types::u8_io::size(0), types::get_size(types::NULL_TYPE_ID, 0))
+}

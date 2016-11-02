@@ -3,7 +3,7 @@ use uuid::Uuid;
 use std::cmp::PartialEq;
 use std::string::String;
 use std::any::Any;
-use linked_hash_map::LinkedHashMap;
+use std::collections::hash_map;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -26,6 +26,9 @@ macro_rules! gen_primitive_types_io {
                     pub fn size(_: usize) -> usize {
                         mem::size_of::<$t>()
                     }
+                    pub fn val_size(_: $t) -> usize {
+                        size(0)
+                    }
                 }
             )*
     );
@@ -46,8 +49,11 @@ macro_rules! gen_compound_types_io {
                         let write = $writer;
                         write(val, mem_ptr)
                     }
-                    pub fn size(mem_ptr: usize) -> usize {
+                    pub fn size(_: usize) -> usize {
                         $size
+                    }
+                    pub fn val_size(_: &$t) -> usize {
+                        size(0)
                     }
                 }
             )*
@@ -56,7 +62,7 @@ macro_rules! gen_compound_types_io {
 
 macro_rules! gen_variable_types_io {
     (
-        $($t:ident, $tmod:ident, $reader:expr, $writer: expr, $size:expr);*
+        $($t:ident, $tmod:ident, $reader:expr, $writer: expr, $size:expr, $val_size:expr);*
     ) => (
             $(
                 pub mod $tmod {
@@ -72,6 +78,10 @@ macro_rules! gen_variable_types_io {
                     pub fn size(mem_ptr: usize) -> usize {
                         let size = $size;
                         size(mem_ptr)
+                    }
+                    pub fn val_size(val: &$t) -> usize {
+                        let size = $val_size;
+                        size(val)
                     }
                 }
             )*
@@ -93,7 +103,7 @@ macro_rules! gen_write_extractor {
     )
 }
 
-pub type Map<K, V> = LinkedHashMap<K, V>;
+pub type Map<K, V> = hash_map::HashMap<K, V>;
 
 macro_rules! define_types {
     (
@@ -101,6 +111,8 @@ macro_rules! define_types {
             [ $( $name:expr ),* ], $id:expr, $t:ty, $e:ident, $r:ident, $io:ident
          );*
     ) => (
+
+        #[derive(Debug, Clone)]
         pub enum Value {
             $(
                 $e($t),
@@ -150,6 +162,21 @@ macro_rules! define_types {
                  _ => (),
              }
         }
+        pub fn get_vsize (id: u32, val: &Value) -> usize {
+            match id {
+                $(
+                    $id => {
+                        let val_opt = gen_write_extractor!($r, $e, val);
+                        if val_opt.is_none() {
+                            panic!("value does not match id");
+                        } else {
+                            $io::val_size(val_opt.unwrap())
+                        }
+                    },
+                )*
+                _ => {panic!("type id does not found");},
+           }
+        }
     );
 }
 
@@ -186,22 +213,26 @@ gen_primitive_types_io!(
     f64:    f64_io
 );
 
+#[derive(Debug, Clone)]
 pub struct pos2d32 {
     pub x: f32,
     pub y: f32,
 }
 
+#[derive(Debug, Clone)]
 pub struct pos2d64 {
     pub x: f64,
     pub y: f64,
 }
 
+#[derive(Debug, Clone)]
 pub struct pos3d32 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
+#[derive(Debug, Clone)]
 pub struct pos3d64 {
     pub x: f64,
     pub y: f64,
@@ -372,6 +403,10 @@ gen_variable_types_io! (
             str_len + u32_io::size(0)
 
         }
+    }, {
+        |val: &String| {
+            val.as_bytes().len()
+        }
     }
 );
 
@@ -397,3 +432,6 @@ define_types!(
     ["uuid"], 19, uuid_                                ,uuid     ,true  ,  uuid_io       ;
     ["string", "str"], 20, String                      ,string   ,true  ,  string_io
 );
+
+pub const ARRAY_LEN_TYPE_ID: u32 = 8; //u16
+pub const NULL_TYPE_ID: u32 = 7; //u8
