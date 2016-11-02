@@ -59,3 +59,9 @@ fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue, mu
         *offset += types::get_vsize(field.type_id, value);
     }
 }
+
+fn execute_plan (ptr: usize, instructions: Vec<Instruction>) {
+    for ins in instructions {
+        types::set_val(ins.type_id, &ins.val, ptr + ins.offset);
+    }
+}

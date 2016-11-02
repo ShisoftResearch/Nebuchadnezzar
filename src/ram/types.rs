@@ -154,7 +154,7 @@ macro_rules! define_types {
                  _ => Value::NA,
              }
         }
-        pub fn set_val (val: &Value, id:u32, mem_ptr: usize) {
+        pub fn set_val (id:u32, val: &Value, mem_ptr: usize) {
              match id {
                  $(
                      $id => $io::write(gen_write_extractor!($r, $e, val).unwrap() , mem_ptr),
