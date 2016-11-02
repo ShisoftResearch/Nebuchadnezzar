@@ -19,7 +19,7 @@ serde = "0.8"
 serde_json = { version = "0.8", features = ["preserve_order"] }
 serde_derive = "0.8"
 concurrent-hashmap = "*"
-linked-hash-map = "*"
+crossbeam = "*"
 
 [dev-dependencies]
 rand = "0.3"

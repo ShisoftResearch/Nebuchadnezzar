@@ -6,13 +6,14 @@ use std::sync::{Arc, Mutex};
 use concurrent_hashmap::ConcHashMap;
 use std::rc::Rc;
 use ram::schema::Schemas;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Chunk {
     pub addr: usize,
-    pub segs: Vec<Segment>,
     pub index: ConcHashMap<u64, usize>,
     pub locks: ConcHashMap<u64, Mutex<u16>>,
+    pub segs: Vec<Segment>,
+    pub seg_round: AtomicUsize,
     pub meta: Rc<ServerMeta>,
 }
 
@@ -23,8 +24,8 @@ pub struct Chunks {
 impl Chunk {
     fn new (size: usize, meta: Rc<ServerMeta>) -> Chunk {
         let mem_ptr = unsafe {libc::malloc(size)} as usize;
-        let mut segments = Vec::new();
         let seg_count = size / SEGMENT_SIZE;
+        let mut segments = Vec::<Segment>::new();
         for seg_idx in 0..seg_count {
             let seg_addr = seg_idx * SEGMENT_SIZE;
             segments.push(Segment {
@@ -37,14 +38,29 @@ impl Chunk {
         info!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
         Chunk {
             addr: mem_ptr,
-            segs: segments,
             index: ConcHashMap::<u64, usize>::new(),
             locks: ConcHashMap::<u64, Mutex<u16>>::new(),
             meta: meta,
+            segs: segments,
+            seg_round: AtomicUsize::new(0),
         }
 
     }
-
+    pub fn try_acquire(&self, size: usize) -> Option<usize> {
+        let mut retried = 0;
+        loop {
+            let n = self.seg_round.fetch_add(1, Ordering::Relaxed);
+            let seg_id = n % self.segs.len();
+            let seg_acquire = self.segs[seg_id].try_acquire(size);
+            match seg_acquire {
+                None => {
+                    if retried > self.segs.len() * 2 {return None;}
+                    retried += 1;
+                },
+                Some(addr) => {return Some(addr);}
+            }
+        }
+    }
     fn dispose (&mut self) {
         info!("disposing chunk at {}", self.addr);
         unsafe {
