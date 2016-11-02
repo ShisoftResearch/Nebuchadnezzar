@@ -38,11 +38,18 @@ impl Cell {
         }
     }
 
-//    pub fn to_raw(&self, chunk: Chunk, schema: Schema) -> usize {
-//        let mut offset: usize = 0;
-//        let mut instructions = Vec::<writer::Instruction>::new();
-//        let plan = writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions);
-//        let ptr = chunk.
-//    }
+    pub fn to_raw(&self, chunk: Chunk, schema: Schema) -> usize {
+        let mut offset: usize = 0;
+        let mut instructions = Vec::<writer::Instruction>::new();
+        let plan = writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions);
+        let addr_opt = chunk.try_acquire(offset);
+        match addr_opt {
+            None => panic!("Cannot allocate new spaces in chunk"),
+            Some(addr) => {
+                writer::execute_plan(addr, instructions);
+                return addr;
+            }
+        }
+    }
 
 }

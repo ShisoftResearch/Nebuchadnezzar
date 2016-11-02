@@ -57,7 +57,7 @@ impl Chunk {
                     if retried > self.segs.len() * 2 {return None;}
                     retried += 1;
                 },
-                Some(addr) => {return Some(addr);}
+                _ => {return seg_acquire;}
             }
         }
     }
