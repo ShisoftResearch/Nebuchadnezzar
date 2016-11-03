@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::HashMap;
 use std::string::String;
 use concurrent_hashmap::ConcHashMap;
@@ -8,7 +7,7 @@ use serde_json;
 pub struct Schema {
     pub id: u32,
     pub name: String,
-    pub key_field: String,
+    pub key_field: Option<String>,
     pub fields: Field
 }
 

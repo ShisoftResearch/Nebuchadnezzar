@@ -27,7 +27,7 @@ impl Chunk {
         let seg_count = size / SEGMENT_SIZE;
         let mut segments = Vec::<Segment>::new();
         for seg_idx in 0..seg_count {
-            let seg_addr = seg_idx * SEGMENT_SIZE;
+            let seg_addr = mem_ptr + seg_idx * SEGMENT_SIZE;
             segments.push(Segment {
                 addr: seg_addr,
                 id: seg_idx,

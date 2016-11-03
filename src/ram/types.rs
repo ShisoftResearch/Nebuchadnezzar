@@ -88,7 +88,7 @@ macro_rules! gen_variable_types_io {
     );
 }
 
-macro_rules! gen_write_extractor {
+macro_rules! get_from_val {
     (true, $e:ident, $d:ident) => (
         match $d {
             &Value::$e(ref v) => Some(v),
@@ -99,6 +99,19 @@ macro_rules! gen_write_extractor {
         match $d {
             &Value::$e(v) => Some(v),
             _ => None
+        }
+    )
+}
+
+macro_rules! get_from_val_fn {
+    (true, $e:ident, $t:ty) => (
+        pub fn $e(&self) -> Option<&$t> {
+            get_from_val!(true, $e, self)
+        }
+    );
+    (false, $e:ident, $t:ty) => (
+        pub fn $e(&self) -> Option<$t> {
+            get_from_val!(false, $e, self)
         }
     )
 }
@@ -121,6 +134,17 @@ macro_rules! define_types {
             Array(Vec<Value>),
             NA,
             Null
+        }
+        impl Value {
+            $(
+                get_from_val_fn!($r, $e, $t);
+            )*
+            pub fn Map(&self) -> Option<&Map<String, Value>> {
+                match self {
+                    &Value::Map(ref m) => Some(m),
+                    _ => None
+                }
+            }
         }
         pub fn get_type_id (name: String) -> u32 {
            match name.as_ref() {
@@ -157,7 +181,7 @@ macro_rules! define_types {
         pub fn set_val (id:u32, val: &Value, mem_ptr: usize) {
              match id {
                  $(
-                     $id => $io::write(gen_write_extractor!($r, $e, val).unwrap() , mem_ptr),
+                     $id => $io::write(get_from_val!($r, $e, val).unwrap() , mem_ptr),
                  )*
                  _ => (),
              }
@@ -166,7 +190,7 @@ macro_rules! define_types {
             match id {
                 $(
                     $id => {
-                        let val_opt = gen_write_extractor!($r, $e, val);
+                        let val_opt = get_from_val!($r, $e, val);
                         if val_opt.is_none() {
                             panic!("value does not match id");
                         } else {
@@ -401,11 +425,10 @@ gen_variable_types_io! (
         |mem_ptr| {
             let str_len = u32_io::read(mem_ptr) as usize;
             str_len + u32_io::size(0)
-
         }
     }, {
         |val: &String| {
-            val.as_bytes().len()
+            val.as_bytes().len() + u32_io::size(0)
         }
     }
 );

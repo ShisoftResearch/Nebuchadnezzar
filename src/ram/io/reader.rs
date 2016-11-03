@@ -38,7 +38,7 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
     }
 }
 
-pub fn read_by_schema(ptr: usize, schema: Schema) -> DataValue {
+pub fn read_by_schema(ptr: usize, schema: &Schema) -> DataValue {
     let (val, _) = read_field(ptr, &schema.fields);
     val
 }
