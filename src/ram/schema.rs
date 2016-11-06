@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::string::String;
 use concurrent_hashmap::ConcHashMap;
-use serde_json;
 
-#[derive(Serialize, Deserialize, Debug)]
 pub struct Schema {
     pub id: u32,
     pub name: String,
@@ -11,7 +9,7 @@ pub struct Schema {
     pub fields: Field
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Clone)]
 pub struct Field {
     pub type_id: u32,
     pub name: String,

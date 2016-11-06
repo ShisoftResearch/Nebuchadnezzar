@@ -106,6 +106,6 @@ pub fn cell_rw () {
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().i64().unwrap(), 100);
         assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().string().unwrap(), "Jack");
+        assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().u64().unwrap(), 70);
     }
 }
-

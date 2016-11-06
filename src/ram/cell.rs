@@ -2,7 +2,6 @@ use ram::schema::Schema;
 use ram::chunk::Chunk;
 use std::mem;
 use std::ptr;
-use serde_json;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value};
 
