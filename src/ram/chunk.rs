@@ -44,7 +44,6 @@ impl Chunk {
             segs: segments,
             seg_round: AtomicUsize::new(0),
         }
-
     }
     pub fn try_acquire(&self, size: usize) -> Option<usize> {
         let mut retried = 0;

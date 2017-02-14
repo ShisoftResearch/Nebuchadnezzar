@@ -12,5 +12,6 @@
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="library" name="Rust &lt;neb&gt;" level="project" />
     <orderEntry type="library" name="Cargo &lt;neb&gt;" level="project" />
+    <orderEntry type="library" name="Cargo &lt;neb&gt;" level="project" />
   </component>
 </module>
