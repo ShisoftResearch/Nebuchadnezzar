@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::string::String;
 use concurrent_hashmap::ConcHashMap;
 
+mod sm;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
     pub id: u32,
     pub name: String,
@@ -9,7 +12,7 @@ pub struct Schema {
     pub fields: Field
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     pub type_id: u32,
     pub name: String,
@@ -37,4 +40,3 @@ impl Schemas {
         self.name_map.insert(name, id);
     }
 }
-
