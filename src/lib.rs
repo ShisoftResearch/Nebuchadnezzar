@@ -12,4 +12,4 @@ pub mod server;
 extern crate log;
 #[macro_use]
 extern crate lazy_static;
-extern crate mio;
+extern crate bifrost;

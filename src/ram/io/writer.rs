@@ -18,7 +18,7 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
         };
         ins.push(Instruction {
             type_id: NULL_TYPE_ID,
-            val: Value::u8(null_bit),
+            val: Value::U8(null_bit),
             offset: *offset
         });
         *offset += 1;
@@ -30,7 +30,7 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
             sub_field.is_array = false;
             ins.push(Instruction {
                 type_id: types::ARRAY_LEN_TYPE_ID,
-                val: Value::u16(len as u16),
+                val: Value::U16(len as u16),
                 offset: *offset
             });
             *offset += types::u16_io::size(0);

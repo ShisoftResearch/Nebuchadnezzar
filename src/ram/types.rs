@@ -434,26 +434,26 @@ gen_variable_types_io! (
 );
 
 define_types!(
-    ["bool", "bit"], 1, bool                           ,bool     ,false ,  bool_io       ;
-    ["char"], 2, char                                  ,char     ,false ,  char_io       ;
-    ["i8"], 3, i8                                      ,i8       ,false ,  i8_io         ;
-    ["i16", "int"], 4, i16                             ,i16      ,false ,  i16_io        ;
-    ["i32", "long"], 5, i32                            ,i32      ,false ,  i32_io        ;
-    ["i64", "longlong"], 6, i64                        ,i64      ,false ,  i64_io        ;
-    ["u8", "byte"], 7, u8                              ,u8       ,false ,  u8_io         ;
-    ["u16"], 8, u16                                    ,u16      ,false ,  u16_io        ;
-    ["u32"], 9, u32                                    ,u32      ,false ,  u32_io        ;
-    ["u64"], 10, u64                                   ,u64      ,false ,  u64_io        ;
-    ["isize"], 11, isize                               ,isize    ,false ,  isize_io      ;
-    ["usize"], 12, usize                               ,usize    ,false ,  usize_io      ;
-    ["f32", "float"], 13, f32                          ,f32      ,false ,  f32_io        ;
-    ["f64", "double"], 14, f64                         ,f64      ,false ,  f64_io        ;
-    ["pos2d32", "pos2d", "pos", "pos32"], 15, pos2d32  ,pos2d32  ,true  ,  pos2d32_io    ;
-    ["pos2d64", "pos64"], 16, pos2d64                  ,pos2d64  ,true  ,  pos2d64_io    ;
-    ["pos3d32", "pos3d"], 17, pos3d32                  ,pos3d32  ,true  ,  pos3d32_io    ;
-    ["pos3d64"], 18, pos3d64                           ,pos3d64  ,true  ,  pos3d64_io    ;
-    ["uuid"], 19, uuid_                                ,uuid     ,true  ,  uuid_io       ;
-    ["string", "str"], 20, String                      ,string   ,true  ,  string_io
+    ["bool", "bit"], 1, bool                           ,Bool     ,false ,  bool_io       ;
+    ["char"], 2, char                                  ,Char     ,false ,  char_io       ;
+    ["i8"], 3, i8                                      ,I8       ,false ,  i8_io         ;
+    ["i16", "int"], 4, i16                             ,I16      ,false ,  i16_io        ;
+    ["i32", "long"], 5, i32                            ,I32      ,false ,  i32_io        ;
+    ["i64", "longlong"], 6, i64                        ,I64      ,false ,  i64_io        ;
+    ["u8", "byte"], 7, u8                              ,U8       ,false ,  u8_io         ;
+    ["u16"], 8, u16                                    ,U16      ,false ,  u16_io        ;
+    ["u32"], 9, u32                                    ,U32      ,false ,  u32_io        ;
+    ["u64"], 10, u64                                   ,U64      ,false ,  u64_io        ;
+    ["isize"], 11, isize                               ,Isize    ,false ,  isize_io      ;
+    ["usize"], 12, usize                               ,Usize    ,false ,  usize_io      ;
+    ["f32", "float"], 13, f32                          ,F32      ,false ,  f32_io        ;
+    ["f64", "double"], 14, f64                         ,F64      ,false ,  f64_io        ;
+    ["pos2d32", "pos2d", "pos", "pos32"], 15, pos2d32  ,Pos2d32  ,true  ,  pos2d32_io    ;
+    ["pos2d64", "pos64"], 16, pos2d64                  ,Pos2d64  ,true  ,  pos2d64_io    ;
+    ["pos3d32", "pos3d"], 17, pos3d32                  ,Pos3d32  ,true  ,  pos3d32_io    ;
+    ["pos3d64"], 18, pos3d64                           ,Pos3d64  ,true  ,  pos3d64_io    ;
+    ["uuid"], 19, uuid_                                ,Uuid     ,true  ,  uuid_io       ;
+    ["string", "str"], 20, String                      ,String   ,true  ,  string_io
 );
 
 pub const ARRAY_LEN_TYPE_ID: u32 = 8; //u16
