@@ -34,9 +34,6 @@ impl Schemas {
         }
     }
     pub fn new_schema(&self, schema: Schema) {
-        let name = schema.name.clone();
-        let id = schema.id;
-        self.schema_map.insert(id, schema);
-        self.name_map.insert(name, id);
+
     }
 }
