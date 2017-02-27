@@ -1,15 +1,16 @@
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,
-    pub schemas: Schemas
+    pub schemas: Arc<Schemas>
 }
 
 pub struct ServerMeta {
-    pub schemas: Schemas
+    pub schemas: Arc<Schemas>
 }
 
 pub struct Server {

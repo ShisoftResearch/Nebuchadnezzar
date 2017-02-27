@@ -8,7 +8,7 @@ pub fn init () {
     let server = Server::new(ServerOptions {
         chunk_count: 1,
         memory_size: 1000,
-        schemas: Schemas::new()
+        schemas: Schemas::new(None)
     });
 }
 

@@ -89,7 +89,7 @@ impl Chunks {
 
     pub fn new_dummy(count: usize, size: usize) -> Chunks {
         Chunks::new(count, size, Rc::<ServerMeta>::new(ServerMeta {
-            schemas: Schemas::new()
+            schemas: Schemas::new(None)
         }))
     }
 }
