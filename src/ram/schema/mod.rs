@@ -2,8 +2,9 @@ use bifrost::raft::client::RaftClient;
 use bifrost_hasher::hash_str;
 
 use concurrent_hashmap::ConcHashMap;
+use parking_lot::Mutex;
 
-use std::sync::Arc;
+use std::sync::{Arc};
 use std::collections::HashMap;
 use std::string::String;
 
@@ -27,8 +28,9 @@ pub struct Field {
 }
 
 pub struct Schemas {
-    pub schema_map: ConcHashMap<u32, Schema>,
-    pub name_map: ConcHashMap<String, u32>,
+    schema_map: ConcHashMap<u32, Schema>,
+    name_map: ConcHashMap<String, u32>,
+    id_counter: Mutex<u32>,
     sm: Option<sm::client::SMClient>,
 }
 
@@ -41,13 +43,14 @@ impl Schemas {
         let schemas = Arc::new(Schemas {
             schema_map: ConcHashMap::<u32, Schema>::new(),
             name_map: ConcHashMap::<String, u32>::new(),
+            id_counter: Mutex::new(0),
             sm: sm
         });
         let sc1 = schemas.clone();
         let sc2 = schemas.clone();
         if let Some(ref sm) = schemas.sm {
             sm.on_schema_added(move |r| {
-                sc1.new_schema(&r.unwrap());
+                sc1.new_schema_(&r.unwrap());
             });
             sm.on_schema_deleted(move |r| {
                 sc2.del_schema(&r.unwrap());
@@ -55,7 +58,11 @@ impl Schemas {
         }
         return schemas;
     }
-    pub fn new_schema(&self, schema: &Schema) {
+    pub fn new_schema(&self, schema: &mut Schema) {
+        schema.id = self.get_id();
+        self.new_schema_(schema)
+    }
+    pub fn new_schema_(&self, schema: &Schema) {
         let name = schema.name.clone();
         let id = schema.id;
         self.schema_map.insert(id, schema.clone());
@@ -86,5 +93,16 @@ impl Schemas {
             return Some(schema.get())
         }
         return None;
+    }
+    fn get_id(&self) -> u32 {
+        let mut local_id_counter = self.id_counter.lock();
+        if let Some(ref sm) = self.sm {
+            let id = sm.next_id().unwrap().unwrap();
+            *local_id_counter = id;
+            return id
+        } else {
+            *local_id_counter += 1;
+            return *local_id_counter;
+        }
     }
 }

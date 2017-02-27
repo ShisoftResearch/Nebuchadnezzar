@@ -22,6 +22,7 @@ serde = "0.8"
 serde_derive = "0.8"
 bincode = "0.6"
 byteorder = "1"
+parking_lot = {version = "0.3", features = ["nightly"]}
 
 [dev-dependencies]
 rand = "0.3"

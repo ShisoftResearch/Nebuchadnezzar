@@ -12,15 +12,17 @@ pub static DEFAULT_SM_ID: u64 = hash_ident!(NEB_SCHEMAS_SM) as u64;
 pub type SchemasData = (HashMap<u32, Schema>, HashMap<String, u32>);
 
 pub struct SchemasSM {
-    pub schema_map: HashMap<u32, Schema>,
-    pub name_map: HashMap<String, u32>,
-    pub callback: SMCallback,
+    schema_map: HashMap<u32, Schema>,
+    name_map: HashMap<String, u32>,
+    callback: SMCallback,
+    id_counter: u32,
 }
 
 raft_state_machine! {
     def qry get_all() -> SchemasData;
     def cmd new_schema(schema: Schema);
     def cmd del_schema(name: String);
+    def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
 }
@@ -46,6 +48,10 @@ impl StateMachineCmds for SchemasSM {
         self.callback.notify(&commands::on_schema_deleted{}, Ok(name));
         Ok(())
     }
+    fn next_id(&mut self) -> Result<u32, ()> {
+        self.id_counter += 1;
+        Ok(self.id_counter)
+    }
 }
 
 impl StateMachineCtl for SchemasSM {
@@ -66,7 +72,8 @@ impl SchemasSM {
         SchemasSM {
             schema_map: HashMap::new(),
             name_map: HashMap::new(),
-            callback: SMCallback::new(DEFAULT_SM_ID, raft_service.clone())
+            callback: SMCallback::new(DEFAULT_SM_ID, raft_service.clone()),
+            id_counter: 0,
         }
     }
     fn to_data(&self) -> SchemasData {
