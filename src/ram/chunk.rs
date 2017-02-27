@@ -2,7 +2,8 @@ use libc;
 use ram::segs::{Segment, SEGMENT_SIZE};
 use server::ServerMeta;
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc};
+use parking_lot::Mutex;
 use concurrent_hashmap::ConcHashMap;
 use std::rc::Rc;
 use ram::schema::Schemas;
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 pub struct Chunk {
     pub addr: usize,
     pub index: ConcHashMap<u64, usize>,
-    pub locks: ConcHashMap<u64, Mutex<u16>>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Rc<ServerMeta>,
@@ -39,7 +39,6 @@ impl Chunk {
         Chunk {
             addr: mem_ptr,
             index: ConcHashMap::<u64, usize>::new(),
-            locks: ConcHashMap::<u64, Mutex<u16>>::new(),
             meta: meta,
             segs: segments,
             seg_round: AtomicUsize::new(0),
