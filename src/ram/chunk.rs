@@ -10,11 +10,13 @@ use ram::schema::Schemas;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct Chunk {
+    pub id: usize,
     pub addr: usize,
     pub index: ConcHashMap<u64, usize>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Rc<ServerMeta>,
+    pub back_storage: Option<String>,
 }
 
 pub struct Chunks {
@@ -22,7 +24,7 @@ pub struct Chunks {
 }
 
 impl Chunk {
-    fn new (size: usize, meta: Rc<ServerMeta>) -> Chunk {
+    fn new (id: usize, size: usize, meta: Rc<ServerMeta>, back_storage: Option<String>) -> Chunk {
         let mem_ptr = unsafe {libc::malloc(size)} as usize;
         let seg_count = size / SEGMENT_SIZE;
         let mut segments = Vec::<Segment>::new();
@@ -37,11 +39,13 @@ impl Chunk {
         }
         info!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
         Chunk {
+            id: id,
             addr: mem_ptr,
             index: ConcHashMap::<u64, usize>::new(),
             meta: meta,
             segs: segments,
             seg_round: AtomicUsize::new(0),
+            back_storage: back_storage
         }
     }
     pub fn try_acquire(&self, size: usize) -> Option<usize> {
@@ -74,12 +78,16 @@ impl Drop for Chunk {
 }
 
 impl Chunks {
-    pub fn new (count: usize, size: usize, meta: Rc<ServerMeta>) -> Chunks {
+    pub fn new (count: usize, size: usize, meta: Rc<ServerMeta>, backup_storage: Option<String>) -> Chunks {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         info!("Creating {} chunks, total {} bytes", count, size);
-        for _ in 0..count {
-            chunks.push(Chunk::new(chunk_size, meta.clone()));
+        for i in 0..count {
+            let backup_storage = match backup_storage {
+                Some(ref dir) => Some(format!("{}/data-{}.bak", dir, i)),
+                None => None
+            };
+            chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage));
         }
         Chunks {
             list: chunks
@@ -89,6 +97,6 @@ impl Chunks {
     pub fn new_dummy(count: usize, size: usize) -> Chunks {
         Chunks::new(count, size, Rc::<ServerMeta>::new(ServerMeta {
             schemas: Schemas::new(None)
-        }))
+        }), None)
     }
 }

@@ -8,7 +8,7 @@ use std::sync::{Arc};
 use std::collections::HashMap;
 use std::string::String;
 
-mod sm;
+pub mod sm;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
@@ -46,9 +46,9 @@ impl Schemas {
             id_counter: Mutex::new(0),
             sm: sm
         });
-        let sc1 = schemas.clone();
-        let sc2 = schemas.clone();
         if let Some(ref sm) = schemas.sm {
+            let sc1 = schemas.clone();
+            let sc2 = schemas.clone();
             sm.on_schema_added(move |r| {
                 sc1.new_schema_(&r.unwrap());
             });
@@ -62,7 +62,7 @@ impl Schemas {
         schema.id = self.get_id();
         self.new_schema_(schema)
     }
-    pub fn new_schema_(&self, schema: &Schema) {
+    fn new_schema_(&self, schema: &Schema) {
         let name = schema.name.clone();
         let id = schema.id;
         self.schema_map.insert(id, schema.clone());
@@ -71,7 +71,7 @@ impl Schemas {
             sm.new_schema(schema.clone());
         }
     }
-    fn del_schema(&self, name: &String) -> Result<(), ()> {
+    pub fn del_schema(&self, name: &String) -> Result<(), ()> {
         if let Some(id) = self.name_map.find(name) {
             self.schema_map.remove(&id.get());
         }
@@ -81,14 +81,14 @@ impl Schemas {
         }
         Ok(())
     }
-    fn get_by_name(&self, name: &String) -> Option<&Schema> {
+    pub fn get_by_name(&self, name: &String) -> Option<&Schema> {
         if let Some(id) = self.name_map.find(name) {
             let id = id.get();
             return self.get(&id)
         }
         return None;
     }
-    fn get(&self, id: &u32) -> Option<&Schema> {
+    pub fn get(&self, id: &u32) -> Option<&Schema> {
         if let Some(schema) = self.schema_map.find(id) {
             return Some(schema.get())
         }
