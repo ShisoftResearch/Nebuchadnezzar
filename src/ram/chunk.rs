@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{Mutex, MutexGuard, RwLock};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use concurrent_hashmap::ConcHashMap;
 use ram::schema::Schemas;
 use ram::segs::{Segment, SEGMENT_SIZE};
@@ -52,7 +52,7 @@ impl Chunk {
             backup_storage: back_storage
         }
     }
-    pub fn try_acquire(&self, size: usize) -> Option<usize> {
+    pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
         let mut retried = 0;
         loop {
             let n = self.seg_round.load(Ordering::Relaxed);

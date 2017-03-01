@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{RwLock, Mutex};
+use parking_lot::{RwLock, RwLockReadGuard, Mutex};
 
 use super::cell::Header;
 
@@ -16,8 +16,8 @@ pub struct Segment {
 }
 
 impl Segment {
-    pub fn try_acquire(&self, size: usize) -> Option<usize> {
-        let _ = self.lock.read();
+    pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
+        let rl = self.lock.read();
         loop {
             let curr_last = self.last.load(Ordering::SeqCst);
             let exp_last = curr_last + size;
@@ -28,7 +28,7 @@ impl Segment {
                     continue;
                 } else {
                     Header::reserve(curr_last, size);
-                    return Some(curr_last);
+                    return Some((curr_last, rl));
                 }
             }
         }

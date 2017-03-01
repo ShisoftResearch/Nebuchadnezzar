@@ -120,7 +120,7 @@ impl Cell {
                 error!("Cannot allocate new spaces in chunk");
                 return Err(WriteError::CannotAllocateSpace);
             },
-            Some(addr) => {
+            Some((addr, _lock)) => {
                 self.header.write(addr);
                 writer::execute_plan(addr + HEADER_SIZE, instructions);
                 return Ok(addr);
