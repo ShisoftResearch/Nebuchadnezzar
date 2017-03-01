@@ -57,16 +57,17 @@ pub fn cell_rw () {
     let mut data = Value::Map(data_map);
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     let mut cell = Cell {
-        header: Header {
-            version: 1,
-            size: 0,
-            schema: 0,
-            hash: 1,
-            partation: 1,
-        },
+        header: Header::new(0, 0, 1, 1),
+//        Header {
+//            version: 1,
+//            size: 0,
+//            schema: 0,
+//            hash: 1,
+//            partition: 1,
+//        },
         data: data
     };
-    let mut loc = cell.to_raw(&chunk, &schema);
+    let mut loc = cell.write_to_chunk(&chunk, &schema);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_raw(cell_1_ptr, &schema);
@@ -82,16 +83,17 @@ pub fn cell_rw () {
     data_map.insert(String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header {
-            version: 1,
-            size: 0,
-            schema: 0,
-            hash: 2,
-            partation: 1,
-        },
+        header: Header::new(0, 0, 2, 1),
+//        Header {
+//            version: 1,
+//            size: 0,
+//            schema: 0,
+//            hash: 2,
+//            partition: 1,
+//        },
         data: data
     };
-    loc = cell.to_raw(&chunk, &schema);
+    loc = cell.write_to_chunk(&chunk, &schema);
     let cell_2_ptr = loc.unwrap();
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {

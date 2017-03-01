@@ -17,10 +17,24 @@ pub struct Header {
     pub size: u32,
     pub schema: u32,
     pub hash: u64,
-    pub partation: u64
+    pub partition: u64,
+    pub lock: u16,
 }
 
-pub const HEADER_SIZE :usize = 32;
+impl Header {
+    pub fn new(size: u32, schema: u32, hash: u64, partition: u64) -> Header {
+        Header {
+            version: 1,
+            size: size,
+            schema: schema,
+            hash: hash,
+            partition: partition,
+            lock: 1,
+        }
+    }
+}
+
+pub const HEADER_SIZE :usize = 34;
 
 pub struct Cell {
     pub header: Header,
@@ -38,7 +52,7 @@ impl Cell {
         }
     }
 
-    pub fn to_raw(& mut self, chunk: &Chunk, schema: &Schema) -> Option<usize> {
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, schema: &Schema) -> Option<usize> {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();
         let plan = writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions);
@@ -49,7 +63,10 @@ impl Cell {
         self.header.size = total_size as u32;
         self.header.version += 1;
         match addr_opt {
-            None => panic!("Cannot allocate new spaces in chunk"),
+            None => {
+                error!("Cannot allocate new spaces in chunk");
+                return None;
+            },
             Some(addr) => {
                 unsafe {
                     let header = self.header;

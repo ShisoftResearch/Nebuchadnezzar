@@ -64,7 +64,7 @@ impl Server {
                 Ok(raft_client) => {
                     schemas = Schemas::new(Some(&raft_client));
                 },
-                Err(e) => {error!("Cannot generate raft client: {:?}", e);}
+                Err(e) => {error!("Cannot generate meta client: {:?}", e);}
             }
         } else if opt.is_meta {error!("Meta server cannot be standalone");}
         let meta_rc = Rc::<ServerMeta>::new(ServerMeta {

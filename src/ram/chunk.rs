@@ -3,7 +3,7 @@ use ram::segs::{Segment, SEGMENT_SIZE};
 use server::ServerMeta;
 use std::thread;
 use std::sync::{Arc};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use concurrent_hashmap::ConcHashMap;
 use std::rc::Rc;
 use ram::schema::Schemas;
@@ -35,9 +35,11 @@ impl Chunk {
                 id: seg_idx,
                 bound: seg_addr + SEGMENT_SIZE,
                 last: AtomicUsize::new(seg_addr),
+                lock: RwLock::new(()),
+                tombstones: Vec::new(),
             });
         }
-        info!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
+        debug!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
         Chunk {
             id: id,
             addr: mem_ptr,
@@ -51,12 +53,13 @@ impl Chunk {
     pub fn try_acquire(&self, size: usize) -> Option<usize> {
         let mut retried = 0;
         loop {
-            let n = self.seg_round.fetch_add(1, Ordering::Relaxed);
+            let n = self.seg_round.load(Ordering::Relaxed);
             let seg_id = n % self.segs.len();
             let seg_acquire = self.segs[seg_id].try_acquire(size);
             match seg_acquire {
                 None => {
                     if retried > self.segs.len() * 2 {return None;}
+                    self.seg_round.fetch_add(1, Ordering::Relaxed);
                     retried += 1;
                 },
                 _ => {return seg_acquire;}
@@ -64,7 +67,7 @@ impl Chunk {
         }
     }
     fn dispose (&mut self) {
-        info!("disposing chunk at {}", self.addr);
+        debug!("disposing chunk at {}", self.addr);
         unsafe {
             libc::free(self.addr as *mut libc::c_void)
         }
@@ -81,7 +84,7 @@ impl Chunks {
     pub fn new (count: usize, size: usize, meta: Rc<ServerMeta>, backup_storage: Option<String>) -> Chunks {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
-        info!("Creating {} chunks, total {} bytes", count, size);
+        debug!("Creating {} chunks, total {} bytes", count, size);
         for i in 0..count {
             let backup_storage = match backup_storage {
                 Some(ref dir) => Some(format!("{}/data-{}.bak", dir, i)),
