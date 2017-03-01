@@ -1,28 +1,23 @@
 use libc;
-use ram::segs::{Segment, SEGMENT_SIZE};
-use server::ServerMeta;
 use std::thread;
-use std::sync::{Arc};
-use parking_lot::{Mutex, RwLock};
-use concurrent_hashmap::ConcHashMap;
 use std::rc::Rc;
-use ram::schema::Schemas;
+use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-#[repr(packed)]
-pub struct CellIndex {
-    pub location: u64,
-    pub lock: Mutex<()>
-}
+use parking_lot::{Mutex, MutexGuard, RwLock};
+use concurrent_hashmap::ConcHashMap;
+use ram::schema::Schemas;
+use ram::segs::{Segment, SEGMENT_SIZE};
+use ram::cell::{Cell, ReadError, WriteError};
+use server::ServerMeta;
 
 pub struct Chunk {
     pub id: usize,
     pub addr: usize,
-    pub index: ConcHashMap<u64, CellIndex>,
+    pub index: ConcHashMap<u64, Mutex<usize>>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Rc<ServerMeta>,
-    pub back_storage: Option<String>,
+    pub backup_storage: Option<String>,
 }
 
 pub struct Chunks {
@@ -49,11 +44,11 @@ impl Chunk {
         Chunk {
             id: id,
             addr: mem_ptr,
-            index: ConcHashMap::<u64, CellIndex>::new(),
+            index: ConcHashMap::<u64, Mutex<usize>>::new(),
             meta: meta,
             segs: segments,
             seg_round: AtomicUsize::new(0),
-            back_storage: back_storage
+            backup_storage: back_storage
         }
     }
     pub fn try_acquire(&self, size: usize) -> Option<usize> {
@@ -72,6 +67,33 @@ impl Chunk {
             }
         }
     }
+    fn locate_segment(&self, location: usize) -> &Segment {
+        let offset = location - self.addr;
+        let seg_id = offset / SEGMENT_SIZE;
+        return &self.segs[seg_id];
+    }
+    fn location_of(&self, hash: u64) -> Option<MutexGuard<usize>> {
+        match self.index.find(&hash) {
+            Some(index) => {
+                let index = index.get();
+                let index_lock = index.lock();
+                if *index_lock == 0 {
+                    return None
+                }
+                return Some(index_lock);
+            },
+            None => None
+        }
+    }
+    fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
+        match self.location_of(hash) {
+            Some(loc) => {
+                Cell::from_chunk_raw(*loc, self)
+            },
+            None => Err(ReadError::CellDoesNotExisted)
+        }
+    }
+
     fn dispose (&mut self) {
         debug!("disposing chunk at {}", self.addr);
         unsafe {

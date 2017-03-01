@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::RwLock;
 
+use super::cell::Header;
+
 pub const SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct Segment {
@@ -24,12 +26,16 @@ impl Segment {
                 if self.last.compare_and_swap(curr_last, exp_last, Ordering::SeqCst) != curr_last {
                     continue;
                 } else {
+                    Header::reserve(curr_last, size);
                     return Some(curr_last);
                 }
             }
         }
     }
-    pub fn del_cell(&self, location: usize) {
-
+    pub fn put_cell_tombstone(&self, location: usize) {
+        unsafe {
+            let mut ver_field = location as *mut u64;
+            *ver_field = 0; // set version to 0 to represent tombstone
+        }
     }
 }
