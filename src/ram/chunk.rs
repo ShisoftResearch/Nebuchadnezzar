@@ -131,7 +131,9 @@ impl Chunk {
         if let Some(mut cell_location) = self.location_of(hash) {
             let written = cell.write_to_chunk(self);
             if let Ok(new_location) = written {
+                let old_location = *cell_location;
                 *cell_location = new_location;
+                self.put_tombstone(old_location);
             }
             return written;
         } else {
@@ -148,7 +150,9 @@ impl Chunk {
                     if let Some(mut new_cell) = new_cell {
                         let written = new_cell.write_to_chunk(self);
                         if let Ok(new_location) = written {
+                            let old_location = *cell_location;
                             *cell_location = new_location;
+                            self.put_tombstone(old_location);
                         }
                         return written;
                     } else {
@@ -159,6 +163,15 @@ impl Chunk {
             }
         } else {
             return Err(WriteError::CellDoesNotExisted)
+        }
+    }
+    fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
+        if let Some(cell_location) = self.location_of(hash) {
+            self.index.remove(&hash);
+            self.put_tombstone(*cell_location);
+            return Ok(());
+        } else {
+            return Err(WriteError::CellDoesNotExisted);
         }
     }
     fn dispose (&mut self) {
