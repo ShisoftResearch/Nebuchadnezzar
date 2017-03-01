@@ -27,6 +27,9 @@ pub enum WriteError {
     CannotAllocateSpace,
     CellIsTooLarge(usize),
     CellAlreadyExisted,
+    CellDoesNotExisted,
+    ReadError(ReadError),
+    UserCanceledUpdate,
 }
 
 #[derive(Debug)]

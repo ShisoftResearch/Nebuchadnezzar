@@ -2,7 +2,7 @@ use libc;
 use std::thread;
 use std::rc::Rc;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use concurrent_hashmap::ConcHashMap;
@@ -38,7 +38,7 @@ impl Chunk {
                 bound: seg_addr + SEGMENT_SIZE,
                 last: AtomicUsize::new(seg_addr),
                 lock: RwLock::new(()),
-                tombstones: BTreeSet::new(),
+                tombstones: Mutex::new(BTreeSet::new()),
             });
         }
         debug!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
@@ -98,32 +98,67 @@ impl Chunk {
             None => Err(ReadError::CellDoesNotExisted)
         }
     }
-    fn write_cell(&self, cell: &Cell) -> Result<usize, WriteError> {
+    fn write_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
         let hash = cell.header.hash;
         if self.location_of(hash).is_some() {
             return Err(WriteError::CellAlreadyExisted);
         } else {
             let written = cell.write_to_chunk(self);
-            let mut need_rollback = false;
+            let need_rollback = AtomicBool::new(false);
             if let Ok(loc) = written {
                 self.index.upsert(
                     hash,
                     Mutex::new(loc),
                     &|m| {
-                        let inserted_loc = m.lock();
+                        let mut inserted_loc = m.lock();
                         if *inserted_loc == 0 {
                             *inserted_loc = loc
                         } else {
-                            need_rollback = true;
+                            need_rollback.store(true, Ordering::Relaxed);
                         }
                     }
                 );
-                if need_rollback {
+                if need_rollback.load(Ordering::Relaxed) {
                     self.put_tombstone(loc);
                     return Err(WriteError::CellAlreadyExisted)
                 }
             }
             return written
+        }
+    }
+    fn update_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+        let hash = cell.header.hash;
+        if let Some(mut cell_location) = self.location_of(hash) {
+            let written = cell.write_to_chunk(self);
+            if let Ok(new_location) = written {
+                *cell_location = new_location;
+            }
+            return written;
+        } else {
+            return Err(WriteError::CellDoesNotExisted)
+        }
+    }
+    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<usize, WriteError>
+        where U: Fn(Cell) -> Option<Cell> {
+        if let Some(mut cell_location) = self.location_of(hash) {
+            let cell = Cell::from_chunk_raw(*cell_location, self);
+            match cell {
+                Ok(cell) => {
+                    let mut new_cell = update(cell);
+                    if let Some(mut new_cell) = new_cell {
+                        let written = new_cell.write_to_chunk(self);
+                        if let Ok(new_location) = written {
+                            *cell_location = new_location;
+                        }
+                        return written;
+                    } else {
+                        return Err(WriteError::UserCanceledUpdate);
+                    }
+                },
+                Err(e) => Err(WriteError::ReadError(e))
+            }
+        } else {
+            return Err(WriteError::CellDoesNotExisted)
         }
     }
     fn dispose (&mut self) {
