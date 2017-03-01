@@ -44,7 +44,7 @@ pub fn cell_rw () {
             }
         ])
     };
-    let schema = Schema {
+    let mut schema = Schema {
         id: 1,
         name: String::from("dummy"),
         key_field: None,
@@ -56,8 +56,9 @@ pub fn cell_rw () {
     data_map.insert(String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
+    chunk.meta.schemas.new_schema(&mut schema);
     let mut cell = Cell {
-        header: Header::new(0, 0, 1, 1),
+        header: Header::new(0, schema.id, 1, 1),
 //        Header {
 //            version: 1,
 //            size: 0,
@@ -67,10 +68,10 @@ pub fn cell_rw () {
 //        },
         data: data
     };
-    let mut loc = cell.write_to_chunk(&chunk, &schema);
+    let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
-        let stored_cell = Cell::from_raw(cell_1_ptr, &schema);
+        let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 100);
@@ -83,7 +84,7 @@ pub fn cell_rw () {
     data_map.insert(String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header::new(0, 0, 2, 1),
+        header: Header::new(0, schema.id, 2, 1),
 //        Header {
 //            version: 1,
 //            size: 0,
@@ -93,18 +94,18 @@ pub fn cell_rw () {
 //        },
         data: data
     };
-    loc = cell.write_to_chunk(&chunk, &schema);
+    loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
-        let stored_cell = Cell::from_raw(cell_2_ptr, &schema);
+        let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);
         assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 80);
         assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "John");
     }
     {
-        let stored_cell = Cell::from_raw(cell_1_ptr, &schema);
+        let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 100);
         assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "Jack");

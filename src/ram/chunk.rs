@@ -9,10 +9,16 @@ use std::rc::Rc;
 use ram::schema::Schemas;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[repr(packed)]
+pub struct CellIndex {
+    pub location: u64,
+    pub lock: Mutex<()>
+}
+
 pub struct Chunk {
     pub id: usize,
     pub addr: usize,
-    pub index: ConcHashMap<u64, usize>,
+    pub index: ConcHashMap<u64, CellIndex>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Rc<ServerMeta>,
@@ -43,7 +49,7 @@ impl Chunk {
         Chunk {
             id: id,
             addr: mem_ptr,
-            index: ConcHashMap::<u64, usize>::new(),
+            index: ConcHashMap::<u64, CellIndex>::new(),
             meta: meta,
             segs: segments,
             seg_round: AtomicUsize::new(0),

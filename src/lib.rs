@@ -2,7 +2,8 @@
 #![feature(proc_macro)]
 #![feature(integer_atomics)]
 #![feature(plugin)]
-
+#![feature(asm)]
+#![feature(core_intrinsics)]
 #![plugin(bifrost_plugins)]
 
 extern crate libc;
@@ -25,3 +26,4 @@ extern crate serde;
 #[macro_use]
 extern crate serde_derive;
 extern crate parking_lot;
+extern crate core;
