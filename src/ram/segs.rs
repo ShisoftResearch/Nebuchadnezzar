@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeSet;
 use parking_lot::RwLock;
 
 use super::cell::Header;
@@ -11,7 +12,7 @@ pub struct Segment {
     pub bound: usize,
     pub last: AtomicUsize,
     pub lock: RwLock<()>,
-    pub tombstones: Vec<usize>,
+    pub tombstones: BTreeSet<usize>,
 }
 
 impl Segment {
@@ -36,6 +37,7 @@ impl Segment {
         unsafe {
             let mut ver_field = location as *mut u64;
             *ver_field = 0; // set version to 0 to represent tombstone
+            self.tombstones.append(location);
         }
     }
 }

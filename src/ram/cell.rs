@@ -26,6 +26,7 @@ pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
     CellIsTooLarge(usize),
+    CellAlreadyExisted,
 }
 
 #[derive(Debug)]

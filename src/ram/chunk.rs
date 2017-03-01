@@ -3,6 +3,7 @@ use std::thread;
 use std::rc::Rc;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::BTreeSet;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use concurrent_hashmap::ConcHashMap;
 use ram::schema::Schemas;
@@ -37,7 +38,7 @@ impl Chunk {
                 bound: seg_addr + SEGMENT_SIZE,
                 last: AtomicUsize::new(seg_addr),
                 lock: RwLock::new(()),
-                tombstones: Vec::new(),
+                tombstones: BTreeSet::new(),
             });
         }
         debug!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
@@ -85,6 +86,10 @@ impl Chunk {
             None => None
         }
     }
+    fn put_tombstone(&self, location: usize) {
+        let seg = self.locate_segment(location);
+        seg.put_cell_tombstone(location);
+    }
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
         match self.location_of(hash) {
             Some(loc) => {
@@ -93,7 +98,34 @@ impl Chunk {
             None => Err(ReadError::CellDoesNotExisted)
         }
     }
-
+    fn write_cell(&self, cell: &Cell) -> Result<usize, WriteError> {
+        let hash = cell.header.hash;
+        if self.location_of(hash).is_some() {
+            return Err(WriteError::CellAlreadyExisted);
+        } else {
+            let written = cell.write_to_chunk(self);
+            let mut need_rollback = false;
+            if let Ok(loc) = written {
+                self.index.upsert(
+                    hash,
+                    Mutex::new(loc),
+                    &|m| {
+                        let inserted_loc = m.lock();
+                        if *inserted_loc == 0 {
+                            *inserted_loc = loc
+                        } else {
+                            need_rollback = true;
+                        }
+                    }
+                );
+                if need_rollback {
+                    self.put_tombstone(loc);
+                    return Err(WriteError::CellAlreadyExisted)
+                }
+            }
+            return written
+        }
+    }
     fn dispose (&mut self) {
         debug!("disposing chunk at {}", self.addr);
         unsafe {
