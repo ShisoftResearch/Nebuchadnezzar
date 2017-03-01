@@ -30,6 +30,7 @@ pub enum WriteError {
     CellDoesNotExisted,
     ReadError(ReadError),
     UserCanceledUpdate,
+    DeletionPredictionFailed,
 }
 
 #[derive(Debug)]

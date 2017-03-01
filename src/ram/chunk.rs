@@ -174,6 +174,26 @@ impl Chunk {
             return Err(WriteError::CellDoesNotExisted);
         }
     }
+    fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
+        where P: Fn(Cell) -> bool {
+        if let Some(cell_location) = self.location_of(hash) {
+            let cell = Cell::from_chunk_raw(*cell_location, self);
+            match cell {
+                Ok(cell) => {
+                    if predict(cell) {
+                        self.index.remove(&hash);
+                        self.put_tombstone(*cell_location);
+                        return Ok(());
+                    } else {
+                        return Err(WriteError::DeletionPredictionFailed);
+                    }
+                },
+                Err(e) => Err(WriteError::ReadError(e))
+            }
+        } else {
+            return Err(WriteError::CellDoesNotExisted);
+        }
+    }
     fn dispose (&mut self) {
         debug!("disposing chunk at {}", self.addr);
         unsafe {
