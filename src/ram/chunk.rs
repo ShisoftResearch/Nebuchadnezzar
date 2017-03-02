@@ -224,10 +224,43 @@ impl Chunks {
             list: chunks
         }
     }
-
     pub fn new_dummy(count: usize, size: usize) -> Chunks {
         Chunks::new(count, size, Rc::<ServerMeta>::new(ServerMeta {
             schemas: Schemas::new(None)
         }), None)
+    }
+    fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {
+        let chunk_id = partition as usize % self.list.len();
+        return &self.list[chunk_id];
+    }
+    fn locate_chunk_by_key(&self, key: (u64, u64)) -> (&Chunk, u64) {
+        let (partition, hash) = key;
+        return (self.locate_chunk_by_partition(partition), hash);
+    }
+    pub fn read_cell(&self, key: (u64, u64)) -> Result<Cell, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.read_cell(hash);
+    }
+    pub fn write_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        return chunk.write_cell(cell);
+    }
+    pub fn update_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+        let chunk = self.locate_chunk_by_partition(cell.header.partition);
+        return chunk.update_cell(cell);
+    }
+    pub fn update_cell_by<U>(&self, key: (u64, u64), update: U) -> Result<usize, WriteError>
+        where U: Fn(Cell) -> Option<Cell>{
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.update_cell_by(hash, update);
+    }
+    pub fn remove_cell(self, key: (u64, u64)) -> Result<(), WriteError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.remove_cell(hash);
+    }
+    pub fn remove_cell_by<P>(&self, key: (u64, u64), predict: P) -> Result<(), WriteError>
+        where P: Fn(Cell) -> bool {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.remove_cell_by(hash, predict);
     }
 }
