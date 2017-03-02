@@ -127,6 +127,21 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "Jack");
         assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 70);
     }
+    chunks.update_cell_by((1, 2), |mut cell| {
+        let mut data_map = Map::<String, Value>::new();
+        data_map.insert(String::from("id"), Value::I64(2));
+        data_map.insert(String::from("score"), Value::U64(100));
+        data_map.insert(String::from("name"), Value::String(String::from("John")));
+        let data = Value::Map(data_map);
+        cell.data = data;
+        Some(cell)
+    }).unwrap();
+    {
+        let stored_cell = chunks.read_cell((1, 2)).unwrap();
+        assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);
+        assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 100);
+        assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "John");
+    }
     chunks.remove_cell((1, 1)).unwrap();
     assert!(chunks.read_cell((1, 1)).is_err());
 }
