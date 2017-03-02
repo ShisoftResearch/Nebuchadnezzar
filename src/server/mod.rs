@@ -25,7 +25,7 @@ pub struct ServerMeta {
 }
 
 pub struct Server {
-    pub chunks: Chunks,
+    pub chunks: Arc<Chunks>,
     pub meta: Rc<ServerMeta>,
     pub rpc: Arc<rpc::Server>
 }
@@ -70,13 +70,14 @@ impl Server {
         let meta_rc = Rc::<ServerMeta>::new(ServerMeta {
             schemas: schemas.clone()
         });
+        let chunks = Arc::new(Chunks::new(
+            opt.chunk_count,
+            opt.memory_size,
+            meta_rc.clone(),
+            opt.backup_storage.clone(),
+        ));
         Server {
-            chunks: Chunks::new(
-                opt.chunk_count,
-                opt.memory_size,
-                meta_rc.clone(),
-                opt.backup_storage.clone(),
-            ),
+            chunks: chunks,
             meta: meta_rc,
             rpc: rpc_server
         }
