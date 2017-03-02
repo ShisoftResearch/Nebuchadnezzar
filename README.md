@@ -7,7 +7,8 @@
 High performance, rich typing RAMCloud implementation.
 Distributed in-memory Key-Value store, made to power the [Morpheus project](https://github.com/shisoft/Morpheus).
 
+Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure version](https://github.com/shisoft/Nebuchadnezzar/tree/clojure-version) and will stay with rust afterwards.  
 
-Copyright © 2016 Shisoft Research
+Copyright © 2017 Shisoft Research
 
 Distributed under the Eclipse Public License either version 1.0 or BSD any later version.
