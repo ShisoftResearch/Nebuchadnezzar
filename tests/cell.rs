@@ -1,10 +1,11 @@
 use neb::ram::cell;
 use neb::ram::cell::*;
-use std::mem;
 use neb::ram::schema::*;
 use neb::ram::chunk::Chunks;
 use neb::ram::types::*;
 use neb::ram::io::writer;
+
+use std::mem;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 

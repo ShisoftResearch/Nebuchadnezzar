@@ -18,6 +18,17 @@ pub struct Schema {
     pub fields: Field
 }
 
+impl Schema {
+    pub fn new(name: String, key_field: Option<String>, fields: Field) -> Schema {
+        Schema {
+            id: 0,
+            name: name,
+            key_field: key_field,
+            fields: fields
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     pub type_id: u32,

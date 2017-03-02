@@ -254,7 +254,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
     }
-    pub fn remove_cell(self, key: (u64, u64)) -> Result<(), WriteError> {
+    pub fn remove_cell(&self, key: (u64, u64)) -> Result<(), WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
     }
