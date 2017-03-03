@@ -26,7 +26,7 @@ pub struct ServerMeta {
 
 pub struct Server {
     pub chunks: Arc<Chunks>,
-    pub meta: Rc<ServerMeta>,
+    pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>
 }
 
@@ -67,7 +67,7 @@ impl Server {
                 Err(e) => {error!("Cannot generate meta client: {:?}", e);}
             }
         } else if opt.is_meta {error!("Meta server cannot be standalone");}
-        let meta_rc = Rc::<ServerMeta>::new(ServerMeta {
+        let meta_rc = Arc::new(ServerMeta {
             schemas: schemas.clone()
         });
         let chunks = Arc::new(Chunks::new(

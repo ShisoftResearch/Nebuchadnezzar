@@ -6,8 +6,8 @@ use neb::ram::types::*;
 use neb::ram::io::writer;
 use neb::server::ServerMeta;
 use env_logger;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use std;
 use std::rc::Rc;
 
@@ -60,7 +60,7 @@ pub fn cell_rw () {
     data_map.insert(String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
     let schemas = Schemas::new(None);
-    let chunks = Chunks::new(1, CHUNK_SIZE, Rc::<ServerMeta>::new(ServerMeta {
+    let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
         schemas: schemas.clone()
     }), None);
     schemas.new_schema(&mut schema);
