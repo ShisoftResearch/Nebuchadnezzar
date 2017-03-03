@@ -32,8 +32,23 @@ impl Cleaner {
         return cleaner;
     }
     pub fn clean_segment(seg: &Segment) {
-        while !seg.tombstones.is_empty() {
+        // Clean only if segment have fragments
+        let mut frags = seg.frags.lock();
+        if !frags.is_empty() {return;}
+        // Lock segment exclusively only if it is not rw locked to avoid waiting for disk backups.
+        // There is one potential deadlock with writing cells. Because every cell write operations
+        // locks on cell first and then lock it's underlying segment to acquire space, but cleaner
+        // will lock segments first then lock the cell to move it to fill the fragments.
+        // The solution is to lock the segment first. Before moving the cells, segment lock have to
+        // be released and then lock the cell lock. After cell moved, release the cell lock and do
+        // further operations on segment with a new segment lock guard.
+        // Because the segment will be locked twice, there is no guarantee for not modifying the
+        // segment when moving the cell, extra efforts need to taken care of to ensure correctness.
+        while true {
+            let seg_lock = seg.lock.try_write();
+            if seg_lock.is_none() {return;}
 
         }
+
     }
 }

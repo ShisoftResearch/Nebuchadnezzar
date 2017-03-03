@@ -38,7 +38,7 @@ impl Chunk {
                 bound: seg_addr + SEGMENT_SIZE,
                 last: AtomicUsize::new(seg_addr),
                 lock: RwLock::new(()),
-                tombstones: Mutex::new(BTreeSet::new()),
+                frags: Mutex::new(BTreeSet::new()),
             });
         }
         debug!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
