@@ -195,6 +195,7 @@ impl Cleaner {
             seg.put_cell_tombstone(new_frag_loc);
             // write length to the tombstone;
             unsafe {*seg.cell_size(new_frag_loc) = new_frag_len as u32};
+            retried = 0;
             defrag_pos = new_frag_loc;
         }
         debug!("Clean segment completed: {}", seg.addr);
