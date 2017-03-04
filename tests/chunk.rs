@@ -4,6 +4,7 @@ use neb::ram::schema::*;
 use neb::ram::chunk::Chunks;
 use neb::ram::types::*;
 use neb::ram::io::writer;
+use neb::ram::cleaner::Cleaner;
 use neb::server::ServerMeta;
 use env_logger;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -11,7 +12,7 @@ use std::sync::Arc;
 use std;
 use std::rc::Rc;
 
-pub const CHUNK_SIZE: usize = 32 * 8 * 1024 * 1024;
+pub const CHUNK_SIZE: usize = 1 * 8 * 1024 * 1024;
 
 #[test]
 pub fn round_robin_segment () {
@@ -24,6 +25,7 @@ pub fn round_robin_segment () {
 
 #[test]
 pub fn cell_rw () {
+    env_logger::init();
     let fields = Field {
         type_id: 0,
         name: String::from("*"),
@@ -144,4 +146,15 @@ pub fn cell_rw () {
     }
     chunks.remove_cell((1, 1)).unwrap();
     assert!(chunks.read_cell((1, 1)).is_err());
+    /////////////////////////// TESET CLEANER ///////////////////////////
+    debug!("Testing cleaner");
+    Cleaner::clean_chunks(&chunks);
+    let stored_cell = chunks.read_cell((1, 2)).unwrap();
+    assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);
+    assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 100);
+    assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "John");
+
+    let cell_size = stored_cell.header.size;
+    let seg = &chunks.list[0].segs[0];
+    assert_eq!(seg.append_header.load(Ordering::SeqCst), seg.addr + cell_size as usize);
 }

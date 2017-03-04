@@ -210,7 +210,7 @@ impl Drop for Chunk {
 }
 
 impl Chunks {
-    pub fn new (count: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunks {
+    pub fn new (count: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Arc<Chunks> {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         debug!("Creating {} chunks, total {} bytes", count, size);
@@ -221,11 +221,11 @@ impl Chunks {
             };
             chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage));
         }
-        Chunks {
+        Arc::new(Chunks {
             list: chunks
-        }
+        })
     }
-    pub fn new_dummy(count: usize, size: usize) -> Chunks {
+    pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(count, size, Arc::<ServerMeta>::new(ServerMeta {
             schemas: Schemas::new(None)
         }), None)

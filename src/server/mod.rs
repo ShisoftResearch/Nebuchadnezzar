@@ -70,12 +70,12 @@ impl Server {
         let meta_rc = Arc::new(ServerMeta {
             schemas: schemas.clone()
         });
-        let chunks = Arc::new(Chunks::new(
+        let chunks = Chunks::new(
             opt.chunk_count,
             opt.memory_size,
             meta_rc.clone(),
             opt.backup_storage.clone(),
-        ));
+        );
         Server {
             chunks: chunks,
             meta: meta_rc,

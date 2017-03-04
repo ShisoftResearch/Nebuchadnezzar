@@ -35,15 +35,21 @@ impl Cleaner {
         thread::spawn(move || {
             let chunks = &cleaner_clone.chunks;
             while !cleaner_clone.closed.load(Ordering::Relaxed) {
-                for chunk in &chunks.list { // consider put this in separate thread or fiber
-                    for seg in &chunk.segs {
-                        Cleaner::clean_segment(chunk, seg);
-                    }
-                }
+                Cleaner::clean_chunks(&chunks);
                 thread::sleep(Duration::from_millis(10));
             }
         });
         return cleaner;
+    }
+    pub fn clean_chunks(chunks: &Arc<Chunks>) {
+        for chunk in &chunks.list { // consider put this in separate thread or fiber
+            Cleaner::clean_chunk(chunk);
+        }
+    }
+    pub fn clean_chunk(chunk: &Chunk) {
+        for seg in &chunk.segs {
+            Cleaner::clean_segment(chunk, seg);
+        }
     }
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
         // Clean only if segment have fragments
@@ -59,6 +65,7 @@ impl Cleaner {
         // further operations on segment with a new segment lock guard.
         // Because the segment will be locked twice, there is no guarantee for not modifying the
         // segment when moving the cell, extra efforts need to taken care of to ensure correctness.
+        debug!("Cleaning segment: {}", seg.addr);
         let mut defrag_pos = seg.addr;
         while retried < MAX_CLEAN_RETRY {
             // those are for moving cell next to the fragment after the segment locking block
@@ -76,8 +83,12 @@ impl Cleaner {
                 // the time
                 let mut frags = seg.frags.lock();
                 let frag_opt = ceiling_frag(&frags, defrag_pos);
-                if frag_opt.is_none() {return;}  // return if there is no fragments to cleaned
+                if frag_opt.is_none() {
+                    debug!("No fragments, will exit for segment: {}", seg.addr);
+                    return;
+                }  // return if there is no fragments to cleaned
                 frag_loc = frag_opt.unwrap();
+                debug!("Cleaning fragment at {} for segment: {}", frag_loc, seg.addr);
                 // The first things we need to do is read the length of the fragment and check it there
                 // is a tombstone at the location to make sure there is no corruption. Corruption is
                 // unexpected, we can retry in next iteration but I don't think it can be self-healed.
@@ -100,6 +111,7 @@ impl Cleaner {
                         retried += 1; continue;
                     } else {
                         // if it succeed, the segment have been cleaned in this turn
+                        debug!("Clean fragments completed, will exit for segment: {}", seg.addr);
                         frags.remove(&frag_loc); return;
                     }
                 }
@@ -108,14 +120,18 @@ impl Cleaner {
                 // if it is a fragment
                 if next_version == 0 {
                     if frags.contains(&next_loc) {
+                        debug!("Unit next to fragment {} is another fragment {} on record", frag_loc, next_loc);
                         // if there is any record in the segment for the next fragment, we need to
                         // combine it with the fragment we are working on
                         let next_len: u32 = unsafe {*seg.cell_size(next_loc)};
+                        debug!("Size of next fragment for {} is : {}", next_loc, next_len);
                         // remove the next fragment
                         frags.remove(&next_loc);
                         // reset size of the tombstone for the fragment we are working on
                         let new_frag_len = seg.cell_size(frag_loc);
-                        unsafe {*new_frag_len = frag_len + next_len;}
+                        let new_frag_len_val = frag_len + next_len;
+                        unsafe {*new_frag_len = new_frag_len_val;}
+                        debug!("Resize fragment {} from {} to {}", frag_loc, frag_len, new_frag_len_val);
                         // reset retry
                         retried = 0;
                         // and move to next iteration
@@ -153,6 +169,8 @@ impl Cleaner {
             let mut frags = seg.frags.lock();
             // because the cell is locked, it will always be there in the segment
             let cell_len = unsafe {*seg.cell_size(next_loc)} as usize;
+            let frag_len = unsafe {*seg.cell_size(frag_loc)} as usize;
+            debug!("Moving cell {} of size {} for fragment {} of size {}", next_loc, cell_len, frag_loc, frag_len);
             // There is only one cleaner for each segment at a time, the fragment will be there for
             // sure. Next we need to do is move the cell to the location of the fragment, update
             // cell index in chunk, put new fragment and tombstone next to the moved cell.
@@ -163,11 +181,14 @@ impl Cleaner {
                     cell_len
                 );
             }
+            let original_cell_loc = *cell_loc;
             *cell_loc = frag_loc;
             // remove the fragment
+            debug!("Removing fragment {}", frag_loc);
             frags.remove(&frag_loc);
             let new_frag_loc = frag_loc + cell_len;
-            let new_frag_len = *cell_loc + cell_len - new_frag_loc;
+            let new_frag_len = original_cell_loc + cell_len - new_frag_loc;
+            debug!("New fragment next to the moved cell {} is {}, size {}", next_loc, new_frag_loc, new_frag_len);
             // insert new fragment next to the moved cell
             frags.insert(new_frag_loc);
             // put tombstone
@@ -176,6 +197,6 @@ impl Cleaner {
             unsafe {*seg.cell_size(new_frag_loc) = new_frag_len as u32};
             defrag_pos = new_frag_loc;
         }
-
+        debug!("Clean segment completed: {}", seg.addr);
     }
 }
