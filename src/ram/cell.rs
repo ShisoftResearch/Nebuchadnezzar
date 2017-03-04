@@ -16,9 +16,8 @@ pub struct Header {
     pub version: u64,
     pub size: u32,
     pub schema: u32,
-    pub hash: u64,
     pub partition: u64,
-    pub lock: u16,
+    pub hash: u64,
 }
 
 #[derive(Debug)]
@@ -47,7 +46,6 @@ impl Header {
             schema: schema,
             hash: hash,
             partition: partition,
-            lock: 1,
         }
     }
     pub fn write(&self, location: usize) {
@@ -62,12 +60,11 @@ impl Header {
             schema: 0,
             hash: 0,
             partition: 0,
-            lock: 1,
         }.write(location);
     }
 }
 
-pub const HEADER_SIZE :usize = 34;
+pub const HEADER_SIZE :usize = 32;
 
 pub struct Cell {
     pub header: Header,

@@ -36,7 +36,7 @@ impl Chunk {
                 addr: seg_addr,
                 id: seg_idx,
                 bound: seg_addr + SEGMENT_SIZE,
-                last: AtomicUsize::new(seg_addr),
+                append_header: AtomicUsize::new(seg_addr),
                 lock: RwLock::new(()),
                 frags: Mutex::new(BTreeSet::new()),
             });
@@ -73,7 +73,7 @@ impl Chunk {
         let seg_id = offset / SEGMENT_SIZE;
         return &self.segs[seg_id];
     }
-    fn location_of(&self, hash: u64) -> Option<MutexGuard<usize>> {
+    pub fn location_of(&self, hash: u64) -> Option<MutexGuard<usize>> {
         match self.index.find(&hash) {
             Some(index) => {
                 let index = index.get();
@@ -89,6 +89,7 @@ impl Chunk {
     fn put_tombstone(&self, location: usize) {
         let seg = self.locate_segment(location);
         seg.put_cell_tombstone(location);
+        seg.put_frag(location);
     }
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
         match self.location_of(hash) {

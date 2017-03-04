@@ -4,6 +4,7 @@
 #![feature(plugin)]
 #![feature(asm)]
 #![feature(core_intrinsics)]
+#![feature(btree_range, collections_bound)]
 #![plugin(bifrost_plugins)]
 
 extern crate libc;
