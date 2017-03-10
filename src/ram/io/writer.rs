@@ -51,12 +51,13 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
             panic!(data_mismatch);
         }
     } else {
+        let size = types::get_vsize(field.type_id, value);
         ins.push(Instruction {
             type_id: field.type_id,
             val: value.clone(),
             offset: *offset
         });
-        *offset += types::get_vsize(field.type_id, value);
+        *offset += size;
     }
 }
 

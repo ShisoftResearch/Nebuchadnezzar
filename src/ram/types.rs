@@ -1,9 +1,10 @@
 use libc;
-use uuid::Uuid;
 use std::cmp::PartialEq;
 use std::string::String;
 use std::any::Any;
 use std::collections::hash_map;
+
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
 
 macro_rules! gen_primitive_types_io {
     (
@@ -125,7 +126,7 @@ macro_rules! define_types {
          );*
     ) => (
 
-        #[derive(Debug, Clone)]
+        #[derive(Debug, Clone, Serialize, Deserialize)]
         pub enum Value {
             $(
                 $e($t),
@@ -237,31 +238,38 @@ gen_primitive_types_io!(
     f64:    f64_io
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct pos2d32 {
     pub x: f32,
     pub y: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct pos2d64 {
     pub x: f64,
     pub y: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct pos3d32 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct pos3d64 {
     pub x: f64,
     pub y: f64,
     pub z: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct id {
+    pub higher: u64,
+    pub lower:  u64,
+}
+
 
 impl PartialEq for pos2d32 {
     fn eq(&self, other: &pos2d32) -> bool {
@@ -299,7 +307,14 @@ impl PartialEq for pos3d64 {
     }
 }
 
-pub type uuid_ = Uuid;
+impl PartialEq for id {
+    fn eq(&self, other: &id) -> bool {
+        self.higher == other.higher && self.lower == other.lower
+    }
+    fn ne(&self, other: &id) -> bool {
+        self.higher != other.higher || self.lower != other.lower
+    }
+}
 
 gen_compound_types_io! (
     pos2d32, pos2d32_io, {
@@ -370,27 +385,20 @@ gen_compound_types_io! (
 
     //////////////////////////////////////////////////////////
 
-    uuid_, uuid_io, {
+    id, id_io, {
         |mem_ptr| {
-            use uuid::{UuidBytes, Uuid};
-            use std::ptr;
-            unsafe {
-                Uuid::from_bytes(
-                    ptr::read(mem_ptr as *mut &UuidBytes) as &[u8]
-                ).unwrap()
-            }
+            let higher = u64_io::read(mem_ptr);
+            let lower =  u64_io::read(mem_ptr + u64_io::size(0));
+            id {higher: higher, lower: lower}
         }
     }, {
-        use uuid::{UuidBytes, Uuid};
-        use std::ptr;
-        |val: &uuid_, mem_ptr| {
-            unsafe {
-                ptr::write(mem_ptr as *mut &UuidBytes, val.as_bytes());
-            }
+        |val: &id, mem_ptr| {
+            u64_io::write(val.higher, mem_ptr);
+            u64_io::write(val.lower,  mem_ptr + u64_io::size(0));
         }
     }, {
-        16
-    }
+        u64_io::size(0) * 2
+    };
 );
 
 gen_variable_types_io! (
@@ -452,7 +460,7 @@ define_types!(
     ["pos2d64", "pos64"], 16, pos2d64                  ,Pos2d64  ,true  ,  pos2d64_io    ;
     ["pos3d32", "pos3d"], 17, pos3d32                  ,Pos3d32  ,true  ,  pos3d32_io    ;
     ["pos3d64"], 18, pos3d64                           ,Pos3d64  ,true  ,  pos3d64_io    ;
-    ["uuid"], 19, uuid_                                ,Uuid     ,true  ,  uuid_io       ;
+    ["id"], 19, id                                     ,Id       ,true  ,  id_io         ;
     ["string", "str"], 20, String                      ,String   ,true  ,  string_io
 );
 

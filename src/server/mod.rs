@@ -9,6 +9,8 @@ use ram::schema::{sm as schema_sm};
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod poto;
+
 pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,

@@ -11,7 +11,7 @@ pub type DataValue = Value;
 pub type DataMap = Map<String, Value>;
 
 #[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct Header {
     pub version: u64,
     pub size: u32,
@@ -20,7 +20,7 @@ pub struct Header {
     pub hash: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
@@ -32,7 +32,7 @@ pub enum WriteError {
     DeletionPredictionFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted
@@ -66,6 +66,7 @@ impl Header {
 
 pub const HEADER_SIZE :usize = 32;
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Cell {
     pub header: Header,
     pub data: DataValue
