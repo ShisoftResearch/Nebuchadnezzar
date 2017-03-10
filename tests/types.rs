@@ -164,28 +164,23 @@ mod pos3d64 {
 
 mod uuid {
     use neb::ram::types;
+    use neb::ram::types::id;
     use neb::ram::chunk::Chunks;
-    use uuid::Uuid;
-    use uuid;
     use super::CHUNK_SIZE;
     #[test]
     fn test () {
-        let test_data = vec![
-            Uuid::parse_str("936DA01F9ABD4d9d80C702AF85C822A8").unwrap(),
-            Uuid::new_v4(),
-            Uuid::new_v5(&uuid::NAMESPACE_DNS, "foo")
-        ];
+        let test_data = vec![id {higher: 1, lower: 2}];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::uuid_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::id_io::size(0) as usize;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk.addr + i * types::uuid_io::size(0);
-                types::uuid_io::write(&d, addr);
-                assert!(types::uuid_io::read(addr) == d);
+                let addr = chunk.addr + i * types::id_io::size(0);
+                types::id_io::write(&d, addr);
+                assert!(types::id_io::read(addr) == d);
             }
             for i in 0..counts {
-                let addr = chunk.addr + i * types::uuid_io::size(0);
-                assert!(types::uuid_io::read(addr) == d);
+                let addr = chunk.addr + i * types::id_io::size(0);
+                assert!(types::id_io::read(addr) == d);
             }
         }
     }

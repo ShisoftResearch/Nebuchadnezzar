@@ -398,7 +398,7 @@ gen_compound_types_io! (
         }
     }, {
         u64_io::size(0) * 2
-    };
+    }
 );
 
 gen_variable_types_io! (
