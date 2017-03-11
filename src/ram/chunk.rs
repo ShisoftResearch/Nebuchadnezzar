@@ -235,10 +235,10 @@ impl Chunks {
         let chunk_id = partition as usize % self.list.len();
         return &self.list[chunk_id];
     }
-    fn locate_chunk_by_key(&self, key: Id) -> (&Chunk, u64) {
+    fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
         return (self.locate_chunk_by_partition(key.higher), key.lower);
     }
-    pub fn read_cell(&self, key: Id) -> Result<Cell, ReadError> {
+    pub fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
@@ -250,16 +250,16 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
     }
-    pub fn update_cell_by<U>(&self, key: Id, update: U) -> Result<usize, WriteError>
+    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<usize, WriteError>
         where U: Fn(Cell) -> Option<Cell>{
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
     }
-    pub fn remove_cell(&self, key: Id) -> Result<(), WriteError> {
+    pub fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell(hash);
     }
-    pub fn remove_cell_by<P>(&self, key: Id, predict: P) -> Result<(), WriteError>
+    pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
         where P: Fn(Cell) -> bool {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);

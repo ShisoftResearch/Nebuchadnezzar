@@ -3,7 +3,7 @@ use ram::chunk::Chunk;
 use std::mem;
 use std::ptr;
 use ram::io::{reader, writer};
-use ram::types::{Map, Value};
+use ram::types::{Map, Value, Id};
 
 const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
@@ -39,13 +39,13 @@ pub enum ReadError {
 }
 
 impl Header {
-    pub fn new(size: u32, schema: u32, hash: u64, partition: u64) -> Header {
+    pub fn new(size: u32, schema: u32, id: &Id) -> Header {
         Header {
             version: 1,
             size: size,
             schema: schema,
-            hash: hash,
-            partition: partition,
+            partition: id.higher,
+            hash: id.lower,
         }
     }
     pub fn write(&self, location: usize) {
@@ -74,9 +74,9 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, hash: u64, partition: u64, data: DataValue) -> Cell {
+    pub fn new(schema_id: u32, id: &Id, data: DataValue) -> Cell {
         Cell {
-            header: Header::new(0, schema_id, hash, partition),
+            header: Header::new(0, schema_id, id),
             data: data
         }
     }

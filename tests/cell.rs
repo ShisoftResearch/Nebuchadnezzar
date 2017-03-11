@@ -45,6 +45,8 @@ pub fn cell_rw () {
             }
         ])
     };
+    let id1 = Id::new(1, 1);
+    let id2 = Id::new(1, 2);
     let mut schema = Schema {
         id: 1,
         name: String::from("dummy"),
@@ -59,7 +61,7 @@ pub fn cell_rw () {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(&mut schema);
     let mut cell = Cell {
-        header: Header::new(0, schema.id, 1, 1),
+        header: Header::new(0, schema.id, &id1),
 //        Header {
 //            version: 1,
 //            size: 0,
@@ -85,7 +87,7 @@ pub fn cell_rw () {
     data_map.insert(String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header::new(0, schema.id, 2, 1),
+        header: Header::new(0, schema.id, &id2),
 //        Header {
 //            version: 1,
 //            size: 0,
