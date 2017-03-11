@@ -271,10 +271,10 @@ pub struct Id {
 }
 
 impl Id {
-    pub fn new(lower: u64, higher: u64) -> Id {
+    pub fn new(higher: u64, lower: u64) -> Id {
         Id {
+            higher: higher,
             lower: lower,
-            higher: higher
         }
     }
 }

@@ -120,7 +120,7 @@ pub fn cell_rw () {
     loc = chunks.update_cell(&mut cell);
     let cell_2_ptr = loc.unwrap();
     {
-        let stored_cell = chunks.read_cell(&id1).unwrap();
+        let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);
         assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 95);
         assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "John");
@@ -151,7 +151,7 @@ pub fn cell_rw () {
     /////////////////////////// TESET CLEANER ///////////////////////////
     debug!("Testing cleaner");
     Cleaner::clean_chunks(&chunks);
-    let stored_cell = chunks.read_cell(&id1).unwrap();
+    let stored_cell = chunks.read_cell(&id2).unwrap();
     assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);
     assert_eq!(stored_cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 100);
     assert_eq!(stored_cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "John");
