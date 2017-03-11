@@ -4,6 +4,8 @@ use ram::types::Id;
 
 use bifrost::rpc::*;
 
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
+
 service! {
     rpc read_cell(key: Id) -> Cell | ReadError;
     rpc write_cell(cell: Cell) -> Cell | WriteError;
@@ -39,3 +41,11 @@ impl Service for NebRPCService {
 }
 
 dispatch_rpc_service_functions!(NebRPCService);
+
+impl NebRPCService {
+    pub fn new(chunks: &Arc<Chunks>) -> Arc<NebRPCService> {
+        Arc::new(NebRPCService {
+            chunks: chunks.clone()
+        })
+    }
+}

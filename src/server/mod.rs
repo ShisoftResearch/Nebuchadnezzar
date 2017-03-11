@@ -9,7 +9,7 @@ use ram::schema::{sm as schema_sm};
 use std::rc::Rc;
 use std::sync::Arc;
 
-mod poto;
+mod cell_rpc;
 
 pub struct ServerOptions {
     pub chunk_count: usize,
@@ -48,7 +48,10 @@ impl Server {
                     address: server_addr.clone(),
                     service_id: raft::DEFAULT_SERVICE_ID,
                 });
-                rpc_server.register_service(raft::DEFAULT_SERVICE_ID, raft_service.clone());
+                rpc_server.register_service(
+                    raft::DEFAULT_SERVICE_ID,
+                    raft_service.clone()
+                );
                 raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&raft_service)));
                 match raft_service.join(&opt.meta_members) {
                     Err(sm_master::ExecError::CannotConstructClient) => {
@@ -77,6 +80,10 @@ impl Server {
             opt.memory_size,
             meta_rc.clone(),
             opt.backup_storage.clone(),
+        );
+        rpc_server.register_service(
+            cell_rpc::DEFAULT_SERVICE_ID,
+            cell_rpc::NebRPCService::new(&chunks)
         );
         Server {
             chunks: chunks,
