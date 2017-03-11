@@ -17,16 +17,24 @@ pub struct NebRPCService {
 
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> Result<Cell, ReadError> {
-        Err(ReadError::CellDoesNotExisted)
+        self.chunks.read_cell(&key)
     }
-    fn write_cell(&self, cell: Cell)-> Result<Cell, WriteError> {
-        Err(WriteError::CellDoesNotExisted)
+    fn write_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
+        let mut cell = cell;
+        match self.chunks.write_cell(&mut cell) {
+            Ok(_) => Ok(cell),
+            Err(e) => Err(e)
+        }
     }
-    fn update_cell(&self, cell: Cell)-> Result<Cell, WriteError> {
-        Err(WriteError::CellDoesNotExisted)
+    fn update_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
+        let mut cell = cell;
+        match self.chunks.update_cell(&mut cell) {
+            Ok(_) => Ok(cell),
+            Err(e) => Err(e)
+        }
     }
     fn remove_cell(&self, key: Id) -> Result<(), WriteError> {
-        Err(WriteError::CellDoesNotExisted)
+        self.chunks.remove_cell(&key)
     }
 }
 
