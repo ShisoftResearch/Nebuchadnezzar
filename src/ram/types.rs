@@ -239,100 +239,100 @@ gen_primitive_types_io!(
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct pos2d32 {
+pub struct Pos2d32 {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct pos2d64 {
+pub struct Pos2d64 {
     pub x: f64,
     pub y: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct pos3d32 {
+pub struct Pos3d32 {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct pos3d64 {
+pub struct Pos3d64 {
     pub x: f64,
     pub y: f64,
     pub z: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct id {
+pub struct Id {
     pub higher: u64,
     pub lower:  u64,
 }
 
-impl id {
-    pub fn new(lower: u64, higher: u64) -> id {
-        id {
+impl Id {
+    pub fn new(lower: u64, higher: u64) -> Id {
+        Id {
             lower: lower,
             higher: higher
         }
     }
 }
 
-impl PartialEq for pos2d32 {
-    fn eq(&self, other: &pos2d32) -> bool {
+impl PartialEq for Pos2d32 {
+    fn eq(&self, other: &Pos2d32) -> bool {
         self.x == other.x && self.y == other.y
     }
-    fn ne(&self, other: &pos2d32) -> bool {
+    fn ne(&self, other: &Pos2d32) -> bool {
         self.x != other.x || self.y != other.y
     }
 }
 
-impl PartialEq for pos2d64 {
-    fn eq(&self, other: &pos2d64) -> bool {
+impl PartialEq for Pos2d64 {
+    fn eq(&self, other: &Pos2d64) -> bool {
         self.x == other.x && self.y == other.y
     }
-    fn ne(&self, other: &pos2d64) -> bool {
+    fn ne(&self, other: &Pos2d64) -> bool {
         self.x != other.x || self.y != other.y
     }
 }
 
-impl PartialEq for pos3d32 {
-    fn eq(&self, other: &pos3d32) -> bool {
+impl PartialEq for Pos3d32 {
+    fn eq(&self, other: &Pos3d32) -> bool {
         self.x == other.x && self.y == other.y && self.z == other.z
     }
-    fn ne(&self, other: &pos3d32) -> bool {
+    fn ne(&self, other: &Pos3d32) -> bool {
         self.x != other.x || self.y != other.y || self.z != other.z
     }
 }
 
-impl PartialEq for pos3d64 {
-    fn eq(&self, other: &pos3d64) -> bool {
+impl PartialEq for Pos3d64 {
+    fn eq(&self, other: &Pos3d64) -> bool {
         self.x == other.x && self.y == other.y && self.z == other.z
     }
-    fn ne(&self, other: &pos3d64) -> bool {
+    fn ne(&self, other: &Pos3d64) -> bool {
         self.x != other.x || self.y != other.y || self.z != other.z
     }
 }
 
-impl PartialEq for id {
-    fn eq(&self, other: &id) -> bool {
+impl PartialEq for Id {
+    fn eq(&self, other: &Id) -> bool {
         self.higher == other.higher && self.lower == other.lower
     }
-    fn ne(&self, other: &id) -> bool {
+    fn ne(&self, other: &Id) -> bool {
         self.higher != other.higher || self.lower != other.lower
     }
 }
 
 gen_compound_types_io! (
-    pos2d32, pos2d32_io, {
+    Pos2d32, pos2d32_io, {
         |mem_ptr| {
             let x = f32_io::read(mem_ptr);
             let y = f32_io::read(mem_ptr + f32_io::size(0));
-            pos2d32 {x: x, y: y}
+            Pos2d32 {x: x, y: y}
         }
     }, {
-        |val: &pos2d32, mem_ptr| {
+        |val: &Pos2d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
             f32_io::write(val.y, mem_ptr + f32_io::size(0));
         }
@@ -340,14 +340,14 @@ gen_compound_types_io! (
         f32_io::size(0) * 2
     };
 
-    pos2d64, pos2d64_io, {
+    Pos2d64, pos2d64_io, {
         |mem_ptr| {
             let x = f64_io::read(mem_ptr);
             let y = f64_io::read(mem_ptr + f64_io::size(0));
-            pos2d64 {x: x, y: y}
+            Pos2d64 {x: x, y: y}
         }
     }, {
-        |val: &pos2d64, mem_ptr| {
+        |val: &Pos2d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
             f64_io::write(val.y, mem_ptr + f64_io::size(0));
         }
@@ -357,15 +357,15 @@ gen_compound_types_io! (
 
     //////////////////////////////////////////////////////////////
 
-    pos3d32, pos3d32_io, {
+    Pos3d32, pos3d32_io, {
         |mem_ptr| {
             let x = f32_io::read(mem_ptr);
             let y = f32_io::read(mem_ptr + f32_io::size(0));
             let z = f32_io::read(mem_ptr + f32_io::size(0) * 2);
-            pos3d32 {x: x, y: y, z: z}
+            Pos3d32 {x: x, y: y, z: z}
         }
     }, {
-        |val: &pos3d32, mem_ptr| {
+        |val: &Pos3d32, mem_ptr| {
             f32_io::write(val.x, mem_ptr);
             f32_io::write(val.y, mem_ptr + f32_io::size(0));
             f32_io::write(val.z, mem_ptr + f32_io::size(0) * 2);
@@ -374,15 +374,15 @@ gen_compound_types_io! (
         f32_io::size(0) * 3
     };
 
-    pos3d64, pos3d64_io, {
+    Pos3d64, pos3d64_io, {
         |mem_ptr| {
             let x = f64_io::read(mem_ptr);
             let y = f64_io::read(mem_ptr + f64_io::size(0));
             let z = f64_io::read(mem_ptr + f64_io::size(0) * 2);
-            pos3d64 {x: x, y: y, z: z}
+            Pos3d64 {x: x, y: y, z: z}
         }
     }, {
-        |val: &pos3d64, mem_ptr| {
+        |val: &Pos3d64, mem_ptr| {
             f64_io::write(val.x, mem_ptr);
             f64_io::write(val.y, mem_ptr + f64_io::size(0));
             f64_io::write(val.z, mem_ptr + f64_io::size(0) * 2);
@@ -393,14 +393,14 @@ gen_compound_types_io! (
 
     //////////////////////////////////////////////////////////
 
-    id, id_io, {
+    Id, id_io, {
         |mem_ptr| {
             let higher = u64_io::read(mem_ptr);
             let lower =  u64_io::read(mem_ptr + u64_io::size(0));
-            id {higher: higher, lower: lower}
+            Id {higher: higher, lower: lower}
         }
     }, {
-        |val: &id, mem_ptr| {
+        |val: &Id, mem_ptr| {
             u64_io::write(val.higher, mem_ptr);
             u64_io::write(val.lower,  mem_ptr + u64_io::size(0));
         }
@@ -464,11 +464,11 @@ define_types!(
     ["usize"], 12, usize                               ,Usize    ,false ,  usize_io      ;
     ["f32", "float"], 13, f32                          ,F32      ,false ,  f32_io        ;
     ["f64", "double"], 14, f64                         ,F64      ,false ,  f64_io        ;
-    ["pos2d32", "pos2d", "pos", "pos32"], 15, pos2d32  ,Pos2d32  ,true  ,  pos2d32_io    ;
-    ["pos2d64", "pos64"], 16, pos2d64                  ,Pos2d64  ,true  ,  pos2d64_io    ;
-    ["pos3d32", "pos3d"], 17, pos3d32                  ,Pos3d32  ,true  ,  pos3d32_io    ;
-    ["pos3d64"], 18, pos3d64                           ,Pos3d64  ,true  ,  pos3d64_io    ;
-    ["id"], 19, id                                     ,Id       ,true  ,  id_io         ;
+    ["pos2d32", "pos2d", "pos", "pos32"], 15, Pos2d32  ,Pos2d32  ,true  ,  pos2d32_io    ;
+    ["pos2d64", "pos64"], 16, Pos2d64                  ,Pos2d64  ,true  ,  pos2d64_io    ;
+    ["pos3d32", "pos3d"], 17, Pos3d32                  ,Pos3d32  ,true  ,  pos3d32_io    ;
+    ["pos3d64"], 18, Pos3d64                           ,Pos3d64  ,true  ,  pos3d64_io    ;
+    ["id"], 19, Id                                     ,Id       ,true  ,  id_io         ;
     ["string", "str"], 20, String                      ,String   ,true  ,  string_io
 );
 

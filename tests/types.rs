@@ -59,8 +59,8 @@ mod pos2d32 {
     #[test]
     fn test () {
         let test_data = vec![
-            types::pos2d32 {x: std::f32::MIN, y: std::f32::MAX},
-            types::pos2d32 {x: rand::random::<f32>(), y: rand::random::<f32>()}
+            types::Pos2d32 {x: std::f32::MIN, y: std::f32::MAX},
+            types::Pos2d32 {x: rand::random::<f32>(), y: rand::random::<f32>()}
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos2d32_io::size(0) as usize;
@@ -87,8 +87,8 @@ mod pos2d64 {
     #[test]
     fn test () {
         let test_data = vec![
-            types::pos2d64 {x: std::f64::MIN, y: std::f64::MAX},
-            types::pos2d64 {x: rand::random::<f64>(), y: rand::random::<f64>()}
+            types::Pos2d64 {x: std::f64::MIN, y: std::f64::MAX},
+            types::Pos2d64 {x: rand::random::<f64>(), y: rand::random::<f64>()}
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos2d64_io::size(0) as usize;
@@ -115,8 +115,8 @@ mod pos3d32 {
     #[test]
     fn test () {
         let test_data = vec![
-            types::pos3d32 {x: std::f32::MIN, y: std::f32::MAX, z: rand::random::<f32>()},
-            types::pos3d32 {x: rand::random::<f32>(), y: rand::random::<f32>(), z: rand::random::<f32>()}
+            types::Pos3d32 {x: std::f32::MIN, y: std::f32::MAX, z: rand::random::<f32>()},
+            types::Pos3d32 {x: rand::random::<f32>(), y: rand::random::<f32>(), z: rand::random::<f32>()}
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos3d32_io::size(0) as usize;
@@ -143,8 +143,8 @@ mod pos3d64 {
     #[test]
     fn test () {
         let test_data = vec![
-            types::pos3d64 {x: std::f64::MIN, y: std::f64::MAX, z: rand::random::<f64>()},
-            types::pos3d64 {x: rand::random::<f64>(), y: rand::random::<f64>(), z: rand::random::<f64>()}
+            types::Pos3d64 {x: std::f64::MIN, y: std::f64::MAX, z: rand::random::<f64>()},
+            types::Pos3d64 {x: rand::random::<f64>(), y: rand::random::<f64>(), z: rand::random::<f64>()}
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::pos3d64_io::size(0) as usize;
@@ -164,12 +164,12 @@ mod pos3d64 {
 
 mod uuid {
     use neb::ram::types;
-    use neb::ram::types::id;
+    use neb::ram::types::Id;
     use neb::ram::chunk::Chunks;
     use super::CHUNK_SIZE;
     #[test]
     fn test () {
-        let test_data = vec![id {higher: 1, lower: 2}];
+        let test_data = vec![Id {higher: 1, lower: 2}];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let counts = CHUNK_SIZE / types::id_io::size(0) as usize;
         for d in test_data {
