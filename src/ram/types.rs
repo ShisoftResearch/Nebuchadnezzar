@@ -270,6 +270,14 @@ pub struct id {
     pub lower:  u64,
 }
 
+impl id {
+    pub fn new(lower: u64, higher: u64) -> id {
+        id {
+            lower: lower,
+            higher: higher
+        }
+    }
+}
 
 impl PartialEq for pos2d32 {
     fn eq(&self, other: &pos2d32) -> bool {
