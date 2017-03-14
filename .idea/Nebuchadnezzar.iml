@@ -8,8 +8,8 @@
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
-    <orderEntry type="library" name="Cargo &lt;Nebuchadnezzar&gt;" level="project" />
     <orderEntry type="library" name="Rust &lt;Nebuchadnezzar&gt;" level="project" />
+    <orderEntry type="library" name="Cargo &lt;Nebuchadnezzar&gt;" level="project" />
     <orderEntry type="library" name="Cargo &lt;Nebuchadnezzar&gt;" level="project" />
   </component>
 </module>

@@ -7,6 +7,7 @@ use bifrost::raft::state_machine::callback::client::SubscriptionService;
 use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::client::ObserverClient;
+use bifrost::conshash::weights::Weights;
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use ram::schema::{sm as schema_sm};
@@ -64,6 +65,7 @@ impl Server {
             e => {error!("Cannot join into cluster: {:?}", e);}
         }
         Membership::new(rpc_server, &raft_service);
+        Weights::new(&raft_service);
     }
     fn load_subscription(rpc_server: &Arc<rpc::Server>, raft_client: &RaftClient) {
         let subs_service = SubscriptionService::initialize(rpc_server);
@@ -76,6 +78,22 @@ impl Server {
             _ => {error!("Cannot join cluster group");}
         }
     }
+    fn init_conshash(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Option<Arc<ConsistentHashing>> {
+        match ConsistentHashing::new(&opt.group_name, raft_client) {
+            Ok(ch) => {
+                ch.set_weight(&opt.address, opt.memory_size as u64);
+                if !ch.init_table().is_ok() {
+                    error!("Cannot initialize member table");
+                    return None;
+                }
+                return Some(ch);
+            },
+            _ => {
+                error!("Cannot set server weight");
+                return None;
+            }
+        }
+    }
     fn load_cluster_clients(opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>) {
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
@@ -83,6 +101,7 @@ impl Server {
                 *schemas = Schemas::new(Some(&raft_client));
                 Server::load_subscription(rpc_server, &raft_client);
                 Server::join_group(opt, &raft_client);
+                Server::init_conshash(opt, &raft_client);
             },
             Err(e) => {error!("Cannot generate meta client: {:?}", e);}
         }
