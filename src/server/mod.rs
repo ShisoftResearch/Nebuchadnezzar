@@ -16,6 +16,16 @@ use std::sync::Arc;
 
 mod cell_rpc;
 
+pub enum ServerError {
+    CannotJoinCluster,
+    CannotJoinClusterGroup,
+    CannotInitMemberTable,
+    CannotSetServerWeight,
+    CannotInitConsistentHashTable,
+    CannotLoadMetaClient,
+    MetaServerCannotBeStandalone,
+}
+
 pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,
@@ -39,7 +49,7 @@ pub struct Server {
 }
 
 impl Server {
-    fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) {
+    fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<(), ServerError> {
         let server_addr = &opt.address;
         let raft_service = raft::RaftService::new(raft::Options {
             storage: match opt.meta_storage {
@@ -62,61 +72,78 @@ impl Server {
             Ok(Ok(())) => {
                 info!("Joined meta cluster, number of members: {}", raft_service.num_members());
             },
-            e => {error!("Cannot join into cluster: {:?}", e);}
+            e => {
+                error!("Cannot join into cluster: {:?}", e);
+                return Err(ServerError::CannotJoinCluster)
+            }
         }
         Membership::new(rpc_server, &raft_service);
         Weights::new(&raft_service);
+        return Ok(());
     }
     fn load_subscription(rpc_server: &Arc<rpc::Server>, raft_client: &RaftClient) {
         let subs_service = SubscriptionService::initialize(rpc_server);
         raft_client.set_subscription(&subs_service);
     }
-    fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) {
+    fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
         match member_service.join_group(&opt.group_name) {
-            Ok(Ok(_)) => {},
-            _ => {error!("Cannot join cluster group");}
+            Ok(Ok(_)) => {Ok(())},
+            _ => {
+                error!("Cannot join cluster group");
+                Err(ServerError::CannotJoinClusterGroup)
+            }
         }
     }
-    fn init_conshash(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Option<Arc<ConsistentHashing>> {
+    fn init_conshash(opt: &ServerOptions, raft_client: &Arc<RaftClient>)
+        -> Result<Arc<ConsistentHashing>, ServerError> {
         match ConsistentHashing::new(&opt.group_name, raft_client) {
             Ok(ch) => {
                 ch.set_weight(&opt.address, opt.memory_size as u64);
                 if !ch.init_table().is_ok() {
                     error!("Cannot initialize member table");
-                    return None;
+                    return Err(ServerError::CannotInitMemberTable);
                 }
-                return Some(ch);
+                return Ok(ch);
             },
             _ => {
-                error!("Cannot set server weight");
-                return None;
+                error!("Cannot initialize consistent hash table");
+                return Err(ServerError::CannotInitConsistentHashTable);
             }
         }
     }
-    fn load_cluster_clients(opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>) {
+    fn load_cluster_clients
+    (opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>)
+    -> Result<(), ServerError>{
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
                 *schemas = Schemas::new(Some(&raft_client));
                 Server::load_subscription(rpc_server, &raft_client);
-                Server::join_group(opt, &raft_client);
-                Server::init_conshash(opt, &raft_client);
+                Server::join_group(opt, &raft_client)?;
+                Server::init_conshash(opt, &raft_client)?;
+                Ok(())
             },
-            Err(e) => {error!("Cannot generate meta client: {:?}", e);}
+            Err(e) => {
+                error!("Cannot load meta client: {:?}", e);
+                Err(ServerError::CannotLoadMetaClient)
+            }
         }
     }
-    pub fn new(opt: ServerOptions) -> Server {
+    pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
         let server_addr = &opt.address;
         let rpc_server = rpc::Server::new(vec!());
         let mut schemas = Schemas::new(None);
         rpc::Server::listen_and_resume(&rpc_server, server_addr);
         if !opt.standalone {
             if opt.is_meta {
-                Server::load_meta_server(&opt, &rpc_server);
+                Server::load_meta_server(&opt, &rpc_server)?;
             }
-            Server::load_cluster_clients(&opt, &mut schemas, &rpc_server);
-        } else if opt.is_meta {error!("Meta server cannot be standalone");}
+            Server::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
+        } else if opt.is_meta {
+            error!("Meta server cannot be standalone");
+            return Err(ServerError::MetaServerCannotBeStandalone)
+        }
         let meta_rc = Arc::new(ServerMeta {
             schemas: schemas.clone()
         });
@@ -130,10 +157,10 @@ impl Server {
             cell_rpc::DEFAULT_SERVICE_ID,
             cell_rpc::NebRPCService::new(&chunks)
         );
-        Server {
+        Ok(Server {
             chunks: chunks,
             meta: meta_rc,
             rpc: rpc_server
-        }
+        })
     }
 }
