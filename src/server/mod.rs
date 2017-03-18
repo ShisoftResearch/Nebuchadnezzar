@@ -19,7 +19,7 @@ mod cell_rpc;
 #[derive(Debug)]
 pub enum ServerError {
     CannotJoinCluster,
-    CannotJoinClusterGroup,
+    CannotJoinClusterGroup(sm_master::ExecError),
     CannotInitMemberTable,
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
@@ -65,6 +65,7 @@ impl Server {
             raft_service.clone()
         );
         raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&raft_service)));
+        raft::RaftService::start(&raft_service);
         match raft_service.join(&opt.meta_members) {
             Err(sm_master::ExecError::CannotConstructClient) => {
                 info!("Cannot join meta cluster, will bootstrap one.");
@@ -89,10 +90,10 @@ impl Server {
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
         match member_service.join_group(&opt.group_name) {
-            Ok(Ok(_)) => {Ok(())},
-            _ => {
+            Ok(_) => {Ok(())},
+            Err(e) => {
                 error!("Cannot join cluster group");
-                Err(ServerError::CannotJoinClusterGroup)
+                Err(ServerError::CannotJoinClusterGroup(e))
             }
         }
     }
