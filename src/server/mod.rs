@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 mod cell_rpc;
 
+#[derive(Debug)]
 pub enum ServerError {
     CannotJoinCluster,
     CannotJoinClusterGroup,

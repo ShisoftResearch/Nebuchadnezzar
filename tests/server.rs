@@ -5,11 +5,17 @@ use concurrent_hashmap::ConcHashMap;
 
 #[test]
 pub fn init () {
-//    let server = Server::new(ServerOptions {
-//        chunk_count: 1,
-//        memory_size: 1000,
-//        schemas: Schemas::new(None)
-//    });
+    Server::new(ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(String::from("127.0.0.1:5100")),
+        address: String::from("127.0.0.1:5100"),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
 }
 
 #[test]
