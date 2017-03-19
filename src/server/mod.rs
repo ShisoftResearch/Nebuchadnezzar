@@ -46,7 +46,8 @@ pub struct ServerMeta {
 pub struct Server {
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
-    pub rpc: Arc<rpc::Server>
+    pub rpc: Arc<rpc::Server>,
+    pub consh: Option<Arc<ConsistentHashing>>
 }
 
 impl Server {
@@ -116,15 +117,14 @@ impl Server {
     }
     fn load_cluster_clients
     (opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>)
-    -> Result<(), ServerError>{
+    -> Result<Arc<ConsistentHashing>, ServerError>{
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
                 *schemas = Schemas::new(Some(&raft_client));
                 Server::load_subscription(rpc_server, &raft_client);
                 Server::join_group(opt, &raft_client)?;
-                Server::init_conshash(opt, &raft_client)?;
-                Ok(())
+                Ok(Server::init_conshash(opt, &raft_client)?)
             },
             Err(e) => {
                 error!("Cannot load meta client: {:?}", e);
@@ -135,13 +135,14 @@ impl Server {
     pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
         let server_addr = &opt.address;
         let rpc_server = rpc::Server::new(vec!());
+        let mut conshasing = None;
         let mut schemas = Schemas::new(None);
         rpc::Server::listen_and_resume(&rpc_server, server_addr);
         if !opt.standalone {
             if opt.is_meta {
                 Server::load_meta_server(&opt, &rpc_server)?;
             }
-            Server::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
+            conshasing = Some(Server::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
         } else if opt.is_meta {
             error!("Meta server cannot be standalone");
             return Err(ServerError::MetaServerCannotBeStandalone)
@@ -162,7 +163,8 @@ impl Server {
         Ok(Server {
             chunks: chunks,
             meta: meta_rc,
-            rpc: rpc_server
+            rpc: rpc_server,
+            consh: conshasing
         })
     }
 }
