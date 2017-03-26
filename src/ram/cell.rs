@@ -30,12 +30,14 @@ pub enum WriteError {
     ReadError(ReadError),
     UserCanceledUpdate,
     DeletionPredictionFailed,
+    NetworkingError,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
-    CellDoesNotExisted
+    CellDoesNotExisted,
+    NetworkingError,
 }
 
 impl Header {

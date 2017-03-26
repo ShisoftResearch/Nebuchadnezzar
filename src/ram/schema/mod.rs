@@ -79,7 +79,7 @@ impl Schemas {
         self.schema_map.insert(id, schema.clone());
         self.name_map.insert(name, id);
         if let Some(ref sm) = self.sm {
-            sm.new_schema(schema.clone());
+            sm.new_schema(schema);
         }
     }
     pub fn del_schema(&self, name: &String) -> Result<(), ()> {
@@ -88,7 +88,7 @@ impl Schemas {
         }
         self.name_map.remove(name);
         if let Some(ref sm) = self.sm {
-            sm.del_schema(name.clone());
+            sm.del_schema(name);
         }
         Ok(())
     }
