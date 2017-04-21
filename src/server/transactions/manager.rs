@@ -32,8 +32,11 @@ service! {
     rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<usize, WriteError>;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<usize, WriteError>;
     rpc remove(tid: TransactionId, id: Id) -> Result<(), WriteError>;
+
     rpc commit(tid: TransactionId);
     rpc abort(tid: TransactionId);
+
+    rpc go_ahead(tid: TransactionId); // invoked by data site to continue on it's transaction in case of waiting
 }
 
 pub struct TransactionManager {

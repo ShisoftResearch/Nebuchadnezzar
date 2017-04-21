@@ -19,25 +19,12 @@ impl Peer {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct TransactionId {
-    pub timestamp: i64,
-    pub rand_int: u64
-}
-
-impl TransactionId {
-    pub fn next() -> TransactionId {
-        let mut rng = ::rand::thread_rng();
-        TransactionId {
-            timestamp: get_time(),
-            rand_int: rng.gen::<u64>()
-        }
-    }
-}
+pub type TransactionId = StandardVectorClock;
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum TransactionExecResult<A, E> {
     Rejected,
+    Wait,
     Accepted(A),
     Error(E),
 }
@@ -46,4 +33,13 @@ pub enum TransactionExecResult<A, E> {
 pub struct DataSiteResponse<T> {
     payload: T,
     clock: StandardVectorClock
+}
+
+impl <T> DataSiteResponse <T> {
+    pub fn new(peer: &Arc<Peer>, data: T) -> DataSiteResponse<T> {
+        DataSiteResponse {
+            payload: data,
+            clock: peer.clock.to_clock()
+        }
+    }
 }
