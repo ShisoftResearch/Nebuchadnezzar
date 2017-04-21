@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 mod cell_rpc;
+mod transactions;
 
 #[derive(Debug)]
 pub enum ServerError {
