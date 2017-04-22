@@ -33,14 +33,14 @@ pub struct DataManager {
 }
 
 service! {
-    rpc read(server_id: u64, clock :StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<usize, ReadError>>;
-    rpc write(server_id: u64, clock :StandardVectorClock, tid: TransactionId, id: Id, cell: Cell) -> DataSiteResponse<TransactionExecResult<usize, WriteError>>;
-    rpc update(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell: Cell) -> DataSiteResponse<TransactionExecResult<usize, WriteError>>;
+    rpc read(server_id: u64, clock :StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
+    rpc write(server_id: u64, clock :StandardVectorClock, tid: TransactionId, id: Id, cell: Cell) -> DataSiteResponse<TransactionExecResult<(), WriteError>>;
+    rpc update(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell: Cell) -> DataSiteResponse<TransactionExecResult<(), WriteError>>;
     rpc remove(server_id: u64, clock :StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<Result<(), WriteError>>;
 
     // two phase commit
     rpc prepare(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<bool>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId) -> StandardVectorClock;
+    rpc commit(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<bool>;
 
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> StandardVectorClock;
 }

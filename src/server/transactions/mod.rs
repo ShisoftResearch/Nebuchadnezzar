@@ -1,6 +1,7 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
-use std::sync::Arc;
 use bifrost::utils::time::get_time;
+use ram::cell::{Cell, WriteError};
+use std::sync::Arc;
 use rand::Rng;
 
 mod manager;
@@ -43,3 +44,5 @@ impl <T> DataSiteResponse <T> {
         }
     }
 }
+
+pub type AwaitResponse = TransactionExecResult<Option<Cell>, WriteError>;

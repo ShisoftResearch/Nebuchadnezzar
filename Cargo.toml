@@ -24,6 +24,7 @@ bincode = "0.6"
 byteorder = "1"
 parking_lot = {version = "0.3", features = ["nightly"]}
 rand = "0.3"
+futures = "0.1.9"
 
 [dev-dependencies]
 rand = "0.3"

@@ -30,3 +30,4 @@ extern crate serde_derive;
 extern crate parking_lot;
 extern crate core;
 extern crate rand;
+extern crate futures;
