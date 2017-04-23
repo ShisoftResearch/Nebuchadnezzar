@@ -1,4 +1,5 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
+use bifrost::utils::time::get_time;
 use concurrent_hashmap::ConcHashMap;
 use std::collections::{HashSet, HashMap};
 use ram::types::{Id};
@@ -9,6 +10,7 @@ use super::*;
 struct DataObject {
     id: Id,
     server: u64,
+    cell: Cell
 }
 
 impl PartialEq for DataObject {
@@ -21,10 +23,10 @@ impl PartialEq for DataObject {
 }
 
 struct Transaction {
-    start_time: i64,
+    start_time: i64, // use for timeout detecting
     id: TransactionId,
-    reads: HashSet<DataObject>,
-    writes: HashSet<DataObject>,
+    reads: HashMap<Id, DataObject>,
+    writes: HashMap<Id, DataObject>,
     await_chan: (Sender<AwaitResponse>, Receiver<AwaitResponse>)
 }
 
@@ -33,7 +35,7 @@ service! {
     rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError>;
     rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError>;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError>;
-    rpc remove(tid: TransactionId, id: Id) -> Result<(), WriteError>;
+    rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError>;
 
     rpc commit(tid: TransactionId);
     rpc abort(tid: TransactionId);
@@ -44,4 +46,44 @@ service! {
 pub struct TransactionManager {
     peer: Arc<Peer>,
     transactions: ConcHashMap<TransactionId, Transaction>
+}
+dispatch_rpc_service_functions!(TransactionManager);
+
+impl Service for TransactionManager {
+    fn begin(&self) -> Result<TransactionId, ()> {
+        let id = self.peer.clock.inc();
+        self.transactions.insert(id.clone(), Transaction {
+            start_time: get_time(),
+            id: id.clone(),
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+            await_chan: channel(1)
+        });
+        Ok(id)
+    }
+    fn read(&self, tid: TransactionId, id: Id) -> Result<TransactionExecResult<Cell, ReadError>, ()> {
+        if let Some(ref mut trans) = self.transactions.find_mut(&tid) {
+            let mut trans = trans.get();
+            //trans.reads.entry(id.clone()).or_insert_with
+        }
+        Err(())
+    }
+    fn write(&self, tid: TransactionId, id: Id, cell: Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
+        Err(())
+    }
+    fn update(&self, tid: TransactionId, cell: Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
+        Err(())
+    }
+    fn remove(&self, tid: TransactionId, id: Id) -> Result<TransactionExecResult<(), WriteError>, ()> {
+        Err(())
+    }
+    fn commit(&self, tid: TransactionId) -> Result<(), ()> {
+        Err(())
+    }
+    fn abort(&self, tid: TransactionId) -> Result<(), ()> {
+        Err(())
+    }
+    fn go_ahead(&self, tid: TransactionId, response: AwaitResponse) -> Result<(), ()> {
+        Err(())
+    }
 }

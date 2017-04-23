@@ -264,7 +264,7 @@ pub struct Pos3d64 {
     pub z: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash)]
 pub struct Id {
     pub higher: u64,
     pub lower:  u64,

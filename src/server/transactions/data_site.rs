@@ -40,7 +40,7 @@ service! {
 
     // two phase commit
     rpc prepare(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<bool>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<bool>;
+    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<Cell>) -> DataSiteResponse<bool>;
 
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> StandardVectorClock;
 }
