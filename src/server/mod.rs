@@ -173,7 +173,7 @@ impl Server {
             member_pool: rpc::ClientPool::new()
         })
     }
-    pub fn server_get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {
+    pub fn get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {
         match self.consh {
             Some(ref consh) => {
                 if let Some(hashed_address) = consh.get_server(id.higher) {
