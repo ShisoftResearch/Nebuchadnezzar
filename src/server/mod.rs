@@ -8,12 +8,14 @@ use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::client::ObserverClient;
 use bifrost::conshash::weights::Weights;
-use bifrost::tcp::STANDALONE_ADDRESS;
+use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use ram::schema::{sm as schema_sm};
+use ram::types::Id;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::io;
 
 mod cell_rpc;
 mod transactions;
@@ -49,7 +51,8 @@ pub struct Server {
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
-    pub consh: Option<Arc<ConsistentHashing>>
+    pub consh: Option<Arc<ConsistentHashing>>,
+    pub member_pool: rpc::ClientPool
 }
 
 impl Server {
@@ -135,8 +138,7 @@ impl Server {
         }
     }
     pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
-        let standalone_address = String::from(STANDALONE_ADDRESS);
-        let server_addr = if opt.standalone {&standalone_address} else {&opt.address};
+        let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
         let mut conshasing = None;
         let mut schemas = Schemas::new(None);
@@ -167,7 +169,20 @@ impl Server {
             chunks: chunks,
             meta: meta_rc,
             rpc: rpc_server,
-            consh: conshasing
+            consh: conshasing,
+            member_pool: rpc::ClientPool::new()
         })
+    }
+    pub fn server_get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {
+        match self.consh {
+            Some(ref consh) => {
+                if let Some(hashed_address) = consh.get_server(id.higher) {
+                    self.member_pool.get(&hashed_address)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, "Cannot get server from consistent hashing"))
+                }
+            },
+            _ => self.member_pool.get(&STANDALONE_ADDRESS_STRING)
+        }
     }
 }
