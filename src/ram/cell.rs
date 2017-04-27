@@ -20,7 +20,7 @@ pub struct Header {
     pub hash: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
@@ -33,7 +33,7 @@ pub enum WriteError {
     NetworkingError,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,
@@ -68,7 +68,7 @@ impl Header {
 
 pub const HEADER_SIZE :usize = 32;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
     pub header: Header,
     pub data: DataValue

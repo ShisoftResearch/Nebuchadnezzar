@@ -22,8 +22,9 @@ impl Peer {
 
 pub type TransactionId = StandardVectorClock;
 
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub enum TransactionExecResult<A, E> {
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub enum TransactionExecResult<A, E>
+where A: Clone, E: Clone {
     Rejected,
     Wait,
     Accepted(A),

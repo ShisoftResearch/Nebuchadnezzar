@@ -8,6 +8,7 @@ use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::client::ObserverClient;
 use bifrost::conshash::weights::Weights;
+use bifrost::tcp::STANDALONE_ADDRESS;
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use ram::schema::{sm as schema_sm};
@@ -64,7 +65,7 @@ impl Server {
         });
         rpc_server.register_service(
             raft::DEFAULT_SERVICE_ID,
-            raft_service.clone()
+            &raft_service
         );
         raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&raft_service)));
         raft::RaftService::start(&raft_service);
@@ -134,11 +135,12 @@ impl Server {
         }
     }
     pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
-        let server_addr = &opt.address;
-        let rpc_server = rpc::Server::new(vec!());
+        let standalone_address = String::from(STANDALONE_ADDRESS);
+        let server_addr = if opt.standalone {&standalone_address} else {&opt.address};
+        let rpc_server = rpc::Server::new(server_addr);
         let mut conshasing = None;
         let mut schemas = Schemas::new(None);
-        rpc::Server::listen_and_resume(&rpc_server, server_addr);
+        rpc::Server::listen_and_resume(&rpc_server);
         if !opt.standalone {
             if opt.is_meta {
                 Server::load_meta_server(&opt, &rpc_server)?;
@@ -159,7 +161,7 @@ impl Server {
         );
         rpc_server.register_service(
             cell_rpc::DEFAULT_SERVICE_ID,
-            cell_rpc::NebRPCService::new(&chunks)
+            &cell_rpc::NebRPCService::new(&chunks)
         );
         Ok(Server {
             chunks: chunks,
