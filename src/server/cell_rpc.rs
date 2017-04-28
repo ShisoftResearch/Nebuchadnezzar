@@ -19,24 +19,24 @@ pub struct NebRPCService {
 }
 
 impl Service for NebRPCService {
-    fn read_cell(&self, key: Id) -> Result<Cell, ReadError> {
+    fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
         self.server.chunks.read_cell(&key)
     }
-    fn write_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
-        let mut cell = cell;
+    fn write_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
+        let mut cell = cell.clone();
         match self.server.chunks.write_cell(&mut cell) {
             Ok(_) => Ok(cell),
             Err(e) => Err(e)
         }
     }
-    fn update_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
-        let mut cell = cell;
+    fn update_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
+        let mut cell = cell.clone();
         match self.server.chunks.update_cell(&mut cell) {
             Ok(_) => Ok(cell),
             Err(e) => Err(e)
         }
     }
-    fn remove_cell(&self, key: Id) -> Result<(), WriteError> {
+    fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
         self.server.chunks.remove_cell(&key)
     }
 }
