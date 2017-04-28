@@ -1,6 +1,7 @@
 use ram::cell::{Cell, ReadError, WriteError};
 use ram::chunk::Chunks;
 use ram::types::Id;
+use server::Server;
 
 use bifrost::rpc::*;
 
@@ -14,38 +15,38 @@ service! {
 }
 
 pub struct NebRPCService {
-    chunks: Arc<Chunks>
+    server: Arc<Server>
 }
 
 impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> Result<Cell, ReadError> {
-        self.chunks.read_cell(&key)
+        self.server.chunks.read_cell(&key)
     }
     fn write_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
         let mut cell = cell;
-        match self.chunks.write_cell(&mut cell) {
+        match self.server.chunks.write_cell(&mut cell) {
             Ok(_) => Ok(cell),
             Err(e) => Err(e)
         }
     }
     fn update_cell(&self, cell: Cell) -> Result<Cell, WriteError> {
         let mut cell = cell;
-        match self.chunks.update_cell(&mut cell) {
+        match self.server.chunks.update_cell(&mut cell) {
             Ok(_) => Ok(cell),
             Err(e) => Err(e)
         }
     }
     fn remove_cell(&self, key: Id) -> Result<(), WriteError> {
-        self.chunks.remove_cell(&key)
+        self.server.chunks.remove_cell(&key)
     }
 }
 
 dispatch_rpc_service_functions!(NebRPCService);
 
 impl NebRPCService {
-    pub fn new(chunks: &Arc<Chunks>) -> Arc<NebRPCService> {
+    pub fn new(server: &Arc<Server>) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
-            chunks: chunks.clone()
+            server: server.clone()
         })
     }
 }

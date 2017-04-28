@@ -137,7 +137,7 @@ impl Server {
             }
         }
     }
-    pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
+    pub fn new(opt: ServerOptions) -> Result<Arc<Server>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
         let mut conshasing = None;
@@ -161,17 +161,18 @@ impl Server {
             meta_rc.clone(),
             opt.backup_storage.clone(),
         );
-        rpc_server.register_service(
-            cell_rpc::DEFAULT_SERVICE_ID,
-            &cell_rpc::NebRPCService::new(&chunks)
-        );
-        Ok(Server {
+        let server = Arc::new(Server {
             chunks: chunks,
             meta: meta_rc,
-            rpc: rpc_server,
+            rpc: rpc_server.clone(),
             consh: conshasing,
             member_pool: rpc::ClientPool::new()
-        })
+        });
+        rpc_server.register_service(
+            cell_rpc::DEFAULT_SERVICE_ID,
+            &cell_rpc::NebRPCService::new(&server)
+        );
+        Ok(server)
     }
     pub fn get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {
         match self.consh {
