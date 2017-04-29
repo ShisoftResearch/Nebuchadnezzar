@@ -4,6 +4,7 @@ use concurrent_hashmap::ConcHashMap;
 use std::collections::{HashSet, HashMap};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
+use server::Server;
 use futures::sync::mpsc::{Sender, Receiver, channel};
 use super::*;
 
@@ -45,7 +46,7 @@ service! {
 
 pub struct TransactionManager {
     peer: Arc<Peer>,
-    transactions: ConcHashMap<TransactionId, Transaction>
+    transactions: ConcHashMap<TransactionId, Transaction>,
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
