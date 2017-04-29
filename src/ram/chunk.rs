@@ -190,13 +190,15 @@ impl Chunk {
     }
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
         where P: Fn(Cell) -> bool {
-        if let Some(cell_location) = self.location_for_read(hash) {
+        if let Some(mut cell_location) = self.location_for_write(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
                 Ok(cell) => {
                     if predict(cell) {
-                        self.index.remove(&hash);
                         self.put_tombstone(*cell_location);
+                        *cell_location = 0;
+                        // can't remove from index at this time due to write deadlock
+                        // TODO: FIX IT, remove cell by prediction, atomically
                         return Ok(());
                     } else {
                         return Err(WriteError::DeletionPredictionFailed);
