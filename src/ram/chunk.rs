@@ -5,17 +5,20 @@ use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
-use chashmap::CHashMap;
+use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::Schemas;
 use ram::types::Id;
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, Header};
 use server::ServerMeta;
 
+pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
+pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
+
 pub struct Chunk {
     pub id: usize,
     pub addr: usize,
-    pub index: CHashMap<u64, Mutex<usize>>,
+    pub index: CHashMap<u64, usize>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Arc<ServerMeta>,
@@ -74,15 +77,26 @@ impl Chunk {
         let seg_id = offset / SEGMENT_SIZE;
         return &self.segs[seg_id];
     }
-    pub fn location_of(&self, hash: u64) -> Option<MutexGuard<usize>> {
+    pub fn location_for_read<'a>(&self, hash: u64)
+        -> Option<CellReadGuard> {
         match self.index.get(&hash) {
             Some(index) => {
-                let index = *index;
-                let index_lock = index.lock();
-                if *index_lock == 0 {
+                if *index == 0 {
                     return None
                 }
-                return Some(index_lock);
+                return Some(index);
+            },
+            None => None
+        }
+    }
+    pub fn location_for_write(&self, hash: u64)
+        -> Option<CellWriteGuard> {
+        match self.index.get_mut(&hash) {
+            Some(index) => {
+                if *index == 0 {
+                    return None
+                }
+                return Some(index);
             },
             None => None
         }
@@ -93,7 +107,7 @@ impl Chunk {
         seg.put_frag(location);
     }
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
-        match self.location_of(hash) {
+        match self.location_for_read(hash) {
             Some(loc) => {
                 Cell::from_chunk_raw(*loc, self)
             },
@@ -102,7 +116,7 @@ impl Chunk {
     }
     fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
-        if self.location_of(hash).is_some() {
+        if self.location_for_read(hash).is_some() {
             return Err(WriteError::CellAlreadyExisted);
         } else {
             let written = cell.write_to_chunk(self);
@@ -110,9 +124,8 @@ impl Chunk {
             if let Ok(loc) = written {
                 self.index.upsert(
                     hash,
-                    ||{Mutex::new(loc)},
-                    |m| {
-                        let mut inserted_loc = m.lock();
+                    ||{loc},
+                    |inserted_loc| {
                         if *inserted_loc == 0 {
                             *inserted_loc = loc
                         } else {
@@ -130,7 +143,7 @@ impl Chunk {
     }
     fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
-        if let Some(mut cell_location) = self.location_of(hash) {
+        if let Some(mut cell_location) = self.location_for_write(hash) {
             let written = cell.write_to_chunk(self);
             if let Ok(new_location) = written {
                 let old_location = *cell_location;
@@ -144,7 +157,7 @@ impl Chunk {
     }
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
         where U: Fn(Cell) -> Option<Cell> {
-        if let Some(mut cell_location) = self.location_of(hash) {
+        if let Some(mut cell_location) = self.location_for_write(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
                 Ok(cell) => {
@@ -168,17 +181,16 @@ impl Chunk {
         }
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        if let Some(cell_location) = self.location_of(hash) {
-            self.index.remove(&hash);
-            self.put_tombstone(*cell_location);
-            return Ok(());
+        if let Some(cell_location) = self.index.remove(&hash) {
+            self.put_tombstone(cell_location);
+            Ok(())
         } else {
-            return Err(WriteError::CellDoesNotExisted);
+            Err(WriteError::CellDoesNotExisted)
         }
     }
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
         where P: Fn(Cell) -> bool {
-        if let Some(cell_location) = self.location_of(hash) {
+        if let Some(cell_location) = self.location_for_read(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
                 Ok(cell) => {
@@ -266,6 +278,6 @@ impl Chunks {
     }
     pub fn chunk_ptr(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return *chunk.location_of(hash).unwrap()
+        return *chunk.location_for_read(hash).unwrap()
     }
 }

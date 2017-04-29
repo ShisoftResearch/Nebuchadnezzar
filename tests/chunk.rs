@@ -26,6 +26,7 @@ pub fn round_robin_segment () {
 #[test]
 pub fn cell_rw () {
     env_logger::init();
+    info!("START");
     let fields = Field {
         type_id: 0,
         name: String::from("*"),

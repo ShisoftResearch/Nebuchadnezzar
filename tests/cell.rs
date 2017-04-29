@@ -99,6 +99,7 @@ pub fn cell_rw () {
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
+
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
