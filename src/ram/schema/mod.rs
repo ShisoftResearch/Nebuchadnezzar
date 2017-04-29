@@ -1,7 +1,7 @@
 use bifrost::raft::client::RaftClient;
 use bifrost_hasher::hash_str;
 
-use concurrent_hashmap::ConcHashMap;
+use chashmap::CHashMap;
 use parking_lot::Mutex;
 
 use std::sync::{Arc};
@@ -39,8 +39,8 @@ pub struct Field {
 }
 
 pub struct Schemas {
-    schema_map: ConcHashMap<u32, Schema>,
-    name_map: ConcHashMap<String, u32>,
+    schema_map: CHashMap<u32, Arc<Schema>>,
+    name_map: CHashMap<String, u32>,
     id_counter: Mutex<u32>,
     sm: Option<sm::client::SMClient>,
 }
@@ -52,8 +52,8 @@ impl Schemas {
             None => None
         };
         let schemas = Arc::new(Schemas {
-            schema_map: ConcHashMap::<u32, Schema>::new(),
-            name_map: ConcHashMap::<String, u32>::new(),
+            schema_map: CHashMap::new(),
+            name_map: CHashMap::new(),
             id_counter: Mutex::new(0),
             sm: sm
         });
@@ -76,15 +76,15 @@ impl Schemas {
     fn new_schema_(&self, schema: &Schema) {
         let name = schema.name.clone();
         let id = schema.id;
-        self.schema_map.insert(id, schema.clone());
+        self.schema_map.insert(id, Arc::new(schema.clone()));
         self.name_map.insert(name, id);
         if let Some(ref sm) = self.sm {
             sm.new_schema(schema);
         }
     }
     pub fn del_schema(&self, name: &String) -> Result<(), ()> {
-        if let Some(id) = self.name_map.find(name) {
-            self.schema_map.remove(&id.get());
+        if let Some(id) = self.name_map.get(name) {
+            self.schema_map.remove(&id);
         }
         self.name_map.remove(name);
         if let Some(ref sm) = self.sm {
@@ -92,16 +92,15 @@ impl Schemas {
         }
         Ok(())
     }
-    pub fn get_by_name(&self, name: &String) -> Option<&Schema> {
-        if let Some(id) = self.name_map.find(name) {
-            let id = id.get();
+    pub fn get_by_name(&self, name: &String) -> Option<Arc<Schema>> {
+        if let Some(id) = self.name_map.get(name) {
             return self.get(&id)
         }
         return None;
     }
-    pub fn get(&self, id: &u32) -> Option<&Schema> {
-        if let Some(schema) = self.schema_map.find(id) {
-            return Some(schema.get())
+    pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {
+        if let Some(schema) = self.schema_map.get(id) {
+            return Some(schema.clone())
         }
         return None;
     }

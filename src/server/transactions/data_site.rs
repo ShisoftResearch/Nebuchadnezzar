@@ -1,6 +1,6 @@
 use bifrost::vector_clock::{StandardVectorClock};
 use std::collections::{HashSet, HashMap};
-use concurrent_hashmap::ConcHashMap;
+use chashmap::CHashMap;
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
@@ -27,9 +27,9 @@ struct Transaction {
 }
 
 pub struct DataManager {
-    timestamps: ConcHashMap<Id, Timestamp>,
-    prev_cells: ConcHashMap<Id, Cell>,
-    status: ConcHashMap<TransactionId, Transaction>,
+    timestamps: CHashMap<Id, Timestamp>,
+    prev_cells: CHashMap<Id, Cell>,
+    status: CHashMap<TransactionId, Transaction>,
     server: Arc<NebServer>
 }
 

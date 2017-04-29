@@ -1,6 +1,6 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
-use concurrent_hashmap::ConcHashMap;
+use chashmap::CHashMap;
 use std::collections::{HashSet, HashMap};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
@@ -46,7 +46,7 @@ service! {
 
 pub struct TransactionManager {
     peer: Arc<Peer>,
-    transactions: ConcHashMap<TransactionId, Transaction>,
+    transactions: CHashMap<TransactionId, Transaction>,
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
@@ -63,8 +63,7 @@ impl Service for TransactionManager {
         Ok(id)
     }
     fn read(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<Cell, ReadError>, ()> {
-        if let Some(ref mut trans) = self.transactions.find_mut(&tid) {
-            let mut trans = trans.get();
+        if let Some(ref mut trans) = self.transactions.get_mut(&tid) {
             //trans.reads.entry(id.clone()).or_insert_with
         }
         Err(())

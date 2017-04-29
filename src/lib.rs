@@ -9,7 +9,7 @@
 
 extern crate libc;
 extern crate uuid;
-extern crate concurrent_hashmap;
+extern crate chashmap;
 
 pub mod ram;
 pub mod server;

@@ -5,7 +5,7 @@ use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
-use concurrent_hashmap::ConcHashMap;
+use chashmap::CHashMap;
 use ram::schema::Schemas;
 use ram::types::Id;
 use ram::segs::{Segment, SEGMENT_SIZE};
@@ -15,7 +15,7 @@ use server::ServerMeta;
 pub struct Chunk {
     pub id: usize,
     pub addr: usize,
-    pub index: ConcHashMap<u64, Mutex<usize>>,
+    pub index: CHashMap<u64, Mutex<usize>>,
     pub segs: Vec<Segment>,
     pub seg_round: AtomicUsize,
     pub meta: Arc<ServerMeta>,
@@ -46,7 +46,7 @@ impl Chunk {
         Chunk {
             id: id,
             addr: mem_ptr,
-            index: ConcHashMap::<u64, Mutex<usize>>::new(),
+            index: CHashMap::new(),
             meta: meta,
             segs: segments,
             seg_round: AtomicUsize::new(0),
@@ -75,9 +75,9 @@ impl Chunk {
         return &self.segs[seg_id];
     }
     pub fn location_of(&self, hash: u64) -> Option<MutexGuard<usize>> {
-        match self.index.find(&hash) {
+        match self.index.get(&hash) {
             Some(index) => {
-                let index = index.get();
+                let index = *index;
                 let index_lock = index.lock();
                 if *index_lock == 0 {
                     return None
@@ -106,21 +106,21 @@ impl Chunk {
             return Err(WriteError::CellAlreadyExisted);
         } else {
             let written = cell.write_to_chunk(self);
-            let need_rollback = AtomicBool::new(false);
+            let mut need_rollback = false;
             if let Ok(loc) = written {
                 self.index.upsert(
                     hash,
-                    Mutex::new(loc),
-                    &|m| {
+                    ||{Mutex::new(loc)},
+                    |m| {
                         let mut inserted_loc = m.lock();
                         if *inserted_loc == 0 {
                             *inserted_loc = loc
                         } else {
-                            need_rollback.store(true, Ordering::Relaxed);
+                            need_rollback = true;
                         }
                     }
                 );
-                if need_rollback.load(Ordering::Relaxed) {
+                if need_rollback {
                     self.put_tombstone(loc);
                     return Err(WriteError::CellAlreadyExisted)
                 }
