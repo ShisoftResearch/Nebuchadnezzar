@@ -1,3 +1,4 @@
+use ram::cell::Header;
 use libc;
 use std::cmp::PartialEq;
 use std::string::String;
@@ -275,6 +276,12 @@ impl Id {
         Id {
             higher: higher,
             lower: lower,
+        }
+    }
+    pub fn from_header(header: &Header) -> Id {
+        Id {
+            higher: header.partition,
+            lower: header.hash
         }
     }
 }

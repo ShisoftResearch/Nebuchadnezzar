@@ -72,8 +72,8 @@ pub fn cell_rw () {
         header: Header::new(0, schema.id, &id1),
         data: data
     };
-    let mut loc = chunks.write_cell(&mut cell);
-    let cell_1_ptr = loc.unwrap();
+    let header = chunks.write_cell(&mut cell).unwrap();
+    let cell_1_ptr = chunks.chunk_ptr(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
@@ -91,8 +91,8 @@ pub fn cell_rw () {
         header: Header::new(0, schema.id, &id2),
         data: data
     };
-    loc = chunks.write_cell(&mut cell);
-    let cell_2_ptr = loc.unwrap();
+    let header = chunks.write_cell(&mut cell).unwrap();
+    let cell_2_ptr = chunks.chunk_ptr(&Id::from_header(&header));
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
@@ -117,8 +117,8 @@ pub fn cell_rw () {
         header: Header::new(0, schema.id, &id2),
         data: data
     };
-    loc = chunks.update_cell(&mut cell);
-    let cell_2_ptr = loc.unwrap();
+    let header = chunks.update_cell(&mut cell).unwrap();
+    let cell_2_ptr = chunks.chunk_ptr(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 2);

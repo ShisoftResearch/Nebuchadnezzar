@@ -98,7 +98,7 @@ impl Cell {
         }
     }
     pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
-        let schema_id = self.header.schema.clone();
+        let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
             return self.write_to_chunk_with_schema(chunk, schema)
         } else {

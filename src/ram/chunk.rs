@@ -9,7 +9,7 @@ use concurrent_hashmap::ConcHashMap;
 use ram::schema::Schemas;
 use ram::types::Id;
 use ram::segs::{Segment, SEGMENT_SIZE};
-use ram::cell::{Cell, ReadError, WriteError};
+use ram::cell::{Cell, ReadError, WriteError, Header};
 use server::ServerMeta;
 
 pub struct Chunk {
@@ -100,7 +100,7 @@ impl Chunk {
             None => Err(ReadError::CellDoesNotExisted)
         }
     }
-    fn write_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+    fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if self.location_of(hash).is_some() {
             return Err(WriteError::CellAlreadyExisted);
@@ -125,10 +125,10 @@ impl Chunk {
                     return Err(WriteError::CellAlreadyExisted)
                 }
             }
-            return written
+            return Ok(cell.header)
         }
     }
-    fn update_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+    fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_of(hash) {
             let written = cell.write_to_chunk(self);
@@ -137,12 +137,12 @@ impl Chunk {
                 *cell_location = new_location;
                 self.put_tombstone(old_location);
             }
-            return written;
+            return Ok(cell.header);
         } else {
             return Err(WriteError::CellDoesNotExisted)
         }
     }
-    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<usize, WriteError>
+    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Header, WriteError>
         where U: Fn(Cell) -> Option<Cell> {
         if let Some(mut cell_location) = self.location_of(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
@@ -156,7 +156,7 @@ impl Chunk {
                             *cell_location = new_location;
                             self.put_tombstone(old_location);
                         }
-                        return written;
+                        return Ok(new_cell.header);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
                     }
@@ -242,15 +242,15 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn write_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+    pub fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.write_cell(cell);
     }
-    pub fn update_cell(&self, cell: &mut Cell) -> Result<usize, WriteError> {
+    pub fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
     }
-    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<usize, WriteError>
+    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<Header, WriteError>
         where U: Fn(Cell) -> Option<Cell>{
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
@@ -263,5 +263,9 @@ impl Chunks {
         where P: Fn(Cell) -> bool {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);
+    }
+    pub fn chunk_ptr(&self, key: &Id) -> usize {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return *chunk.location_of(hash).unwrap()
     }
 }
