@@ -56,7 +56,7 @@ impl DataManager {
         self.server.tnx_peer.clock.merge_with(clock);
     }
 //    fn get_transaction(&self, tid: &TransactionId) -> &Transaction {
-//        self.status.
+//
 //    }
 }
 
