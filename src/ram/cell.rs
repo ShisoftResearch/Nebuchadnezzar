@@ -84,6 +84,7 @@ impl Cell {
     }
 
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
+        if ptr == 0 {return Err(ReadError::CellDoesNotExisted)}
         let header = unsafe {(*(ptr as *const Header))};
         let data_ptr = ptr + HEADER_SIZE;
         let schema_id = &header.schema;

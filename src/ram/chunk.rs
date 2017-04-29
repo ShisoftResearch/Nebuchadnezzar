@@ -194,18 +194,28 @@ impl Chunk {
         self.index.alter(hash, |loc_opt|{
             match loc_opt {
                 Some(cell_location) => {
-                    if cell_location > 0 {
-                        let cell = Cell::from_chunk_raw(cell_location, self);
-                        self.put_tombstone(cell_location);
-                    } else {
-                        result = Err(WriteError::CellDoesNotExisted);
+                    let cell = Cell::from_chunk_raw(cell_location, self);
+                    match cell {
+                        Ok(cell) => {
+                            if predict(cell) {
+                                self.put_tombstone(cell_location);
+                                None
+                            } else {
+                                result = Err(WriteError::CellDoesNotExisted);
+                                loc_opt
+                            }
+                        },
+                        Err(e) => {
+                            result = Err(WriteError::ReadError(e));
+                            None
+                        }
                     }
                 },
                 None => {
                     result = Err(WriteError::CellDoesNotExisted);
+                    None
                 }
-            };
-            None
+            }
         });
         return result;
     }
