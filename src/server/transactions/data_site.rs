@@ -1,15 +1,17 @@
 use bifrost::vector_clock::{StandardVectorClock};
-use std::collections::{HashSet, HashMap};
-use chashmap::CHashMap;
+use std::collections::{BTreeSet, HashMap};
+use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use super::*;
 
-pub struct Timestamp {
+pub struct CellMeta {
     read: i64,
     write: i64,
-    committed: bool
+    committed: bool,
+    owner: Option<TransactionId>, // transaction that owns the cell in Committing state
+    waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -27,8 +29,7 @@ struct Transaction {
 }
 
 pub struct DataManager {
-    timestamps: CHashMap<Id, Timestamp>,
-    prev_cells: CHashMap<Id, Cell>,
+    cells: CHashMap<Id, CellMeta>,
     status: CHashMap<TransactionId, Transaction>,
     server: Arc<NebServer>
 }
@@ -55,9 +56,18 @@ impl DataManager {
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.tnx_peer.clock.merge_with(clock);
     }
-//    fn get_transaction(&self, tid: &TransactionId) -> &Transaction {
-//
-//    }
+    fn get_transaction(&self, tid: &TransactionId, server: &u64) -> WriteGuard<TransactionId, Transaction> {
+        if !self.status.contains_key(tid) {
+            self.status.upsert(tid.clone(), ||{
+                Transaction {
+                    id: tid.clone(),
+                    server: *server,
+                    state: TransactionState::Started
+                }
+            }, |t|{});
+        }
+        self.status.get_mut(tid).unwrap()
+    }
 }
 
 impl Service for DataManager {
@@ -65,7 +75,7 @@ impl Service for DataManager {
         -> Result<DataSiteResponse<TransactionExecResult<Cell, ReadError>>, ()> {
         let local_clock = self.local_clock();
         self.update_clock(clock);
-
+        let mut tnx = self.get_transaction(tid, server_id);
         unimplemented!()
     }
     fn write(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id, cell: &Cell)
