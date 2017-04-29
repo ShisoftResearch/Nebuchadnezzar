@@ -142,7 +142,7 @@ impl Chunk {
             return Err(WriteError::CellDoesNotExisted)
         }
     }
-    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Header, WriteError>
+    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
         where U: Fn(Cell) -> Option<Cell> {
         if let Some(mut cell_location) = self.location_of(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
@@ -156,7 +156,7 @@ impl Chunk {
                             *cell_location = new_location;
                             self.put_tombstone(old_location);
                         }
-                        return Ok(new_cell.header);
+                        return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
                     }
@@ -250,7 +250,7 @@ impl Chunks {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
     }
-    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<Header, WriteError>
+    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<Cell, WriteError>
         where U: Fn(Cell) -> Option<Cell>{
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
