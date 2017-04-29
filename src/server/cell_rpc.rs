@@ -1,7 +1,7 @@
 use ram::cell::{Cell, ReadError, WriteError};
 use ram::chunk::Chunks;
 use ram::types::Id;
-use server::Server;
+use server::NebServer;
 
 use bifrost::rpc::*;
 
@@ -15,7 +15,7 @@ service! {
 }
 
 pub struct NebRPCService {
-    server: Arc<Server>
+    server: Arc<NebServer>
 }
 
 impl Service for NebRPCService {
@@ -44,7 +44,7 @@ impl Service for NebRPCService {
 dispatch_rpc_service_functions!(NebRPCService);
 
 impl NebRPCService {
-    pub fn new(server: &Arc<Server>) -> Arc<NebRPCService> {
+    pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
             server: server.clone()
         })

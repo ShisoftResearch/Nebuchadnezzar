@@ -4,7 +4,7 @@ use concurrent_hashmap::ConcHashMap;
 use std::collections::{HashSet, HashMap};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
-use server::Server;
+use server::NebServer;
 use futures::sync::mpsc::{Sender, Receiver, channel};
 use super::*;
 

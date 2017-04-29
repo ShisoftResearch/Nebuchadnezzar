@@ -47,15 +47,16 @@ pub struct ServerMeta {
     pub schemas: Arc<Schemas>
 }
 
-pub struct Server {
+pub struct NebServer {
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Option<Arc<ConsistentHashing>>,
-    pub member_pool: rpc::ClientPool
+    pub member_pool: rpc::ClientPool,
+    pub tnx_peer: transactions::Peer
 }
 
-impl Server {
+impl NebServer {
     fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<(), ServerError> {
         let server_addr = &opt.address;
         let raft_service = raft::RaftService::new(raft::Options {
@@ -127,9 +128,9 @@ impl Server {
         match raft_client {
             Ok(raft_client) => {
                 *schemas = Schemas::new(Some(&raft_client));
-                Server::load_subscription(rpc_server, &raft_client);
-                Server::join_group(opt, &raft_client)?;
-                Ok(Server::init_conshash(opt, &raft_client)?)
+                NebServer::load_subscription(rpc_server, &raft_client);
+                NebServer::join_group(opt, &raft_client)?;
+                Ok(NebServer::init_conshash(opt, &raft_client)?)
             },
             Err(e) => {
                 error!("Cannot load meta client: {:?}", e);
@@ -137,7 +138,7 @@ impl Server {
             }
         }
     }
-    pub fn new(opt: ServerOptions) -> Result<Arc<Server>, ServerError> {
+    pub fn new(opt: ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
         let mut conshasing = None;
@@ -145,9 +146,9 @@ impl Server {
         rpc::Server::listen_and_resume(&rpc_server);
         if !opt.standalone {
             if opt.is_meta {
-                Server::load_meta_server(&opt, &rpc_server)?;
+                NebServer::load_meta_server(&opt, &rpc_server)?;
             }
-            conshasing = Some(Server::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
+            conshasing = Some(NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
         } else if opt.is_meta {
             error!("Meta server cannot be standalone");
             return Err(ServerError::MetaServerCannotBeStandalone)
@@ -161,12 +162,13 @@ impl Server {
             meta_rc.clone(),
             opt.backup_storage.clone(),
         );
-        let server = Arc::new(Server {
+        let server = Arc::new(NebServer {
             chunks: chunks,
             meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing,
-            member_pool: rpc::ClientPool::new()
+            member_pool: rpc::ClientPool::new(),
+            tnx_peer: transactions::Peer::new(server_addr)
         });
         rpc_server.register_service(
             cell_rpc::DEFAULT_SERVICE_ID,

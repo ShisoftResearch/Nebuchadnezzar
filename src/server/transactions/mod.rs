@@ -13,10 +13,10 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn new(server_address: &String) -> Arc<Peer> {
-        Arc::new(Peer {
+    pub fn new(server_address: &String) -> Peer {
+        Peer {
             clock: ServerVectorClock::new(server_address)
-        })
+        }
     }
 }
 

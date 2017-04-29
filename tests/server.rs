@@ -5,7 +5,7 @@ use concurrent_hashmap::ConcHashMap;
 
 #[test]
 pub fn init () {
-    Server::new(ServerOptions {
+    NebServer::new(ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024,
         standalone: false,
