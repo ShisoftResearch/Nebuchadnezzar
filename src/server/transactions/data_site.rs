@@ -8,8 +8,6 @@ use super::*;
 
 pub struct CellMeta {
     read: i64,
-    write: i64,
-    committed: bool,
     owner: Option<TransactionId>, // transaction that owns the cell in Committing state
     waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
 }
@@ -23,14 +21,14 @@ enum TransactionState {
 }
 
 struct Transaction {
-    id: TransactionId,
     server: u64,
+    id: TransactionId,
     state: TransactionState
 }
 
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
-    status: CHashMap<TransactionId, Transaction>,
+    tnxs: CHashMap<TransactionId, Transaction>,
     server: Arc<NebServer>
 }
 
@@ -57,8 +55,8 @@ impl DataManager {
         self.server.tnx_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TransactionId, server: &u64) -> WriteGuard<TransactionId, Transaction> {
-        if !self.status.contains_key(tid) {
-            self.status.upsert(tid.clone(), ||{
+        if !self.tnxs.contains_key(tid) {
+            self.tnxs.upsert(tid.clone(), ||{
                 Transaction {
                     id: tid.clone(),
                     server: *server,
@@ -66,7 +64,25 @@ impl DataManager {
                 }
             }, |t|{});
         }
-        self.status.get_mut(tid).unwrap()
+        match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => self.get_transaction(tid, server) // it should be rare
+        }
+    }
+    fn get_cell_meta(&self, id: &Id) -> WriteGuard<Id, CellMeta > {
+        if !self.cells.contains_key(id) {
+            self.cells.upsert(id.clone(), || {
+                CellMeta {
+                    read: 0,
+                    owner: None,
+                    waiting: BTreeSet::new()
+                }
+            }, |c|{});
+        }
+        match self.cells.get_mut(id) {
+            Some(cell) => cell,
+            _ => self.get_cell_meta(id)
+        }
     }
 }
 
@@ -76,6 +92,8 @@ impl Service for DataManager {
         let local_clock = self.local_clock();
         self.update_clock(clock);
         let mut tnx = self.get_transaction(tid, server_id);
+        let mut cell= self.get_cell_meta(id);
+
         unimplemented!()
     }
     fn write(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id, cell: &Cell)
