@@ -6,9 +6,11 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use super::*;
 
+pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
+
 pub struct CellMeta {
-    read: Option<TransactionId>,
-    write: Option<TransactionId>,
+    read: TransactionId,
+    write: TransactionId,
     owner: Option<TransactionId>, // transaction that owns the cell in Committing state
     waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
 }
@@ -21,10 +23,11 @@ pub enum CellCommit {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CellPrepare {
-    Write(Id),
-    Update(Id),
-    Remove(Id)
+pub enum PrepareResult {
+    Wait,
+    Success,
+    TransactionNotExisted,
+    NotRealizable,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -51,7 +54,7 @@ service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
 
     // two phase commit
-    rpc prepare(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CellPrepare>) -> DataSiteResponse<bool>;
+    rpc prepare(clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CellCommit>) -> DataSiteResponse<bool>;
 
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
@@ -81,12 +84,12 @@ impl DataManager {
             _ => self.get_transaction(tid, server) // it should be rare
         }
     }
-    fn get_cell_meta(&self, id: &Id) -> WriteGuard<Id, CellMeta > {
+    fn get_cell_meta(&self, id: &Id) -> CellMetaGuard {
         if !self.cells.contains_key(id) {
             self.cells.upsert(id.clone(), || {
                 CellMeta {
-                    read: None,
-                    write: None,
+                    read: TransactionId::new(),
+                    write: TransactionId::new(),
                     owner: None,
                     waiting: BTreeSet::new()
                 }
@@ -106,15 +109,11 @@ impl DataManager {
 impl Service for DataManager {
     fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id)
         -> Result<DataSiteResponse<TransactionExecResult<Cell, ReadError>>, ()> {
-        let local_clock = self.local_clock();
         self.update_clock(clock);
         let mut tnx = self.get_transaction(tid, server_id);
         let mut meta = self.get_cell_meta(id);
         let committing = meta.owner.is_some();
-        let read_too_late = !meta.write.is_none() && match meta.write {
-            Some(ref w) => w > tid,
-            _ => false
-        };
+        let read_too_late = &meta.write > tid;
         if read_too_late { // not realizable
             return self.response_with(TransactionExecResult::Rejected);
         }
@@ -129,32 +128,53 @@ impl Service for DataManager {
                 return self.response_with(TransactionExecResult::Error(read_error));
             }
         };
-        let update_read = {
-            meta.read.is_none() || match meta.read {
-                Some(ref r) => r < tid,
-                None => true
-            }
-        };
+        let update_read = &meta.read < tid;
         if update_read {
-            meta.read = Some(tid.clone())
+            meta.read = tid.clone()
         }
         self.response_with(TransactionExecResult::Accepted(cell))
     }
-    fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellPrepare>)
-        -> Result<DataSiteResponse<bool>, ()> {
-        let local_clock = self.local_clock();
+    fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
+        -> Result<DataSiteResponse<PrepareResult>, ()> {
+        // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
+        // It will also check if write are realizable. If not, transaction manager should retry with new id
+        // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         self.update_clock(clock);
-        unimplemented!()
+        let mut tnx = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => {
+                return self.response_with(PrepareResult::TransactionNotExisted);
+            }
+        };
+        let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+        for cell_id in cell_ids {
+            let meta = self.get_cell_meta(cell_id);
+            if tid < &meta.read { // write too late
+                break;
+            }
+            if tid < &meta.write {
+                if meta.owner.is_some() { // not committed, should wait and try prepare again
+                    return self.response_with(PrepareResult::Wait)
+                }
+            }
+            cell_metas.push(meta);
+        }
+        if cell_metas.len() < cell_ids.len() {
+            return self.response_with(PrepareResult::NotRealizable); // need retry
+        } else {
+            for mut meta in cell_metas {
+                meta.owner = Some(tid.clone()) // set owner to lock this cell
+            }
+            return self.response_with(PrepareResult::Success);
+        }
     }
     fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellCommit>)
         -> Result<DataSiteResponse<bool>, ()>  {
-        let local_clock = self.local_clock();
         self.update_clock(clock);
         unimplemented!()
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)
         -> Result<DataSiteResponse<()>, ()>  {
-        let local_clock = self.local_clock();
         self.update_clock(clock);
         unimplemented!()
     }
