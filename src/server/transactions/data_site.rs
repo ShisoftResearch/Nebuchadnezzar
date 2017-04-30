@@ -1,6 +1,6 @@
 use bifrost::vector_clock::{StandardVectorClock, Relation};
 use bifrost::utils::time::get_time;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, BTreeMap};
 use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
@@ -17,7 +17,7 @@ pub struct CellMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CellCommit {
+pub enum CommitOp {
     Write(Cell),
     Update(Cell),
     Remove(Id)
@@ -34,8 +34,17 @@ pub enum PrepareResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CommitResult {
     Success,
+    WriteError(Id, WriteError),
+    CheckFailed(CommitCheckError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CommitCheckError {
+    CellNumberDoesNotMatch(usize, usize),
     TransactionNotExisted,
-    Error(WriteError),
+    TransactionNotCommitted,
+    TransactionAlreadyCommitted,
+    TransactionAlreadyAborted,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -50,7 +59,7 @@ struct Transaction {
     server: u64,
     id: TransactionId,
     state: TransactionState,
-    affect_cells: u16,
+    affect_cells: usize,
     last_activity: i64,
 }
 
@@ -65,7 +74,7 @@ service! {
 
     // two phase commit
     rpc prepare(clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CellCommit>) -> DataSiteResponse<bool>;
+    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<CommitResult>;
 
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
 }
@@ -155,9 +164,7 @@ impl Service for DataManager {
         self.update_clock(clock);
         let mut tnx = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
-            _ => {
-                return self.response_with(PrepareResult::TransactionNotExisted);
-            }
+            _ => { return self.response_with(PrepareResult::TransactionNotExisted); }
         };
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
         for cell_id in cell_ids {
@@ -179,14 +186,43 @@ impl Service for DataManager {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
             tnx.state = TransactionState::Committing;
-            tnx.last_activity = get_time();
+            tnx.affect_cells = cell_ids.len(); // for cell number check
+            tnx.last_activity = get_time();    // check if transaction timeout
             return self.response_with(PrepareResult::Success);
         }
     }
-    fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellCommit>)
-        -> Result<DataSiteResponse<bool>, ()>  {
+    fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CommitOp>)
+        -> Result<DataSiteResponse<CommitResult>, ()>  {
         self.update_clock(clock);
+        let mut tnx = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => { return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionNotExisted)); }
+        };
+        // check state
+        match tnx.state {
+            TransactionState::Started => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionNotCommitted))},
+            TransactionState::Aborted => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionAlreadyAborted))},
+            TransactionState::Committed => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionAlreadyCommitted))},
+            TransactionState::Committing => {}
+        }
+        // check cell list integrity
+        let prepared_cells_num = tnx.affect_cells;
+        let arrived_cells_num = self.cells.len();
+        if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CommitCheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        let cell_history: BTreeMap<Id, Option<Cell>> = BTreeMap::new(); // for rollback in case of write error
+        for cell_op in cells {
+            match cell_op {
+                &CommitOp::Write(ref cell) => {
 
+                },
+                &CommitOp::Remove(ref cell_id) => {
+
+                },
+                &CommitOp::Update(ref cell) => {
+
+                }
+            }
+        }
         unimplemented!()
 
     }

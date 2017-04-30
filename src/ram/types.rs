@@ -4,6 +4,7 @@ use std::cmp::PartialEq;
 use std::string::String;
 use std::any::Any;
 use std::collections::hash_map;
+use std::cmp::Ordering;
 
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 
@@ -284,6 +285,9 @@ impl Id {
             lower: header.hash
         }
     }
+    pub fn is_greater_than(&self, other: &Id) -> bool {
+        self.higher >= other.higher && self.lower > other.lower
+    }
 }
 
 impl PartialEq for Pos2d32 {
@@ -328,6 +332,21 @@ impl PartialEq for Id {
     }
     fn ne(&self, other: &Id) -> bool {
         self.higher != other.higher || self.lower != other.lower
+    }
+}
+impl PartialOrd for Id {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self == other {return Some(Ordering::Equal)}
+        if self.is_greater_than(other) {return Some(Ordering::Greater)}
+        Some(Ordering::Less)
+    }
+}
+
+impl Ord for Id {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self == other {return Ordering::Equal}
+        if self.is_greater_than(other) {return Ordering::Greater}
+        Ordering::Less
     }
 }
 
