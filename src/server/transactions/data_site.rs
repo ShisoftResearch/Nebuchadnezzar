@@ -1,4 +1,4 @@
-use bifrost::vector_clock::{StandardVectorClock};
+use bifrost::vector_clock::{StandardVectorClock, Relation};
 use std::collections::{BTreeSet, HashMap};
 use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
@@ -7,9 +7,24 @@ use server::NebServer;
 use super::*;
 
 pub struct CellMeta {
-    read: i64,
+    read: Option<TransactionId>,
+    write: Option<TransactionId>,
     owner: Option<TransactionId>, // transaction that owns the cell in Committing state
     waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CellCommit {
+    Write(Cell),
+    Update(Cell),
+    Remove(Id)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CellPrepare {
+    Write(Id),
+    Update(Id),
+    Remove(Id)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -34,13 +49,10 @@ pub struct DataManager {
 
 service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
-    rpc write(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id, cell: Cell) -> DataSiteResponse<TransactionExecResult<(), WriteError>>;
-    rpc update(server_id: u64, clock: StandardVectorClock, tid: TransactionId, cell: Cell) -> DataSiteResponse<TransactionExecResult<(), WriteError>>;
-    rpc remove(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<Result<(), WriteError>>;
 
     // two phase commit
-    rpc prepare(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<bool>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<Cell>) -> DataSiteResponse<bool>;
+    rpc prepare(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CellPrepare>) -> DataSiteResponse<bool>;
+    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CellCommit>) -> DataSiteResponse<bool>;
 
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
 }
@@ -73,7 +85,8 @@ impl DataManager {
         if !self.cells.contains_key(id) {
             self.cells.upsert(id.clone(), || {
                 CellMeta {
-                    read: 0,
+                    read: None,
+                    write: None,
                     owner: None,
                     waiting: BTreeSet::new()
                 }
@@ -84,6 +97,10 @@ impl DataManager {
             _ => self.get_cell_meta(id)
         }
     }
+    fn response_with<T>(&self, data: T)
+        -> Result<DataSiteResponse<T>, ()>{
+        Ok(DataSiteResponse::new(&self.server.tnx_peer, data))
+    }
 }
 
 impl Service for DataManager {
@@ -92,36 +109,44 @@ impl Service for DataManager {
         let local_clock = self.local_clock();
         self.update_clock(clock);
         let mut tnx = self.get_transaction(tid, server_id);
-        let mut cell= self.get_cell_meta(id);
-
-        unimplemented!()
+        let mut meta = self.get_cell_meta(id);
+        let committing = meta.owner.is_some();
+        let read_too_late = !meta.write.is_none() && match meta.write {
+            Some(ref w) => w > tid,
+            _ => false
+        };
+        if read_too_late { // not realizable
+            return self.response_with(TransactionExecResult::Rejected);
+        }
+        if committing { // ts >= wt but committing, need to wait until it committed
+            meta.waiting.insert(tid.clone());
+            return self.response_with(TransactionExecResult::Wait);
+        }
+        let cell = match self.server.chunks.read_cell(id) {
+            Ok(cell) => {cell}
+            Err(read_error) => {
+                // cannot read
+                return self.response_with(TransactionExecResult::Error(read_error));
+            }
+        };
+        let update_read = {
+            meta.read.is_none() || match meta.read {
+                Some(ref r) => r < tid,
+                None => true
+            }
+        };
+        if update_read {
+            meta.read = Some(tid.clone())
+        }
+        self.response_with(TransactionExecResult::Accepted(cell))
     }
-    fn write(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id, cell: &Cell)
-        -> Result<DataSiteResponse<TransactionExecResult<(), WriteError>>, ()> {
-        let local_clock = self.local_clock();
-        self.update_clock(clock);
-        unimplemented!()
-    }
-    fn update(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, cell: &Cell)
-        -> Result<DataSiteResponse<TransactionExecResult<(), WriteError>>, ()> {
-        let local_clock = self.local_clock();
-        self.update_clock(clock);
-        unimplemented!()
-    }
-    fn remove(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id)
-        -> Result<DataSiteResponse<Result<(), WriteError>>, ()> {
-        let local_clock = self.local_clock();
-        self.update_clock(clock);
-        unimplemented!()
-    }
-
-    fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId)
+    fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellPrepare>)
         -> Result<DataSiteResponse<bool>, ()> {
         let local_clock = self.local_clock();
         self.update_clock(clock);
         unimplemented!()
     }
-    fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<Cell>)
+    fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellCommit>)
         -> Result<DataSiteResponse<bool>, ()>  {
         let local_clock = self.local_clock();
         self.update_clock(clock);

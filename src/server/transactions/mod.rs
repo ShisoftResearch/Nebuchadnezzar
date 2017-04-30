@@ -38,7 +38,7 @@ pub struct DataSiteResponse<T> {
 }
 
 impl <T> DataSiteResponse <T> {
-    pub fn new(peer: &Arc<Peer>, data: T) -> DataSiteResponse<T> {
+    pub fn new(peer: &Peer, data: T) -> DataSiteResponse<T> {
         DataSiteResponse {
             payload: data,
             clock: peer.clock.to_clock()
