@@ -1,4 +1,5 @@
 use bifrost::vector_clock::{StandardVectorClock, Relation};
+use bifrost::utils::time::get_time;
 use std::collections::{BTreeSet, HashMap};
 use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
@@ -30,18 +31,27 @@ pub enum PrepareResult {
     NotRealizable,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CommitResult {
+    Success,
+    TransactionNotExisted,
+    Error(WriteError),
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum TransactionState {
     Started,
     Aborted,
     Committing,
-    Committed
+    Committed,
 }
 
 struct Transaction {
     server: u64,
     id: TransactionId,
-    state: TransactionState
+    state: TransactionState,
+    affect_cells: u16,
+    last_activity: i64,
 }
 
 pub struct DataManager {
@@ -75,7 +85,9 @@ impl DataManager {
                 Transaction {
                     id: tid.clone(),
                     server: *server,
-                    state: TransactionState::Started
+                    state: TransactionState::Started,
+                    affect_cells: 0,
+                    last_activity: get_time()
                 }
             }, |t|{});
         }
@@ -110,10 +122,10 @@ impl Service for DataManager {
     fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id)
         -> Result<DataSiteResponse<TransactionExecResult<Cell, ReadError>>, ()> {
         self.update_clock(clock);
-        let mut tnx = self.get_transaction(tid, server_id);
         let mut meta = self.get_cell_meta(id);
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
+        let mut tnx = self.get_transaction(tid, server_id);
         if read_too_late { // not realizable
             return self.response_with(TransactionExecResult::Rejected);
         }
@@ -132,6 +144,7 @@ impl Service for DataManager {
         if update_read {
             meta.read = tid.clone()
         }
+        tnx.last_activity = get_time();
         self.response_with(TransactionExecResult::Accepted(cell))
     }
     fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
@@ -165,13 +178,17 @@ impl Service for DataManager {
             for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
+            tnx.state = TransactionState::Committing;
+            tnx.last_activity = get_time();
             return self.response_with(PrepareResult::Success);
         }
     }
     fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CellCommit>)
         -> Result<DataSiteResponse<bool>, ()>  {
         self.update_clock(clock);
+
         unimplemented!()
+
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)
         -> Result<DataSiteResponse<()>, ()>  {
