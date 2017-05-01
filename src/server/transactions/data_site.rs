@@ -243,12 +243,13 @@ impl Service for DataManager {
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
         for cell_id in cell_ids {
-            let meta = self.get_cell_meta(cell_id);
+            let mut meta = self.get_cell_meta(cell_id);
             if tid < &meta.read { // write too late
                 break;
             }
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
+                    meta.waiting.insert(tid.clone());
                     return self.response_with(PrepareResult::Wait)
                 }
             }
@@ -427,6 +428,7 @@ impl Service for DataManager {
             }
         }
         // TODO: remove transaction and unuseful cell meta data
+        // TODO: Inform waiting transactions to continue
         if released_locks == tnx.affected_cells.len() {
             self.response_with(EndResult::Success)
         } else {
