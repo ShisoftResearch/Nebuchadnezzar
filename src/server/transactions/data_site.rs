@@ -37,16 +37,17 @@ pub enum CommitResult {
     Success,
     WriteError(Id, WriteError, Vec<RollbackFailure>),
     CellChanged(Id, Vec<RollbackFailure>),
-    CheckFailed(CommitCheckError),
+    CheckFailed(CheckError),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CommitCheckError {
+pub enum CheckError {
     CellNumberDoesNotMatch(usize, usize),
     TransactionNotExisted,
     TransactionNotCommitted,
     TransactionAlreadyCommitted,
     TransactionAlreadyAborted,
+    TransactionCannotEnd,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -55,6 +56,18 @@ enum TransactionState {
     Aborted,
     Committing,
     Committed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AbortResult {
+    CheckFailed(CheckError),
+    Success(Option<Vec<RollbackFailure>>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EndResult {
+    CheckFailed(CheckError),
+    Success,
 }
 
 struct Transaction {
@@ -100,10 +113,10 @@ service! {
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
     // for committed transaction, abort need to recover the data according to it's cells history
-    rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
+    rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<AbortResult>;
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
-    rpc end(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
+    rpc end(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<EndResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -135,7 +148,7 @@ impl DataManager {
     }
     fn get_cell_meta(&self, id: &Id) -> CellMetaGuard {
         if !self.cells.contains_key(id) {
-            self.cells.upsert(id.clone(), || {
+            self.cells.upsert(*id, || {
                 CellMeta {
                     read: TransactionId::new(),
                     write: TransactionId::new(),
@@ -249,19 +262,19 @@ impl Service for DataManager {
         self.update_clock(clock);
         let mut tnx = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
-            _ => { return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionNotExisted)); }
+            _ => { return self.response_with(CommitResult::CheckFailed(CheckError::TransactionNotExisted)); }
         };
         // check state
         match tnx.state {
-            TransactionState::Started => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionNotCommitted))},
-            TransactionState::Aborted => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionAlreadyAborted))},
-            TransactionState::Committed => {return self.response_with(CommitResult::CheckFailed(CommitCheckError::TransactionAlreadyCommitted))},
+            TransactionState::Started => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
+            TransactionState::Aborted => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
+            TransactionState::Committed => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
             TransactionState::Committing => {}
         }
         // check cell list integrity
         let prepared_cells_num = tnx.affect_cells;
         let arrived_cells_num = self.cells.len();
-        if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CommitCheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
         for cell_op in cells {
@@ -337,6 +350,7 @@ impl Service for DataManager {
         if let Some((id, error)) = write_error {
             let rollback_result = self.rollback(&commit_history);
             tnx.state = TransactionState::Aborted; // set to abort so it can't be abort again
+            tnx.last_activity = get_time();
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
                     // in this case, we can inform transaction manager to try again
@@ -355,17 +369,43 @@ impl Service for DataManager {
             // all set, able to commit
             tnx.state = TransactionState::Committed;
             tnx.history = Some(commit_history);
+            tnx.last_activity = get_time();
             return self.response_with(CommitResult::Success)
         }
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)
-        -> Result<DataSiteResponse<()>, ()>  {
+        -> Result<DataSiteResponse<AbortResult>, ()>  {
         self.update_clock(clock);
-        unimplemented!()
+        let mut tnx = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => { return self.response_with(AbortResult::CheckFailed(CheckError::TransactionNotExisted)); }
+        };
+        if tnx.state == TransactionState::Aborted {
+            return self.response_with(AbortResult::CheckFailed(CheckError::TransactionAlreadyAborted));
+        }
+        let rollback_failure = {
+            if let Some(ref history) = tnx.history {
+                let history = self.rollback(history);
+                if history.len() == 0 { None } else { Some(history) }
+            } else { None }
+        };
+        tnx.last_activity = get_time();
+        tnx.state = TransactionState::Aborted;
+        self.response_with(AbortResult::Success(rollback_failure))
     }
     fn end(&self, clock :&StandardVectorClock, tid: &TransactionId)
-             -> Result<DataSiteResponse<()>, ()>  {
+             -> Result<DataSiteResponse<EndResult>, ()>  {
         self.update_clock(clock);
-        unimplemented!()
+        let mut tnx = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => { return self.response_with(EndResult::CheckFailed(CheckError::TransactionNotExisted)); }
+        };
+        if !(tnx.state == TransactionState::Aborted || tnx.state == TransactionState::Committed) {
+            return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
+        }
+        // TODO: clean up and inform waiting transaction managers
+        self.response_with(EndResult::Success)
     }
 }
+
+// TODO: update 'read' and 'write' in CellMeta and deal with abort recover
