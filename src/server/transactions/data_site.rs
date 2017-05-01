@@ -30,6 +30,7 @@ pub enum PrepareResult {
     Success,
     TransactionNotExisted,
     NotRealizable,
+    TransactionStateError(TransactionState)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -50,7 +51,7 @@ pub enum CheckError {
     TransactionCannotEnd,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
 enum TransactionState {
     Started,
     Aborted,
@@ -67,6 +68,7 @@ pub enum AbortResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum EndResult {
     CheckFailed(CheckError),
+    SomeLocksNotReleased,
     Success,
 }
 
@@ -74,9 +76,9 @@ struct Transaction {
     server: u64,
     id: TransactionId,
     state: TransactionState,
-    affect_cells: usize,
+    affected_cells: Vec<Id>,
     last_activity: i64,
-    history: Option<CommitHistory>
+    history: CommitHistory
 }
 
 struct CellHistory {
@@ -135,9 +137,9 @@ impl DataManager {
                     id: tid.clone(),
                     server: *server,
                     state: TransactionState::Started,
-                    affect_cells: 0,
+                    affected_cells: Vec::new(),
                     last_activity: get_time(),
-                    history: None
+                    history: BTreeMap::new(),
                 }
             }, |t|{});
         }
@@ -191,6 +193,10 @@ impl DataManager {
         }
         failures
     }
+    fn update_cell_write(&self, cell_id: &Id, tid: &TransactionId) {
+        let mut meta = self.get_cell_meta(cell_id);
+        meta.write = tid.clone();
+    }
 }
 
 impl Service for DataManager {
@@ -232,6 +238,9 @@ impl Service for DataManager {
             Some(tnx) => tnx,
             _ => { return self.response_with(PrepareResult::TransactionNotExisted); }
         };
+        if tnx.state != TransactionState::Started {
+            return self.response_with(PrepareResult::TransactionStateError(tnx.state))
+        }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
         for cell_id in cell_ids {
             let meta = self.get_cell_meta(cell_id);
@@ -245,14 +254,14 @@ impl Service for DataManager {
             }
             cell_metas.push(meta);
         }
-        if cell_metas.len() < cell_ids.len() {
+        if cell_metas.len() != cell_ids.len() {
             return self.response_with(PrepareResult::NotRealizable); // need retry
         } else {
             for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
             tnx.state = TransactionState::Committing;
-            tnx.affect_cells = cell_ids.len(); // for cell number check
+            tnx.affected_cells = cell_ids.clone(); // for cell number check
             tnx.last_activity = get_time();    // check if transaction timeout
             return self.response_with(PrepareResult::Success);
         }
@@ -272,7 +281,7 @@ impl Service for DataManager {
             TransactionState::Committing => {}
         }
         // check cell list integrity
-        let prepared_cells_num = tnx.affect_cells;
+        let prepared_cells_num = tnx.affected_cells.len();
         let arrived_cells_num = self.cells.len();
         if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
@@ -285,6 +294,7 @@ impl Service for DataManager {
                     match write_result {
                         Ok(header) => {
                             commit_history.insert(cell.id(), CellHistory::new(None, header.version));
+                            self.update_cell_write(&cell.id(), tid);
                         },
                         Err(error) => {
                             write_error = Some((cell.id(), error));
@@ -309,6 +319,7 @@ impl Service for DataManager {
                     match write_result {
                         Ok(()) => {
                             commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
+                            self.update_cell_write(cell_id, tid);
                         },
                         Err(error) => {
                             write_error = Some((*cell_id, error));
@@ -337,6 +348,7 @@ impl Service for DataManager {
                     match write_result {
                         Ok(cell) => {
                             commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
+                            self.update_cell_write(&cell_id, tid);
                         },
                         Err(error) => {
                             write_error = Some((cell_id, error));
@@ -368,7 +380,7 @@ impl Service for DataManager {
         } else {
             // all set, able to commit
             tnx.state = TransactionState::Committed;
-            tnx.history = Some(commit_history);
+            tnx.history = commit_history;
             tnx.last_activity = get_time();
             return self.response_with(CommitResult::Success)
         }
@@ -383,15 +395,13 @@ impl Service for DataManager {
         if tnx.state == TransactionState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::TransactionAlreadyAborted));
         }
-        let rollback_failure = {
-            if let Some(ref history) = tnx.history {
-                let history = self.rollback(history);
-                if history.len() == 0 { None } else { Some(history) }
-            } else { None }
+        let rollback_failures = {
+            let failures = self.rollback(&tnx.history);
+            if failures.len() == 0 { None } else { Some(failures) }
         };
         tnx.last_activity = get_time();
         tnx.state = TransactionState::Aborted;
-        self.response_with(AbortResult::Success(rollback_failure))
+        self.response_with(AbortResult::Success(rollback_failures))
     }
     fn end(&self, clock :&StandardVectorClock, tid: &TransactionId)
              -> Result<DataSiteResponse<EndResult>, ()>  {
@@ -403,9 +413,24 @@ impl Service for DataManager {
         if !(tnx.state == TransactionState::Aborted || tnx.state == TransactionState::Committed) {
             return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
         }
-        // TODO: clean up and inform waiting transaction managers
-        self.response_with(EndResult::Success)
+        let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+        for cell_id in &tnx.affected_cells {
+            if let Some(meta) = self.cells.get_mut(cell_id){
+                cell_metas.push(meta)
+            }
+        }
+        let mut released_locks = 0;
+        for mut meta in cell_metas {
+            if meta.owner == Some(tid.clone()) {
+                meta.owner = None;
+                released_locks += 1;
+            }
+        }
+        // TODO: remove transaction and unuseful cell meta data
+        if released_locks == tnx.affected_cells.len() {
+            self.response_with(EndResult::Success)
+        } else {
+            self.response_with(EndResult::SomeLocksNotReleased)
+        }
     }
 }
-
-// TODO: update 'read' and 'write' in CellMeta and deal with abort recover
