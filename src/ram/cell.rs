@@ -64,6 +64,12 @@ impl Header {
             partition: 0,
         }.write(location);
     }
+    pub fn id(&self) -> Id {
+        Id {
+            higher: self.partition,
+            lower: self.hash,
+        }
+    }
 }
 
 pub const HEADER_SIZE :usize = 32;
@@ -128,5 +134,7 @@ impl Cell {
             }
         }
     }
-
+    pub fn id(&self) -> Id {
+        self.header.id()
+    }
 }

@@ -8,6 +8,7 @@ use server::NebServer;
 use super::*;
 
 pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
+pub type CommitHistory = BTreeMap<Id, CellHistory>;
 
 pub struct CellMeta {
     read: TransactionId,
@@ -34,7 +35,8 @@ pub enum PrepareResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CommitResult {
     Success,
-    WriteError(Id, WriteError),
+    WriteError(Id, WriteError, Vec<RollbackFailure>),
+    CellChanged(Id, Vec<RollbackFailure>),
     CheckFailed(CommitCheckError),
 }
 
@@ -61,6 +63,26 @@ struct Transaction {
     state: TransactionState,
     affect_cells: usize,
     last_activity: i64,
+    history: Option<CommitHistory>
+}
+
+struct CellHistory {
+    cell: Option<Cell>,
+    current_version: u64
+}
+
+impl CellHistory {
+    pub fn new (cell: Option<Cell>, current_ver: u64) -> CellHistory {
+        CellHistory {
+            cell: cell,
+            current_version: current_ver,
+        }
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RollbackFailure {
+    id: Id,
+    error: WriteError
 }
 
 pub struct DataManager {
@@ -76,7 +98,12 @@ service! {
     rpc prepare(clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<CommitResult>;
 
+    // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
+    // for committed transaction, abort need to recover the data according to it's cells history
     rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
+
+    // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
+    rpc end(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<()>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -96,7 +123,8 @@ impl DataManager {
                     server: *server,
                     state: TransactionState::Started,
                     affect_cells: 0,
-                    last_activity: get_time()
+                    last_activity: get_time(),
+                    history: None
                 }
             }, |t|{});
         }
@@ -124,6 +152,31 @@ impl DataManager {
     fn response_with<T>(&self, data: T)
         -> Result<DataSiteResponse<T>, ()>{
         Ok(DataSiteResponse::new(&self.server.tnx_peer, data))
+    }
+    fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
+        let mut failures: Vec<RollbackFailure> = Vec::new();
+        for (id, history) in history.iter() {
+            let cell = &history.cell;
+            let current_ver = history.current_version;
+            let error = if cell.is_none() { // the cell was created, need to remove
+                self.server.chunks.remove_cell_by(&id, |cell| {
+                    cell.header.version == current_ver
+                }).err()
+            } else if current_ver > 0 { // the cell was updated, need to update back
+                self.server.chunks.update_cell_by(id, |cell_to_update|{
+                    if cell_to_update.header.version == current_ver {
+                        cell.clone()
+                    } else { None }
+                }).err()
+            } else { // the cell was removed, need to put back
+                let mut cell = cell.clone().unwrap();
+                self.server.chunks.write_cell(&mut cell).err()
+            };
+            if let Some(error) = error {
+                failures.push(RollbackFailure{id: *id, error: error});
+            }
+        }
+        failures
     }
 }
 
@@ -209,25 +262,109 @@ impl Service for DataManager {
         let prepared_cells_num = tnx.affect_cells;
         let arrived_cells_num = self.cells.len();
         if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CommitCheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
-        let cell_history: BTreeMap<Id, Option<Cell>> = BTreeMap::new(); // for rollback in case of write error
+        let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
+        let mut write_error: Option<(Id, WriteError)> = None;
         for cell_op in cells {
             match cell_op {
                 &CommitOp::Write(ref cell) => {
-
+                    let mut cell = cell.clone();
+                    let write_result = self.server.chunks.write_cell(&mut cell);
+                    match write_result {
+                        Ok(header) => {
+                            commit_history.insert(cell.id(), CellHistory::new(None, header.version));
+                        },
+                        Err(error) => {
+                            write_error = Some((cell.id(), error));
+                            break;
+                        }
+                    };
                 },
                 &CommitOp::Remove(ref cell_id) => {
-
+                    let original_cell = {
+                        match self.server.chunks.read_cell(cell_id) {
+                            Ok(cell) => cell,
+                            Err(re) => {
+                                write_error = Some((*cell_id, WriteError::ReadError(re)));
+                                break;
+                            }
+                        }
+                    };
+                    let write_result = self.server.chunks.remove_cell_by(cell_id, |cell|{
+                        let version = cell.header.version;
+                        version == original_cell.header.version
+                    });
+                    match write_result {
+                        Ok(()) => {
+                            commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
+                        },
+                        Err(error) => {
+                            write_error = Some((*cell_id, error));
+                            break;
+                        }
+                    }
                 },
                 &CommitOp::Update(ref cell) => {
-
+                    let cell_id = cell.id();
+                    let original_cell = {
+                        match self.server.chunks.read_cell(&cell_id) {
+                            Ok(cell) => cell,
+                            Err(re) => {
+                                write_error = Some((cell_id, WriteError::ReadError(re)));
+                                break;
+                            }
+                        }
+                    };
+                    let write_result = self.server.chunks.update_cell_by(&cell_id, |cell_to_update| {
+                        if cell_to_update.header.version == original_cell.header.version {
+                            Some(cell.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    match write_result {
+                        Ok(cell) => {
+                            commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
+                        },
+                        Err(error) => {
+                            write_error = Some((cell_id, error));
+                            break;
+                        }
+                    }
                 }
             }
         }
-        unimplemented!()
-
+        // check if any of those operations failed, if yes, rollback and fail this commit
+        if let Some((id, error)) = write_error {
+            let rollback_result = self.rollback(&commit_history);
+            tnx.state = TransactionState::Aborted; // set to abort so it can't be abort again
+            match error {
+                WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
+                    // in this case, we can inform transaction manager to try again
+                    return self.response_with(CommitResult::CellChanged(
+                        id, rollback_result
+                    ));
+                }
+                _ => {
+                    // other failure due to unfixable error should abort without retry
+                    return self.response_with(CommitResult::WriteError(
+                        id, error, rollback_result
+                    ));
+                }
+            }
+        } else {
+            // all set, able to commit
+            tnx.state = TransactionState::Committed;
+            tnx.history = Some(commit_history);
+            return self.response_with(CommitResult::Success)
+        }
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)
         -> Result<DataSiteResponse<()>, ()>  {
+        self.update_clock(clock);
+        unimplemented!()
+    }
+    fn end(&self, clock :&StandardVectorClock, tid: &TransactionId)
+             -> Result<DataSiteResponse<()>, ()>  {
         self.update_clock(clock);
         unimplemented!()
     }
