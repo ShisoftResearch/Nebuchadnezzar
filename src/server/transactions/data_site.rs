@@ -7,6 +7,8 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use super::*;
 
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_DATA_MANAGER_RPC_SERVICE) as u64;
+
 pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
 pub type CommitHistory = BTreeMap<Id, CellHistory>;
 
@@ -124,6 +126,13 @@ service! {
 dispatch_rpc_service_functions!(DataManager);
 
 impl DataManager {
+    pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
+        Arc::new(DataManager {
+            cells: CHashMap::new(),
+            tnxs: CHashMap::new(),
+            server: server.clone()
+        })
+    }
     fn local_clock(&self) -> StandardVectorClock {
         self.server.tnx_peer.clock.to_clock()
     }

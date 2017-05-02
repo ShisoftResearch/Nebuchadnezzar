@@ -8,6 +8,8 @@ use server::NebServer;
 use futures::sync::mpsc::{Sender, Receiver, channel};
 use super::*;
 
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64;
+
 struct DataObject {
     id: Id,
     server: u64,
@@ -45,14 +47,23 @@ service! {
 }
 
 pub struct TransactionManager {
-    peer: Arc<Peer>,
+    server: Arc<NebServer>,
     transactions: CHashMap<TransactionId, Transaction>,
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
+impl TransactionManager {
+    pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
+        Arc::new(TransactionManager {
+            server: server.clone(),
+            transactions: CHashMap::new()
+        })
+    }
+}
+
 impl Service for TransactionManager {
     fn begin(&self) -> Result<TransactionId, ()> {
-        let id = self.peer.clock.inc();
+        let id = self.server.tnx_peer.clock.inc();
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
             id: id.clone(),

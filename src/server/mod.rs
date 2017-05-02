@@ -174,6 +174,14 @@ impl NebServer {
             cell_rpc::DEFAULT_SERVICE_ID,
             &cell_rpc::NebRPCService::new(&server)
         );
+        rpc_server.register_service(
+           transactions::manager::DEFAULT_SERVICE_ID,
+           &transactions::manager::TransactionManager::new(&server)
+        );
+        rpc_server.register_service(
+            transactions::data_site::DEFAULT_SERVICE_ID,
+            &transactions::data_site::DataManager::new(&server)
+        );
         Ok(server)
     }
     pub fn get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {

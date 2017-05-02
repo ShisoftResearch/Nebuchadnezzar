@@ -4,8 +4,8 @@ use ram::cell::{Cell, WriteError};
 use std::sync::Arc;
 use rand::Rng;
 
-mod manager;
-mod data_site;
+pub mod manager;
+pub mod data_site;
 
 // Peer have a clock, meant to update with other servers in the cluster
 pub struct Peer {
