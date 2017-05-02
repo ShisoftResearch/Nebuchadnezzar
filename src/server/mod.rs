@@ -196,4 +196,16 @@ impl NebServer {
             _ => self.member_pool.get(&STANDALONE_ADDRESS_STRING)
         }
     }
+    pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
+        match self.consh {
+            Some(ref consh) => {
+                if let Some(ref server_name) = consh.to_server_name(Some(server_id)) {
+                    self.member_pool.get(server_name)
+                } else {
+                    Err(io::Error::new(io::ErrorKind::Other, "Cannot find server id in consistent hash table"))
+                }
+            },
+            _ => self.member_pool.get(&STANDALONE_ADDRESS_STRING)
+        }
+    }
 }

@@ -105,6 +105,7 @@ pub struct RollbackFailure {
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
     tnxs: CHashMap<TransactionId, Transaction>,
+    managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>
 }
 
@@ -130,7 +131,8 @@ impl DataManager {
         Arc::new(DataManager {
             cells: CHashMap::new(),
             tnxs: CHashMap::new(),
-            server: server.clone()
+            managers: CHashMap::new(),
+            server: server.clone(),
         })
     }
     fn local_clock(&self) -> StandardVectorClock {
@@ -205,6 +207,15 @@ impl DataManager {
     fn update_cell_write(&self, cell_id: &Id, tid: &TransactionId) {
         let mut meta = self.get_cell_meta(cell_id);
         meta.write = tid.clone();
+    }
+    fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
+        if !self.managers.contains_key(&server_id) {
+            let client = self.server.get_member_by_server_id(server_id)?;
+            self.managers.upsert(server_id, || {
+                manager::AsyncServiceClient::new(DEFAULT_SERVICE_ID, &client)
+            }, |_| {});
+        }
+        Ok(self.managers.get(&server_id).unwrap().clone())
     }
 }
 
