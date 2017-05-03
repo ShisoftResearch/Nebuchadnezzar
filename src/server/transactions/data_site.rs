@@ -5,6 +5,7 @@ use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
+use itertools::Itertools;
 use super::*;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_DATA_MANAGER_RPC_SERVICE) as u64;
@@ -441,14 +442,32 @@ impl Service for DataManager {
             }
         }
         let mut released_locks = 0;
+        let mut waiting_list: BTreeMap<u64, BTreeSet<TransactionId>> = BTreeMap::new();
         for mut meta in cell_metas {
             if meta.owner == Some(tid.clone()) {
+                for waiting_tid in &meta.waiting {
+                    if let Some(t) = self.tnxs.get(waiting_tid) {
+                        waiting_list
+                            .entry(t.server)
+                            .or_insert_with(|| BTreeSet::new())
+                            .insert(waiting_tid.clone());
+                    }
+                }
+                meta.waiting.clear();
                 meta.owner = None;
                 released_locks += 1;
+            } else {
+                warn!("affected tnx does not own the cell");
+            }
+        }
+        for (server_id, transactions) in waiting_list { // inform waiting servers to go on
+            if let Ok(client) = self.get_tnx_manager(server_id) {
+                client.go_ahead(&transactions);
+            } else {
+                warn!("cannot inform server {} to continue it transactions", server_id);
             }
         }
         // TODO: remove transaction and unuseful cell meta data
-        // TODO: Inform waiting transactions to continue
         if released_locks == tnx.affected_cells.len() {
             self.response_with(EndResult::Success)
         } else {

@@ -31,3 +31,5 @@ extern crate parking_lot;
 extern crate core;
 extern crate rand;
 extern crate futures;
+#[macro_use]
+extern crate itertools;

@@ -1,7 +1,7 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
 use chashmap::CHashMap;
-use std::collections::{HashSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
@@ -28,8 +28,8 @@ impl PartialEq for DataObject {
 struct Transaction {
     start_time: i64, // use for timeout detecting
     id: TransactionId,
-    reads: HashMap<Id, DataObject>,
-    writes: HashMap<Id, DataObject>,
+    reads: BTreeMap<Id, DataObject>,
+    writes: BTreeMap<Id, DataObject>,
     await_chan: (Sender<AwaitResponse>, Receiver<AwaitResponse>)
 }
 
@@ -43,7 +43,7 @@ service! {
     rpc commit(tid: TransactionId);
     rpc abort(tid: TransactionId);
 
-    rpc go_ahead(tid: TransactionId, response: AwaitResponse); // invoked by data site to continue on it's transaction in case of waiting
+    rpc go_ahead(tid: BTreeSet<TransactionId>); // invoked by data site to continue on it's transaction in case of waiting
 }
 
 pub struct TransactionManager {
@@ -67,8 +67,8 @@ impl Service for TransactionManager {
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
             id: id.clone(),
-            reads: HashMap::new(),
-            writes: HashMap::new(),
+            reads: BTreeMap::new(),
+            writes: BTreeMap::new(),
             await_chan: channel(1)
         });
         Ok(id)
@@ -94,7 +94,7 @@ impl Service for TransactionManager {
     fn abort(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
     }
-    fn go_ahead(&self, tid: &TransactionId, response: &AwaitResponse) -> Result<(), ()> {
+    fn go_ahead(&self, tid: &BTreeSet<TransactionId>) -> Result<(), ()> {
         Err(())
     }
 }
