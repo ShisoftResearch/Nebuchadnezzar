@@ -6,6 +6,7 @@ use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use itertools::Itertools;
+use futures;
 use super::*;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_DATA_MANAGER_RPC_SERVICE) as u64;
@@ -153,7 +154,7 @@ impl DataManager {
                     last_activity: get_time(),
                     history: BTreeMap::new(),
                 }
-            }, |t|{});
+            }, |_|{});
         }
         match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
@@ -460,14 +461,18 @@ impl Service for DataManager {
                 warn!("affected tnx does not own the cell");
             }
         }
+        let mut wake_up_futures = Vec::new();
         for (server_id, transactions) in waiting_list { // inform waiting servers to go on
             if let Ok(client) = self.get_tnx_manager(server_id) {
-                client.go_ahead(&transactions);
+                wake_up_futures.push(client.go_ahead(&transactions));
             } else {
                 warn!("cannot inform server {} to continue it transactions", server_id);
             }
         }
+        futures::collect(wake_up_futures).wait();
         // TODO: remove transaction and unuseful cell meta data
+
+        self.tnxs.remove(tid);
         if released_locks == tnx.affected_cells.len() {
             self.response_with(EndResult::Success)
         } else {
