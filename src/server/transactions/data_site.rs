@@ -178,9 +178,11 @@ impl DataManager {
                 }
             }, |c|{});
         }
-        let mut lru = self.cell_lru.lock();
-        *lru.entry(id.clone()).or_insert(0) = get_time();
-        lru.get_refresh(id);
+        {
+            let mut lru = self.cell_lru.lock();
+            *lru.entry(id.clone()).or_insert(0) = get_time();
+            lru.get_refresh(id);
+        }
         match self.cells.get_mut(id) {
             Some(meta) => meta,
             _ => self.get_cell_meta(id)
