@@ -5,7 +5,8 @@ use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use itertools::Itertools;
+use linked_hash_map::LinkedHashMap;
+use parking_lot::Mutex;
 use futures;
 use super::*;
 
@@ -106,7 +107,9 @@ pub struct RollbackFailure {
 
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
+    cell_lru: Mutex<LinkedHashMap<Id, i64>>,
     tnxs: CHashMap<TransactionId, Transaction>,
+    tnxs_sorted: Mutex<BTreeSet<TransactionId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>
 }
@@ -132,7 +135,9 @@ impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
         Arc::new(DataManager {
             cells: CHashMap::new(),
+            cell_lru: Mutex::new(LinkedHashMap::new()),
             tnxs: CHashMap::new(),
+            tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
         })
@@ -146,6 +151,7 @@ impl DataManager {
     fn get_transaction(&self, tid: &TransactionId, server: &u64) -> WriteGuard<TransactionId, Transaction> {
         if !self.tnxs.contains_key(tid) {
             self.tnxs.upsert(tid.clone(), ||{
+                self.tnxs_sorted.lock().insert(tid.clone());
                 Transaction {
                     id: tid.clone(),
                     server: *server,
@@ -168,12 +174,15 @@ impl DataManager {
                     read: TransactionId::new(),
                     write: TransactionId::new(),
                     owner: None,
-                    waiting: BTreeSet::new()
+                    waiting: BTreeSet::new(),
                 }
             }, |c|{});
         }
+        let mut lru = self.cell_lru.lock();
+        *lru.entry(id.clone()).or_insert(0) = get_time();
+        lru.get_refresh(id);
         match self.cells.get_mut(id) {
-            Some(cell) => cell,
+            Some(meta) => meta,
             _ => self.get_cell_meta(id)
         }
     }
@@ -218,6 +227,41 @@ impl DataManager {
             }, |_| {});
         }
         Ok(self.managers.get(&server_id).unwrap().clone())
+    }
+    fn wipe_out_transaction(&self, tid: &TransactionId) {
+        self.tnxs.remove(tid);
+        self.tnxs_sorted.lock().remove(tid);
+    }
+    fn cell_meta_cleanup(&self) {
+        let mut cell_lru = self.cell_lru.lock();
+        let mut evicted_cells = Vec::new();
+        let oldest_transaction = {
+            let tnx_sorted = self.tnxs_sorted.lock();
+            tnx_sorted.iter()
+                .next()
+                .cloned()
+                .unwrap_or(
+                    self.server.tnx_peer.clock.to_clock()
+                )
+        };
+        let now = get_time();
+        for (cell_id, timestamp) in cell_lru.iter() {
+            if let Some(meta) = self.cells.get(cell_id) {
+                if meta.write < oldest_transaction &&
+                   meta.read < oldest_transaction &&
+                   now - timestamp > 5 * 60 * 1000 {
+                    self.cells.remove(cell_id);
+                    evicted_cells.push(*cell_id);
+                } else {
+                    break;
+                }
+            } else {
+                evicted_cells.push(*cell_id);
+            }
+        }
+        for evicted_cell in &evicted_cells {
+            cell_lru.remove(evicted_cell);
+        }
     }
 }
 
@@ -442,6 +486,7 @@ impl Service for DataManager {
                 cell_metas.push(meta)
             }
         }
+        let affected_cells = tnx.affected_cells.len();
         let mut released_locks = 0;
         let mut waiting_list: BTreeMap<u64, BTreeSet<TransactionId>> = BTreeMap::new();
         for mut meta in cell_metas {
@@ -461,7 +506,7 @@ impl Service for DataManager {
                 warn!("affected tnx does not own the cell");
             }
         }
-        let mut wake_up_futures = Vec::new();
+        let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
         for (server_id, transactions) in waiting_list { // inform waiting servers to go on
             if let Ok(client) = self.get_tnx_manager(server_id) {
                 wake_up_futures.push(client.go_ahead(&transactions));
@@ -470,10 +515,9 @@ impl Service for DataManager {
             }
         }
         futures::collect(wake_up_futures).wait();
-        // TODO: remove transaction and unuseful cell meta data
-
-        self.tnxs.remove(tid);
-        if released_locks == tnx.affected_cells.len() {
+        self.wipe_out_transaction(tid);
+        self.cell_meta_cleanup();
+        if released_locks == affected_cells {
             self.response_with(EndResult::Success)
         } else {
             self.response_with(EndResult::SomeLocksNotReleased)

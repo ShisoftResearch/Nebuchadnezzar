@@ -33,3 +33,4 @@ extern crate rand;
 extern crate futures;
 #[macro_use]
 extern crate itertools;
+extern crate linked_hash_map;
