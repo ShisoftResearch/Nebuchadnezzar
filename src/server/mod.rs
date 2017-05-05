@@ -8,7 +8,7 @@ use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::client::ObserverClient;
 use bifrost::conshash::weights::Weights;
-use bifrost::tcp::STANDALONE_ADDRESS_STRING;
+use bifrost::tcp::{STANDALONE_ADDRESS_STRING, STANDALONE_SERVER_ID};
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use ram::schema::{sm as schema_sm};
@@ -184,16 +184,16 @@ impl NebServer {
         );
         Ok(server)
     }
-    pub fn get_member_by_id(&self, id: &Id) -> io::Result<Arc<rpc::RPCClient>> {
+    pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
         match self.consh {
             Some(ref consh) => {
-                if let Some(hashed_address) = consh.get_server(id.higher) {
-                    self.member_pool.get(&hashed_address)
+                if let Some(server_id) = consh.get_server_id(id.higher) {
+                    Some(server_id)
                 } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "Cannot get server from consistent hashing"))
+                    None
                 }
             },
-            _ => self.member_pool.get(&STANDALONE_ADDRESS_STRING)
+            _ => Some(STANDALONE_SERVER_ID.clone())
         }
     }
     pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
