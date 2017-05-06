@@ -118,7 +118,7 @@ service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
 
     // two phase commit
-    rpc prepare(clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
+    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<CommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
@@ -296,16 +296,13 @@ impl Service for DataManager {
         tnx.last_activity = get_time();
         self.response_with(TransactionExecResult::Accepted(cell))
     }
-    fn prepare(&self, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
+    fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
         -> Result<DataSiteResponse<PrepareResult>, ()> {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         self.update_clock(clock);
-        let mut tnx = match self.tnxs.get_mut(tid) {
-            Some(tnx) => tnx,
-            _ => { return self.response_with(PrepareResult::TransactionNotExisted); }
-        };
+        let mut tnx = self.get_transaction(tid, server_id);
         if tnx.state != TransactionState::Started {
             return self.response_with(PrepareResult::TransactionStateError(tnx.state))
         }

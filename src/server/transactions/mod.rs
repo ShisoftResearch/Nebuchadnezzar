@@ -33,8 +33,8 @@ where A: Clone, E: Clone {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DataSiteResponse<T> {
-    payload: T,
-    clock: StandardVectorClock
+    pub payload: T,
+    pub clock: StandardVectorClock
 }
 
 impl <T> DataSiteResponse <T> {
@@ -45,5 +45,3 @@ impl <T> DataSiteResponse <T> {
         }
     }
 }
-
-pub type AwaitResponse = TransactionExecResult<Option<Cell>, WriteError>;

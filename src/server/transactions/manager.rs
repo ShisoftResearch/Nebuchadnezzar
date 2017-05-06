@@ -10,32 +10,29 @@ use super::*;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64;
 
-struct DataObject {
-    id: Id,
-    server: u64,
-    cell: Cell
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TMError {
+    TransactionNotFound,
+    CannotLocateCellServer,
+    NoResponseFromCellServer,
 }
 
-impl PartialEq for DataObject {
-    fn eq(&self, other: &DataObject) -> bool {
-        self.id == other.id
-    }
-    fn ne(&self, other: &DataObject) -> bool {
-        self.id != other.id
-    }
+struct DataObject {
+    server: u64,
+    cell: Cell
 }
 
 struct Transaction {
     start_time: i64, // use for timeout detecting
     id: TransactionId,
-    reads: BTreeMap<Id, DataObject>,
-    writes: BTreeMap<Id, DataObject>,
-    await_chan: (Sender<AwaitResponse>, Receiver<AwaitResponse>)
+    data: BTreeMap<Id, DataObject>,
+    writes: BTreeSet<Id>,
+    await_chan: (Sender<()>, Receiver<()>)
 }
 
 service! {
     rpc begin() -> TransactionId;
-    rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError>;
+    rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError> | TMError;
     rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError>;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError>;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError>;
@@ -64,20 +61,26 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
-    fn get_data_sites(&self, server_id: u64) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+    fn get_data_site(&self, server_id: u64) -> io::Result<(Arc<data_site::AsyncServiceClient>, u64)> {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id)?;
             self.data_sites.upsert(server_id, || {
                 data_site::AsyncServiceClient::new(DEFAULT_SERVICE_ID, &client)
             }, |_| {});
         }
-        Ok(self.data_sites .get(&server_id).unwrap().clone())
+        Ok((self.data_sites .get(&server_id).unwrap().clone(), server_id))
     }
-    fn get_data_sites_by_id(&self, id: &Id) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+    fn get_data_site_by_id(&self, id: &Id) -> io::Result<(Arc<data_site::AsyncServiceClient>, u64)> {
         match self.server.get_server_id_by_id(id) {
-            Some(id) => self.get_data_sites(id),
+            Some(id) => self.get_data_site(id),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "cannot find data site for this id"))
         }
+    }
+    fn get_clock(&self) -> StandardVectorClock {
+        self.server.tnx_peer.clock.to_clock()
+    }
+    fn merge_clock(&self, clock: &StandardVectorClock) {
+        self.server.tnx_peer.clock.merge_with(clock)
     }
 }
 
@@ -87,17 +90,57 @@ impl Service for TransactionManager {
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
             id: id.clone(),
-            reads: BTreeMap::new(),
-            writes: BTreeMap::new(),
+            data: BTreeMap::new(),
+            writes: BTreeSet::new(),
             await_chan: channel(1)
         });
         Ok(id)
     }
-    fn read(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<Cell, ReadError>, ()> {
-        if let Some(ref mut trans) = self.transactions.get_mut(&tid) {
-
+    fn read(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<Cell, ReadError>, TMError> {
+        let mut tnx = {
+            match self.transactions.get_mut(tid) {
+                Some(tnx) => tnx,
+                _ => {return Err(TMError::TransactionNotFound)}
+            }
+        };
+        if let Some(dataObj) = tnx.data.get(id) {
+            return Ok(TransactionExecResult::Accepted(dataObj.cell.clone())) // read from cache
         }
-        Err(())
+        let server = self.get_data_site_by_id(&id);
+        match server {
+            Ok((server, server_id)) => {
+                let self_server_id = self.server.server_id;
+                let read_response = server.read(
+                    &self_server_id,
+                    &self.get_clock(),
+                    tid, id
+                ).wait();
+                match read_response {
+                    Ok(dsr) => {
+                        let dsr = dsr.unwrap();
+                        self.merge_clock(&dsr.clock);
+                        match dsr.payload {
+                            TransactionExecResult::Accepted(ref cell) => {
+                                tnx.data.insert(*id, DataObject {
+                                    server: server_id,
+                                    cell: cell.clone()
+                                });
+                            },
+                            _ => {}
+                        }
+                        Ok(dsr.payload)
+                    },
+                    Err(e) => {
+                        error!("{:?}", e);
+                        Err(TMError::NoResponseFromCellServer)
+                    }
+                }
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
     }
     fn write(&self, tid: &TransactionId, id: &Id, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
         Err(())
