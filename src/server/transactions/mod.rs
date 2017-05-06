@@ -1,6 +1,7 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
 use ram::cell::{Cell, WriteError};
+use ram::types::{Id};
 use std::sync::Arc;
 use rand::Rng;
 
@@ -44,4 +45,51 @@ impl <T> DataSiteResponse <T> {
             clock: peer.clock.to_clock()
         }
     }
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
+enum TransactionState {
+    Started,
+    Aborted,
+    Committing,
+    Committed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum PrepareResult {
+    Wait,
+    Success,
+    TransactionNotExisted,
+    NotRealizable,
+    TransactionStateError(TransactionState)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CommitResult {
+    Success,
+    WriteError(Id, WriteError, Vec<RollbackFailure>),
+    CellChanged(Id, Vec<RollbackFailure>),
+    CheckFailed(CheckError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum AbortResult {
+    CheckFailed(CheckError),
+    Success(Option<Vec<RollbackFailure>>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RollbackFailure {
+    id: Id,
+    error: WriteError
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CheckError {
+    CellNumberDoesNotMatch(usize, usize),
+    TransactionNotExisted,
+    TransactionNotCommitted,
+    TransactionAlreadyCommitted,
+    TransactionAlreadyAborted,
+    TransactionCannotEnd,
 }

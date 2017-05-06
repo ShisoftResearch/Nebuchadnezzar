@@ -30,47 +30,6 @@ pub enum CommitOp {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum PrepareResult {
-    Wait,
-    Success,
-    TransactionNotExisted,
-    NotRealizable,
-    TransactionStateError(TransactionState)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum CommitResult {
-    Success,
-    WriteError(Id, WriteError, Vec<RollbackFailure>),
-    CellChanged(Id, Vec<RollbackFailure>),
-    CheckFailed(CheckError),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum CheckError {
-    CellNumberDoesNotMatch(usize, usize),
-    TransactionNotExisted,
-    TransactionNotCommitted,
-    TransactionAlreadyCommitted,
-    TransactionAlreadyAborted,
-    TransactionCannotEnd,
-}
-
-#[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
-enum TransactionState {
-    Started,
-    Aborted,
-    Committing,
-    Committed,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum AbortResult {
-    CheckFailed(CheckError),
-    Success(Option<Vec<RollbackFailure>>),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub enum EndResult {
     CheckFailed(CheckError),
     SomeLocksNotReleased,
@@ -98,11 +57,6 @@ impl CellHistory {
             current_version: current_ver,
         }
     }
-}
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RollbackFailure {
-    id: Id,
-    error: WriteError
 }
 
 pub struct DataManager {
