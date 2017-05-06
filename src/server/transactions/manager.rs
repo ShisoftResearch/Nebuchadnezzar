@@ -1,6 +1,6 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
-use chashmap::CHashMap;
+use chashmap::{CHashMap, WriteGuard};
 use std::collections::{BTreeMap, BTreeSet};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
@@ -33,7 +33,7 @@ struct Transaction {
 service! {
     rpc begin() -> TransactionId;
     rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError> | TMError;
-    rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError>;
+    rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError>;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError>;
 
@@ -82,6 +82,12 @@ impl TransactionManager {
     fn merge_clock(&self, clock: &StandardVectorClock) {
         self.server.tnx_peer.clock.merge_with(clock)
     }
+    fn get_transaction(&self, tid: &TransactionId) -> Result<WriteGuard<TransactionId, Transaction>, TMError> {
+        match self.transactions.get_mut(tid) {
+            Some(tnx) => Ok(tnx),
+            _ => {Err(TMError::TransactionNotFound)}
+        }
+    }
 }
 
 impl Service for TransactionManager {
@@ -97,12 +103,7 @@ impl Service for TransactionManager {
         Ok(id)
     }
     fn read(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<Cell, ReadError>, TMError> {
-        let mut tnx = {
-            match self.transactions.get_mut(tid) {
-                Some(tnx) => tnx,
-                _ => {return Err(TMError::TransactionNotFound)}
-            }
-        };
+        let mut tnx = self.get_transaction(tid)?;
         if let Some(dataObj) = tnx.data.get(id) {
             match dataObj.cell {
                 Some(ref cell) => {
@@ -155,8 +156,18 @@ impl Service for TransactionManager {
             }
         }
     }
-    fn write(&self, tid: &TransactionId, id: &Id, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
-        Err(())
+    fn write(&self, tid: &TransactionId, id: &Id, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
+        let mut tnx = self.get_transaction(tid)?;
+        match self.server.get_server_id_by_id(id) {
+            Some(server_id) => {
+                tnx.data.insert(*id, DataObject {
+                    server: server_id,
+                    cell: Some(cell.clone())
+                });
+                Ok(TransactionExecResult::Accepted(()))
+            },
+            None => Err(TMError::CannotLocateCellServer)
+        }
     }
     fn update(&self, tid: &TransactionId, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
         Err(())
