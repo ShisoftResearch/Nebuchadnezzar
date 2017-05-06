@@ -19,7 +19,8 @@ pub enum TMError {
 
 struct DataObject {
     server: u64,
-    cell: Option<Cell>
+    cell: Option<Cell>,
+    new: bool
 }
 
 struct Transaction {
@@ -34,7 +35,7 @@ service! {
     rpc begin() -> TransactionId;
     rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError> | TMError;
     rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
-    rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError>;
+    rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError>;
 
     rpc commit(tid: TransactionId);
@@ -131,13 +132,15 @@ impl Service for TransactionManager {
                             TransactionExecResult::Accepted(ref cell) => {
                                 tnx.data.insert(*id, DataObject {
                                     server: server_id,
-                                    cell: Some(cell.clone())
+                                    cell: Some(cell.clone()),
+                                    new: false
                                 });
                             },
                             TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
                                 tnx.data.insert(*id, DataObject {
                                     server: server_id,
-                                    cell: None
+                                    cell: None,
+                                    new: false
                                 });
                             }
                             _ => {}
@@ -160,17 +163,45 @@ impl Service for TransactionManager {
         let mut tnx = self.get_transaction(tid)?;
         match self.server.get_server_id_by_id(id) {
             Some(server_id) => {
-                tnx.data.insert(*id, DataObject {
-                    server: server_id,
-                    cell: Some(cell.clone())
-                });
-                Ok(TransactionExecResult::Accepted(()))
+                let have_cached_cell = tnx.data.contains_key(id);
+                if !have_cached_cell {
+                    tnx.data.insert(*id, DataObject {
+                        server: server_id,
+                        cell: Some(cell.clone()),
+                        new: true
+                    });
+                    Ok(TransactionExecResult::Accepted(()))
+                } else {
+                    let mut data_obj = tnx.data.get_mut(id).unwrap();
+                    if !data_obj.cell.is_none() {
+                        return Ok(TransactionExecResult::Error(WriteError::CellAlreadyExisted))
+                    }
+                    data_obj.cell = Some(cell.clone());
+                    Ok(TransactionExecResult::Accepted(()))
+                }
             },
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn update(&self, tid: &TransactionId, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, ()> {
-        Err(())
+    fn update(&self, tid: &TransactionId, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
+        let mut tnx = self.get_transaction(tid)?;
+        let id = cell.id();
+        match self.server.get_server_id_by_id(&id) {
+            Some(server_id) => {
+                let cell = cell.clone();
+                if tnx.data.contains_key(&id) {
+                    tnx.data.get_mut(&id).unwrap().cell = Some(cell)
+                } else {
+                    tnx.data.insert(id, DataObject {
+                        server: server_id,
+                        cell: Some(cell),
+                        new: false
+                    });
+                }
+                Ok(TransactionExecResult::Accepted(()))
+            },
+            None => Err(TMError::CannotLocateCellServer)
+        }
     }
     fn remove(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<(), WriteError>, ()> {
         Err(())
