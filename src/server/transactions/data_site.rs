@@ -275,6 +275,9 @@ impl Service for DataManager {
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
         let mut tnx = self.get_transaction(tid, server_id);
+        if tnx.state != TransactionState::Started {
+            return self.response_with(TransactionExecResult::Rejected)
+        }
         if read_too_late { // not realizable
             return self.response_with(TransactionExecResult::Rejected);
         }

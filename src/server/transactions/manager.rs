@@ -38,6 +38,7 @@ service! {
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError> | TMError;
 
+    rpc prepare(tid: TransactionId);
     rpc commit(tid: TransactionId);
     rpc abort(tid: TransactionId);
 
@@ -224,6 +225,9 @@ impl Service for TransactionManager {
             },
             None => Err(TMError::CannotLocateCellServer)
         }
+    }
+    fn prepare(&self, tid: &TransactionId) -> Result<(), ()> {
+        Err(())
     }
     fn commit(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
