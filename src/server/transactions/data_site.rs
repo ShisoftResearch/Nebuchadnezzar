@@ -7,7 +7,6 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
-use futures;
 use super::*;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_DATA_MANAGER_RPC_SERVICE) as u64;
@@ -470,7 +469,7 @@ impl Service for DataManager {
                 warn!("cannot inform server {} to continue it transactions", server_id);
             }
         }
-        futures::collect(wake_up_futures).wait();
+        future::join_all(wake_up_futures).wait();
         self.wipe_out_transaction(tid);
         self.cell_meta_cleanup();
         if released_locks == affected_cells {

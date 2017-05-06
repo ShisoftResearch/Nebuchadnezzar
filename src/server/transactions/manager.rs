@@ -1,7 +1,7 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, WriteGuard};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
@@ -15,8 +15,10 @@ pub enum TMError {
     TransactionNotFound,
     CannotLocateCellServer,
     NoResponseFromCellServer,
+    AssertionError
 }
 
+#[derive(Clone)]
 struct DataObject {
     server: u64,
     cell: Option<Cell>,
@@ -63,18 +65,21 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
-    fn get_data_site(&self, server_id: u64) -> io::Result<(Arc<data_site::AsyncServiceClient>, u64)> {
+    fn get_data_site(&self, server_id: u64) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id)?;
             self.data_sites.upsert(server_id, || {
                 data_site::AsyncServiceClient::new(DEFAULT_SERVICE_ID, &client)
             }, |_| {});
         }
-        Ok((self.data_sites .get(&server_id).unwrap().clone(), server_id))
+        Ok(self.data_sites .get(&server_id).unwrap().clone())
     }
-    fn get_data_site_by_id(&self, id: &Id) -> io::Result<(Arc<data_site::AsyncServiceClient>, u64)> {
+    fn get_data_site_by_id(&self, id: &Id) -> io::Result<(u64, Arc<data_site::AsyncServiceClient>)> {
         match self.server.get_server_id_by_id(id) {
-            Some(id) => self.get_data_site(id),
+            Some(id) => match self.get_data_site(id) {
+                Ok(site) => Ok((id, site.clone())),
+                Err(e) => Err(e)
+            },
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "cannot find data site for this id"))
         }
     }
@@ -118,7 +123,7 @@ impl Service for TransactionManager {
         }
         let server = self.get_data_site_by_id(&id);
         match server {
-            Ok((server, server_id)) => {
+            Ok((server_id, server)) => {
                 let self_server_id = self.server.server_id;
                 let read_response = server.read(
                     &self_server_id,
@@ -134,16 +139,17 @@ impl Service for TransactionManager {
                                 tnx.data.insert(*id, DataObject {
                                     server: server_id,
                                     cell: Some(cell.clone()),
-                                    new: false
+                                    new: false,
                                 });
                             },
                             TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
                                 tnx.data.insert(*id, DataObject {
                                     server: server_id,
                                     cell: None,
-                                    new: false
+                                    new: false,
                                 });
                             }
+                            TransactionExecResult::Wait => {} // TODO: deal with wait
                             _ => {}
                         }
                         Ok(dsr.payload)
@@ -169,7 +175,7 @@ impl Service for TransactionManager {
                     tnx.data.insert(*id, DataObject {
                         server: server_id,
                         cell: Some(cell.clone()),
-                        new: true
+                        new: true,
                     });
                     Ok(TransactionExecResult::Accepted(()))
                 } else {
@@ -196,7 +202,7 @@ impl Service for TransactionManager {
                     tnx.data.insert(id, DataObject {
                         server: server_id,
                         cell: Some(cell),
-                        new: false
+                        new: false,
                     });
                 }
                 Ok(TransactionExecResult::Accepted(()))
@@ -218,7 +224,7 @@ impl Service for TransactionManager {
                     tnx.data.insert(*id, DataObject {
                         server: server_id,
                         cell: None,
-                        new: false
+                        new: false,
                     });
                 }
                 Ok(TransactionExecResult::Accepted(()))
@@ -228,6 +234,48 @@ impl Service for TransactionManager {
     }
     fn prepare(&self, tid: &TransactionId) -> Result<PrepareResult, TMError> {
         let mut tnx = self.get_transaction(tid)?;
+        let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
+        for (id, data_obj) in &tnx.data {
+            changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
+        }
+        let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
+            (*server_id, self.get_data_site(*server_id))
+        }).collect();
+        if data_sites.iter().any(|(_, data_site)| { data_site.is_err() }) {
+            return Err(TMError::CannotLocateCellServer)
+        }
+        let data_sites: HashMap<u64, _> = data_sites.into_iter().map(
+            |(server_id, data_site)| {
+                (server_id, data_site.unwrap())
+            }
+        ).collect();
+        let self_server_id = self.server.server_id;
+        let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
+            let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
+            let data_site = data_sites.get(&server).unwrap();
+            data_site.prepare(&self_server_id, &self.get_clock(), tid, &cell_ids)
+        }).collect();
+        let prepare_result = future::join_all(prepare_futures).wait();
+        match prepare_result {
+            Err(e) => {return Ok(PrepareResult::NetworkError);},
+            Ok(responses) => {
+                for prepare_res in responses {
+                    if let Ok(prepare_res) = prepare_res {
+                        self.merge_clock(&prepare_res.clock);
+                        let payload = prepare_res.payload;
+                        match payload {
+                            PrepareResult::Success => {},
+                            PrepareResult::Wait => {}, // TODO: deal with wait
+                            _ => {
+                                return Ok(payload) // something went wrong
+                            }
+                        }
+                    } else {
+                        return Err(TMError::AssertionError);
+                    }
+                }
+            }
+        }
         Err(TMError::CannotLocateCellServer)
     }
     fn commit(&self, tid: &TransactionId) -> Result<(), ()> {

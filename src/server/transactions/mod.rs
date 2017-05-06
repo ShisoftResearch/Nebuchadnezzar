@@ -1,5 +1,6 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
+use bifrost::rpc::RPCError;
 use ram::cell::{Cell, WriteError};
 use ram::types::{Id};
 use std::sync::Arc;
@@ -61,7 +62,8 @@ pub enum PrepareResult {
     Success,
     TransactionNotExisted,
     NotRealizable,
-    TransactionStateError(TransactionState)
+    TransactionStateError(TransactionState),
+    NetworkError
 }
 
 #[derive(Debug, Serialize, Deserialize)]
