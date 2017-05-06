@@ -36,7 +36,7 @@ service! {
     rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError> | TMError;
     rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
-    rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError>;
+    rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError> | TMError;
 
     rpc commit(tid: TransactionId);
     rpc abort(tid: TransactionId);
@@ -203,8 +203,27 @@ impl Service for TransactionManager {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn remove(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<(), WriteError>, ()> {
-        Err(())
+    fn remove(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<(), WriteError>, TMError> {
+        let mut tnx = self.get_transaction(tid)?;
+        match self.server.get_server_id_by_id(&id) {
+            Some(server_id) => {
+                if tnx.data.contains_key(&id) {
+                    let data_obj = tnx.data.get_mut(&id).unwrap();
+                    if data_obj.cell.is_none() {
+                        return Ok(TransactionExecResult::Error(WriteError::CellDoesNotExisted))
+                    }
+                    data_obj.cell = None;
+                } else {
+                    tnx.data.insert(*id, DataObject {
+                        server: server_id,
+                        cell: None,
+                        new: false
+                    });
+                }
+                Ok(TransactionExecResult::Accepted(()))
+            },
+            None => Err(TMError::CannotLocateCellServer)
+        }
     }
     fn commit(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
