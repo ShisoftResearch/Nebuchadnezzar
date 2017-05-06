@@ -19,7 +19,7 @@ pub enum TMError {
 
 struct DataObject {
     server: u64,
-    cell: Cell
+    cell: Option<Cell>
 }
 
 struct Transaction {
@@ -104,7 +104,14 @@ impl Service for TransactionManager {
             }
         };
         if let Some(dataObj) = tnx.data.get(id) {
-            return Ok(TransactionExecResult::Accepted(dataObj.cell.clone())) // read from cache
+            match dataObj.cell {
+                Some(ref cell) => {
+                    return Ok(TransactionExecResult::Accepted(cell.clone())) // read from cache
+                },
+                None => {
+                   return Ok(TransactionExecResult::Error(ReadError::CellDoesNotExisted))
+                }
+            }
         }
         let server = self.get_data_site_by_id(&id);
         match server {
@@ -123,9 +130,15 @@ impl Service for TransactionManager {
                             TransactionExecResult::Accepted(ref cell) => {
                                 tnx.data.insert(*id, DataObject {
                                     server: server_id,
-                                    cell: cell.clone()
+                                    cell: Some(cell.clone())
                                 });
                             },
+                            TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
+                                tnx.data.insert(*id, DataObject {
+                                    server: server_id,
+                                    cell: None
+                                });
+                            }
                             _ => {}
                         }
                         Ok(dsr.payload)
