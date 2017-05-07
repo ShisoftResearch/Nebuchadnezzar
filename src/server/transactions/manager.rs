@@ -133,20 +133,27 @@ impl TransactionManager {
         let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
         let res_future = data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), tid, &cell_ids)
-            .map_err(|prepare_res| -> TMError {
+            .map_err(|_| -> TMError {
                 TMError::NoResponseFromCellServer
             })
             .map(move |prepare_res| -> PrepareResult {
                 let prepare_res = prepare_res.unwrap();
-                let payload = prepare_res.payload;
                 server.txn_peer.clock.merge_with(&prepare_res.clock);
-                match payload {
-                    PrepareResult::Wait => {
-                        return payload
+                prepare_res.payload
+            })
+            .then(|prepare_payload| {
+                match prepare_payload {
+                    Ok(payload) => {
+                        match payload {
+                            PrepareResult::Wait => {
+                                return Ok(payload)
+                            },
+                            _ => {
+                                return Ok(payload)
+                            }
+                        }
                     },
-                    _ => {
-                        return payload
-                    }
+                    Err(e) => Err(e)
                 }
             });
         Box::new(res_future)
@@ -155,9 +162,7 @@ impl TransactionManager {
         let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap();
             TransactionManager::site_prepare(
-                self.server.clone(),
-                tid, objs,
-                data_site
+                self.server.clone(), tid, objs, data_site
             )
         }).collect();
         let prepare_result = future::join_all(prepare_futures).wait();
