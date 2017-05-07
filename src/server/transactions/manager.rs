@@ -5,13 +5,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use futures::sync::mpsc::{Sender, Receiver, channel};
+use parking_lot::Mutex;
+use std::sync::mpsc::{channel, Sender, Receiver};
 use futures;
 use super::*;
 
-pub type TransactionGuard <'a> = WriteGuard<'a, TransactionId, Transaction>;
-pub type ChangedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>;
-pub type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
+type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
+type TxnGuard<'a> = WriteGuard<'a, TransactionId, Transaction>;
+type ChangedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>;
+type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64;
 
@@ -35,7 +37,6 @@ struct Transaction {
     id: TransactionId,
     data: BTreeMap<Id, DataObject>,
     writes: BTreeSet<Id>,
-    await_chan: (Sender<()>, Receiver<()>)
 }
 
 service! {
@@ -97,13 +98,13 @@ impl TransactionManager {
     fn merge_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock)
     }
-    fn get_transaction(&self, tid: &TransactionId) -> Result<TransactionGuard, TMError> {
+    fn get_transaction(&self, tid: &TransactionId) -> Result<TxnGuard, TMError> {
         match self.transactions.get_mut(tid) {
             Some(tnx) => Ok(tnx),
             _ => {Err(TMError::TransactionNotFound)}
         }
     }
-    fn changed_objs(&self, txn: &TransactionGuard) -> ChangedObjs {
+    fn changed_objs(&self, txn: &TxnGuard) -> ChangedObjs {
         let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
         for (id, data_obj) in &txn.data {
             changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
@@ -176,8 +177,7 @@ impl Service for TransactionManager {
             start_time: get_time(),
             id: id.clone(),
             data: BTreeMap::new(),
-            writes: BTreeSet::new(),
-            await_chan: channel(1)
+            writes: BTreeSet::new()
         });
         Ok(id)
     }
@@ -318,5 +318,52 @@ impl Service for TransactionManager {
     }
     fn go_ahead(&self, tid: &BTreeSet<TransactionId>) -> Result<(), ()> {
         Err(())
+    }
+}
+
+
+
+struct AwaitingServer {
+    sender: Sender<()>,
+    receiver: Receiver<()>,
+}
+
+impl AwaitingServer {
+    pub fn new() -> AwaitingServer {
+        let (sender, receiver) = channel();
+        AwaitingServer {
+            sender: sender,
+            receiver: receiver
+        }
+    }
+    pub fn send(&self) {
+        self.sender.send(());
+    }
+    pub fn wait(&self) {
+        self.receiver.recv();
+    }
+}
+
+struct AwaitManager {
+    channels: Mutex<HashMap<TransactionId, TxnAwaits>>
+}
+
+impl AwaitManager {
+    pub fn new() -> AwaitManager {
+        AwaitManager {
+            channels: Mutex::new(HashMap::new())
+        }
+    }
+    pub fn get_txn(&self, tid: &TransactionId) -> TxnAwaits {
+        self.channels.lock()
+            .entry(tid.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
+    }
+    pub fn server_from_awaits(awaits: TxnAwaits, server_id: u64) -> Arc<AwaitingServer> {
+        awaits.lock()
+            .entry(server_id)
+            .or_insert_with(|| Arc::new(AwaitingServer::new()))
+            .clone()
     }
 }
