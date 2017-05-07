@@ -57,6 +57,7 @@ pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: CHashMap<TransactionId, Transaction>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
+    await_manager: AwaitManager
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
@@ -65,7 +66,8 @@ impl TransactionManager {
         Arc::new(TransactionManager {
             server: server.clone(),
             transactions: CHashMap::new(),
-            data_sites: CHashMap::new()
+            data_sites: CHashMap::new(),
+            await_manager: AwaitManager::new()
         })
     }
 }
@@ -324,23 +326,23 @@ impl Service for TransactionManager {
 
 
 struct AwaitingServer {
-    sender: Sender<()>,
-    receiver: Receiver<()>,
+    sender: Mutex<Sender<()>>,
+    receiver: Mutex<Receiver<()>>,
 }
 
 impl AwaitingServer {
     pub fn new() -> AwaitingServer {
         let (sender, receiver) = channel();
         AwaitingServer {
-            sender: sender,
-            receiver: receiver
+            sender: Mutex::new(sender),
+            receiver: Mutex::new(receiver)
         }
     }
     pub fn send(&self) {
-        self.sender.send(());
+        self.sender.lock().send(());
     }
     pub fn wait(&self) {
-        self.receiver.recv();
+        self.receiver.lock().recv();
     }
 }
 
