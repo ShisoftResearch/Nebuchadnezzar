@@ -127,29 +127,31 @@ impl TransactionManager {
         ).collect())
     }
     fn site_prepare(
-        server: Arc<NebServer>,
-        tid: &TransactionId,
-        objs: &Vec<(Id, DataObject)>,
-        data_site: &Arc<data_site::AsyncServiceClient>
+        server: Arc<NebServer>, awaits: TxnAwaits, tid: TransactionId, objs: Vec<(Id, DataObject)>,
+        data_site: Arc<data_site::AsyncServiceClient>
     ) -> Box<futures::Future<Item = PrepareResult, Error = TMError>> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
+        let server_for_clock = server.clone();
         let res_future = data_site
-            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), tid, &cell_ids)
+            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
             .map_err(|_| -> TMError {
                 TMError::NoResponseFromCellServer
             })
             .map(move |prepare_res| -> PrepareResult {
                 let prepare_res = prepare_res.unwrap();
-                server.txn_peer.clock.merge_with(&prepare_res.clock);
+                server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
                 prepare_res.payload
             })
-            .then(|prepare_payload| {
+            .then(move |prepare_payload| {
                 match prepare_payload {
                     Ok(payload) => {
                         match payload {
                             PrepareResult::Wait => {
-                                return Ok(payload)
+                                AwaitManager::txn_wait(&awaits, data_site.server_id);
+                                return TransactionManager::site_prepare(
+                                    server, awaits, tid, objs, data_site
+                                ).wait() // after waiting, retry
                             },
                             _ => {
                                 return Ok(payload)
@@ -161,14 +163,24 @@ impl TransactionManager {
             });
         Box::new(res_future)
     }
-    fn sites_prepare(&self, tid: &TransactionId, txn: Transaction, changed_objs: &ChangedObjs, data_sites: DataSiteClients) {
-        let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
-            let data_site = data_sites.get(&server).unwrap();
+    fn sites_prepare(&self, tid: &TransactionId, changed_objs: ChangedObjs, data_sites: DataSiteClients)
+        -> Result<PrepareResult, TMError> {
+        let prepare_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
+            let data_site = data_sites.get(&server).unwrap().clone();
             TransactionManager::site_prepare(
-                self.server.clone(), tid, objs, data_site
+                self.server.clone(),
+                self.await_manager.get_txn(tid),
+                tid.clone(), objs, data_site
             )
         }).collect();
-        let prepare_result = future::join_all(prepare_futures).wait();
+        let prepare_results = future::join_all(prepare_futures).wait()?;
+        for result in prepare_results {
+            match result {
+                PrepareResult::Success => {},
+                _ => {return Ok(result)}
+            }
+        }
+        Ok(PrepareResult::Success)
     }
 }
 
@@ -310,7 +322,7 @@ impl Service for TransactionManager {
         let mut txn = self.get_transaction(tid)?;
         let mut changed_objs = self.changed_objs(&txn);
         let data_sites = self.data_sites(&changed_objs)?;
-        Err(TMError::CannotLocateCellServer)
+        self.sites_prepare(tid, changed_objs, data_sites)
     }
     fn commit(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
@@ -362,10 +374,16 @@ impl AwaitManager {
             .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
             .clone()
     }
-    pub fn server_from_awaits(awaits: TxnAwaits, server_id: u64) -> Arc<AwaitingServer> {
+    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<AwaitingServer> {
         awaits.lock()
             .entry(server_id)
             .or_insert_with(|| Arc::new(AwaitingServer::new()))
             .clone()
+    }
+    pub fn txn_send(awaits: &TxnAwaits, server_id: u64) {
+        AwaitManager::server_from_txn_awaits(awaits, server_id).send();
+    }
+    pub fn txn_wait(awaits: &TxnAwaits, server_id: u64) {
+        AwaitManager::server_from_txn_awaits(awaits, server_id).wait();
     }
 }
