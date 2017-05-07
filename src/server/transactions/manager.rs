@@ -8,6 +8,8 @@ use server::NebServer;
 use futures::sync::mpsc::{Sender, Receiver, channel};
 use super::*;
 
+pub type TransactionGuard <'a> = WriteGuard<'a, TransactionId, Transaction>;
+
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,11 +91,18 @@ impl TransactionManager {
     fn merge_clock(&self, clock: &StandardVectorClock) {
         self.server.tnx_peer.clock.merge_with(clock)
     }
-    fn get_transaction(&self, tid: &TransactionId) -> Result<WriteGuard<TransactionId, Transaction>, TMError> {
+    fn get_transaction(&self, tid: &TransactionId) -> Result<TransactionGuard, TMError> {
         match self.transactions.get_mut(tid) {
             Some(tnx) => Ok(tnx),
             _ => {Err(TMError::TransactionNotFound)}
         }
+    }
+    fn changed_objs(&self, txn: TransactionGuard) -> BTreeMap<u64, Vec<(Id, DataObject)>> {
+        let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
+        for (id, data_obj) in &txn.data {
+            changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
+        }
+        changed_objs
     }
 }
 
@@ -110,8 +119,8 @@ impl Service for TransactionManager {
         Ok(id)
     }
     fn read(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<Cell, ReadError>, TMError> {
-        let mut tnx = self.get_transaction(tid)?;
-        if let Some(dataObj) = tnx.data.get(id) {
+        let mut txn = self.get_transaction(tid)?;
+        if let Some(dataObj) = txn.data.get(id) {
             match dataObj.cell {
                 Some(ref cell) => {
                     return Ok(TransactionExecResult::Accepted(cell.clone())) // read from cache
@@ -136,14 +145,14 @@ impl Service for TransactionManager {
                         self.merge_clock(&dsr.clock);
                         match dsr.payload {
                             TransactionExecResult::Accepted(ref cell) => {
-                                tnx.data.insert(*id, DataObject {
+                                txn.data.insert(*id, DataObject {
                                     server: server_id,
                                     cell: Some(cell.clone()),
                                     new: false,
                                 });
                             },
                             TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
-                                tnx.data.insert(*id, DataObject {
+                                txn.data.insert(*id, DataObject {
                                     server: server_id,
                                     cell: None,
                                     new: false,
@@ -167,19 +176,19 @@ impl Service for TransactionManager {
         }
     }
     fn write(&self, tid: &TransactionId, id: &Id, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
-        let mut tnx = self.get_transaction(tid)?;
+        let mut txn = self.get_transaction(tid)?;
         match self.server.get_server_id_by_id(id) {
             Some(server_id) => {
-                let have_cached_cell = tnx.data.contains_key(id);
+                let have_cached_cell = txn.data.contains_key(id);
                 if !have_cached_cell {
-                    tnx.data.insert(*id, DataObject {
+                    txn.data.insert(*id, DataObject {
                         server: server_id,
                         cell: Some(cell.clone()),
                         new: true,
                     });
                     Ok(TransactionExecResult::Accepted(()))
                 } else {
-                    let mut data_obj = tnx.data.get_mut(id).unwrap();
+                    let mut data_obj = txn.data.get_mut(id).unwrap();
                     if !data_obj.cell.is_none() {
                         return Ok(TransactionExecResult::Error(WriteError::CellAlreadyExisted))
                     }
@@ -191,15 +200,15 @@ impl Service for TransactionManager {
         }
     }
     fn update(&self, tid: &TransactionId, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
-        let mut tnx = self.get_transaction(tid)?;
+        let mut txn = self.get_transaction(tid)?;
         let id = cell.id();
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
                 let cell = cell.clone();
-                if tnx.data.contains_key(&id) {
-                    tnx.data.get_mut(&id).unwrap().cell = Some(cell)
+                if txn.data.contains_key(&id) {
+                    txn.data.get_mut(&id).unwrap().cell = Some(cell)
                 } else {
-                    tnx.data.insert(id, DataObject {
+                    txn.data.insert(id, DataObject {
                         server: server_id,
                         cell: Some(cell),
                         new: false,
@@ -211,17 +220,17 @@ impl Service for TransactionManager {
         }
     }
     fn remove(&self, tid: &TransactionId, id: &Id) -> Result<TransactionExecResult<(), WriteError>, TMError> {
-        let mut tnx = self.get_transaction(tid)?;
+        let mut txn = self.get_transaction(tid)?;
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
-                if tnx.data.contains_key(&id) {
-                    let data_obj = tnx.data.get_mut(&id).unwrap();
+                if txn.data.contains_key(&id) {
+                    let data_obj = txn.data.get_mut(&id).unwrap();
                     if data_obj.cell.is_none() {
                         return Ok(TransactionExecResult::Error(WriteError::CellDoesNotExisted))
                     }
                     data_obj.cell = None;
                 } else {
-                    tnx.data.insert(*id, DataObject {
+                    txn.data.insert(*id, DataObject {
                         server: server_id,
                         cell: None,
                         new: false,
@@ -233,11 +242,8 @@ impl Service for TransactionManager {
         }
     }
     fn prepare(&self, tid: &TransactionId) -> Result<PrepareResult, TMError> {
-        let mut tnx = self.get_transaction(tid)?;
-        let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
-        for (id, data_obj) in &tnx.data {
-            changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
-        }
+        let mut txn = self.get_transaction(tid)?;
+        let mut changed_objs = self.changed_objs(txn);
         let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
             (*server_id, self.get_data_site(*server_id))
         }).collect();
