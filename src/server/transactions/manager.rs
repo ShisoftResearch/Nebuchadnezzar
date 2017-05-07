@@ -6,9 +6,12 @@ use ram::types::{Id};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use futures::sync::mpsc::{Sender, Receiver, channel};
+use futures;
 use super::*;
 
 pub type TransactionGuard <'a> = WriteGuard<'a, TransactionId, Transaction>;
+pub type ChangedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>;
+pub type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64;
 
@@ -67,6 +70,9 @@ impl TransactionManager {
 }
 
 impl TransactionManager {
+    fn server_id(&self) -> u64 {
+        self.server.server_id
+    }
     fn get_data_site(&self, server_id: u64) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id)?;
@@ -86,10 +92,10 @@ impl TransactionManager {
         }
     }
     fn get_clock(&self) -> StandardVectorClock {
-        self.server.tnx_peer.clock.to_clock()
+        self.server.txn_peer.clock.to_clock()
     }
     fn merge_clock(&self, clock: &StandardVectorClock) {
-        self.server.tnx_peer.clock.merge_with(clock)
+        self.server.txn_peer.clock.merge_with(clock)
     }
     fn get_transaction(&self, tid: &TransactionId) -> Result<TransactionGuard, TMError> {
         match self.transactions.get_mut(tid) {
@@ -97,15 +103,14 @@ impl TransactionManager {
             _ => {Err(TMError::TransactionNotFound)}
         }
     }
-    fn changed_objs(&self, txn: &TransactionGuard) -> BTreeMap<u64, Vec<(Id, DataObject)>> {
+    fn changed_objs(&self, txn: &TransactionGuard) -> ChangedObjs {
         let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
         for (id, data_obj) in &txn.data {
             changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
         }
         changed_objs
     }
-    fn data_sites(&self, changed_objs: &BTreeMap<u64, Vec<(Id, DataObject)>>)
-        -> Result<HashMap<u64, Arc<data_site::AsyncServiceClient>>, TMError> {
+    fn data_sites(&self, changed_objs: &ChangedObjs) -> Result<DataSiteClients, TMError>  {
         let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
             (*server_id, self.get_data_site(*server_id))
         }).collect();
@@ -118,11 +123,50 @@ impl TransactionManager {
             }
         ).collect())
     }
+    fn site_prepare(
+        server: Arc<NebServer>,
+        tid: &TransactionId,
+        objs: &Vec<(Id, DataObject)>,
+        data_site: &Arc<data_site::AsyncServiceClient>
+    ) -> Box<futures::Future<Item = PrepareResult, Error = TMError>> {
+        let self_server_id = server.server_id;
+        let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
+        let res_future = data_site
+            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), tid, &cell_ids)
+            .map_err(|prepare_res| -> TMError {
+                TMError::NoResponseFromCellServer
+            })
+            .map(move |prepare_res| -> PrepareResult {
+                let prepare_res = prepare_res.unwrap();
+                let payload = prepare_res.payload;
+                server.txn_peer.clock.merge_with(&prepare_res.clock);
+                match payload {
+                    PrepareResult::Wait => {
+                        return payload
+                    },
+                    _ => {
+                        return payload
+                    }
+                }
+            });
+        Box::new(res_future)
+    }
+    fn sites_prepare(&self, tid: &TransactionId, txn: Transaction, changed_objs: &ChangedObjs, data_sites: DataSiteClients) {
+        let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
+            let data_site = data_sites.get(&server).unwrap();
+            TransactionManager::site_prepare(
+                self.server.clone(),
+                tid, objs,
+                data_site
+            )
+        }).collect();
+        let prepare_result = future::join_all(prepare_futures).wait();
+    }
 }
 
 impl Service for TransactionManager {
     fn begin(&self) -> Result<TransactionId, ()> {
-        let id = self.server.tnx_peer.clock.inc();
+        let id = self.server.txn_peer.clock.inc();
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
             id: id.clone(),
@@ -259,33 +303,6 @@ impl Service for TransactionManager {
         let mut txn = self.get_transaction(tid)?;
         let mut changed_objs = self.changed_objs(&txn);
         let data_sites = self.data_sites(&changed_objs)?;
-        let self_server_id = self.server.server_id;
-        let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
-            let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
-            let data_site = data_sites.get(&server).unwrap();
-            data_site.prepare(&self_server_id, &self.get_clock(), tid, &cell_ids)
-        }).collect();
-        let prepare_result = future::join_all(prepare_futures).wait();
-        match prepare_result {
-            Err(e) => {return Ok(PrepareResult::NetworkError);},
-            Ok(responses) => {
-                for prepare_res in responses {
-                    if let Ok(prepare_res) = prepare_res {
-                        self.merge_clock(&prepare_res.clock);
-                        let payload = prepare_res.payload;
-                        match payload {
-                            PrepareResult::Success => {},
-                            PrepareResult::Wait => {}, // TODO: deal with wait
-                            _ => {
-                                return Ok(payload) // something went wrong
-                            }
-                        }
-                    } else {
-                        return Err(TMError::AssertionError);
-                    }
-                }
-            }
-        }
         Err(TMError::CannotLocateCellServer)
     }
     fn commit(&self, tid: &TransactionId) -> Result<(), ()> {

@@ -96,10 +96,10 @@ impl DataManager {
         })
     }
     fn local_clock(&self) -> StandardVectorClock {
-        self.server.tnx_peer.clock.to_clock()
+        self.server.txn_peer.clock.to_clock()
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
-        self.server.tnx_peer.clock.merge_with(clock);
+        self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TransactionId, server: &u64) -> WriteGuard<TransactionId, Transaction> {
         if !self.tnxs.contains_key(tid) {
@@ -143,7 +143,7 @@ impl DataManager {
     }
     fn response_with<T>(&self, data: T)
         -> Result<DataSiteResponse<T>, ()>{
-        Ok(DataSiteResponse::new(&self.server.tnx_peer, data))
+        Ok(DataSiteResponse::new(&self.server.txn_peer, data))
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures: Vec<RollbackFailure> = Vec::new();
@@ -196,7 +196,7 @@ impl DataManager {
                 .next()
                 .cloned()
                 .unwrap_or(
-                    self.server.tnx_peer.clock.to_clock()
+                    self.server.txn_peer.clock.to_clock()
                 )
         };
         let now = get_time();

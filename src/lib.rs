@@ -6,6 +6,7 @@
 #![feature(core_intrinsics)]
 #![feature(btree_range, collections_bound)]
 #![plugin(bifrost_plugins)]
+#![feature(conservative_impl_trait)]
 
 extern crate libc;
 extern crate uuid;

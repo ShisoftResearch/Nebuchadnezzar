@@ -53,7 +53,7 @@ pub struct NebServer {
     pub rpc: Arc<rpc::Server>,
     pub consh: Option<Arc<ConsistentHashing>>,
     pub member_pool: rpc::ClientPool,
-    pub tnx_peer: transactions::Peer,
+    pub txn_peer: transactions::Peer,
     pub server_id: u64
 }
 
@@ -169,7 +169,7 @@ impl NebServer {
             rpc: rpc_server.clone(),
             consh: conshasing,
             member_pool: rpc::ClientPool::new(),
-            tnx_peer: transactions::Peer::new(server_addr),
+            txn_peer: transactions::Peer::new(server_addr),
             server_id: rpc_server.server_id
         });
         rpc_server.register_service(
