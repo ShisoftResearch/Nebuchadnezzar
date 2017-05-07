@@ -97,12 +97,26 @@ impl TransactionManager {
             _ => {Err(TMError::TransactionNotFound)}
         }
     }
-    fn changed_objs(&self, txn: TransactionGuard) -> BTreeMap<u64, Vec<(Id, DataObject)>> {
+    fn changed_objs(&self, txn: &TransactionGuard) -> BTreeMap<u64, Vec<(Id, DataObject)>> {
         let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
         for (id, data_obj) in &txn.data {
             changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
         }
         changed_objs
+    }
+    fn data_sites(&self, changed_objs: &BTreeMap<u64, Vec<(Id, DataObject)>>)
+        -> Result<HashMap<u64, Arc<data_site::AsyncServiceClient>>, TMError> {
+        let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
+            (*server_id, self.get_data_site(*server_id))
+        }).collect();
+        if data_sites.iter().any(|(_, data_site)| { data_site.is_err() }) {
+            return Err(TMError::CannotLocateCellServer)
+        }
+        Ok(data_sites.into_iter().map(
+            |(server_id, data_site)| {
+                (server_id, data_site.unwrap())
+            }
+        ).collect())
     }
 }
 
@@ -243,18 +257,8 @@ impl Service for TransactionManager {
     }
     fn prepare(&self, tid: &TransactionId) -> Result<PrepareResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
-        let mut changed_objs = self.changed_objs(txn);
-        let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
-            (*server_id, self.get_data_site(*server_id))
-        }).collect();
-        if data_sites.iter().any(|(_, data_site)| { data_site.is_err() }) {
-            return Err(TMError::CannotLocateCellServer)
-        }
-        let data_sites: HashMap<u64, _> = data_sites.into_iter().map(
-            |(server_id, data_site)| {
-                (server_id, data_site.unwrap())
-            }
-        ).collect();
+        let mut changed_objs = self.changed_objs(&txn);
+        let data_sites = self.data_sites(&changed_objs)?;
         let self_server_id = self.server.server_id;
         let prepare_futures: Vec<_> = changed_objs.iter().map(|(server, objs)| {
             let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
