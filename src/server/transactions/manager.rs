@@ -106,6 +106,49 @@ impl TransactionManager {
             _ => {Err(TMError::TransactionNotFound)}
         }
     }
+    fn read_from_site(
+        &self, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
+        tid: &TransactionId, id: &Id, mut txn: TxnGuard, await: TxnAwaits
+    ) -> Result<TransactionExecResult<Cell, ReadError>, TMError> {
+        let self_server_id = self.server.server_id;
+        let read_response = server.read(
+            &self_server_id,
+            &self.get_clock(),
+            tid, id
+        ).wait();
+        match read_response {
+            Ok(dsr) => {
+                let dsr = dsr.unwrap();
+                self.merge_clock(&dsr.clock);
+                match dsr.payload {
+                    TransactionExecResult::Accepted(ref cell) => {
+                        txn.data.insert(*id, DataObject {
+                            server: server_id,
+                            cell: Some(cell.clone()),
+                            new: false,
+                        });
+                    },
+                    TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
+                        txn.data.insert(*id, DataObject {
+                            server: server_id,
+                            cell: None,
+                            new: false,
+                        });
+                    }
+                    TransactionExecResult::Wait => {
+                        AwaitManager::txn_wait(&await, server_id);
+                        self.read_from_site(server_id, server, tid, id, txn, await);
+                    }
+                    _ => {}
+                }
+                Ok(dsr.payload)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::RPCErrorFromCellServer)
+            }
+        }
+    }
     fn generate_changed_objs(&self, txn: &mut TxnGuard) {
         let mut changed_objs = ChangedObjs::new();
         for (id, data_obj) in &txn.data {
@@ -245,41 +288,8 @@ impl Service for TransactionManager {
         let server = self.get_data_site_by_id(&id);
         match server {
             Ok((server_id, server)) => {
-                let self_server_id = self.server.server_id;
-                let read_response = server.read(
-                    &self_server_id,
-                    &self.get_clock(),
-                    tid, id
-                ).wait();
-                match read_response {
-                    Ok(dsr) => {
-                        let dsr = dsr.unwrap();
-                        self.merge_clock(&dsr.clock);
-                        match dsr.payload {
-                            TransactionExecResult::Accepted(ref cell) => {
-                                txn.data.insert(*id, DataObject {
-                                    server: server_id,
-                                    cell: Some(cell.clone()),
-                                    new: false,
-                                });
-                            },
-                            TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {
-                                txn.data.insert(*id, DataObject {
-                                    server: server_id,
-                                    cell: None,
-                                    new: false,
-                                });
-                            }
-                            TransactionExecResult::Wait => {} // TODO: deal with wait
-                            _ => {}
-                        }
-                        Ok(dsr.payload)
-                    },
-                    Err(e) => {
-                        error!("{:?}", e);
-                        Err(TMError::RPCErrorFromCellServer)
-                    }
-                }
+                let await = self.await_manager.get_txn(tid);
+                self.read_from_site(server_id, server, tid, id, txn, await)
             },
             Err(e) => {
                 error!("{:?}", e);
