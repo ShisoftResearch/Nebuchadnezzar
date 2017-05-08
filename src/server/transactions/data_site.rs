@@ -22,13 +22,6 @@ pub struct CellMeta {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CommitOp {
-    Write(Cell),
-    Update(Cell),
-    Remove(Id)
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub enum EndResult {
     CheckFailed(CheckError),
     SomeLocksNotReleased,

@@ -95,3 +95,10 @@ pub enum CheckError {
     TransactionAlreadyAborted,
     TransactionCannotEnd,
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum CommitOp {
+    Write(Cell),
+    Update(Cell),
+    Remove(Id)
+}

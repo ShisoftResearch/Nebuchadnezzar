@@ -21,7 +21,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_MANAGER_RPC_SERVICE) as u64
 pub enum TMError {
     TransactionNotFound,
     CannotLocateCellServer,
-    NoResponseFromCellServer,
+    RPCErrorFromCellServer,
     AssertionError
 }
 
@@ -36,7 +36,7 @@ struct Transaction {
     start_time: i64, // use for timeout detecting
     id: TransactionId,
     data: BTreeMap<Id, DataObject>,
-    writes: BTreeSet<Id>,
+    changed_objects: ChangedObjs
 }
 
 service! {
@@ -47,7 +47,7 @@ service! {
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError> | TMError;
 
     rpc prepare(tid: TransactionId) -> PrepareResult | TMError;
-    rpc commit(tid: TransactionId);
+    rpc commit(tid: TransactionId) -> CommitResult | TMError;
     rpc abort(tid: TransactionId);
 
     rpc go_ahead(tid: BTreeSet<TransactionId>); // invoked by data site to continue on it's transaction in case of waiting
@@ -106,12 +106,12 @@ impl TransactionManager {
             _ => {Err(TMError::TransactionNotFound)}
         }
     }
-    fn changed_objs(&self, txn: &TxnGuard) -> ChangedObjs {
-        let mut changed_objs: BTreeMap<u64, Vec<(Id, DataObject)>> = BTreeMap::new();
+    fn generate_changed_objs(&self, txn: &mut TxnGuard) {
+        let mut changed_objs = ChangedObjs::new();
         for (id, data_obj) in &txn.data {
             changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
         }
-        changed_objs
+        txn.changed_objects = changed_objs;
     }
     fn data_sites(&self, changed_objs: &ChangedObjs) -> Result<DataSiteClients, TMError>  {
         let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
@@ -136,7 +136,7 @@ impl TransactionManager {
         let res_future = data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
             .map_err(|_| -> TMError {
-                TMError::NoResponseFromCellServer
+                TMError::RPCErrorFromCellServer
             })
             .map(move |prepare_res| -> PrepareResult {
                 let prepare_res = prepare_res.unwrap();
@@ -182,6 +182,41 @@ impl TransactionManager {
         }
         Ok(PrepareResult::Success)
     }
+    fn sites_commit(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: DataSiteClients)
+        -> Result<CommitResult, TMError> {
+        let commit_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
+            let data_site = data_sites.get(&server).unwrap().clone();
+            let ops: Vec<CommitOp> = objs.iter().map(|&(ref cell_id, ref data_obj)| {
+                if data_obj.cell.is_none() {
+                    CommitOp::Remove(*cell_id)
+                } else if data_obj.new {
+                    CommitOp::Write(data_obj.cell.clone().unwrap())
+                } else {
+                    CommitOp::Update(data_obj.cell.clone().unwrap())
+                }
+            }).collect();
+            data_site.commit(&self.get_clock(), tid, &ops)
+        }).collect();
+        let commit_results = future::join_all(commit_futures).wait();
+        if let Ok(commit_results) = commit_results {
+            for result in commit_results {
+                if let Ok(dsr) = result {
+                    self.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        CommitResult::Success => {},
+                        _ => {
+                            return Ok(dsr.payload);
+                        }
+                    }
+                } else {
+                    return Err(TMError::AssertionError)
+                }
+            }
+        } else {
+            return Err(TMError::RPCErrorFromCellServer)
+        }
+        Ok(CommitResult::Success)
+    }
 }
 
 impl Service for TransactionManager {
@@ -191,7 +226,7 @@ impl Service for TransactionManager {
             start_time: get_time(),
             id: id.clone(),
             data: BTreeMap::new(),
-            writes: BTreeSet::new()
+            changed_objects: ChangedObjs::new()
         });
         Ok(id)
     }
@@ -242,7 +277,7 @@ impl Service for TransactionManager {
                     },
                     Err(e) => {
                         error!("{:?}", e);
-                        Err(TMError::NoResponseFromCellServer)
+                        Err(TMError::RPCErrorFromCellServer)
                     }
                 }
             },
@@ -320,12 +355,17 @@ impl Service for TransactionManager {
     }
     fn prepare(&self, tid: &TransactionId) -> Result<PrepareResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
-        let mut changed_objs = self.changed_objs(&txn);
+        self.generate_changed_objs(&mut txn);
+        let generated_objs = &txn.changed_objects;
+        let changed_objs = generated_objs.clone();
         let data_sites = self.data_sites(&changed_objs)?;
         self.sites_prepare(tid, changed_objs, data_sites)
     }
-    fn commit(&self, tid: &TransactionId) -> Result<(), ()> {
-        Err(())
+    fn commit(&self, tid: &TransactionId) -> Result<CommitResult, TMError> {
+        let mut txn = self.get_transaction(tid)?;
+        let changed_objs = &txn.changed_objects;
+        let data_sites = self.data_sites(changed_objs)?;
+        self.sites_commit(tid, changed_objs, data_sites)
     }
     fn abort(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
