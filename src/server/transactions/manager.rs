@@ -225,7 +225,7 @@ impl TransactionManager {
         }
         Ok(PrepareResult::Success)
     }
-    fn sites_commit(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: DataSiteClients)
+    fn sites_commit(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
         -> Result<CommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
@@ -375,7 +375,15 @@ impl Service for TransactionManager {
         let mut txn = self.get_transaction(tid)?;
         let changed_objs = &txn.changed_objects;
         let data_sites = self.data_sites(changed_objs)?;
-        self.sites_commit(tid, changed_objs, data_sites)
+        let commit_result = self.sites_commit(tid, changed_objs, &data_sites);
+        match commit_result {
+            Ok(CommitResult::Success) => {},
+            _ => {
+                self.abort(tid); // TODO: beware deadlock on txn
+                return commit_result;
+            }
+        }
+        return Err(TMError::AssertionError)
     }
     fn abort(&self, tid: &TransactionId) -> Result<(), ()> {
         Err(())
