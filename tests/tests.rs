@@ -7,7 +7,7 @@ mod chunk;
 mod types;
 mod server;
 mod cell;
-
+mod transaction;
 
 #[macro_use]
 extern crate log;

@@ -1,9 +1,10 @@
 use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
 use bifrost::utils::time::get_time;
-use bifrost::rpc::RPCError;
+use bifrost::rpc::{RPCError, ClientPool, DEFAULT_CLIENT_POOL};
 use ram::cell::{Cell, WriteError};
 use ram::types::{Id};
 use std::sync::Arc;
+use std::io;
 use rand::Rng;
 
 pub mod manager;
@@ -122,4 +123,9 @@ pub enum TMPrepareResult {
 pub enum TMCommitResult {
     Success,
     CheckFailed(CheckError),
+}
+
+pub fn new_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
+    let client = DEFAULT_CLIENT_POOL.get(address)?;
+    Ok(manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
 }
