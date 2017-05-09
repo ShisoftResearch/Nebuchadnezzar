@@ -50,7 +50,7 @@ service! {
     rpc commit(tid: TransactionId) -> CommitResult | TMError;
     rpc abort(tid: TransactionId) -> AbortResult | TMError;
 
-    rpc go_ahead(tid: BTreeSet<TransactionId>); // invoked by data site to continue on it's transaction in case of waiting
+    rpc go_ahead(tids: BTreeSet<TransactionId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
 }
 
 pub struct TransactionManager {
@@ -424,8 +424,12 @@ impl Service for TransactionManager {
         let data_sites = self.data_sites(changed_objs)?;
         self.sites_abort(tid, changed_objs, &data_sites)
     }
-    fn go_ahead(&self, tid: &BTreeSet<TransactionId>) -> Result<(), ()> {
-        Err(())
+    fn go_ahead(&self, tids: &BTreeSet<TransactionId>, server_id: &u64) -> Result<(), ()> {
+        for tid in tids {
+            let await_txn = self.await_manager.get_txn(tid);
+            AwaitManager::txn_send(&await_txn, *server_id);
+        }
+        Ok(())
     }
 }
 

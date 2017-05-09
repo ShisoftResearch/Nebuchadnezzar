@@ -457,7 +457,7 @@ impl Service for DataManager {
         let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
         for (server_id, transactions) in waiting_list { // inform waiting servers to go on
             if let Ok(client) = self.get_tnx_manager(server_id) {
-                wake_up_futures.push(client.go_ahead(&transactions));
+                wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
             } else {
                 warn!("cannot inform server {} to continue it transactions", server_id);
             }
