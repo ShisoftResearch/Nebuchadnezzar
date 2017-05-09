@@ -42,7 +42,7 @@ struct Transaction {
 service! {
     rpc begin() -> TransactionId;
     rpc read(tid: TransactionId, id: Id) -> TransactionExecResult<Cell, ReadError> | TMError;
-    rpc write(tid: TransactionId, id: Id, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
+    rpc write(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError> | TMError;
 
@@ -353,20 +353,21 @@ impl Service for TransactionManager {
             }
         }
     }
-    fn write(&self, tid: &TransactionId, id: &Id, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
+    fn write(&self, tid: &TransactionId, cell: &Cell) -> Result<TransactionExecResult<(), WriteError>, TMError> {
         let mut txn = self.get_transaction(tid)?;
-        match self.server.get_server_id_by_id(id) {
+        let id = cell.id();
+        match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
-                let have_cached_cell = txn.data.contains_key(id);
+                let have_cached_cell = txn.data.contains_key(&id);
                 if !have_cached_cell {
-                    txn.data.insert(*id, DataObject {
+                    txn.data.insert(id, DataObject {
                         server: server_id,
                         cell: Some(cell.clone()),
                         new: true,
                     });
                     Ok(TransactionExecResult::Accepted(()))
                 } else {
-                    let mut data_obj = txn.data.get_mut(id).unwrap();
+                    let mut data_obj = txn.data.get_mut(&id).unwrap();
                     if !data_obj.cell.is_none() {
                         return Ok(TransactionExecResult::Error(WriteError::CellAlreadyExisted))
                     }

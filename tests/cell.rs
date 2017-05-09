@@ -6,6 +6,7 @@ use neb::ram::types::*;
 use neb::ram::io::writer;
 
 use std::mem;
+use super::*;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -16,35 +17,7 @@ pub fn header_size() {
 
 #[test]
 pub fn cell_rw () {
-    let fields = Field {
-        type_id: 0,
-        name: String::from("*"),
-        nullable: false,
-        is_array: false,
-        sub: Some(vec![
-            Field {
-                type_id: 6,
-                name: String::from("id"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            },
-            Field {
-                type_id: 20,
-                name: String::from("name"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            },
-            Field {
-                type_id: 10,
-                name: String::from("score"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            }
-        ])
-    };
+    let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
     let mut schema = Schema {

@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std;
 use std::rc::Rc;
+use super::*;
 
 pub const CHUNK_SIZE: usize = 1 * 8 * 1024 * 1024;
 
@@ -27,37 +28,9 @@ pub fn round_robin_segment () {
 pub fn cell_rw () {
     env_logger::init();
     info!("START");
-    let fields = Field {
-        type_id: 0,
-        name: String::from("*"),
-        nullable: false,
-        is_array: false,
-        sub: Some(vec![
-            Field {
-                type_id: 6,
-                name: String::from("id"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            },
-            Field {
-                type_id: 20,
-                name: String::from("name"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            },
-            Field {
-                type_id: 10,
-                name: String::from("score"),
-                nullable:false,
-                is_array:false,
-                sub: None,
-            }
-        ])
-    };
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
+    let fields = default_fields();
     let mut schema = Schema::new(String::from("dummy"), None, fields);
     let mut data_map = Map::<String, Value>::new();
     data_map.insert(String::from("id"), Value::I64(100));

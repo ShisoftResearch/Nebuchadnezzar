@@ -50,7 +50,7 @@ impl <T> DataSiteResponse <T> {
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
-enum TransactionState {
+pub enum TransactionState {
     Started,
     Aborted,
     Committing,
@@ -125,7 +125,11 @@ pub enum TMCommitResult {
     CheckFailed(CheckError),
 }
 
-pub fn new_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
+pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
     let client = DEFAULT_CLIENT_POOL.get(address)?;
     Ok(manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
+}
+pub fn new_client(address: &String) -> io::Result<Arc<manager::SyncServiceClient>> {
+    let client = DEFAULT_CLIENT_POOL.get(address)?;
+    Ok(manager::SyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
 }
