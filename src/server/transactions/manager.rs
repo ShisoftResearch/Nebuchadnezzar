@@ -48,7 +48,7 @@ service! {
 
     rpc prepare(tid: TransactionId) -> PrepareResult | TMError;
     rpc commit(tid: TransactionId) -> CommitResult | TMError;
-    rpc abort(tid: TransactionId);
+    rpc abort(tid: TransactionId) -> AbortResult | TMError;
 
     rpc go_ahead(tid: BTreeSet<TransactionId>); // invoked by data site to continue on it's transaction in case of waiting
 }
@@ -227,8 +227,8 @@ impl TransactionManager {
     }
     fn sites_commit(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
         -> Result<CommitResult, TMError> {
-        let commit_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
-            let data_site = data_sites.get(&server).unwrap().clone();
+        let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
+            let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter().map(|&(ref cell_id, ref data_obj)| {
                 if data_obj.cell.is_none() {
                     CommitOp::Remove(*cell_id)
@@ -259,6 +259,39 @@ impl TransactionManager {
             return Err(TMError::RPCErrorFromCellServer)
         }
         Ok(CommitResult::Success)
+    }
+    fn sites_abort(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
+        -> Result<AbortResult, TMError> {
+        let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
+            let data_site = data_sites.get(server_id).unwrap().clone();
+            data_site.abort(&self.get_clock(), tid)
+        }).collect();
+        let abort_results = future::join_all(abort_futures).wait();
+        if abort_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
+        let abort_results = abort_results.unwrap();
+        let mut rollback_failures = Vec::new();
+        for result in abort_results {
+            match result {
+                Ok(asr) => {
+                    let payload = asr.payload;
+                    self.merge_clock(&asr.clock);
+                    match payload {
+                        AbortResult::Success(mut failures) => {
+                            if let Some(mut failures) = failures {
+                                rollback_failures.append(&mut failures);
+                            }
+                        },
+                        _ => (return Ok(payload))
+                    }
+                },
+                Err(_) => {return Err(TMError::AssertionError)}
+            }
+        }
+        return
+            Ok(AbortResult::Success(
+                if rollback_failures.is_empty()
+                    {None} else {Some(rollback_failures)}
+            ))
     }
 }
 
@@ -385,8 +418,11 @@ impl Service for TransactionManager {
         }
         return Err(TMError::AssertionError)
     }
-    fn abort(&self, tid: &TransactionId) -> Result<(), ()> {
-        Err(())
+    fn abort(&self, tid: &TransactionId) -> Result<AbortResult, TMError> {
+        let mut txn = self.get_transaction(tid)?;
+        let changed_objs = &txn.changed_objects;
+        let data_sites = self.data_sites(changed_objs)?;
+        Err(TMError::AssertionError)
     }
     fn go_ahead(&self, tid: &BTreeSet<TransactionId>) -> Result<(), ()> {
         Err(())
