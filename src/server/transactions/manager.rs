@@ -413,10 +413,9 @@ impl Service for TransactionManager {
             Ok(CommitResult::Success) => {},
             _ => {
                 self.sites_abort(tid, changed_objs, &data_sites);
-                return commit_result;
             }
         }
-        return Err(TMError::AssertionError)
+        return commit_result;
     }
     fn abort(&self, tid: &TransactionId) -> Result<AbortResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
