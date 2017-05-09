@@ -412,7 +412,7 @@ impl Service for TransactionManager {
         match commit_result {
             Ok(CommitResult::Success) => {},
             _ => {
-                self.abort(tid); // TODO: beware deadlock on txn
+                self.sites_abort(tid, changed_objs, &data_sites);
                 return commit_result;
             }
         }
@@ -422,7 +422,7 @@ impl Service for TransactionManager {
         let mut txn = self.get_transaction(tid)?;
         let changed_objs = &txn.changed_objects;
         let data_sites = self.data_sites(changed_objs)?;
-        Err(TMError::AssertionError)
+        self.sites_abort(tid, changed_objs, &data_sites)
     }
     fn go_ahead(&self, tid: &BTreeSet<TransactionId>) -> Result<(), ()> {
         Err(())
