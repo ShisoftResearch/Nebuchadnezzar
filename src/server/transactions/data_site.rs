@@ -21,13 +21,6 @@ pub struct CellMeta {
     waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EndResult {
-    CheckFailed(CheckError),
-    SomeLocksNotReleased,
-    Success,
-}
-
 struct Transaction {
     server: u64,
     id: TransactionId,
@@ -64,8 +57,8 @@ service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
 
     // two phase commit
-    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<PrepareResult>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<CommitResult>;
+    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
+    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
     // for committed transaction, abort need to recover the data according to it's cells history
@@ -246,14 +239,14 @@ impl Service for DataManager {
         self.response_with(TransactionExecResult::Accepted(cell))
     }
     fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
-        -> Result<DataSiteResponse<PrepareResult>, ()> {
+        -> Result<DataSiteResponse<DMPrepareResult>, ()> {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
         if txn.state != TransactionState::Started && txn.state != TransactionState::Committing {
-            return self.response_with(PrepareResult::TransactionStateError(txn.state))
+            return self.response_with(DMPrepareResult::TransactionStateError(txn.state))
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
         for cell_id in cell_ids {
@@ -264,13 +257,13 @@ impl Service for DataManager {
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
                     meta.waiting.insert(tid.clone());
-                    return self.response_with(PrepareResult::Wait)
+                    return self.response_with(DMPrepareResult::Wait)
                 }
             }
             cell_metas.push(meta);
         }
         if cell_metas.len() != cell_ids.len() {
-            return self.response_with(PrepareResult::NotRealizable); // need retry
+            return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
             for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
@@ -278,27 +271,27 @@ impl Service for DataManager {
             txn.state = TransactionState::Committing;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time();    // check if transaction timeout
-            return self.response_with(PrepareResult::Success);
+            return self.response_with(DMPrepareResult::Success);
         }
     }
     fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CommitOp>)
-        -> Result<DataSiteResponse<CommitResult>, ()>  {
+        -> Result<DataSiteResponse<DMCommitResult>, ()>  {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
-            _ => { return self.response_with(CommitResult::CheckFailed(CheckError::TransactionNotExisted)); }
+            _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotExisted)); }
         };
         // check state
         match txn.state {
-            TransactionState::Started => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
-            TransactionState::Aborted => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
-            TransactionState::Committed => {return self.response_with(CommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
+            TransactionState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
+            TransactionState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
+            TransactionState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
             TransactionState::Committing => {}
         }
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();
         let arrived_cells_num = self.cells.len();
-        if prepared_cells_num != arrived_cells_num {return self.response_with(CommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        if prepared_cells_num != arrived_cells_num {return self.response_with(DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
         for cell_op in cells {
@@ -381,13 +374,13 @@ impl Service for DataManager {
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
                     // in this case, we can inform transaction manager to try again
-                    return self.response_with(CommitResult::CellChanged(
+                    return self.response_with(DMCommitResult::CellChanged(
                         id, rollback_result
                     ));
                 }
                 _ => {
                     // other failure due to unfixable error should abort without retry
-                    return self.response_with(CommitResult::WriteError(
+                    return self.response_with(DMCommitResult::WriteError(
                         id, error, rollback_result
                     ));
                 }
@@ -397,7 +390,7 @@ impl Service for DataManager {
             txn.state = TransactionState::Committed;
             txn.history = commit_history;
             txn.last_activity = get_time();
-            return self.response_with(CommitResult::Success)
+            return self.response_with(DMCommitResult::Success)
         }
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)

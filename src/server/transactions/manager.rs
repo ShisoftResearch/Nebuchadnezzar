@@ -46,8 +46,8 @@ service! {
     rpc update(tid: TransactionId, cell: Cell) -> TransactionExecResult<(), WriteError> | TMError;
     rpc remove(tid: TransactionId, id: Id) -> TransactionExecResult<(), WriteError> | TMError;
 
-    rpc prepare(tid: TransactionId) -> PrepareResult | TMError;
-    rpc commit(tid: TransactionId) -> CommitResult | TMError;
+    rpc prepare(tid: TransactionId) -> TMPrepareResult | TMError;
+    rpc commit(tid: TransactionId) -> TMCommitResult | TMError;
     rpc abort(tid: TransactionId) -> AbortResult | TMError;
 
     rpc go_ahead(tids: BTreeSet<TransactionId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
@@ -172,7 +172,7 @@ impl TransactionManager {
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TransactionId, objs: Vec<(Id, DataObject)>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> Box<futures::Future<Item = PrepareResult, Error = TMError>> {
+    ) -> Box<futures::Future<Item =DMPrepareResult, Error = TMError>> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
         let server_for_clock = server.clone();
@@ -181,7 +181,7 @@ impl TransactionManager {
             .map_err(|_| -> TMError {
                 TMError::RPCErrorFromCellServer
             })
-            .map(move |prepare_res| -> PrepareResult {
+            .map(move |prepare_res| -> DMPrepareResult {
                 let prepare_res = prepare_res.unwrap();
                 server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
                 prepare_res.payload
@@ -190,7 +190,7 @@ impl TransactionManager {
                 match prepare_payload {
                     Ok(payload) => {
                         match payload {
-                            PrepareResult::Wait => {
+                            DMPrepareResult::Wait => {
                                 AwaitManager::txn_wait(&awaits, data_site.server_id);
                                 return TransactionManager::site_prepare(
                                     server, awaits, tid, objs, data_site
@@ -207,7 +207,7 @@ impl TransactionManager {
         Box::new(res_future)
     }
     fn sites_prepare(&self, tid: &TransactionId, changed_objs: ChangedObjs, data_sites: DataSiteClients)
-        -> Result<PrepareResult, TMError> {
+        -> Result<DMPrepareResult, TMError> {
         let prepare_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
             TransactionManager::site_prepare(
@@ -219,14 +219,14 @@ impl TransactionManager {
         let prepare_results = future::join_all(prepare_futures).wait()?;
         for result in prepare_results {
             match result {
-                PrepareResult::Success => {},
+                DMPrepareResult::Success => {},
                 _ => {return Ok(result)}
             }
         }
-        Ok(PrepareResult::Success)
+        Ok(DMPrepareResult::Success)
     }
     fn sites_commit(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
-        -> Result<CommitResult, TMError> {
+        -> Result<DMCommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter().map(|&(ref cell_id, ref data_obj)| {
@@ -246,7 +246,7 @@ impl TransactionManager {
                 if let Ok(dsr) = result {
                     self.merge_clock(&dsr.clock);
                     match dsr.payload {
-                        CommitResult::Success => {},
+                        DMCommitResult::Success => {},
                         _ => {
                             return Ok(dsr.payload);
                         }
@@ -258,7 +258,7 @@ impl TransactionManager {
         } else {
             return Err(TMError::RPCErrorFromCellServer)
         }
-        Ok(CommitResult::Success)
+        Ok(DMCommitResult::Success)
     }
     fn sites_abort(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
         -> Result<AbortResult, TMError> {
@@ -292,6 +292,29 @@ impl TransactionManager {
                 if rollback_failures.is_empty()
                     {None} else {Some(rollback_failures)}
             ))
+    }
+    fn sites_end(&self, tid: &TransactionId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
+        -> Result<EndResult, TMError> {
+        let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
+            let data_site = data_sites.get(server_id).unwrap().clone();
+            data_site.end(&self.get_clock(), tid)
+        }).collect();
+        let end_results = future::join_all(end_futures).wait();
+        if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
+        let end_results = end_results.unwrap();
+        for result in end_results {
+            if let Ok(result) = result {
+                self.merge_clock(&result.clock);
+                let payload = result.payload;
+                match payload {
+                    EndResult::Success => {},
+                    _ => {return Ok(payload);}
+                }
+            } else {
+                return Err(TMError::AssertionError);
+            }
+        }
+        Ok(EndResult::Success)
     }
 }
 
@@ -396,26 +419,39 @@ impl Service for TransactionManager {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn prepare(&self, tid: &TransactionId) -> Result<PrepareResult, TMError> {
+    fn prepare(&self, tid: &TransactionId) -> Result<TMPrepareResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
         self.generate_changed_objs(&mut txn);
         let generated_objs = &txn.changed_objects;
         let changed_objs = generated_objs.clone();
         let data_sites = self.data_sites(&changed_objs)?;
-        self.sites_prepare(tid, changed_objs, data_sites)
+        let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
+        match sites_prepare_result {
+            DMPrepareResult::Success => {},
+            _ => {
+                self.sites_abort(tid, generated_objs, &data_sites);
+                return Ok(TMPrepareResult::DMPrepareError(sites_prepare_result));
+            }
+        }
+        let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
+        match sites_commit_result {
+            DMCommitResult::Success => {},
+            _ => {
+                self.sites_abort(tid, generated_objs, &data_sites);
+                return Ok(TMPrepareResult::DMCommitError(sites_commit_result))
+            }
+        }
+        return Ok(TMPrepareResult::Success);
     }
-    fn commit(&self, tid: &TransactionId) -> Result<CommitResult, TMError> {
+    fn commit(&self, tid: &TransactionId) -> Result<TMCommitResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
         let changed_objs = &txn.changed_objects;
         let data_sites = self.data_sites(changed_objs)?;
-        let commit_result = self.sites_commit(tid, changed_objs, &data_sites);
-        match commit_result {
-            Ok(CommitResult::Success) => {},
-            _ => {
-                self.sites_abort(tid, changed_objs, &data_sites);
-            }
+        let sites_end_result = self.sites_end(tid, changed_objs, &data_sites)?;
+        match sites_end_result {
+            EndResult::CheckFailed(ce) => {return Ok(TMCommitResult::CheckFailed(ce))},
+            _ => {return Ok(TMCommitResult::Success)}
         }
-        return commit_result;
     }
     fn abort(&self, tid: &TransactionId) -> Result<AbortResult, TMError> {
         let mut txn = self.get_transaction(tid)?;

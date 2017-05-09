@@ -57,7 +57,7 @@ enum TransactionState {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum PrepareResult {
+pub enum DMPrepareResult {
     Wait,
     Success,
     TransactionNotExisted,
@@ -67,7 +67,7 @@ pub enum PrepareResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum CommitResult {
+pub enum DMCommitResult {
     Success,
     WriteError(Id, WriteError, Vec<RollbackFailure>),
     CellChanged(Id, Vec<RollbackFailure>),
@@ -78,6 +78,13 @@ pub enum CommitResult {
 pub enum AbortResult {
     CheckFailed(CheckError),
     Success(Option<Vec<RollbackFailure>>),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EndResult {
+    CheckFailed(CheckError),
+    SomeLocksNotReleased,
+    Success,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,4 +108,18 @@ pub enum CommitOp {
     Write(Cell),
     Update(Cell),
     Remove(Id)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TMPrepareResult {
+    Success,
+    DMPrepareError(DMPrepareResult),
+    DMCommitError(DMCommitResult),
+    CheckFailed(CheckError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum TMCommitResult {
+    Success,
+    CheckFailed(CheckError),
 }
