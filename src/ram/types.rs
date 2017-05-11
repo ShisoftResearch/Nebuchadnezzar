@@ -5,6 +5,7 @@ use std::string::String;
 use std::any::Any;
 use std::collections::hash_map;
 use std::cmp::Ordering;
+use utils::rand;
 
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 
@@ -278,6 +279,10 @@ impl Id {
             higher: higher,
             lower: lower,
         }
+    }
+    pub fn rand() -> Id {
+        let (hi, lw) = rand::next_two();
+        Id::new(hi, lw)
     }
     pub fn from_header(header: &Header) -> Id {
         Id {

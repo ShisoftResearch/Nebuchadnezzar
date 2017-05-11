@@ -14,6 +14,7 @@ extern crate chashmap;
 
 pub mod ram;
 pub mod server;
+pub mod utils;
 
 #[macro_use]
 extern crate log;
