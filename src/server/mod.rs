@@ -28,7 +28,7 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
-    MetaServerCannotBeStandalone,
+    StandaloneMustAlsoBeMetaServer,
 }
 
 pub struct ServerOptions {
@@ -145,17 +145,17 @@ impl NebServer {
         let mut conshasing = None;
         let mut schemas = Schemas::new(None);
         rpc::Server::listen_and_resume(&rpc_server);
+        if opt.is_meta {
+            NebServer::load_meta_server(&opt, &rpc_server)?;
+        }
         if !opt.standalone {
-            if opt.is_meta {
-                NebServer::load_meta_server(&opt, &rpc_server)?;
-            }
             conshasing = Some(NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
-        } else if opt.is_meta {
-            error!("Meta server cannot be standalone");
-            return Err(ServerError::MetaServerCannotBeStandalone)
+        }
+        if !opt.is_meta && !opt.standalone {
+            return Err(ServerError::StandaloneMustAlsoBeMetaServer)
         }
         let meta_rc = Arc::new(ServerMeta {
-            schemas: schemas.clone()
+            schemas: schemas
         });
         let chunks = Chunks::new(
             opt.chunk_count,
