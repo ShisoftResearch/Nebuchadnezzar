@@ -4,6 +4,7 @@ use std::mem;
 use std::ptr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
+use std::collections::HashMap;
 
 const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
@@ -82,10 +83,10 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, id: &Id, data: DataValue) -> Cell {
+    pub fn new(schema_id: u32, id: &Id, map: HashMap<String, Value>) -> Cell {
         Cell {
             header: Header::new(0, schema_id, id),
-            data: data
+            data: Value::Map(map)
         }
     }
 
