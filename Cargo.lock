@@ -32,7 +32,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4a2b8c93ab85f829ca901e9a268933ca77785d84"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#7f941eecb929dd4502d791010e029a5a77fb30f9"
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
@@ -62,12 +62,12 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4a2b8c93ab85f829ca901e9a268933ca77785d84"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#7f941eecb929dd4502d791010e029a5a77fb30f9"
 
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4a2b8c93ab85f829ca901e9a268933ca77785d84"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#7f941eecb929dd4502d791010e029a5a77fb30f9"
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
 ]

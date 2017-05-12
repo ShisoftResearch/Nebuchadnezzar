@@ -119,5 +119,6 @@ pub fn data_site_wr() {
     data_map.insert(String::from("score"), Value::U64(70));
     data_map.insert(String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
-    let cell_1_non_exists_read = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+//    let cell_1_non_exists_read = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+//    let cell_1_write = txn.write(&txn_id, &cell_1).unwrap().unwrap();
 }

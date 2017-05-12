@@ -240,7 +240,7 @@ impl TransactionManager {
                 } else {
                     CommitOp::None
                 }
-            }).filter(|op| match op { &CommitOp::None => false, _ => true }).collect();
+            }).collect();
             data_site.commit(&self.get_clock(), tid, &ops)
         }).collect();
         let commit_results = future::join_all(commit_futures).wait();
@@ -406,11 +406,21 @@ impl Service for TransactionManager {
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
                 if txn.data.contains_key(&id) {
-                    let data_obj = txn.data.get_mut(&id).unwrap();
-                    if data_obj.cell.is_none() {
-                        return Ok(TransactionExecResult::Error(WriteError::CellDoesNotExisted))
+                    let mut new_obj = false;
+                    {
+                        let data_obj = txn.data.get_mut(&id).unwrap();
+                        if data_obj.cell.is_none() {
+                            return Ok(TransactionExecResult::Error(WriteError::CellDoesNotExisted))
+                        }
+                        if data_obj.new {
+                            new_obj = true;
+                        } else {
+                            data_obj.cell = None;
+                        }
                     }
-                    data_obj.cell = None;
+                    if new_obj {
+                        txn.data.remove(&id);
+                    }
                 } else {
                     txn.data.insert(*id, DataObject {
                         server: server_id,
