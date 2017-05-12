@@ -3,6 +3,7 @@ use super::*;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::state_machine::callback::server::SMCallback;
 use bifrost::raft::RaftService;
+use bifrost::utils::bincode;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,10 +58,10 @@ impl StateMachineCmds for SchemasSM {
 impl StateMachineCtl for SchemasSM {
     raft_sm_complete!();
     fn snapshot(&self) -> Option<Vec<u8>> {
-        Some(serialize!(&self.to_data()))
+        Some(bincode::serialize(&self.to_data()))
     }
     fn recover(&mut self, data: Vec<u8>) {
-        let maps: SchemasData = deserialize!(&data);
+        let maps: SchemasData = bincode::deserialize(&data);
         self.schema_map = maps.0;
         self.name_map = maps.1;
     }

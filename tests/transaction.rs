@@ -79,16 +79,20 @@ pub fn workspace_wr() {
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
     }
-    let cell_1_rm_res = txn.remove(&txn_id, &cell_1.id()).unwrap().unwrap();
-    match cell_1_rm_res {
-        TransactionExecResult::Accepted(()) => {},
-        _ => {panic!("remove cell 1 not accepted {:?}", cell_1_rm_res)}
-    }
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
-    match cell_1_r_res {
-        TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {},
-        _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
-    }
+//    let cell_1_rm_res = txn.remove(&txn_id, &cell_1.id()).unwrap().unwrap();
+//    match cell_1_rm_res {
+//        TransactionExecResult::Accepted(()) => {},
+//        _ => {panic!("remove cell 1 not accepted {:?}", cell_1_rm_res)}
+//    }
+//    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+//    match cell_1_r_res {
+//        TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {},
+//        _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
+//    }
+    txn.prepare(&txn_id).unwrap().unwrap();
+    txn.commit(&txn_id).unwrap().unwrap();
+    //let cell = server.chunks.read_cell(&cell_1.id()).unwrap();
+
 }
 
 #[test]
