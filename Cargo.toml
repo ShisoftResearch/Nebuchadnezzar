@@ -18,9 +18,9 @@ chashmap = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-serde = "0.8"
-serde_derive = "0.8"
-bincode = "0.6"
+serde = "1.0.4"
+serde_derive = "1.0.4"
+bincode = "0.8.0"
 byteorder = "1"
 parking_lot = {version = "0.3", features = ["nightly"]}
 rand = "0.3"
