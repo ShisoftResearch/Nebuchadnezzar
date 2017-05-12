@@ -8,7 +8,7 @@ use neb::ram::cell::*;
 use super::*;
 
 #[test]
-pub fn basic_wr () {
+pub fn workspace_wr() {
     let server_addr = String::from("127.0.0.1:5200");
     let server = NebServer::new(ServerOptions {
         chunk_count: 1,
@@ -66,5 +66,27 @@ pub fn basic_wr () {
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
     }
-
+    let cell_1_u_res = txn.update(&txn_id, &cell_1_w2).unwrap().unwrap();
+    match cell_1_u_res {
+        TransactionExecResult::Accepted(()) => {},
+        _ => {panic!("update cell 1 not accepted")}
+    }
+    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+    match cell_1_r_res {
+        TransactionExecResult::Accepted(cell) => {
+            assert_eq!(cell.id(), cell_1.id());
+            assert_eq!(cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 90);
+        },
+        _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
+    }
+    let cell_1_rm_res = txn.remove(&txn_id, &cell_1.id()).unwrap().unwrap();
+    match cell_1_rm_res {
+        TransactionExecResult::Accepted(()) => {},
+        _ => {panic!("remove cell 1 not accepted {:?}", cell_1_rm_res)}
+    }
+    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+    match cell_1_r_res {
+        TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {},
+        _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
+    }
 }

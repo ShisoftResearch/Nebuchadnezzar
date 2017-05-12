@@ -108,7 +108,8 @@ pub enum CheckError {
 pub enum CommitOp {
     Write(Cell),
     Update(Cell),
-    Remove(Id)
+    Remove(Id),
+    None,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

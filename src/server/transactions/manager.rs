@@ -229,15 +229,18 @@ impl TransactionManager {
         -> Result<DMCommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
-            let ops: Vec<CommitOp> = objs.iter().map(|&(ref cell_id, ref data_obj)| {
-                if data_obj.cell.is_none() {
+            let ops: Vec<CommitOp> = objs.iter()
+                .map(|&(ref cell_id, ref data_obj)| {
+                if data_obj.cell.is_none() && !data_obj.new {
                     CommitOp::Remove(*cell_id)
                 } else if data_obj.new {
                     CommitOp::Write(data_obj.cell.clone().unwrap())
-                } else {
+                } else if !data_obj.new {
                     CommitOp::Update(data_obj.cell.clone().unwrap())
+                } else {
+                    CommitOp::None
                 }
-            }).collect();
+            }).filter(|op| match op { &CommitOp::None => false, _ => true }).collect();
             data_site.commit(&self.get_clock(), tid, &ops)
         }).collect();
         let commit_results = future::join_all(commit_futures).wait();

@@ -363,6 +363,9 @@ impl Service for DataManager {
                             break;
                         }
                     }
+                },
+                &CommitOp::None => {
+                    panic!("None CommitOp should not appear in data site");
                 }
             }
         }
