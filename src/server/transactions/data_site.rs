@@ -9,7 +9,7 @@ use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use super::*;
 
-pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TNX_DATA_MANAGER_RPC_SERVICE) as u64;
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
 pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
 pub type CommitHistory = BTreeMap<Id, CellHistory>;
