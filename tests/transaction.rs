@@ -90,3 +90,34 @@ pub fn workspace_wr() {
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
     }
 }
+
+#[test]
+pub fn data_site_wr() {
+    let server_addr = String::from("127.0.0.1:5201");
+    let server = NebServer::new(ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(server_addr.clone()),
+        address: server_addr.clone(),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
+    let mut schema = Schema {
+        id: 1,
+        name: String::from("test"),
+        key_field: None,
+        fields: default_fields()
+    };
+    server.meta.schemas.new_schema(&mut schema);
+    let txn = transactions::new_client(&server_addr).unwrap();
+    let txn_id = txn.begin().unwrap().unwrap();
+    let mut data_map = Map::<String, Value>::new();
+    data_map.insert(String::from("id"), Value::I64(100));
+    data_map.insert(String::from("score"), Value::U64(70));
+    data_map.insert(String::from("name"), Value::String(String::from("Jack")));
+    let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
+    let cell_1_non_exists_read = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
+}
