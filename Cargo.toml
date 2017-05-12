@@ -13,7 +13,6 @@ name = "tests"
 libc = "*"
 log = "0.3"
 lazy_static = "*"
-uuid = { version = "0.2", features = ["v4", "v5"] }
 chashmap = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }

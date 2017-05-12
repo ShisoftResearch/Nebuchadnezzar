@@ -9,7 +9,6 @@
 #![feature(conservative_impl_trait)]
 
 extern crate libc;
-extern crate uuid;
 extern crate chashmap;
 
 pub mod ram;
