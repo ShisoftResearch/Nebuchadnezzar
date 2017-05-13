@@ -215,6 +215,7 @@ impl Service for DataManager {
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
         let mut txn = self.get_transaction(tid, server_id);
+        txn.last_activity = get_time();
         if txn.state != TxnState::Started {
             return self.response_with(TxnExecResult::Rejected)
         }
@@ -225,19 +226,18 @@ impl Service for DataManager {
             meta.waiting.insert(tid.clone());
             return self.response_with(TxnExecResult::Wait);
         }
-        let cell = match self.server.chunks.read_cell(id) {
-            Ok(cell) => {cell}
-            Err(read_error) => {
-                // cannot read
-                return self.response_with(TxnExecResult::Error(read_error));
-            }
-        };
-        let update_read = &meta.read < tid;
-        if update_read {
+        if &meta.read < tid {
             meta.read = tid.clone()
         }
-        txn.last_activity = get_time();
-        self.response_with(TxnExecResult::Accepted(cell))
+        match self.server.chunks.read_cell(id) {
+            Ok(cell) => {
+                self.response_with(TxnExecResult::Accepted(cell))
+            }
+            Err(read_error) => {
+                // cannot read
+                self.response_with(TxnExecResult::Error(read_error))
+            }
+        }
     }
     fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TxnId, cell_ids: &Vec<Id>)
                -> Result<DataSiteResponse<DMPrepareResult>, ()> {
@@ -282,6 +282,7 @@ impl Service for DataManager {
             Some(tnx) => tnx,
             _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotExisted)); }
         };
+        txn.last_activity = get_time();
         // check state
         match txn.state {
             TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},

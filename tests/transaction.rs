@@ -202,7 +202,11 @@ pub fn multi_transaction() {
         _ => {panic!("Cannot read cell 1 for txn 2");}
     }
     txn.update(&txn_1_id, &cell_1).unwrap().unwrap();
-    assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(),
+    assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(), // write too late
     TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable));
     assert_eq!(txn.commit(&txn_1_id).unwrap().err().unwrap(), TMError::TransactionNotFound);
+    let txn_1_id = txn.begin().unwrap().unwrap();
+    txn.update(&txn_1_id, &cell_1).unwrap().unwrap(); // txn_1_id > txn_2_id, realizable
+    assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(), TMPrepareResult::Success);
+    assert_eq!(txn.commit(&txn_1_id).unwrap().unwrap(), EndResult::Success);
 }
