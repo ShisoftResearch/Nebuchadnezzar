@@ -438,32 +438,44 @@ impl Service for TransactionManager {
         }
     }
     fn prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
-        let mut txn = self.get_transaction(tid)?;
-        self.ensure_rw_state(&txn)?;
-        {
-            self.generate_changed_objs(&mut txn);
-            let generated_objs = &txn.changed_objects;
-            let changed_objs = generated_objs.clone();
-            let data_sites = self.data_sites(&changed_objs)?;
-            let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
-            match sites_prepare_result {
-                DMPrepareResult::Success => {},
-                _ => {
+        let conclusion = {
+            let mut txn = self.get_transaction(tid)?;
+            let result = {
+                self.ensure_rw_state(&txn)?;
+                self.generate_changed_objs(&mut txn);
+                let generated_objs = &txn.changed_objects;
+                let changed_objs = generated_objs.clone();
+                let data_sites = self.data_sites(&changed_objs)?;
+                let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
+                if sites_prepare_result == DMPrepareResult::Success {
+                    let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
+                    match sites_commit_result {
+                        DMCommitResult::Success => {
+                            TMPrepareResult::Success
+                        },
+                        _ => {
+                            self.sites_abort(tid, generated_objs, &data_sites);
+                            TMPrepareResult::DMCommitError(sites_commit_result)
+                        }
+                    }
+                } else {
                     self.sites_abort(tid, generated_objs, &data_sites);
-                    return Ok(TMPrepareResult::DMPrepareError(sites_prepare_result));
+                    TMPrepareResult::DMPrepareError(sites_prepare_result)
                 }
+            };
+            match result {
+                TMPrepareResult::Success => {
+                    txn.state = TxnState::Prepared;
+                },
+                _ => {}
             }
-            let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
-            match sites_commit_result {
-                DMCommitResult::Success => {},
-                _ => {
-                    self.sites_abort(tid, generated_objs, &data_sites);
-                    return Ok(TMPrepareResult::DMCommitError(sites_commit_result))
-                }
-            }
+            result
+        };
+        match conclusion {
+            TMPrepareResult::Success => {},
+            _ => {self.cleanup_transaction(tid);}
         }
-        txn.state = TxnState::Prepared;
-        return Ok(TMPrepareResult::Success);
+        return Ok(conclusion);
     }
     fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {
         let result = {

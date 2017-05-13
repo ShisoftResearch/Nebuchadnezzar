@@ -14,6 +14,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) a
 pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
 pub type CommitHistory = BTreeMap<Id, CellHistory>;
 
+#[derive(Debug)]
 pub struct CellMeta {
     read: TxnId,
     write: TxnId,
@@ -115,7 +116,7 @@ impl DataManager {
                     owner: None,
                     waiting: BTreeSet::new(),
                 }
-            }, |c|{});
+            }, |_|{});
         }
         {
             let mut lru = self.cell_lru.lock();

@@ -116,8 +116,7 @@ pub enum CommitOp {
 pub enum TMPrepareResult {
     Success,
     DMPrepareError(DMPrepareResult),
-    DMCommitError(DMCommitResult),
-    CheckFailed(CheckError),
+    DMCommitError(DMCommitResult)
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
