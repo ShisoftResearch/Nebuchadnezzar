@@ -53,7 +53,7 @@ impl <T> DataSiteResponse <T> {
 pub enum TxnState {
     Started,
     Aborted,
-    Committing,
+    Prepared,
     Committed,
 }
 

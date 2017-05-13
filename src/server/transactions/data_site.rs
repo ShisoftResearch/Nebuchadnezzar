@@ -245,7 +245,7 @@ impl Service for DataManager {
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
-        if txn.state != TxnState::Started && txn.state != TxnState::Committing {
+        if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::TransactionStateError(txn.state))
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
@@ -268,7 +268,7 @@ impl Service for DataManager {
             for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
-            txn.state = TxnState::Committing;
+            txn.state = TxnState::Prepared;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time();    // check if transaction timeout
             return self.response_with(DMPrepareResult::Success);
@@ -286,7 +286,7 @@ impl Service for DataManager {
             TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
             TxnState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
             TxnState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
-            TxnState::Committing => {}
+            TxnState::Prepared => {}
         }
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();

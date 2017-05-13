@@ -321,11 +321,15 @@ impl TransactionManager {
         }
         Ok(EndResult::Success)
     }
-    fn ensure_wr_state(txn: &TxnGuard) -> Result<(), TMError> {
-        match txn.state {
-            TxnState::Started => {return Ok(())},
-            _ => {return Err(TMError::InvalidTransactionState(txn.state))}
+    fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
+        if txn.state == state {
+            return Ok(())
+        } else {
+            return Err(TMError::InvalidTransactionState(txn.state))
         }
+    }
+    fn ensure_rw_state(&self, txn: &TxnGuard) -> Result<(), TMError> {
+        self.ensure_txn_state(txn, TxnState::Started)
     }
 }
 
@@ -343,6 +347,7 @@ impl Service for TransactionManager {
     }
     fn read(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
         let mut txn = self.get_transaction(tid)?;
+        self.ensure_rw_state(&txn)?;
         if let Some(dataObj) = txn.data.get(id) {
             match dataObj.cell {
                 Some(ref cell) => {
@@ -368,6 +373,7 @@ impl Service for TransactionManager {
     fn write(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let mut txn = self.get_transaction(tid)?;
         let id = cell.id();
+        self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
                 let have_cached_cell = txn.data.contains_key(&id);
@@ -393,6 +399,7 @@ impl Service for TransactionManager {
     fn update(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let mut txn = self.get_transaction(tid)?;
         let id = cell.id();
+        self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
                 let cell = cell.clone();
@@ -412,6 +419,7 @@ impl Service for TransactionManager {
     }
     fn remove(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let mut txn = self.get_transaction(tid)?;
+        self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
                 if txn.data.contains_key(&id) {
@@ -444,30 +452,35 @@ impl Service for TransactionManager {
     }
     fn prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
-        self.generate_changed_objs(&mut txn);
-        let generated_objs = &txn.changed_objects;
-        let changed_objs = generated_objs.clone();
-        let data_sites = self.data_sites(&changed_objs)?;
-        let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
-        match sites_prepare_result {
-            DMPrepareResult::Success => {},
-            _ => {
-                self.sites_abort(tid, generated_objs, &data_sites);
-                return Ok(TMPrepareResult::DMPrepareError(sites_prepare_result));
+        self.ensure_rw_state(&txn)?;
+        {
+            self.generate_changed_objs(&mut txn);
+            let generated_objs = &txn.changed_objects;
+            let changed_objs = generated_objs.clone();
+            let data_sites = self.data_sites(&changed_objs)?;
+            let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
+            match sites_prepare_result {
+                DMPrepareResult::Success => {},
+                _ => {
+                    self.sites_abort(tid, generated_objs, &data_sites);
+                    return Ok(TMPrepareResult::DMPrepareError(sites_prepare_result));
+                }
+            }
+            let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
+            match sites_commit_result {
+                DMCommitResult::Success => {},
+                _ => {
+                    self.sites_abort(tid, generated_objs, &data_sites);
+                    return Ok(TMPrepareResult::DMCommitError(sites_commit_result))
+                }
             }
         }
-        let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
-        match sites_commit_result {
-            DMCommitResult::Success => {},
-            _ => {
-                self.sites_abort(tid, generated_objs, &data_sites);
-                return Ok(TMPrepareResult::DMCommitError(sites_commit_result))
-            }
-        }
+        txn.state = TxnState::Prepared;
         return Ok(TMPrepareResult::Success);
     }
     fn commit(&self, tid: &TxnId) -> Result<TMCommitResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
+        self.ensure_txn_state(&txn, TxnState::Prepared)?;
         let changed_objs = &txn.changed_objects;
         let data_sites = self.data_sites(changed_objs)?;
         let sites_end_result = self.sites_end(tid, changed_objs, &data_sites)?;
@@ -478,6 +491,7 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let mut txn = self.get_transaction(tid)?;
+        if txn.state == TxnState::Aborted {return Err(TMError::InvalidTransactionState(txn.state))}
         let changed_objs = &txn.changed_objects;
         let data_sites = self.data_sites(changed_objs)?;
         self.sites_abort(tid, changed_objs, &data_sites)
