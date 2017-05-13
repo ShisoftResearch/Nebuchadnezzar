@@ -146,6 +146,7 @@ pub fn data_site_wr() {
         TxnExecResult::Accepted(()) => {}
         _ => {panic!("Wrong feedback {:?}", cell_1_w_res)}
     }
+    assert!(server.chunks.read_cell(&cell_1.id()).is_err()); // isolation test
     assert_eq!(txn.prepare(&txn_id).unwrap().unwrap(), TMPrepareResult::Success);
     assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
     let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
