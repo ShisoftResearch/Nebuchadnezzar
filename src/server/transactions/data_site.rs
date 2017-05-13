@@ -416,55 +416,58 @@ impl Service for DataManager {
     }
     fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
              -> Result<DataSiteResponse<EndResult>, ()>  {
-        self.update_clock(clock);
-        let mut txn = match self.tnxs.get_mut(tid) {
-            Some(tnx) => tnx,
-            _ => { return self.response_with(EndResult::CheckFailed(CheckError::TransactionNotExisted)); }
-        };
-        if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
-            return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
-        }
-        let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
-        for cell_id in &txn.affected_cells {
-            if let Some(meta) = self.cells.get_mut(cell_id){
-                cell_metas.push(meta)
+        let result = {
+            self.update_clock(clock);
+            let mut txn = match self.tnxs.get_mut(tid) {
+                Some(tnx) => tnx,
+                _ => { return self.response_with(EndResult::CheckFailed(CheckError::TransactionNotExisted)); }
+            };
+            if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
+                return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
             }
-        }
-        let affected_cells = txn.affected_cells.len();
-        let mut released_locks = 0;
-        let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
-        for mut meta in cell_metas {
-            if meta.owner == Some(tid.clone()) {
-                for waiting_tid in &meta.waiting {
-                    if let Some(t) = self.tnxs.get(waiting_tid) {
-                        waiting_list
-                            .entry(t.server)
-                            .or_insert_with(|| BTreeSet::new())
-                            .insert(waiting_tid.clone());
-                    }
+            let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+            for cell_id in &txn.affected_cells {
+                if let Some(meta) = self.cells.get_mut(cell_id){
+                    cell_metas.push(meta)
                 }
-                meta.waiting.clear();
-                meta.owner = None;
-                released_locks += 1;
-            } else {
-                warn!("affected txn does not own the cell");
             }
-        }
-        let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
-        for (server_id, transactions) in waiting_list { // inform waiting servers to go on
-            if let Ok(client) = self.get_tnx_manager(server_id) {
-                wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
-            } else {
-                warn!("cannot inform server {} to continue it transactions", server_id);
+            let affected_cells = txn.affected_cells.len();
+            let mut released_locks = 0;
+            let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
+            for mut meta in cell_metas {
+                if meta.owner == Some(tid.clone()) {
+                    for waiting_tid in &meta.waiting {
+                        if let Some(t) = self.tnxs.get(waiting_tid) {
+                            waiting_list
+                                .entry(t.server)
+                                .or_insert_with(|| BTreeSet::new())
+                                .insert(waiting_tid.clone());
+                        }
+                    }
+                    meta.waiting.clear();
+                    meta.owner = None;
+                    released_locks += 1;
+                } else {
+                    warn!("affected txn does not own the cell");
+                }
             }
-        }
-        future::join_all(wake_up_futures).wait();
+            let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
+            for (server_id, transactions) in waiting_list { // inform waiting servers to go on
+                if let Ok(client) = self.get_tnx_manager(server_id) {
+                    wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
+                } else {
+                    warn!("cannot inform server {} to continue it transactions", server_id);
+                }
+            }
+            future::join_all(wake_up_futures).wait();
+            self.cell_meta_cleanup();
+            if released_locks == affected_cells {
+                self.response_with(EndResult::Success)
+            } else {
+                self.response_with(EndResult::SomeLocksNotReleased)
+            }
+        };
         self.wipe_out_transaction(tid);
-        self.cell_meta_cleanup();
-        if released_locks == affected_cells {
-            self.response_with(EndResult::Success)
-        } else {
-            self.response_with(EndResult::SomeLocksNotReleased)
-        }
+        return result;
     }
 }
