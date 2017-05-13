@@ -23,10 +23,10 @@ impl Peer {
     }
 }
 
-pub type TransactionId = StandardVectorClock;
+pub type TxnId = StandardVectorClock;
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
-pub enum TransactionExecResult<A, E>
+pub enum TxnExecResult<A, E>
 where A: Clone, E: Clone {
     Rejected,
     Wait,
@@ -50,7 +50,7 @@ impl <T> DataSiteResponse <T> {
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize, Copy, Clone)]
-pub enum TransactionState {
+pub enum TxnState {
     Started,
     Aborted,
     Committing,
@@ -63,7 +63,7 @@ pub enum DMPrepareResult {
     Success,
     TransactionNotExisted,
     NotRealizable,
-    TransactionStateError(TransactionState),
+    TransactionStateError(TxnState),
     NetworkError
 }
 

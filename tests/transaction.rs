@@ -37,12 +37,12 @@ pub fn workspace_wr() {
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     let cell_1_w_res = txn.write(&txn_id, &cell_1).unwrap().unwrap();
     match cell_1_w_res {
-        TransactionExecResult::Accepted(()) => {},
+        TxnExecResult::Accepted(()) => {},
         _ => {panic!("write cell 1 not accepted {:?}", cell_1_w_res)}
     }
     let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_r_res {
-        TransactionExecResult::Accepted(cell) => {
+        TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
             assert_eq!(cell.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 100);
             assert_eq!(cell.data.Map().unwrap().get("name").unwrap().String().unwrap(), "Jack");
@@ -54,13 +54,13 @@ pub fn workspace_wr() {
     let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), data_map.clone());
     let cell_1_w_res = txn.write(&txn_id, &cell_1_w2).unwrap().unwrap();
     match cell_1_w_res {
-        TransactionExecResult::Accepted(()) => {panic!("Write existed cell should fail")}
-        TransactionExecResult::Error(WriteError::CellAlreadyExisted) => {}
+        TxnExecResult::Accepted(()) => {panic!("Write existed cell should fail")}
+        TxnExecResult::Error(WriteError::CellAlreadyExisted) => {}
         _ => {panic!("Wrong feedback {:?}", cell_1_w_res)}
     }
     let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_r_res {
-        TransactionExecResult::Accepted(cell) => {
+        TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
             assert_eq!(cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 70);
         },
@@ -68,12 +68,12 @@ pub fn workspace_wr() {
     }
     let cell_1_u_res = txn.update(&txn_id, &cell_1_w2).unwrap().unwrap();
     match cell_1_u_res {
-        TransactionExecResult::Accepted(()) => {},
+        TxnExecResult::Accepted(()) => {},
         _ => {panic!("update cell 1 not accepted")}
     }
     let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_r_res {
-        TransactionExecResult::Accepted(cell) => {
+        TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
             assert_eq!(cell.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 90);
         },
@@ -81,15 +81,15 @@ pub fn workspace_wr() {
     }
     let cell_1_rm_res = txn.remove(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_rm_res {
-        TransactionExecResult::Accepted(()) => {},
+        TxnExecResult::Accepted(()) => {},
         _ => {panic!("remove cell 1 not accepted {:?}", cell_1_rm_res)}
     }
     let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_r_res {
-        TransactionExecResult::Error(ReadError::CellDoesNotExisted) => {},
+        TxnExecResult::Error(ReadError::CellDoesNotExisted) => {},
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
     }
-
+    
 }
 
 #[test]

@@ -15,16 +15,16 @@ pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
 pub type CommitHistory = BTreeMap<Id, CellHistory>;
 
 pub struct CellMeta {
-    read: TransactionId,
-    write: TransactionId,
-    owner: Option<TransactionId>, // transaction that owns the cell in Committing state
-    waiting: BTreeSet<TransactionId>, // transactions that waiting for owner to finish
+    read: TxnId,
+    write: TxnId,
+    owner: Option<TxnId>, // transaction that owns the cell in Committing state
+    waiting: BTreeSet<TxnId>, // transactions that waiting for owner to finish
 }
 
 struct Transaction {
     server: u64,
-    id: TransactionId,
-    state: TransactionState,
+    id: TxnId,
+    state: TxnState,
     affected_cells: Vec<Id>,
     last_activity: i64,
     history: CommitHistory
@@ -47,25 +47,25 @@ impl CellHistory {
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
-    tnxs: CHashMap<TransactionId, Transaction>,
-    tnxs_sorted: Mutex<BTreeSet<TransactionId>>,
+    tnxs: CHashMap<TxnId, Transaction>,
+    tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>
 }
 
 service! {
-    rpc read(server_id: u64, clock: StandardVectorClock, tid: TransactionId, id: Id) -> DataSiteResponse<TransactionExecResult<Cell, ReadError>>;
+    rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
 
     // two phase commit
-    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TransactionId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
-    rpc commit(clock :StandardVectorClock, tid: TransactionId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
+    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
+    rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
 
     // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
     // for committed transaction, abort need to recover the data according to it's cells history
-    rpc abort(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<AbortResult>;
+    rpc abort(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<AbortResult>;
 
     // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
-    rpc end(clock :StandardVectorClock, tid: TransactionId) -> DataSiteResponse<EndResult>;
+    rpc end(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<EndResult>;
 }
 
 dispatch_rpc_service_functions!(DataManager);
@@ -87,14 +87,14 @@ impl DataManager {
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
-    fn get_transaction(&self, tid: &TransactionId, server: &u64) -> WriteGuard<TransactionId, Transaction> {
+    fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
         if !self.tnxs.contains_key(tid) {
             self.tnxs.upsert(tid.clone(), ||{
                 self.tnxs_sorted.lock().insert(tid.clone());
                 Transaction {
                     id: tid.clone(),
                     server: *server,
-                    state: TransactionState::Started,
+                    state: TxnState::Started,
                     affected_cells: Vec::new(),
                     last_activity: get_time(),
                     history: BTreeMap::new(),
@@ -110,8 +110,8 @@ impl DataManager {
         if !self.cells.contains_key(id) {
             self.cells.upsert(*id, || {
                 CellMeta {
-                    read: TransactionId::new(),
-                    write: TransactionId::new(),
+                    read: TxnId::new(),
+                    write: TxnId::new(),
                     owner: None,
                     waiting: BTreeSet::new(),
                 }
@@ -156,7 +156,7 @@ impl DataManager {
         }
         failures
     }
-    fn update_cell_write(&self, cell_id: &Id, tid: &TransactionId) {
+    fn update_cell_write(&self, cell_id: &Id, tid: &TxnId) {
         let mut meta = self.get_cell_meta(cell_id);
         meta.write = tid.clone();
     }
@@ -169,7 +169,7 @@ impl DataManager {
         }
         Ok(self.managers.get(&server_id).unwrap().clone())
     }
-    fn wipe_out_transaction(&self, tid: &TransactionId) {
+    fn wipe_out_transaction(&self, tid: &TxnId) {
         self.tnxs.remove(tid);
         self.tnxs_sorted.lock().remove(tid);
     }
@@ -207,28 +207,28 @@ impl DataManager {
 }
 
 impl Service for DataManager {
-    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TransactionId, id: &Id)
-        -> Result<DataSiteResponse<TransactionExecResult<Cell, ReadError>>, ()> {
+    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
+            -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
         self.update_clock(clock);
         let mut meta = self.get_cell_meta(id);
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
         let mut txn = self.get_transaction(tid, server_id);
-        if txn.state != TransactionState::Started {
-            return self.response_with(TransactionExecResult::Rejected)
+        if txn.state != TxnState::Started {
+            return self.response_with(TxnExecResult::Rejected)
         }
         if read_too_late { // not realizable
-            return self.response_with(TransactionExecResult::Rejected);
+            return self.response_with(TxnExecResult::Rejected);
         }
         if committing { // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert(tid.clone());
-            return self.response_with(TransactionExecResult::Wait);
+            return self.response_with(TxnExecResult::Wait);
         }
         let cell = match self.server.chunks.read_cell(id) {
             Ok(cell) => {cell}
             Err(read_error) => {
                 // cannot read
-                return self.response_with(TransactionExecResult::Error(read_error));
+                return self.response_with(TxnExecResult::Error(read_error));
             }
         };
         let update_read = &meta.read < tid;
@@ -236,16 +236,16 @@ impl Service for DataManager {
             meta.read = tid.clone()
         }
         txn.last_activity = get_time();
-        self.response_with(TransactionExecResult::Accepted(cell))
+        self.response_with(TxnExecResult::Accepted(cell))
     }
-    fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TransactionId, cell_ids: &Vec<Id>)
-        -> Result<DataSiteResponse<DMPrepareResult>, ()> {
+    fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TxnId, cell_ids: &Vec<Id>)
+               -> Result<DataSiteResponse<DMPrepareResult>, ()> {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
-        if txn.state != TransactionState::Started && txn.state != TransactionState::Committing {
+        if txn.state != TxnState::Started && txn.state != TxnState::Committing {
             return self.response_with(DMPrepareResult::TransactionStateError(txn.state))
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
@@ -268,14 +268,14 @@ impl Service for DataManager {
             for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
-            txn.state = TransactionState::Committing;
+            txn.state = TxnState::Committing;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time();    // check if transaction timeout
             return self.response_with(DMPrepareResult::Success);
         }
     }
-    fn commit(&self, clock :&StandardVectorClock, tid: &TransactionId, cells: &Vec<CommitOp>)
-        -> Result<DataSiteResponse<DMCommitResult>, ()>  {
+    fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
+              -> Result<DataSiteResponse<DMCommitResult>, ()>  {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
@@ -283,10 +283,10 @@ impl Service for DataManager {
         };
         // check state
         match txn.state {
-            TransactionState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
-            TransactionState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
-            TransactionState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
-            TransactionState::Committing => {}
+            TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
+            TxnState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
+            TxnState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
+            TxnState::Committing => {}
         }
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();
@@ -372,7 +372,7 @@ impl Service for DataManager {
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
             let rollback_result = self.rollback(&commit_history);
-            txn.state = TransactionState::Aborted; // set to abort so it can't be abort again
+            txn.state = TxnState::Aborted; // set to abort so it can't be abort again
             txn.last_activity = get_time();
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
@@ -390,20 +390,20 @@ impl Service for DataManager {
             }
         } else {
             // all set, able to commit
-            txn.state = TransactionState::Committed;
+            txn.state = TxnState::Committed;
             txn.history = commit_history;
             txn.last_activity = get_time();
             return self.response_with(DMCommitResult::Success)
         }
     }
-    fn abort(&self, clock :&StandardVectorClock, tid: &TransactionId)
+    fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
         -> Result<DataSiteResponse<AbortResult>, ()>  {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(AbortResult::CheckFailed(CheckError::TransactionNotExisted)); }
         };
-        if txn.state == TransactionState::Aborted {
+        if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::TransactionAlreadyAborted));
         }
         let rollback_failures = {
@@ -411,17 +411,17 @@ impl Service for DataManager {
             if failures.len() == 0 { None } else { Some(failures) }
         };
         txn.last_activity = get_time();
-        txn.state = TransactionState::Aborted;
+        txn.state = TxnState::Aborted;
         self.response_with(AbortResult::Success(rollback_failures))
     }
-    fn end(&self, clock :&StandardVectorClock, tid: &TransactionId)
+    fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
              -> Result<DataSiteResponse<EndResult>, ()>  {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(EndResult::CheckFailed(CheckError::TransactionNotExisted)); }
         };
-        if !(txn.state == TransactionState::Aborted || txn.state == TransactionState::Committed) {
+        if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
             return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
@@ -432,7 +432,7 @@ impl Service for DataManager {
         }
         let affected_cells = txn.affected_cells.len();
         let mut released_locks = 0;
-        let mut waiting_list: BTreeMap<u64, BTreeSet<TransactionId>> = BTreeMap::new();
+        let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
         for mut meta in cell_metas {
             if meta.owner == Some(tid.clone()) {
                 for waiting_tid in &meta.waiting {
