@@ -120,6 +120,15 @@ pub enum TMPrepareResult {
     CheckFailed(CheckError),
 }
 
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub enum TMError {
+    TransactionNotFound,
+    CannotLocateCellServer,
+    RPCErrorFromCellServer,
+    AssertionError,
+    InvalidTransactionState(TxnState)
+}
+
 pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
     let client = DEFAULT_CLIENT_POOL.get(address)?;
     Ok(manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))

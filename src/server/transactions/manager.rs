@@ -17,15 +17,6 @@ type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum TMError {
-    TransactionNotFound,
-    CannotLocateCellServer,
-    RPCErrorFromCellServer,
-    AssertionError,
-    InvalidTransactionState(TxnState)
-}
-
 #[derive(Clone)]
 struct DataObject {
     server: u64,
