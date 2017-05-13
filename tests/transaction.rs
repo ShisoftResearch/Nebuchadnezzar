@@ -141,13 +141,16 @@ pub fn data_site_wr() {
     }
     data_map.insert(String::from("score"), Value::U64(90));
     let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), data_map.clone());
-    let cell_1_w_res = txn.write(&txn_id, &cell_1_w2).unwrap().unwrap();
+    let cell_1_w_res = txn.update(&txn_id, &cell_1_w2).unwrap().unwrap();
     match cell_1_w_res {
-        TxnExecResult::Accepted(()) => {panic!("Write existed cell should fail")}
-        TxnExecResult::Error(WriteError::CellAlreadyExisted) => {}
+        TxnExecResult::Accepted(()) => {}
         _ => {panic!("Wrong feedback {:?}", cell_1_w_res)}
     }
     assert_eq!(txn.prepare(&txn_id).unwrap().unwrap(), TMPrepareResult::Success);
     assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
-
+    let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
+    assert_eq!(cell_r2.id(), cell_1.id());
+    assert_eq!(cell_r2.data.Map().unwrap().get("id").unwrap().I64().unwrap(), 100);
+    assert_eq!(cell_r2.data.Map().unwrap().get("name").unwrap().String().unwrap(), "Jack");
+    assert_eq!(cell_r2.data.Map().unwrap().get("score").unwrap().U64().unwrap(), 90);
 }
