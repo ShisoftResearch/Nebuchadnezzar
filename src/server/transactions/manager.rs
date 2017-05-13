@@ -80,7 +80,7 @@ impl TransactionManager {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id)?;
             self.data_sites.upsert(server_id, || {
-                data_site::AsyncServiceClient::new(DEFAULT_SERVICE_ID, &client)
+                data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)
             }, |_| {});
         }
         Ok(self.data_sites .get(&server_id).unwrap().clone())
