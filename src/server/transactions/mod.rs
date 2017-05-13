@@ -57,7 +57,7 @@ pub enum TxnState {
     Committed,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DMPrepareResult {
     Wait,
     Success,
@@ -67,7 +67,7 @@ pub enum DMPrepareResult {
     NetworkError
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DMCommitResult {
     Success,
     WriteError(Id, WriteError, Vec<RollbackFailure>),
@@ -75,26 +75,26 @@ pub enum DMCommitResult {
     CheckFailed(CheckError),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum AbortResult {
     CheckFailed(CheckError),
     Success(Option<Vec<RollbackFailure>>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum EndResult {
     CheckFailed(CheckError),
     SomeLocksNotReleased,
     Success,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct RollbackFailure {
     id: Id,
     error: WriteError
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum CheckError {
     CellNumberDoesNotMatch(usize, usize),
     TransactionNotExisted,
@@ -112,7 +112,7 @@ pub enum CommitOp {
     None,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum TMPrepareResult {
     Success,
     DMPrepareError(DMPrepareResult),
@@ -120,7 +120,7 @@ pub enum TMPrepareResult {
     CheckFailed(CheckError),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum TMCommitResult {
     Success,
     CheckFailed(CheckError),

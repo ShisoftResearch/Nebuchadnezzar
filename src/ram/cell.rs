@@ -21,7 +21,7 @@ pub struct Header {
     pub hash: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
@@ -34,7 +34,7 @@ pub enum WriteError {
     NetworkingError,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,

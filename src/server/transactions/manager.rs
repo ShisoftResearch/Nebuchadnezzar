@@ -130,13 +130,6 @@ impl TransactionManager {
                             new: false,
                         });
                     },
-                    TxnExecResult::Error(ReadError::CellDoesNotExisted) => {
-                        txn.data.insert(*id, DataObject {
-                            server: server_id,
-                            cell: None,
-                            new: false,
-                        });
-                    }
                     TxnExecResult::Wait => {
                         AwaitManager::txn_wait(&await, server_id);
                         self.read_from_site(server_id, server, tid, id, txn, await);
