@@ -90,7 +90,7 @@ pub fn workspace_wr() {
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_w_res)}
     }
     assert_eq!(txn.prepare(&txn_id).unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), TMCommitResult::Success);
+    assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
 }
 
 #[test]

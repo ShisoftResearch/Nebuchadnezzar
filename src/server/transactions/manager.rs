@@ -49,7 +49,7 @@ service! {
     rpc remove(tid: TxnId, id: Id) -> TxnExecResult<(), WriteError> | TMError;
 
     rpc prepare(tid: TxnId) -> TMPrepareResult | TMError;
-    rpc commit(tid: TxnId) -> TMCommitResult | TMError;
+    rpc commit(tid: TxnId) -> EndResult | TMError;
     rpc abort(tid: TxnId) -> AbortResult | TMError;
 
     rpc go_ahead(tids: BTreeSet<TxnId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
@@ -285,11 +285,11 @@ impl TransactionManager {
                 Err(_) => {return Err(TMError::AssertionError)}
             }
         }
-        return
-            Ok(AbortResult::Success(
-                if rollback_failures.is_empty()
-                    {None} else {Some(rollback_failures)}
-            ))
+        self.sites_end(tid, changed_objs, &data_sites);
+        Ok(AbortResult::Success(
+            if rollback_failures.is_empty()
+                {None} else {Some(rollback_failures)}
+        ))
     }
     fn sites_end(&self, tid: &TxnId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
                  -> Result<EndResult, TMError> {
@@ -474,17 +474,13 @@ impl Service for TransactionManager {
         txn.state = TxnState::Prepared;
         return Ok(TMPrepareResult::Success);
     }
-    fn commit(&self, tid: &TxnId) -> Result<TMCommitResult, TMError> {
+    fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {
         let result = {
             let mut txn = self.get_transaction(tid)?;
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
             let changed_objs = &txn.changed_objects;
             let data_sites = self.data_sites(changed_objs)?;
-            let sites_end_result = self.sites_end(tid, changed_objs, &data_sites)?;
-            match sites_end_result {
-                EndResult::CheckFailed(ce) => {return Ok(TMCommitResult::CheckFailed(ce))},
-                _ => {return Ok(TMCommitResult::Success)}
-            }
+            self.sites_end(tid, changed_objs, &data_sites)
         };
         self.cleanup_transaction(tid);
         return result;
@@ -492,10 +488,13 @@ impl Service for TransactionManager {
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
             let mut txn = self.get_transaction(tid)?;
-            if txn.state == TxnState::Aborted {return Err(TMError::InvalidTransactionState(txn.state))}
-            let changed_objs = &txn.changed_objects;
-            let data_sites = self.data_sites(changed_objs)?;
-            self.sites_abort(tid, changed_objs, &data_sites)
+            if txn.state != TxnState::Aborted {
+                let changed_objs = &txn.changed_objects;
+                let data_sites = self.data_sites(changed_objs)?;
+                self.sites_abort(tid, changed_objs, &data_sites) // with end
+            } else {
+                Err(TMError::InvalidTransactionState(txn.state))
+            }
         };
         self.cleanup_transaction(tid);
         return result;
