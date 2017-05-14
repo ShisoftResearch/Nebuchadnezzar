@@ -113,7 +113,8 @@ impl TransactionManager {
             Ok(dsr) => {
                 let dsr = dsr.unwrap();
                 self.merge_clock(&dsr.clock);
-                match dsr.payload {
+                let payload = dsr.payload;
+                match payload {
                     TxnExecResult::Accepted(ref cell) => {
                         txn.data.insert(*id, DataObject {
                             server: server_id,
@@ -123,11 +124,11 @@ impl TransactionManager {
                     },
                     TxnExecResult::Wait => {
                         AwaitManager::txn_wait(&await, server_id);
-                        self.read_from_site(server_id, server, tid, id, txn, await);
+                        return self.read_from_site(server_id, server, tid, id, txn, await);
                     }
                     _ => {}
                 }
-                Ok(dsr.payload)
+                Ok(payload)
             },
             Err(e) => {
                 error!("{:?}", e);

@@ -250,8 +250,8 @@ pub fn smoke_rw() {
         let txn = txn.clone();
         threads.push(thread::spawn(move || {
             let txn_id = txn.begin().unwrap().unwrap();
-            let read_result = txn.read(&txn_id, &cell_id).unwrap().unwrap();
-            if let TxnExecResult::Accepted(mut cell) = read_result {
+            let read_result = txn.read(&txn_id, &cell_id).unwrap();
+            if let Ok(TxnExecResult::Accepted(mut cell)) = read_result {
                 let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
