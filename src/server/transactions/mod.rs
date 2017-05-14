@@ -27,11 +27,21 @@ pub type TxnId = StandardVectorClock;
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub enum TxnExecResult<A, E>
-where A: Clone, E: Clone {
+    where A: Clone, E: Clone {
     Rejected,
     Wait,
     Accepted(A),
     Error(E),
+}
+
+impl <A, E> TxnExecResult <A, E>
+    where A: Clone, E: Clone {
+    pub fn unwrap(self) -> A {
+        match self {
+            TxnExecResult::Accepted(data) => data,
+            _ => {panic!("no data for it result because it is not accepted");}
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

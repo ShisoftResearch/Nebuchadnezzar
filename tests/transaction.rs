@@ -3,9 +3,11 @@ use neb::ram::schema::*;
 use neb::server::transactions;
 use neb::ram::types::*;
 use neb::server::transactions::*;
-use std::rc::Rc;
 use neb::ram::cell::*;
 use super::*;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
 
 #[test]
 pub fn workspace_wr() {
@@ -209,4 +211,59 @@ pub fn multi_transaction() {
     txn.update(&txn_1_id, &cell_1).unwrap().unwrap(); // txn_1_id > txn_2_id, realizable
     assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(), TMPrepareResult::Success);
     assert_eq!(txn.commit(&txn_1_id).unwrap().unwrap(), EndResult::Success);
+}
+
+#[test]
+pub fn smoke_rw() {
+    // this test is likely to have unrealizable transactions and
+    // should not cause any deadlock even if they failed
+    let server_addr = String::from("127.0.0.1:5203");
+    let server = NebServer::new(ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(server_addr.clone()),
+        address: server_addr.clone(),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
+    let mut schema = Schema {
+        id: 1,
+        name: String::from("test"),
+        key_field: None,
+        fields: default_fields()
+    };
+    server.meta.schemas.new_schema(&mut schema);
+    let txn = transactions::new_client(&server_addr).unwrap();
+    let mut data_map_1 = Map::<String, Value>::new();
+    data_map_1.insert(String::from("id"), Value::I64(100));
+    data_map_1.insert(String::from("score"), Value::U64(0));
+    data_map_1.insert(String::from("name"), Value::String(String::from("Jack")));
+    let mut cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
+    server.chunks.write_cell(&mut cell_1);
+    let cell_id = cell_1.id();
+    let thread_count = 100;
+    let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
+    for _ in 0..thread_count {
+        let txn = txn.clone();
+        threads.push(thread::spawn(move || {
+            let txn_id = txn.begin().unwrap().unwrap();
+            let mut cell = txn.read(&txn_id, &cell_id).unwrap().unwrap().unwrap();
+            let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+            score += 1;
+            let mut data = cell.data.Map().unwrap().clone();
+            data.insert(String::from("score"), Value::U64(score));
+            cell.data = Value::Map(data);
+            txn.update(&txn_id, &cell).unwrap().unwrap().unwrap();
+            txn.prepare(&txn_id);
+            txn.commit(&txn_id);
+            //assert_eq!(txn.prepare(&txn_id).unwrap(), Ok(TMPrepareResult::Success));
+            //assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
+        }));
+    }
+    for handle in threads {
+        handle.join();
+    }
 }
