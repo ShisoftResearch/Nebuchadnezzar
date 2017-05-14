@@ -224,7 +224,7 @@ impl Service for DataManager {
         }
         if committing { // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert(tid.clone());
-            debug!("{:?} WAITING {:?}", tid, &meta.owner.clone());
+            debug!("READ {:?} WAITING {:?}", tid, &meta.owner.clone());
             return self.response_with(TxnExecResult::Wait);
         }
         if &meta.read < tid {
@@ -260,6 +260,7 @@ impl Service for DataManager {
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
                     meta.waiting.insert(tid.clone());
+                    debug!("WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
                     return self.response_with(DMPrepareResult::Wait)
                 }
             }
