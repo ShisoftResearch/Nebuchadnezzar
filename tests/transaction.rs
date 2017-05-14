@@ -8,6 +8,7 @@ use super::*;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
+use env_logger;
 
 #[test]
 pub fn workspace_wr() {
@@ -215,6 +216,7 @@ pub fn multi_transaction() {
 
 #[test]
 pub fn smoke_rw() {
+    env_logger::init();
     // this test is likely to have unrealizable transactions and
     // should not cause any deadlock even if they failed
     let server_addr = String::from("127.0.0.1:5203");
