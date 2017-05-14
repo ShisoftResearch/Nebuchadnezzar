@@ -165,7 +165,7 @@ impl DataManager {
         if !self.managers.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id)?;
             self.managers.upsert(server_id, || {
-                manager::AsyncServiceClient::new(DEFAULT_SERVICE_ID, &client)
+                manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
             }, |_| {});
         }
         Ok(self.managers.get(&server_id).unwrap().clone())
@@ -217,13 +217,14 @@ impl Service for DataManager {
         let mut txn = self.get_transaction(tid, server_id);
         txn.last_activity = get_time();
         if txn.state != TxnState::Started {
-            return self.response_with(TxnExecResult::Rejected)
+            return self.response_with(TxnExecResult::StateError(txn.state))
         }
         if read_too_late { // not realizable
             return self.response_with(TxnExecResult::Rejected);
         }
         if committing { // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert(tid.clone());
+            debug!("{:?} WAITING {:?}", tid, &meta.owner.clone());
             return self.response_with(TxnExecResult::Wait);
         }
         if &meta.read < tid {
@@ -244,10 +245,11 @@ impl Service for DataManager {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
+        debug!("PREPARE {:?}", tid);
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
-            return self.response_with(DMPrepareResult::TransactionStateError(txn.state))
+            return self.response_with(DMPrepareResult::StateError(txn.state))
         }
         let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
         for cell_id in cell_ids {
@@ -280,14 +282,14 @@ impl Service for DataManager {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
-            _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotExisted)); }
+            _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted)); }
         };
         txn.last_activity = get_time();
         // check state
         match txn.state {
-            TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionNotCommitted))},
-            TxnState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyAborted))},
-            TxnState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::TransactionAlreadyCommitted))},
+            TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted))},
+            TxnState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted))},
+            TxnState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted))},
             TxnState::Prepared => {}
         }
         // check cell list integrity
@@ -313,7 +315,7 @@ impl Service for DataManager {
                     };
                 },
                 &CommitOp::Remove(ref cell_id) => {
-                    let original_cell = {
+                    let original_cell  = {
                         match self.server.chunks.read_cell(cell_id) {
                             Ok(cell) => cell,
                             Err(re) => {
@@ -403,10 +405,10 @@ impl Service for DataManager {
         self.update_clock(clock);
         let mut txn = match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
-            _ => { return self.response_with(AbortResult::CheckFailed(CheckError::TransactionNotExisted)); }
+            _ => { return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted)); }
         };
         if txn.state == TxnState::Aborted {
-            return self.response_with(AbortResult::CheckFailed(CheckError::TransactionAlreadyAborted));
+            return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
         let rollback_failures = {
             let failures = self.rollback(&txn.history);
@@ -418,16 +420,18 @@ impl Service for DataManager {
     }
     fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
              -> Result<DataSiteResponse<EndResult>, ()>  {
+        debug!("END {:?}", tid);
         let result = {
             self.update_clock(clock);
             let mut txn = match self.tnxs.get_mut(tid) {
                 Some(tnx) => tnx,
-                _ => { return self.response_with(EndResult::CheckFailed(CheckError::TransactionNotExisted)); }
+                _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
             };
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
-                return self.response_with(EndResult::CheckFailed(CheckError::TransactionCannotEnd))
+                return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
             }
             let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+            debug!("AFFECTED: {}, {:?}, {:?}", txn.affected_cells.len(), txn.state, tid);
             for cell_id in &txn.affected_cells {
                 if let Some(meta) = self.cells.get_mut(cell_id){
                     cell_metas.push(meta)
@@ -454,11 +458,13 @@ impl Service for DataManager {
                 }
             }
             let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
+            debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
             for (server_id, transactions) in waiting_list { // inform waiting servers to go on
                 if let Ok(client) = self.get_tnx_manager(server_id) {
                     wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
+                    debug!("GOT CLIENT FOR WAKE UP")
                 } else {
-                    warn!("cannot inform server {} to continue it transactions", server_id);
+                    debug!("cannot inform server {} to continue its transactions", server_id);
                 }
             }
             future::join_all(wake_up_futures).wait();

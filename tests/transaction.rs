@@ -244,23 +244,26 @@ pub fn smoke_rw() {
     let mut cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
     server.chunks.write_cell(&mut cell_1);
     let cell_id = cell_1.id();
-    let thread_count = 100;
+    let thread_count = 10;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let txn = txn.clone();
         threads.push(thread::spawn(move || {
             let txn_id = txn.begin().unwrap().unwrap();
-            let mut cell = txn.read(&txn_id, &cell_id).unwrap().unwrap().unwrap();
-            let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
-            score += 1;
-            let mut data = cell.data.Map().unwrap().clone();
-            data.insert(String::from("score"), Value::U64(score));
-            cell.data = Value::Map(data);
-            txn.update(&txn_id, &cell).unwrap().unwrap().unwrap();
-            txn.prepare(&txn_id);
-            txn.commit(&txn_id);
-            //assert_eq!(txn.prepare(&txn_id).unwrap(), Ok(TMPrepareResult::Success));
-            //assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
+            let read_result = txn.read(&txn_id, &cell_id).unwrap().unwrap();
+            if let TxnExecResult::Accepted(mut cell) = read_result {
+                let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                score += 1;
+                let mut data = cell.data.Map().unwrap().clone();
+                data.insert(String::from("score"), Value::U64(score));
+                cell.data = Value::Map(data);
+                txn.update(&txn_id, &cell);
+            } else {
+                println!("Failed read, {:?}", read_result);
+            }
+            if txn.prepare(&txn_id).unwrap() == Ok(TMPrepareResult::Success) {
+                assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);
+            }
         }));
     }
     for handle in threads {

@@ -503,6 +503,7 @@ impl Service for TransactionManager {
         return result;
     }
     fn go_ahead(&self, tids: &BTreeSet<TxnId>, server_id: &u64) -> Result<(), ()> {
+        debug!("WAKE UP TXN: {:?}", tids);
         for tid in tids {
             let await_txn = self.await_manager.get_txn(tid);
             AwaitManager::txn_send(&await_txn, *server_id);

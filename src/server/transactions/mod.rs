@@ -32,6 +32,7 @@ pub enum TxnExecResult<A, E>
     Wait,
     Accepted(A),
     Error(E),
+    StateError(TxnState)
 }
 
 impl <A, E> TxnExecResult <A, E>
@@ -73,7 +74,7 @@ pub enum DMPrepareResult {
     Success,
     TransactionNotExisted,
     NotRealizable,
-    TransactionStateError(TxnState),
+    StateError(TxnState),
     NetworkError
 }
 
@@ -107,11 +108,11 @@ pub struct RollbackFailure {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum CheckError {
     CellNumberDoesNotMatch(usize, usize),
-    TransactionNotExisted,
-    TransactionNotCommitted,
-    TransactionAlreadyCommitted,
-    TransactionAlreadyAborted,
-    TransactionCannotEnd,
+    NotExisted,
+    NotCommitted,
+    AlreadyCommitted,
+    AlreadyAborted,
+    CannotEnd,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
