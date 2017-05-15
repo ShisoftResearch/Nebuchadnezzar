@@ -190,3 +190,4 @@ fabric.properties
 .idea
 oprofile_data
 profile.log
+callgrind.out.*

@@ -224,7 +224,7 @@ impl Service for DataManager {
         }
         if committing { // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert(tid.clone());
-            debug!("READ {:?} WAITING {:?}", tid, &meta.owner.clone());
+            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
             return self.response_with(TxnExecResult::Wait);
         }
         if &meta.read < tid {
@@ -260,7 +260,7 @@ impl Service for DataManager {
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
                     meta.waiting.insert(tid.clone());
-                    debug!("WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
+                    debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
                     return self.response_with(DMPrepareResult::Wait)
                 }
             }
@@ -463,7 +463,6 @@ impl Service for DataManager {
             for (server_id, transactions) in waiting_list { // inform waiting servers to go on
                 if let Ok(client) = self.get_tnx_manager(server_id) {
                     wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
-                    debug!("GOT CLIENT FOR WAKE UP")
                 } else {
                     debug!("cannot inform server {} to continue its transactions", server_id);
                 }
