@@ -24,7 +24,6 @@ pub struct CellMeta {
 
 struct Transaction {
     server: u64,
-    id: TxnId,
     state: TxnState,
     affected_cells: Vec<Id>,
     last_activity: i64,
@@ -93,7 +92,6 @@ impl DataManager {
             match t {
                 Some(t) => Some(t),
                 None => Some(Transaction {
-                    id: tid.clone(),
                     server: *server,
                     state: TxnState::Started,
                     affected_cells: Vec::new(),
@@ -482,14 +480,14 @@ impl Service for DataManager {
                 }
             }
             future::join_all(wake_up_futures).wait();
-            self.cell_meta_cleanup();
             if released_locks == affected_cells {
                 self.response_with(EndResult::Success)
             } else {
                 self.response_with(EndResult::SomeLocksNotReleased)
             }
         };
-        self.wipe_out_transaction(tid);
+        // self.cell_meta_cleanup();
+        // self.wipe_out_transaction(tid);
         return result;
     }
 }
