@@ -76,7 +76,7 @@ impl TransactionManager {
                 data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)
             }, |_| {});
         }
-        Ok(self.data_sites .get(&server_id).unwrap().clone())
+        Ok(self.data_sites.get(&server_id).unwrap().clone())
     }
     fn get_data_site_by_id(&self, id: &Id) -> io::Result<(u64, Arc<data_site::AsyncServiceClient>)> {
         match self.server.get_server_id_by_id(id) {
@@ -529,10 +529,14 @@ impl AwaitingServer {
         }
     }
     pub fn send(&self) {
+        println!(">>>>>>>>>>>>>>>>");
         self.sender.lock().send(());
+        println!("<<<<<<<<<<<<<<<<");
     }
     pub fn wait(&self) {
+        println!(">-------------->");
         self.receiver.lock().recv();
+        println!("<--------------<");
     }
 }
 
