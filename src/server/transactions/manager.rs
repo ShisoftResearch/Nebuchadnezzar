@@ -529,14 +529,10 @@ impl AwaitingServer {
         }
     }
     pub fn send(&self) {
-        println!(">>>>>>>>>>>>>>>>");
         self.sender.lock().send(());
-        println!("<<<<<<<<<<<<<<<<");
     }
     pub fn wait(&self) {
-        println!(">-------------->");
         self.receiver.lock().recv();
-        println!("<--------------<");
     }
 }
 

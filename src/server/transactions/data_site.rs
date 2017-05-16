@@ -89,43 +89,46 @@ impl DataManager {
         self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
-        if !self.tnxs.contains_key(tid) {
-            self.tnxs.upsert(tid.clone(), ||{
-                self.tnxs_sorted.lock().insert(tid.clone());
-                Transaction {
+        self.tnxs.alter(tid.clone(), |t|{
+            match t {
+                Some(t) => Some(t),
+                None => Some(Transaction {
                     id: tid.clone(),
                     server: *server,
                     state: TxnState::Started,
                     affected_cells: Vec::new(),
                     last_activity: get_time(),
                     history: BTreeMap::new(),
-                }
-            }, |_|{});
-        }
+                })
+            }
+        });
         match self.tnxs.get_mut(tid) {
             Some(tnx) => tnx,
             _ => self.get_transaction(tid, server) // it should be rare
         }
     }
     fn get_cell_meta(&self, id: &Id) -> CellMetaGuard {
-        if !self.cells.contains_key(id) {
-            self.cells.upsert(*id, || {
-                CellMeta {
-                    read: TxnId::new(),
-                    write: TxnId::new(),
-                    owner: None,
-                    waiting: BTreeSet::new(),
+        self.cells.alter(*id, |cell| {
+            match cell {
+                Some(c) => Some(c),
+                None => {
+                    Some(CellMeta {
+                        read: TxnId::new(),
+                        write: TxnId::new(),
+                        owner: None,
+                        waiting: BTreeSet::new(),
+                    })
                 }
-            }, |_|{});
-        }
+            }
+        });
         {
             let mut lru = self.cell_lru.lock();
             *lru.entry(id.clone()).or_insert(0) = get_time();
             lru.get_refresh(id);
         }
         match self.cells.get_mut(id) {
-            Some(meta) => meta,
-            _ => self.get_cell_meta(id)
+            Some(cell) => cell,
+            None => self.get_cell_meta(id)
         }
     }
     fn response_with<T>(&self, data: T)
@@ -187,18 +190,29 @@ impl DataManager {
                 )
         };
         let now = get_time();
+        let mut need_break = false;
         for (cell_id, timestamp) in cell_lru.iter() {
-            if let Some(meta) = self.cells.get(cell_id) {
-                if meta.write < oldest_transaction &&
-                   meta.read < oldest_transaction &&
-                   now - timestamp > 5 * 60 * 1000 {
-                    self.cells.remove(cell_id);
-                    evicted_cells.push(*cell_id);
-                } else {
-                    break;
+            self.cells.alter(*cell_id, |meta| {
+                match meta {
+                    Some(meta) => {
+                        if meta.write < oldest_transaction &&
+                            meta.read < oldest_transaction &&
+                            now - timestamp > 5 * 60 * 1000 {
+                            evicted_cells.push(*cell_id);
+                            return None;
+                        } else {
+                            need_break = true;
+                            return Some(meta)
+                        }
+                    },
+                    None => {
+                        evicted_cells.push(*cell_id);
+                        return None;
+                    }
                 }
-            } else {
-                evicted_cells.push(*cell_id);
+            });
+            if need_break {
+                break;
             }
         }
         for evicted_cell in &evicted_cells {

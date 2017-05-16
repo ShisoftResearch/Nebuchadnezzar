@@ -21,7 +21,7 @@ serde = "*"
 serde_derive = "*"
 bincode = "*"
 byteorder = "1"
-parking_lot = {version = "0.3", features = ["nightly"]}
+parking_lot = {version = "0.4", features = ["nightly"]}
 rand = "0.3"
 futures = "0.1.9"
 itertools = "0.6.0"
