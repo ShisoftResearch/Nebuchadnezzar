@@ -246,7 +246,7 @@ pub fn smoke_rw() {
     let mut cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
     server.chunks.write_cell(&mut cell_1);
     let cell_id = cell_1.id();
-    let thread_count = 50;
+    let thread_count = 500;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         // observed deadlock under 100 threads, Waiting check seems okay
@@ -262,7 +262,7 @@ pub fn smoke_rw() {
                 cell.data = Value::Map(data);
                 txn.update(&txn_id, &cell);
             } else {
-                println!("Failed read, {:?}", read_result);
+                // println!("Failed read, {:?}", read_result);
             }
             if txn.prepare(&txn_id).unwrap() == Ok(TMPrepareResult::Success) {
                 assert_eq!(txn.commit(&txn_id).unwrap().unwrap(), EndResult::Success);

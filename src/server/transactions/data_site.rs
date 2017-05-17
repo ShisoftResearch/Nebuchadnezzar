@@ -19,7 +19,7 @@ pub struct CellMeta {
     read: TxnId,
     write: TxnId,
     owner: Option<TxnId>, // transaction that owns the cell in Committing state
-    waiting: BTreeSet<TxnId>, // transactions that waiting for owner to finish
+    waiting: BTreeSet<(TxnId, u64)>, // transactions that waiting for owner to finish
 }
 
 struct Transaction {
@@ -223,10 +223,10 @@ impl Service for DataManager {
     fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
             -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
         self.update_clock(clock);
+        let mut txn = self.get_transaction(tid, server_id);
         let mut meta = self.get_cell_meta(id);
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
-        let mut txn = self.get_transaction(tid, server_id);
         txn.last_activity = get_time();
         if txn.state != TxnState::Started {
             return self.response_with(TxnExecResult::StateError(txn.state))
@@ -235,7 +235,7 @@ impl Service for DataManager {
             return self.response_with(TxnExecResult::Rejected);
         }
         if committing { // ts >= wt but committing, need to wait until it committed
-            meta.waiting.insert(tid.clone());
+            meta.waiting.insert((tid.clone(), *server_id));
             debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
             return self.response_with(TxnExecResult::Wait);
         }
@@ -257,7 +257,7 @@ impl Service for DataManager {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
-        debug!("PREPARE {:?}", tid);
+        debug!("PREPARE FOR {:?}, {} cells", tid, cell_ids.len());
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
@@ -271,7 +271,7 @@ impl Service for DataManager {
             }
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
-                    meta.waiting.insert(tid.clone());
+                    meta.waiting.insert((tid.clone(), *server_id));
                     debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
                     return self.response_with(DMPrepareResult::Wait)
                 }
@@ -455,13 +455,11 @@ impl Service for DataManager {
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
             for mut meta in cell_metas {
                 if meta.owner == Some(tid.clone()) {
-                    for waiting_tid in &meta.waiting {
-                        if let Some(t) = self.tnxs.get(waiting_tid) {
-                            waiting_list
-                                .entry(t.server)
-                                .or_insert_with(|| BTreeSet::new())
-                                .insert(waiting_tid.clone());
-                        }
+                    for &(ref tid, ref server_id) in &meta.waiting {
+                        waiting_list
+                            .entry(*server_id)
+                            .or_insert_with(|| BTreeSet::new())
+                            .insert(tid.clone());
                     }
                     meta.waiting.clear();
                     meta.owner = None;
@@ -486,8 +484,8 @@ impl Service for DataManager {
                 self.response_with(EndResult::SomeLocksNotReleased)
             }
         };
-        // self.cell_meta_cleanup();
-        // self.wipe_out_transaction(tid);
+        self.cell_meta_cleanup();
+        self.wipe_out_transaction(tid);
         return result;
     }
 }
