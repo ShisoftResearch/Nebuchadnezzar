@@ -249,7 +249,6 @@ pub fn smoke_rw() {
     let thread_count = 500;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
-        // observed deadlock under 100 threads, Waiting check seems okay
         let txn = txn.clone();
         threads.push(thread::spawn(move || {
             let txn_id = txn.begin().unwrap().unwrap();
