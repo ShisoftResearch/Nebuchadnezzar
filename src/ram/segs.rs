@@ -71,7 +71,7 @@ impl Segment {
         frags.insert(location);
     }
     pub fn no_frags(&self) -> bool {
-        let mut frags = self.frags.lock();
+        let frags = self.frags.lock();
         frags.is_empty()
     }
 }

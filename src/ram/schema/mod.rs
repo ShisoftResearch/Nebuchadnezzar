@@ -1,11 +1,9 @@
 use bifrost::raft::client::RaftClient;
-use bifrost_hasher::hash_str;
 
 use chashmap::CHashMap;
 use parking_lot::Mutex;
 
 use std::sync::{Arc};
-use std::collections::HashMap;
 use std::string::String;
 
 pub mod sm;

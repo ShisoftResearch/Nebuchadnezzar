@@ -246,7 +246,7 @@ pub fn smoke_rw() {
     let mut cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
     server.chunks.write_cell(&mut cell_1);
     let cell_id = cell_1.id();
-    let thread_count = 500;
+    let thread_count = 200;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let txn = txn.clone();

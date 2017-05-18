@@ -6,14 +6,12 @@ use bifrost::raft::state_machine::{master as sm_master};
 use bifrost::raft::state_machine::callback::client::SubscriptionService;
 use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
-use bifrost::membership::client::ObserverClient;
 use bifrost::conshash::weights::Weights;
 use bifrost::tcp::{STANDALONE_ADDRESS_STRING, STANDALONE_SERVER_ID};
 use ram::chunk::Chunks;
 use ram::schema::Schemas;
 use ram::schema::{sm as schema_sm};
 use ram::types::Id;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::io;
 

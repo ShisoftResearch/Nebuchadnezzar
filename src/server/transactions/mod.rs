@@ -1,11 +1,9 @@
-use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
-use bifrost::utils::time::get_time;
-use bifrost::rpc::{RPCError, ClientPool, DEFAULT_CLIENT_POOL};
+use bifrost::vector_clock::{StandardVectorClock, ServerVectorClock};
+use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
 use ram::cell::{Cell, WriteError};
 use ram::types::{Id};
 use std::sync::Arc;
 use std::io;
-use rand::Rng;
 
 pub mod manager;
 pub mod data_site;

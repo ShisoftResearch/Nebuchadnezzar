@@ -16,8 +16,8 @@ dependencies = [
  "log 0.3.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "parking_lot 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde_derive 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -31,7 +31,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#9ba808ae629ddcf8da382075964f409fd3b8fead"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#ef8a4b74bf0b0ad9a1e6d1e2ba96226694526c36"
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
@@ -45,13 +45,14 @@ dependencies = [
  "num_cpus 1.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "parking_lot 0.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde_derive 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thread-id 3.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "threadpool 1.3.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.37 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-core 0.1.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "tokio-io 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-middleware 0.1.0 (git+https://github.com/tokio-rs/tokio-middleware)",
  "tokio-proto 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-service 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -61,12 +62,12 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#9ba808ae629ddcf8da382075964f409fd3b8fead"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#ef8a4b74bf0b0ad9a1e6d1e2ba96226694526c36"
 
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#9ba808ae629ddcf8da382075964f409fd3b8fead"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#ef8a4b74bf0b0ad9a1e6d1e2ba96226694526c36"
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
 ]
@@ -78,7 +79,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "byteorder 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-traits 0.1.37 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -322,12 +323,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "serde"
-version = "1.0.5"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "serde_derive"
-version = "1.0.5"
+version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "quote 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -564,8 +565,8 @@ dependencies = [
 "checksum regex 0.1.80 (registry+https://github.com/rust-lang/crates.io-index)" = "4fd4ace6a8cf7860714a2c2280d6c1f7e6a413486c13298bbc86fd3da019402f"
 "checksum regex-syntax 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)" = "f9ec002c35e86791825ed294b50008eea9ddfc8def4420124fbc6b08db834957"
 "checksum scoped-tls 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "f417c22df063e9450888a7561788e9bd46d3bb3c1466435b4eccb903807f147d"
-"checksum serde 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)" = "e101024c846392aadc80d5d452f2ff011f9bff1a0441151f8575e8a23488ef95"
-"checksum serde_derive 1.0.5 (registry+https://github.com/rust-lang/crates.io-index)" = "7c85839e9a00a5b0c7bddb1e44b8c3907c7aba5fe234c7ec5ccef1c188eb41d9"
+"checksum serde 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)" = "38a3db3a5757f68069aba764b793823ea9fb9717c42c016f8903f8add50f508a"
+"checksum serde_derive 1.0.6 (registry+https://github.com/rust-lang/crates.io-index)" = "e46ef71ee001a4279a4513e79a6ebbb59da3a4987bf77a6df2e5534cd6f21d82"
 "checksum serde_derive_internals 0.15.0 (registry+https://github.com/rust-lang/crates.io-index)" = "021c338d22c7e30f957a6ab7e388cb6098499dda9fd4ba1661ee074ca7a180d1"
 "checksum slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)" = "17b4fcaed89ab08ef143da37bc52adbcc04d4a69014f4c1208d6b51f0c47bc23"
 "checksum smallvec 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)" = "4c8cbcd6df1e117c2210e13ab5109635ad68a929fcbb8964dc965b76cb5ee013"
