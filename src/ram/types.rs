@@ -1,13 +1,9 @@
 use ram::cell::Header;
-use libc;
 use std::cmp::PartialEq;
 use std::string::String;
-use std::any::Any;
 use std::collections::hash_map;
 use std::cmp::Ordering;
 use utils::rand;
-
-use serde::{Serialize, Deserialize, Serializer, Deserializer};
 
 macro_rules! gen_primitive_types_io {
     (

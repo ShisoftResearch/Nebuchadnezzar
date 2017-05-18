@@ -1,5 +1,4 @@
 use ram::cell::{Cell, ReadError, WriteError};
-use ram::chunk::Chunks;
 use ram::types::Id;
 use server::NebServer;
 

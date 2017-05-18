@@ -1,4 +1,4 @@
-use bifrost::vector_clock::{VectorClock, StandardVectorClock, ServerVectorClock};
+use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, WriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -26,7 +26,6 @@ struct DataObject {
 
 struct Transaction {
     start_time: i64, // use for timeout detecting
-    id: TxnId,
     data: BTreeMap<Id, DataObject>,
     changed_objects: ChangedObjs,
     state: TxnState,
@@ -266,7 +265,7 @@ impl TransactionManager {
                     let payload = asr.payload;
                     self.merge_clock(&asr.clock);
                     match payload {
-                        AbortResult::Success(mut failures) => {
+                        AbortResult::Success(failures) => {
                             if let Some(mut failures) = failures {
                                 rollback_failures.append(&mut failures);
                             }
@@ -326,7 +325,6 @@ impl Service for TransactionManager {
         let id = self.server.txn_peer.clock.inc();
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
-            id: id.clone(),
             data: BTreeMap::new(),
             changed_objects: ChangedObjs::new(),
             state: TxnState::Started
@@ -334,10 +332,10 @@ impl Service for TransactionManager {
         Ok(id)
     }
     fn read(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let mut txn = self.get_transaction(tid)?;
+        let txn = self.get_transaction(tid)?;
         self.ensure_rw_state(&txn)?;
-        if let Some(dataObj) = txn.data.get(id) {
-            match dataObj.cell {
+        if let Some(data_obj) = txn.data.get(id) {
+            match data_obj.cell {
                 Some(ref cell) => {
                     return Ok(TxnExecResult::Accepted(cell.clone())) // read from cache
                 },
@@ -455,12 +453,12 @@ impl Service for TransactionManager {
                             TMPrepareResult::Success
                         },
                         _ => {
-                            self.sites_abort(tid, generated_objs, &data_sites);
+                            let _ = self.sites_abort(tid, generated_objs, &data_sites);
                             TMPrepareResult::DMCommitError(sites_commit_result)
                         }
                     }
                 } else {
-                    self.sites_abort(tid, generated_objs, &data_sites);
+                    let _ = self.sites_abort(tid, generated_objs, &data_sites);
                     TMPrepareResult::DMPrepareError(sites_prepare_result)
                 }
             };
@@ -480,7 +478,7 @@ impl Service for TransactionManager {
     }
     fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {
         let result = {
-            let mut txn = self.get_transaction(tid)?;
+            let txn = self.get_transaction(tid)?;
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
             let changed_objs = &txn.changed_objects;
             let data_sites = self.data_sites(changed_objs)?;
@@ -491,7 +489,7 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
-            let mut txn = self.get_transaction(tid)?;
+            let txn = self.get_transaction(tid)?;
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.changed_objects;
                 let data_sites = self.data_sites(changed_objs)?;
@@ -529,10 +527,10 @@ impl AwaitingServer {
         }
     }
     pub fn send(&self) {
-        self.sender.lock().send(());
+        let _ = self.sender.lock().send(());
     }
     pub fn wait(&self) {
-        self.receiver.lock().recv();
+        let _ = self.receiver.lock().recv();
     }
 }
 

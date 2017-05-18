@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
+use parking_lot::{RwLock, RwLockReadGuard, Mutex};
 
 use super::cell::Header;
 

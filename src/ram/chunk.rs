@@ -1,10 +1,8 @@
 use libc;
-use std::thread;
-use std::rc::Rc;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::Schemas;
 use ram::types::Id;

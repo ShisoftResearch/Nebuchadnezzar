@@ -1,4 +1,4 @@
-use bifrost::vector_clock::{StandardVectorClock, Relation};
+use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
 use std::collections::{BTreeSet, BTreeMap};
 use chashmap::{CHashMap, WriteGuard};
@@ -11,8 +11,8 @@ use super::*;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
-pub type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
-pub type CommitHistory = BTreeMap<Id, CellHistory>;
+type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
+type CommitHistory = BTreeMap<Id, CellHistory>;
 
 #[derive(Debug)]
 pub struct CellMeta {
@@ -23,7 +23,6 @@ pub struct CellMeta {
 }
 
 struct Transaction {
-    server: u64,
     state: TxnState,
     affected_cells: Vec<Id>,
     last_activity: i64,
@@ -81,9 +80,6 @@ impl DataManager {
             server: server.clone(),
         })
     }
-    fn local_clock(&self) -> StandardVectorClock {
-        self.server.txn_peer.clock.to_clock()
-    }
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
@@ -92,7 +88,6 @@ impl DataManager {
             match t {
                 Some(t) => Some(t),
                 None => Some(Transaction {
-                    server: *server,
                     state: TxnState::Started,
                     affected_cells: Vec::new(),
                     last_activity: get_time(),
@@ -436,7 +431,7 @@ impl Service for DataManager {
         debug!("END {:?}", tid);
         let result = {
             self.update_clock(clock);
-            let mut txn = match self.tnxs.get_mut(tid) {
+            let txn = match self.tnxs.get_mut(tid) {
                 Some(tnx) => tnx,
                 _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
             };
