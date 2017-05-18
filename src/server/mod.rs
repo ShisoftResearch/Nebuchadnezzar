@@ -49,7 +49,7 @@ pub struct NebServer {
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
-    pub consh: Option<Arc<ConsistentHashing>>,
+    pub consh: Arc<ConsistentHashing>,
     pub member_pool: rpc::ClientPool,
     pub txn_peer: transactions::Peer,
     pub server_id: u64
@@ -140,18 +140,15 @@ impl NebServer {
     pub fn new(opt: ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
-        let mut conshasing = None;
         let mut schemas = Schemas::new(None);
         rpc::Server::listen_and_resume(&rpc_server);
         if opt.is_meta {
             NebServer::load_meta_server(&opt, &rpc_server)?;
         }
-        if !opt.standalone {
-            conshasing = Some(NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
-        }
-        if !opt.is_meta && !opt.standalone {
+        if !opt.is_meta && opt.standalone {
             return Err(ServerError::StandaloneMustAlsoBeMetaServer)
         }
+        let mut conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
         let meta_rc = Arc::new(ServerMeta {
             schemas: schemas
         });
@@ -185,27 +182,17 @@ impl NebServer {
         Ok(server)
     }
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        match self.consh {
-            Some(ref consh) => {
-                if let Some(server_id) = consh.get_server_id(id.higher) {
-                    Some(server_id)
-                } else {
-                    None
-                }
-            },
-            _ => Some(STANDALONE_SERVER_ID.clone())
+        if let Some(server_id) = self.consh.get_server_id(id.higher) {
+            Some(server_id)
+        } else {
+            None
         }
     }
     pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
-        match self.consh {
-            Some(ref consh) => {
-                if let Some(ref server_name) = consh.to_server_name(Some(server_id)) {
-                    self.member_pool.get(server_name)
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "Cannot find server id in consistent hash table"))
-                }
-            },
-            _ => self.member_pool.get(&STANDALONE_ADDRESS_STRING)
+        if let Some(ref server_name) = self.consh.to_server_name(Some(server_id)) {
+            self.member_pool.get(server_name)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "Cannot find server id in consistent hash table"))
         }
     }
 }

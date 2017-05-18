@@ -8,9 +8,10 @@
 extern crate libc;
 extern crate chashmap;
 
+pub mod utils;
 pub mod ram;
 pub mod server;
-pub mod utils;
+pub mod client;
 
 #[macro_use]
 extern crate log;
