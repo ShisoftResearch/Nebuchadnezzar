@@ -192,3 +192,4 @@ oprofile_data
 profile.log
 callgrind.out.*
 *.iml
+.vscode
