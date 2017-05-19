@@ -77,14 +77,13 @@ impl Client {
             }
             match exec_result {
                 Ok(()) => {
-                    return Ok(())
+                    return Ok(());
                 },
                 Err(TxnError::NotRealizable) =>{
                     txn.abort();
                 },
                 Err(e) => {
-                    txn.abort();
-                    return Err(e);
+                    txn.abort()?; // abort will always be an error to achieve early break
                 }
             }
             retried += 1;
