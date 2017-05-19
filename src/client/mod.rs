@@ -13,7 +13,6 @@ use self::transaction::*;
 static TRANSACTION_MAX_RETRY: u32 = 50;
 
 pub mod transaction;
-pub mod plain;
 
 pub enum NebClientError {
     RaftClientError(ClientError),
