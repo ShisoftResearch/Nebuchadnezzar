@@ -46,8 +46,8 @@ impl Client {
     fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
         unimplemented!()
     }
-    fn transaction<TFN>(&self, func: TFN) -> Result<(), TxnError>
-        where TFN: Fn(Transaction) -> Result<(), TxnError> {
+    fn transaction<TFN>(&self, mut func: TFN) -> Result<(), TxnError>
+        where TFN: FnMut(&mut Transaction) -> Result<(), TxnError> {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
@@ -63,15 +63,29 @@ impl Client {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin)
             };
-            let txn = Transaction{
+            let mut txn = Transaction{
                 tid: txn_id,
+                state: txn_server::TxnState::Started,
                 client: txn_client.clone()
             };
-            let exec_result = func(txn);
+            let mut exec_result = func(&mut txn);
+            if exec_result.is_ok() && txn.state == txn_server::TxnState::Started {
+                exec_result = txn.prepare();
+            }
+            if exec_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
+                exec_result = txn.commit();
+            }
             match exec_result {
-                Ok(()) => return Ok(()),
-                Err(TxnError::NotRealizable) => continue,
-                Err(e) => return Err(e)
+                Ok(()) => {
+                    return Ok(())
+                },
+                Err(TxnError::NotRealizable) =>{
+                    txn.abort();
+                },
+                Err(e) => {
+                    txn.abort();
+                    return Err(e);
+                }
             }
             retried += 1;
         }

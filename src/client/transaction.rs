@@ -14,17 +14,19 @@ pub enum TxnError {
     NotRealizable,
     TooManyRetry,
     InternalError,
+    Aborted,
     RPCError(RPCError),
     ManagerError(TMError),
     ReadError(ReadError),
     WriteError(WriteError),
     PrepareError(TMPrepareResult),
     CommitError(EndResult),
-    AbortError(AbortResult)
+    AbortError(AbortResult),
 }
 
 pub struct Transaction {
     pub tid: TxnId,
+    pub state: TxnState,
     pub client: Arc<manager::SyncServiceClient>
 }
 
@@ -72,9 +74,10 @@ impl Transaction {
         }
     }
 
-    pub fn prepare(&self) -> Result<(), TxnError> {
+    pub fn prepare(&mut self) -> Result<(), TxnError> {
+        self.state = TxnState::Prepared;
         match self.client.prepare(&self.tid) {
-            Ok(Ok(TMPrepareResult::Success)) => Ok(()),
+            Ok(Ok(TMPrepareResult::Success)) => return Ok(()),
             Ok(Ok(TMPrepareResult::DMPrepareError
                   (DMPrepareResult::NotRealizable))) =>
                 Err(TxnError::NotRealizable),
@@ -86,18 +89,21 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-    pub fn commit(&self) -> Result<(), TxnError> {
+    pub fn commit(&mut self) -> Result<(), TxnError> {
+        self.state = TxnState::Committed;
         match self.client.commit(&self.tid) {
-            Ok(Ok(EndResult::Success)) => Ok(()),
-            Ok(Ok(EndResult::SomeLocksNotReleased)) => Ok(()),
+            Ok(Ok(EndResult::Success)) => return Ok(()),
+            Ok(Ok(EndResult::SomeLocksNotReleased)) => return Ok(()),
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-    pub fn abort(&self) -> Result<(), TxnError> {
+    pub fn abort(&mut self) -> Result<(), TxnError> {
+        if self.state == TxnState::Aborted {return Ok(());}
+        self.state = TxnState::Aborted;
         match self.client.abort(&self.tid) {
-            Ok(Ok(AbortResult::Success(_))) => Ok(()),
+            Ok(Ok(AbortResult::Success(_))) => Err(TxnError::Aborted),
             Ok(Ok(ar)) => Err(TxnError::AbortError(ar)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e))
