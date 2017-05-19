@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::io;
 use bifrost::conshash::{ConsistentHashing, CHError};
 use bifrost::raft::client::{RaftClient, ClientError};
 use bifrost::raft;
+use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
 
-use server::{transactions as txn_server};
+use server::{transactions as txn_server, cell_rpc as plain_server};
 use ram::types::Id;
 use ram::cell::{Cell, ReadError, WriteError};
 use self::transaction::*;
@@ -34,17 +36,35 @@ impl Client {
             Err(err) => Err(NebClientError::RaftClientError(err))
         }
     }
-    pub fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
-        unimplemented!()
+    pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
+        match self.conshash.get_server(id.higher) {
+            Some(n) => Ok(n),
+            None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, "cannot locate")))
+        }
     }
-    fn write_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
-         unimplemented!()
+    pub fn locate_plain_server(&self, id: &Id) -> Result<Arc<plain_server::SyncServiceClient>, RPCError> {
+        let address = self.locate_server_address(id)?;
+        let client = match DEFAULT_CLIENT_POOL.get(&address) {
+            Ok(c) => c,
+            Err(e) => return Err(RPCError::IOError(e))
+        };
+        Ok(plain_server::SyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
     }
-    fn update_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
-        unimplemented!()
+    pub fn read_cell(&self, id: &Id) -> Result<Result<Cell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id)?;
+        client.read_cell(id)
     }
-    fn remove_cell(&self, key: &Id) -> Result<(), WriteError> {
-        unimplemented!()
+    fn write_cell(&self, cell: &Cell) -> Result<Result<Cell, WriteError>, RPCError> {
+        let client = self.locate_plain_server(&cell.id())?;
+        client.write_cell(cell)
+    }
+    fn update_cell(&self, cell: &Cell) -> Result<Result<Cell, WriteError>, RPCError> {
+        let client = self.locate_plain_server(&cell.id())?;
+        client.update_cell(cell)
+    }
+    fn remove_cell(&self, id: &Id) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id)?;
+        client.remove_cell(id)
     }
     fn transaction<TFN>(&self, mut func: TFN) -> Result<(), TxnError>
         where TFN: FnMut(&mut Transaction) -> Result<(), TxnError> {
@@ -80,7 +100,7 @@ impl Client {
                     return Ok(());
                 },
                 Err(TxnError::NotRealizable) =>{
-                    txn.abort();
+                    txn.abort();  // continue the loop to retry
                 },
                 Err(e) => {
                     txn.abort()?; // abort will always be an error to achieve early break
