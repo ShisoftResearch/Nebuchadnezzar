@@ -8,6 +8,8 @@ use ram::types::Id;
 use ram::cell::{Cell, ReadError, WriteError};
 use self::transaction::*;
 
+static TRANSACTION_MAX_RETRY: u32 = 50;
+
 pub mod transaction;
 pub mod plain;
 
@@ -55,7 +57,8 @@ impl Client {
             Err(e) => return Err(TxnError::IoError(e))
         };
         let mut txn_id: txn_server::TxnId;
-        while true {
+        let mut retried = 0;
+        while retried < TRANSACTION_MAX_RETRY {
             txn_id = match txn_client.begin() {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin)
@@ -70,7 +73,8 @@ impl Client {
                 Err(TxnError::NotRealizable) => continue,
                 Err(e) => return Err(e)
             }
+            retried += 1;
         }
-        Ok(())
+        Err(TxnError::TooManyRetry)
     }
 }

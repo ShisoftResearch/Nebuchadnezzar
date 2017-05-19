@@ -9,7 +9,8 @@ pub enum TxnError {
     CannotFindAServer,
     IoError(io::Error),
     CannotBegin,
-    NotRealizable
+    NotRealizable,
+    TooManyRetry,
 }
 
 pub struct Transaction {
