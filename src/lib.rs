@@ -5,9 +5,6 @@
 #![plugin(bifrost_plugins)]
 #![feature(conservative_impl_trait)]
 
-extern crate libc;
-extern crate chashmap;
-
 pub mod utils;
 pub mod ram;
 pub mod server;
@@ -30,3 +27,5 @@ extern crate core;
 extern crate rand;
 extern crate futures;
 extern crate linked_hash_map;
+extern crate libc;
+extern crate chashmap;

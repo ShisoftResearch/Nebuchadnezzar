@@ -18,6 +18,7 @@ static TRANSACTION_MAX_RETRY: u32 = 50;
 
 pub mod transaction;
 
+#[derive(Debug)]
 pub enum NebClientError {
     RaftClientError(ClientError),
     ConsistentHashtableError(CHError)
