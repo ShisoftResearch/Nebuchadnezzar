@@ -27,6 +27,8 @@ pub fn data_site_wr() {
         key_field: None,
         fields: default_fields()
     };
-    let client = client::Client::new(&vec!(server_addr), &String::from("test")).unwrap();
+    let client = client::Client::new(
+        &server.rpc, &vec!(server_addr),
+        &String::from("test")).unwrap();
     
 }

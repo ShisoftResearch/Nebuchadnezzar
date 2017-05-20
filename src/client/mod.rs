@@ -3,7 +3,7 @@ use std::io;
 use bifrost::conshash::{ConsistentHashing, CHError};
 use bifrost::raft::client::{RaftClient, ClientError};
 use bifrost::raft;
-use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL, Server as RPCServer};
 use bifrost::raft::state_machine::master::ExecError;
 
 use server::{transactions as txn_server, cell_rpc as plain_server};
@@ -31,9 +31,10 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(meta_servers: &Vec<String>, group: &String) -> Result<Client, NebClientError> {
+    pub fn new(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &String) -> Result<Client, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
+                raft_client.prepare_subscription(subscription_server);
                 match ConsistentHashing::new_client(group, &raft_client) {
                     Ok(chash) => Ok(Client {
                         conshash: chash,

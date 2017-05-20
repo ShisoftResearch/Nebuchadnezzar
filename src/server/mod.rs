@@ -89,10 +89,6 @@ impl NebServer {
         Weights::new(&raft_service);
         return Ok(());
     }
-    fn load_subscription(rpc_server: &Arc<rpc::Server>, raft_client: &RaftClient) {
-        let subs_service = SubscriptionService::initialize(rpc_server);
-        raft_client.set_subscription(&subs_service);
-    }
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
         match member_service.join_group(&opt.group_name) {
@@ -127,7 +123,7 @@ impl NebServer {
         match raft_client {
             Ok(raft_client) => {
                 *schemas = Schemas::new(Some(&raft_client));
-                NebServer::load_subscription(rpc_server, &raft_client);
+                raft_client.prepare_subscription(rpc_server);
                 NebServer::join_group(opt, &raft_client)?;
                 Ok(NebServer::init_conshash(opt, &raft_client)?)
             },
