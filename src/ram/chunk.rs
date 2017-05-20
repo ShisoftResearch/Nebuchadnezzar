@@ -117,24 +117,22 @@ impl Chunk {
         if self.location_for_read(hash).is_some() {
             return Err(WriteError::CellAlreadyExisted);
         } else {
-            let written = cell.write_to_chunk(self);
+            let loc = cell.write_to_chunk(self)?;
             let mut need_rollback = false;
-            if let Ok(loc) = written {
-                self.index.upsert(
-                    hash,
-                    ||{loc},
-                    |inserted_loc| {
-                        if *inserted_loc == 0 {
-                            *inserted_loc = loc
-                        } else {
-                            need_rollback = true;
-                        }
+            self.index.upsert(
+                hash,
+                ||{loc},
+                |inserted_loc| {
+                    if *inserted_loc == 0 {
+                        *inserted_loc = loc
+                    } else {
+                        need_rollback = true;
                     }
-                );
-                if need_rollback {
-                    self.put_tombstone(loc);
-                    return Err(WriteError::CellAlreadyExisted)
                 }
+            );
+            if need_rollback {
+                self.put_tombstone(loc);
+                return Err(WriteError::CellAlreadyExisted)
             }
             return Ok(cell.header)
         }
@@ -142,12 +140,10 @@ impl Chunk {
     fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_for_write(hash) {
-            let written = cell.write_to_chunk(self);
-            if let Ok(new_location) = written {
-                let old_location = *cell_location;
-                *cell_location = new_location;
-                self.put_tombstone(old_location);
-            }
+            let new_location = cell.write_to_chunk(self)?;
+            let old_location = *cell_location;
+            *cell_location = new_location;
+            self.put_tombstone(old_location);
             return Ok(cell.header);
         } else {
             return Err(WriteError::CellDoesNotExisted)
@@ -161,12 +157,10 @@ impl Chunk {
                 Ok(cell) => {
                     let mut new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
-                        let written = new_cell.write_to_chunk(self);
-                        if let Ok(new_location) = written {
-                            let old_location = *cell_location;
-                            *cell_location = new_location;
-                            self.put_tombstone(old_location);
-                        }
+                        let new_location = new_cell.write_to_chunk(self)?;
+                        let old_location = *cell_location;
+                        *cell_location = new_location;
+                        self.put_tombstone(old_location);
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);

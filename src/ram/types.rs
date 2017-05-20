@@ -204,22 +204,6 @@ macro_rules! define_types {
     );
 }
 
-macro_rules! rc {
-    (
-        $read:ident
-    ) => (
-        $read
-    );
-}
-
-macro_rules! wc {
-    (
-        $rwrite:ident
-    ) => (
-        $rwrite
-    );
-}
-
 gen_primitive_types_io!(
     bool:   bool_io       ;
     char:   char_io       ;

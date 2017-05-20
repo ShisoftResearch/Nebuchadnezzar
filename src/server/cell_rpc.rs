@@ -1,4 +1,4 @@
-use ram::cell::{Cell, ReadError, WriteError};
+use ram::cell::{Cell, Header, ReadError, WriteError};
 use ram::types::Id;
 use server::NebServer;
 
@@ -8,8 +8,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
 service! {
     rpc read_cell(key: Id) -> Cell | ReadError;
-    rpc write_cell(cell: Cell) -> Cell | WriteError;
-    rpc update_cell(cell: Cell) -> Cell | WriteError;
+    rpc write_cell(cell: Cell) -> Header | WriteError;
+    rpc update_cell(cell: Cell) -> Header | WriteError;
     rpc remove_cell(key: Id) -> () | WriteError;
 }
 
@@ -21,17 +21,17 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
         self.server.chunks.read_cell(&key)
     }
-    fn write_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
+    fn write_cell(&self, cell: &Cell) -> Result<Header, WriteError> {
         let mut cell = cell.clone();
         match self.server.chunks.write_cell(&mut cell) {
-            Ok(_) => Ok(cell),
+            Ok(header) => Ok(header),
             Err(e) => Err(e)
         }
     }
-    fn update_cell(&self, cell: &Cell) -> Result<Cell, WriteError> {
+    fn update_cell(&self, cell: &Cell) -> Result<Header, WriteError> {
         let mut cell = cell.clone();
         match self.server.chunks.update_cell(&mut cell) {
-            Ok(_) => Ok(cell),
+            Ok(header) => Ok(header),
             Err(e) => Err(e)
         }
     }

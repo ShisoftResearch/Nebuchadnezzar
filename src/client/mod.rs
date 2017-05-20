@@ -8,7 +8,7 @@ use bifrost::raft::state_machine::master::ExecError;
 
 use server::{transactions as txn_server, cell_rpc as plain_server};
 use ram::types::Id;
-use ram::cell::{Cell, ReadError, WriteError};
+use ram::cell::{Cell, Header, ReadError, WriteError};
 use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::sm::{DEFAULT_SM_ID};
 use ram::schema::Schema;
@@ -65,19 +65,19 @@ impl Client {
         let client = self.locate_plain_server(id)?;
         client.read_cell(id)
     }
-    fn write_cell(&self, cell: &Cell) -> Result<Result<Cell, WriteError>, RPCError> {
+    pub fn write_cell(&self, cell: &Cell) -> Result<Result<Header, WriteError>, RPCError> {
         let client = self.locate_plain_server(&cell.id())?;
         client.write_cell(cell)
     }
-    fn update_cell(&self, cell: &Cell) -> Result<Result<Cell, WriteError>, RPCError> {
+    pub fn update_cell(&self, cell: &Cell) -> Result<Result<Header, WriteError>, RPCError> {
         let client = self.locate_plain_server(&cell.id())?;
         client.update_cell(cell)
     }
-    fn remove_cell(&self, id: &Id) -> Result<Result<(), WriteError>, RPCError> {
+    pub fn remove_cell(&self, id: &Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = self.locate_plain_server(id)?;
         client.remove_cell(id)
     }
-    fn transaction<TFN>(&self, mut func: TFN) -> Result<(), TxnError>
+    pub fn transaction<TFN>(&self, mut func: TFN) -> Result<(), TxnError>
         where TFN: FnMut(&mut Transaction) -> Result<(), TxnError> {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
@@ -121,17 +121,17 @@ impl Client {
         }
         Err(TxnError::TooManyRetry)
     }
-    fn new_schema(&self, schema: &mut Schema) -> Result<(), ExecError> {
+    pub fn new_schema(&self, schema: &mut Schema) -> Result<(), ExecError> {
         let schema_id = self.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
         self.schema_client.new_schema(schema)?;
         Ok(())
     }
-    fn del_schema(&self, schema_id: &String) -> Result<(), ExecError> {
+    pub fn del_schema(&self, schema_id: &String) -> Result<(), ExecError> {
         self.schema_client.del_schema(schema_id)?;
         Ok(())
     }
-    fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
+    pub fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         Ok(self.schema_client.get_all()?.unwrap())
     }
 }
