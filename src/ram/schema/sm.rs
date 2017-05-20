@@ -20,7 +20,7 @@ pub struct SchemasSM {
 }
 
 raft_state_machine! {
-    def qry get_all() -> SchemasData;
+    def qry get_all() -> Vec<Schema>;
     def cmd new_schema(schema: Schema);
     def cmd del_schema(name: String);
     def cmd next_id() -> u32;
@@ -29,8 +29,8 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for SchemasSM {
-    fn get_all(&self) -> Result<SchemasData, ()> {
-        Ok(self.to_data())
+    fn get_all(&self) -> Result<Vec<Schema>, ()> {
+        Ok(self.schema_map.values().cloned().collect())
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), ()> {
         let schema_clone = schema.clone();

@@ -4,10 +4,14 @@ use bifrost::conshash::{ConsistentHashing, CHError};
 use bifrost::raft::client::{RaftClient, ClientError};
 use bifrost::raft;
 use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
+use bifrost::raft::state_machine::master::ExecError;
 
 use server::{transactions as txn_server, cell_rpc as plain_server};
 use ram::types::Id;
 use ram::cell::{Cell, ReadError, WriteError};
+use ram::schema::sm::client::{SMClient as SchemaClient};
+use ram::schema::sm::{DEFAULT_SM_ID};
+use ram::schema::Schema;
 use self::transaction::*;
 
 static TRANSACTION_MAX_RETRY: u32 = 50;
@@ -21,6 +25,8 @@ pub enum NebClientError {
 
 pub struct Client {
     pub conshash: Arc<ConsistentHashing>,
+    pub raft_client: Arc<RaftClient>,
+    pub schema_client: SchemaClient
 }
 
 impl Client {
@@ -28,7 +34,11 @@ impl Client {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
                 match ConsistentHashing::new_client(group, &raft_client) {
-                    Ok(chash) => Ok(Client {conshash: chash}),
+                    Ok(chash) => Ok(Client {
+                        conshash: chash,
+                        raft_client: raft_client.clone(),
+                        schema_client: SchemaClient::new(DEFAULT_SM_ID, &raft_client)
+                    }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err))
                 }
             },
@@ -108,5 +118,18 @@ impl Client {
             retried += 1;
         }
         Err(TxnError::TooManyRetry)
+    }
+    fn new_schema(&self, schema: &mut Schema) -> Result<(), ExecError> {
+        let schema_id = self.schema_client.next_id()?.unwrap();
+        schema.id = schema_id;
+        self.schema_client.new_schema(schema)?;
+        Ok(())
+    }
+    fn del_schema(&self, schema_id: &String) -> Result<(), ExecError> {
+        self.schema_client.del_schema(schema_id)?;
+        Ok(())
+    }
+    fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
+        Ok(self.schema_client.get_all()?.unwrap())
     }
 }

@@ -8,6 +8,7 @@ mod types;
 mod server;
 mod cell;
 mod transaction;
+mod client;
 
 #[macro_use]
 extern crate log;
