@@ -38,7 +38,8 @@ impl StateMachineCmds for SchemasSM {
         let id = schema.id;
         self.schema_map.insert(id, schema);
         self.name_map.insert(name, id);
-        self.callback.notify(&commands::on_schema_added::new(), Ok(schema_clone));
+        println!("-----------> {:?}",
+                 self.callback.notify(&commands::on_schema_added::new(), Ok(schema_clone)));
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), ()> {

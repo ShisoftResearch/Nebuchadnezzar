@@ -1,5 +1,5 @@
 use neb::server::*;
-use neb::ram::schema::Schemas;
+use neb::ram::schema::ServerSchemas;
 use std::rc::Rc;
 
 #[test]

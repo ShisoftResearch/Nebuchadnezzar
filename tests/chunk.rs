@@ -37,7 +37,7 @@ pub fn cell_rw () {
     data_map.insert(String::from("score"), Value::U64(70));
     data_map.insert(String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
-    let schemas = Schemas::new(None);
+    let schemas = ServerSchemas::new(None);
     let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
         schemas: schemas.clone()
     }), None);
