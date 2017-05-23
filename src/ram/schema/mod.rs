@@ -37,22 +37,22 @@ pub struct Field {
     pub sub: Option<Vec<Field>>
 }
 
-pub struct ServerSchemas {
+pub struct SchemasServer {
     schema_map: CHashMap<u32, Arc<Schema>>,
     name_map: CHashMap<String, u32>,
     id_counter: Mutex<u32>,
     sm: Option<sm::client::SMClient>,
 }
 
-impl ServerSchemas {
-    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Arc<ServerSchemas> {
+impl SchemasServer {
+    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Arc<SchemasServer> {
         let sm = match raft_client {
             Some(raft) => {
                 Some(sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft))
             },
             None => None
         };
-        let schemas = Arc::new(ServerSchemas {
+        let schemas = Arc::new(SchemasServer {
             schema_map: CHashMap::new(),
             name_map: CHashMap::new(),
             id_counter: Mutex::new(0),
