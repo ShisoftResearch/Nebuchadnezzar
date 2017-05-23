@@ -123,10 +123,9 @@ impl NebServer {
         match raft_client {
             Ok(raft_client) => {
                 raft_client.prepare_subscription(rpc_server);
-                println!("=============<>");
                 NebServer::join_group(opt, &raft_client)?;
                 let conshash = NebServer::init_conshash(opt, &raft_client)?;
-                *schemas = SchemasServer::new(Some(&raft_client)); // why deadlock?
+                *schemas = SchemasServer::new(Some(&raft_client));
                 Ok(conshash)
             },
             Err(e) => {
