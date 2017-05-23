@@ -14,9 +14,9 @@ libc = "*"
 log = "0.3"
 lazy_static = "*"
 chashmap = "*"
-bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
+bifrost = {  path = "../bifrost"  }
+bifrost_plugins = { path = "../bifrost/src/plugins" }
+bifrost_hasher = { path = "../bifrost/src/hasher" }
 serde = "*"
 serde_derive = "*"
 bincode = "*"
