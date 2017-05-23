@@ -9,7 +9,7 @@ use bifrost::membership::member::MemberService;
 use bifrost::conshash::weights::Weights;
 use bifrost::tcp::{STANDALONE_ADDRESS_STRING, STANDALONE_SERVER_ID};
 use ram::chunk::Chunks;
-use ram::schema::Schemas;
+use ram::schema::ServerSchemas;
 use ram::schema::{sm as schema_sm};
 use ram::types::Id;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub struct ServerOptions {
 }
 
 pub struct ServerMeta {
-    pub schemas: Arc<Schemas>
+    pub schemas: Arc<ServerSchemas>
 }
 
 pub struct NebServer {
@@ -117,13 +117,13 @@ impl NebServer {
         }
     }
     fn load_cluster_clients
-    (opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>)
-    -> Result<Arc<ConsistentHashing>, ServerError>{
+    (opt: &ServerOptions, schemas: &mut Arc<ServerSchemas>, rpc_server: &Arc<rpc::Server>)
+     -> Result<Arc<ConsistentHashing>, ServerError>{
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
-                *schemas = Schemas::new(Some(&raft_client));
                 raft_client.prepare_subscription(rpc_server);
+                //*schemas = ServerSchemas::new(Some(&raft_client)); // why deadlock?
                 NebServer::join_group(opt, &raft_client)?;
                 Ok(NebServer::init_conshash(opt, &raft_client)?)
             },
@@ -136,7 +136,7 @@ impl NebServer {
     pub fn new(opt: ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
-        let mut schemas = Schemas::new(None);
+        let mut schemas = ServerSchemas::new(None);
         rpc::Server::listen_and_resume(&rpc_server);
         if opt.is_meta {
             NebServer::load_meta_server(&opt, &rpc_server)?;

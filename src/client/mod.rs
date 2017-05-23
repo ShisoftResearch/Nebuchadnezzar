@@ -35,6 +35,7 @@ impl Client {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
                 raft_client.prepare_subscription(subscription_server);
+                assert!(raft_client.can_callback());
                 match ConsistentHashing::new_client(group, &raft_client) {
                     Ok(chash) => Ok(Client {
                         conshash: chash,

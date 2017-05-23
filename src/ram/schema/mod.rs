@@ -1,4 +1,5 @@
-use bifrost::raft::client::RaftClient;
+use bifrost::raft::client::{RaftClient, SubscriptionError};
+use bifrost::raft::state_machine::master::ExecError;
 
 use chashmap::CHashMap;
 use parking_lot::Mutex;
@@ -36,20 +37,22 @@ pub struct Field {
     pub sub: Option<Vec<Field>>
 }
 
-pub struct Schemas {
+pub struct ServerSchemas {
     schema_map: CHashMap<u32, Arc<Schema>>,
     name_map: CHashMap<String, u32>,
     id_counter: Mutex<u32>,
     sm: Option<sm::client::SMClient>,
 }
 
-impl Schemas {
-    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Arc<Schemas> {
+impl ServerSchemas {
+    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Arc<ServerSchemas> {
         let sm = match raft_client {
-            Some(raft) => Some(sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft)),
+            Some(raft) => {
+                Some(sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft))
+            },
             None => None
         };
-        let schemas = Arc::new(Schemas {
+        let schemas = Arc::new(ServerSchemas {
             schema_map: CHashMap::new(),
             name_map: CHashMap::new(),
             id_counter: Mutex::new(0),
@@ -58,10 +61,10 @@ impl Schemas {
         if let Some(ref sm) = schemas.sm {
             let sc1 = schemas.clone();
             let sc2 = schemas.clone();
-            sm.on_schema_added(move |r| {
+            let new_sub = sm.on_schema_added(move |r| {
                 sc1.new_schema_(&r.unwrap());
             });
-            sm.on_schema_deleted(move |r| {
+            let del_sub = sm.on_schema_deleted(move |r| {
                 sc2.del_schema(&r.unwrap());
             });
         }
