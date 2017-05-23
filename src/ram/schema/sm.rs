@@ -34,7 +34,7 @@ impl StateMachineCmds for SchemasSM {
             let mut map = self.map.write();
             map.new_schema(&schema);
         }
-        println!("{:?}", self.callback.notify(&commands::on_schema_added::new(), Ok(schema)));
+        self.callback.notify(&commands::on_schema_added::new(), Ok(schema));
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), ()> {

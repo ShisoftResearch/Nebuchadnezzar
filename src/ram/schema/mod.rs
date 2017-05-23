@@ -57,14 +57,11 @@ impl SchemasServer {
                 let m1 = map.clone();
                 let m2 = map.clone();
                 let sm = sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft);
-                println!("------------<>");
                 let new_sub = sm.on_schema_added(move |r| {
-                    println!("===========>");
                     let mut m1 = m1.write();
                     m1.new_schema(&r.unwrap());
                 });
                 let del_sub = sm.on_schema_deleted(move |r| {
-                    println!("===========>");
                     let mut m2 = m2.write();
                     m2.del_schema(&r.unwrap());
                 });

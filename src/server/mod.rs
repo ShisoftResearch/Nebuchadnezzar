@@ -122,7 +122,7 @@ impl NebServer {
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
-                raft_client.prepare_subscription(rpc_server);
+                RaftClient::prepare_subscription(rpc_server);
                 NebServer::join_group(opt, &raft_client)?;
                 let conshash = NebServer::init_conshash(opt, &raft_client)?;
                 *schemas = SchemasServer::new(Some(&raft_client));
