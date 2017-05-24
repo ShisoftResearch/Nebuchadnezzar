@@ -4,7 +4,7 @@
 > ― Morpheus, The Matrix
 
 High performance, rich typing RAMCloud implementation.
-Distributed in-memory Key-Value store, made to power the [Morpheus project](https://github.com/shisoft/Morpheus).
+Distributed in-memory Key-Value store, optional transaction, made to power the [Morpheus project](https://github.com/shisoft/Morpheus).
 
 Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure version](https://github.com/shisoft/Nebuchadnezzar/tree/clojure-version) and will stay with rust afterwards.  
 
