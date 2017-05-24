@@ -111,11 +111,13 @@ impl Client {
                 Ok(()) => {
                     return Ok(());
                 },
-                Err(TxnError::NotRealizable) =>{
+                Err(TxnError::NotRealizable) => {
                     txn.abort();  // continue the loop to retry
                 },
                 Err(e) => {
-                    txn.abort()?; // abort will always be an error to achieve early break
+                    // abort will always be an error to achieve early break
+                    txn.abort();
+                    return Err(e);
                 }
             }
             retried += 1;

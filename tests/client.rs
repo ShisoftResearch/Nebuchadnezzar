@@ -3,6 +3,7 @@ use neb::ram::schema::*;
 use neb::ram::types::*;
 use neb::ram::cell::*;
 use neb::client;
+use neb::client::transaction::TxnError;
 use env_logger;
 
 use super::*;
@@ -38,4 +39,15 @@ pub fn general() {
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
+    client.transaction(|ref mut trans| {
+        Ok(()) // empty transaction
+    }).unwrap();
+    let should_aborted = client.transaction(|ref mut trans| {
+        trans.abort()
+    });
+    match should_aborted {
+        Err(TxnError::Aborted) => {},
+        _ => panic!("{:?}", should_aborted)
+    }
+
 }

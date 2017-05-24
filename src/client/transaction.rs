@@ -7,6 +7,7 @@ use std::io;
 
 use bifrost::rpc::RPCError;
 
+#[derive(Debug)]
 pub enum TxnError {
     CannotFindAServer,
     IoError(io::Error),
