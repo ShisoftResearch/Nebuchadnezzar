@@ -14,7 +14,7 @@ use ram::schema::sm::{DEFAULT_SM_ID};
 use ram::schema::Schema;
 use self::transaction::*;
 
-static TRANSACTION_MAX_RETRY: u32 = 50;
+static TRANSACTION_MAX_RETRY: u32 = 100;
 
 pub mod transaction;
 
@@ -121,6 +121,7 @@ impl Client {
                 }
             }
             retried += 1;
+            debug!("Client retry transaction, {:?} times", retried);
         }
         Err(TxnError::TooManyRetry)
     }
