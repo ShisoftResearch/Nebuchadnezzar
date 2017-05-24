@@ -4,6 +4,8 @@ use neb::ram::types::*;
 use neb::ram::cell::*;
 use neb::client;
 use neb::client::transaction::TxnError;
+use std::thread;
+use std::sync::Arc;
 use env_logger;
 
 use super::*;
@@ -28,13 +30,13 @@ pub fn general() {
         key_field: None,
         fields: default_fields()
     };
-    let client = client::Client::new(
+    let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap();
+        &String::from("test")).unwrap());
     client.new_schema(&mut schema).unwrap();
     let mut data_map = Map::<String, Value>::new();
     data_map.insert(String::from("id"), Value::I64(100));
-    data_map.insert(String::from("score"), Value::U64(70));
+    data_map.insert(String::from("score"), Value::U64(0));
     data_map.insert(String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     client.write_cell(&cell_1).unwrap().unwrap();
@@ -49,5 +51,27 @@ pub fn general() {
         Err(TxnError::Aborted) => {},
         _ => panic!("{:?}", should_aborted)
     }
-
+    let cell_id = cell_1.id();
+    let thread_count = 200;
+    let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
+    for _ in 0..thread_count {
+        let client = client.clone();
+        threads.push(thread::spawn(move || {
+            client.transaction(|ref mut txn| {
+                let mut cell = txn.read(&cell_id)?.unwrap();
+                let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                score += 1;
+                let mut data = cell.data.Map().unwrap().clone();
+                data.insert(String::from("score"), Value::U64(score));
+                cell.data = Value::Map(data);
+                txn.update(&cell)?;
+                Ok(())
+            }).unwrap();
+        }));
+    }
+    for handle in threads {
+        handle.join();
+    }
+    let cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
+    assert_eq!(cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap(), thread_count as u64);
 }
