@@ -1,9 +1,9 @@
 use ram::schema::Schema;
 use ram::chunk::Chunk;
-use std::mem;
 use std::ptr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
+use std::collections::HashMap;
 
 const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
@@ -20,7 +20,7 @@ pub struct Header {
     pub hash: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum WriteError {
     SchemaDoesNotExisted(u32),
     CannotAllocateSpace,
@@ -33,7 +33,7 @@ pub enum WriteError {
     NetworkingError,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
 pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,
@@ -64,11 +64,17 @@ impl Header {
             partition: 0,
         }.write(location);
     }
+    pub fn id(&self) -> Id {
+        Id {
+            higher: self.partition,
+            lower: self.hash,
+        }
+    }
 }
 
 pub const HEADER_SIZE :usize = 32;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
     pub header: Header,
     pub data: DataValue
@@ -76,21 +82,22 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, id: &Id, data: DataValue) -> Cell {
+    pub fn new(schema_id: u32, id: &Id, map: HashMap<String, Value>) -> Cell {
         Cell {
             header: Header::new(0, schema_id, id),
-            data: data
+            data: Value::Map(map)
         }
     }
 
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
+        if ptr == 0 {return Err(ReadError::CellDoesNotExisted)}
         let header = unsafe {(*(ptr as *const Header))};
         let data_ptr = ptr + HEADER_SIZE;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
                 header: header,
-                data: reader::read_by_schema(data_ptr, schema)
+                data: reader::read_by_schema(data_ptr, &schema)
             })
         } else {
             error!("Schema {} does not existed to read", schema_id);
@@ -98,9 +105,9 @@ impl Cell {
         }
     }
     pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
-        let schema_id = self.header.schema.clone();
+        let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            return self.write_to_chunk_with_schema(chunk, schema)
+            return self.write_to_chunk_with_schema(chunk, &schema)
         } else {
             error!("Schema {} does not existed to write", schema_id);
             return Err(WriteError::SchemaDoesNotExisted(schema_id));
@@ -127,5 +134,7 @@ impl Cell {
             }
         }
     }
-
+    pub fn id(&self) -> Id {
+        self.header.id()
+    }
 }

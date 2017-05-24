@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{RwLock, RwLockReadGuard, Mutex, MutexGuard};
+use parking_lot::{RwLock, RwLockReadGuard, Mutex};
 
 use super::cell::Header;
 
@@ -71,7 +71,7 @@ impl Segment {
         frags.insert(location);
     }
     pub fn no_frags(&self) -> bool {
-        let mut frags = self.frags.lock();
+        let frags = self.frags.lock();
         frags.is_empty()
     }
 }

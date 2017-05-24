@@ -6,15 +6,17 @@ use bifrost::raft::state_machine::{master as sm_master};
 use bifrost::raft::state_machine::callback::client::SubscriptionService;
 use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
-use bifrost::membership::client::ObserverClient;
 use bifrost::conshash::weights::Weights;
+use bifrost::tcp::{STANDALONE_ADDRESS_STRING, STANDALONE_SERVER_ID};
 use ram::chunk::Chunks;
-use ram::schema::Schemas;
+use ram::schema::SchemasServer;
 use ram::schema::{sm as schema_sm};
-use std::rc::Rc;
+use ram::types::Id;
 use std::sync::Arc;
+use std::io;
 
-mod cell_rpc;
+pub mod cell_rpc;
+pub mod transactions;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -24,7 +26,7 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
-    MetaServerCannotBeStandalone,
+    StandaloneMustAlsoBeMetaServer,
 }
 
 pub struct ServerOptions {
@@ -40,17 +42,20 @@ pub struct ServerOptions {
 }
 
 pub struct ServerMeta {
-    pub schemas: Arc<Schemas>
+    pub schemas: Arc<SchemasServer>
 }
 
-pub struct Server {
+pub struct NebServer {
     pub chunks: Arc<Chunks>,
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
-    pub consh: Option<Arc<ConsistentHashing>>
+    pub consh: Arc<ConsistentHashing>,
+    pub member_pool: rpc::ClientPool,
+    pub txn_peer: transactions::Peer,
+    pub server_id: u64
 }
 
-impl Server {
+impl NebServer {
     fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<(), ServerError> {
         let server_addr = &opt.address;
         let raft_service = raft::RaftService::new(raft::Options {
@@ -63,7 +68,7 @@ impl Server {
         });
         rpc_server.register_service(
             raft::DEFAULT_SERVICE_ID,
-            raft_service.clone()
+            &raft_service
         );
         raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&raft_service)));
         raft::RaftService::start(&raft_service);
@@ -83,10 +88,6 @@ impl Server {
         Membership::new(rpc_server, &raft_service);
         Weights::new(&raft_service);
         return Ok(());
-    }
-    fn load_subscription(rpc_server: &Arc<rpc::Server>, raft_client: &RaftClient) {
-        let subs_service = SubscriptionService::initialize(rpc_server);
-        raft_client.set_subscription(&subs_service);
     }
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
@@ -116,15 +117,16 @@ impl Server {
         }
     }
     fn load_cluster_clients
-    (opt: &ServerOptions, schemas: &mut Arc<Schemas>, rpc_server: &Arc<rpc::Server>)
-    -> Result<Arc<ConsistentHashing>, ServerError>{
+    (opt: &ServerOptions, schemas: &mut Arc<SchemasServer>, rpc_server: &Arc<rpc::Server>)
+     -> Result<Arc<ConsistentHashing>, ServerError>{
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
-                *schemas = Schemas::new(Some(&raft_client));
-                Server::load_subscription(rpc_server, &raft_client);
-                Server::join_group(opt, &raft_client)?;
-                Ok(Server::init_conshash(opt, &raft_client)?)
+                RaftClient::prepare_subscription(rpc_server);
+                NebServer::join_group(opt, &raft_client)?;
+                let conshash = NebServer::init_conshash(opt, &raft_client)?;
+                *schemas = SchemasServer::new(Some(&raft_client));
+                Ok(conshash)
             },
             Err(e) => {
                 error!("Cannot load meta client: {:?}", e);
@@ -132,23 +134,20 @@ impl Server {
             }
         }
     }
-    pub fn new(opt: ServerOptions) -> Result<Server, ServerError> {
-        let server_addr = &opt.address;
-        let rpc_server = rpc::Server::new(vec!());
-        let mut conshasing = None;
-        let mut schemas = Schemas::new(None);
-        rpc::Server::listen_and_resume(&rpc_server, server_addr);
-        if !opt.standalone {
-            if opt.is_meta {
-                Server::load_meta_server(&opt, &rpc_server)?;
-            }
-            conshasing = Some(Server::load_cluster_clients(&opt, &mut schemas, &rpc_server)?);
-        } else if opt.is_meta {
-            error!("Meta server cannot be standalone");
-            return Err(ServerError::MetaServerCannotBeStandalone)
+    pub fn new(opt: ServerOptions) -> Result<Arc<NebServer>, ServerError> {
+        let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
+        let rpc_server = rpc::Server::new(server_addr);
+        let mut schemas = SchemasServer::new(None);
+        rpc::Server::listen_and_resume(&rpc_server);
+        if opt.is_meta {
+            NebServer::load_meta_server(&opt, &rpc_server)?;
         }
+        if !opt.is_meta && opt.standalone {
+            return Err(ServerError::StandaloneMustAlsoBeMetaServer)
+        }
+        let mut conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
         let meta_rc = Arc::new(ServerMeta {
-            schemas: schemas.clone()
+            schemas: schemas
         });
         let chunks = Chunks::new(
             opt.chunk_count,
@@ -156,15 +155,41 @@ impl Server {
             meta_rc.clone(),
             opt.backup_storage.clone(),
         );
-        rpc_server.register_service(
-            cell_rpc::DEFAULT_SERVICE_ID,
-            cell_rpc::NebRPCService::new(&chunks)
-        );
-        Ok(Server {
+        let server = Arc::new(NebServer {
             chunks: chunks,
             meta: meta_rc,
-            rpc: rpc_server,
-            consh: conshasing
-        })
+            rpc: rpc_server.clone(),
+            consh: conshasing,
+            member_pool: rpc::ClientPool::new(),
+            txn_peer: transactions::Peer::new(server_addr),
+            server_id: rpc_server.server_id
+        });
+        rpc_server.register_service(
+            cell_rpc::DEFAULT_SERVICE_ID,
+            &cell_rpc::NebRPCService::new(&server)
+        );
+        rpc_server.register_service(
+           transactions::manager::DEFAULT_SERVICE_ID,
+           &transactions::manager::TransactionManager::new(&server)
+        );
+        rpc_server.register_service(
+            transactions::data_site::DEFAULT_SERVICE_ID,
+            &transactions::data_site::DataManager::new(&server)
+        );
+        Ok(server)
+    }
+    pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
+        if let Some(server_id) = self.consh.get_by_server_id(id.higher) {
+            Some(server_id)
+        } else {
+            None
+        }
+    }
+    pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
+        if let Some(ref server_name) = self.consh.to_server_name(Some(server_id)) {
+            self.member_pool.get(server_name)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "Cannot find server id in consistent hash table"))
+        }
     }
 }

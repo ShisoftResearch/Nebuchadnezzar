@@ -1,7 +1,7 @@
-use ram::schema::{Schema, Field};
+use ram::schema::{Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{u16_io, u8_io, Map, Value, ARRAY_LEN_TYPE_ID, NULL_TYPE_ID};
+use ram::types::{Value, NULL_TYPE_ID};
 
 pub struct Instruction {
     type_id: u32,

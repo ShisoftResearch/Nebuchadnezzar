@@ -1,0 +1,486 @@
+use bifrost::vector_clock::{StandardVectorClock};
+use bifrost::utils::time::get_time;
+use std::collections::{BTreeSet, BTreeMap};
+use chashmap::{CHashMap, WriteGuard};
+use ram::types::{Id};
+use ram::cell::{Cell, ReadError, WriteError};
+use server::NebServer;
+use linked_hash_map::LinkedHashMap;
+use parking_lot::Mutex;
+use super::*;
+
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
+
+type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
+type CommitHistory = BTreeMap<Id, CellHistory>;
+
+#[derive(Debug)]
+pub struct CellMeta {
+    read: TxnId,
+    write: TxnId,
+    owner: Option<TxnId>, // transaction that owns the cell in Committing state
+    waiting: BTreeSet<(TxnId, u64)>, // transactions that waiting for owner to finish
+}
+
+struct Transaction {
+    state: TxnState,
+    affected_cells: Vec<Id>,
+    last_activity: i64,
+    history: CommitHistory
+}
+
+struct CellHistory {
+    cell: Option<Cell>,
+    current_version: u64
+}
+
+impl CellHistory {
+    pub fn new (cell: Option<Cell>, current_ver: u64) -> CellHistory {
+        CellHistory {
+            cell: cell,
+            current_version: current_ver,
+        }
+    }
+}
+
+pub struct DataManager {
+    cells: CHashMap<Id, CellMeta>,
+    cell_lru: Mutex<LinkedHashMap<Id, i64>>,
+    tnxs: CHashMap<TxnId, Transaction>,
+    tnxs_sorted: Mutex<BTreeSet<TxnId>>,
+    managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
+    server: Arc<NebServer>
+}
+
+service! {
+    rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
+
+    // two phase commit
+    rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
+    rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
+
+    // because there may be some exception on commit, abort have to handle 'committed' and 'committing' transactions
+    // for committed transaction, abort need to recover the data according to it's cells history
+    rpc abort(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<AbortResult>;
+
+    // there also should be a 'end' from transaction manager to inform data manager to clean up and release cell locks
+    rpc end(clock :StandardVectorClock, tid: TxnId) -> DataSiteResponse<EndResult>;
+}
+
+dispatch_rpc_service_functions!(DataManager);
+
+impl DataManager {
+    pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
+        Arc::new(DataManager {
+            cells: CHashMap::new(),
+            cell_lru: Mutex::new(LinkedHashMap::new()),
+            tnxs: CHashMap::new(),
+            tnxs_sorted: Mutex::new(BTreeSet::new()),
+            managers: CHashMap::new(),
+            server: server.clone(),
+        })
+    }
+    fn update_clock(&self, clock: &StandardVectorClock) {
+        self.server.txn_peer.clock.merge_with(clock);
+    }
+    fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
+        self.tnxs.alter(tid.clone(), |t|{
+            match t {
+                Some(t) => Some(t),
+                None => Some(Transaction {
+                    state: TxnState::Started,
+                    affected_cells: Vec::new(),
+                    last_activity: get_time(),
+                    history: BTreeMap::new(),
+                })
+            }
+        });
+        match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => self.get_transaction(tid, server) // it should be rare
+        }
+    }
+    fn get_cell_meta(&self, id: &Id) -> CellMetaGuard {
+        self.cells.alter(*id, |cell| {
+            match cell {
+                Some(c) => Some(c),
+                None => {
+                    Some(CellMeta {
+                        read: TxnId::new(),
+                        write: TxnId::new(),
+                        owner: None,
+                        waiting: BTreeSet::new(),
+                    })
+                }
+            }
+        });
+        {
+            let mut lru = self.cell_lru.lock();
+            *lru.entry(id.clone()).or_insert(0) = get_time();
+            lru.get_refresh(id);
+        }
+        match self.cells.get_mut(id) {
+            Some(cell) => cell,
+            None => self.get_cell_meta(id)
+        }
+    }
+    fn response_with<T>(&self, data: T)
+        -> Result<DataSiteResponse<T>, ()>{
+        Ok(DataSiteResponse::new(&self.server.txn_peer, data))
+    }
+    fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
+        let mut failures: Vec<RollbackFailure> = Vec::new();
+        for (id, history) in history.iter() {
+            let cell = &history.cell;
+            let current_ver = history.current_version;
+            let error = if cell.is_none() { // the cell was created, need to remove
+                self.server.chunks.remove_cell_by(&id, |cell| {
+                    cell.header.version == current_ver
+                }).err()
+            } else if current_ver > 0 { // the cell was updated, need to update back
+                self.server.chunks.update_cell_by(id, |cell_to_update|{
+                    if cell_to_update.header.version == current_ver {
+                        cell.clone()
+                    } else { None }
+                }).err()
+            } else { // the cell was removed, need to put back
+                let mut cell = cell.clone().unwrap();
+                self.server.chunks.write_cell(&mut cell).err()
+            };
+            if let Some(error) = error {
+                failures.push(RollbackFailure{id: *id, error: error});
+            }
+        }
+        failures
+    }
+    fn update_cell_write(&self, cell_id: &Id, tid: &TxnId) {
+        let mut meta = self.get_cell_meta(cell_id);
+        meta.write = tid.clone();
+    }
+    fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
+        if !self.managers.contains_key(&server_id) {
+            let client = self.server.get_member_by_server_id(server_id)?;
+            self.managers.upsert(server_id, || {
+                manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
+            }, |_| {});
+        }
+        Ok(self.managers.get(&server_id).unwrap().clone())
+    }
+    fn wipe_out_transaction(&self, tid: &TxnId) {
+        self.tnxs.remove(tid);
+        self.tnxs_sorted.lock().remove(tid);
+    }
+    fn cell_meta_cleanup(&self) {
+        let mut cell_lru = self.cell_lru.lock();
+        let mut evicted_cells = Vec::new();
+        let oldest_transaction = {
+            let tnx_sorted = self.tnxs_sorted.lock();
+            tnx_sorted.iter()
+                .next()
+                .cloned()
+                .unwrap_or(
+                    self.server.txn_peer.clock.to_clock()
+                )
+        };
+        let now = get_time();
+        let mut need_break = false;
+        for (cell_id, timestamp) in cell_lru.iter() {
+            self.cells.alter(*cell_id, |meta| {
+                match meta {
+                    Some(meta) => {
+                        if meta.write < oldest_transaction &&
+                            meta.read < oldest_transaction &&
+                            now - timestamp > 5 * 60 * 1000 {
+                            evicted_cells.push(*cell_id);
+                            return None;
+                        } else {
+                            need_break = true;
+                            return Some(meta)
+                        }
+                    },
+                    None => {
+                        evicted_cells.push(*cell_id);
+                        return None;
+                    }
+                }
+            });
+            if need_break {
+                break;
+            }
+        }
+        for evicted_cell in &evicted_cells {
+            cell_lru.remove(evicted_cell);
+        }
+    }
+}
+
+impl Service for DataManager {
+    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
+            -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
+        self.update_clock(clock);
+        let mut txn = self.get_transaction(tid, server_id);
+        let mut meta = self.get_cell_meta(id);
+        let committing = meta.owner.is_some();
+        let read_too_late = &meta.write > tid;
+        txn.last_activity = get_time();
+        if txn.state != TxnState::Started {
+            return self.response_with(TxnExecResult::StateError(txn.state))
+        }
+        if read_too_late { // not realizable
+            return self.response_with(TxnExecResult::Rejected);
+        }
+        if committing { // ts >= wt but committing, need to wait until it committed
+            meta.waiting.insert((tid.clone(), *server_id));
+            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
+            return self.response_with(TxnExecResult::Wait);
+        }
+        if &meta.read < tid {
+            meta.read = tid.clone()
+        }
+        match self.server.chunks.read_cell(id) {
+            Ok(cell) => {
+                self.response_with(TxnExecResult::Accepted(cell))
+            }
+            Err(read_error) => {
+                // cannot read
+                self.response_with(TxnExecResult::Error(read_error))
+            }
+        }
+    }
+    fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TxnId, cell_ids: &Vec<Id>)
+               -> Result<DataSiteResponse<DMPrepareResult>, ()> {
+        // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
+        // It will also check if write are realizable. If not, transaction manager should retry with new id
+        // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
+        debug!("PREPARE FOR {:?}, {} cells", tid, cell_ids.len());
+        self.update_clock(clock);
+        let mut txn = self.get_transaction(tid, server_id);
+        if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
+            return self.response_with(DMPrepareResult::StateError(txn.state))
+        }
+        let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+        for cell_id in cell_ids {
+            let mut meta = self.get_cell_meta(cell_id);
+            if tid < &meta.read { // write too late
+                break;
+            }
+            if tid < &meta.write {
+                if meta.owner.is_some() { // not committed, should wait and try prepare again
+                    meta.waiting.insert((tid.clone(), *server_id));
+                    debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
+                    return self.response_with(DMPrepareResult::Wait)
+                }
+            }
+            cell_metas.push(meta);
+        }
+        if cell_metas.len() != cell_ids.len() {
+            return self.response_with(DMPrepareResult::NotRealizable); // need retry
+        } else {
+            for mut meta in cell_metas {
+                meta.owner = Some(tid.clone()) // set owner to lock this cell
+            }
+            txn.state = TxnState::Prepared;
+            txn.affected_cells = cell_ids.clone(); // for cell number check
+            txn.last_activity = get_time();    // check if transaction timeout
+            return self.response_with(DMPrepareResult::Success);
+        }
+    }
+    fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
+              -> Result<DataSiteResponse<DMCommitResult>, ()>  {
+        self.update_clock(clock);
+        let mut txn = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted)); }
+        };
+        txn.last_activity = get_time();
+        // check state
+        match txn.state {
+            TxnState::Started => {return self.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted))},
+            TxnState::Aborted => {return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted))},
+            TxnState::Committed => {return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted))},
+            TxnState::Prepared => {}
+        }
+        // check cell list integrity
+        let prepared_cells_num = txn.affected_cells.len();
+        let arrived_cells_num = self.cells.len();
+        if prepared_cells_num != arrived_cells_num {return self.response_with(DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
+        let mut write_error: Option<(Id, WriteError)> = None;
+        for cell_op in cells {
+            match cell_op {
+                &CommitOp::Write(ref cell) => {
+                    let mut cell = cell.clone();
+                    let write_result = self.server.chunks.write_cell(&mut cell);
+                    match write_result {
+                        Ok(header) => {
+                            commit_history.insert(cell.id(), CellHistory::new(None, header.version));
+                            self.update_cell_write(&cell.id(), tid);
+                        },
+                        Err(error) => {
+                            write_error = Some((cell.id(), error));
+                            break;
+                        }
+                    };
+                },
+                &CommitOp::Remove(ref cell_id) => {
+                    let original_cell  = {
+                        match self.server.chunks.read_cell(cell_id) {
+                            Ok(cell) => cell,
+                            Err(re) => {
+                                write_error = Some((*cell_id, WriteError::ReadError(re)));
+                                break;
+                            }
+                        }
+                    };
+                    let write_result = self.server.chunks.remove_cell_by(cell_id, |cell|{
+                        let version = cell.header.version;
+                        version == original_cell.header.version
+                    });
+                    match write_result {
+                        Ok(()) => {
+                            commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
+                            self.update_cell_write(cell_id, tid);
+                        },
+                        Err(error) => {
+                            write_error = Some((*cell_id, error));
+                            break;
+                        }
+                    }
+                },
+                &CommitOp::Update(ref cell) => {
+                    let cell_id = cell.id();
+                    let original_cell = {
+                        match self.server.chunks.read_cell(&cell_id) {
+                            Ok(cell) => cell,
+                            Err(re) => {
+                                write_error = Some((cell_id, WriteError::ReadError(re)));
+                                break;
+                            }
+                        }
+                    };
+                    let write_result = self.server.chunks.update_cell_by(&cell_id, |cell_to_update| {
+                        if cell_to_update.header.version == original_cell.header.version {
+                            Some(cell.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    match write_result {
+                        Ok(cell) => {
+                            commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
+                            self.update_cell_write(&cell_id, tid);
+                        },
+                        Err(error) => {
+                            write_error = Some((cell_id, error));
+                            break;
+                        }
+                    }
+                },
+                &CommitOp::None => {
+                    panic!("None CommitOp should not appear in data site");
+                }
+            }
+        }
+        // check if any of those operations failed, if yes, rollback and fail this commit
+        if let Some((id, error)) = write_error {
+            let rollback_result = self.rollback(&commit_history);
+            txn.state = TxnState::Aborted; // set to abort so it can't be abort again
+            txn.last_activity = get_time();
+            match error {
+                WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
+                    // in this case, we can inform transaction manager to try again
+                    return self.response_with(DMCommitResult::CellChanged(
+                        id, rollback_result
+                    ));
+                }
+                _ => {
+                    // other failure due to unfixable error should abort without retry
+                    return self.response_with(DMCommitResult::WriteError(
+                        id, error, rollback_result
+                    ));
+                }
+            }
+        } else {
+            // all set, able to commit
+            txn.state = TxnState::Committed;
+            txn.history = commit_history;
+            txn.last_activity = get_time();
+            return self.response_with(DMCommitResult::Success)
+        }
+    }
+    fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
+        -> Result<DataSiteResponse<AbortResult>, ()>  {
+        self.update_clock(clock);
+        let mut txn = match self.tnxs.get_mut(tid) {
+            Some(tnx) => tnx,
+            _ => { return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted)); }
+        };
+        if txn.state == TxnState::Aborted {
+            return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
+        }
+        let rollback_failures = {
+            let failures = self.rollback(&txn.history);
+            if failures.len() == 0 { None } else { Some(failures) }
+        };
+        txn.last_activity = get_time();
+        txn.state = TxnState::Aborted;
+        self.response_with(AbortResult::Success(rollback_failures))
+    }
+    fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
+             -> Result<DataSiteResponse<EndResult>, ()>  {
+        debug!("END {:?}", tid);
+        let result = {
+            self.update_clock(clock);
+            let txn = match self.tnxs.get_mut(tid) {
+                Some(tnx) => tnx,
+                _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
+            };
+            if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
+                return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
+            }
+            let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+            debug!("AFFECTED: {}, {:?}, {:?}", txn.affected_cells.len(), txn.state, tid);
+            for cell_id in &txn.affected_cells {
+                if let Some(meta) = self.cells.get_mut(cell_id){
+                    cell_metas.push(meta)
+                }
+            }
+            let affected_cells = txn.affected_cells.len();
+            let mut released_locks = 0;
+            let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
+            for mut meta in cell_metas {
+                if meta.owner == Some(tid.clone()) {
+                    for &(ref tid, ref server_id) in &meta.waiting {
+                        waiting_list
+                            .entry(*server_id)
+                            .or_insert_with(|| BTreeSet::new())
+                            .insert(tid.clone());
+                    }
+                    meta.waiting.clear();
+                    meta.owner = None;
+                    released_locks += 1;
+                } else {
+                    warn!("affected txn does not own the cell");
+                }
+            }
+            let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
+            debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
+            for (server_id, transactions) in waiting_list { // inform waiting servers to go on
+                if let Ok(client) = self.get_tnx_manager(server_id) {
+                    wake_up_futures.push(client.go_ahead(&transactions, &self.server.server_id));
+                } else {
+                    debug!("cannot inform server {} to continue its transactions", server_id);
+                }
+            }
+            future::join_all(wake_up_futures).wait();
+            if released_locks == affected_cells {
+                self.response_with(EndResult::Success)
+            } else {
+                self.response_with(EndResult::SomeLocksNotReleased)
+            }
+        };
+        self.cell_meta_cleanup();
+        self.wipe_out_transaction(tid);
+        return result;
+    }
+}

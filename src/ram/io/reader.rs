@@ -1,7 +1,7 @@
 use ram::schema::{Schema, Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{u16_io, u8_io, Map, Value};
+use ram::types::{u16_io, u8_io, Value};
 
 fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
     let mut ptr = ptr;
