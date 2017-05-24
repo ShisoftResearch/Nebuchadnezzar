@@ -13,16 +13,18 @@ name = "tests"
 libc = "*"
 log = "0.3"
 lazy_static = "*"
-uuid = { version = "0.2", features = ["v4", "v5"] }
-concurrent-hashmap = "*"
-bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-serde = "0.8"
-serde_derive = "0.8"
-bincode = "0.6"
+chashmap = "*"
+bifrost = {  path = "../bifrost"  }
+bifrost_plugins = { path = "../bifrost/src/plugins" }
+bifrost_hasher = { path = "../bifrost/src/hasher" }
+serde = "*"
+serde_derive = "*"
+bincode = "*"
 byteorder = "1"
-parking_lot = {version = "0.3", features = ["nightly"]}
+parking_lot = {version = "0.4", features = ["nightly"]}
+rand = "0.3"
+futures = "0.1.9"
+linked-hash-map = "0.4.2"
 
 [dev-dependencies]
 rand = "0.3"

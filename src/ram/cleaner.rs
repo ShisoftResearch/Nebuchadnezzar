@@ -152,7 +152,8 @@ impl Cleaner {
             // we will fetch the cell by it's hash
             let cell_hash = unsafe {*seg.cell_hash(next_loc)};
             // 'cell_loc' will contain a lock to the cell if succeed
-            let cell_loc = chunk.location_of(cell_hash);
+            let cell_loc = chunk.location_for_write(cell_hash);
+            // TODO: check transaction versions
             // check if the hash exists in the chunk. If not, retry
             if cell_loc.is_none() {
                 debug!("Cell hash not exists in the chunk: {}", cell_hash);

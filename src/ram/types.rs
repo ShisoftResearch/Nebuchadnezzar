@@ -1,10 +1,9 @@
-use libc;
+use ram::cell::Header;
 use std::cmp::PartialEq;
 use std::string::String;
-use std::any::Any;
 use std::collections::hash_map;
-
-use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use std::cmp::Ordering;
+use utils::rand;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -205,22 +204,6 @@ macro_rules! define_types {
     );
 }
 
-macro_rules! rc {
-    (
-        $read:ident
-    ) => (
-        $read
-    );
-}
-
-macro_rules! wc {
-    (
-        $rwrite:ident
-    ) => (
-        $rwrite
-    );
-}
-
 gen_primitive_types_io!(
     bool:   bool_io       ;
     char:   char_io       ;
@@ -264,7 +247,7 @@ pub struct Pos3d64 {
     pub z: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, Hash)]
 pub struct Id {
     pub higher: u64,
     pub lower:  u64,
@@ -276,6 +259,19 @@ impl Id {
             higher: higher,
             lower: lower,
         }
+    }
+    pub fn rand() -> Id {
+        let (hi, lw) = rand::next_two();
+        Id::new(hi, lw)
+    }
+    pub fn from_header(header: &Header) -> Id {
+        Id {
+            higher: header.partition,
+            lower: header.hash
+        }
+    }
+    pub fn is_greater_than(&self, other: &Id) -> bool {
+        self.higher >= other.higher && self.lower > other.lower
     }
 }
 
@@ -321,6 +317,21 @@ impl PartialEq for Id {
     }
     fn ne(&self, other: &Id) -> bool {
         self.higher != other.higher || self.lower != other.lower
+    }
+}
+impl PartialOrd for Id {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        if self == other {return Some(Ordering::Equal)}
+        if self.is_greater_than(other) {return Some(Ordering::Greater)}
+        Some(Ordering::Less)
+    }
+}
+
+impl Ord for Id {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self == other {return Ordering::Equal}
+        if self.is_greater_than(other) {return Ordering::Greater}
+        Ordering::Less
     }
 }
 
