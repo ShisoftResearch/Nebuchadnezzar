@@ -35,7 +35,7 @@ pub struct Field {
     pub name: String,
     pub nullable: bool,
     pub is_array: bool,
-    pub sub: Option<Vec<Field>>
+    pub sub_fields: Option<Vec<Field>>
 }
 
 pub struct SchemasMap {

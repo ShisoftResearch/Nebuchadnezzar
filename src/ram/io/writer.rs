@@ -40,7 +40,7 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
         } else {
             panic!(data_mismatch);
         }
-    } else if let Some(ref subs) = field.sub {
+    } else if let Some(ref subs) = field.sub_fields {
         if let &Value::Map(ref map) = value {
             for sub in subs {
                 let field_name = sub.name.clone();

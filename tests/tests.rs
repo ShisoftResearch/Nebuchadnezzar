@@ -25,27 +25,27 @@ pub fn default_fields () -> Field {
         name: String::from("*"),
         nullable: false,
         is_array: false,
-        sub: Some(vec![
+        sub_fields: Some(vec![
             Field {
                 type_id: 6,
                 name: String::from("id"),
                 nullable:false,
                 is_array:false,
-                sub: None,
+                sub_fields: None,
             },
             Field {
                 type_id: 20,
                 name: String::from("name"),
                 nullable:false,
                 is_array:false,
-                sub: None,
+                sub_fields: None,
             },
             Field {
                 type_id: 10,
                 name: String::from("score"),
                 nullable:false,
                 is_array:false,
-                sub: None,
+                sub_fields: None,
             }
         ])
     }

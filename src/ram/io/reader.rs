@@ -24,7 +24,7 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
             val.push(nxt_val);
         }
         (Value::Array(val), ptr)
-    } else if let Some(ref subs) = field.sub {
+    } else if let Some(ref subs) = field.sub_fields {
         let mut map = DataMap::new();
         for sub in subs {
             let field_name = sub.name.clone();
