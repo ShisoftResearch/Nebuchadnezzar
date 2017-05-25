@@ -51,14 +51,14 @@ pub fn general() {
         Err(TxnError::Aborted) => {},
         _ => panic!("{:?}", should_aborted)
     }
-    let cell_id = cell_1.id();
-    let thread_count = 200;
+    let cell_1_id = cell_1.id();
+    let thread_count = 100;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let client = client.clone();
         threads.push(thread::spawn(move || {
             client.transaction(|ref mut txn| {
-                let mut cell = txn.read(&cell_id)?.unwrap();
+                let mut cell = txn.read(&cell_1_id)?.unwrap();
                 let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
@@ -72,6 +72,42 @@ pub fn general() {
     for handle in threads {
         handle.join();
     }
-    let cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let mut cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
     assert_eq!(cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap(), thread_count as u64);
+
+    let mut data = cell_1_r.data.Map().unwrap().clone();
+    data.insert(String::from("score"), Value::U64(0)); // reset to zero so we can test it again
+    cell_1_r.data = Value::Map(data);
+    client.update_cell(&cell_1_r).unwrap().unwrap();
+
+    let mut cell_2 = cell_1.clone(); // clone one to test write skew
+    cell_2.set_id(&Id::rand());
+    client.write_cell(&cell_2).unwrap().unwrap();
+    client.read_cell(&cell_2.id()).unwrap().unwrap();
+    let cell_2_id = cell_2.id();
+    threads = Vec::new();
+    for i in 0..thread_count {
+        let client = client.clone();
+        threads.push(thread::spawn(move || {
+            client.transaction(|ref mut txn| {
+                let read_id = if i % 2 == 1 {&cell_1_id} else {&cell_2_id};
+                let update_id = if i % 2 == 1 {&cell_2_id} else {&cell_1_id};
+                let mut cell = txn.read(read_id)?.unwrap();
+                let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                score += 1;
+                let mut data = cell.data.Map().unwrap().clone();
+                data.insert(String::from("score"), Value::U64(score));
+                cell.data = Value::Map(data);
+                cell.set_id(update_id);
+                txn.update(&cell)?;
+                Ok(())
+            }).unwrap();
+        }));
+    }
+    let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
+    let mut cell_2_r = client.read_cell(&cell_2_id).unwrap().unwrap();
+    assert_eq!(
+        cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap() +
+        cell_2_r.data.Map().unwrap().get("score").unwrap().U64().unwrap()
+    , thread_count as u64);
 }

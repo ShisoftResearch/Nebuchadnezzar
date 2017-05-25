@@ -70,6 +70,10 @@ impl Header {
             lower: self.hash,
         }
     }
+    pub fn set_id(&mut self, id: &Id) {
+        self.partition = id.higher;
+        self.hash = id.lower;
+    }
 }
 
 pub const HEADER_SIZE :usize = 32;
@@ -136,5 +140,8 @@ impl Cell {
     }
     pub fn id(&self) -> Id {
         self.header.id()
+    }
+    pub fn set_id(&mut self, id: &Id) {
+        self.header.set_id(id)
     }
 }
