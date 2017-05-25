@@ -12,7 +12,8 @@ use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnGuard<'a> = WriteGuard<'a, TxnId, Transaction>;
-type ChangedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>;
+type AffectedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>; // server_id as key
+type ReadObjs = BTreeMap<u64, Vec<(Id, u64)>>; // server_id as key, (id, version) as value
 type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
@@ -27,8 +28,8 @@ struct DataObject {
 struct Transaction {
     start_time: i64, // use for timeout detecting
     data: BTreeMap<Id, DataObject>,
-    changed_objects: ChangedObjs,
-    state: TxnState,
+    affected_objects: AffectedObjs,
+    state: TxnState
 }
 
 service! {
@@ -135,14 +136,15 @@ impl TransactionManager {
             }
         }
     }
-    fn generate_changed_objs(&self, txn: &mut TxnGuard) {
-        let mut changed_objs = ChangedObjs::new();
+    fn generate_affected_objs(&self, txn: &mut TxnGuard) {
+        let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in &txn.data {
-            changed_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
+            affected_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
         }
-        txn.changed_objects = changed_objs;
+        txn.data.clear(); // clean up data after transfered to changed/
+        txn.affected_objects = affected_objs;
     }
-    fn data_sites(&self, changed_objs: &ChangedObjs) -> Result<DataSiteClients, TMError>  {
+    fn data_sites(&self, changed_objs: &AffectedObjs) -> Result<DataSiteClients, TMError>  {
         let data_sites: HashMap<u64, _> = changed_objs.iter().map(|(server_id, _)| {
             (*server_id, self.get_data_site(*server_id))
         }).collect();
@@ -192,7 +194,7 @@ impl TransactionManager {
             });
         Box::new(res_future)
     }
-    fn sites_prepare(&self, tid: &TxnId, changed_objs: ChangedObjs, data_sites: DataSiteClients)
+    fn sites_prepare(&self, tid: &TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
                      -> Result<DMPrepareResult, TMError> {
         let prepare_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
@@ -211,7 +213,7 @@ impl TransactionManager {
         }
         Ok(DMPrepareResult::Success)
     }
-    fn sites_commit(&self, tid: &TxnId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
+    fn sites_commit(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
                     -> Result<DMCommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
@@ -249,7 +251,7 @@ impl TransactionManager {
         }
         Ok(DMCommitResult::Success)
     }
-    fn sites_abort(&self, tid: &TxnId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
+    fn sites_abort(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
                    -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
@@ -282,7 +284,7 @@ impl TransactionManager {
                 {None} else {Some(rollback_failures)}
         ))
     }
-    fn sites_end(&self, tid: &TxnId, changed_objs: &ChangedObjs, data_sites: &DataSiteClients)
+    fn sites_end(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
                  -> Result<EndResult, TMError> {
         let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
@@ -326,7 +328,7 @@ impl Service for TransactionManager {
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
             data: BTreeMap::new(),
-            changed_objects: ChangedObjs::new(),
+            affected_objects: AffectedObjs::new(),
             state: TxnState::Started
         });
         Ok(id)
@@ -441,11 +443,11 @@ impl Service for TransactionManager {
             let mut txn = self.get_transaction(tid)?;
             let result = {
                 self.ensure_rw_state(&txn)?;
-                self.generate_changed_objs(&mut txn);
-                let generated_objs = &txn.changed_objects;
-                let changed_objs = generated_objs.clone();
-                let data_sites = self.data_sites(&changed_objs)?;
-                let sites_prepare_result = self.sites_prepare(tid, changed_objs, data_sites.clone())?;
+                self.generate_affected_objs(&mut txn);
+                let generated_objs = &txn.affected_objects;
+                let affect_objs = generated_objs.clone();
+                let data_sites = self.data_sites(&affect_objs)?;
+                let sites_prepare_result = self.sites_prepare(tid, affect_objs, data_sites.clone())?;
                 if sites_prepare_result == DMPrepareResult::Success {
                     let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
                     match sites_commit_result {
@@ -480,7 +482,7 @@ impl Service for TransactionManager {
         let result = {
             let txn = self.get_transaction(tid)?;
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let changed_objs = &txn.changed_objects;
+            let changed_objs = &txn.affected_objects;
             let data_sites = self.data_sites(changed_objs)?;
             self.sites_end(tid, changed_objs, &data_sites)
         };
@@ -491,7 +493,7 @@ impl Service for TransactionManager {
         let result = {
             let txn = self.get_transaction(tid)?;
             if txn.state != TxnState::Aborted {
-                let changed_objs = &txn.changed_objects;
+                let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
                 self.sites_abort(tid, changed_objs, &data_sites) // with end
             } else {

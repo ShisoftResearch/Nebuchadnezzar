@@ -74,12 +74,42 @@ pub fn general() {
     }
     let mut cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
     assert_eq!(cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap(), thread_count as u64);
+}
 
-    let mut data = cell_1_r.data.Map().unwrap().clone();
-    data.insert(String::from("score"), Value::U64(0)); // reset to zero so we can test it again
-    cell_1_r.data = Value::Map(data);
-    client.update_cell(&cell_1_r).unwrap().unwrap();
-
+#[test]
+pub fn write_skew() {
+    let server_addr = String::from("127.0.0.1:5401");
+    let server = NebServer::new(ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(server_addr.clone()),
+        address: server_addr.clone(),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
+    let mut schema = Schema {
+        id: 1,
+        name: String::from("test"),
+        key_field: None,
+        fields: default_fields()
+    };
+    let client = Arc::new(client::Client::new(
+        &server.rpc, &vec!(server_addr),
+        &String::from("test")).unwrap());
+    let thread_count = 100;
+    let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
+    client.new_schema(&mut schema).unwrap();
+    let mut data_map = Map::<String, Value>::new();
+    data_map.insert(String::from("id"), Value::I64(100));
+    data_map.insert(String::from("score"), Value::U64(0));
+    data_map.insert(String::from("name"), Value::String(String::from("Jack")));
+    let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
+    client.write_cell(&cell_1).unwrap().unwrap();
+    client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let cell_1_id = cell_1.id();
     let mut cell_2 = cell_1.clone(); // clone one to test write skew
     cell_2.set_id(&Id::rand());
     client.write_cell(&cell_2).unwrap().unwrap();
