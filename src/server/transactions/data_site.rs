@@ -8,6 +8,8 @@ use server::NebServer;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use super::*;
+use std::sync::mpsc::{Sender, Receiver, channel};
+use std::thread;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -49,7 +51,8 @@ pub struct DataManager {
     tnxs: CHashMap<TxnId, Transaction>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
-    server: Arc<NebServer>
+    server: Arc<NebServer>,
+    cleanup_sender: Mutex<Sender<()>>,
 }
 
 service! {
@@ -71,14 +74,24 @@ dispatch_rpc_service_functions!(DataManager);
 
 impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
-        Arc::new(DataManager {
+        let (cleaup_sender, cleaup_recv) = channel();
+        let manager = Arc::new(DataManager {
             cells: CHashMap::new(),
             cell_lru: Mutex::new(LinkedHashMap::new()),
             tnxs: CHashMap::new(),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
-        })
+            cleanup_sender: Mutex::new(cleaup_sender)
+        });
+        let manager_clone = manager.clone();
+        thread::spawn(move || { //TODO: give way to shutdown
+            loop {
+                cleaup_recv.recv();
+                manager_clone.cell_meta_cleanup();
+            }
+        });
+        return manager;
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
@@ -512,7 +525,7 @@ impl Service for DataManager {
             }
         };
         self.wipe_out_transaction(tid);
-        // self.cell_meta_cleanup();
+        self.cleanup_sender.lock().send(());
         return result;
     }
 }
