@@ -269,6 +269,10 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
+    pub fn location_for_read(&self, key: &Id) -> Option<CellReadGuard> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.location_for_read(hash);
+    }
     pub fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.write_cell(cell);

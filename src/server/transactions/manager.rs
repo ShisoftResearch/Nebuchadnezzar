@@ -198,9 +198,9 @@ impl TransactionManager {
             });
         Box::new(res_future)
     }
-    fn sites_prepare(&self, tid: &TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
+    fn sites_prepare(&self, tid: &TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
                      -> Result<DMPrepareResult, TMError> {
-        let prepare_futures: Vec<_> = changed_objs.into_iter().map(|(server, objs)| {
+        let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
             TransactionManager::site_prepare(
                 self.server.clone(),
@@ -498,9 +498,9 @@ impl Service for TransactionManager {
         let result = {
             let txn = self.get_transaction(tid)?;
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let changed_objs = &txn.affected_objects;
-            let data_sites = self.data_sites(changed_objs)?;
-            self.sites_end(tid, changed_objs, &data_sites)
+            let affected_objs = &txn.affected_objects;
+            let data_sites = self.data_sites(affected_objs)?;
+            self.sites_end(tid, affected_objs, &data_sites)
         };
         self.cleanup_transaction(tid);
         return result;

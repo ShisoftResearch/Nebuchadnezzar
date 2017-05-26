@@ -302,10 +302,15 @@ impl Service for DataManager {
         }
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();
-        let arrived_cells_num = self.cells.len();
-        if prepared_cells_num != arrived_cells_num {return self.response_with(DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        let arrived_cells_num = cells.len();
+        if prepared_cells_num != arrived_cells_num {
+            return self.response_with(
+                DMCommitResult::CheckFailed(
+                    CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))
+        }
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
+        let mut read_lock = Vec::new();
         for cell_op in cells {
             match cell_op {
                 &CommitOp::Read(id, version) => {
@@ -318,6 +323,7 @@ impl Service for DataManager {
                                 ))
                             } else {
                                 debug!("Read cell unchanged with version{}", version);
+                                read_lock.push(self.server.chunks.location_for_read(&id).unwrap());
                             }
                         }
                         Err(_) => {
@@ -505,8 +511,8 @@ impl Service for DataManager {
                 self.response_with(EndResult::SomeLocksNotReleased)
             }
         };
-        self.cell_meta_cleanup();
         self.wipe_out_transaction(tid);
+        // self.cell_meta_cleanup();
         return result;
     }
 }
