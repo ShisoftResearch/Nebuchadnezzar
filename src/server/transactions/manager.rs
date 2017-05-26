@@ -22,6 +22,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64
 struct DataObject {
     server: u64,
     cell: Option<Cell>,
+    version: Option<u64>,
+    changed: bool,
     new: bool
 }
 
@@ -120,6 +122,8 @@ impl TransactionManager {
                             server: server_id,
                             cell: Some(cell.clone()),
                             new: false,
+                            version: Some(cell.header.version),
+                            changed: false,
                         });
                     },
                     TxnExecResult::Wait => {
@@ -219,7 +223,9 @@ impl TransactionManager {
             let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter()
                 .map(|&(ref cell_id, ref data_obj)| {
-                if data_obj.cell.is_none() && !data_obj.new {
+                if data_obj.version.is_some() && !data_obj.changed {
+                    CommitOp::Read(*cell_id,data_obj.version.unwrap())
+                } else if data_obj.cell.is_none() && !data_obj.new {
                     CommitOp::Remove(*cell_id)
                 } else if data_obj.new {
                     CommitOp::Write(data_obj.cell.clone().unwrap())
@@ -370,6 +376,8 @@ impl Service for TransactionManager {
                         server: server_id,
                         cell: Some(cell.clone()),
                         new: true,
+                        version: None,
+                        changed: true,
                     });
                     Ok(TxnExecResult::Accepted(()))
                 } else {
@@ -378,6 +386,7 @@ impl Service for TransactionManager {
                         return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted))
                     }
                     data_obj.cell = Some(cell.clone());
+                    data_obj.changed = true;
                     Ok(TxnExecResult::Accepted(()))
                 }
             },
@@ -392,12 +401,16 @@ impl Service for TransactionManager {
             Some(server_id) => {
                 let cell = cell.clone();
                 if txn.data.contains_key(&id) {
-                    txn.data.get_mut(&id).unwrap().cell = Some(cell)
+                    let mut data_obj = txn.data.get_mut(&id).unwrap();
+                    data_obj.cell = Some(cell);
+                    data_obj.changed = true
                 } else {
                     txn.data.insert(id, DataObject {
                         server: server_id,
                         cell: Some(cell),
                         new: false,
+                        version: None,
+                        changed: true,
                     });
                 }
                 Ok(TxnExecResult::Accepted(()))
@@ -422,6 +435,7 @@ impl Service for TransactionManager {
                         } else {
                             data_obj.cell = None;
                         }
+                        data_obj.changed = true;
                     }
                     if new_obj {
                         txn.data.remove(&id);
@@ -431,6 +445,8 @@ impl Service for TransactionManager {
                         server: server_id,
                         cell: None,
                         new: false,
+                        version: None,
+                        changed: true
                     });
                 }
                 Ok(TxnExecResult::Accepted(()))

@@ -118,6 +118,7 @@ pub enum CommitOp {
     Write(Cell),
     Update(Cell),
     Remove(Id),
+    Read(Id, u64), // id, version
     None,
 }
 
