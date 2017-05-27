@@ -471,7 +471,7 @@ impl Service for TransactionManager {
                             TMPrepareResult::Success
                         },
                         _ => {
-                            let _ = self.sites_abort(tid, generated_objs, &data_sites);
+                            self.sites_abort(tid, generated_objs, &data_sites);
                             TMPrepareResult::DMCommitError(sites_commit_result)
                         }
                     }

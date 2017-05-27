@@ -48,7 +48,7 @@ impl CellHistory {
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
-    tnxs: CHashMap<TxnId, Transaction>,
+    txns: CHashMap<TxnId, Transaction>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
@@ -78,7 +78,7 @@ impl DataManager {
         let manager = Arc::new(DataManager {
             cells: CHashMap::new(),
             cell_lru: Mutex::new(LinkedHashMap::new()),
-            tnxs: CHashMap::new(),
+            txns: CHashMap::new(),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
@@ -97,7 +97,7 @@ impl DataManager {
         self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
-        self.tnxs.alter(tid.clone(), |t|{
+        self.txns.alter(tid.clone(), |t|{
             match t {
                 Some(t) => Some(t),
                 None => Some(Transaction {
@@ -108,7 +108,7 @@ impl DataManager {
                 })
             }
         });
-        match self.tnxs.get_mut(tid) {
+        match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => self.get_transaction(tid, server) // it should be rare
         }
@@ -180,11 +180,11 @@ impl DataManager {
         Ok(self.managers.get(&server_id).unwrap().clone())
     }
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        self.tnxs.remove(tid);
+        self.txns.remove(tid);
         self.tnxs_sorted.lock().remove(tid);
     }
     fn cell_meta_cleanup(&self) {
-        let mut cell_lru = self.cell_lru.lock();
+        let mut cell_lru = self.cell_lru.lock().clone(); // TODO: Don't clone
         let mut evicted_cells = Vec::new();
         let oldest_transaction = {
             let tnx_sorted = self.tnxs_sorted.lock();
@@ -243,9 +243,10 @@ impl Service for DataManager {
             return self.response_with(TxnExecResult::Rejected);
         }
         if committing { // ts >= wt but committing, need to wait until it committed
-            meta.waiting.insert((tid.clone(), *server_id));
-            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
-            return self.response_with(TxnExecResult::Wait);
+//            meta.waiting.insert((tid.clone(), *server_id));
+//            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
+//            return self.response_with(TxnExecResult::Wait);
+            return self.response_with(TxnExecResult::Rejected);
         }
         if &meta.read < tid {
             meta.read = tid.clone()
@@ -279,9 +280,10 @@ impl Service for DataManager {
             }
             if tid < &meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
-                    meta.waiting.insert((tid.clone(), *server_id));
-                    debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
-                    return self.response_with(DMPrepareResult::Wait)
+//                    meta.waiting.insert((tid.clone(), *server_id));
+//                    debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
+//                    return self.response_with(DMPrepareResult::Wait)
+                    break;
                 }
             }
             cell_metas.push(meta);
@@ -301,7 +303,7 @@ impl Service for DataManager {
     fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
               -> Result<DataSiteResponse<DMCommitResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.tnxs.get_mut(tid) {
+        let mut txn = match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted)); }
         };
@@ -456,7 +458,7 @@ impl Service for DataManager {
     fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
         -> Result<DataSiteResponse<AbortResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.tnxs.get_mut(tid) {
+        let mut txn = match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted)); }
         };
@@ -476,7 +478,7 @@ impl Service for DataManager {
         debug!("END {:?}", tid);
         let result = {
             self.update_clock(clock);
-            let txn = match self.tnxs.get_mut(tid) {
+            let txn = match self.txns.get_mut(tid) {
                 Some(tnx) => tnx,
                 _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
             };
