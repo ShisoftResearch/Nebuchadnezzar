@@ -120,17 +120,19 @@ pub fn write_skew() {
         let client = client.clone();
         threads.push(thread::spawn(move || {
             client.transaction(|ref mut txn| {
-                let backup = if i % 2 == 1 {&cell_1_id} else {&cell_2_id};
-                let update_id = if i % 2 == 0 {&cell_1_id} else {&cell_2_id};
-                let mut cell = txn.read(update_id)?.unwrap();
-                let mut backup_cell = txn.read(backup)?.unwrap();
-                let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                let cell_1_id = if i % 2 == 1 {&cell_1_id} else {&cell_2_id};
+                let cell_2_id = if i % 2 == 0 {&cell_1_id} else {&cell_2_id};
+                let mut cell_1 = txn.read(cell_1_id)?.unwrap();
+                let mut cell_2 = txn.read(cell_2_id)?.unwrap();
+                let mut score = cell_1.data.Map().unwrap().get("score").unwrap().U64().unwrap();
                 score += 1;
-                let mut data = cell.data.Map().unwrap().clone();
+                let mut data = cell_1.data.Map().unwrap().clone();
                 data.insert(String::from("score"), Value::U64(score));
-                cell.data = Value::Map(data);
-                cell.set_id(update_id);
-                txn.update(&cell)?;
+                cell_1.data = Value::Map(data);
+                cell_1.set_id(cell_2_id);
+                cell_2.set_id(cell_1_id);
+                txn.update(&cell_1)?;
+                txn.update(&cell_2)?;
                 Ok(())
             }).unwrap();
         }));

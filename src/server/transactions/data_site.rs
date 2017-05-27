@@ -323,33 +323,33 @@ impl Service for DataManager {
         }
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
-        let mut read_lock = Vec::new();
-        for cell_op in cells {
-            match cell_op {
-                &CommitOp::Read(id, version) => {
-                    match self.server.chunks.head_cell(&id) {
-                        Ok(header) => {
-                            if header.version != version {
-                                debug!("Cell header version not match {}/{}", header.version, version);
-                                return self.response_with(DMCommitResult::CellChanged(
-                                    id, Vec::new()
-                                ))
-                            } else {
-                                debug!("Read cell unchanged with version{}", version);
-                                read_lock.push(self.server.chunks.location_for_read(&id).unwrap());
-                            }
-                        }
-                        Err(_) => {
-                            debug!("Cell have been removed, trying to match version {}", version);
-                            return self.response_with(DMCommitResult::CellChanged(
-                                id, Vec::new()
-                            ))
-                        }
-                    }
-                },
-                _ => {}
-            }
-        }
+//        let mut read_lock = Vec::new();
+//        for cell_op in cells {
+//            match cell_op {
+//                &CommitOp::Read(id, version) => {
+//                    match self.server.chunks.head_cell(&id) {
+//                        Ok(header) => {
+//                            if header.version != version {
+//                                debug!("Cell header version not match {}/{}", header.version, version);
+//                                return self.response_with(DMCommitResult::CellChanged(
+//                                    id, Vec::new()
+//                                ))
+//                            } else {
+//                                debug!("Read cell unchanged with version{}", version);
+//                                read_lock.push(self.server.chunks.location_for_read(&id).unwrap());
+//                            }
+//                        }
+//                        Err(_) => {
+//                            debug!("Cell have been removed, trying to match version {}", version);
+//                            return self.response_with(DMCommitResult::CellChanged(
+//                                id, Vec::new()
+//                            ))
+//                        }
+//                    }
+//                },
+//                _ => {}
+//            }
+//        }
         for cell_op in cells {
             match cell_op {
                 &CommitOp::Read(id, version) => {}
