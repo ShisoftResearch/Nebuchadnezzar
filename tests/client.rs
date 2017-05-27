@@ -129,8 +129,6 @@ pub fn write_skew() {
                 let mut data = cell_1.data.Map().unwrap().clone();
                 data.insert(String::from("score"), Value::U64(score));
                 cell_1.data = Value::Map(data);
-                cell_1.set_id(cell_2_id);
-                cell_2.set_id(cell_1_id);
                 txn.update(&cell_1)?;
                 txn.update(&cell_2)?;
                 Ok(())
@@ -142,8 +140,8 @@ pub fn write_skew() {
     }
     let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
     let mut cell_2_r = client.read_cell(&cell_2_id).unwrap().unwrap();
-    assert_eq!(
-        cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap() +
-        cell_2_r.data.Map().unwrap().get("score").unwrap().U64().unwrap()
-    , thread_count as u64);
+    let cell_1_score = cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+    let cell_2_score = cell_2_r.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+    println!("{} / {}", cell_1_score, cell_2_score);
+    assert_eq!(cell_1_score + cell_2_score, thread_count as u64);
 }
