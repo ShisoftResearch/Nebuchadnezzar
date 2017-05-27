@@ -12,13 +12,12 @@ use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnGuard<'a> = WriteGuard<'a, TxnId, Transaction>;
-type AffectedObjs = BTreeMap<u64, Vec<(Id, DataObject)>>; // server_id as key
-type ReadObjs = BTreeMap<u64, Vec<(Id, u64)>>; // server_id as key, (id, version) as value
+type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct DataObject {
     server: u64,
     cell: Option<Cell>,
@@ -29,7 +28,7 @@ struct DataObject {
 
 struct Transaction {
     start_time: i64, // use for timeout detecting
-    data: BTreeMap<Id, DataObject>,
+    data: HashMap<Id, DataObject>,
     affected_objects: AffectedObjs,
     state: TxnState
 }
@@ -143,7 +142,7 @@ impl TransactionManager {
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in &txn.data {
-            affected_objs.entry(data_obj.server).or_insert_with(|| Vec::new()).push((*id, data_obj.clone()));
+            affected_objs.entry(data_obj.server).or_insert_with(|| BTreeMap::new()).insert(*id, data_obj.clone());
         }
         txn.data.clear(); // clean up data after transfered to changed/
         txn.affected_objects = affected_objs;
@@ -162,11 +161,11 @@ impl TransactionManager {
         ).collect())
     }
     fn site_prepare(
-        server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: Vec<(Id, DataObject)>,
+        server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
     ) -> Box<futures::Future<Item =DMPrepareResult, Error = TMError>> {
         let self_server_id = server.server_id;
-        let cell_ids: Vec<_> = objs.iter().map(|&(id, _)| id).collect();
+        let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
         let res_future = data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
@@ -222,7 +221,7 @@ impl TransactionManager {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter()
-                .map(|&(ref cell_id, ref data_obj)| {
+                .map(|(cell_id, data_obj)| {
                 if data_obj.version.is_some() && !data_obj.changed {
                     CommitOp::Read(*cell_id,data_obj.version.unwrap())
                 } else if data_obj.cell.is_none() && !data_obj.new {
@@ -333,7 +332,7 @@ impl Service for TransactionManager {
         let id = self.server.txn_peer.clock.inc();
         self.transactions.insert(id.clone(), Transaction {
             start_time: get_time(),
-            data: BTreeMap::new(),
+            data: HashMap::new(),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started
         });
