@@ -16,6 +16,7 @@ extern crate env_logger;
 extern crate rand;
 #[macro_use]
 extern crate lazy_static;
+extern crate parking_lot;
 
 use neb::ram::schema::Field;
 

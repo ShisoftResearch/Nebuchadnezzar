@@ -104,6 +104,14 @@ impl Chunk {
         seg.put_cell_tombstone(location);
         seg.put_frag(location);
     }
+    fn head_cell(&self, hash: u64) -> Result<Header, ReadError> {
+        match self.location_for_read(hash) {
+            Some(loc) => {
+                Cell::header_from_chunk_raw(*loc)
+            },
+            None => Err(ReadError::CellDoesNotExisted)
+        }
+    }
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
         match self.location_for_read(hash) {
             Some(loc) => {
@@ -256,6 +264,14 @@ impl Chunks {
     pub fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
+    }
+    pub fn head_cell(&self, key: &Id) -> Result<Header, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.head_cell(hash);
+    }
+    pub fn location_for_read(&self, key: &Id) -> Option<CellReadGuard> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.location_for_read(hash);
     }
     pub fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);

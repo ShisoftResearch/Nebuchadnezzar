@@ -8,6 +8,8 @@ use server::NebServer;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use super::*;
+use std::sync::mpsc::{Sender, Receiver, channel};
+use std::thread;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -46,10 +48,11 @@ impl CellHistory {
 pub struct DataManager {
     cells: CHashMap<Id, CellMeta>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
-    tnxs: CHashMap<TxnId, Transaction>,
+    txns: CHashMap<TxnId, Transaction>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
-    server: Arc<NebServer>
+    server: Arc<NebServer>,
+    cleanup_sender: Mutex<Sender<()>>,
 }
 
 service! {
@@ -71,20 +74,30 @@ dispatch_rpc_service_functions!(DataManager);
 
 impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
-        Arc::new(DataManager {
+        let (cleaup_sender, cleaup_recv) = channel();
+        let manager = Arc::new(DataManager {
             cells: CHashMap::new(),
             cell_lru: Mutex::new(LinkedHashMap::new()),
-            tnxs: CHashMap::new(),
+            txns: CHashMap::new(),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
-        })
+            cleanup_sender: Mutex::new(cleaup_sender)
+        });
+        let manager_clone = manager.clone();
+        thread::spawn(move || { //TODO: give way to shutdown
+            loop {
+                cleaup_recv.recv();
+                manager_clone.cell_meta_cleanup();
+            }
+        });
+        return manager;
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
-        self.tnxs.alter(tid.clone(), |t|{
+        self.txns.alter(tid.clone(), |t|{
             match t {
                 Some(t) => Some(t),
                 None => Some(Transaction {
@@ -95,7 +108,7 @@ impl DataManager {
                 })
             }
         });
-        match self.tnxs.get_mut(tid) {
+        match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => self.get_transaction(tid, server) // it should be rare
         }
@@ -167,11 +180,11 @@ impl DataManager {
         Ok(self.managers.get(&server_id).unwrap().clone())
     }
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        self.tnxs.remove(tid);
+        self.txns.remove(tid);
         self.tnxs_sorted.lock().remove(tid);
     }
     fn cell_meta_cleanup(&self) {
-        let mut cell_lru = self.cell_lru.lock();
+        let mut cell_lru = self.cell_lru.lock().clone(); // TODO: Don't clone
         let mut evicted_cells = Vec::new();
         let oldest_transaction = {
             let tnx_sorted = self.tnxs_sorted.lock();
@@ -268,7 +281,7 @@ impl Service for DataManager {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
                     meta.waiting.insert((tid.clone(), *server_id));
                     debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
-                    return self.response_with(DMPrepareResult::Wait)
+                    return self.response_with(DMPrepareResult::Wait);
                 }
             }
             cell_metas.push(meta);
@@ -288,7 +301,7 @@ impl Service for DataManager {
     fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
               -> Result<DataSiteResponse<DMCommitResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.tnxs.get_mut(tid) {
+        let mut txn = match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted)); }
         };
@@ -302,12 +315,44 @@ impl Service for DataManager {
         }
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();
-        let arrived_cells_num = self.cells.len();
-        if prepared_cells_num != arrived_cells_num {return self.response_with(DMCommitResult::CheckFailed(CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))}
+        let arrived_cells_num = cells.len();
+        if prepared_cells_num != arrived_cells_num {
+            return self.response_with(
+                DMCommitResult::CheckFailed(
+                    CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))
+        }
         let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
+//        let mut read_lock = Vec::new();
+//        for cell_op in cells {
+//            match cell_op {
+//                &CommitOp::Read(id, version) => {
+//                    match self.server.chunks.head_cell(&id) {
+//                        Ok(header) => {
+//                            if header.version != version {
+//                                debug!("Cell header version not match {}/{}", header.version, version);
+//                                return self.response_with(DMCommitResult::CellChanged(
+//                                    id, Vec::new()
+//                                ))
+//                            } else {
+//                                debug!("Read cell unchanged with version{}", version);
+//                                read_lock.push(self.server.chunks.location_for_read(&id).unwrap());
+//                            }
+//                        }
+//                        Err(_) => {
+//                            debug!("Cell have been removed, trying to match version {}", version);
+//                            return self.response_with(DMCommitResult::CellChanged(
+//                                id, Vec::new()
+//                            ))
+//                        }
+//                    }
+//                },
+//                _ => {}
+//            }
+//        }
         for cell_op in cells {
             match cell_op {
+                &CommitOp::Read(id, version) => {}
                 &CommitOp::Write(ref cell) => {
                     let mut cell = cell.clone();
                     let write_result = self.server.chunks.write_cell(&mut cell);
@@ -411,7 +456,7 @@ impl Service for DataManager {
     fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
         -> Result<DataSiteResponse<AbortResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.tnxs.get_mut(tid) {
+        let mut txn = match self.txns.get_mut(tid) {
             Some(tnx) => tnx,
             _ => { return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted)); }
         };
@@ -431,7 +476,7 @@ impl Service for DataManager {
         debug!("END {:?}", tid);
         let result = {
             self.update_clock(clock);
-            let txn = match self.tnxs.get_mut(tid) {
+            let txn = match self.txns.get_mut(tid) {
                 Some(tnx) => tnx,
                 _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
             };
@@ -479,8 +524,8 @@ impl Service for DataManager {
                 self.response_with(EndResult::SomeLocksNotReleased)
             }
         };
-        self.cell_meta_cleanup();
         self.wipe_out_transaction(tid);
+        self.cleanup_sender.lock().send(());
         return result;
     }
 }
