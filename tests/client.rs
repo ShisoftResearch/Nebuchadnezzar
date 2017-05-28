@@ -54,7 +54,7 @@ pub fn general() {
         _ => panic!("{:?}", should_aborted)
     }
     let cell_1_id = cell_1.id();
-    let thread_count = 100;
+    let thread_count = 50;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let client = client.clone();
