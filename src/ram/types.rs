@@ -125,6 +125,13 @@ macro_rules! define_types {
          );*
     ) => (
 
+        #[derive(Copy, Clone)]
+        pub enum TypeId {
+            $(
+                $e = $id,
+            )*
+        }
+
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub enum Value {
             $(
