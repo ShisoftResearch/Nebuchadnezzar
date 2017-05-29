@@ -28,12 +28,14 @@ pub enum TxnError {
 pub struct Transaction {
     pub tid: TxnId,
     pub state: TxnState,
-    pub client: Arc<manager::SyncServiceClient>
+    pub client: Arc<manager::SyncServiceClient>,
+    pub changes: u32,
 }
 
 impl Transaction {
 
-    pub fn read(&self, id: &Id) -> Result<Option<Cell>, TxnError> {
+    pub fn read(&mut self, id: &Id) -> Result<Option<Cell>, TxnError> {
+        self.changes += 1;
         match self.client.read(&self.tid, id) {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -44,7 +46,8 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-    pub fn write(&self, cell: &Cell) -> Result<(), TxnError> {
+    pub fn write(&mut self, cell: &Cell) -> Result<(), TxnError> {
+        self.changes += 1;
         match self.client.write(&self.tid, cell) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -54,7 +57,8 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-    pub fn update(&self, cell: &Cell) -> Result<(), TxnError> {
+    pub fn update(&mut self, cell: &Cell) -> Result<(), TxnError> {
+        self.changes += 1;
         match self.client.update(&self.tid, cell) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -64,7 +68,8 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-    pub fn remove(&self, id: &Id) -> Result<(), TxnError> {
+    pub fn remove(&mut self, id: &Id) -> Result<(), TxnError> {
+        self.changes += 1;
         match self.client.remove(&self.tid, id) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),

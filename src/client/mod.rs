@@ -98,7 +98,8 @@ impl Client {
             let mut txn = Transaction{
                 tid: txn_id,
                 state: txn_server::TxnState::Started,
-                client: txn_client.clone()
+                client: txn_client.clone(),
+                changes: 0
             };
             let mut exec_result = func(&mut txn);
             if exec_result.is_ok() && txn.state == txn_server::TxnState::Started {
