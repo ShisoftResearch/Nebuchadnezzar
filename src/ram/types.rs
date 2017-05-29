@@ -130,6 +130,7 @@ macro_rules! define_types {
             $(
                 $e = $id,
             )*
+            Map = 0 // No matter which id we pick for 'Map' because w/r planners will ignore it when sub_fields is not 'None'
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
