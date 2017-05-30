@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 #[test]
 pub fn init () {
-    NebServer::new(ServerOptions {
+    NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024,
         standalone: false,

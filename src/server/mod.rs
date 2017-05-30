@@ -134,7 +134,7 @@ impl NebServer {
             }
         }
     }
-    pub fn new(opt: ServerOptions) -> Result<Arc<NebServer>, ServerError> {
+    pub fn new(opt: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
         let mut schemas = SchemasServer::new(None);

@@ -15,7 +15,7 @@ use super::*;
 #[test]
 pub fn general() {
     let server_addr = String::from("127.0.0.1:5400");
-    let server = NebServer::new(ServerOptions {
+    let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -81,7 +81,7 @@ pub fn general() {
 #[test]
 pub fn multi_cell_update() {
     let server_addr = String::from("127.0.0.1:5401");
-    let server = NebServer::new(ServerOptions {
+    let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -156,7 +156,7 @@ pub fn multi_cell_update() {
 #[test]
 pub fn write_skew() {
     let server_addr = String::from("127.0.0.1:5402");
-    let server = NebServer::new(ServerOptions {
+    let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
