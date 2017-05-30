@@ -23,8 +23,8 @@ bincode = "*"
 byteorder = "1"
 parking_lot = {version = "0.4", features = ["nightly"]}
 rand = "0.3"
-futures = "0.1.9"
-linked-hash-map = "0.4.2"
+futures = "0.1"
+linked-hash-map = "0.4"
 
 [dev-dependencies]
 rand = "0.3"
