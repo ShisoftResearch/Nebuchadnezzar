@@ -32,10 +32,10 @@ impl Schema {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Field {
     pub type_id: u32,
-    pub name: String,
     pub nullable: bool,
     pub is_array: bool,
-    pub sub_fields: Option<Vec<Field>>
+    pub sub_fields: Option<Vec<Field>>,
+    pub name: String,
 }
 
 pub struct SchemasMap {
