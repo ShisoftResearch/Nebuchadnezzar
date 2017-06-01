@@ -260,6 +260,10 @@ pub struct Id {
     pub lower:  u64,
 }
 
+pub fn key_hash(key: &String) -> u64 {
+    hash_str(&key)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map<V> {
     map: hash_map::HashMap<u64, V>
@@ -274,14 +278,14 @@ impl <V>Map<V> {
     pub fn from_hash_map(map: hash_map::HashMap<String, V>) -> Map<V> {
         let mut target_map = hash_map::HashMap::new();
         for (key, value) in map {
-            target_map.insert(hash_str(&key), value);
+            target_map.insert(key_hash(&key), value);
         }
         Map {
             map: target_map
         }
     }
     pub fn insert(&mut self, key: &String, value: V) -> Option<V> {
-        self.insert_key_id(hash_str(key), value)
+        self.insert_key_id(key_hash(key), value)
     }
     pub fn insert_key_id(&mut self, key: u64, value: V) -> Option<V> {
         self.map.insert(key, value)
@@ -290,7 +294,7 @@ impl <V>Map<V> {
         self.map.get(&key)
     }
     pub fn get(&self, key: &String) -> Option<&V> {
-        self.get_key_id(hash_str(key))
+        self.get_key_id(key_hash(key))
     }
     pub fn get_static_key(&self, key: &'static str) -> Option<&V> {
         self.get(&String::from(key))

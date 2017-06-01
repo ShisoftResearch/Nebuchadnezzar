@@ -8,6 +8,7 @@ use parking_lot::{RwLock};
 use std::sync::{Arc};
 use std::string::String;
 use core::borrow::Borrow;
+use super::types;
 
 pub mod sm;
 
@@ -50,7 +51,7 @@ impl Field {
         -> Field {
         Field {
             name: name.clone(),
-            name_id: hash_str(name),
+            name_id: types::key_hash(name),
             type_id: type_id,
             nullable: nullable,
             is_array: is_array,
