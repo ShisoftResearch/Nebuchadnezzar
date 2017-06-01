@@ -8,7 +8,7 @@ use std::collections::HashMap;
 const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
 pub type DataValue = Value;
-pub type DataMap = Map<String, Value>;
+pub type DataMap = Map<Value>;
 
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, id: &Id, map: HashMap<String, Value>) -> Cell {
+    pub fn new(schema_id: u32, id: &Id, map: Map<Value>) -> Cell {
         Cell {
             header: Header::new(0, schema_id, id),
             data: Value::Map(map)

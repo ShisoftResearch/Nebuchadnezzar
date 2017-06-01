@@ -36,10 +36,10 @@ pub fn general() {
         &server.rpc, &vec!(server_addr),
         &String::from("test")).unwrap());
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<String, Value>::new();
-    data_map.insert(String::from("id"), Value::I64(100));
-    data_map.insert(String::from("score"), Value::U64(0));
-    data_map.insert(String::from("name"), Value::String(String::from("Jack")));
+    let mut data_map = Map::<Value>::new();
+    data_map.insert(&String::from("id"), Value::I64(100));
+    data_map.insert(&String::from("score"), Value::U64(0));
+    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
@@ -61,10 +61,10 @@ pub fn general() {
         threads.push(thread::spawn(move || {
             client.transaction(|ref mut txn| {
                 let mut cell = txn.read(&cell_1_id)?.unwrap();
-                let mut score = cell.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                let mut score = cell.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
-                data.insert(String::from("score"), Value::U64(score));
+                data.insert(&String::from("score"), Value::U64(score));
                 cell.data = Value::Map(data);
                 txn.update(&cell)?;
                 Ok(())
@@ -75,7 +75,7 @@ pub fn general() {
         handle.join();
     }
     let mut cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
-    assert_eq!(cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap(), thread_count as u64);
+    assert_eq!(cell_1_r.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap(), thread_count as u64);
 }
 
 #[test]
@@ -104,10 +104,10 @@ pub fn multi_cell_update() {
     let thread_count = 100;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<String, Value>::new();
-    data_map.insert(String::from("id"), Value::I64(100));
-    data_map.insert(String::from("score"), Value::U64(0));
-    data_map.insert(String::from("name"), Value::String(String::from("Jack")));
+    let mut data_map = Map::<Value>::new();
+    data_map.insert(&String::from("id"), Value::I64(100));
+    data_map.insert(&String::from("score"), Value::U64(0));
+    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
@@ -126,15 +126,15 @@ pub fn multi_cell_update() {
             client.transaction(|ref mut txn| {
                 let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
                 let mut cell_2 = txn.read(&cell_2_id)?.unwrap();
-                score_1 = cell_1.data.Map().unwrap().get("score").unwrap().U64().unwrap();
-                score_2 = cell_2.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+                score_1 = cell_1.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
+                score_2 = cell_2.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
                 score_1 += 1;
                 score_2 += 1;
                 let mut data_1 = cell_1.data.Map().unwrap().clone();
-                data_1.insert(String::from("score"), Value::U64(score_1));
+                data_1.insert(&String::from("score"), Value::U64(score_1));
                 cell_1.data = Value::Map(data_1);
                 let mut data_2 = cell_2.data.Map().unwrap().clone();
-                data_2.insert(String::from("score"), Value::U64(score_2));
+                data_2.insert(&String::from("score"), Value::U64(score_2));
                 cell_2.data = Value::Map(data_2);
                 txn.update(&cell_1)?;
                 txn.update(&cell_2)?;
@@ -148,8 +148,8 @@ pub fn multi_cell_update() {
     }
     let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
     let mut cell_2_r = client.read_cell(&cell_2_id).unwrap().unwrap();
-    let cell_1_score = cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap();
-    let cell_2_score = cell_2_r.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+    let cell_1_score = cell_1_r.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
+    let cell_2_score = cell_2_r.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
 }
 
@@ -178,10 +178,10 @@ pub fn write_skew() {
         &String::from("test")).unwrap());
     let thread_count = 100;
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<String, Value>::new();
-    data_map.insert(String::from("id"), Value::I64(100));
-    data_map.insert(String::from("score"), Value::U64(0));
-    data_map.insert(String::from("name"), Value::String(String::from("Jack")));
+    let mut data_map = Map::<Value>::new();
+    data_map.insert(&String::from("id"), Value::I64(100));
+    data_map.insert(&String::from("score"), Value::U64(0));
+    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
@@ -197,11 +197,11 @@ pub fn write_skew() {
         client_c1.transaction(|ref mut txn| {
             *skew_tried_c.lock() += 1;
             let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
-            let mut score_1 = cell_1.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+            let mut score_1 = cell_1.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
             thread::sleep(Duration::new(5, 0)); // wait 5 secs to let late write occur
             score_1 += 1;
             let mut data_1 = cell_1.data.Map().unwrap().clone();
-            data_1.insert(String::from("score"), Value::U64(score_1));
+            data_1.insert(&String::from("score"), Value::U64(score_1));
             cell_1.data = Value::Map(data_1);
             txn.update(&cell_1)?;
             Ok(())
@@ -213,10 +213,10 @@ pub fn write_skew() {
             thread::sleep(Duration::new(1, 0));
             *normal_tried_c.lock() += 1;
             let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
-            let mut score_1 = cell_1.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+            let mut score_1 = cell_1.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
             score_1 += 1;
             let mut data_1 = cell_1.data.Map().unwrap().clone();
-            data_1.insert(String::from("score"), Value::U64(score_1));
+            data_1.insert(&String::from("score"), Value::U64(score_1));
             cell_1.data = Value::Map(data_1);
             txn.update(&cell_1)?;
             Ok(())
@@ -225,7 +225,7 @@ pub fn write_skew() {
     t2.join();
     t1.join();
     let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
-    let cell_1_score = cell_1_r.data.Map().unwrap().get("score").unwrap().U64().unwrap();
+    let cell_1_score = cell_1_r.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap();
     assert_eq!(cell_1_score, 2);
 //    assert_eq!(*skew_tried.lock(), 2);
 //    assert_eq!(*normal_tried.lock(), 1);

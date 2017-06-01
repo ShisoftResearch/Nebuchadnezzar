@@ -4,6 +4,7 @@ use std::string::String;
 use std::collections::hash_map;
 use std::cmp::Ordering;
 use utils::rand;
+use bifrost_hasher::hash_str;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -116,8 +117,6 @@ macro_rules! get_from_val_fn {
     )
 }
 
-pub type Map<K, V> = hash_map::HashMap<K, V>;
-
 macro_rules! define_types {
     (
         $(
@@ -138,7 +137,7 @@ macro_rules! define_types {
             $(
                 $e($t),
             )*
-            Map(Map<String, Value>),
+            Map(Map<Value>),
             Array(Vec<Value>),
             NA,
             Null
@@ -147,7 +146,7 @@ macro_rules! define_types {
             $(
                 get_from_val_fn!($r, $e, $t);
             )*
-            pub fn Map(&self) -> Option<&Map<String, Value>> {
+            pub fn Map(&self) -> Option<&Map<Value>> {
                 match self {
                     &Value::Map(ref m) => Some(m),
                     _ => None
@@ -259,6 +258,43 @@ pub struct Pos3d64 {
 pub struct Id {
     pub higher: u64,
     pub lower:  u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Map<V> {
+    map: hash_map::HashMap<u64, V>
+}
+
+impl <V>Map<V> {
+    pub fn new() -> Map<V> {
+        Map {
+            map: hash_map::HashMap::new()
+        }
+    }
+    pub fn from_hash_map(map: hash_map::HashMap<String, V>) -> Map<V> {
+        let mut target_map = hash_map::HashMap::new();
+        for (key, value) in map {
+            target_map.insert(hash_str(&key), value);
+        }
+        Map {
+            map: target_map
+        }
+    }
+    pub fn insert(&mut self, key: &String, value: V) -> Option<V> {
+        self.insert_key_id(hash_str(key), value)
+    }
+    pub fn insert_key_id(&mut self, key: u64, value: V) -> Option<V> {
+        self.map.insert(key, value)
+    }
+    pub fn get_key_id(&self, key: u64) -> Option<&V> {
+        self.map.get(&key)
+    }
+    pub fn get(&self, key: &String) -> Option<&V> {
+        self.get_key_id(hash_str(key))
+    }
+    pub fn get_static_key(&self, key: &'static str) -> Option<&V> {
+        self.get(&String::from(key))
+    }
 }
 
 impl Id {

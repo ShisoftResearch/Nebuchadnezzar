@@ -1,5 +1,6 @@
 use bifrost::raft::client::{RaftClient, SubscriptionError};
 use bifrost::raft::state_machine::master::ExecError;
+use bifrost_hasher::hash_str;
 
 use std::collections::HashMap;
 use parking_lot::{RwLock};
@@ -36,6 +37,26 @@ pub struct Field {
     pub is_array: bool,
     pub sub_fields: Option<Vec<Field>>,
     pub name: String,
+    pub name_id: u64,
+}
+
+impl Field {
+    pub fn new(
+        name: &String,
+        type_id: u32,
+        nullable: bool,
+        is_array: bool,
+        sub_fields: Option<Vec<Field>>)
+        -> Field {
+        Field {
+            name: name.clone(),
+            name_id: hash_str(name),
+            type_id: type_id,
+            nullable: nullable,
+            is_array: is_array,
+            sub_fields: sub_fields
+        }
+    }
 }
 
 pub struct SchemasMap {

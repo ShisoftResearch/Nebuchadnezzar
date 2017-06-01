@@ -21,33 +21,11 @@ extern crate parking_lot;
 use neb::ram::schema::Field;
 
 pub fn default_fields () -> Field {
-    Field {
-        type_id: 0,
-        name: String::from("*"),
-        nullable: false,
-        is_array: false,
-        sub_fields: Some(vec![
-            Field {
-                type_id: 6,
-                name: String::from("id"),
-                nullable:false,
-                is_array:false,
-                sub_fields: None,
-            },
-            Field {
-                type_id: 20,
-                name: String::from("name"),
-                nullable:false,
-                is_array:false,
-                sub_fields: None,
-            },
-            Field {
-                type_id: 10,
-                name: String::from("score"),
-                nullable:false,
-                is_array:false,
-                sub_fields: None,
-            }
-        ])
-    }
+    Field::new (&String::from("*"), 0, false, false, Some(
+        vec![
+            Field::new(&String::from("id"), 6, false, false, None),
+            Field::new(&String::from("name"), 20, false, false, None),
+            Field::new(&String::from("score"), 10, false, false, None),
+        ]
+    ))
 }

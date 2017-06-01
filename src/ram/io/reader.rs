@@ -27,9 +27,8 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = DataMap::new();
         for sub in subs {
-            let field_name = sub.name.clone();
             let (cval, cptr) = read_field(ptr, &sub);
-            map.insert(field_name, cval);
+            map.insert_key_id(sub.name_id, cval);
             ptr = cptr;
         }
             (Value::Map(map), ptr)

@@ -43,8 +43,7 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
     } else if let Some(ref subs) = field.sub_fields {
         if let &Value::Map(ref map) = value {
             for sub in subs {
-                let field_name = sub.name.clone();
-                let val = map.get(&field_name).unwrap();
+                let val = map.get_key_id(sub.name_id).unwrap();
                 plan_write_field(&mut offset, &sub, val, &mut ins);
             }
         } else {
