@@ -266,25 +266,30 @@ pub fn key_hash(key: &String) -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map<V> {
-    map: hash_map::HashMap<u64, V>
+    map: hash_map::HashMap<u64, V>,
+    pub fields: Vec<String>
 }
 
 impl <V>Map<V> {
     pub fn new() -> Map<V> {
         Map {
-            map: hash_map::HashMap::new()
+            map: hash_map::HashMap::new(),
+            fields: Vec::new()
         }
     }
     pub fn from_hash_map(map: hash_map::HashMap<String, V>) -> Map<V> {
         let mut target_map = hash_map::HashMap::new();
+        let fields = map.keys().cloned().collect();
         for (key, value) in map {
             target_map.insert(key_hash(&key), value);
         }
         Map {
-            map: target_map
+            map: target_map,
+            fields: fields
         }
     }
     pub fn insert(&mut self, key: &String, value: V) -> Option<V> {
+        self.fields.push(key.clone());
         self.insert_key_id(key_hash(key), value)
     }
     pub fn insert_key_id(&mut self, key: u64, value: V) -> Option<V> {
@@ -298,6 +303,19 @@ impl <V>Map<V> {
     }
     pub fn get_static_key(&self, key: &'static str) -> Option<&V> {
         self.get(&String::from(key))
+    }
+    pub fn into_string_map(self) -> hash_map::HashMap<String, V> {
+        let mut id_map: hash_map::HashMap<u64, String> =
+            self.fields
+                .into_iter()
+                .map(|field| (hash_str(&field), field))
+                .collect();
+        self.map
+            .into_iter()
+            .map(|(fid, value)| (id_map.remove(&fid), value))
+            .filter(|&(ref field, _)| field.is_some())
+            .map(|(field, value)| (field.unwrap(), value))
+            .collect()
     }
 }
 

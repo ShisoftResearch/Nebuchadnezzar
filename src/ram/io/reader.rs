@@ -31,7 +31,8 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
             map.insert_key_id(sub.name_id, cval);
             ptr = cptr;
         }
-            (Value::Map(map), ptr)
+        map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
+        (Value::Map(map), ptr)
     } else {
         (types::get_val(field.type_id, ptr), ptr + types::get_size(field.type_id, ptr))
     }
