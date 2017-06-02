@@ -17,13 +17,13 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
         let mut sub_field = field.clone();
         sub_field.is_array = false;
         ptr += u16_io::size(ptr);
-        let mut val = Vec::<DataValue>::new();
+        let mut vals = Vec::<DataValue>::new();
         for _ in 0..len {
             let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field);
             ptr = nxt_ptr;
-            val.push(nxt_val);
+            vals.push(nxt_val);
         }
-        (Value::Array(val), ptr)
+        (Value::Array(vals), ptr)
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = DataMap::new();
         for sub in subs {
