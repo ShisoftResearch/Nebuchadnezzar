@@ -72,21 +72,28 @@ pub struct SchemasServer {
 }
 
 impl SchemasServer {
-    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Arc<SchemasServer> {
+    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Result<Arc<SchemasServer>, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let sm = match raft_client {
             Some(raft) => {
                 let m1 = map.clone();
                 let m2 = map.clone();
                 let sm = sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft);
+                let mut sm_data = sm.get_all()?.unwrap();
+                {
+                    let mut map = map.write();
+                    for schema in sm_data {
+                        map.new_schema(schema);
+                    }
+                }
                 let new_sub = sm.on_schema_added(move |r| {
                     let mut m1 = m1.write();
-                    m1.new_schema(&r.unwrap());
-                });
+                    m1.new_schema(r.unwrap());
+                })?;
                 let del_sub = sm.on_schema_deleted(move |r| {
                     let mut m2 = m2.write();
                     m2.del_schema(&r.unwrap());
-                });
+                })?;
                 Some(sm)
             },
             None => None
@@ -95,13 +102,13 @@ impl SchemasServer {
             map: map,
             sm: sm
         });
-        return schemas;
+        return Ok(schemas);
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {
         let m = self.map.read();
         m.get(id)
     }
-    pub fn new_schema(&self, schema: &Schema) { // for debug only
+    pub fn new_schema(&self, schema: Schema) { // for debug only
         let mut m = self.map.write();
         m.new_schema(schema)
     }
@@ -115,7 +122,7 @@ impl SchemasMap {
             id_counter: 0,
         }
     }
-    pub fn new_schema(&mut self, schema: &Schema) {
+    pub fn new_schema(&mut self, schema: Schema) {
         let name = schema.name.clone();
         let id = schema.id;
         self.schema_map.insert(id, Arc::new(schema.clone()));

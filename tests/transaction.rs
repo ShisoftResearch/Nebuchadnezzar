@@ -30,7 +30,7 @@ pub fn workspace_wr() {
         key_field: None,
         fields: default_fields()
     };
-    server.meta.schemas.new_schema(&mut schema);
+    server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_id = txn.begin().unwrap().unwrap();
     let mut data_map = Map::<Value>::new();
@@ -118,7 +118,7 @@ pub fn data_site_wr() {
         key_field: None,
         fields: default_fields()
     };
-    server.meta.schemas.new_schema(&mut schema);
+    server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_id = txn.begin().unwrap().unwrap();
     let mut data_map = Map::<Value>::new();
@@ -179,7 +179,7 @@ pub fn multi_transaction() {
         key_field: None,
         fields: default_fields()
     };
-    server.meta.schemas.new_schema(&mut schema);
+    server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_1_id = txn.begin().unwrap().unwrap();
     let txn_2_id = txn.begin().unwrap().unwrap();
@@ -237,7 +237,7 @@ pub fn smoke_rw() {
         key_field: None,
         fields: default_fields()
     };
-    server.meta.schemas.new_schema(&mut schema);
+    server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let mut data_map_1 = Map::<Value>::new();
     data_map_1.insert(&String::from("id"), Value::I64(100));

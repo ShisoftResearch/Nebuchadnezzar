@@ -32,7 +32,7 @@ impl StateMachineCmds for SchemasSM {
     fn new_schema(&mut self, schema: Schema) -> Result<(), ()> {
         {
             let mut map = self.map.write();
-            map.new_schema(&schema);
+            map.new_schema(schema.clone());
         }
         self.callback.notify(&commands::on_schema_added::new(), Ok(schema));
         Ok(())

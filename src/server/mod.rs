@@ -26,6 +26,7 @@ pub enum ServerError {
     CannotSetServerWeight,
     CannotInitConsistentHashTable,
     CannotLoadMetaClient,
+    CannotInitializeSchemaServer(sm_master::ExecError),
     StandaloneMustAlsoBeMetaServer,
 }
 
@@ -125,7 +126,11 @@ impl NebServer {
                 RaftClient::prepare_subscription(rpc_server);
                 NebServer::join_group(opt, &raft_client)?;
                 let conshash = NebServer::init_conshash(opt, &raft_client)?;
-                *schemas = SchemasServer::new(Some(&raft_client));
+                let schema_server = match SchemasServer::new(Some(&raft_client)) {
+                    Ok(schema) => schema,
+                    Err(e) => return Err(ServerError::CannotInitializeSchemaServer(e))
+                };
+                *schemas = schema_server;
                 Ok(conshash)
             },
             Err(e) => {
@@ -137,7 +142,7 @@ impl NebServer {
     pub fn new(opt: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
-        let mut schemas = SchemasServer::new(None);
+        let mut schemas = SchemasServer::new(None).unwrap();
         rpc::Server::listen_and_resume(&rpc_server);
         if opt.is_meta {
             NebServer::load_meta_server(&opt, &rpc_server)?;

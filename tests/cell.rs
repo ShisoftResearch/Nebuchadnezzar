@@ -32,7 +32,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-    chunk.meta.schemas.new_schema(&mut schema);
+    chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: Header::new(0, schema.id, &id1),
 //        Header {
