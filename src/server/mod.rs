@@ -53,11 +53,12 @@ pub struct NebServer {
     pub consh: Arc<ConsistentHashing>,
     pub member_pool: rpc::ClientPool,
     pub txn_peer: transactions::Peer,
+    pub raft_service: Option<Arc<raft::RaftService>>,
     pub server_id: u64
 }
 
 impl NebServer {
-    fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<(), ServerError> {
+    fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<Arc<raft::RaftService>, ServerError> {
         let server_addr = &opt.address;
         let raft_service = raft::RaftService::new(raft::Options {
             storage: match opt.meta_storage {
@@ -88,7 +89,7 @@ impl NebServer {
         }
         Membership::new(rpc_server, &raft_service);
         Weights::new(&raft_service);
-        return Ok(());
+        return Ok(raft_service);
     }
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
@@ -143,9 +144,10 @@ impl NebServer {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
         let mut schemas = SchemasServer::new(None).unwrap();
+        let mut raft_service = None;
         rpc::Server::listen_and_resume(&rpc_server);
         if opt.is_meta {
-            NebServer::load_meta_server(&opt, &rpc_server)?;
+            raft_service = Some(NebServer::load_meta_server(&opt, &rpc_server)?);
         }
         if !opt.is_meta && opt.standalone {
             return Err(ServerError::StandaloneMustAlsoBeMetaServer)
@@ -167,6 +169,7 @@ impl NebServer {
             consh: conshasing,
             member_pool: rpc::ClientPool::new(),
             txn_peer: transactions::Peer::new(server_addr),
+            raft_service: raft_service,
             server_id: rpc_server.server_id
         });
         rpc_server.register_service(
