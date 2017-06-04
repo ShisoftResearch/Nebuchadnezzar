@@ -3,11 +3,10 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::{master as sm_master};
-use bifrost::raft::state_machine::callback::client::SubscriptionService;
 use bifrost::membership::server::Membership;
 use bifrost::membership::member::MemberService;
 use bifrost::conshash::weights::Weights;
-use bifrost::tcp::{STANDALONE_ADDRESS_STRING, STANDALONE_SERVER_ID};
+use bifrost::tcp::{STANDALONE_ADDRESS_STRING};
 use ram::chunk::Chunks;
 use ram::schema::SchemasServer;
 use ram::schema::{sm as schema_sm};
@@ -152,7 +151,7 @@ impl NebServer {
         if !opt.is_meta && opt.standalone {
             return Err(ServerError::StandaloneMustAlsoBeMetaServer)
         }
-        let mut conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
+        let conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
         let meta_rc = Arc::new(ServerMeta {
             schemas: schemas
         });
