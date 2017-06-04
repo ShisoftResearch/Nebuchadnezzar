@@ -16,16 +16,22 @@ pub mod sm;
 pub struct Schema {
     pub id: u32,
     pub name: String,
-    pub key_field: Option<String>,
+    pub key_field: Option<Vec<u64>>,
     pub fields: Field
 }
 
 impl Schema {
-    pub fn new(name: String, key_field: Option<String>, fields: Field) -> Schema {
+    pub fn new(name: String, key_field: Option<Vec<String>>, fields: Field) -> Schema {
         Schema {
             id: 0,
             name: name,
-            key_field: key_field,
+            key_field: match key_field {
+                None => None,
+                Some(keys) => Some(keys
+                    .iter()
+                    .map(|f| hash_str(f))
+                    .collect())             // field list into field ids
+            },
             fields: fields
         }
     }
