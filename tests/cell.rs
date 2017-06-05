@@ -24,6 +24,7 @@ pub fn cell_rw () {
         id: 1,
         name: String::from("dummy"),
         key_field: None,
+        str_key_field: None,
         fields: fields
     };
     let mut data_map = Map::<Value>::new();

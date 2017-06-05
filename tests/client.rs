@@ -30,6 +30,7 @@ pub fn general() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     let client = Arc::new(client::Client::new(
@@ -96,6 +97,7 @@ pub fn multi_cell_update() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     let client = Arc::new(client::Client::new(
@@ -171,6 +173,7 @@ pub fn write_skew() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     let client = Arc::new(client::Client::new(

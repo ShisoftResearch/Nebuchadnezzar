@@ -28,6 +28,7 @@ pub fn workspace_wr() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     server.meta.schemas.new_schema(schema.clone());
@@ -116,6 +117,7 @@ pub fn data_site_wr() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     server.meta.schemas.new_schema(schema.clone());
@@ -177,6 +179,7 @@ pub fn multi_transaction() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     server.meta.schemas.new_schema(schema.clone());
@@ -235,6 +238,7 @@ pub fn smoke_rw() {
         id: 1,
         name: String::from("test"),
         key_field: None,
+        str_key_field: None,
         fields: default_fields()
     };
     server.meta.schemas.new_schema(schema.clone());

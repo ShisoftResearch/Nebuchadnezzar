@@ -17,6 +17,7 @@ pub struct Schema {
     pub id: u32,
     pub name: String,
     pub key_field: Option<Vec<u64>>,
+    pub str_key_field: Option<Vec<String>>,
     pub fields: Field
 }
 
@@ -27,11 +28,12 @@ impl Schema {
             name: name,
             key_field: match key_field {
                 None => None,
-                Some(keys) => Some(keys
+                Some(ref keys) => Some(keys
                     .iter()
                     .map(|f| hash_str(f))
                     .collect())             // field list into field ids
             },
+            str_key_field: key_field,
             fields: fields
         }
     }
