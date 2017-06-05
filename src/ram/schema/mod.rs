@@ -78,7 +78,7 @@ pub struct SchemasServer {
 }
 
 impl SchemasServer {
-    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Result<Arc<SchemasServer>, ExecError> {
+    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Result<SchemasServer, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let sm = match raft_client {
             Some(raft) => {
@@ -104,10 +104,10 @@ impl SchemasServer {
             },
             None => None
         };
-        let schemas = Arc::new(SchemasServer {
+        let schemas = SchemasServer {
             map: map,
             sm: sm
-        });
+        };
         return Ok(schemas);
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {

@@ -42,7 +42,7 @@ pub struct ServerOptions {
 }
 
 pub struct ServerMeta {
-    pub schemas: Arc<SchemasServer>
+    pub schemas: SchemasServer
 }
 
 pub struct NebServer {
@@ -118,7 +118,7 @@ impl NebServer {
         }
     }
     fn load_cluster_clients
-    (opt: &ServerOptions, schemas: &mut Arc<SchemasServer>, rpc_server: &Arc<rpc::Server>)
+    (opt: &ServerOptions, schemas: &mut SchemasServer, rpc_server: &Arc<rpc::Server>)
      -> Result<Arc<ConsistentHashing>, ServerError>{
         let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {

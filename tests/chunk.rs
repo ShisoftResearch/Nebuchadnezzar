@@ -38,14 +38,14 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
     let schemas = SchemasServer::new(None).unwrap();
-    let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
-        schemas: schemas.clone()
-    }), None);
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: Header::new(0, schema.id, &id1),
         data: data
     };
+    let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
+        schemas: schemas
+    }), None);
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_1_ptr = chunks.chunk_ptr(&Id::from_header(&header));
     {
