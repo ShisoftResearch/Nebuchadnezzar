@@ -50,7 +50,7 @@ impl Header {
             hash: id.lower,
         }
     }
-    pub fn write(&self, location: usize) {
+    fn write(&self, location: usize) {
         unsafe {
             ptr::copy_nonoverlapping(self as *const Header, location as *mut Header, HEADER_SIZE);
         }
