@@ -137,7 +137,7 @@ macro_rules! define_types {
             $(
                 $e($t),
             )*
-            Map(Map<Value>),
+            Map(DataMap),
             Array(Vec<Value>),
             NA,
             Null
@@ -146,7 +146,7 @@ macro_rules! define_types {
             $(
                 get_from_val_fn!($r, $e, $t);
             )*
-            pub fn Map(&self) -> Option<&Map<Value>> {
+            pub fn Map(&self) -> Option<&DataMap> {
                 match self {
                     &Value::Map(ref m) => Some(m),
                     _ => None
@@ -318,6 +318,8 @@ impl <V>Map<V> {
             .collect()
     }
 }
+
+pub type DataMap = Map<Value>;
 
 impl Id {
     pub fn new(higher: u64, lower: u64) -> Id {
