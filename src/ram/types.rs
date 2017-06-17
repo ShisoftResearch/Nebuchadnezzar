@@ -330,18 +330,16 @@ impl Map {
         }
         return None
     }
-    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, update: U) -> Option<()>
-        where U: FnOnce(&mut Value) {
+    pub fn get_in_mut(&mut self, keys: Vec<&'static str>) -> Option<&mut Value> {
         let current_key = keys.first().cloned();
         if let Some(key) = current_key {
             if let Some(value) = self.get_mut_static_key(key) {
                 let rest_keys: Vec<&'static str> = keys.into_iter().skip(1).collect();
                 if rest_keys.is_empty() {
-                    update(value);
-                    return Some(())
+                    return Some(value)
                 } else {
                     match value {
-                        &mut Value::Map(ref mut map) => return map.update_in(rest_keys, update),
+                        &mut Value::Map(ref mut map) => return map.get_in_mut(rest_keys),
                         _ => {}
                     }
                 }
@@ -349,9 +347,25 @@ impl Map {
         }
         return None
     }
+    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, update: U) -> Option<()>
+        where U: FnOnce(&mut Value) {
+        let val = self.get_in_mut(keys);
+        match val {
+            Some(val) => {
+                update(val);
+                Some(())
+            },
+            None => None
+        }
+    }
     pub fn set_in(&mut self, keys: Vec<&'static str>, value: Value) -> Option<()> {
-        let update = move |value_to_set: &mut Value| *value_to_set = value;
-        self.update_in(keys, update)
+        match self.get_in_mut(keys) {
+            Some(val) => {
+                *val = value;
+                Some(())
+            },
+            None => None
+        }
     }
     pub fn into_string_map(self) -> hash_map::HashMap<String, Value> {
         let mut id_map: hash_map::HashMap<u64, String> =
