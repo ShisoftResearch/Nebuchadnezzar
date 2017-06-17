@@ -37,7 +37,7 @@ pub fn general() {
         &server.rpc, &vec!(server_addr),
         &String::from("test")).unwrap());
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -106,7 +106,7 @@ pub fn multi_cell_update() {
     let thread_count = 100;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -181,7 +181,7 @@ pub fn write_skew() {
         &String::from("test")).unwrap());
     let thread_count = 100;
     client.new_schema(&mut schema).unwrap();
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));

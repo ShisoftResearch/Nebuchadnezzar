@@ -34,7 +34,7 @@ pub fn workspace_wr() {
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_id = txn.begin().unwrap().unwrap();
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -123,7 +123,7 @@ pub fn data_site_wr() {
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_id = txn.begin().unwrap().unwrap();
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -186,7 +186,7 @@ pub fn multi_transaction() {
     let txn = transactions::new_client(&server_addr).unwrap();
     let txn_1_id = txn.begin().unwrap().unwrap();
     let txn_2_id = txn.begin().unwrap().unwrap();
-    let mut data_map_1 = Map::<Value>::new();
+    let mut data_map_1 = Map::new();
     data_map_1.insert(&String::from("id"), Value::I64(100));
     data_map_1.insert(&String::from("score"), Value::U64(70));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -243,7 +243,7 @@ pub fn smoke_rw() {
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
-    let mut data_map_1 = Map::<Value>::new();
+    let mut data_map_1 = Map::new();
     data_map_1.insert(&String::from("id"), Value::I64(100));
     data_map_1.insert(&String::from("score"), Value::U64(0));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));

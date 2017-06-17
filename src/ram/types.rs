@@ -265,19 +265,19 @@ pub fn key_hash(key: &String) -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Map<V> {
-    map: hash_map::HashMap<u64, V>,
+pub struct Map {
+    map: hash_map::HashMap<u64, Value>,
     pub fields: Vec<String>
 }
 
-impl <V>Map<V> {
-    pub fn new() -> Map<V> {
+impl Map {
+    pub fn new() -> Map {
         Map {
             map: hash_map::HashMap::new(),
             fields: Vec::new()
         }
     }
-    pub fn from_hash_map(map: hash_map::HashMap<String, V>) -> Map<V> {
+    pub fn from_hash_map(map: hash_map::HashMap<String, Value>) -> Map {
         let mut target_map = hash_map::HashMap::new();
         let fields = map.keys().cloned().collect();
         for (key, value) in map {
@@ -288,23 +288,40 @@ impl <V>Map<V> {
             fields: fields
         }
     }
-    pub fn insert(&mut self, key: &String, value: V) -> Option<V> {
+    pub fn insert(&mut self, key: &String, value: Value) -> Option<Value> {
         self.fields.push(key.clone());
         self.insert_key_id(key_hash(key), value)
     }
-    pub fn insert_key_id(&mut self, key: u64, value: V) -> Option<V> {
+    pub fn insert_key_id(&mut self, key: u64, value: Value) -> Option<Value> {
         self.map.insert(key, value)
     }
-    pub fn get_key_id(&self, key: u64) -> Option<&V> {
+    pub fn get_key_id(&self, key: u64) -> Option<&Value> {
         self.map.get(&key)
     }
-    pub fn get(&self, key: &String) -> Option<&V> {
+    pub fn get(&self, key: &String) -> Option<&Value> {
         self.get_key_id(key_hash(key))
     }
-    pub fn get_static_key(&self, key: &'static str) -> Option<&V> {
+    pub fn get_static_key(&self, key: &'static str) -> Option<&Value> {
         self.get(&String::from(key))
     }
-    pub fn into_string_map(self) -> hash_map::HashMap<String, V> {
+    pub fn get_in(&self, keys: Vec<&'static str>) -> Option<&Value> {
+        let current_key = keys.first().cloned();
+        if let Some(key) = current_key {
+            if let Some(value) = self.get_static_key(key) {
+                let rest_keys: Vec<&'static str> = keys.into_iter().skip(1).collect();
+                if rest_keys.is_empty() {
+                    return Some(value)
+                } else {
+                    match value {
+                        &Value::Map(ref map) => return map.get_in(rest_keys),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return None
+    }
+    pub fn into_string_map(self) -> hash_map::HashMap<String, Value> {
         let mut id_map: hash_map::HashMap<u64, String> =
             self.fields
                 .into_iter()
@@ -319,7 +336,7 @@ impl <V>Map<V> {
     }
 }
 
-pub type DataMap = Map<Value>;
+pub type DataMap = Map;
 
 impl Id {
     pub fn new(higher: u64, lower: u64) -> Id {

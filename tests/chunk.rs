@@ -32,7 +32,7 @@ pub fn cell_rw () {
     let id2 = Id::new(1, 2);
     let fields = default_fields();
     let mut schema = Schema::new(String::from("dummy"), None, fields);
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -56,7 +56,7 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").unwrap().String().unwrap(), "Jack");
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap(), 70);
     }
-    data_map = Map::<Value>::new();
+    data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(2));
     data_map.insert(&String::from("score"), Value::U64(80));
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
@@ -82,7 +82,7 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").unwrap().String().unwrap(), "Jack");
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap(), 70);
     }
-    data_map = Map::<Value>::new();
+    data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(2));
     data_map.insert(&String::from("score"), Value::U64(95));
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
@@ -106,7 +106,7 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap(), 70);
     }
     chunks.update_cell_by(&id2, |mut cell| {
-        let mut data_map = Map::<Value>::new();
+        let mut data_map = Map::new();
         data_map.insert(&String::from("id"), Value::I64(2));
         data_map.insert(&String::from("score"), Value::U64(100));
         data_map.insert(&String::from("name"), Value::String(String::from("John")));

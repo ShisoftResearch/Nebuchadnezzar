@@ -27,7 +27,7 @@ pub fn cell_rw () {
         str_key_field: None,
         fields: fields
     };
-    let mut data_map = Map::<Value>::new();
+    let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
@@ -55,7 +55,7 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").unwrap().String().unwrap(), "Jack");
         assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").unwrap().U64().unwrap(), 70);
     }
-    data_map = Map::<Value>::new();
+    data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(2));
     data_map.insert(&String::from("score"), Value::U64(80));
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
