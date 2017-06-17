@@ -298,11 +298,20 @@ impl Map {
     pub fn get_key_id(&self, key: u64) -> Option<&Value> {
         self.map.get(&key)
     }
+    pub fn get_mut_key_id(&mut self, key: u64) -> Option<&mut Value> {
+        self.map.get_mut(&key)
+    }
     pub fn get(&self, key: &String) -> Option<&Value> {
         self.get_key_id(key_hash(key))
     }
+    pub fn get_mut(&mut self, key: &String) -> Option<&mut Value> {
+        self.get_mut_key_id(key_hash(key))
+    }
     pub fn get_static_key(&self, key: &'static str) -> Option<&Value> {
         self.get(&String::from(key))
+    }
+    pub fn get_mut_static_key(&mut self, key: &'static str) -> Option<&mut Value> {
+        self.get_mut(&String::from(key))
     }
     pub fn get_in(&self, keys: Vec<&'static str>) -> Option<&Value> {
         let current_key = keys.first().cloned();
@@ -314,6 +323,25 @@ impl Map {
                 } else {
                     match value {
                         &Value::Map(ref map) => return map.get_in(rest_keys),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        return None
+    }
+    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, mut update: U) -> Option<()>
+        where U: FnMut(&mut Value) {
+        let current_key = keys.first().cloned();
+        if let Some(key) = current_key {
+            if let Some(value) = self.get_mut_static_key(key) {
+                let rest_keys: Vec<&'static str> = keys.into_iter().skip(1).collect();
+                if rest_keys.is_empty() {
+                    update(value);
+                    return Some(())
+                } else {
+                    match value {
+                        &mut Value::Map(ref mut map) => return map.update_in(rest_keys, update),
                         _ => {}
                     }
                 }
