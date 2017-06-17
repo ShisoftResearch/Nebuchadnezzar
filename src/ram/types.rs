@@ -350,7 +350,7 @@ impl Map {
         return None
     }
     pub fn set_in(&mut self, keys: Vec<&'static str>, value: Value) -> Option<()> {
-        let mut update = move |value_to_set: &mut Value| *value_to_set = value;
+        let update = move |value_to_set: &mut Value| *value_to_set = value;
         self.update_in(keys, update)
     }
     pub fn into_string_map(self) -> hash_map::HashMap<String, Value> {
