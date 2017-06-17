@@ -330,8 +330,8 @@ impl Map {
         }
         return None
     }
-    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, mut update: U) -> Option<()>
-        where U: FnMut(&mut Value) {
+    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, update: U) -> Option<()>
+        where U: FnOnce(&mut Value) {
         let current_key = keys.first().cloned();
         if let Some(key) = current_key {
             if let Some(value) = self.get_mut_static_key(key) {
@@ -348,6 +348,10 @@ impl Map {
             }
         }
         return None
+    }
+    pub fn set_in(&mut self, keys: Vec<&'static str>, value: Value) -> Option<()> {
+        let mut update = move |value_to_set: &mut Value| *value_to_set = value;
+        self.update_in(keys, update)
     }
     pub fn into_string_map(self) -> hash_map::HashMap<String, Value> {
         let mut id_map: hash_map::HashMap<u64, String> =
