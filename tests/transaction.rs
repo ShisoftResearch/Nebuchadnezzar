@@ -38,7 +38,7 @@ pub fn workspace_wr() {
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
+    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map.clone()));
     let cell_1_w_res = txn.write(&txn_id, &cell_1).unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {},
@@ -55,7 +55,7 @@ pub fn workspace_wr() {
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
     data_map.insert(&String::from("score"), Value::U64(90));
-    let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), data_map.clone());
+    let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
     let cell_1_w_res = txn.write(&txn_id, &cell_1_w2).unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {panic!("Write existed cell should fail")}
@@ -127,7 +127,7 @@ pub fn data_site_wr() {
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), data_map.clone());
+    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map.clone()));
     let cell_1_non_exists_read = txn.read(&txn_id, &cell_1.id()).unwrap().unwrap();
     match cell_1_non_exists_read {
         TxnExecResult::Error(ReadError::CellDoesNotExisted) => {},
@@ -145,7 +145,7 @@ pub fn data_site_wr() {
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
     data_map.insert(&String::from("score"), Value::U64(90));
-    let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), data_map.clone());
+    let cell_1_w2 = Cell::new(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
     let cell_1_w_res = txn.update(&txn_id, &cell_1_w2).unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {}
@@ -190,11 +190,11 @@ pub fn multi_transaction() {
     data_map_1.insert(&String::from("id"), Value::I64(100));
     data_map_1.insert(&String::from("score"), Value::U64(70));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
+    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
     let cell_1_t1_write = txn.update(&txn_1_id, &cell_1).unwrap().unwrap();
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), Value::U64(90));
-    let cell_2 = Cell::new(schema.id, &cell_1.id(), data_map_2.clone());
+    let cell_2 = Cell::new(schema.id, &cell_1.id(), Value::Map(data_map_2.clone()));
     let cell_1_t2_write = txn.write(&txn_2_id, &cell_2).unwrap().unwrap();
     txn.prepare(&txn_2_id).unwrap().unwrap();
     txn.commit(&txn_2_id).unwrap().unwrap();
@@ -247,7 +247,7 @@ pub fn smoke_rw() {
     data_map_1.insert(&String::from("id"), Value::I64(100));
     data_map_1.insert(&String::from("score"), Value::U64(0));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let mut cell_1 = Cell::new(schema.id, &Id::rand(), data_map_1.clone());
+    let mut cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
     server.chunks.write_cell(&mut cell_1);
     let cell_id = cell_1.id();
     let thread_count = 200;

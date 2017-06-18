@@ -86,10 +86,10 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, id: &Id, map: Map) -> Cell {
+    pub fn new(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
             header: Header::new(0, schema_id, id),
-            data: Value::Map(map)
+            data: value
         }
     }
     pub fn header_from_chunk_raw(ptr: usize) -> Result<Header, ReadError> {
