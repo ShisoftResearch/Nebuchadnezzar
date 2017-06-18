@@ -237,15 +237,15 @@ fn _in_map() {
     map.insert(&String::from("A"), types::Value::I32(1));
     map.insert(&String::from("B"), types::Value::Map(map2));
 
-    assert_eq!(map.get(&String::from("A")).unwrap().I32().unwrap(), 1);
-    assert_eq!(map.get_in(vec!["B", "a"]).unwrap().I32().unwrap(), 1);
+    assert_eq!(map.get(&String::from("A")).I32().unwrap(), 1);
+    assert_eq!(map.get_in(vec!["B", "a"]).I32().unwrap(), 1);
 
     map.set_in(vec!["B", "a"], types::Value::I32(20)).unwrap();
-    assert_eq!(map.get_in(vec!["B", "a"]).unwrap().I32().unwrap(), 20);
+    assert_eq!(map.get_in(vec!["B", "a"]).I32().unwrap(), 20);
 
     map.update_in(vec!["B", "b"], |value: &mut types::Value| {
         assert_eq!(value.I64().unwrap(), 2);
         *value = types::Value::I64(30);
     });
-    assert_eq!(map.get_in(vec!["B", "b"]).unwrap().I64().unwrap(), 30);
+    assert_eq!(map.get_in(vec!["B", "b"]).I64().unwrap(), 30);
 }

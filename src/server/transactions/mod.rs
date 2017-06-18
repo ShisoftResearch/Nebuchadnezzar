@@ -38,7 +38,7 @@ impl <A, E> TxnExecResult <A, E>
     pub fn unwrap(self) -> A {
         match self {
             TxnExecResult::Accepted(data) => data,
-            _ => {panic!("no data for it result because it is not accepted");}
+            _ => {panic!("no data for result because it is not accepted");}
         }
     }
 }

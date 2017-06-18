@@ -274,6 +274,8 @@ pub struct Map {
     pub fields: Vec<String>
 }
 
+static NULL_VALUE: Value = Value::Null;
+
 impl Map {
     pub fn new() -> Map {
         Map {
@@ -299,19 +301,19 @@ impl Map {
     pub fn insert_key_id(&mut self, key: u64, value: Value) -> Option<Value> {
         self.map.insert(key, value)
     }
-    pub fn get_by_key_id(&self, key: u64) -> Option<&Value> {
-        self.map.get(&key)
+    pub fn get_by_key_id(&self, key: u64) -> &Value {
+        self.map.get(&key).unwrap_or(&NULL_VALUE)
     }
     pub fn get_mut_by_key_id(&mut self, key: u64) -> Option<&mut Value> {
         self.map.get_mut(&key)
     }
-    pub fn get(&self, key: &String) -> Option<&Value> {
+    pub fn get(&self, key: &String) -> &Value {
         self.get_by_key_id(key_hash(key))
     }
     pub fn get_mut(&mut self, key: &String) -> Option<&mut Value> {
         self.get_mut_by_key_id(key_hash(key))
     }
-    pub fn get_static_key(&self, key: &'static str) -> Option<&Value> {
+    pub fn get_static_key(&self, key: &'static str) -> &Value {
         self.get(&String::from(key))
     }
     pub fn get_mut_static_key(&mut self, key: &'static str) -> Option<&mut Value> {
@@ -320,29 +322,29 @@ impl Map {
     pub fn strs_to_ids(keys: Vec<&'static str>) -> Vec<u64> {
         keys.into_iter().map(|str| key_hash(&String::from(str))).collect()
     }
-    pub fn get_in_by_ids(&self, mut key_ids: Iter<u64>) -> Option<&Value> {
+    pub fn get_in_by_ids(&self, mut key_ids: Iter<u64>) -> &Value {
         let current_key = key_ids.next().cloned();
         if let Some(key) = current_key {
-            if let Some(value) = self.get_by_key_id(key) {
-                if key_ids.is_empty() {
-                    return Some(value)
-                } else {
-                    match value {
-                        &Value::Map(ref map) => return map.get_in_by_ids(key_ids),
-                        _ => {}
-                    }
+            let value = self.get_by_key_id(key);
+            if key_ids.is_empty() {
+                return value
+            } else {
+                match value {
+                    &Value::Map(ref map) => return map.get_in_by_ids(key_ids),
+                    _ => {}
                 }
             }
         }
-        return None
+        return &NULL_VALUE
     }
-    pub fn get_in(&self, keys: Vec<&'static str>) -> Option<&Value> {
+    pub fn get_in(&self, keys: Vec<&'static str>) -> &Value {
         self.get_in_by_ids(Map::strs_to_ids(keys).iter())
     }
     pub fn get_in_mut_by_key_ids(&mut self, mut keys_ids: Iter<u64>) -> Option<&mut Value> {
         let current_key = keys_ids.next().cloned();
         if let Some(key) = current_key {
-            if let Some(value) = self.get_mut_by_key_id(key) {
+            let value = self.get_mut_by_key_id(key);
+            if let Some(value) = value {
                 if keys_ids.is_empty() {
                     return Some(value)
                 } else {
@@ -360,13 +362,12 @@ impl Map {
     }
     pub fn update_in_by_key_ids<U>(&mut self, keys: Iter<u64>, update: U) -> Option<()>
         where U: FnOnce(&mut Value) {
-        let val = self.get_in_mut_by_key_ids(keys);
-        match val {
-            Some(val) => {
-                update(val);
-                Some(())
-            },
-            None => None
+        let value = self.get_in_mut_by_key_ids(keys);
+        if let Some(value) = value {
+            update(value);
+            Some(())
+        } else {
+            None
         }
     }
     pub fn update_in<U>(&mut self, keys: Vec<&'static str>, update: U) -> Option<()>
@@ -374,12 +375,12 @@ impl Map {
         self.update_in_by_key_ids(Map::strs_to_ids(keys).iter(), update)
     }
     pub fn set_in_by_key_ids(&mut self, keys: Iter<u64>, value: Value) -> Option<()> {
-        match self.get_in_mut_by_key_ids(keys) {
-            Some(val) => {
-                *val = value;
-                Some(())
-            },
-            None => None
+        let val = self.get_in_mut_by_key_ids(keys);
+        if let Some(val) = val {
+            *val = value;
+            Some(())
+        } else {
+            None
         }
     }
     pub fn set_in(&mut self, keys: Vec<&'static str>, value: Value) -> Option<()> {

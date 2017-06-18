@@ -9,10 +9,15 @@ pub struct Instruction {
     offset: usize
 }
 
-pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue, mut ins: &mut Vec<Instruction>) {
+pub fn plan_write_field (
+    mut offset: &mut usize,
+    field: &Field,
+    value: &Value,
+    mut ins: &mut Vec<Instruction>
+) -> Result<(), WriteError> {
     let data_mismatch = "Data type does not match the schema for";
     if field.nullable {
-        let  null_bit = match value {
+        let null_bit = match value {
             &Value::Null => 1,
             _ => 0
         };
@@ -35,29 +40,36 @@ pub fn plan_write_field(mut offset: &mut usize, field: &Field, value: &DataValue
             });
             *offset += types::u16_io::size(0);
             for val in array {
-                plan_write_field(&mut offset, &sub_field, val, &mut ins);
+                plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
         } else {
-            panic!(data_mismatch);
+            return Err(WriteError::DataMismatchSchema);
         }
     } else if let Some(ref subs) = field.sub_fields {
         if let &Value::Map(ref map) = value {
             for sub in subs {
-                let val = map.get_by_key_id(sub.name_id).unwrap();
-                plan_write_field(&mut offset, &sub, val, &mut ins);
+                let val = map.get_by_key_id(sub.name_id);
+                plan_write_field(&mut offset, &sub, val, &mut ins)?;
             }
         } else {
-            panic!(data_mismatch);
+            return Err(WriteError::DataMismatchSchema);
         }
     } else {
-        let size = types::get_vsize(field.type_id, value);
-        ins.push(Instruction {
-            type_id: field.type_id,
-            val: value.clone(),
-            offset: *offset
-        });
-        *offset += size;
+        let is_null = match value {&Value::Null => true, _ => false};
+        if !field.nullable && is_null {
+            return Err(WriteError::DataMismatchSchema)
+        }
+        if !is_null {
+            let size = types::get_vsize(field.type_id, value);
+            ins.push(Instruction {
+                type_id: field.type_id,
+                val: value.clone(),
+                offset: *offset
+            });
+            *offset += size;
+        }
     }
+    return Ok(())
 }
 
 pub fn execute_plan (ptr: usize, instructions: Vec<Instruction>) {

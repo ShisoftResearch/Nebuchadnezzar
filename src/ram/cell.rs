@@ -31,6 +31,7 @@ pub enum WriteError {
     UserCanceledUpdate,
     DeletionPredictionFailed,
     NetworkingError,
+    DataMismatchSchema,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -122,7 +123,7 @@ impl Cell {
     pub fn write_to_chunk_with_schema(&mut self, chunk: &Chunk, schema: &Schema) -> Result<usize, WriteError> {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();
-        let plan = writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions);
+        writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions)?;
         let total_size = offset + HEADER_SIZE;
         if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size))}
         let addr_opt = chunk.try_acquire(total_size);
