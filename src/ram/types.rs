@@ -6,7 +6,9 @@ use std::cmp::Ordering;
 use std::slice::Iter;
 use std::iter::Iterator;
 use utils::rand;
-use bifrost_hasher::hash_str;
+use bifrost_hasher::{hash_str, hash_bytes, hash_bytes_secondary};
+use bifrost::utils::bincode::serialize;
+use serde;
 
 macro_rules! gen_primitive_types_io {
     (
@@ -415,6 +417,14 @@ impl Id {
         Id {
             higher: header.partition,
             lower: header.hash
+        }
+    }
+    pub fn from_obj<T>(obj: &T) -> Id where T: serde::Serialize {
+        let vec = serialize(obj);
+        let bin = vec.as_slice();
+        Id {
+            higher: hash_bytes(&bin),
+            lower: hash_bytes_secondary(&bin)
         }
     }
     pub fn is_greater_than(&self, other: &Id) -> bool {
