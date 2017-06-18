@@ -4,6 +4,7 @@
 #![feature(asm)]
 #![plugin(bifrost_plugins)]
 #![feature(conservative_impl_trait)]
+#![feature(exact_size_is_empty)]
 
 pub mod utils;
 pub mod ram;
