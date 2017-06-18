@@ -430,6 +430,12 @@ impl Id {
     pub fn is_greater_than(&self, other: &Id) -> bool {
         self.higher >= other.higher && self.lower > other.lower
     }
+    pub fn unit_id() -> Id {
+        Id {higher: 0, lower: 0}
+    }
+    pub fn is_unit_id(&self) -> bool {
+        self.higher == 0 && self.lower == 0
+    }
 }
 
 impl PartialEq for Pos2d32 {
