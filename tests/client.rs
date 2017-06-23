@@ -41,7 +41,7 @@ pub fn general() {
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map.clone()));
+    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
     client.transaction(|ref mut trans| {
@@ -110,7 +110,7 @@ pub fn multi_cell_update() {
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map.clone()));
+    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
     let cell_1_id = cell_1.id();
@@ -185,7 +185,7 @@ pub fn write_skew() {
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new(schema.id, &Id::rand(), Value::Map(data_map.clone()));
+    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
     client.write_cell(&cell_1).unwrap().unwrap();
     client.read_cell(&cell_1.id()).unwrap().unwrap();
     let cell_1_id = cell_1.id();

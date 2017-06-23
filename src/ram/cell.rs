@@ -4,6 +4,8 @@ use std::ptr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
 use std::collections::HashMap;
+use std::sync::Arc;
+use serde::Serialize;
 
 const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
@@ -87,12 +89,39 @@ pub struct Cell {
 
 impl Cell {
 
-    pub fn new(schema_id: u32, id: &Id, value: Value) -> Cell {
+    pub fn new_with_id(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
             header: Header::new(0, schema_id, id),
             data: value
         }
     }
+
+    fn encode_cell_key<V>(schema_id: u32, value: &V) -> Id
+        where V: Serialize{
+        Id::from_obj(&(schema_id, value))
+    }
+
+    pub fn new(schema: &Arc<Schema>, value: Value) -> Option<Cell> {
+        let schema_id = schema.id;
+        let id = if let Value::Map(ref data) = value {
+            match schema.key_field {
+                Some(ref keys) => {
+                    let value = data.get_in_by_ids(keys.iter());
+                    match value {
+                        &Value::Null => return None,
+                        _ => Cell::encode_cell_key(schema_id, value)
+                    }
+                },
+                None => {
+                    Id::rand()
+                }
+            }
+        } else {
+            Id::rand()
+        };
+        Some(Cell::new_with_id(schema_id, &id, value))
+    }
+
     pub fn header_from_chunk_raw(ptr: usize) -> Result<Header, ReadError> {
         if ptr == 0 {return Err(ReadError::CellDoesNotExisted)}
         Ok(unsafe {(*(ptr as *const Header))})
