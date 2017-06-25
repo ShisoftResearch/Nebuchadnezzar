@@ -268,6 +268,10 @@ pub fn key_hash(key: &String) -> u64 {
     hash_str(&key)
 }
 
+pub fn key_hashes(keys: &Vec<String>) -> Vec<u64> {
+    keys.iter().map(|str| hash_str(str)).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
     map: hash_map::HashMap<u64, Value>,

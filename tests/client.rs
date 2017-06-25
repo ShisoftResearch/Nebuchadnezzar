@@ -1,5 +1,6 @@
 use neb::server::*;
 use neb::ram::schema::*;
+use neb::ram::types;
 use neb::ram::types::*;
 use neb::ram::cell::*;
 use neb::client;
@@ -61,13 +62,21 @@ pub fn general() {
         let client = client.clone();
         threads.push(thread::spawn(move || {
             client.transaction(|ref mut txn| {
+                let selected = txn.read_selected(&cell_1_id, &types::key_hashes(
+                    &vec![String::from("score")]
+                ))?.unwrap();
                 let mut cell = txn.read(&cell_1_id)?.unwrap();
                 let mut score = cell.data.Map().unwrap().get_static_key("score").U64().unwrap();
+                assert_eq!(selected.first().unwrap().U64().unwrap(), score);
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
                 cell.data = Value::Map(data);
                 txn.update(&cell)?;
+                let selected = txn.read_selected(&cell_1_id, &types::key_hashes(
+                    &vec![String::from("score")]
+                ))?.unwrap();
+                assert_eq!(selected.first().unwrap().U64().unwrap(), score);
                 Ok(())
             }).unwrap();
         }));
