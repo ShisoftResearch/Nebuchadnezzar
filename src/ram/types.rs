@@ -319,8 +319,8 @@ impl Map {
     pub fn get_mut_static_key(&mut self, key: &'static str) -> Option<&mut Value> {
         self.get_mut(&String::from(key))
     }
-    pub fn strs_to_ids(keys: Vec<&'static str>) -> Vec<u64> {
-        keys.into_iter().map(|str| key_hash(&String::from(str))).collect()
+    pub fn strs_to_ids(keys: &[&'static str]) -> Vec<u64> {
+        keys.iter().map(|str| key_hash(&String::from(*str))).collect()
     }
     pub fn get_in_by_ids(&self, mut key_ids: Iter<u64>) -> &Value {
         let current_key = key_ids.next().cloned();
@@ -337,7 +337,7 @@ impl Map {
         }
         return &NULL_VALUE
     }
-    pub fn get_in(&self, keys: Vec<&'static str>) -> &Value {
+    pub fn get_in(&self, keys: &[&'static str]) -> &Value {
         self.get_in_by_ids(Map::strs_to_ids(keys).iter())
     }
     pub fn get_in_mut_by_key_ids(&mut self, mut keys_ids: Iter<u64>) -> Option<&mut Value> {
@@ -357,7 +357,7 @@ impl Map {
         }
         return None
     }
-    pub fn get_in_mut(&mut self, keys: Vec<&'static str>) -> Option<&mut Value> {
+    pub fn get_in_mut(&mut self, keys: &[&'static str]) -> Option<&mut Value> {
         self.get_in_mut_by_key_ids(Map::strs_to_ids(keys).iter())
     }
     pub fn update_in_by_key_ids<U>(&mut self, keys: Iter<u64>, update: U) -> Option<()>
@@ -370,7 +370,7 @@ impl Map {
             None
         }
     }
-    pub fn update_in<U>(&mut self, keys: Vec<&'static str>, update: U) -> Option<()>
+    pub fn update_in<U>(&mut self, keys: &[&'static str], update: U) -> Option<()>
         where U: FnOnce(&mut Value) {
         self.update_in_by_key_ids(Map::strs_to_ids(keys).iter(), update)
     }
@@ -383,7 +383,7 @@ impl Map {
             None
         }
     }
-    pub fn set_in(&mut self, keys: Vec<&'static str>, value: Value) -> Option<()> {
+    pub fn set_in(&mut self, keys: &[&'static str], value: Value) -> Option<()> {
         self.set_in_by_key_ids(Map::strs_to_ids(keys).iter(), value)
     }
     pub fn into_string_map(self) -> hash_map::HashMap<String, Value> {

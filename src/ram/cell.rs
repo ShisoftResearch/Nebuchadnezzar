@@ -140,6 +140,17 @@ impl Cell {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
+//    pub fn select_from_chunk_raw(ptr: usize, chunk: &Chunk, fields: Vec<u64>) -> Result<Vec<DataValue>, ReadError> {
+//        let header = Cell::header_from_chunk_raw(ptr)?;
+//        let data_ptr = ptr + HEADER_SIZE;
+//        let schema_id = &header.schema;
+//        if let Some(schema) = chunk.meta.schemas.get(schema_id) {
+//            Ok()
+//        } else {
+//            error!("Schema {} does not existed to read", schema_id);
+//            return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+//        }
+//    }
     pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {

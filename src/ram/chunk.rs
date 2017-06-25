@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::SchemasServer;
-use ram::types::Id;
+use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, Header};
 use server::ServerMeta;
@@ -120,6 +120,14 @@ impl Chunk {
             None => Err(ReadError::CellDoesNotExisted)
         }
     }
+//    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
+//        match self.location_for_read(hash) {
+//            Some(loc) => {
+//                Err(ReadError::CellDoesNotExisted)
+//            },
+//            None => Err(ReadError::CellDoesNotExisted)
+//        }
+//    }
     fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if self.location_for_read(hash).is_some() {
