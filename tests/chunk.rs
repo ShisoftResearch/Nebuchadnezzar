@@ -2,6 +2,7 @@ use neb::ram::cell;
 use neb::ram::cell::*;
 use neb::ram::schema::*;
 use neb::ram::chunk::Chunks;
+use neb::ram::types;
 use neb::ram::types::*;
 use neb::ram::io::writer;
 use neb::ram::cleaner::Cleaner;
@@ -133,4 +134,11 @@ pub fn cell_rw () {
     let cell_size = stored_cell.header.size;
     let seg = &chunks.list[0].segs[0];
     assert_eq!(seg.append_header.load(Ordering::SeqCst), seg.addr + cell_size as usize);
+
+    let selected = chunks.read_selected(
+        &id2, &[types::key_hash(&String::from("id")), types::key_hash(&String::from("name"))]
+    ).unwrap();
+    assert_eq!(selected.len(), 2);
+    assert_eq!(selected.get(0).unwrap().I64().unwrap(), 2);
+    assert_eq!(selected.get(1).unwrap().String().unwrap(), "John");
 }

@@ -390,7 +390,7 @@ impl Map {
         let mut id_map: hash_map::HashMap<u64, String> =
             self.fields
                 .into_iter()
-                .map(|field| (hash_str(&field), field))
+                .map(|field| (key_hash(&field), field))
                 .collect();
         self.map
             .into_iter()
