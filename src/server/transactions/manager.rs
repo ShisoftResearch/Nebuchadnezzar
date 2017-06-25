@@ -2,7 +2,7 @@ use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, WriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use ram::types::{Id};
+use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use parking_lot::Mutex;
@@ -36,6 +36,7 @@ struct Transaction {
 service! {
     rpc begin() -> TxnId;
     rpc read(tid: TxnId, id: Id) -> TxnExecResult<Cell, ReadError> | TMError;
+    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> TxnExecResult<Vec<Value>, ReadError> | TMError;
     rpc write(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
     rpc update(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
     rpc remove(tid: TxnId, id: Id) -> TxnExecResult<(), WriteError> | TMError;
@@ -128,6 +129,36 @@ impl TransactionManager {
                     TxnExecResult::Wait => {
                         AwaitManager::txn_wait(&await, server_id);
                         return self.read_from_site(server_id, server, tid, id, txn, await);
+                    }
+                    _ => {}
+                }
+                Ok(payload)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::RPCErrorFromCellServer)
+            }
+        }
+    }
+    fn read_selected_from_site(
+        &self, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
+        tid: &TxnId, id: &Id, fields: &Vec<u64>, mut txn: TxnGuard, await: TxnAwaits
+    ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
+        let self_server_id = self.server.server_id;
+        let read_response = server.read_selected(
+            &self_server_id,
+            &self.get_clock(),
+            tid, id, fields
+        ).wait();
+        match read_response {
+            Ok(dsr) => {
+                let dsr = dsr.unwrap();
+                self.merge_clock(&dsr.clock);
+                let payload = dsr.payload;
+                match payload {
+                    TxnExecResult::Wait => {
+                        AwaitManager::txn_wait(&await, server_id);
+                        return self.read_selected_from_site(server_id, server, tid, id, fields, txn, await);
                     }
                     _ => {}
                 }
@@ -343,12 +374,8 @@ impl Service for TransactionManager {
         self.ensure_rw_state(&txn)?;
         if let Some(data_obj) = txn.data.get(id) {
             match data_obj.cell {
-                Some(ref cell) => {
-                    return Ok(TxnExecResult::Accepted(cell.clone())) // read from cache
-                },
-                None => {
-                   return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
-                }
+                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
+                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
             }
         }
         let server = self.get_data_site_by_id(&id);
@@ -356,6 +383,38 @@ impl Service for TransactionManager {
             Ok((server_id, server)) => {
                 let await = self.await_manager.get_txn(tid);
                 self.read_from_site(server_id, server, tid, id, txn, await)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+    fn read_selected(&self, tid: &TxnId, id: &Id, fields: &Vec<u64>) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
+        let txn = self.get_transaction(tid)?;
+        self.ensure_rw_state(&txn)?;
+        if let Some(data_obj) = txn.data.get(id) {
+            match data_obj.cell {
+                Some(ref cell) => {
+                    let mut result = Vec::with_capacity(fields.len());
+                    match cell.data {
+                        Value::Map(ref map) => {
+                            for field in fields {
+                                result.push(map.get_by_key_id(*field).clone())
+                            }
+                        },
+                        _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect))
+                    }
+                    return Ok(TxnExecResult::Accepted(result))
+                }, // read from cache
+                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
+            }
+        }
+        let server = self.get_data_site_by_id(&id);
+        match server {
+            Ok((server_id, server)) => {
+                let await = self.await_manager.get_txn(tid);
+                self.read_selected_from_site(server_id, server, tid, id, fields, txn, await)
             },
             Err(e) => {
                 error!("{:?}", e);
