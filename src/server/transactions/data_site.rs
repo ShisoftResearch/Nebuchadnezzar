@@ -2,7 +2,7 @@ use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
 use std::collections::{BTreeSet, BTreeMap};
 use chashmap::{CHashMap, WriteGuard};
-use ram::types::{Id};
+use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use linked_hash_map::LinkedHashMap;
@@ -57,6 +57,7 @@ pub struct DataManager {
 
 service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
+    rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>;
 
     // two phase commit
     rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
@@ -225,8 +226,8 @@ impl DataManager {
             cell_lru.remove(evicted_cell);
         }
     }
-    fn prepare_read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
-        -> Result<(), Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()>> {
+    fn prepare_read<T>(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
+        -> Result<(), Result<DataSiteResponse<TxnExecResult<T, ReadError>>, ()>> where T: Clone{
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
         let mut meta = self.get_cell_meta(id);
@@ -256,13 +257,16 @@ impl Service for DataManager {
             -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
         if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
         match self.server.chunks.read_cell(id) {
-            Ok(cell) => {
-                self.response_with(TxnExecResult::Accepted(cell))
-            }
-            Err(read_error) => {
-                // cannot read
-                self.response_with(TxnExecResult::Error(read_error))
-            }
+            Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
+        }
+    }
+    fn read_selected(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id, fields: &Vec<u64>)
+            -> Result<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, ()> {
+        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
+        match self.server.chunks.read_selected(id, &fields[..]) {
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }
     }
     fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TxnId, cell_ids: &Vec<Id>)
