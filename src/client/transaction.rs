@@ -1,7 +1,7 @@
 use server::transactions::TxnId;
 use server::transactions::*;
 use ram::cell::{Cell, ReadError, WriteError};
-use ram::types::{Id};
+use ram::types::{Id, Value};
 use std::sync::Arc;
 use std::io;
 
@@ -40,9 +40,21 @@ impl Transaction {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
+            Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
+            Err(e) => Err(TxnError::RPCError(e))
+        }
+    }
+    pub fn read_selected(&mut self, id: &Id, fields: &Vec<u64>) -> Result<Option<Vec<Value>>, TxnError> {
+        self.changes += 1;
+        match self.client.read_selected(&self.tid, id, fields) {
+            Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
+            Ok(Ok(_)) => Err(TxnError::InternalError),
+            Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
