@@ -225,11 +225,8 @@ impl DataManager {
             cell_lru.remove(evicted_cell);
         }
     }
-}
-
-impl Service for DataManager {
-    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
-            -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
+    fn prepare_read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
+        -> Result<(), Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()>> {
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
         let mut meta = self.get_cell_meta(id);
@@ -237,19 +234,27 @@ impl Service for DataManager {
         let read_too_late = &meta.write > tid;
         txn.last_activity = get_time();
         if txn.state != TxnState::Started {
-            return self.response_with(TxnExecResult::StateError(txn.state))
+            return Err(self.response_with(TxnExecResult::StateError(txn.state)))
         }
         if read_too_late { // not realizable
-            return self.response_with(TxnExecResult::Rejected);
+            return Err(self.response_with(TxnExecResult::Rejected));
         }
         if committing { // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert((tid.clone(), *server_id));
             debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
-            return self.response_with(TxnExecResult::Wait);
+            return Err(self.response_with(TxnExecResult::Wait));
         }
         if &meta.read < tid {
             meta.read = tid.clone()
         }
+        return Ok(())
+    }
+}
+
+impl Service for DataManager {
+    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
+            -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
+        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
         match self.server.chunks.read_cell(id) {
             Ok(cell) => {
                 self.response_with(TxnExecResult::Accepted(cell))

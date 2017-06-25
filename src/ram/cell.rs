@@ -41,6 +41,7 @@ pub enum ReadError {
     SchemaDoesNotExisted(u32),
     CellDoesNotExisted,
     NetworkingError,
+    CellTypeIsNotMapForSelect
 }
 
 impl Header {

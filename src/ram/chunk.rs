@@ -123,7 +123,17 @@ impl Chunk {
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
         match self.location_for_read(hash) {
             Some(loc) => {
-                Err(ReadError::CellDoesNotExisted)
+                let selected_data = Cell::select_from_chunk_raw(*loc, self, fields)?;
+                let mut result = Vec::with_capacity(fields.len());
+                match selected_data {
+                    Value::Map(map) => {
+                        for field_id in fields {
+                            result.push(map.get_by_key_id(*field_id).clone())
+                        }
+                        return Ok(result)
+                    },
+                    _ => Err(ReadError::CellTypeIsNotMapForSelect)
+                }
             },
             None => Err(ReadError::CellDoesNotExisted)
         }
@@ -272,6 +282,10 @@ impl Chunks {
     pub fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
+    }
+    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.read_selected(hash, fields)
     }
     pub fn head_cell(&self, key: &Id) -> Result<Header, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
