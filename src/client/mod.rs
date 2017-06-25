@@ -78,8 +78,8 @@ impl Client {
         let client = self.locate_plain_server(id)?;
         client.remove_cell(id)
     }
-    pub fn transaction<TFN>(&self, mut func: TFN) -> Result<(), TxnError>
-        where TFN: FnMut(&mut Transaction) -> Result<(), TxnError> {
+    pub fn transaction<TFN>(&self, func: TFN) -> Result<(), TxnError>
+        where TFN: Fn(&mut Transaction) -> Result<(), TxnError> {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)

@@ -123,9 +123,9 @@ pub fn multi_cell_update() {
     for i in 0..thread_count {
         let client = client.clone();
         threads.push(thread::spawn(move || {
-            let mut score_1 = 0;
-            let mut score_2 = 0;
-            client.transaction(|ref mut txn| {
+            client.transaction(move |txn| {
+                let mut score_1 = 0;
+                let mut score_2 = 0;
                 let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
                 let mut cell_2 = txn.read(&cell_2_id)?.unwrap();
                 score_1 = cell_1.data.Map().unwrap().get_static_key("score").U64().unwrap();
