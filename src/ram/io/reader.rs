@@ -3,7 +3,7 @@ use ram::cell::*;
 use ram::types;
 use ram::types::{u16_io, u8_io, Value};
 
-fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
+fn read_field(ptr: usize, field: &Field, selected: Option<(&[u64], usize)>) -> (DataValue, usize) {
     let mut ptr = ptr;
     if field.nullable {
         let null_byte = u8_io::read(ptr);
@@ -19,7 +19,7 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
         ptr += u16_io::size(ptr);
         let mut vals = Vec::<DataValue>::new();
         for _ in 0..len {
-            let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field);
+            let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field, None);
             ptr = nxt_ptr;
             vals.push(nxt_val);
         }
@@ -27,9 +27,20 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = DataMap::new();
         for sub in subs {
-            let (cval, cptr) = read_field(ptr, &sub);
+            let (cval, cptr) = read_field(ptr, &sub, None);
             map.insert_key_id(sub.name_id, cval);
             ptr = cptr;
+            match selected {
+                None => {},
+                Some((field_ids, mut pos)) => {
+                    if field_ids[pos] == sub.name_id {
+                        pos += 1;
+                        if field_ids.len() <= pos {
+                            return (Value::Map(map), ptr)
+                        }
+                    }
+                }
+            }
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         (Value::Map(map), ptr)
@@ -39,5 +50,9 @@ fn read_field(ptr: usize, field: &Field) -> (DataValue, usize) {
 }
 
 pub fn read_by_schema(ptr: usize, schema: &Schema) -> DataValue {
-    read_field(ptr, &schema.fields).0
+    read_field(ptr, &schema.fields, None).0
+}
+
+pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> DataValue {
+    read_field(ptr, &schema.fields, Some((fields, 0))).0
 }
