@@ -35,7 +35,7 @@ pub fn plan_write_field (
             sub_field.is_array = false;
             ins.push(Instruction {
                 type_id: types::ARRAY_LEN_TYPE_ID,
-                val: Value::U16(len as u16),
+                val: Value::U32(len as u32),
                 offset: *offset
             });
             *offset += types::u16_io::size(0);

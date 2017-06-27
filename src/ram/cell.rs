@@ -3,7 +3,6 @@ use ram::chunk::Chunk;
 use std::ptr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
-use std::collections::HashMap;
 use std::sync::Arc;
 use serde::Serialize;
 

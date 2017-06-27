@@ -651,5 +651,5 @@ define_types!(
     ["string", "str"], 20, String                      ,String   ,true  ,  string_io
 );
 
-pub const ARRAY_LEN_TYPE_ID: u32 = 8; //u16
+pub const ARRAY_LEN_TYPE_ID: u32 = 9; //u32
 pub const NULL_TYPE_ID: u32 = 7; //u8
