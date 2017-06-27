@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use serde::Serialize;
 
-const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
+pub const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
 pub type DataValue = Value;
 pub type DataMap = Map;
