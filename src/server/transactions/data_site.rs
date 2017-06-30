@@ -58,7 +58,7 @@ pub struct DataManager {
 service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
     rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>;
-
+    rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
     // two phase commit
     rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
@@ -265,6 +265,14 @@ impl Service for DataManager {
             -> Result<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, ()> {
         if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
         match self.server.chunks.read_selected(id, &fields[..]) {
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
+        }
+    }
+    fn read_partial_raw(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id, offset: &usize, len: &usize)
+                     -> Result<DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, ()> {
+        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
+        match self.server.chunks.read_partial_raw(id, *offset, *len) {
             Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }

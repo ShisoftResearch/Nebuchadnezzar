@@ -138,6 +138,19 @@ impl Chunk {
             None => Err(ReadError::CellDoesNotExisted)
         }
     }
+    fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
+        match self.location_for_read(hash) {
+            Some(loc) => {
+                let mut head_ptr = *loc + offset;
+                let mut data = Vec::with_capacity(len);
+                for ptr in head_ptr..(head_ptr + len) {
+                    data.push(unsafe {(*(ptr as *const u8))});
+                }
+                Ok(data.to_vec())
+            },
+            None => Err(ReadError::CellDoesNotExisted)
+        }
+    }
     fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if self.location_for_read(hash).is_some() {
@@ -286,6 +299,10 @@ impl Chunks {
     pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields)
+    }
+    pub fn read_partial_raw(&self, key: &Id, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
+        let (chunk, hash) = self.locate_chunk_by_key(key);
+        return chunk.read_partial_raw(hash, offset, len)
     }
     pub fn head_cell(&self, key: &Id) -> Result<Header, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
