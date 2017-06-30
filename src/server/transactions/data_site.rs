@@ -269,6 +269,7 @@ impl Service for DataManager {
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }
     }
+    // TODO: Link this function in transaction manager
     fn read_partial_raw(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id, offset: &usize, len: &usize)
                      -> Result<DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, ()> {
         if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
