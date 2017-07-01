@@ -126,11 +126,14 @@ impl Client {
         }
         Err(TxnError::TooManyRetry)
     }
+    pub fn new_schema_with_id(&self, schema: &Schema) -> Result<(), ExecError> {
+        self.schema_client.new_schema(schema)?;
+        Ok(())
+    }
     pub fn new_schema(&self, schema: &mut Schema) -> Result<(), ExecError> {
         let schema_id = self.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
-        self.schema_client.new_schema(schema)?;
-        Ok(())
+        self.new_schema_with_id(schema)
     }
     pub fn del_schema(&self, schema_id: &String) -> Result<(), ExecError> {
         self.schema_client.del_schema(schema_id)?;

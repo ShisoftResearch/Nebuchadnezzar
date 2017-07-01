@@ -157,6 +157,9 @@ impl SchemasMap {
     }
     fn next_id(&mut self) -> u32 {
         self.id_counter += 1;
+        while self.schema_map.contains_key(&self.id_counter) {
+            self.id_counter += 1;
+        }
         self.id_counter
     }
     fn get_all(&self) -> Vec<Schema> {
