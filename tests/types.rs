@@ -249,3 +249,14 @@ fn _in_map() {
     });
     assert_eq!(map.get_in(&["B", "b"]).I64().unwrap(), 30);
 }
+
+#[test]
+fn index_mut_map() {
+    let mut value = types::Value::Map(types::Map::new());
+    value["a"] = types::Value::String(String::from("A"));
+    value["b"] = types::Value::Array(vec![types::Value::U64(5)]);
+    assert_eq!(value["a"].String().unwrap(), &String::from("A"));
+    assert_eq!(value["b"][0 as usize].U64().unwrap(), 5);
+    value["b"][0 as usize] = types::Value::U64(10);
+    assert_eq!(value["b"][0 as usize].U64().unwrap(), 10);
+}

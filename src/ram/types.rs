@@ -254,8 +254,16 @@ impl Index<u64> for Value {
 static MISSING_ARRAY_ITEM: &'static str ="Cannot get item from array";
 static DATA_TYPE_DONT_SUPPORT_INDEXING: &'static str ="Data type don't support indexing";
 
-impl IndexMut<usize> for Value {
+impl <'a> IndexMut <&'a str> for Value {
+    fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
+        match self {
+            &mut Value::Map(ref mut map) => map.get_mut(index),
+            _ => panic!(DATA_TYPE_DONT_SUPPORT_INDEXING)
+        }
+    }
+}
 
+impl IndexMut<usize> for Value {
     fn index_mut<'a>(&'a mut self, index: usize) -> &'a mut Self::Output {
         match self {
             &mut Value::Array(ref mut array) => array.get_mut(index).expect(MISSING_ARRAY_ITEM),
@@ -266,7 +274,6 @@ impl IndexMut<usize> for Value {
 }
 
 impl IndexMut<u64> for Value {
-
     fn index_mut<'a>(&'a mut self, index: u64) -> &'a mut Self::Output {
         match self {
             &mut Value::Map(ref mut map) => map.get_mut_by_key_id(index),
