@@ -5,7 +5,7 @@ use std::collections::hash_map;
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::iter::Iterator;
-use std::ops::Index;
+use std::ops::{Index, IndexMut};
 use utils::rand;
 use bifrost_hasher::{hash_str, hash_bytes, hash_bytes_secondary};
 use bifrost::utils::bincode::serialize;
@@ -251,6 +251,31 @@ impl Index<u64> for Value {
     }
 }
 
+static MISSING_ARRAY_ITEM: &'static str ="Cannot get item from array";
+static DATA_TYPE_DONT_SUPPORT_INDEXING: &'static str ="Data type don't support indexing";
+
+impl IndexMut<usize> for Value {
+
+    fn index_mut<'a>(&'a mut self, index: usize) -> &'a mut Self::Output {
+        match self {
+            &mut Value::Array(ref mut array) => array.get_mut(index).expect(MISSING_ARRAY_ITEM),
+            &mut Value::Map(ref mut map) => map.get_mut_by_key_id(index as u64),
+            _ => panic!(DATA_TYPE_DONT_SUPPORT_INDEXING)
+        }
+    }
+}
+
+impl IndexMut<u64> for Value {
+
+    fn index_mut<'a>(&'a mut self, index: u64) -> &'a mut Self::Output {
+        match self {
+            &mut Value::Map(ref mut map) => map.get_mut_by_key_id(index),
+            &mut Value::Array(ref mut array) => array.get_mut(index as usize).expect(MISSING_ARRAY_ITEM),
+            _ => panic!(DATA_TYPE_DONT_SUPPORT_INDEXING)
+        }
+    }
+}
+
 gen_primitive_types_io!(
     bool:   bool_io       ;
     char:   char_io       ;
@@ -344,13 +369,13 @@ impl Map {
     pub fn get_by_key_id(&self, key: u64) -> &Value {
         self.map.get(&key).unwrap_or(&NULL_VALUE)
     }
-    pub fn get_mut_by_key_id(&mut self, key: u64) -> Option<&mut Value> {
-        self.map.get_mut(&key)
+    pub fn get_mut_by_key_id(&mut self, key: u64) -> &mut Value {
+        self.map.entry(key).or_insert(Value::Null)
     }
     pub fn get<'a>(&self, key: &'a str) -> &Value {
         self.get_by_key_id(key_hash(key))
     }
-    pub fn get_mut<'a>(&mut self, key: &'a str) -> Option<&mut Value> {
+    pub fn get_mut<'a>(&mut self, key: &'a str) -> &mut Value {
         self.get_mut_by_key_id(key_hash(key))
     }
     pub fn strs_to_ids<'a>(keys: &[&'a str]) -> Vec<u64> {
@@ -377,19 +402,23 @@ impl Map {
     pub fn get_in_mut_by_key_ids(&mut self, mut keys_ids: Iter<u64>) -> Option<&mut Value> {
         let current_key = keys_ids.next().cloned();
         if let Some(key) = current_key {
-            let value = self.get_mut_by_key_id(key);
-            if let Some(value) = value {
-                if keys_ids.is_empty() {
-                    return Some(value)
-                } else {
-                    match value {
-                        &mut Value::Map(ref mut map) => return map.get_in_mut_by_key_ids(keys_ids),
-                        _ => {}
+            let mut value = self.get_mut_by_key_id(key);
+            match value {
+                &mut Value::Null => return None,
+                _ => {
+                    if keys_ids.is_empty() {
+                        return Some(value)
+                    } else {
+                        match value {
+                            &mut Value::Map(ref mut map) => return map.get_in_mut_by_key_ids(keys_ids),
+                            _ => return None
+                        }
                     }
                 }
             }
+        } else {
+            return None
         }
-        return None
     }
     pub fn get_in_mut(&mut self, keys: &[&'static str]) -> Option<&mut Value> {
         self.get_in_mut_by_key_ids(Map::strs_to_ids(keys).iter())
