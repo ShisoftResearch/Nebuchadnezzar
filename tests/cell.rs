@@ -51,9 +51,9 @@ pub fn cell_rw () {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("id").I64().unwrap(), 100);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").U64().unwrap(), 70);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
+        assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
     }
     data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(2));
@@ -78,15 +78,15 @@ pub fn cell_rw () {
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("id").I64().unwrap(), 2);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").U64().unwrap(), 80);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").String().unwrap(), "John");
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
+        assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
     }
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("id").I64().unwrap(), 100);
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("name").String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data.Map().unwrap().get_static_key("score").U64().unwrap(), 70);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
+        assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
     }
 }

@@ -5,6 +5,7 @@ use std::collections::hash_map;
 use std::cmp::Ordering;
 use std::slice::Iter;
 use std::iter::Iterator;
+use std::ops::Index;
 use utils::rand;
 use bifrost_hasher::{hash_str, hash_bytes, hash_bytes_secondary};
 use bifrost::utils::bincode::serialize;
@@ -215,6 +216,41 @@ macro_rules! define_types {
     );
 }
 
+impl <'a> Index <&'a str> for Value {
+    type Output = Value;
+
+    fn index(&self, index: &'a str) -> &Self::Output {
+        match self {
+            &Value::Map(ref map) => map.get(index),
+            _ => &NULL_VALUE
+        }
+    }
+}
+
+impl Index<usize> for Value {
+    type Output = Value;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self {
+            &Value::Array(ref array) => array.get(index).unwrap_or(&NULL_VALUE),
+            &Value::Map(ref map) => map.get_by_key_id(index as u64),
+            _ => &NULL_VALUE
+        }
+    }
+}
+
+impl Index<u64> for Value {
+    type Output = Value;
+
+    fn index(&self, index: u64) -> &Self::Output {
+        match self {
+            &Value::Map(ref map) => map.get_by_key_id(index),
+            &Value::Array(ref array) => array.get(index as usize).unwrap_or(&NULL_VALUE),
+            _ => &NULL_VALUE
+        }
+    }
+}
+
 gen_primitive_types_io!(
     bool:   bool_io       ;
     char:   char_io       ;
@@ -264,8 +300,8 @@ pub struct Id {
     pub lower:  u64,
 }
 
-pub fn key_hash(key: &String) -> u64 {
-    hash_str(&key)
+pub fn key_hash<'a>(key: &'a str) -> u64 {
+    hash_str(key)
 }
 
 pub fn key_hashes(keys: &Vec<String>) -> Vec<u64> {
@@ -311,20 +347,14 @@ impl Map {
     pub fn get_mut_by_key_id(&mut self, key: u64) -> Option<&mut Value> {
         self.map.get_mut(&key)
     }
-    pub fn get(&self, key: &String) -> &Value {
+    pub fn get<'a>(&self, key: &'a str) -> &Value {
         self.get_by_key_id(key_hash(key))
     }
-    pub fn get_mut(&mut self, key: &String) -> Option<&mut Value> {
+    pub fn get_mut<'a>(&mut self, key: &'a str) -> Option<&mut Value> {
         self.get_mut_by_key_id(key_hash(key))
     }
-    pub fn get_static_key(&self, key: &'static str) -> &Value {
-        self.get(&String::from(key))
-    }
-    pub fn get_mut_static_key(&mut self, key: &'static str) -> Option<&mut Value> {
-        self.get_mut(&String::from(key))
-    }
-    pub fn strs_to_ids(keys: &[&'static str]) -> Vec<u64> {
-        keys.iter().map(|str| key_hash(&String::from(*str))).collect()
+    pub fn strs_to_ids<'a>(keys: &[&'a str]) -> Vec<u64> {
+        keys.iter().map(|str| key_hash(str)).collect()
     }
     pub fn get_in_by_ids(&self, mut key_ids: Iter<u64>) -> &Value {
         let current_key = key_ids.next().cloned();
