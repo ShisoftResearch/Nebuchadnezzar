@@ -29,6 +29,7 @@ pub enum ServerError {
     StandaloneMustAlsoBeMetaServer,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,
