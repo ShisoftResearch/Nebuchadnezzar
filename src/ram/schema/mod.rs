@@ -37,6 +37,11 @@ impl Schema {
             fields: fields
         }
     }
+    pub fn new_with_id(id: u32, name: String, key_field: Option<Vec<String>>, fields: Field) -> Schema {
+        let mut schema = Schema::new(name, key_field, fields);
+        schema.id = id;
+        schema
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
