@@ -50,15 +50,15 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn new(
-        name: &String,
+    pub fn new<'a>(
+        name: & 'a str,
         type_id: u32,
         nullable: bool,
         is_array: bool,
         sub_fields: Option<Vec<Field>>)
         -> Field {
         Field {
-            name: name.clone(),
+            name: name.to_string(),
             name_id: types::key_hash(name),
             type_id: type_id,
             nullable: nullable,
@@ -136,15 +136,15 @@ impl SchemasMap {
         self.schema_map.insert(id, Arc::new(schema.clone()));
         self.name_map.insert(name, id);
     }
-    pub fn del_schema(&mut self, name: &String) -> Result<(), ()> {
-        if let Some(id) = self.name_map.get(name) {
+    pub fn del_schema<'a>(&mut self, name: & 'a str) -> Result<(), ()> {
+        if let Some(id) = self.name_map.get(&name.to_string()) {
             self.schema_map.remove(&id);
         }
-        self.name_map.remove(name);
+        self.name_map.remove(&name.to_string());
         Ok(())
     }
-    pub fn get_by_name(&self, name: &String) -> Option<Arc<Schema>> {
-        if let Some(id) = self.name_map.get(name) {
+    pub fn get_by_name<'a>(&self, name: & 'a str) -> Option<Arc<Schema>> {
+        if let Some(id) = self.name_map.get(&name.to_string()) {
             return self.get(&id)
         }
         return None;

@@ -366,8 +366,8 @@ impl Map {
             fields: fields
         }
     }
-    pub fn insert(&mut self, key: &String, value: Value) -> Option<Value> {
-        self.fields.push(key.clone());
+    pub fn insert<'a>(&mut self, key: & 'a str, value: Value) -> Option<Value> {
+        self.fields.push(key.to_string());
         self.insert_key_id(key_hash(key), value)
     }
     pub fn insert_key_id(&mut self, key: u64, value: Value) -> Option<Value> {
