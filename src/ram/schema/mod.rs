@@ -125,6 +125,10 @@ impl SchemasServer {
         let mut m = self.map.write();
         m.new_schema(schema)
     }
+    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+        let m = self.map.read();
+        m.name_to_id(name)
+    }
 }
 
 impl SchemasMap {
@@ -142,14 +146,14 @@ impl SchemasMap {
         self.name_map.insert(name, id);
     }
     pub fn del_schema<'a>(&mut self, name: & 'a str) -> Result<(), ()> {
-        if let Some(id) = self.name_map.get(&name.to_string()) {
+        if let Some(id) =self.name_to_id(name) {
             self.schema_map.remove(&id);
         }
         self.name_map.remove(&name.to_string());
         Ok(())
     }
     pub fn get_by_name<'a>(&self, name: & 'a str) -> Option<Arc<Schema>> {
-        if let Some(id) = self.name_map.get(&name.to_string()) {
+        if let Some(id) = self.name_to_id(name) {
             return self.get(&id)
         }
         return None;
@@ -159,6 +163,9 @@ impl SchemasMap {
             return Some(schema.clone())
         }
         return None;
+    }
+    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+        self.name_map.get(&name.to_string()).cloned()
     }
     fn next_id(&mut self) -> u32 {
         self.id_counter += 1;
