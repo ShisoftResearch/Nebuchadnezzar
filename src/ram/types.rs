@@ -8,7 +8,7 @@ use std::iter::Iterator;
 use std::ops::{Index, IndexMut};
 use utils::rand;
 use bifrost_hasher::{hash_str, hash_bytes, hash_bytes_secondary};
-use bifrost::utils::bincode::serialize;
+use bifrost::utils::bincode::{serialize, deserialize};
 use serde;
 
 macro_rules! gen_primitive_types_io {
@@ -340,14 +340,13 @@ pub fn key_hashes(keys: &Vec<String>) -> Vec<u64> {
     keys.iter().map(|str| hash_str(str)).collect()
 }
 
+static NULL_VALUE: Value = Value::Null;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
     map: hash_map::HashMap<u64, Value>,
     pub fields: Vec<String>
 }
-
-static NULL_VALUE: Value = Value::Null;
-
 impl Map {
     pub fn new() -> Map {
         Map {
@@ -468,6 +467,19 @@ impl Map {
             .filter(|&(ref field, _)| field.is_some())
             .map(|(field, value)| (field.unwrap(), value))
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Any {
+    data: Vec<u8>
+}
+impl Any {
+    pub fn to<'a, T>(&'a self) -> T where T: serde::Deserialize<'a> {
+        deserialize(&self.data)
+    }
+    pub fn from<T>(data: &T) -> Vec<u8> where T: serde::Serialize {
+        serialize(data)
     }
 }
 
@@ -694,6 +706,46 @@ gen_variable_types_io! (
     }
 );
 
+gen_variable_types_io! (
+    Any, any_io, {
+        use std::ptr;
+        |mem_ptr| {
+            let len = u32_io::read(mem_ptr) as usize;
+            let smem_ptr = mem_ptr + u32_io::size(0);
+            let mut bytes = Vec::with_capacity(len);
+            for i in 0..len {
+                let ptr = smem_ptr + i;
+                let b = unsafe {ptr::read(ptr as *mut u8)};
+                bytes.push(b);
+            }
+            Any {data: bytes}
+        }
+    }, {
+        use std::ptr;
+        |val: &Any, mem_ptr| {
+            let bytes = &val.data;
+            let len = bytes.len();
+            u32_io::write(len as u32, mem_ptr);
+            let mut smem_ptr = mem_ptr + u32_io::size(0);
+            unsafe {
+                for b in bytes {
+                    ptr::write(smem_ptr as *mut u8, *b);
+                    smem_ptr += 1;
+                }
+            }
+        }
+    }, {
+        |mem_ptr| {
+            let str_len = u32_io::read(mem_ptr) as usize;
+            str_len + u32_io::size(0)
+        }
+    }, {
+        |val: &Any| {
+            val.data.len() + u32_io::size(0)
+        }
+    }
+);
+
 define_types!(
     ["bool", "bit"], 1, bool                           ,Bool     ,false ,  bool_io       ;
     ["char"], 2, char                                  ,Char     ,false ,  char_io       ;
@@ -714,7 +766,8 @@ define_types!(
     ["pos3d32", "pos3d"], 17, Pos3d32                  ,Pos3d32  ,true  ,  pos3d32_io    ;
     ["pos3d64"], 18, Pos3d64                           ,Pos3d64  ,true  ,  pos3d64_io    ;
     ["id"], 19, Id                                     ,Id       ,true  ,  id_io         ;
-    ["string", "str"], 20, String                      ,String   ,true  ,  string_io
+    ["string", "str"], 20, String                      ,String   ,true  ,  string_io     ;
+    ["any", "dynamic"], 21, Any                        ,Any      ,true  ,  any_io
 );
 
 pub const ARRAY_LEN_TYPE_ID: u32 = 9; //u32
