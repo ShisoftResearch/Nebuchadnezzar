@@ -29,7 +29,8 @@ pub fn workspace_wr() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
@@ -118,7 +119,8 @@ pub fn data_site_wr() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: true
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
@@ -180,7 +182,8 @@ pub fn multi_transaction() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();
@@ -239,7 +242,8 @@ pub fn smoke_rw() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_client(&server_addr).unwrap();

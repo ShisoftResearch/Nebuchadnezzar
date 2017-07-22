@@ -18,14 +18,15 @@ pub struct Schema {
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
-    pub fields: Field
+    pub fields: Field,
+    pub is_dynamic: bool
 }
 
 impl Schema {
-    pub fn new(name: String, key_field: Option<Vec<String>>, fields: Field) -> Schema {
+    pub fn new<'a>(name: &'a str, key_field: Option<Vec<String>>, fields: Field, is_dynamic: bool) -> Schema {
         Schema {
             id: 0,
-            name: name,
+            name: name.to_string(),
             key_field: match key_field {
                 None => None,
                 Some(ref keys) => Some(keys
@@ -34,11 +35,12 @@ impl Schema {
                     .collect())             // field list into field ids
             },
             str_key_field: key_field,
-            fields: fields
+            fields: fields,
+            is_dynamic: is_dynamic
         }
     }
-    pub fn new_with_id(id: u32, name: String, key_field: Option<Vec<String>>, fields: Field) -> Schema {
-        let mut schema = Schema::new(name, key_field, fields);
+    pub fn new_with_id<'a>(id: u32, name: &'a str, key_field: Option<Vec<String>>, fields: Field, dynamic: bool) -> Schema {
+        let mut schema = Schema::new(name, key_field, fields, dynamic);
         schema.id = id;
         schema
     }

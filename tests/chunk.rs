@@ -32,7 +32,7 @@ pub fn cell_rw () {
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
     let fields = default_fields();
-    let mut schema = Schema::new(String::from("dummy"), None, fields);
+    let mut schema = Schema::new("dummy", None, fields, false);
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));

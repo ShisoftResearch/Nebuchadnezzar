@@ -8,7 +8,6 @@ use serde::Serialize;
 
 pub const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
-pub type DataValue = Value;
 pub type DataMap = Map;
 
 #[repr(C, packed)]
@@ -84,7 +83,7 @@ pub const HEADER_SIZE :usize = 32;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
     pub header: Header,
-    pub data: DataValue
+    pub data: Value
 }
 
 impl Cell {
@@ -140,7 +139,7 @@ impl Cell {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn select_from_chunk_raw(ptr: usize, chunk: &Chunk, fields: &[u64]) -> Result<DataValue, ReadError> {
+    pub fn select_from_chunk_raw(ptr: usize, chunk: &Chunk, fields: &[u64]) -> Result<Value, ReadError> {
         let header = Cell::header_from_chunk_raw(ptr)?;
         let data_ptr = ptr + HEADER_SIZE;
         let schema_id = &header.schema;
@@ -164,6 +163,12 @@ impl Cell {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();
         writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions)?;
+        if schema.is_dynamic {
+            writer::plan_write_dynamic_fields(
+                &mut offset, &schema.fields,
+                &self.data, &mut instructions
+            )?;
+        }
         let total_size = offset + HEADER_SIZE;
         if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size))}
         let addr_opt = chunk.try_acquire(total_size);

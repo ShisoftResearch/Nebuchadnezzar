@@ -25,7 +25,8 @@ pub fn cell_rw () {
         name: String::from("dummy"),
         key_field: None,
         str_key_field: None,
-        fields: fields
+        fields: fields,
+        is_dynamic: false
     };
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));

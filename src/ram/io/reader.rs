@@ -1,9 +1,9 @@
 use ram::schema::{Schema, Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{u16_io, u8_io, Value};
+use ram::types::{u16_io, u8_io, Value, Map};
 
-fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (DataValue, usize) {
+fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, usize) {
     let mut ptr = ptr;
     if field.nullable {
         let null_byte = u8_io::read(ptr);
@@ -17,7 +17,7 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (DataValue
         let mut sub_field = field.clone();
         sub_field.is_array = false;
         ptr += u16_io::size(ptr);
-        let mut vals = Vec::<DataValue>::new();
+        let mut vals = Vec::<Value>::new();
         for _ in 0..len {
             let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field, None);
             ptr = nxt_ptr;
@@ -50,10 +50,27 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (DataValue
     }
 }
 
-pub fn read_by_schema(ptr: usize, schema: &Schema) -> DataValue {
-    read_field(ptr, &schema.fields, None).0
+pub fn read_attach_dynamic_part(tail_ptr: usize, dest: &mut Value) {
+    let src = types::get_val(types::TypeId::Any as u32, tail_ptr);
+    if let &mut Value::Map(ref mut map_dest) = dest {
+        if let Value::Any(any_src) = src {
+            let mut map_src: Map = any_src.to();
+            for (k, v) in map_src.map.into_iter() {
+                map_dest.insert_key_id(k, v);
+            }
+            map_dest.fields.append(&mut map_src.fields);
+        }
+    }
 }
 
-pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> DataValue {
+pub fn read_by_schema(ptr: usize, schema: &Schema) -> Value {
+    let (mut schema_value, tail_ptr) = read_field(ptr, &schema.fields, None);
+    if schema.is_dynamic {
+        read_attach_dynamic_part(tail_ptr, &mut schema_value)
+    }
+    schema_value
+}
+
+pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> Value {
     read_field(ptr, &schema.fields, Some(fields)).0
 }

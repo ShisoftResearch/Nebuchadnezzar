@@ -32,7 +32,8 @@ pub fn general() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
@@ -107,7 +108,8 @@ pub fn multi_cell_update() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
@@ -183,7 +185,8 @@ pub fn write_skew() {
         name: String::from("test"),
         key_field: None,
         str_key_field: None,
-        fields: default_fields()
+        fields: default_fields(),
+        is_dynamic: false
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),

@@ -195,7 +195,7 @@ macro_rules! define_types {
                  $(
                      $id => $io::write(get_from_val!($r, $e, val).unwrap() , mem_ptr),
                  )*
-                 _ => (),
+                 _ => panic!("Type id not illegal {}", id),
              }
         }
         pub fn get_vsize (id: u32, val: &Value) -> usize {
@@ -344,7 +344,7 @@ static NULL_VALUE: Value = Value::Null;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
-    map: hash_map::HashMap<u64, Value>,
+    pub map: hash_map::HashMap<u64, Value>,
     pub fields: Vec<String>
 }
 impl Map {
@@ -478,8 +478,8 @@ impl Any {
     pub fn to<'a, T>(&'a self) -> T where T: serde::Deserialize<'a> {
         deserialize(&self.data)
     }
-    pub fn from<T>(data: &T) -> Vec<u8> where T: serde::Serialize {
-        serialize(data)
+    pub fn from<T>(data: &T) -> Any where T: serde::Serialize {
+        Any { data: serialize(data) }
     }
 }
 
