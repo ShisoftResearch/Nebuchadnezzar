@@ -1,6 +1,7 @@
 #![feature(integer_atomics)]
 
 
+#[macro_use]
 extern crate neb;
 
 mod chunk;

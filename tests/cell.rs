@@ -28,11 +28,11 @@ pub fn cell_rw () {
         fields: fields,
         is_dynamic: false
     };
-    let mut data_map = Map::new();
-    data_map.insert("id", Value::I64(100));
-    data_map.insert("score", Value::U64(70));
-    data_map.insert("name", Value::String(String::from("Jack")));
-    let mut data = Value::Map(data_map);
+    let mut data = map_value!{
+        id: 100 as i64,
+        score: 70 as u64,
+        name: String::from("Jack")
+    };
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
@@ -49,11 +49,11 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
     }
-    data_map = Map::new();
-    data_map.insert("id", Value::I64(2));
-    data_map.insert("score", Value::U64(80));
-    data_map.insert("name", Value::String(String::from("John")));
-    data = Value::Map(data_map);
+    data = map_value!{
+        id: 2 as i64,
+        score: 80 as u64,
+        name: "John"
+    };
     cell = Cell {
         header: Header::new(0, schema.id, &id2),
         data: data

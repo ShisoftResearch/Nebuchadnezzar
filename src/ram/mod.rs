@@ -1,3 +1,4 @@
+#[macro_use]
 pub mod types;
 pub mod chunk;
 pub mod cell;

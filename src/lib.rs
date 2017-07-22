@@ -7,6 +7,7 @@
 #![feature(exact_size_is_empty)]
 
 pub mod utils;
+#[macro_use]
 pub mod ram;
 pub mod server;
 pub mod client;
