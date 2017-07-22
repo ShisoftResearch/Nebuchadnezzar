@@ -384,6 +384,14 @@ impl Map {
     pub fn insert_key_id(&mut self, key: u64, value: Value) -> Option<Value> {
         self.map.insert(key, value)
     }
+    pub fn insert_value<'a, V>(&mut self, key: & 'a str, value: V) -> Option<Value>
+    where V: ToValue{
+        self.insert(key, value.value())
+    }
+    pub fn insert_key_id_value<V>(&mut self, key: u64, value: V) -> Option<Value>
+    where V: ToValue{
+        self.insert_key_id(key, value.value())
+    }
     pub fn get_by_key_id(&self, key: u64) -> &Value {
         self.map.get(&key).unwrap_or(&NULL_VALUE)
     }
