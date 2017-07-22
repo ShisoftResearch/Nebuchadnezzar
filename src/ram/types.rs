@@ -137,6 +137,14 @@ macro_rules! define_types {
             Map = 0 // No matter which id we pick for 'Map' because w/r planners will ignore it when sub_fields is not 'None'
         }
 
+        $(
+            impl ToValue for $t {
+                fn value(self) -> Value {
+                    Value::$e(self)
+                }
+            }
+        )*
+
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub enum Value {
             $(
@@ -214,6 +222,10 @@ macro_rules! define_types {
            }
         }
     );
+}
+
+pub trait ToValue{
+    fn value(self) -> Value;
 }
 
 impl <'a> Index <&'a str> for Value {
