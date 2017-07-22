@@ -225,11 +225,18 @@ macro_rules! define_types {
 }
 
 #[macro_export]
-macro_rules! map_value {
+macro_rules! data_map {
     ($($k:ident: $v:expr),*) => {{
             let mut map = Map::new();
             $(map.insert_value(stringify!($k), $v);)*
-            Value::Map(map)
+            map
+     }};
+}
+
+#[macro_export]
+macro_rules! data_map_value {
+    ($($k:ident: $v:expr),*) => {{
+            Value::Map(data_map!($($k: $v),*))
      }};
 }
 
@@ -239,6 +246,11 @@ pub trait ToValue{
 impl <'a> ToValue for &'a str {
     fn value(self) -> Value {
         Value::String(self.to_string())
+    }
+}
+impl ToValue for Value {
+    fn value(self) -> Value {
+        self
     }
 }
 

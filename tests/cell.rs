@@ -28,7 +28,7 @@ pub fn cell_rw () {
         fields: fields,
         is_dynamic: false
     };
-    let mut data = map_value!{
+    let mut data = data_map_value!{
         id: 100 as i64,
         score: 70 as u64,
         name: String::from("Jack")
@@ -49,7 +49,7 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
     }
-    data = map_value!{
+    data = data_map_value!{
         id: 2 as i64,
         score: 80 as u64,
         name: "John"
