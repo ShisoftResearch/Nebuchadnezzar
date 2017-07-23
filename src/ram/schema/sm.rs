@@ -5,7 +5,6 @@ use bifrost::raft::state_machine::callback::server::SMCallback;
 use bifrost::raft::RaftService;
 use bifrost::utils::bincode;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub static DEFAULT_SM_ID: u64 = hash_ident!(NEB_SCHEMAS_SM) as u64;
@@ -17,6 +16,7 @@ pub struct SchemasSM {
 
 raft_state_machine! {
     def qry get_all() -> Vec<Schema>;
+    def qry get(id: u32) -> Option<Schema>;
     def cmd new_schema(schema: Schema);
     def cmd del_schema(name: String);
     def cmd next_id() -> u32;
@@ -28,6 +28,15 @@ impl StateMachineCmds for SchemasSM {
     fn get_all(&self) -> Result<Vec<Schema>, ()> {
         let m = self.map.read();
         Ok(m.get_all())
+    }
+    fn get(&self, id: u32) -> Result<Option<Schema>, ()> {
+        let m = self.map.read();
+        Ok(m.get(&id).map(
+            |r: Arc<Schema>| -> Schema {
+                let borrow: &Schema = r.borrow();
+                borrow.clone()
+            }
+        ))
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), ()> {
         {

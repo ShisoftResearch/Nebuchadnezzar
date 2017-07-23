@@ -303,4 +303,36 @@ pub fn server_isolation() {
     };
     client1.new_schema_with_id(&schema1).unwrap();
     client2.new_schema_with_id(&schema2).unwrap();
+
+    let schema_1_got: Schema = client1.schema_client.get(&schema1.id).unwrap().unwrap().unwrap();
+    assert_eq!(schema_1_got.id, 1);
+    let schema_1_fields = schema1.fields;
+    assert_eq!(
+        schema_1_fields.clone().sub_fields.unwrap().first().unwrap().name,
+        default_fields().sub_fields.unwrap().first().unwrap().name
+    );
+    assert_eq!(
+        schema_1_fields.clone().sub_fields.unwrap().get(1).unwrap().name,
+        default_fields().sub_fields.unwrap().get(1).unwrap().name
+    );
+    assert_eq!(
+        schema_1_fields.clone().sub_fields.unwrap().get(2).unwrap().name,
+        default_fields().sub_fields.unwrap().get(2).unwrap().name
+    );
+
+    let schema_2_got: Schema = client1.schema_client.get(&schema2.id).unwrap().unwrap().unwrap();
+    assert_eq!(schema_2_got.id, 1);
+    let schema_2_fields = schema2.fields;
+    assert_eq!(
+        schema_2_fields.clone().sub_fields.unwrap().first().unwrap().name,
+        "-id"
+    );
+    assert_eq!(
+        schema_2_fields.clone().sub_fields.unwrap().get(1).unwrap().name,
+        "-name"
+    );
+    assert_eq!(
+        schema_2_fields.clone().sub_fields.unwrap().get(2).unwrap().name,
+        "-score"
+    );
 }
