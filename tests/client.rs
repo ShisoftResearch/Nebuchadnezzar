@@ -246,3 +246,61 @@ pub fn write_skew() {
 //    assert_eq!(*normal_tried.lock(), 1);
     println!("Skew tried {}, normal tried {}", *skew_tried.lock(), *normal_tried.lock());
 }
+
+#[test]
+pub fn server_isolation() {
+    let server_addr = String::from("127.0.0.1:5403");
+    let server = NebServer::new(&ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(server_addr.clone()),
+        address: server_addr.clone(),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
+    let client1 = Arc::new(client::Client::new(
+        &server.rpc, &vec!(server_addr),
+        &String::from("test")).unwrap());
+    let server_addr = String::from("127.0.0.1:5404");
+    let server = NebServer::new(&ServerOptions {
+        chunk_count: 1,
+        memory_size: 16 * 1024 * 1024,
+        standalone: false,
+        is_meta: true,
+        meta_members: vec!(server_addr.clone()),
+        address: server_addr.clone(),
+        backup_storage: None,
+        meta_storage: None,
+        group_name: String::from("test"),
+    }).unwrap();
+    let client2 = Arc::new(client::Client::new(
+        &server.rpc, &vec!(server_addr),
+        &String::from("test")).unwrap());
+    let mut schema1 = Schema {
+        id: 1,
+        name: String::from("test"),
+        key_field: None,
+        str_key_field: None,
+        fields: default_fields(),
+        is_dynamic: false
+    };
+    let mut schema2 = Schema {
+        id: 1,
+        name: String::from("test"),
+        key_field: None,
+        str_key_field: None,
+        fields: Field::new (&String::from("*"), 0, false, false, Some(
+            vec![
+                Field::new(&String::from("-id"), 6, false, false, None),
+                Field::new(&String::from("-name"), 20, false, false, None),
+                Field::new(&String::from("-score"), 10, false, false, None),
+            ]
+        )),
+        is_dynamic: false
+    };
+    client1.new_schema_with_id(&schema1).unwrap();
+    client2.new_schema_with_id(&schema2).unwrap();
+}
