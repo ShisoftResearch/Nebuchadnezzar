@@ -1,11 +1,14 @@
 #!/bin/bash
 
-RUST_BACKTRACE=1 RUST_LOG=neb=debug cargo test -- --nocapture
+export RUST_BACKTRACE=1
+export RUST_LOG=neb=debug
+
+cargo test -- --nocapture
 # RUST_BACKTRACE=1 fswatch src/ tests/ -e ".*" -i "\\.rs$" | (while read; do cargo test; done)
 
 while true; do
 
 inotifywait -e modify,create,delete -r src/ tests/ && \
-RUST_BACKTRACE=1 RUST_LOG=neb=debug cargo test -- --nocapture
+cargo test -- --nocapture
 
 done
