@@ -282,7 +282,7 @@ impl Chunks {
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(count, size, Arc::<ServerMeta>::new(ServerMeta {
-            schemas: SchemasServer::new(None).unwrap()
+            schemas: SchemasServer::new("", None).unwrap()
         }), None)
     }
     fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {

@@ -72,7 +72,7 @@ impl NebServer {
             raft::DEFAULT_SERVICE_ID,
             &raft_service
         );
-        raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&raft_service)));
+        raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&opt.group_name, &raft_service)));
         raft::RaftService::start(&raft_service);
         match raft_service.join(&opt.meta_members) {
             Err(sm_master::ExecError::CannotConstructClient) => {
@@ -127,7 +127,7 @@ impl NebServer {
                 RaftClient::prepare_subscription(rpc_server);
                 NebServer::join_group(opt, &raft_client)?;
                 let conshash = NebServer::init_conshash(opt, &raft_client)?;
-                let schema_server = match SchemasServer::new(Some(&raft_client)) {
+                let schema_server = match SchemasServer::new(&opt.group_name, Some(&raft_client)) {
                     Ok(schema) => schema,
                     Err(e) => return Err(ServerError::CannotInitializeSchemaServer(e))
                 };
@@ -143,7 +143,7 @@ impl NebServer {
     pub fn new(opt: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
         let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
         let rpc_server = rpc::Server::new(server_addr);
-        let mut schemas = SchemasServer::new(None).unwrap();
+        let mut schemas = SchemasServer::new(&opt.group_name, None).unwrap();
         let mut raft_service = None;
         rpc::Server::listen_and_resume(&rpc_server);
         if opt.is_meta {

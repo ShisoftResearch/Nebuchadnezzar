@@ -15,6 +15,7 @@ use super::*;
 
 #[test]
 pub fn general() {
+    let server_group = "general_test";
     let server_addr = String::from("127.0.0.1:5400");
     let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
@@ -25,7 +26,7 @@ pub fn general() {
         address: server_addr.clone(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from("test"),
+        group_name: String::from(server_group),
     }).unwrap();
     let mut schema = Schema {
         id: 1,
@@ -37,7 +38,7 @@ pub fn general() {
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap());
+        server_group).unwrap());
     client.new_schema(&mut schema).unwrap();
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
@@ -91,6 +92,7 @@ pub fn general() {
 
 #[test]
 pub fn multi_cell_update() {
+    let server_group = "multi_cell_update_test";
     let server_addr = String::from("127.0.0.1:5401");
     let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
@@ -101,7 +103,7 @@ pub fn multi_cell_update() {
         address: server_addr.clone(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from("test"),
+        group_name: String::from(server_group),
     }).unwrap();
     let mut schema = Schema {
         id: 1,
@@ -113,7 +115,7 @@ pub fn multi_cell_update() {
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap());
+        server_group).unwrap());
     let thread_count = 100;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     client.new_schema(&mut schema).unwrap();
@@ -168,6 +170,7 @@ pub fn multi_cell_update() {
 
 #[test]
 pub fn write_skew() {
+    let server_group = "write_skew_test";
     let server_addr = String::from("127.0.0.1:5402");
     let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
@@ -178,7 +181,7 @@ pub fn write_skew() {
         address: server_addr.clone(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from("test"),
+        group_name: String::from(server_group),
     }).unwrap();
     let mut schema = Schema {
         id: 1,
@@ -190,7 +193,7 @@ pub fn write_skew() {
     };
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap());
+        server_group).unwrap());
     let thread_count = 100;
     client.new_schema(&mut schema).unwrap();
     let mut data_map = Map::new();
@@ -249,6 +252,8 @@ pub fn write_skew() {
 
 #[test]
 pub fn server_isolation() {
+    let server_1_group = "server_isolation_test_1";
+    let server_2_group = "server_isolation_test_2";
     let server_addr = String::from("127.0.0.1:5403");
     let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
@@ -259,11 +264,11 @@ pub fn server_isolation() {
         address: server_addr.clone(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from("test"),
+        group_name: String::from(server_1_group),
     }).unwrap();
     let client1 = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap());
+        server_1_group).unwrap());
     let server_addr = String::from("127.0.0.1:5404");
     let server = NebServer::new(&ServerOptions {
         chunk_count: 1,
@@ -274,11 +279,11 @@ pub fn server_isolation() {
         address: server_addr.clone(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from("test"),
+        group_name: String::from(server_2_group),
     }).unwrap();
     let client2 = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
-        &String::from("test")).unwrap());
+        server_2_group).unwrap());
     let mut schema1 = Schema {
         id: 1,
         name: String::from("test"),
@@ -301,8 +306,12 @@ pub fn server_isolation() {
         )),
         is_dynamic: false
     };
-    client1.new_schema_with_id(&schema1).unwrap();
-    client2.new_schema_with_id(&schema2).unwrap();
+    client1.new_schema_with_id(&schema1).unwrap().unwrap();
+    client2.new_schema_with_id(&schema2).unwrap().unwrap();
+
+    println!("Schema added");
+
+    thread::sleep(Duration::new(2, 0));
 
     let schema_1_got: Schema = client1.schema_client.get(&schema1.id).unwrap().unwrap().unwrap();
     assert_eq!(schema_1_got.id, 1);

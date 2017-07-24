@@ -87,13 +87,13 @@ pub struct SchemasServer {
 }
 
 impl SchemasServer {
-    pub fn new(raft_client: Option<&Arc<RaftClient>>) -> Result<SchemasServer, ExecError> {
+    pub fn new<'a>(group: &'a str, raft_client: Option<&Arc<RaftClient>>) -> Result<SchemasServer, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let sm = match raft_client {
             Some(raft) => {
                 let m1 = map.clone();
                 let m2 = map.clone();
-                let sm = sm::client::SMClient::new(sm::DEFAULT_SM_ID, raft);
+                let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft);
                 let mut sm_data = sm.get_all()?.unwrap();
                 {
                     let mut map = map.write();
@@ -102,8 +102,10 @@ impl SchemasServer {
                     }
                 }
                 let _ = sm.on_schema_added(move |r| {
+                    let schema = r.unwrap();
+                    println!("-------------> Add schema {}", schema.id);
                     let mut m1 = m1.write();
-                    m1.new_schema(r.unwrap());
+                    m1.new_schema(schema);
                 })?;
                 let _ = sm.on_schema_deleted(move |r| {
                     let mut m2 = m2.write();

@@ -5,12 +5,13 @@ use bifrost::raft::client::{RaftClient, ClientError};
 use bifrost::raft;
 use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL, Server as RPCServer};
 use bifrost::raft::state_machine::master::ExecError;
+use bifrost::raft::state_machine::callback::server::{NotifyError};
 
 use server::{transactions as txn_server, cell_rpc as plain_server};
 use ram::types::Id;
 use ram::cell::{Cell, Header, ReadError, WriteError};
+use ram::schema::{sm as schema_sm};
 use ram::schema::sm::client::{SMClient as SchemaClient};
-use ram::schema::sm::{DEFAULT_SM_ID};
 use ram::schema::Schema;
 use self::transaction::*;
 
@@ -31,7 +32,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn new(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &String) -> Result<Client, NebClientError> {
+    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str) -> Result<Client, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server);
@@ -40,7 +41,7 @@ impl Client {
                     Ok(chash) => Ok(Client {
                         conshash: chash,
                         raft_client: raft_client.clone(),
-                        schema_client: SchemaClient::new(DEFAULT_SM_ID, &raft_client)
+                        schema_client: SchemaClient::new(schema_sm::generate_sm_id(group), &raft_client)
                     }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err))
                 }
@@ -126,18 +127,16 @@ impl Client {
         }
         Err(TxnError::TooManyRetry)
     }
-    pub fn new_schema_with_id(&self, schema: &Schema) -> Result<(), ExecError> {
-        self.schema_client.new_schema(schema)?;
-        Ok(())
+    pub fn new_schema_with_id(&self, schema: &Schema) -> Result<Result<(), NotifyError>, ExecError> {
+        self.schema_client.new_schema(schema)
     }
-    pub fn new_schema(&self, schema: &mut Schema) -> Result<(), ExecError> {
+    pub fn new_schema(&self, schema: &mut Schema) -> Result<Result<(), NotifyError>, ExecError> {
         let schema_id = self.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
         self.new_schema_with_id(schema)
     }
-    pub fn del_schema(&self, schema_id: &String) -> Result<(), ExecError> {
-        self.schema_client.del_schema(schema_id)?;
-        Ok(())
+    pub fn del_schema(&self, schema_id: &String) -> Result<Result<(), NotifyError>, ExecError> {
+        self.schema_client.del_schema(schema_id)
     }
     pub fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         Ok(self.schema_client.get_all()?.unwrap())
