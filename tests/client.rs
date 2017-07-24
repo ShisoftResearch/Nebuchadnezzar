@@ -254,36 +254,39 @@ pub fn write_skew() {
 pub fn server_isolation() {
     let server_1_group = "server_isolation_test_1";
     let server_2_group = "server_isolation_test_2";
-    let server_addr = String::from("127.0.0.1:5403");
-    let server = NebServer::new(&ServerOptions {
+    let server_address_1 = "127.0.0.1:5403";
+    let server_address_2 = "127.0.0.1:5404";
+
+    let server_1 = NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
         is_meta: true,
-        meta_members: vec!(server_addr.clone()),
-        address: server_addr.clone(),
+        meta_members: vec!(server_address_1.to_string()),
+        address: server_address_1.to_string(),
         backup_storage: None,
         meta_storage: None,
-        group_name: String::from(server_1_group),
+        group_name: server_1_group.to_string(),
     }).unwrap();
     let client1 = Arc::new(client::Client::new(
-        &server.rpc, &vec!(server_addr),
+        &server_1.rpc, &vec!(server_address_1.to_string()),
         server_1_group).unwrap());
-    let server_addr = String::from("127.0.0.1:5404");
-    let server = NebServer::new(&ServerOptions {
+
+    let server_2 = NebServer::new(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
         is_meta: true,
-        meta_members: vec!(server_addr.clone()),
-        address: server_addr.clone(),
+        meta_members: vec!(server_address_2.to_string()),
+        address: server_address_2.to_string(),
         backup_storage: None,
         meta_storage: None,
         group_name: String::from(server_2_group),
     }).unwrap();
     let client2 = Arc::new(client::Client::new(
-        &server.rpc, &vec!(server_addr),
+        &server_2.rpc, &vec!(server_address_2.to_string()),
         server_2_group).unwrap());
+
     let mut schema1 = Schema {
         id: 1,
         name: String::from("test"),
@@ -306,6 +309,7 @@ pub fn server_isolation() {
         )),
         is_dynamic: false
     };
+
     client1.new_schema_with_id(&schema1).unwrap().unwrap();
     client2.new_schema_with_id(&schema2).unwrap().unwrap();
 
@@ -313,7 +317,9 @@ pub fn server_isolation() {
 
     thread::sleep(Duration::new(2, 0));
 
-    let schema_1_got: Schema = client1.schema_client.get(&schema1.id).unwrap().unwrap().unwrap();
+    println!("{:?}", client1.schema_client.get(&schema1.id));
+
+    let schema_1_got: Schema = client1.get_all_schema().unwrap().first().unwrap().clone();
     assert_eq!(schema_1_got.id, 1);
     let schema_1_fields = schema1.fields;
     assert_eq!(
@@ -329,7 +335,7 @@ pub fn server_isolation() {
         default_fields().sub_fields.unwrap().get(2).unwrap().name
     );
 
-    let schema_2_got: Schema = client1.schema_client.get(&schema2.id).unwrap().unwrap().unwrap();
+    let schema_2_got: Schema = client2.get_all_schema().unwrap().first().unwrap().clone();
     assert_eq!(schema_2_got.id, 1);
     let schema_2_fields = schema2.fields;
     assert_eq!(

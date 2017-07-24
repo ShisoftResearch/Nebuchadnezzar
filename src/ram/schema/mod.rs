@@ -103,7 +103,7 @@ impl SchemasServer {
                 }
                 let _ = sm.on_schema_added(move |r| {
                     let schema = r.unwrap();
-                    println!("-------------> Add schema {}", schema.id);
+                    debug!("Add schema {} from subscription", schema.id);
                     let mut m1 = m1.write();
                     m1.new_schema(schema);
                 })?;

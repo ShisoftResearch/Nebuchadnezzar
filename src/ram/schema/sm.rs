@@ -45,10 +45,18 @@ impl StateMachineCmds for SchemasSM {
         ))
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), NotifyError> {
+        {
+            let mut map = self.map.write();
+            map.new_schema(schema.clone());
+        }
         self.callback.notify(&commands::on_schema_added::new(), Ok(schema))?;
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), NotifyError> {
+        {
+            let mut map = self.map.write();
+            map.del_schema(&name);
+        }
         self.callback.notify(&commands::on_schema_deleted::new(), Ok(name))?;
         Ok(())
     }
