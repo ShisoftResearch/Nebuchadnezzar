@@ -96,7 +96,7 @@ impl Cell {
     }
 
     pub fn encode_cell_key<V>(schema_id: u32, value: &V) -> Id
-        where V: Serialize{
+        where V: Serialize {
         Id::from_obj(&(schema_id, value))
     }
 

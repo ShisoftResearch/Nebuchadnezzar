@@ -240,7 +240,7 @@ macro_rules! data_map_value {
      }};
 }
 
-pub trait ToValue{
+pub trait ToValue: serde::Serialize{
     fn value(self) -> Value;
 }
 impl <'a> ToValue for &'a str {
