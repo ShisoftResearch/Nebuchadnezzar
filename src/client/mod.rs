@@ -79,8 +79,8 @@ impl Client {
         let client = self.locate_plain_server(id)?;
         client.remove_cell(id)
     }
-    pub fn transaction<TFN>(&self, func: TFN) -> Result<(), TxnError>
-        where TFN: Fn(&mut Transaction) -> Result<(), TxnError> {
+    pub fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
+        where TFN: Fn(&mut Transaction) -> Result<TR, TxnError> {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
@@ -102,16 +102,26 @@ impl Client {
                 client: txn_client.clone(),
                 changes: 0
             };
-            let mut exec_result = func(&mut txn);
-            if exec_result.is_ok() && txn.state == txn_server::TxnState::Started {
-                exec_result = txn.prepare();
-            }
-            if exec_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
-                exec_result = txn.commit();
-            }
+            let exec_result = func(&mut txn);
+            let mut exec_value = None;
+            let mut txn_result = Ok(());
             match exec_result {
+                Ok(val) => {
+                    if txn.state == txn_server::TxnState::Started {
+                        txn_result = txn.prepare();
+                    }
+                    if txn_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
+                        txn_result = txn.commit();
+                    }
+                    exec_value = Some(val);
+                },
+                Err(e) => {
+                    txn_result = Err(e)
+                }
+            }
+            match txn_result {
                 Ok(()) => {
-                    return Ok(());
+                    return Ok(exec_value.unwrap());
                 },
                 Err(TxnError::NotRealizable) => {
                     txn.abort();  // continue the loop to retry
