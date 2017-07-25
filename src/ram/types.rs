@@ -378,7 +378,7 @@ pub fn key_hashes(keys: &Vec<String>) -> Vec<u64> {
     keys.iter().map(|str| hash_str(str)).collect()
 }
 
-static NULL_VALUE: Value = Value::Null;
+pub static NULL_VALUE: Value = Value::Null;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Map {
