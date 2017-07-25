@@ -1,9 +1,10 @@
 use ram::schema::Schema;
 use ram::chunk::Chunk;
-use std::ptr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
 use std::sync::Arc;
+use std::ops::{Index, IndexMut};
+use std::ptr;
 use serde::Serialize;
 
 pub const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
@@ -191,5 +192,33 @@ impl Cell {
     }
     pub fn set_id(&mut self, id: &Id) {
         self.header.set_id(id)
+    }
+}
+
+impl Index<u64> for Cell {
+    type Output = Value;
+
+    fn index(&self, index: u64) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl <'a> Index<&'a str> for Cell {
+    type Output = Value;
+
+    fn index(&self, index: &'a str) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl <'a> IndexMut <&'a str> for Cell {
+    fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
+        &mut self.data[index]
+    }
+}
+
+impl IndexMut <u64> for Cell {
+    fn index_mut<'b>(&'b mut self, index:u64) -> &'b mut Self::Output {
+        &mut self.data[index]
     }
 }
