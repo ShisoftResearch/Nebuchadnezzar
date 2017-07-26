@@ -57,6 +57,16 @@ pub fn general() {
         Err(TxnError::Aborted) => {},
         _ => panic!("{:?}", should_aborted)
     }
+
+    // TODO: investigate dead lock
+//    client.transaction(|ref mut trans| {
+//        trans.write(&cell_1) // regular fail case
+//    }).err().unwrap();
+    client.transaction(|ref mut trans| {
+        let empty_cell = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(Map::new()));
+        trans.write(&empty_cell) // empty cell write should fail
+    }).err().unwrap();
+
     let cell_1_id = cell_1.id();
     let thread_count = 50;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
