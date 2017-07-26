@@ -46,7 +46,7 @@ impl Schema {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Field {
     pub type_id: u32,
     pub nullable: bool,

@@ -1,4 +1,4 @@
-use ram::schema::Schema;
+use ram::schema::{Schema, Field};
 use ram::chunk::Chunk;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id};
@@ -32,7 +32,7 @@ pub enum WriteError {
     UserCanceledUpdate,
     DeletionPredictionFailed,
     NetworkingError,
-    DataMismatchSchema,
+    DataMismatchSchema(Field, Value),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]

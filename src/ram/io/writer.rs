@@ -47,7 +47,7 @@ pub fn plan_write_field (
                 plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
         } else {
-            return Err(WriteError::DataMismatchSchema);
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else if let Some(ref subs) = field.sub_fields {
         if let &Value::Map(ref map) = value {
@@ -56,12 +56,12 @@ pub fn plan_write_field (
                 plan_write_field(&mut offset, &sub, val, &mut ins)?;
             }
         } else {
-            return Err(WriteError::DataMismatchSchema);
+            return Err(WriteError::DataMismatchSchema(field.clone(),value.clone()));
         }
     } else {
         let is_null = match value {&Value::Null => true, _ => false};
         if !field.nullable && is_null {
-            return Err(WriteError::DataMismatchSchema)
+            return Err(WriteError::DataMismatchSchema(field.clone(),value.clone()))
         }
         if !is_null {
             let size = types::get_vsize(field.type_id, value);

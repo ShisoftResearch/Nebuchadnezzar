@@ -1,5 +1,5 @@
 use ram::cell::Header;
-use std::cmp::PartialEq;
+use std::cmp::{PartialEq, Eq};
 use std::string::String;
 use std::collections::hash_map;
 use std::cmp::Ordering;
@@ -145,7 +145,7 @@ macro_rules! define_types {
             }
         )*
 
-        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
         pub enum Value {
             $(
                 $e($t),
@@ -155,6 +155,9 @@ macro_rules! define_types {
             NA,
             Null
         }
+
+        impl Eq for Value {}
+
         impl Value {
             $(
                 get_from_val_fn!($r, $e, $t);
@@ -370,6 +373,14 @@ pub struct Id {
     pub lower:  u64,
 }
 
+impl Eq for Pos2d32 {}
+
+impl Eq for Pos2d64 {}
+
+impl Eq for Pos3d32 {}
+
+impl Eq for Pos3d64 {}
+
 pub fn key_hash<'a>(key: &'a str) -> u64 {
     hash_str(key)
 }
@@ -380,7 +391,7 @@ pub fn key_hashes(keys: &Vec<String>) -> Vec<u64> {
 
 pub static NULL_VALUE: Value = Value::Null;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Map {
     pub map: hash_map::HashMap<u64, Value>,
     pub fields: Vec<String>
@@ -516,7 +527,7 @@ impl Map {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct Any {
     data: Vec<u8>
 }
