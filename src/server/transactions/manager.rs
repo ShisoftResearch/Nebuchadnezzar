@@ -43,7 +43,7 @@ service! {
 
     rpc prepare(tid: TxnId) -> TMPrepareResult | TMError;
     rpc commit(tid: TxnId) -> EndResult | TMError;
-    rpc abort(tid: TxnId) -> (AbortResult, EndResult) | TMError;
+    rpc abort(tid: TxnId) -> AbortResult | TMError;
 
     rpc go_ahead(tids: BTreeSet<TxnId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
 }
@@ -288,7 +288,7 @@ impl TransactionManager {
         Ok(DMCommitResult::Success)
     }
     fn sites_abort(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
-        -> Result<AbortResult, TMError> {
+                   -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&self.get_clock(), tid)
@@ -563,15 +563,13 @@ impl Service for TransactionManager {
         self.cleanup_transaction(tid);
         return result;
     }
-    fn abort(&self, tid: &TxnId) -> Result<(AbortResult, EndResult), TMError> {
+    fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
             let txn = self.get_transaction(tid)?;
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
-                let abort_result = self.sites_abort(tid, changed_objs, &data_sites)?; // with end
-                let end_result = self.sites_end(tid, changed_objs, &data_sites)?;
-                return Ok((abort_result, end_result))
+                self.sites_abort(tid, changed_objs, &data_sites) // with end
             } else {
                 Err(TMError::InvalidTransactionState(txn.state))
             }
