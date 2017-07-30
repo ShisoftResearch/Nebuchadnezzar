@@ -305,16 +305,14 @@ impl Service for DataManager {
             cell_metas.push(meta);
         }
         if cell_metas.len() != cell_ids.len() {
-            cell_metas.clear();
             return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
-            for mut meta in &mut cell_metas {
+            for mut meta in cell_metas {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
             txn.state = TxnState::Prepared;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time();    // check if transaction timeout
-            cell_metas.clear();
             return self.response_with(DMPrepareResult::Success);
         }
     }
@@ -486,7 +484,7 @@ impl Service for DataManager {
             let affected_cells = txn.affected_cells.len();
             let mut released_locks = 0;
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
-            for mut meta in &mut cell_metas {
+            for mut meta in cell_metas {
                 if meta.owner == Some(tid.clone()) {
                     // collect waiting transactions
                     for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
@@ -512,7 +510,6 @@ impl Service for DataManager {
                 }
             }
             future::join_all(wake_up_futures).wait();
-            cell_metas.clear();
             if released_locks == affected_cells {
                 self.response_with(EndResult::Success)
             } else {
