@@ -486,11 +486,12 @@ impl Service for DataManager {
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
             for mut meta in cell_metas {
                 if meta.owner == Some(tid.clone()) {
-                    for &(ref tid, ref server_id) in &meta.waiting {
+                    // collect waiting transactions
+                    for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
                         waiting_list
-                            .entry(*server_id)
+                            .entry(*waiting_server_id)
                             .or_insert_with(|| BTreeSet::new())
-                            .insert(tid.clone());
+                            .insert(waiting_tid.clone());
                     }
                     meta.waiting.clear();
                     meta.owner = None;
