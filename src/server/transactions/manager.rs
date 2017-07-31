@@ -565,7 +565,7 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
-            let txn = self.get_transaction(tid)?;
+            let txn = self.get_transaction(tid)?; // cause of deadlock with L364(begin)?
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
