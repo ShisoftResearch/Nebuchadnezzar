@@ -178,7 +178,7 @@ impl DataManager {
         self.tnxs_sorted.lock().remove(tid);
     }
     fn cell_meta_cleanup(&self) {
-        let mut cell_lru = self.cell_lru.lock(); // TODO: Don't clone
+        let mut cell_lru = self.cell_lru.lock();
         let mut cells = self.cells.lock();
         let mut evicted_cells = Vec::new();
         let oldest_transaction = {
