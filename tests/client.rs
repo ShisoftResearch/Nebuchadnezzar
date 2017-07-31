@@ -126,7 +126,7 @@ pub fn multi_cell_update() {
     let client = Arc::new(client::Client::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
-    let thread_count = 100;
+    let thread_count = 200;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
     client.new_schema(&mut schema).unwrap();
     let mut data_map = Map::new();
@@ -322,10 +322,6 @@ pub fn server_isolation() {
 
     client1.new_schema_with_id(&schema1).unwrap().unwrap();
     client2.new_schema_with_id(&schema2).unwrap().unwrap();
-
-    println!("Schema added");
-
-    thread::sleep(Duration::new(2, 0));
 
     println!("{:?}", client1.schema_client.get(&schema1.id));
 
