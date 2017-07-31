@@ -1,20 +1,20 @@
 use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
-use std::collections::{BTreeSet, BTreeMap};
+use std::collections::{BTreeSet, BTreeMap, HashMap};
 use chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use linked_hash_map::LinkedHashMap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use super::*;
 use std::sync::mpsc::{Sender, Receiver, channel};
 use std::thread;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
-type CellMetaGuard <'a> = WriteGuard<'a, Id, CellMeta>;
 type CommitHistory = BTreeMap<Id, CellHistory>;
+type CellMetaMutex = Arc<Mutex<CellMeta>>;
 
 #[derive(Debug)]
 pub struct CellMeta {
@@ -46,7 +46,7 @@ impl CellHistory {
 }
 
 pub struct DataManager {
-    cells: CHashMap<Id, CellMeta>,
+    cells: Mutex<HashMap<Id, Arc<Mutex<CellMeta>>>>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
     txns: CHashMap<TxnId, Transaction>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
@@ -77,7 +77,7 @@ impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
         let (cleaup_sender, cleaup_recv) = channel();
         let manager = Arc::new(DataManager {
-            cells: CHashMap::new(),
+            cells: Mutex::new(HashMap::new()),
             cell_lru: Mutex::new(LinkedHashMap::new()),
             txns: CHashMap::new(),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
@@ -114,29 +114,21 @@ impl DataManager {
             _ => self.get_transaction(tid, server) // it should be rare
         }
     }
-    fn get_cell_meta(&self, id: &Id) -> CellMetaGuard {
-        self.cells.alter(*id, |cell| {
-            match cell {
-                Some(c) => Some(c),
-                None => {
-                    Some(CellMeta {
-                        read: TxnId::new(),
-                        write: TxnId::new(),
-                        owner: None,
-                        waiting: BTreeSet::new(),
-                    })
-                }
-            }
-        });
+    fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
             let mut lru = self.cell_lru.lock();
             *lru.entry(id.clone()).or_insert(0) = get_time();
             lru.get_refresh(id);
         }
-        match self.cells.get_mut(id) {
-            Some(cell) => cell,
-            None => self.get_cell_meta(id)
-        }
+        let mut cells = self.cells.lock();
+        cells.entry(*id).or_insert_with(|| {
+            Arc::new(Mutex::new(CellMeta {
+                read: TxnId::new(),
+                write: TxnId::new(),
+                owner: None,
+                waiting: BTreeSet::new(),
+            }))
+        }).clone()
     }
     fn response_with<T>(&self, data: T)
         -> Result<DataSiteResponse<T>, ()>{
@@ -168,7 +160,8 @@ impl DataManager {
         failures
     }
     fn update_cell_write(&self, cell_id: &Id, tid: &TxnId) {
-        let mut meta = self.get_cell_meta(cell_id);
+        let meta_ref = self.cell_meta_mutex(cell_id);
+        let mut meta = meta_ref.lock();
         meta.write = tid.clone();
     }
     fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
@@ -185,7 +178,8 @@ impl DataManager {
         self.tnxs_sorted.lock().remove(tid);
     }
     fn cell_meta_cleanup(&self) {
-        let mut cell_lru = self.cell_lru.lock().clone(); // TODO: Don't clone
+        let mut cell_lru = self.cell_lru.lock();
+        let mut cells = self.cells.lock();
         let mut evicted_cells = Vec::new();
         let oldest_transaction = {
             let tnx_sorted = self.tnxs_sorted.lock();
@@ -197,32 +191,27 @@ impl DataManager {
                 )
         };
         let now = get_time();
+        let mut cell_to_evict = Vec::new();
         let mut need_break = false;
         for (cell_id, timestamp) in cell_lru.iter() {
-            self.cells.alter(*cell_id, |meta| {
-                match meta {
-                    Some(meta) => {
-                        if meta.write < oldest_transaction &&
-                            meta.read < oldest_transaction &&
-                            now - timestamp > 5 * 60 * 1000 {
-                            evicted_cells.push(*cell_id);
-                            return None;
-                        } else {
-                            need_break = true;
-                            return Some(meta)
-                        }
-                    },
-                    None => {
-                        evicted_cells.push(*cell_id);
-                        return None;
-                    }
+            if let Some(cell_meta) = cells.get(cell_id) {
+                let meta = cell_meta.lock();
+                if meta.write < oldest_transaction &&
+                    meta.read < oldest_transaction &&
+                    now - timestamp > 5 * 60 * 1000 {
+                    cell_to_evict.push(*cell_id);
+                } else {
+                    need_break = true;
                 }
-            });
+            } else {
+                cell_to_evict.push(*cell_id);
+            }
             if need_break {
                 break;
             }
         }
         for evicted_cell in &evicted_cells {
+            cells.remove(evicted_cell);
             cell_lru.remove(evicted_cell);
         }
     }
@@ -230,7 +219,8 @@ impl DataManager {
         -> Result<(), Result<DataSiteResponse<TxnExecResult<T, ReadError>>, ()>> where T: Clone{
         self.update_clock(clock);
         let mut txn = self.get_transaction(tid, server_id);
-        let mut meta = self.get_cell_meta(id);
+        let meta_ref = self.cell_meta_mutex(id);
+        let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
         let read_too_late = &meta.write > tid;
         txn.last_activity = get_time();
@@ -289,9 +279,15 @@ impl Service for DataManager {
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state))
         }
-        let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
+
+        let mut cell_mutices = Vec::new();
+        let mut cell_guards = Vec::new();
+
         for cell_id in cell_ids {
-            let mut meta = self.get_cell_meta(cell_id);
+            cell_mutices.push(self.cell_meta_mutex(cell_id));
+        }
+        for cell_mutex in &cell_mutices {
+            let mut meta = cell_mutex.lock();
             if tid < &meta.read { // write too late
                 break;
             }
@@ -302,12 +298,12 @@ impl Service for DataManager {
                     return self.response_with(DMPrepareResult::Wait);
                 }
             }
-            cell_metas.push(meta);
+            cell_guards.push(meta);
         }
-        if cell_metas.len() != cell_ids.len() {
+        if cell_guards.len() != cell_ids.len() {
             return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
-            for mut meta in cell_metas {
+            for mut meta in cell_guards {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
             txn.state = TxnState::Prepared;
@@ -474,30 +470,28 @@ impl Service for DataManager {
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
             }
-            let mut cell_metas: Vec<CellMetaGuard> = Vec::new();
             debug!("AFFECTED: {}, {:?}, {:?}", txn.affected_cells.len(), txn.state, tid);
-            for cell_id in &txn.affected_cells {
-                if let Some(meta) = self.cells.get_mut(cell_id){
-                    cell_metas.push(meta)
-                }
-            }
             let affected_cells = txn.affected_cells.len();
             let mut released_locks = 0;
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
-            for mut meta in cell_metas {
-                if meta.owner == Some(tid.clone()) {
-                    // collect waiting transactions
-                    for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
-                        waiting_list
-                            .entry(*waiting_server_id)
-                            .or_insert_with(|| BTreeSet::new())
-                            .insert(waiting_tid.clone());
+            let cells = self.cells.lock();
+            for cell_id in &txn.affected_cells {
+                if let Some(meta) = cells.get(cell_id){
+                    let mut meta = meta.lock();
+                    if meta.owner == Some(tid.clone()) {
+                        // collect waiting transactions
+                        for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
+                            waiting_list
+                                .entry(*waiting_server_id)
+                                .or_insert_with(|| BTreeSet::new())
+                                .insert(waiting_tid.clone());
+                        }
+                        meta.waiting.clear();
+                        meta.owner = None;
+                        released_locks += 1;
+                    } else {
+                        warn!("affected txn does not own the cell");
                     }
-                    meta.waiting.clear();
-                    meta.owner = None;
-                    released_locks += 1;
-                } else {
-                    warn!("affected txn does not own the cell");
                 }
             }
             let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
