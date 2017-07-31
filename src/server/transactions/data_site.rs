@@ -474,24 +474,33 @@ impl Service for DataManager {
             let affected_cells = txn.affected_cells.len();
             let mut released_locks = 0;
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
-            let cells = self.cells.lock();
-            for cell_id in &txn.affected_cells {
-                if let Some(meta) = cells.get(cell_id){
-                    let mut meta = meta.lock();
-                    if meta.owner == Some(tid.clone()) {
-                        // collect waiting transactions
-                        for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
-                            waiting_list
-                                .entry(*waiting_server_id)
-                                .or_insert_with(|| BTreeSet::new())
-                                .insert(waiting_tid.clone());
-                        }
-                        meta.waiting.clear();
-                        meta.owner = None;
-                        released_locks += 1;
-                    } else {
-                        warn!("affected txn does not own the cell");
+            let mut cell_mutices = Vec::new();
+            let mut cell_guards = Vec::new();
+            {
+                let cells = self.cells.lock();
+                for cell_id in &txn.affected_cells {
+                    if let Some(meta) = cells.get(cell_id){
+                        cell_mutices.push(meta.clone());
                     }
+                }
+            }
+            for cell_mutex in &cell_mutices {
+                cell_guards.push(cell_mutex.lock()); // lock all affected cells on by on
+            }
+            for mut meta in cell_guards {
+                if meta.owner == Some(tid.clone()) {
+                    // collect waiting transactions
+                    for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
+                        waiting_list
+                            .entry(*waiting_server_id)
+                            .or_insert_with(|| BTreeSet::new())
+                            .insert(waiting_tid.clone());
+                    }
+                    meta.waiting.clear();
+                    meta.owner = None;
+                    released_locks += 1;
+                } else {
+                    warn!("affected txn does not own the cell");
                 }
             }
             let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
