@@ -15,6 +15,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) a
 
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
+type TxnMutex = Arc<Mutex<Transaction>>;
 
 #[derive(Debug)]
 pub struct CellMeta {
@@ -48,7 +49,7 @@ impl CellHistory {
 pub struct DataManager {
     cells: Mutex<HashMap<Id, Arc<Mutex<CellMeta>>>>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
-    txns: CHashMap<TxnId, Transaction>,
+    txns: Mutex<HashMap<TxnId, Arc<Mutex<Transaction>>>>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
@@ -79,7 +80,7 @@ impl DataManager {
         let manager = Arc::new(DataManager {
             cells: Mutex::new(HashMap::new()),
             cell_lru: Mutex::new(LinkedHashMap::new()),
-            txns: CHashMap::new(),
+            txns: Mutex::new(HashMap::new()),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
@@ -97,22 +98,16 @@ impl DataManager {
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
-    fn get_transaction(&self, tid: &TxnId, server: &u64) -> WriteGuard<TxnId, Transaction> {
-        self.txns.alter(tid.clone(), |t|{
-            match t {
-                Some(t) => Some(t),
-                None => Some(Transaction {
-                    state: TxnState::Started,
-                    affected_cells: Vec::new(),
-                    last_activity: get_time(),
-                    history: BTreeMap::new(),
-                })
-            }
-        });
-        match self.txns.get_mut(tid) {
-            Some(tnx) => tnx,
-            _ => self.get_transaction(tid, server) // it should be rare
-        }
+    fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
+        let mut txns = self.txns.lock();
+        txns.entry(tid.clone()).or_insert_with(|| {
+            Arc::new(Mutex::new(Transaction {
+                state: TxnState::Started,
+                affected_cells: Vec::new(),
+                last_activity: get_time(),
+                history: BTreeMap::new(),
+            }))
+        }).clone()
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
@@ -174,7 +169,7 @@ impl DataManager {
         Ok(self.managers.get(&server_id).unwrap().clone())
     }
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        self.txns.remove(tid);
+        self.txns.lock().remove(tid);
         self.tnxs_sorted.lock().remove(tid);
     }
     fn cell_meta_cleanup(&self) {
@@ -218,7 +213,8 @@ impl DataManager {
     fn prepare_read<T>(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
         -> Result<(), Result<DataSiteResponse<TxnExecResult<T, ReadError>>, ()>> where T: Clone{
         self.update_clock(clock);
-        let mut txn = self.get_transaction(tid, server_id);
+        let txn_lock = self.get_transaction(tid);
+        let mut txn = txn_lock.lock();
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
@@ -275,7 +271,8 @@ impl Service for DataManager {
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         debug!("PREPARE FOR {:?}, {} cells", tid, cell_ids.len());
         self.update_clock(clock);
-        let mut txn = self.get_transaction(tid, server_id);
+        let txn_lock = self.get_transaction(tid);
+        let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
             return self.response_with(DMPrepareResult::StateError(txn.state))
         }
@@ -315,10 +312,8 @@ impl Service for DataManager {
     fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
               -> Result<DataSiteResponse<DMCommitResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.txns.get_mut(tid) {
-            Some(tnx) => tnx,
-            _ => { return self.response_with(DMCommitResult::CheckFailed(CheckError::NotExisted)); }
-        };
+        let txn_lock = self.get_transaction(tid);
+        let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         // check state
         match txn.state {
@@ -443,10 +438,8 @@ impl Service for DataManager {
     fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
         -> Result<DataSiteResponse<AbortResult>, ()>  {
         self.update_clock(clock);
-        let mut txn = match self.txns.get_mut(tid) {
-            Some(tnx) => tnx,
-            _ => { return self.response_with(AbortResult::CheckFailed(CheckError::NotExisted)); }
-        };
+        let txn_lock = self.get_transaction(tid);
+        let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
@@ -463,10 +456,8 @@ impl Service for DataManager {
         debug!("END {:?}", tid);
         let result = {
             self.update_clock(clock);
-            let txn = match self.txns.get_mut(tid) {
-                Some(tnx) => tnx,
-                _ => { return self.response_with(EndResult::CheckFailed(CheckError::NotExisted)); }
-            };
+            let txn_lock = self.get_transaction(tid);
+            let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
             }
