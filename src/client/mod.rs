@@ -15,7 +15,7 @@ use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::Schema;
 use self::transaction::*;
 
-static TRANSACTION_MAX_RETRY: u32 = 100;
+static TRANSACTION_MAX_RETRY: u32 = 500;
 
 pub mod transaction;
 

@@ -5,13 +5,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use futures;
 use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
-type TxnGuard<'a> = WriteGuard<'a, TxnId, Transaction>;
+type TxnMutex = Arc<Mutex<Transaction>>;
+type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
@@ -34,7 +35,7 @@ struct Transaction {
 }
 
 service! {
-    rpc begin() -> TxnId;
+    rpc begin() -> TxnId | TMError;
     rpc read(tid: TxnId, id: Id) -> TxnExecResult<Cell, ReadError> | TMError;
     rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> TxnExecResult<Vec<Value>, ReadError> | TMError;
     rpc write(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
@@ -50,7 +51,7 @@ service! {
 
 pub struct TransactionManager {
     server: Arc<NebServer>,
-    transactions: CHashMap<TxnId, Transaction>,
+    transactions: RwLock<HashMap<TxnId, TxnMutex>>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager
 }
@@ -60,7 +61,7 @@ impl TransactionManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
         Arc::new(TransactionManager {
             server: server.clone(),
-            transactions: CHashMap::new(),
+            transactions: RwLock::new(HashMap::new()),
             data_sites: CHashMap::new(),
             await_manager: AwaitManager::new()
         })
@@ -95,10 +96,13 @@ impl TransactionManager {
     fn merge_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock)
     }
-    fn get_transaction(&self, tid: &TxnId) -> Result<TxnGuard, TMError> {
-        match self.transactions.get_mut(tid) {
-            Some(tnx) => Ok(tnx),
-            _ => {Err(TMError::TransactionNotFound)}
+    fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
+        let txns = self.transactions.read();
+        match txns.get(tid) {
+            Some(txn) => Ok(txn.clone()),
+            _ => {
+                Err(TMError::TransactionNotFound)
+            }
         }
     }
     fn read_from_site(
@@ -354,23 +358,29 @@ impl TransactionManager {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
-        self.transactions.remove(tid);
+        let mut txn = self.transactions.write();
+        txn.remove(tid);
     }
 }
 
 impl Service for TransactionManager {
-    fn begin(&self) -> Result<TxnId, ()> {
+    fn begin(&self) -> Result<TxnId, TMError> {
         let id = self.server.txn_peer.clock.inc();
-        self.transactions.insert(id.clone(), Transaction {
+        let mut txns = self.transactions.write();
+        if txns.insert(id.clone(), Arc::new(Mutex::new(Transaction {
             start_time: get_time(),
             data: HashMap::new(),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started
-        });
-        Ok(id)
+        }))).is_some() {
+            Err(TMError::TransactionIdExisted)
+        } else {
+            Ok(id)
+        }
     }
     fn read(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let txn = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(tid)?;
+        let txn = txn_mutex.lock();
         self.ensure_rw_state(&txn)?;
         if let Some(data_obj) = txn.data.get(id) {
             match data_obj.cell {
@@ -391,7 +401,8 @@ impl Service for TransactionManager {
         }
     }
     fn read_selected(&self, tid: &TxnId, id: &Id, fields: &Vec<u64>) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
-        let txn = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(tid)?;
+        let txn = txn_mutex.lock();
         self.ensure_rw_state(&txn)?;
         if let Some(data_obj) = txn.data.get(id) {
             match data_obj.cell {
@@ -423,7 +434,8 @@ impl Service for TransactionManager {
         }
     }
     fn write(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let mut txn = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(tid)?;
+        let mut txn = txn_mutex.lock();
         let id = cell.id();
         self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
@@ -452,7 +464,8 @@ impl Service for TransactionManager {
         }
     }
     fn update(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let mut txn = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(tid)?;
+        let mut txn = txn_mutex.lock();
         let id = cell.id();
         self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
@@ -477,7 +490,8 @@ impl Service for TransactionManager {
         }
     }
     fn remove(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let mut txn = self.get_transaction(tid)?;
+        let txn_lock = self.get_transaction(tid)?;
+        let mut txn = txn_lock.lock();
         self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
             Some(server_id) => {
@@ -514,7 +528,8 @@ impl Service for TransactionManager {
     }
     fn prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
         let conclusion = {
-            let mut txn = self.get_transaction(tid)?;
+            let txn_mutex = self.get_transaction(tid)?;
+            let mut txn = txn_mutex.lock();
             let result = {
                 self.ensure_rw_state(&txn)?;
                 self.generate_affected_objs(&mut txn);
@@ -529,12 +544,10 @@ impl Service for TransactionManager {
                             TMPrepareResult::Success
                         },
                         _ => {
-                            self.sites_abort(tid, generated_objs, &data_sites);
                             TMPrepareResult::DMCommitError(sites_commit_result)
                         }
                     }
                 } else {
-                    let _ = self.sites_abort(tid, generated_objs, &data_sites);
                     TMPrepareResult::DMPrepareError(sites_prepare_result)
                 }
             };
@@ -546,15 +559,12 @@ impl Service for TransactionManager {
             }
             result
         };
-        match conclusion {
-            TMPrepareResult::Success => {},
-            _ => {self.cleanup_transaction(tid);}
-        }
         return Ok(conclusion);
     }
     fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {
         let result = {
-            let txn = self.get_transaction(tid)?;
+            let txn_lock = self.get_transaction(tid)?;
+            let txn = txn_lock.lock();
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
             let affected_objs = &txn.affected_objects;
             let data_sites = self.data_sites(affected_objs)?;
@@ -565,7 +575,8 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
-            let txn = self.get_transaction(tid)?; // cause of deadlock with L364(begin)?
+            let txn_lock = self.get_transaction(tid)?; // cause of deadlock with L364(begin)?
+            let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
