@@ -35,7 +35,7 @@ struct Transaction {
 }
 
 service! {
-    rpc begin() -> TxnId;
+    rpc begin() -> TxnId | TMError;
     rpc read(tid: TxnId, id: Id) -> TxnExecResult<Cell, ReadError> | TMError;
     rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> TxnExecResult<Vec<Value>, ReadError> | TMError;
     rpc write(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
@@ -100,7 +100,9 @@ impl TransactionManager {
         let txns = self.transactions.read();
         match txns.get(tid) {
             Some(txn) => Ok(txn.clone()),
-            _ => {Err(TMError::TransactionNotFound)}
+            _ => {
+                Err(TMError::TransactionNotFound)
+            }
         }
     }
     fn read_from_site(
@@ -362,16 +364,19 @@ impl TransactionManager {
 }
 
 impl Service for TransactionManager {
-    fn begin(&self) -> Result<TxnId, ()> {
+    fn begin(&self) -> Result<TxnId, TMError> {
         let id = self.server.txn_peer.clock.inc();
         let mut txns = self.transactions.write();
-        txns.insert(id.clone(), Arc::new(Mutex::new(Transaction {
+        if txns.insert(id.clone(), Arc::new(Mutex::new(Transaction {
             start_time: get_time(),
             data: HashMap::new(),
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started
-        })));
-        Ok(id)
+        }))).is_some() {
+            Err(TMError::TransactionIdExisted)
+        } else {
+            Ok(id)
+        }
     }
     fn read(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
         let txn_mutex = self.get_transaction(tid)?;
@@ -539,12 +544,10 @@ impl Service for TransactionManager {
                             TMPrepareResult::Success
                         },
                         _ => {
-                            self.sites_abort(tid, generated_objs, &data_sites);
                             TMPrepareResult::DMCommitError(sites_commit_result)
                         }
                     }
                 } else {
-                    let _ = self.sites_abort(tid, generated_objs, &data_sites);
                     TMPrepareResult::DMPrepareError(sites_prepare_result)
                 }
             };
@@ -556,10 +559,6 @@ impl Service for TransactionManager {
             }
             result
         };
-        match conclusion {
-            TMPrepareResult::Success => {},
-            _ => {self.cleanup_transaction(tid);}
-        }
         return Ok(conclusion);
     }
     fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {

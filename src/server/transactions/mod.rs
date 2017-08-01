@@ -132,6 +132,7 @@ pub enum TMPrepareResult {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum TMError {
     TransactionNotFound,
+    TransactionIdExisted,
     CannotLocateCellServer,
     RPCErrorFromCellServer,
     AssertionError,
