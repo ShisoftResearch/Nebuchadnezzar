@@ -212,8 +212,9 @@ pub fn multi_transaction() {
     }
     txn.update(&txn_1_id, &cell_1).unwrap().unwrap();
     assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(), // write too late
-    TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable));
-    assert_eq!(txn.commit(&txn_1_id).unwrap().err().unwrap(), TMError::TransactionNotFound);
+               TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable));
+    assert_eq!(txn.commit(&txn_1_id).unwrap().err().unwrap(), // commit need prepared
+               TMError::InvalidTransactionState(TxnState::Started));
     let txn_1_id = txn.begin().unwrap().unwrap();
     txn.update(&txn_1_id, &cell_1).unwrap().unwrap(); // txn_1_id > txn_2_id, realizable
     assert_eq!(txn.prepare(&txn_1_id).unwrap().unwrap(), TMPrepareResult::Success);
