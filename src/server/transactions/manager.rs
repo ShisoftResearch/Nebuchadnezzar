@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use futures;
 use super::*;
@@ -51,7 +51,7 @@ service! {
 
 pub struct TransactionManager {
     server: Arc<NebServer>,
-    transactions: CHashMap<TxnId, TxnMutex>,
+    transactions: RwLock<HashMap<TxnId, TxnMutex>>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager
 }
@@ -61,7 +61,7 @@ impl TransactionManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
         Arc::new(TransactionManager {
             server: server.clone(),
-            transactions: CHashMap::new(),
+            transactions: RwLock::new(HashMap::new()),
             data_sites: CHashMap::new(),
             await_manager: AwaitManager::new()
         })
@@ -97,7 +97,8 @@ impl TransactionManager {
         self.server.txn_peer.clock.merge_with(clock)
     }
     fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
-        match self.transactions.get(tid) {
+        let txns = self.transactions.read();
+        match txns.get(tid) {
             Some(txn) => Ok(txn.clone()),
             _ => {Err(TMError::TransactionNotFound)}
         }
@@ -355,14 +356,16 @@ impl TransactionManager {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
-        self.transactions.remove(tid);
+        let mut txn = self.transactions.write();
+        txn.remove(tid);
     }
 }
 
 impl Service for TransactionManager {
     fn begin(&self) -> Result<TxnId, ()> {
         let id = self.server.txn_peer.clock.inc();
-        self.transactions.insert(id.clone(), Arc::new(Mutex::new(Transaction {
+        let mut txns = self.transactions.write();
+        txns.insert(id.clone(), Arc::new(Mutex::new(Transaction {
             start_time: get_time(),
             data: HashMap::new(),
             affected_objects: AffectedObjs::new(),
