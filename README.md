@@ -1,5 +1,5 @@
 # Nebuchadnezzar
-[![Build Status](https://travis-ci.org/ShisoftResearch/Nebuchadnezzar.svg?branch=master)](https://travis-ci.org/ShisoftResearch/Nebuchadnezzar)
+[![Build Status](https://travis-ci.org/ShisoftResearch/Nebuchadnezzar.svg?branch=develop)](https://travis-ci.org/ShisoftResearch/Nebuchadnezzar)
 > "This is my ship...the Nebuchadnezzar, it's a hovercraft."
 > ― Morpheus, The Matrix
 
