@@ -54,7 +54,7 @@ pub fn general() {
         trans.abort()
     });
     match should_aborted {
-        Err(TxnError::Aborted) => {},
+        Err(TxnError::Aborted(_)) => {},
         _ => panic!("{:?}", should_aborted)
     }
 
