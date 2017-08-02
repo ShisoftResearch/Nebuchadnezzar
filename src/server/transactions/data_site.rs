@@ -410,21 +410,14 @@ impl Service for DataManager {
         }
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
-            let rollback_result = self.rollback(&commit_history);
-            txn.state = TxnState::Aborted; // set to abort so it can't be abort again
-            txn.last_activity = get_time();
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
                     // in this case, we can inform transaction manager to try again
-                    return self.response_with(DMCommitResult::CellChanged(
-                        id, rollback_result
-                    ));
+                    return self.response_with(DMCommitResult::CellChanged(id));
                 }
                 _ => {
                     // other failure due to unfixable error should abort without retry
-                    return self.response_with(DMCommitResult::WriteError(
-                        id, error, rollback_result
-                    ));
+                    return self.response_with(DMCommitResult::WriteError(id, error));
                 }
             }
         } else {
@@ -437,6 +430,7 @@ impl Service for DataManager {
     }
     fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
         -> Result<DataSiteResponse<AbortResult>, ()>  {
+        debug!(">> ABORT {:?}", tid);
         self.update_clock(clock);
         let txn_lock = self.get_transaction(tid);
         let mut txn = txn_lock.lock();
@@ -453,7 +447,7 @@ impl Service for DataManager {
     }
     fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
              -> Result<DataSiteResponse<EndResult>, ()>  {
-        debug!("END {:?}", tid);
+        debug!(">> END {:?}", tid);
         let result = {
             self.update_clock(clock);
             let txn_lock = self.get_transaction(tid);

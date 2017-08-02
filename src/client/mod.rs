@@ -110,6 +110,7 @@ impl Client {
                     if txn.state == txn_server::TxnState::Started {
                         txn_result = txn.prepare();
                     }
+                    debug!("PREPARE STATE: {:?}", txn_result);
                     if txn_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
                         txn_result = txn.commit();
                     }
@@ -119,16 +120,19 @@ impl Client {
                     txn_result = Err(e)
                 }
             }
+            debug!("TXN CONCLUSION: {:?}", txn_result);
             match txn_result {
                 Ok(()) => {
                     return Ok(exec_value.unwrap());
                 },
                 Err(TxnError::NotRealizable) => {
-                    txn.abort();  // continue the loop to retry
+                    let abort_result = txn.abort();  // continue the loop to retry
+                    debug!("TXN NOT REALIZABLE, ABORT: {:?}", abort_result);
                 },
                 Err(e) => {
                     // abort will always be an error to achieve early break
-                    txn.abort();
+                    let abort_result = txn.abort();
+                    debug!("TXN ERROR, ABORT: {:?}", abort_result);
                     return Err(e);
                 }
             }

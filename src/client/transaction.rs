@@ -100,7 +100,7 @@ impl Transaction {
                   (DMPrepareResult::NotRealizable))) =>
                 Err(TxnError::NotRealizable),
             Ok(Ok(TMPrepareResult::DMCommitError(
-                      DMCommitResult::CellChanged(_, _)))) =>
+                      DMCommitResult::CellChanged(_)))) =>
                 Err(TxnError::NotRealizable),
             Ok(Ok(rpr)) => Err(TxnError::PrepareError(rpr)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),

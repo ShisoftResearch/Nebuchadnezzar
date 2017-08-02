@@ -79,8 +79,8 @@ pub enum DMPrepareResult {
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum DMCommitResult {
     Success,
-    WriteError(Id, WriteError, Vec<RollbackFailure>),
-    CellChanged(Id, Vec<RollbackFailure>),
+    WriteError(Id, WriteError),
+    CellChanged(Id),
     CheckFailed(CheckError),
 }
 

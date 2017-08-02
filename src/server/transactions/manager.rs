@@ -292,7 +292,7 @@ impl TransactionManager {
         Ok(DMCommitResult::Success)
     }
     fn sites_abort(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
-                   -> Result<AbortResult, TMError> {
+        -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&self.get_clock(), tid)
@@ -574,6 +574,7 @@ impl Service for TransactionManager {
         return result;
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
+        debug!("TXN ABORT IN MGR {:?}", tid);
         let result = {
             let txn_lock = self.get_transaction(tid)?;
             let txn = txn_lock.lock();
@@ -582,7 +583,7 @@ impl Service for TransactionManager {
                 let data_sites = self.data_sites(changed_objs)?;
                 self.sites_abort(tid, changed_objs, &data_sites) // with end
             } else {
-                Err(TMError::InvalidTransactionState(txn.state))
+                Ok(AbortResult::Success(None))
             }
         };
         self.cleanup_transaction(tid);
