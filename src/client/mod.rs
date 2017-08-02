@@ -109,10 +109,11 @@ impl Client {
                 Ok(val) => {
                     if txn.state == txn_server::TxnState::Started {
                         txn_result = txn.prepare();
+                        debug!("PREPARE STATE: {:?}", txn_result);
                     }
-                    debug!("PREPARE STATE: {:?}", txn_result);
                     if txn_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
                         txn_result = txn.commit();
+                        debug!("COMMIT STATE: {:?}", txn_result);
                     }
                     exec_value = Some(val);
                 },

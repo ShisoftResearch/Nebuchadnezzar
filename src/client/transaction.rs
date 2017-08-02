@@ -15,7 +15,7 @@ pub enum TxnError {
     NotRealizable,
     TooManyRetry,
     InternalError,
-    Aborted,
+    Aborted(Option<Vec<RollbackFailure>>),
     RPCError(RPCError),
     ManagerError(TMError),
     ReadError(ReadError),
@@ -121,7 +121,8 @@ impl Transaction {
         if self.state == TxnState::Aborted {return Ok(());}
         self.state = TxnState::Aborted;
         match self.client.abort(&self.tid) {
-            Ok(Ok(AbortResult::Success(_))) => Err(TxnError::Aborted),
+            Ok(Ok(AbortResult::Success(rollback_failures)))
+                => Err(TxnError::Aborted(rollback_failures)),
             Ok(Ok(ar)) => Err(TxnError::AbortError(ar)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e))

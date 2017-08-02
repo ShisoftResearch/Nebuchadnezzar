@@ -32,6 +32,7 @@ struct Transaction {
     history: CommitHistory
 }
 
+#[derive(Debug)]
 struct CellHistory {
     cell: Option<Cell>,
     current_version: u64
@@ -132,6 +133,7 @@ impl DataManager {
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures: Vec<RollbackFailure> = Vec::new();
         for (id, history) in history.iter() {
+            debug!("ROLLING BACK {:?} - {:?}", id, history);
             let cell = &history.cell;
             let current_ver = history.current_version;
             let error = if cell.is_none() { // the cell was created, need to remove
@@ -330,84 +332,87 @@ impl Service for DataManager {
                 DMCommitResult::CheckFailed(
                     CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num)))
         }
-        let mut commit_history: CommitHistory = BTreeMap::new(); // for rollback in case of write error
         let mut write_error: Option<(Id, WriteError)> = None;
-        for cell_op in cells {
-            match cell_op {
-                &CommitOp::Read(id, version) => {}
-                &CommitOp::Write(ref cell) => {
-                    let mut cell = cell.clone();
-                    let write_result = self.server.chunks.write_cell(&mut cell);
-                    match write_result {
-                        Ok(header) => {
-                            commit_history.insert(cell.id(), CellHistory::new(None, header.version));
-                            self.update_cell_write(&cell.id(), tid);
-                        },
-                        Err(error) => {
-                            write_error = Some((cell.id(), error));
-                            break;
-                        }
-                    };
-                },
-                &CommitOp::Remove(ref cell_id) => {
-                    let original_cell  = {
-                        match self.server.chunks.read_cell(cell_id) {
-                            Ok(cell) => cell,
-                            Err(re) => {
-                                write_error = Some((*cell_id, WriteError::ReadError(re)));
+        {
+            let mut commit_history = &mut txn.history; // for rollback in case of write error
+            for cell_op in cells {
+                match cell_op {
+                    &CommitOp::Read(id, version) => {}
+                    &CommitOp::Write(ref cell) => {
+                        let mut cell = cell.clone();
+                        let write_result = self.server.chunks.write_cell(&mut cell);
+                        match write_result {
+                            Ok(header) => {
+                                commit_history.insert(cell.id(), CellHistory::new(None, header.version));
+                                self.update_cell_write(&cell.id(), tid);
+                            },
+                            Err(error) => {
+                                write_error = Some((cell.id(), error));
+                                break;
+                            }
+                        };
+                    },
+                    &CommitOp::Remove(ref cell_id) => {
+                        let original_cell  = {
+                            match self.server.chunks.read_cell(cell_id) {
+                                Ok(cell) => cell,
+                                Err(re) => {
+                                    write_error = Some((*cell_id, WriteError::ReadError(re)));
+                                    break;
+                                }
+                            }
+                        };
+                        let write_result = self.server.chunks.remove_cell_by(cell_id, |cell|{
+                            let version = cell.header.version;
+                            version == original_cell.header.version
+                        });
+                        match write_result {
+                            Ok(()) => {
+                                commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
+                                self.update_cell_write(cell_id, tid);
+                            },
+                            Err(error) => {
+                                write_error = Some((*cell_id, error));
                                 break;
                             }
                         }
-                    };
-                    let write_result = self.server.chunks.remove_cell_by(cell_id, |cell|{
-                        let version = cell.header.version;
-                        version == original_cell.header.version
-                    });
-                    match write_result {
-                        Ok(()) => {
-                            commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
-                            self.update_cell_write(cell_id, tid);
-                        },
-                        Err(error) => {
-                            write_error = Some((*cell_id, error));
-                            break;
-                        }
-                    }
-                },
-                &CommitOp::Update(ref cell) => {
-                    let cell_id = cell.id();
-                    let original_cell = {
-                        match self.server.chunks.read_cell(&cell_id) {
-                            Ok(cell) => cell,
-                            Err(re) => {
-                                write_error = Some((cell_id, WriteError::ReadError(re)));
+                    },
+                    &CommitOp::Update(ref cell) => {
+                        let cell_id = cell.id();
+                        let original_cell = {
+                            match self.server.chunks.read_cell(&cell_id) {
+                                Ok(cell) => cell,
+                                Err(re) => {
+                                    write_error = Some((cell_id, WriteError::ReadError(re)));
+                                    break;
+                                }
+                            }
+                        };
+                        let write_result = self.server.chunks.update_cell_by(&cell_id, |cell_to_update| {
+                            if cell_to_update.header.version == original_cell.header.version {
+                                Some(cell.clone())
+                            } else {
+                                None
+                            }
+                        });
+                        match write_result {
+                            Ok(cell) => {
+                                commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
+                                self.update_cell_write(&cell_id, tid);
+                            },
+                            Err(error) => {
+                                write_error = Some((cell_id, error));
                                 break;
                             }
                         }
-                    };
-                    let write_result = self.server.chunks.update_cell_by(&cell_id, |cell_to_update| {
-                        if cell_to_update.header.version == original_cell.header.version {
-                            Some(cell.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    match write_result {
-                        Ok(cell) => {
-                            commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
-                            self.update_cell_write(&cell_id, tid);
-                        },
-                        Err(error) => {
-                            write_error = Some((cell_id, error));
-                            break;
-                        }
+                    },
+                    &CommitOp::None => {
+                        panic!("None CommitOp should not appear in data site");
                     }
-                },
-                &CommitOp::None => {
-                    panic!("None CommitOp should not appear in data site");
                 }
             }
         }
+        txn.last_activity = get_time();
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
             match error {
@@ -423,8 +428,6 @@ impl Service for DataManager {
         } else {
             // all set, able to commit
             txn.state = TxnState::Committed;
-            txn.history = commit_history;
-            txn.last_activity = get_time();
             return self.response_with(DMCommitResult::Success)
         }
     }
@@ -438,6 +441,7 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
         let rollback_failures = {
+            debug!(">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}", txn.history.len(), tid);
             let failures = self.rollback(&txn.history);
             if failures.len() == 0 { None } else { Some(failures) }
         };

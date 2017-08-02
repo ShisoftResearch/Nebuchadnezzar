@@ -318,7 +318,7 @@ impl TransactionManager {
                 Err(_) => {return Err(TMError::AssertionError)}
             }
         }
-        self.sites_end(tid, changed_objs, &data_sites);
+        self.sites_end(tid, changed_objs, &data_sites)?;
         Ok(AbortResult::Success(
             if rollback_failures.is_empty()
                 {None} else {Some(rollback_failures)}
@@ -581,6 +581,7 @@ impl Service for TransactionManager {
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
+                debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
                 self.sites_abort(tid, changed_objs, &data_sites) // with end
             } else {
                 Ok(AbortResult::Success(None))
