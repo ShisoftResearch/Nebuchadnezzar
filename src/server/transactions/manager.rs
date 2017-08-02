@@ -179,7 +179,7 @@ impl TransactionManager {
         for (id, data_obj) in &txn.data {
             affected_objs.entry(data_obj.server).or_insert_with(|| BTreeMap::new()).insert(*id, data_obj.clone());
         }
-        txn.data.clear(); // clean up data after transfered to changed/
+        txn.data.clear(); // clean up data after transferred to changed
         txn.affected_objects = affected_objs;
     }
     fn data_sites(&self, changed_objs: &AffectedObjs) -> Result<DataSiteClients, TMError>  {
@@ -575,7 +575,7 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
         let result = {
-            let txn_lock = self.get_transaction(tid)?; // cause of deadlock with L364(begin)?
+            let txn_lock = self.get_transaction(tid)?;
             let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
