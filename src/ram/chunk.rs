@@ -76,17 +76,22 @@ impl Chunk {
         return &self.segs[seg_id];
     }
     pub fn location_for_read<'a>(&self, hash: u64)
-        -> Option<CellReadGuard> {
+        -> Result<CellReadGuard, ReadError> {
         match self.index.get(&hash) {
             Some(index) => {
                 if *index == 0 {
-                    return None
+                    return Err(ReadError::CellDoesNotExisted)
                 }
-                return Some(index);
+                return Ok(index);
             },
-            None => None
+            None => if hash == 0 {
+                Err(ReadError::CellIdIsUnitId)
+            } else {
+                Err(ReadError::CellDoesNotExisted)
+            }
         }
     }
+
     pub fn location_for_write(&self, hash: u64)
         -> Option<CellWriteGuard> {
         match self.index.get_mut(&hash) {
@@ -105,55 +110,37 @@ impl Chunk {
         seg.put_frag(location);
     }
     fn head_cell(&self, hash: u64) -> Result<Header, ReadError> {
-        match self.location_for_read(hash) {
-            Some(loc) => {
-                Cell::header_from_chunk_raw(*loc)
-            },
-            None => Err(ReadError::CellDoesNotExisted)
-        }
+        Cell::header_from_chunk_raw(*self.location_for_read(hash)?)
     }
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
-        match self.location_for_read(hash) {
-            Some(loc) => {
-                Cell::from_chunk_raw(*loc, self)
-            },
-            None => Err(ReadError::CellDoesNotExisted)
-        }
+        Cell::from_chunk_raw(*self.location_for_read(hash)?, self)
     }
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
-        match self.location_for_read(hash) {
-            Some(loc) => {
-                let selected_data = Cell::select_from_chunk_raw(*loc, self, fields)?;
-                let mut result = Vec::with_capacity(fields.len());
-                match selected_data {
-                    Value::Map(map) => {
-                        for field_id in fields {
-                            result.push(map.get_by_key_id(*field_id).clone())
-                        }
-                        return Ok(result)
-                    },
-                    _ => Err(ReadError::CellTypeIsNotMapForSelect)
+        let loc = self.location_for_read(hash)?;
+        let selected_data = Cell::select_from_chunk_raw(*loc, self, fields)?;
+        let mut result = Vec::with_capacity(fields.len());
+        match selected_data {
+            Value::Map(map) => {
+                for field_id in fields {
+                    result.push(map.get_by_key_id(*field_id).clone())
                 }
+                return Ok(result)
             },
-            None => Err(ReadError::CellDoesNotExisted)
+            _ => Err(ReadError::CellTypeIsNotMapForSelect)
         }
     }
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
-        match self.location_for_read(hash) {
-            Some(loc) => {
-                let mut head_ptr = *loc + offset;
-                let mut data = Vec::with_capacity(len);
-                for ptr in head_ptr..(head_ptr + len) {
-                    data.push(unsafe {(*(ptr as *const u8))});
-                }
-                Ok(data.to_vec())
-            },
-            None => Err(ReadError::CellDoesNotExisted)
+        let loc = self.location_for_read(hash)?;
+        let mut head_ptr = *loc + offset;
+        let mut data = Vec::with_capacity(len);
+        for ptr in head_ptr..(head_ptr + len) {
+            data.push(unsafe {(*(ptr as *const u8))});
         }
+        Ok(data.to_vec())
     }
     fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
-        if self.location_for_read(hash).is_some() {
+        if self.location_for_read(hash).is_ok() {
             return Err(WriteError::CellAlreadyExisted);
         } else {
             let loc = cell.write_to_chunk(self)?;
@@ -308,9 +295,9 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
-    pub fn location_for_read(&self, key: &Id) -> Option<CellReadGuard> {
+    pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.location_for_read(hash);
+        chunk.location_for_read(hash)
     }
     pub fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
