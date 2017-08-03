@@ -10,4 +10,4 @@ Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure v
 
 Copyright © 2017 Shisoft Research
 
-Distributed under the Eclipse Public License either version 1.0 or BSD any later version.
+Distributed under the GNU Lesser General Public License v3.0 or any later version.
