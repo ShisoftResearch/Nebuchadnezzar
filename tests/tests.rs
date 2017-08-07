@@ -3,6 +3,8 @@
 
 #[macro_use]
 extern crate neb;
+#[macro_use]
+extern crate dovahkiin;
 
 mod chunk;
 mod types;
