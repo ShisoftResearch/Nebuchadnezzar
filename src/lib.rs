@@ -14,7 +14,7 @@ extern crate lazy_static;
 extern crate bifrost;
 extern crate bifrost_hasher;
 #[macro_use]
-extern crate dovahkiin;
+pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;
 
@@ -27,8 +27,6 @@ extern crate futures;
 extern crate linked_hash_map;
 extern crate libc;
 extern crate chashmap;
-
-pub use dovahkiin;
 
 pub mod utils;
 #[macro_use]
