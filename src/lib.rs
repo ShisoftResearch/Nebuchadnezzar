@@ -28,6 +28,8 @@ extern crate linked_hash_map;
 extern crate libc;
 extern crate chashmap;
 
+pub use dovahkiin;
+
 pub mod utils;
 #[macro_use]
 pub mod ram;
