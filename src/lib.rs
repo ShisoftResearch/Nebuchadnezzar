@@ -5,6 +5,7 @@
 #![plugin(bifrost_plugins)]
 #![feature(conservative_impl_trait)]
 #![feature(exact_size_is_empty)]
+#![feature(macro_reexport)]
 
 #[macro_use]
 extern crate log;
@@ -14,6 +15,7 @@ extern crate lazy_static;
 extern crate bifrost;
 extern crate bifrost_hasher;
 #[macro_use]
+#[macro_reexport(data_map)]
 pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;
