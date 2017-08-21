@@ -6,6 +6,7 @@
 #![feature(conservative_impl_trait)]
 #![feature(exact_size_is_empty)]
 #![feature(macro_reexport)]
+#![feature(integer_atomics)]
 
 #[macro_use]
 extern crate log;
