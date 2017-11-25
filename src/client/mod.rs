@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::io;
+use std::cell::{Cell as StdCell};
 use bifrost::conshash::{ConsistentHashing, CHError};
 use bifrost::raft::client::{RaftClient, ClientError};
 use bifrost::raft;
@@ -80,7 +81,7 @@ impl Client {
         client.remove_cell(id)
     }
     pub fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
-        where TFN: Fn(&mut Transaction) -> Result<TR, TxnError> {
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError> {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
@@ -96,22 +97,21 @@ impl Client {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin)
             };
-            let mut txn = Transaction{
+            let txn = Transaction{
                 tid: txn_id,
-                state: txn_server::TxnState::Started,
+                state: StdCell::new(txn_server::TxnState::Started),
                 client: txn_client.clone(),
-                changes: 0
             };
-            let exec_result = func(&mut txn);
+            let exec_result = func(&txn);
             let mut exec_value = None;
             let mut txn_result = Ok(());
             match exec_result {
                 Ok(val) => {
-                    if txn.state == txn_server::TxnState::Started {
+                    if txn.state.get() == txn_server::TxnState::Started {
                         txn_result = txn.prepare();
                         debug!("PREPARE STATE: {:?}", txn_result);
                     }
-                    if txn_result.is_ok() && txn.state == txn_server::TxnState::Prepared {
+                    if txn_result.is_ok() && txn.state.get() == txn_server::TxnState::Prepared {
                         txn_result = txn.commit();
                         debug!("COMMIT STATE: {:?}", txn_result);
                     }

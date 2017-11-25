@@ -1,7 +1,7 @@
 use ram::schema::{Schema, Field};
 use ram::chunk::Chunk;
 use ram::io::{reader, writer};
-use ram::types::{Map, Value, Id};
+use ram::types::{Map, Value, Id, RandValue};
 use std::sync::Arc;
 use std::ops::{Index, IndexMut};
 use std::ptr;

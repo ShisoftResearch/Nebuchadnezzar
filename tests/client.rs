@@ -163,7 +163,6 @@ pub fn multi_cell_update() {
                 cell_2.data = Value::Map(data_2);
                 txn.update(&cell_1)?;
                 txn.update(&cell_2)?;
-                assert_eq!(txn.changes, 4);
                 Ok(())
             }).unwrap();
         }));

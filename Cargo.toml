@@ -20,6 +20,7 @@ bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develo
 #bifrost_plugins = { path = "../bifrost/src/plugins" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 #bifrost_hasher = { path = "../bifrost/src/hasher" }
+dovahkiin = { git = "https://github.com/ShisoftResearch/Dovahkiin", branch = "develop" }
 serde = "*"
 serde_derive = "*"
 bincode = "*"
