@@ -154,7 +154,7 @@ impl NebServer {
         }
         let conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
         let meta_rc = Arc::new(ServerMeta {
-            schemas: schemas
+            schemas
         });
         let chunks = Chunks::new(
             opt.chunk_count,
@@ -163,13 +163,13 @@ impl NebServer {
             opt.backup_storage.clone(),
         );
         let server = Arc::new(NebServer {
-            chunks: chunks,
+            chunks,
             meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing,
             member_pool: rpc::ClientPool::new(),
             txn_peer: transactions::Peer::new(server_addr),
-            raft_service: raft_service,
+            raft_service,
             server_id: rpc_server.server_id
         });
         rpc_server.register_service(
