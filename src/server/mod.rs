@@ -154,8 +154,6 @@ impl NebServer {
         server_addr: &String,
         rpc_server: &Arc<rpc::Server>,
     ) -> Result<Arc<NebServer>, ServerError> {
-        let mut opts = opts.clone();
-        opts.group_name = format!("neb_{}", opts.group_name);
         let mut raft_service = None;
         if opts.is_meta {
             raft_service = Some(NebServer::load_meta_server(&opts, &rpc_server)?);
