@@ -140,27 +140,35 @@ impl NebServer {
             }
         }
     }
-    pub fn new(opt: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
-        let server_addr = if opt.standalone {&STANDALONE_ADDRESS_STRING} else {&opt.address};
+    pub fn new_from_opts(opts: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
+        let server_addr = if opts.standalone {&STANDALONE_ADDRESS_STRING} else {&opts.address};
         let rpc_server = rpc::Server::new(server_addr);
-        let mut schemas = SchemasServer::new(&opt.group_name, None).unwrap();
-        let mut raft_service = None;
         rpc::Server::listen_and_resume(&rpc_server);
-        if opt.is_meta {
-            raft_service = Some(NebServer::load_meta_server(&opt, &rpc_server)?);
+        return NebServer::new(opts, server_addr, &rpc_server)
+    }
+    pub fn new(
+        opts: &ServerOptions,
+        server_addr: &String,
+        rpc_server: &Arc<rpc::Server>,
+    ) -> Result<Arc<NebServer>, ServerError> {
+        let mut raft_service = None;
+        if opts.is_meta {
+            raft_service = Some(NebServer::load_meta_server(&opts, &rpc_server)?);
         }
-        if !opt.is_meta && opt.standalone {
+        if !opts.is_meta && opts.standalone {
             return Err(ServerError::StandaloneMustAlsoBeMetaServer)
         }
-        let conshasing = NebServer::load_cluster_clients(&opt, &mut schemas, &rpc_server)?;
+        let mut schemas = SchemasServer::new(&opts.group_name, None).unwrap();
+        let conshasing =
+            NebServer::load_cluster_clients(&opts, &mut schemas, &rpc_server)?;
         let meta_rc = Arc::new(ServerMeta {
             schemas
         });
         let chunks = Chunks::new(
-            opt.chunk_count,
-            opt.memory_size,
+            opts.chunk_count,
+            opts.memory_size,
             meta_rc.clone(),
-            opt.backup_storage.clone(),
+            opts.backup_storage.clone(),
         );
         let server = Arc::new(NebServer {
             chunks,
@@ -177,8 +185,8 @@ impl NebServer {
             &cell_rpc::NebRPCService::new(&server)
         );
         rpc_server.register_service(
-           transactions::manager::DEFAULT_SERVICE_ID,
-           &transactions::manager::TransactionManager::new(&server)
+            transactions::manager::DEFAULT_SERVICE_ID,
+            &transactions::manager::TransactionManager::new(&server)
         );
         rpc_server.register_service(
             transactions::data_site::DEFAULT_SERVICE_ID,

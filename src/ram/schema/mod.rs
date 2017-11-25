@@ -35,8 +35,8 @@ impl Schema {
                     .collect())             // field list into field ids
             },
             str_key_field: key_field,
-            fields: fields,
-            is_dynamic: is_dynamic
+            fields,
+            is_dynamic
         }
     }
     pub fn new_with_id<'a>(id: u32, name: &'a str, key_field: Option<Vec<String>>, fields: Field, dynamic: bool) -> Schema {
@@ -67,10 +67,10 @@ impl Field {
         Field {
             name: name.to_string(),
             name_id: types::key_hash(name),
-            type_id: type_id,
-            nullable: nullable,
-            is_array: is_array,
-            sub_fields: sub_fields
+            type_id,
+            nullable,
+            is_array,
+            sub_fields
         }
     }
 }
@@ -115,10 +115,7 @@ impl SchemasServer {
             },
             None => None
         };
-        let schemas = SchemasServer {
-            map: map,
-            sm: sm
-        };
+        let schemas = SchemasServer { map, sm };
         return Ok(schemas);
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {

@@ -17,7 +17,7 @@ use super::*;
 pub fn general() {
     let server_group = "general_test";
     let server_addr = String::from("127.0.0.1:5400");
-    let server = NebServer::new(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -104,7 +104,7 @@ pub fn general() {
 pub fn multi_cell_update() {
     let server_group = "multi_cell_update_test";
     let server_addr = String::from("127.0.0.1:5401");
-    let server = NebServer::new(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -181,7 +181,7 @@ pub fn multi_cell_update() {
 pub fn write_skew() {
     let server_group = "write_skew_test";
     let server_addr = String::from("127.0.0.1:5402");
-    let server = NebServer::new(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -266,7 +266,7 @@ pub fn server_isolation() {
     let server_address_1 = "127.0.0.1:5403";
     let server_address_2 = "127.0.0.1:5404";
 
-    let server_1 = NebServer::new(&ServerOptions {
+    let server_1 = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
@@ -281,7 +281,7 @@ pub fn server_isolation() {
         &server_1.rpc, &vec!(server_address_1.to_string()),
         server_1_group).unwrap());
 
-    let server_2 = NebServer::new(&ServerOptions {
+    let server_2 = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         standalone: false,
