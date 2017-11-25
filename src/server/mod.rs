@@ -94,7 +94,7 @@ impl NebServer {
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
         match member_service.join_group(&opt.group_name) {
-            Ok(_) => {Ok(())},
+            Ok(_) => Ok(()),
             Err(e) => {
                 error!("Cannot join cluster group");
                 Err(ServerError::CannotJoinClusterGroup(e))
@@ -118,10 +118,13 @@ impl NebServer {
             }
         }
     }
-    fn load_cluster_clients
-    (opt: &ServerOptions, schemas: &mut SchemasServer, rpc_server: &Arc<rpc::Server>)
-     -> Result<Arc<ConsistentHashing>, ServerError>{
-        let raft_client = RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
+    fn load_cluster_clients (
+        opt: &ServerOptions,
+        schemas: &mut SchemasServer,
+        rpc_server: &Arc<rpc::Server>
+    ) -> Result<Arc<ConsistentHashing>, ServerError> {
+        let raft_client =
+            RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
         match raft_client {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(rpc_server);
