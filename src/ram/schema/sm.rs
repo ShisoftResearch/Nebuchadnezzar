@@ -16,7 +16,7 @@ pub fn generate_sm_id<'a>(group: &'a str) -> u64 {
 
 pub struct SchemasSM {
     callback: SMCallback,
-    map: Arc<RwLock<SchemasMap>>,
+    map: SchemasMap,
     sm_id: u64
 }
 
@@ -32,50 +32,39 @@ raft_state_machine! {
 
 impl StateMachineCmds for SchemasSM {
     fn get_all(&self) -> Result<Vec<Schema>, ()> {
-        let m = self.map.read();
-        Ok(m.get_all())
+        Ok(self.map.get_all())
     }
     fn get(&self, id: u32) -> Result<Option<Schema>, ()> {
-        let m = self.map.read();
-        Ok(m.get(&id).map(
-            |r: Arc<Schema>| -> Schema {
+        Ok(self.map.get(&id).map(
+            |r| -> Schema {
                 let borrow: &Schema = r.borrow();
                 borrow.clone()
             }
         ))
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), NotifyError> {
-        {
-            let mut map = self.map.write();
-            map.new_schema(schema.clone());
-        }
+        self.map.new_schema(schema.clone());
         self.callback.notify(&commands::on_schema_added::new(), Ok(schema))?;
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), NotifyError> {
-        {
-            let mut map = self.map.write();
-            map.del_schema(&name);
-        }
+        self.map.del_schema(&name);
         self.callback.notify(&commands::on_schema_deleted::new(), Ok(name))?;
         Ok(())
     }
     fn next_id(&mut self) -> Result<u32, ()> {
-        let mut map = self.map.write();
-        Ok(map.next_id())
+        Ok(self.map.next_id())
     }
 }
 
 impl StateMachineCtl for SchemasSM {
     raft_sm_complete!();
     fn snapshot(&self) -> Option<Vec<u8>> {
-        let map = self.map.read();
-        Some(bincode::serialize(&map.get_all()))
+        Some(bincode::serialize(&self.map.get_all()))
     }
     fn recover(&mut self, data: Vec<u8>) {
         let schemas: Vec<Schema> = bincode::deserialize(&data);
-        let mut map = self.map.write();
-        map.load_from_list(&schemas);
+        self.map.load_from_list(&schemas);
     }
     fn id(&self) -> u64 {self.sm_id }
 }
@@ -85,8 +74,8 @@ impl SchemasSM {
         let sm_id = generate_sm_id(group);
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()),
-            map: Arc::new(RwLock::new(SchemasMap::new())),
-            sm_id: sm_id
+            map: SchemasMap::new(),
+            sm_id
         }
     }
 }
