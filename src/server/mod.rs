@@ -198,7 +198,7 @@ impl NebServer {
         Ok(server)
     }
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
-        if let Some(server_id) = self.consh.get_by_server_id(id.higher) {
+        if let Some(server_id) = self.consh.get_server_id(id.higher) {
             Some(server_id)
         } else {
             None
