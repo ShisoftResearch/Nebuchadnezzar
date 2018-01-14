@@ -143,7 +143,3 @@ pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServic
     let client = DEFAULT_CLIENT_POOL.get(address)?;
     Ok(manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
 }
-pub fn new_client(address: &String) -> io::Result<Arc<manager::SyncServiceClient>> {
-    let client = DEFAULT_CLIENT_POOL.get(address)?;
-    Ok(manager::SyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
-}

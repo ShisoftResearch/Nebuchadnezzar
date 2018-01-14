@@ -7,7 +7,6 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
-use futures_cpupool::CpuPool;
 use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
@@ -53,8 +52,7 @@ pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: RwLock<HashMap<TxnId, TxnMutex>>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
-    await_manager: AwaitManager,
-    pool: CpuPool
+    await_manager: AwaitManager
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
@@ -64,8 +62,7 @@ impl TransactionManager {
             server: server.clone(),
             transactions: RwLock::new(HashMap::new()),
             data_sites: CHashMap::new(),
-            await_manager: AwaitManager::new(),
-            pool: CpuPool::new_num_cpus(),
+            await_manager: AwaitManager::new()
         })
     }
 }
@@ -200,7 +197,7 @@ impl TransactionManager {
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> Box<futures::Future<Item =DMPrepareResult, Error = TMError>> {
+    ) -> Box<Future<Item = DMPrepareResult, Error = TMError>> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
@@ -375,9 +372,9 @@ impl Service for TransactionManager {
             affected_objects: AffectedObjs::new(),
             state: TxnState::Started
         }))).is_some() {
-            Err(TMError::TransactionIdExisted)
+            box future::err(TMError::TransactionIdExisted)
         } else {
-            Ok(id)
+            box future::ok(id)
         }
     }
     fn read(&self, tid: TxnId, id: Id)

@@ -14,6 +14,9 @@ use ram::cell::{Cell, Header, ReadError, WriteError};
 use ram::schema::{sm as schema_sm};
 use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::Schema;
+
+use futures::Future;
+
 use self::transaction::*;
 
 static TRANSACTION_MAX_RETRY: u32 = 500;
@@ -26,20 +29,20 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError)
 }
 
-pub struct Client {
+pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient
 }
 
-impl Client {
-    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str) -> Result<Client, NebClientError> {
+impl AsyncClient {
+    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str) -> Result<AsyncClient, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server);
                 assert!(RaftClient::can_callback());
                 match ConsistentHashing::new_client(group, &raft_client) {
-                    Ok(chash) => Ok(Client {
+                    Ok(chash) => Ok(AsyncClient {
                         conshash: chash,
                         raft_client: raft_client.clone(),
                         schema_client: SchemaClient::new(schema_sm::generate_sm_id(group), &raft_client)
@@ -56,15 +59,15 @@ impl Client {
             None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, "cannot locate")))
         }
     }
-    pub fn locate_plain_server(&self, id: &Id) -> Result<Arc<plain_server::SyncServiceClient>, RPCError> {
+    pub fn locate_plain_server(&self, id: &Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
         let address = self.locate_server_address(id)?;
         let client = match DEFAULT_CLIENT_POOL.get(&address) {
             Ok(c) => c,
             Err(e) => return Err(RPCError::IOError(e))
         };
-        Ok(plain_server::SyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
+        Ok(plain_server::AsyncServiceClient::new_async(plain_server::DEFAULT_SERVICE_ID, &client))
     }
-    pub fn read_cell(&self, id: &Id) -> Result<Result<Cell, ReadError>, RPCError> {
+    pub fn read_cell(&self, id: &Id) -> impl Future<Item = Result<Cell, ReadError>, Error = RPCError> {
         let client = self.locate_plain_server(id)?;
         client.read_cell(id)
     }

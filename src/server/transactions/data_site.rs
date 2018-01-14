@@ -206,7 +206,7 @@ impl DataManager {
             } else {
                 cell_to_evict.push(*cell_id);
             }
-            if need_breself.pool.spawn_fnak {
+            if need_break {
                 break;
             }
         }

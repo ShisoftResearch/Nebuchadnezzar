@@ -24,12 +24,12 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id)
         -> Box<Future<Item = Cell, Error = ReadError>>
     {
-        self.pool.spawn_fn(|| self.server.chunks.read_cell(&key))
+        box self.pool.spawn_fn(|| self.server.chunks.read_cell(&key))
     }
     fn write_cell(&self, mut cell: Cell)
         -> Box<Future<Item = Header, Error = WriteError>>
     {
-        self.pool.spawn_fn(||
+        box self.pool.spawn_fn(||
             match self.server.chunks.write_cell(&mut cell) {
                 Ok(header) => Ok(header),
                 Err(e) => Err(e)
@@ -39,7 +39,7 @@ impl Service for NebRPCService {
     fn update_cell(&self, mut cell: Cell)
         -> Box<Future<Item = Header, Error = WriteError>>
     {
-        self.pool.spawn_fn(||
+        box self.pool.spawn_fn(||
             match self.server.chunks.update_cell(&mut cell) {
                 Ok(header) => Ok(header),
                 Err(e) => Err(e)
@@ -49,7 +49,7 @@ impl Service for NebRPCService {
     fn remove_cell(&self, key: Id)
         -> Box<Future<Item = (), Error = WriteError>>
     {
-        self.pool.spawn_fn(||self.server.chunks.remove_cell(&key))
+        box self.pool.spawn_fn(||self.server.chunks.remove_cell(&key))
     }
 }
 

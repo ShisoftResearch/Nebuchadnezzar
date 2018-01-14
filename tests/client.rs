@@ -36,7 +36,7 @@ pub fn general() {
         fields: default_fields(),
         is_dynamic: false
     };
-    let client = Arc::new(client::Client::new(
+    let client = Arc::new(client::AsyncClient::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
     client.new_schema(&mut schema).unwrap();
@@ -123,7 +123,7 @@ pub fn multi_cell_update() {
         fields: default_fields(),
         is_dynamic: false
     };
-    let client = Arc::new(client::Client::new(
+    let client = Arc::new(client::AsyncClient::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
     let thread_count = 100;
@@ -200,7 +200,7 @@ pub fn write_skew() {
         fields: default_fields(),
         is_dynamic: false
     };
-    let client = Arc::new(client::Client::new(
+    let client = Arc::new(client::AsyncClient::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
     let thread_count = 100;
@@ -277,7 +277,7 @@ pub fn server_isolation() {
         meta_storage: None,
         group_name: server_1_group.to_string(),
     }).unwrap();
-    let client1 = Arc::new(client::Client::new(
+    let client1 = Arc::new(client::AsyncClient::new(
         &server_1.rpc, &vec!(server_address_1.to_string()),
         server_1_group).unwrap());
 
@@ -292,7 +292,7 @@ pub fn server_isolation() {
         meta_storage: None,
         group_name: String::from(server_2_group),
     }).unwrap();
-    let client2 = Arc::new(client::Client::new(
+    let client2 = Arc::new(client::AsyncClient::new(
         &server_2.rpc, &vec!(server_address_2.to_string()),
         server_2_group).unwrap());
 
