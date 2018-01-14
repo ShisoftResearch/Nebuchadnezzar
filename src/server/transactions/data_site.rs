@@ -41,7 +41,7 @@ struct CellHistory {
 impl CellHistory {
     pub fn new (cell: Option<Cell>, current_ver: u64) -> CellHistory {
         CellHistory {
-            cell: cell,
+            cell,
             current_version: current_ver,
         }
     }
@@ -85,7 +85,7 @@ impl DataManager {
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: CHashMap::new(),
             server: server.clone(),
-            cleanup_sender: Mutex::new(cleaup_sender)
+            cleanup_sender: Mutex::new(cleaup_sender),
         });
         let manager_clone = manager.clone();
         thread::spawn(move || { //TODO: give way to shutdown
@@ -127,8 +127,10 @@ impl DataManager {
         }).clone()
     }
     fn response_with<T>(&self, data: T)
-        -> Result<DataSiteResponse<T>, ()>{
-        Ok(DataSiteResponse::new(&self.server.txn_peer, data))
+        -> Box<Future<Item = DataSiteResponse<T>, Error = ()>>
+    {
+        let res = DataSiteResponse::new(&self.server.txn_peer, data);
+        box future::ok(res)
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures: Vec<RollbackFailure> = Vec::new();
@@ -203,7 +205,7 @@ impl DataManager {
             } else {
                 cell_to_evict.push(*cell_id);
             }
-            if need_break {
+            if need_breself.pool.spawn_fnak {
                 break;
             }
         }
@@ -213,7 +215,9 @@ impl DataManager {
         }
     }
     fn prepare_read<T>(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
-        -> Result<(), Result<DataSiteResponse<TxnExecResult<T, ReadError>>, ()>> where T: Clone{
+        -> Result<(), Box<Future<Item = DataSiteResponse<TxnExecResult<T, ReadError>>, Error = ()>>>
+        where T: Clone
+    {
         self.update_clock(clock);
         let txn_lock = self.get_transaction(tid);
         let mut txn = txn_lock.lock();
@@ -241,58 +245,61 @@ impl DataManager {
 }
 
 impl Service for DataManager {
-    fn read(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
-            -> Result<DataSiteResponse<TxnExecResult<Cell, ReadError>>, ()> {
-        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
-        match self.server.chunks.read_cell(id) {
+    fn read(&self, server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id)
+            -> Box<Future<Item = DataSiteResponse<TxnExecResult<Cell, ReadError>>, Error = ()>>
+    {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) { return r; }
+        match self.server.chunks.read_cell(&id) {
             Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }
     }
-    fn read_selected(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id, fields: &Vec<u64>)
-            -> Result<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, ()> {
-        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
-        match self.server.chunks.read_selected(id, &fields[..]) {
+    fn read_selected(&self, server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>)
+            -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, Error = ()>> {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) { return r; }
+        match self.server.chunks.read_selected(&id, &fields[..]) {
             Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }
     }
     // TODO: Link this function in transaction manager
-    fn read_partial_raw(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id, offset: &usize, len: &usize)
-                     -> Result<DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, ()> {
-        if let Err(r) = self.prepare_read(server_id, clock, tid, id) { return r; }
-        match self.server.chunks.read_partial_raw(id, *offset, *len) {
+    fn read_partial_raw(&self, server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize)
+        -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, Error = ()>>
+    {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) { return r; }
+        match self.server.chunks.read_partial_raw(&id, offset, len) {
             Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error))
         }
     }
-    fn prepare(&self, server_id: &u64, clock :&StandardVectorClock, tid: &TxnId, cell_ids: &Vec<Id>)
-               -> Result<DataSiteResponse<DMPrepareResult>, ()> {
+    fn prepare(&self, server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>)
+        -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>>
+    {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
-        debug!("PREPARE FOR {:?}, {} cells", tid, cell_ids.len());
-        self.update_clock(clock);
-        let txn_lock = self.get_transaction(tid);
+        debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
-            return self.response_with(DMPrepareResult::StateError(txn.state))
+            return self.response_with(DMPrepareResult::StateError(txn.state));
         }
 
         let mut cell_mutices = Vec::new();
         let mut cell_guards = Vec::new();
 
-        for cell_id in cell_ids {
+        for cell_id in &cell_ids {
             cell_mutices.push(self.cell_meta_mutex(cell_id));
         }
         for cell_mutex in &cell_mutices {
             let mut meta = cell_mutex.lock();
-            if tid < &meta.read { // write too late
+            if tid < meta.read { // write too late
                 break;
             }
-            if tid < &meta.write {
+            if tid < meta.write {
                 if meta.owner.is_some() { // not committed, should wait and try prepare again
-                    meta.waiting.insert((tid.clone(), *server_id));
+                    meta.waiting.insert((tid.clone(), server_id));
                     debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
                     return self.response_with(DMPrepareResult::Wait);
                 }
@@ -311,10 +318,11 @@ impl Service for DataManager {
             return self.response_with(DMPrepareResult::Success);
         }
     }
-    fn commit(&self, clock :&StandardVectorClock, tid: &TxnId, cells: &Vec<CommitOp>)
-              -> Result<DataSiteResponse<DMCommitResult>, ()>  {
-        self.update_clock(clock);
-        let txn_lock = self.get_transaction(tid);
+    fn commit(&self, clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>)
+        -> Box<Future<Item = DataSiteResponse<DMCommitResult>, Error = ()>>
+    {
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         // check state
@@ -335,7 +343,7 @@ impl Service for DataManager {
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             let mut commit_history = &mut txn.history; // for rollback in case of write error
-            for cell_op in cells {
+            for cell_op in &cells {
                 match cell_op {
                     &CommitOp::Read(id, version) => {}
                     &CommitOp::Write(ref cell) => {
@@ -344,7 +352,7 @@ impl Service for DataManager {
                         match write_result {
                             Ok(header) => {
                                 commit_history.insert(cell.id(), CellHistory::new(None, header.version));
-                                self.update_cell_write(&cell.id(), tid);
+                                self.update_cell_write(&cell.id(), &tid);
                             },
                             Err(error) => {
                                 write_error = Some((cell.id(), error));
@@ -369,7 +377,7 @@ impl Service for DataManager {
                         match write_result {
                             Ok(()) => {
                                 commit_history.insert(*cell_id, CellHistory::new(Some(original_cell), 0));
-                                self.update_cell_write(cell_id, tid);
+                                self.update_cell_write(cell_id, &tid);
                             },
                             Err(error) => {
                                 write_error = Some((*cell_id, error));
@@ -398,7 +406,7 @@ impl Service for DataManager {
                         match write_result {
                             Ok(cell) => {
                                 commit_history.insert(cell_id, CellHistory::new(Some(original_cell), cell.header.version));
-                                self.update_cell_write(&cell_id, tid);
+                                self.update_cell_write(&cell_id, &tid);
                             },
                             Err(error) => {
                                 write_error = Some((cell_id, error));
@@ -431,11 +439,12 @@ impl Service for DataManager {
             return self.response_with(DMCommitResult::Success)
         }
     }
-    fn abort(&self, clock :&StandardVectorClock, tid: &TxnId)
-        -> Result<DataSiteResponse<AbortResult>, ()>  {
+    fn abort(&self, clock :StandardVectorClock, tid: TxnId)
+        -> Box<Future<Item = DataSiteResponse<AbortResult>, Error = ()>>
+    {
         debug!(">> ABORT {:?}", tid);
-        self.update_clock(clock);
-        let txn_lock = self.get_transaction(tid);
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
@@ -449,12 +458,13 @@ impl Service for DataManager {
         txn.state = TxnState::Aborted;
         self.response_with(AbortResult::Success(rollback_failures))
     }
-    fn end(&self, clock :&StandardVectorClock, tid: &TxnId)
-             -> Result<DataSiteResponse<EndResult>, ()>  {
+    fn end(&self, clock :StandardVectorClock, tid: TxnId)
+             -> Box<Future<Item = DataSiteResponse<EndResult>, Error = ()>>
+    {
         debug!(">> END {:?}", tid);
         let result = {
-            self.update_clock(clock);
-            let txn_lock = self.get_transaction(tid);
+            self.update_clock(&clock);
+            let txn_lock = self.get_transaction(&tid);
             let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
                 return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd))
@@ -508,7 +518,7 @@ impl Service for DataManager {
                 self.response_with(EndResult::SomeLocksNotReleased)
             }
         };
-        self.wipe_out_transaction(tid);
+        self.wipe_out_transaction(&tid);
         self.cleanup_sender.lock().send(());
         return result;
     }

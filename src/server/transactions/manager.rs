@@ -7,7 +7,7 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use std::sync::mpsc::{channel, Sender, Receiver};
-use futures;
+use futures_cpupool::CpuPool;
 use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
@@ -53,7 +53,8 @@ pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: RwLock<HashMap<TxnId, TxnMutex>>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
-    await_manager: AwaitManager
+    await_manager: AwaitManager,
+    pool: CpuPool
 }
 dispatch_rpc_service_functions!(TransactionManager);
 
@@ -63,7 +64,8 @@ impl TransactionManager {
             server: server.clone(),
             transactions: RwLock::new(HashMap::new()),
             data_sites: CHashMap::new(),
-            await_manager: AwaitManager::new()
+            await_manager: AwaitManager::new(),
+            pool: CpuPool::new_num_cpus(),
         })
     }
 }
@@ -364,7 +366,7 @@ impl TransactionManager {
 }
 
 impl Service for TransactionManager {
-    fn begin(&self) -> Result<TxnId, TMError> {
+    fn begin(&self) -> Box<Future<Item = TxnId, Error = TMError>> {
         let id = self.server.txn_peer.clock.inc();
         let mut txns = self.transactions.write();
         if txns.insert(id.clone(), Arc::new(Mutex::new(Transaction {
@@ -378,11 +380,13 @@ impl Service for TransactionManager {
             Ok(id)
         }
     }
-    fn read(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let txn_mutex = self.get_transaction(tid)?;
+    fn read(&self, tid: TxnId, id: Id)
+        -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>>
+    {
+        let txn_mutex = self.get_transaction(&tid)?;
         let txn = txn_mutex.lock();
         self.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(id) {
+        if let Some(data_obj) = txn.data.get(&id) {
             match data_obj.cell {
                 Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
                 None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
@@ -391,8 +395,8 @@ impl Service for TransactionManager {
         let server = self.get_data_site_by_id(&id);
         match server {
             Ok((server_id, server)) => {
-                let await = self.await_manager.get_txn(tid);
-                self.read_from_site(server_id, server, tid, id, txn, await)
+                let await = self.await_manager.get_txn(&tid);
+                self.read_from_site(server_id, server, &tid, &id, txn, await)
             },
             Err(e) => {
                 error!("{:?}", e);
@@ -400,8 +404,10 @@ impl Service for TransactionManager {
             }
         }
     }
-    fn read_selected(&self, tid: &TxnId, id: &Id, fields: &Vec<u64>) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
-        let txn_mutex = self.get_transaction(tid)?;
+    fn read_selected(&self, tid: TxnId, id: Id, fields: Vec<u64>)
+        -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>>
+    {
+        let txn_mutex = self.get_transaction(&tid)?;
         let txn = txn_mutex.lock();
         self.ensure_rw_state(&txn)?;
         if let Some(data_obj) = txn.data.get(id) {
@@ -424,8 +430,8 @@ impl Service for TransactionManager {
         let server = self.get_data_site_by_id(&id);
         match server {
             Ok((server_id, server)) => {
-                let await = self.await_manager.get_txn(tid);
-                self.read_selected_from_site(server_id, server, tid, id, fields, txn, await)
+                let await = self.await_manager.get_txn(&tid);
+                self.read_selected_from_site(server_id, server, &tid, &id, &fields, txn, await)
             },
             Err(e) => {
                 error!("{:?}", e);
@@ -433,7 +439,9 @@ impl Service for TransactionManager {
             }
         }
     }
-    fn write(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
+    fn write(&self, tid: TxnId, cell: Cell)
+        -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
+    {
         let txn_mutex = self.get_transaction(tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
@@ -463,7 +471,9 @@ impl Service for TransactionManager {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn update(&self, tid: &TxnId, cell: &Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
+    fn update(&self, tid: TxnId, cell: Cell)
+        -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
+    {
         let txn_mutex = self.get_transaction(tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
@@ -489,7 +499,9 @@ impl Service for TransactionManager {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn remove(&self, tid: &TxnId, id: &Id) -> Result<TxnExecResult<(), WriteError>, TMError> {
+    fn remove(&self, tid: TxnId, id: Id)
+        -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
+    {
         let txn_lock = self.get_transaction(tid)?;
         let mut txn = txn_lock.lock();
         self.ensure_rw_state(&txn)?;
@@ -526,7 +538,9 @@ impl Service for TransactionManager {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
+    fn prepare(&self, tid: TxnId)
+        -> Box<Future<Item = TMPrepareResult, Error = TMError>>
+    {
         let conclusion = {
             let txn_mutex = self.get_transaction(tid)?;
             let mut txn = txn_mutex.lock();
@@ -561,7 +575,9 @@ impl Service for TransactionManager {
         };
         return Ok(conclusion);
     }
-    fn commit(&self, tid: &TxnId) -> Result<EndResult, TMError> {
+    fn commit(&self, tid: TxnId)
+        -> Box<Future<Item = EndResult, Error = TMError>>
+    {
         let result = {
             let txn_lock = self.get_transaction(tid)?;
             let txn = txn_lock.lock();
@@ -573,7 +589,7 @@ impl Service for TransactionManager {
         self.cleanup_transaction(tid);
         return result;
     }
-    fn abort(&self, tid: &TxnId) -> Result<AbortResult, TMError> {
+    fn abort(&self, tid: TxnId) -> Box<Future<Item = AbortResult, Error = TMError>> {
         debug!("TXN ABORT IN MGR {:?}", tid);
         let result = {
             let txn_lock = self.get_transaction(tid)?;
@@ -590,7 +606,7 @@ impl Service for TransactionManager {
         self.cleanup_transaction(tid);
         return result;
     }
-    fn go_ahead(&self, tids: &BTreeSet<TxnId>, server_id: &u64) -> Result<(), ()> {
+    fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> Box<Future<Item = (), Error = ()>> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         for tid in tids {
             let await_txn = self.await_manager.get_txn(tid);
