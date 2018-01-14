@@ -128,6 +128,7 @@ impl DataManager {
     }
     fn response_with<T>(&self, data: T)
         -> Box<Future<Item = DataSiteResponse<T>, Error = ()>>
+        where T: 'static
     {
         let res = DataSiteResponse::new(&self.server.txn_peer, data);
         box future::ok(res)
@@ -216,7 +217,7 @@ impl DataManager {
     }
     fn prepare_read<T>(&self, server_id: &u64, clock: &StandardVectorClock, tid: &TxnId, id: &Id)
         -> Result<(), Box<Future<Item = DataSiteResponse<TxnExecResult<T, ReadError>>, Error = ()>>>
-        where T: Clone
+        where T: 'static + Clone
     {
         self.update_clock(clock);
         let txn_lock = self.get_transaction(tid);
@@ -343,10 +344,10 @@ impl Service for DataManager {
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             let mut commit_history = &mut txn.history; // for rollback in case of write error
-            for cell_op in &cells {
+            for cell_op in cells {
                 match cell_op {
-                    &CommitOp::Read(id, version) => {}
-                    &CommitOp::Write(ref cell) => {
+                    CommitOp::Read(id, version) => {}
+                    CommitOp::Write(ref cell) => {
                         let mut cell = cell.clone();
                         let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
@@ -360,7 +361,7 @@ impl Service for DataManager {
                             }
                         };
                     },
-                    &CommitOp::Remove(ref cell_id) => {
+                    CommitOp::Remove(ref cell_id) => {
                         let original_cell  = {
                             match self.server.chunks.read_cell(cell_id) {
                                 Ok(cell) => cell,
@@ -385,7 +386,7 @@ impl Service for DataManager {
                             }
                         }
                     },
-                    &CommitOp::Update(ref cell) => {
+                    CommitOp::Update(ref cell) => {
                         let cell_id = cell.id();
                         let original_cell = {
                             match self.server.chunks.read_cell(&cell_id) {
@@ -414,7 +415,7 @@ impl Service for DataManager {
                             }
                         }
                     },
-                    &CommitOp::None => {
+                    CommitOp::None => {
                         panic!("None CommitOp should not appear in data site");
                     }
                 }
