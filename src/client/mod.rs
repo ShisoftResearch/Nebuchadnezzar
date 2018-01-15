@@ -76,7 +76,7 @@ impl AsyncClientInner {
         await!(client.read_cell(&id))
     }
     #[async]
-    pub fn write_cell(this: Arc<Self>, cell: &Cell) -> Result<Result<Header, WriteError>, RPCError> {
+    pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
         let client = this.locate_plain_server(cell.id())?;
         await!(client.write_cell(&cell))
     }
@@ -85,13 +85,16 @@ impl AsyncClientInner {
         let client = this.locate_plain_server(cell.id())?;
         await!(client.update_cell(&cell))
     }
-    pub fn remove_cell(this: Arc<Self>, id: &Id) -> Result<Result<(), WriteError>, RPCError> {
+    #[async]
+    pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = this.locate_plain_server(id)?;
         await!(client.remove_cell(&id))
     }
-    pub fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
-        where TFN: Fn(&Transaction) -> Result<TR, TxnError> {
-        let server_name = match self.conshash.rand_server() {
+    #[async]
+    pub fn transaction<TFN, TR>(this: Arc<Self>, func: TFN) -> Result<TR, TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>
+    {
+        let server_name = match this.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
         };
@@ -151,13 +154,15 @@ impl AsyncClientInner {
         }
         Err(TxnError::TooManyRetry)
     }
-    pub fn new_schema_with_id(&self, schema: &Schema) -> Result<Result<(), NotifyError>, ExecError> {
-        self.schema_client.new_schema(schema)
+    #[async]
+    pub fn new_schema_with_id(this: Arc<Self>, schema: Schema) -> Result<Result<(), NotifyError>, ExecError> {
+        await!(this.schema_client.new_schema(&schema))
     }
-    pub fn new_schema(&self, schema: &mut Schema) -> Result<Result<(), NotifyError>, ExecError> {
+    #[async]
+    pub fn new_schema(this: Arc<Self>, schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
         let schema_id = self.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
-        self.new_schema_with_id(schema)
+        await!(self.new_schema_with_id(schema)).map(|r| r.map(|_| schema_id))
     }
     pub fn del_schema(&self, schema_id: &String) -> Result<Result<(), NotifyError>, ExecError> {
         self.schema_client.del_schema(schema_id)

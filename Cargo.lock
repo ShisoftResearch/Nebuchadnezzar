@@ -30,7 +30,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#5d2c8c1e63b169bd0850f1c6720936b2bba12e4c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#8036d57b10cd317f088ae295a03629db9a3e640c"
 dependencies = [
  "backtrace 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
@@ -62,7 +62,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#5d2c8c1e63b169bd0850f1c6720936b2bba12e4c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#8036d57b10cd317f088ae295a03629db9a3e640c"
 dependencies = [
  "twox-hash 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -70,7 +70,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#5d2c8c1e63b169bd0850f1c6720936b2bba12e4c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#8036d57b10cd317f088ae295a03629db9a3e640c"
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
 ]
