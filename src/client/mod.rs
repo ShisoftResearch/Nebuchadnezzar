@@ -30,7 +30,7 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError)
 }
 
-pub struct AsyncClientInner {
+struct AsyncClientInner {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient
