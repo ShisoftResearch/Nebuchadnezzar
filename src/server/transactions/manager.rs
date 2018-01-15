@@ -407,7 +407,7 @@ impl Service for TransactionManager {
         let txn_mutex = self.get_transaction(&tid)?;
         let txn = txn_mutex.lock();
         self.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(id) {
+        if let Some(data_obj) = txn.data.get(&id) {
             match data_obj.cell {
                 Some(ref cell) => {
                     let mut result = Vec::with_capacity(fields.len());
@@ -439,7 +439,7 @@ impl Service for TransactionManager {
     fn write(&self, tid: TxnId, cell: Cell)
         -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
     {
-        let txn_mutex = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(&tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
         self.ensure_rw_state(&txn)?;
@@ -471,7 +471,7 @@ impl Service for TransactionManager {
     fn update(&self, tid: TxnId, cell: Cell)
         -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
     {
-        let txn_mutex = self.get_transaction(tid)?;
+        let txn_mutex = self.get_transaction(&tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
         self.ensure_rw_state(&txn)?;
@@ -499,7 +499,7 @@ impl Service for TransactionManager {
     fn remove(&self, tid: TxnId, id: Id)
         -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>>
     {
-        let txn_lock = self.get_transaction(tid)?;
+        let txn_lock = self.get_transaction(&tid)?;
         let mut txn = txn_lock.lock();
         self.ensure_rw_state(&txn)?;
         match self.server.get_server_id_by_id(&id) {
@@ -522,7 +522,7 @@ impl Service for TransactionManager {
                         txn.data.remove(&id);
                     }
                 } else {
-                    txn.data.insert(*id, DataObject {
+                    txn.data.insert(id, DataObject {
                         server: server_id,
                         cell: None,
                         new: false,
@@ -539,7 +539,7 @@ impl Service for TransactionManager {
         -> Box<Future<Item = TMPrepareResult, Error = TMError>>
     {
         let conclusion = {
-            let txn_mutex = self.get_transaction(tid)?;
+            let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock();
             let result = {
                 self.ensure_rw_state(&txn)?;
@@ -547,9 +547,11 @@ impl Service for TransactionManager {
                 let generated_objs = &txn.affected_objects;
                 let affect_objs = generated_objs.clone();
                 let data_sites = self.data_sites(&affect_objs)?;
-                let sites_prepare_result = self.sites_prepare(tid, affect_objs, data_sites.clone())?;
+                let sites_prepare_result =
+                    self.sites_prepare(&tid, affect_objs, data_sites.clone())?;
                 if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result = self.sites_commit(tid, generated_objs, &data_sites)?;
+                    let sites_commit_result =
+                        self.sites_commit(&tid, generated_objs, &data_sites)?;
                     match sites_commit_result {
                         DMCommitResult::Success => {
                             TMPrepareResult::Success
@@ -576,38 +578,38 @@ impl Service for TransactionManager {
         -> Box<Future<Item = EndResult, Error = TMError>>
     {
         let result = {
-            let txn_lock = self.get_transaction(tid)?;
+            let txn_lock = self.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             self.ensure_txn_state(&txn, TxnState::Prepared)?;
             let affected_objs = &txn.affected_objects;
             let data_sites = self.data_sites(affected_objs)?;
-            self.sites_end(tid, affected_objs, &data_sites)
+            self.sites_end(&tid, affected_objs, &data_sites)
         };
-        self.cleanup_transaction(tid);
+        self.cleanup_transaction(&tid);
         return result;
     }
     fn abort(&self, tid: TxnId) -> Box<Future<Item = AbortResult, Error = TMError>> {
-        debug!("TXN ABORT IN MGR {:?}", tid);
+        debug!("TXN ABORT IN MGR {:?}", &tid);
         let result = {
-            let txn_lock = self.get_transaction(tid)?;
+            let txn_lock = self.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
                 let changed_objs = &txn.affected_objects;
                 let data_sites = self.data_sites(changed_objs)?;
                 debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                self.sites_abort(tid, changed_objs, &data_sites) // with end
+                self.sites_abort(&tid, changed_objs, &data_sites) // with end
             } else {
                 Ok(AbortResult::Success(None))
             }
         };
-        self.cleanup_transaction(tid);
+        self.cleanup_transaction(&tid);
         return result;
     }
     fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> Box<Future<Item = (), Error = ()>> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         for tid in tids {
-            let await_txn = self.await_manager.get_txn(tid);
-            AwaitManager::txn_send(&await_txn, *server_id);
+            let await_txn = self.await_manager.get_txn(&tid);
+            AwaitManager::txn_send(&await_txn, server_id);
         }
         Ok(())
     }

@@ -92,20 +92,20 @@ impl AsyncClientInner {
     }
     #[async]
     pub fn transaction<TFN, TR>(this: Arc<Self>, func: TFN) -> Result<TR, TxnError>
-        where TFN: Fn(&Transaction) -> Result<TR, TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>, TR: 'static, TFN: 'static
     {
         let server_name = match this.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
         };
-        let txn_client = match txn_server::new_client(&server_name) {
+        let txn_client = match txn_server::new_async_client(&server_name) {
             Ok(client) => client,
             Err(e) => return Err(TxnError::IoError(e))
         };
         let mut txn_id: txn_server::TxnId;
         let mut retried = 0;
         while retried < TRANSACTION_MAX_RETRY {
-            txn_id = match txn_client.begin() {
+            txn_id = match await!(txn_client.begin()) {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin)
             };
@@ -224,7 +224,7 @@ impl AsyncClient {
 
     pub fn transaction<TFN, TR>(&self, func: TFN)
         -> impl Future<Item = TR, Error = TxnError>
-        where TFN: Fn(&Transaction) -> Result<TR, TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>, TR: 'static, TFN: 'static
     {
         AsyncClientInner::transaction(self.inner, func)
     }
