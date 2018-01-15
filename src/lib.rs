@@ -7,7 +7,10 @@
 #![feature(exact_size_is_empty)]
 #![feature(macro_reexport)]
 #![feature(integer_atomics)]
+
+#![feature(proc_macro, conservative_impl_trait, generators)]
 #![feature(box_syntax)]
+
 
 #[macro_use]
 extern crate log;
