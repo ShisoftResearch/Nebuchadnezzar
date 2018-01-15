@@ -63,12 +63,12 @@ impl AsyncClientInner {
         }
     }
     pub fn locate_plain_server(&self, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        let address = self.locate_server_address(id)?;
+        let address = self.locate_server_address(&id)?;
         let client = match DEFAULT_CLIENT_POOL.get(&address) {
             Ok(c) => c,
             Err(e) => return Err(RPCError::IOError(e))
         };
-        Ok(plain_server::AsyncServiceClient::new_async(plain_server::DEFAULT_SERVICE_ID, &client))
+        Ok(plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
     }
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
@@ -156,18 +156,96 @@ impl AsyncClientInner {
     }
     #[async]
     pub fn new_schema_with_id(this: Arc<Self>, schema: Schema) -> Result<Result<(), NotifyError>, ExecError> {
-        await!(this.schema_client.new_schema(&schema))
+        this.schema_client.new_schema(&schema)
     }
     #[async]
     pub fn new_schema(this: Arc<Self>, schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
-        let schema_id = self.schema_client.next_id()?.unwrap();
+        let schema_id = this.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
-        await!(self.new_schema_with_id(schema)).map(|r| r.map(|_| schema_id))
+        await!(Self::new_schema_with_id(this, schema)).map(|r| r.map(|_| schema_id))
     }
-    pub fn del_schema(&self, schema_id: &String) -> Result<Result<(), NotifyError>, ExecError> {
-        self.schema_client.del_schema(schema_id)
+    #[async]
+    pub fn del_schema(this: Arc<Self>, name: String) -> Result<Result<(), NotifyError>, ExecError> {
+        this.schema_client.del_schema(&name)
     }
-    pub fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
-        Ok(self.schema_client.get_all()?.unwrap())
+    #[async]
+    pub fn get_all_schema(this: Arc<Self>) -> Result<Vec<Schema>, ExecError> {
+        Ok(this.schema_client.get_all()?.unwrap())
+    }
+}
+
+pub struct AsyncClient {
+    inner: Arc<AsyncClientInner>
+}
+
+impl AsyncClient {
+    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str)
+                   -> Result<AsyncClient, NebClientError>
+    {
+        AsyncClientInner::new(subscription_server, meta_servers, group)
+            .map(|inner| {
+                AsyncClient {
+                    inner: Arc::new(inner)
+                }
+            })
+    }
+
+    pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
+        self.inner.locate_server_address(id)
+    }
+
+    pub fn locate_plain_server(&self, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+        self.inner.locate_plain_server(id)
+    }
+
+    pub fn read_cell(&self, id: Id)
+        -> impl Future<Item = Result<Cell, ReadError>, Error = RPCError>
+    {
+        AsyncClientInner::read_cell(self.inner, id)
+    }
+
+    pub fn write_cell(&self, cell: Cell)
+        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::write_cell(self.inner, cell)
+    }
+
+    pub fn update_cell(&self, cell: Cell)
+        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::update_cell(self.inner, cell)
+    }
+
+    pub fn remove_cell(&self, id: Id)
+        -> impl Future<Item = Result<(), WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::remove_cell(self.inner, id)
+    }
+
+    pub fn transaction<TFN, TR>(&self, func: TFN)
+        -> impl Future<Item = TR, Error = TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>
+    {
+        AsyncClientInner::transaction(self.inner, func)
+    }
+    pub fn new_schema_with_id(&self, schema: Schema)
+        -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::new_schema_with_id(self.inner, schema)
+    }
+    pub fn new_schema(&self, schema: Schema)
+        -> impl Future<Item = Result<u32, NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::new_schema(self.inner, schema)
+    }
+    pub fn del_schema(&self, name: String)
+        -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::del_schema(self.inner, name)
+    }
+    pub fn get_all_schema(&self)
+        -> impl Future<Item = Vec<Schema>, Error = ExecError>
+    {
+        AsyncClientInner::get_all_schema(self.inner)
     }
 }
