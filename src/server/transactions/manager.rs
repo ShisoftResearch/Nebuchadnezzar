@@ -633,11 +633,13 @@ impl AwaitingServer {
             receiver: Mutex::new(receiver)
         }
     }
-    pub fn send(&self) {
-        let _ = self.sender.lock().send(());
+    pub fn send(&self) -> impl Future<Item = (), Error = ()> {
+        self.sender
+            .lock_async()
+            .then(|s| s.send(()))
     }
     pub fn wait(&self) {
-        let _ = self.receiver.lock().recv();
+        let _ = self.receiver.lock().recv()
     }
 }
 
