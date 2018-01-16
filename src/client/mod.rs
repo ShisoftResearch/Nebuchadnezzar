@@ -62,9 +62,10 @@ impl AsyncClientInner {
             None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, "cannot locate")))
         }
     }
-    pub fn locate_plain_server(&self, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        let address = self.locate_server_address(&id)?;
-        let client = match DEFAULT_CLIENT_POOL.get(&address) {
+    #[async]
+    pub fn locate_plain_server(this: Arc<Self>, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+        let address = this.locate_server_address(&id)?;
+        let client = match await!(DEFAULT_CLIENT_POOL.get_async(&address)) {
             Ok(c) => c,
             Err(e) => return Err(RPCError::IOError(e))
         };
@@ -72,22 +73,22 @@ impl AsyncClientInner {
     }
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
-        let client = this.locate_plain_server(id)?;
+        let client = await!(Self::locate_plain_server(this, id))?;
         await!(client.read_cell(&id))
     }
     #[async]
     pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
-        let client = this.locate_plain_server(cell.id())?;
+        let client = await!(Self::locate_plain_server(this, cell.id()))?;
         await!(client.write_cell(&cell))
     }
     #[async]
     pub fn update_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
-        let client = this.locate_plain_server(cell.id())?;
+        let client = await!(Self::locate_plain_server(this, cell.id()))?;
         await!(client.update_cell(&cell))
     }
     #[async]
     pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
-        let client = this.locate_plain_server(id)?;
+        let client = await!(Self::locate_plain_server(this, id))?;
         await!(client.remove_cell(&id))
     }
     #[async]
@@ -194,8 +195,10 @@ impl AsyncClient {
         self.inner.locate_server_address(id)
     }
 
-    pub fn locate_plain_server(&self, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        self.inner.locate_plain_server(id)
+    pub fn locate_plain_server(&self, id: Id)
+        -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError>
+    {
+        AsyncClientInner::locate_plain_server(self.inner, id)
     }
 
     pub fn read_cell(&self, id: Id)
