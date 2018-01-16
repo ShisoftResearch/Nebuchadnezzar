@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use parking_lot::{Mutex, MutexGuard, RwLock};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use bifrost::utils::async_locks::{Mutex, MutexGuard, RwLock};
+use futures::sync::mpsc::{channel, Sender, Receiver};
 use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
@@ -176,7 +176,10 @@ impl TransactionManager {
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in &txn.data {
-            affected_objs.entry(data_obj.server).or_insert_with(|| BTreeMap::new()).insert(*id, data_obj.clone());
+            affected_objs
+                .entry(data_obj.server)
+                .or_insert_with(|| BTreeMap::new())
+                .insert(*id, data_obj.clone());
         }
         txn.data.clear(); // clean up data after transferred to changed
         txn.affected_objects = affected_objs;
