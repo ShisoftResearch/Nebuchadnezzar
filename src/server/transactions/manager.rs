@@ -6,7 +6,8 @@ use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use bifrost::utils::async_locks::{Mutex, MutexGuard, RwLock};
-use futures::sync::mpsc::{channel, Sender, Receiver};
+use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
+use futures::Sink;
 use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
@@ -627,19 +628,23 @@ struct AwaitingServer {
 
 impl AwaitingServer {
     pub fn new() -> AwaitingServer {
-        let (sender, receiver) = channel();
+        let (sender, receiver) = channel(1);
         AwaitingServer {
             sender: Mutex::new(sender),
             receiver: Mutex::new(receiver)
         }
     }
-    pub fn send(&self) -> impl Future<Item = (), Error = ()> {
+    pub fn send(&self)
+        -> impl Future<Item = Sender<()>, Error = SendError<()>>
+    {
         self.sender
             .lock_async()
-            .then(|s| s.send(()))
+            .map(|tx| tx.clone())
+            .map_err(|_| SendError)
+            .and_then(|s| s.send(()))
     }
     pub fn wait(&self) {
-        let _ = self.receiver.lock().recv()
+        let _ = self.receiver.lock().recv();
     }
 }
 
