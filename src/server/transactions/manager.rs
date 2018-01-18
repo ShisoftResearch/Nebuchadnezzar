@@ -7,7 +7,8 @@ use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use bifrost::utils::async_locks::{Mutex, MutexGuard, RwLock};
 use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
-use futures::Sink;
+use futures::{Sink};
+use futures::prelude::*;
 use super::*;
 use utils::stream::PollableStream;
 
@@ -97,33 +98,36 @@ impl TransactionManager {
     fn merge_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock)
     }
-    fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
-        let txns = self.transactions.read();
-        match txns.get(tid) {
-            Some(txn) => Ok(txn.clone()),
-            _ => {
-                Err(TMError::TransactionNotFound)
-            }
-        }
+    fn get_transaction(&self, tid: TxnId) -> impl Future<Item = TxnMutex, Error = TMError> {
+        self.transactions.read_async()
+            .map_err(|_| TMError::Other)
+            .and_then(|txns|
+                future::result(match txns.get(tid) {
+                    Some(txn) => Ok(txn.clone()),
+                    _ => {
+                        Err(TMError::TransactionNotFound)
+                    }
+                }))
     }
+    #[async]
     fn read_from_site(
-        &self, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: &TxnId, id: &Id, mut txn: TxnGuard, await: TxnAwaits
+        this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
+        tid: TxnId, id: Id, mut txn: TxnGuard, await: TxnAwaits
     ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let self_server_id = self.server.server_id;
-        let read_response = server.read(
+        let self_server_id = this.server.server_id;
+        let read_response = await!(server.read(
             &self_server_id,
-            &self.get_clock(),
-            tid, id
-        ).wait();
+            &this.get_clock(),
+            &tid, &id
+        ));
         match read_response {
             Ok(dsr) => {
                 let dsr = dsr.unwrap();
-                self.merge_clock(&dsr.clock);
+                this.merge_clock(&dsr.clock);
                 let payload = dsr.payload;
                 match payload {
                     TxnExecResult::Accepted(ref cell) => {
-                        txn.data.insert(*id, DataObject {
+                        txn.data.insert(id, DataObject {
                             server: server_id,
                             cell: Some(cell.clone()),
                             new: false,
@@ -132,8 +136,8 @@ impl TransactionManager {
                         });
                     },
                     TxnExecResult::Wait => {
-                        AwaitManager::txn_wait(&await, server_id);
-                        return self.read_from_site(server_id, server, tid, id, txn, await);
+                        await!(AwaitManager::txn_wait(&await, server_id));
+                        return await!(Self::read_from_site(this, server_id, server, tid, id, txn, await));
                     }
                     _ => {}
                 }
@@ -145,25 +149,26 @@ impl TransactionManager {
             }
         }
     }
+    #[async]
     fn read_selected_from_site(
-        &self, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: &TxnId, id: &Id, fields: &Vec<u64>, mut txn: TxnGuard, await: TxnAwaits
+        this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
+        tid: TxnId, id: Id, fields: Vec<u64>, mut txn: TxnGuard, await: TxnAwaits
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
-        let self_server_id = self.server.server_id;
-        let read_response = server.read_selected(
+        let self_server_id = this.server.server_id;
+        let read_response = await!(server.read_selected(
             &self_server_id,
-            &self.get_clock(),
-            tid, id, fields
-        ).wait();
+            &this.get_clock(),
+            &tid, &id, &fields
+        ));
         match read_response {
             Ok(dsr) => {
                 let dsr = dsr.unwrap();
-                self.merge_clock(&dsr.clock);
+                this.merge_clock(&dsr.clock);
                 let payload = dsr.payload;
                 match payload {
                     TxnExecResult::Wait => {
-                        AwaitManager::txn_wait(&await, server_id);
-                        return self.read_selected_from_site(server_id, server, tid, id, fields, txn, await);
+                        await!(AwaitManager::txn_wait(&await, server_id));
+                        return await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await));
                     }
                     _ => {}
                 }
@@ -199,45 +204,41 @@ impl TransactionManager {
             }
         ).collect())
     }
+    #[async]
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> Box<Future<Item = DMPrepareResult, Error = TMError>> {
+    ) -> Result<DMPrepareResult, TMError> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
-        let res_future = data_site
-            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
-            .map_err(|_| -> TMError {
-                TMError::RPCErrorFromCellServer
-            })
-            .map(move |prepare_res| -> DMPrepareResult {
-                let prepare_res = prepare_res.unwrap();
-                server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
-                prepare_res.payload
-            })
-            .then(move |prepare_payload| {
-                match prepare_payload {
-                    Ok(payload) => {
-                        match payload {
-                            DMPrepareResult::Wait => {
-                                AwaitManager::txn_wait(&awaits, data_site.server_id);
-                                return TransactionManager::site_prepare(
-                                    server, awaits, tid, objs, data_site
-                                ).wait() // after waiting, retry
-                            },
-                            _ => {
-                                return Ok(payload)
-                            }
-                        }
+        let prepared = await!(data_site.prepare(
+                &self_server_id,
+                &server.txn_peer.clock.to_clock(),
+                &tid, &cell_ids)).map_err(|_| TMError::RPCErrorFromCellServer)?;
+        server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
+        let prepare_payload = prepare.payload;
+        match prepare_payload {
+            Ok(Ok(payload)) => {
+                match payload {
+                    DMPrepareResult::Wait => {
+                        await!(AwaitManager::txn_wait(&awaits, data_site.server_id));
+                        return await!(TransactionManager::site_prepare(
+                            server, awaits, tid, objs, data_site
+                        )) // after waiting, retry
                     },
-                    Err(e) => Err(e)
+                    _ => {
+                        return Ok(payload)
+                    }
                 }
-            });
-        Box::new(res_future)
+            },
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e)
+        }
     }
     fn sites_prepare(&self, tid: &TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
-                     -> Result<DMPrepareResult, TMError> {
+                     -> Result<DMPrepareResult, TMError>
+    {
         let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
             TransactionManager::site_prepare(

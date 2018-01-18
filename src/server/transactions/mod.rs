@@ -136,7 +136,8 @@ pub enum TMError {
     CannotLocateCellServer,
     RPCErrorFromCellServer,
     AssertionError,
-    InvalidTransactionState(TxnState)
+    InvalidTransactionState(TxnState),
+    Other
 }
 
 pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
