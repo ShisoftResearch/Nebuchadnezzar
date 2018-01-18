@@ -1,4 +1,4 @@
-use futures::{Stream, Future};
+use futures::{Stream, Future, Poll, Async};
 use parking_lot::{Mutex};
 use std::sync::Arc;
 
@@ -15,14 +15,25 @@ impl <I, E> Future for StreamFuture<I, E> {
     type Error = E;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.inner.lock().poll()
+        let async = self.inner.lock().poll()?;
+        Ok(match async {
+            Async::Ready(Some(i)) => Async::Ready(i),
+            _ => Async::NotReady,
+        })
     }
 }
 
 impl <I, E> PollableStream<I, E> {
-    pub fn from_stream(stream: Stream<Item = I, Error = E>) {
+    pub fn from_stream<S>(stream: S) -> PollableStream<I, E>
+        where S: Stream<Item = I, Error = E> + 'static
+    {
         PollableStream {
             inner: Arc::new(Mutex::new(stream))
+        }
+    }
+    pub fn poll_future(&self) -> StreamFuture<I, E> {
+        StreamFuture {
+            inner: self.inner.clone()
         }
     }
 }
