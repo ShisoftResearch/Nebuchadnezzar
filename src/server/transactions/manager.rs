@@ -640,7 +640,7 @@ impl AwaitingServer {
         self.sender
             .lock_async()
             .map(|tx| tx.clone())
-            .map_err(|_| SendError)
+            .map_err(|_| SendError{0: ()})
             .and_then(|s| s.send(()))
             .map(|_| ())
             .map_err(|_| ())
@@ -648,7 +648,8 @@ impl AwaitingServer {
     pub fn wait(&self)
         -> impl Future<Item = (), Error = ()>
     {
-        let _ = self.receiver.lock().recv();
+        unimplemented!()
+        // let _ = self.receiver.lock().
     }
 }
 
