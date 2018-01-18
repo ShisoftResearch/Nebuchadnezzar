@@ -10,6 +10,11 @@ pub struct StreamFuture<I, E> {
     inner: Arc<Mutex<Stream<Item = I, Error = E>>>
 }
 
+unsafe impl <I, E> Send for PollableStream<I, E>{}
+unsafe impl <I, E> Sync for PollableStream<I, E>{}
+unsafe impl <I, E> Send for StreamFuture<I, E>{}
+unsafe impl <I, E> Sync for StreamFuture<I, E>{}
+
 impl <I, E> Future for StreamFuture<I, E> {
     type Item = I;
     type Error = E;

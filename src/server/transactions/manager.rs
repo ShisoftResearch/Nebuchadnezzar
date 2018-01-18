@@ -9,6 +9,7 @@ use bifrost::utils::async_locks::{Mutex, MutexGuard, RwLock};
 use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
 use futures::Sink;
 use super::*;
+use utils::stream::PollableStream;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -623,7 +624,7 @@ impl Service for TransactionManager {
 
 struct AwaitingServer {
     sender: Mutex<Sender<()>>,
-    receiver: Mutex<Receiver<()>>,
+    receiver: PollableStream<(), ()>,
 }
 
 impl AwaitingServer {
@@ -631,7 +632,7 @@ impl AwaitingServer {
         let (sender, receiver) = channel(1);
         AwaitingServer {
             sender: Mutex::new(sender),
-            receiver: Mutex::new(receiver)
+            receiver: PollableStream::from_stream(receiver)
         }
     }
     pub fn send(&self)
@@ -648,8 +649,7 @@ impl AwaitingServer {
     pub fn wait(&self)
         -> impl Future<Item = (), Error = ()>
     {
-        unimplemented!()
-        // let _ = self.receiver.lock().
+        self.receiver.poll_future()
     }
 }
 
