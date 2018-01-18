@@ -12,7 +12,7 @@ use super::*;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
-type TxnGuard<'a> = MutexGuard<'a, Transaction>;
+type TxnGuard = MutexGuard<Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
@@ -635,15 +635,19 @@ impl AwaitingServer {
         }
     }
     pub fn send(&self)
-        -> impl Future<Item = Sender<()>, Error = SendError<()>>
+        -> impl Future<Item = (), Error = ()>
     {
         self.sender
             .lock_async()
             .map(|tx| tx.clone())
             .map_err(|_| SendError)
             .and_then(|s| s.send(()))
+            .map(|_| ())
+            .map_err(|_| ())
     }
-    pub fn wait(&self) {
+    pub fn wait(&self)
+        -> impl Future<Item = (), Error = ()>
+    {
         let _ = self.receiver.lock().recv();
     }
 }
@@ -658,22 +662,35 @@ impl AwaitManager {
             channels: Mutex::new(HashMap::new())
         }
     }
-    pub fn get_txn(&self, tid: &TxnId) -> TxnAwaits {
-        self.channels.lock()
-            .entry(tid.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
-            .clone()
+    pub fn get_txn(&self, tid: &TxnId)
+        -> impl Future<Item = TxnAwaits, Error = ()>
+    {
+        let tid = tid.clone();
+        self.channels.lock_async()
+            .map(move |m|
+                m.entry(tid)
+                 .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+                 .clone())
     }
-    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<AwaitingServer> {
-        awaits.lock()
-            .entry(server_id)
-            .or_insert_with(|| Arc::new(AwaitingServer::new()))
-            .clone()
+    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64)
+        -> impl Future<Item = Arc<AwaitingServer>, Error = ()>
+    {
+        awaits.lock_async()
+            .map(|m|
+                m.entry(server_id)
+                 .or_insert_with(|| Arc::new(AwaitingServer::new()))
+                 .clone())
     }
-    pub fn txn_send(awaits: &TxnAwaits, server_id: u64) {
-        AwaitManager::server_from_txn_awaits(awaits, server_id).send();
+    pub fn txn_send(awaits: &TxnAwaits, server_id: u64)
+        -> impl Future<Item = (), Error = ()>
+    {
+        AwaitManager::server_from_txn_awaits(awaits, server_id)
+            .and_then(|x| x.send())
     }
-    pub fn txn_wait(awaits: &TxnAwaits, server_id: u64) {
-        AwaitManager::server_from_txn_awaits(awaits, server_id).wait();
+    pub fn txn_wait(awaits: &TxnAwaits, server_id: u64)
+        -> impl Future<Item = (), Error = ()>
+    {
+        AwaitManager::server_from_txn_awaits(awaits, server_id)
+            .and_then(|x| x.wait())
     }
 }
