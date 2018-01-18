@@ -236,18 +236,19 @@ impl TransactionManager {
             Err(e) => Err(e)
         }
     }
-    fn sites_prepare(&self, tid: &TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
-                     -> Result<DMPrepareResult, TMError>
+    #[async]
+    fn sites_prepare(this: Arc<Self>, tid: TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
+        -> Result<DMPrepareResult, TMError>
     {
         let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
             TransactionManager::site_prepare(
-                self.server.clone(),
-                self.await_manager.get_txn(tid),
+                this.server.clone(),
+                this.await_manager.get_txn(&tid),
                 tid.clone(), objs, data_site
             )
         }).collect();
-        let prepare_results = future::join_all(prepare_futures).wait()?;
+        let prepare_results = await!(future::join_all(prepare_futures))?;
         for result in prepare_results {
             match result {
                 DMPrepareResult::Success => {},
@@ -256,7 +257,8 @@ impl TransactionManager {
         }
         Ok(DMPrepareResult::Success)
     }
-    fn sites_commit(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
+    #[async]
+    fn sites_commit(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
                     -> Result<DMCommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
@@ -274,13 +276,13 @@ impl TransactionManager {
                     CommitOp::None
                 }
             }).collect();
-            data_site.commit(&self.get_clock(), tid, &ops)
+            data_site.commit(&this.get_clock(), &tid, &ops)
         }).collect();
-        let commit_results = future::join_all(commit_futures).wait();
+        let commit_results = await!(future::join_all(commit_futures));
         if let Ok(commit_results) = commit_results {
             for result in commit_results {
                 if let Ok(dsr) = result {
-                    self.merge_clock(&dsr.clock);
+                    this.merge_clock(&dsr.clock);
                     match dsr.payload {
                         DMCommitResult::Success => {},
                         _ => {
@@ -296,13 +298,14 @@ impl TransactionManager {
         }
         Ok(DMCommitResult::Success)
     }
-    fn sites_abort(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
+    #[async]
+    fn sites_abort(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
         -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
-            data_site.abort(&self.get_clock(), tid)
+            data_site.abort(&this.get_clock(), &tid)
         }).collect();
-        let abort_results = future::join_all(abort_futures).wait();
+        let abort_results = await!(future::join_all(abort_futures));
         if abort_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
         let abort_results = abort_results.unwrap();
         let mut rollback_failures = Vec::new();
@@ -310,7 +313,7 @@ impl TransactionManager {
             match result {
                 Ok(asr) => {
                     let payload = asr.payload;
-                    self.merge_clock(&asr.clock);
+                    this.merge_clock(&asr.clock);
                     match payload {
                         AbortResult::Success(failures) => {
                             if let Some(mut failures) = failures {
@@ -323,24 +326,26 @@ impl TransactionManager {
                 Err(_) => {return Err(TMError::AssertionError)}
             }
         }
-        self.sites_end(tid, changed_objs, &data_sites)?;
+        await!(Self::sites_end(this, tid, changed_objs, data_sites))?;
         Ok(AbortResult::Success(
             if rollback_failures.is_empty()
                 {None} else {Some(rollback_failures)}
         ))
     }
-    fn sites_end(&self, tid: &TxnId, changed_objs: &AffectedObjs, data_sites: &DataSiteClients)
-                 -> Result<EndResult, TMError> {
+    #[async]
+    fn sites_end(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
+        -> Result<EndResult, TMError>
+    {
         let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
-            data_site.end(&self.get_clock(), tid)
+            data_site.end(&this.get_clock(), &tid)
         }).collect();
-        let end_results = future::join_all(end_futures).wait();
+        let end_results = await!(future::join_all(end_futures));
         if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
         let end_results = end_results.unwrap();
         for result in end_results {
             if let Ok(result) = result {
-                self.merge_clock(&result.clock);
+                this.merge_clock(&result.clock);
                 let payload = result.payload;
                 match payload {
                     EndResult::Success => {},
@@ -664,35 +669,26 @@ impl AwaitManager {
             channels: Mutex::new(HashMap::new())
         }
     }
-    pub fn get_txn(&self, tid: &TxnId)
-        -> impl Future<Item = TxnAwaits, Error = ()>
-    {
-        let tid = tid.clone();
-        self.channels.lock_async()
-            .map(move |m|
-                m.entry(tid)
-                 .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
-                 .clone())
+    pub fn get_txn(&self, tid: &TxnId) -> TxnAwaits {
+        self.channels.lock()
+            .entry(tid.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+            .clone()
     }
-    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64)
-        -> impl Future<Item = Arc<AwaitingServer>, Error = ()>
-    {
-        awaits.lock_async()
-            .map(|m|
-                m.entry(server_id)
-                 .or_insert_with(|| Arc::new(AwaitingServer::new()))
-                 .clone())
+    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<AwaitingServer> {
+        awaits.lock()
+            .entry(server_id)
+            .or_insert_with(|| Arc::new(AwaitingServer::new()))
+            .clone()
     }
     pub fn txn_send(awaits: &TxnAwaits, server_id: u64)
         -> impl Future<Item = (), Error = ()>
     {
-        AwaitManager::server_from_txn_awaits(awaits, server_id)
-            .and_then(|x| x.send())
+        AwaitManager::server_from_txn_awaits(awaits, server_id).send()
     }
     pub fn txn_wait(awaits: &TxnAwaits, server_id: u64)
         -> impl Future<Item = (), Error = ()>
     {
-        AwaitManager::server_from_txn_awaits(awaits, server_id)
-            .and_then(|x| x.wait())
+        AwaitManager::server_from_txn_awaits(awaits, server_id).wait()
     }
 }
