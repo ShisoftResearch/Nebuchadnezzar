@@ -160,7 +160,7 @@ impl AsyncClientInner {
         this.schema_client.new_schema(&schema)
     }
     #[async]
-    pub fn new_schema(this: Arc<Self>, schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
+    pub fn new_schema(this: Arc<Self>, mut schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
         let schema_id = this.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
         await!(Self::new_schema_with_id(this, schema)).map(|r| r.map(|_| schema_id))
@@ -198,57 +198,57 @@ impl AsyncClient {
     pub fn locate_plain_server(&self, id: Id)
         -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError>
     {
-        AsyncClientInner::locate_plain_server(self.inner, id)
+        AsyncClientInner::locate_plain_server(self.inner.clone(), id)
     }
 
     pub fn read_cell(&self, id: Id)
         -> impl Future<Item = Result<Cell, ReadError>, Error = RPCError>
     {
-        AsyncClientInner::read_cell(self.inner, id)
+        AsyncClientInner::read_cell(self.inner.clone(), id)
     }
 
     pub fn write_cell(&self, cell: Cell)
         -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
     {
-        AsyncClientInner::write_cell(self.inner, cell)
+        AsyncClientInner::write_cell(self.inner.clone(), cell)
     }
 
     pub fn update_cell(&self, cell: Cell)
         -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
     {
-        AsyncClientInner::update_cell(self.inner, cell)
+        AsyncClientInner::update_cell(self.inner.clone(), cell)
     }
 
     pub fn remove_cell(&self, id: Id)
         -> impl Future<Item = Result<(), WriteError>, Error = RPCError>
     {
-        AsyncClientInner::remove_cell(self.inner, id)
+        AsyncClientInner::remove_cell(self.inner.clone(), id)
     }
 
     pub fn transaction<TFN, TR>(&self, func: TFN)
         -> impl Future<Item = TR, Error = TxnError>
         where TFN: Fn(&Transaction) -> Result<TR, TxnError>, TR: 'static, TFN: 'static
     {
-        AsyncClientInner::transaction(self.inner, func)
+        AsyncClientInner::transaction(self.inner.clone(), func)
     }
     pub fn new_schema_with_id(&self, schema: Schema)
         -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
     {
-        AsyncClientInner::new_schema_with_id(self.inner, schema)
+        AsyncClientInner::new_schema_with_id(self.inner.clone(), schema)
     }
     pub fn new_schema(&self, schema: Schema)
         -> impl Future<Item = Result<u32, NotifyError>, Error = ExecError>
     {
-        AsyncClientInner::new_schema(self.inner, schema)
+        AsyncClientInner::new_schema(self.inner.clone(), schema)
     }
     pub fn del_schema(&self, name: String)
         -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
     {
-        AsyncClientInner::del_schema(self.inner, name)
+        AsyncClientInner::del_schema(self.inner.clone(), name)
     }
     pub fn get_all_schema(&self)
         -> impl Future<Item = Vec<Schema>, Error = ExecError>
     {
-        AsyncClientInner::get_all_schema(self.inner)
+        AsyncClientInner::get_all_schema(self.inner.clone())
     }
 }

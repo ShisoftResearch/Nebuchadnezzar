@@ -81,12 +81,12 @@ impl Service for TransactionManager {
         box future::result(self.inner.begin())
     }
     fn read(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>> {
-        box TransactionManagerInner::read(self.inner, tid, id)
+        box TransactionManagerInner::read(self.inner.clone(), tid, id)
     }
     fn read_selected(&self, tid: TxnId, id: Id, fields: Vec<u64>)
                      -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>>
     {
-        box TransactionManagerInner::read_selected(self.inner, tid, id, fields)
+        box TransactionManagerInner::read_selected(self.inner.clone(), tid, id, fields)
     }
     fn write(&self, tid: TxnId, cell: Cell) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
         box future::result(self.inner.write(tid, cell))
@@ -98,16 +98,16 @@ impl Service for TransactionManager {
         box future::result(self.inner.remove(tid, id))
     }
     fn prepare(&self, tid: TxnId) -> Box<Future<Item = TMPrepareResult, Error = TMError>> {
-        box TransactionManagerInner::prepare(self.inner, tid)
+        box TransactionManagerInner::prepare(self.inner.clone(), tid)
     }
     fn commit(&self, tid: TxnId) -> Box<Future<Item = EndResult, Error = TMError>> {
-        box TransactionManagerInner::commit(self.inner, tid)
+        box TransactionManagerInner::commit(self.inner.clone(), tid)
     }
     fn abort(&self, tid: TxnId) -> Box<Future<Item = AbortResult, Error = TMError>> {
-        box TransactionManagerInner::abort(self.inner, tid)
+        box TransactionManagerInner::abort(self.inner.clone(), tid)
     }
     fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> Box<Future<Item = (), Error = ()>> {
-        box TransactionManagerInner::go_ahead(self.inner, tids, server_id)
+        box TransactionManagerInner::go_ahead(self.inner.clone(), tids, server_id)
     }
 }
 
@@ -641,10 +641,10 @@ impl TransactionManagerInner {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
-                let changed_objs = txn.affected_objects;
-                let data_sites = this.data_sites(&changed_objs)?;
+                let changed_objs = &txn.affected_objects;
+                let data_sites = this.data_sites(changed_objs)?;
                 debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                await!(Self::sites_abort(this, tid, changed_objs, data_sites)) // with end
+                await!(Self::sites_abort(this.clone(), tid.clone(), changed_objs.clone(), data_sites)) // with end
             } else {
                 Ok(AbortResult::Success(None))
             }
@@ -686,7 +686,7 @@ impl AwaitingServer {
     }
     #[async]
     fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>) -> Result<(), ()> {
-        let lock = await!(sender)?;
+        let lock = await!(sender)?.clone();
         await!(lock.send(()))
             .map(|_| ())
             .map_err(|_| ())
