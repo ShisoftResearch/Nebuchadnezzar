@@ -164,13 +164,14 @@ impl TransactionManagerInner {
                 let dsr = dsr.unwrap();
                 this.merge_clock(&dsr.clock);
                 let payload = dsr.payload;
+                let payload_out = payload.clone();
                 match payload {
-                    TxnExecResult::Accepted(ref cell) => {
+                    TxnExecResult::Accepted(cell) => {
                         txn.data.insert(id, DataObject {
                             server: server_id,
-                            cell: Some(cell.clone()),
-                            new: false,
                             version: Some(cell.header.version),
+                            cell: Some(cell),
+                            new: false,
                             changed: false,
                         });
                     },
@@ -180,7 +181,7 @@ impl TransactionManagerInner {
                     }
                     _ => {}
                 }
-                Ok(payload)
+                Ok(payload_out)
             },
             Err(e) => {
                 error!("{:?}", e);
@@ -191,7 +192,7 @@ impl TransactionManagerInner {
     #[async]
     fn read_selected_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: TxnId, id: Id, fields: Vec<u64>, mut txn: TxnGuard, await: TxnAwaits
+        tid: TxnId, id: Id, fields: Vec<u64>, txn: TxnGuard, await: TxnAwaits
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
         let self_server_id = this.server.server_id;
         let read_response = await!(server.read_selected(
@@ -409,9 +410,9 @@ impl TransactionManagerInner {
     fn ensure_rw_state(&self, txn: &TxnGuard) -> Result<(), TMError> {
         self.ensure_txn_state(txn, TxnState::Started)
     }
-    fn cleanup_transaction(&self, tid: TxnId) -> Result<(), ()> {
+    fn cleanup_transaction(&self, tid: &TxnId) -> Result<(), ()> {
         let mut txn = self.transactions.write();
-        txn.remove(&tid);
+        txn.remove(tid);
         return Ok(());
     }
     ////////////////////////////
@@ -592,13 +593,13 @@ impl TransactionManagerInner {
             let result = {
                 this.ensure_rw_state(&txn)?;
                 this.generate_affected_objs(&mut txn);
-                let affect_objs = txn.affected_objects;
+                let affect_objs = txn.affected_objects.clone();
                 let data_sites = this.data_sites(&affect_objs)?;
                 let sites_prepare_result =
-                    await!(Self::sites_prepare(this, tid, affect_objs, data_sites.clone()))?;
+                    await!(Self::sites_prepare(this.clone(), tid.clone(), affect_objs.clone(), data_sites.clone()))?;
                 if sites_prepare_result == DMPrepareResult::Success {
                     let sites_commit_result =
-                        await!(Self::sites_commit(this, tid, affect_objs, data_sites))?;
+                        await!(Self::sites_commit(this.clone(), tid, affect_objs, data_sites))?;
                     match sites_commit_result {
                         DMCommitResult::Success => {
                             TMPrepareResult::Success
@@ -627,11 +628,11 @@ impl TransactionManagerInner {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             this.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = txn.affected_objects;
+            let affected_objs = txn.affected_objects.clone();
             let data_sites = this.data_sites(&affected_objs)?;
-            await!(Self::sites_end(this, tid, affected_objs, data_sites))
+            await!(Self::sites_end(this.clone(), tid.clone(), affected_objs, data_sites))
         };
-        this.cleanup_transaction(tid);
+        this.cleanup_transaction(&tid);
         return result;
     }
     #[async]
@@ -641,15 +642,15 @@ impl TransactionManagerInner {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
-                let changed_objs = &txn.affected_objects;
-                let data_sites = this.data_sites(changed_objs)?;
+                let changed_objs = txn.affected_objects.clone();
+                let data_sites = this.data_sites(&changed_objs)?;
                 debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                await!(Self::sites_abort(this.clone(), tid.clone(), changed_objs.clone(), data_sites)) // with end
+                await!(Self::sites_abort(this.clone(), tid.clone(), changed_objs, data_sites)) // with end
             } else {
                 Ok(AbortResult::Success(None))
             }
         };
-        this.cleanup_transaction(tid);
+        this.cleanup_transaction(&tid);
         return result;
     }
     #[async]
