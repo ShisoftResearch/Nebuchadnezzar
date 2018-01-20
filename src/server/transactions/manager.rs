@@ -51,22 +51,63 @@ service! {
     rpc go_ahead(tids: BTreeSet<TxnId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
 }
 
+pub struct TransactionManager {
+    inner: Arc<TransactionManagerInner>
+}
+dispatch_rpc_service_functions!(TransactionManager);
+
 pub struct TransactionManagerInner {
     server: Arc<NebServer>,
     transactions: RwLock<HashMap<TxnId, TxnMutex>>,
     data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager
 }
-dispatch_rpc_service_functions!(TransactionManager);
 
 impl TransactionManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
         Arc::new(TransactionManager {
-            server: server.clone(),
-            transactions: RwLock::new(HashMap::new()),
-            data_sites: CHashMap::new(),
-            await_manager: AwaitManager::new()
+            inner: Arc::new(TransactionManagerInner {
+                server: server.clone(),
+                transactions: RwLock::new(HashMap::new()),
+                data_sites: CHashMap::new(),
+                await_manager: AwaitManager::new()
+            })
         })
+    }
+}
+
+impl Service for TransactionManager {
+    fn begin(&self) -> Box<Future<Item = TxnId, Error = TMError>> {
+        box future::result(self.inner.begin())
+    }
+    fn read(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>> {
+        box TransactionManagerInner::read(self.inner, tid, id)
+    }
+    fn read_selected(&self, tid: TxnId, id: Id, fields: Vec<u64>)
+                     -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>>
+    {
+        box TransactionManagerInner::read_selected(self.inner, tid, id, fields)
+    }
+    fn write(&self, tid: TxnId, cell: Cell) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
+        box future::result(self.inner.write(tid, cell))
+    }
+    fn update(&self, tid: TxnId, cell: Cell) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
+        box future::result(self.inner.update(tid, cell))
+    }
+    fn remove(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
+        box future::result(self.inner.remove(tid, id))
+    }
+    fn prepare(&self, tid: TxnId) -> Box<Future<Item = TMPrepareResult, Error = TMError>> {
+        box TransactionManagerInner::prepare(self.inner, tid)
+    }
+    fn commit(&self, tid: TxnId) -> Box<Future<Item = EndResult, Error = TMError>> {
+        box TransactionManagerInner::commit(self.inner, tid)
+    }
+    fn abort(&self, tid: TxnId) -> Box<Future<Item = AbortResult, Error = TMError>> {
+        box TransactionManagerInner::abort(self.inner, tid)
+    }
+    fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> Box<Future<Item = (), Error = ()>> {
+        box TransactionManagerInner::go_ahead(self.inner, tids, server_id)
     }
 }
 
@@ -210,18 +251,22 @@ impl TransactionManagerInner {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
-        let prepared = await!(data_site.prepare(
-                &self_server_id,
-                &server.txn_peer.clock.to_clock(),
-                &tid, &cell_ids)).map_err(|_| TMError::RPCErrorFromCellServer)?;
-        server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
-        let prepare_payload = prepare.payload;
+        let prepare_payload = await!(data_site
+            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
+            .map_err(|_| -> TMError {
+                TMError::RPCErrorFromCellServer
+            })
+            .map(move |prepare_res| -> DMPrepareResult {
+                let prepare_res = prepare_res.unwrap();
+                server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
+                prepare_res.payload
+            }));
         match prepare_payload {
-            Ok(Ok(payload)) => {
+            Ok(payload) => {
                 match payload {
                     DMPrepareResult::Wait => {
                         await!(AwaitManager::txn_wait(&awaits, data_site.server_id));
-                        return await!(TransactionManager::site_prepare(
+                        return await!(TransactionManagerInner::site_prepare(
                             server, awaits, tid, objs, data_site
                         )) // after waiting, retry
                     },
@@ -230,7 +275,6 @@ impl TransactionManagerInner {
                     }
                 }
             },
-            Ok(Err(e)) => Err(e),
             Err(e) => Err(e)
         }
     }
@@ -240,7 +284,7 @@ impl TransactionManagerInner {
     {
         let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
-            TransactionManager::site_prepare(
+            TransactionManagerInner::site_prepare(
                 this.server.clone(),
                 this.await_manager.get_txn(&tid),
                 tid.clone(), objs, data_site
@@ -366,12 +410,13 @@ impl TransactionManagerInner {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: TxnId) -> Result<(), ()> {
-        let mut txn = this.transactions.write();
+        let mut txn = self.transactions.write();
         txn.remove(&tid);
         return Ok(());
     }
-
-    // STARTING IMPL RPC CALLS
+    ////////////////////////////
+    // STARTING IMPL RPC CALLS//
+    ////////////////////////////
     fn begin(&self) -> Result<TxnId, TMError> {
         let id = self.server.txn_peer.clock.inc();
         let mut txns = self.transactions.write();
@@ -446,8 +491,7 @@ impl TransactionManagerInner {
             }
         }
     }
-    fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>
-    {
+    fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_mutex = self.get_transaction(&tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
@@ -477,8 +521,7 @@ impl TransactionManagerInner {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn update(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>
-    {
+    fn update(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_mutex = self.get_transaction(&tid)?;
         let mut txn = txn_mutex.lock();
         let id = cell.id();
@@ -504,8 +547,7 @@ impl TransactionManagerInner {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn remove(&self, tid: TxnId, id: Id) -> Result<TxnExecResult<(), WriteError>, TMError>
-    {
+    fn remove(&self, tid: TxnId, id: Id) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_lock = self.get_transaction(&tid)?;
         let mut txn = txn_lock.lock();
         self.ensure_rw_state(&txn)?;
@@ -543,8 +585,7 @@ impl TransactionManagerInner {
         }
     }
     #[async]
-    fn prepare(this: Arc<Self>, tid: TxnId) -> Result<TMPrepareResult, TMError>
-    {
+    fn prepare(this: Arc<Self>, tid: TxnId) -> Result<TMPrepareResult, TMError> {
         let conclusion = {
             let txn_mutex = this.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock();
@@ -557,7 +598,7 @@ impl TransactionManagerInner {
                     await!(Self::sites_prepare(this, tid, affect_objs, data_sites.clone()))?;
                 if sites_prepare_result == DMPrepareResult::Success {
                     let sites_commit_result =
-                        await!(Self::sites_commit(this, tid, generated_objs, data_sites))?;
+                        await!(Self::sites_commit(this, tid, affect_objs, data_sites))?;
                     match sites_commit_result {
                         DMCommitResult::Success => {
                             TMPrepareResult::Success
@@ -581,8 +622,7 @@ impl TransactionManagerInner {
         return Ok(conclusion);
     }
     #[async]
-    fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError>
-    {
+    fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError> {
         let result = {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
@@ -617,7 +657,7 @@ impl TransactionManagerInner {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         let mut futures = Vec::new();
         for tid in tids {
-            let await_txn = self.await_manager.get_txn(&tid);
+            let await_txn = this.await_manager.get_txn(&tid);
             futures.push(AwaitManager::txn_send(&await_txn, server_id));
         }
         await!(future::join_all(futures));
