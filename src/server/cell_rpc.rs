@@ -15,9 +15,28 @@ service! {
     rpc remove_cell(key: Id) -> () | WriteError;
 }
 
+pub struct NebRPCService {
+    inner: Arc<NebRPCServiceInner>
+}
+
 pub struct NebRPCServiceInner {
     server: Arc<NebServer>,
     pool: CpuPool
+}
+
+impl Service for NebRPCService {
+    fn read_cell(&self, key: Id) -> Box<Future<Item = Cell, Error = ReadError>> {
+        NebRPCServiceInner::read_cell(self.inner, key)
+    }
+    fn write_cell(&self, mut cell: Cell) -> Box<Future<Item = Header, Error = WriteError>> {
+        NebRPCServiceInner::write_cell(self.inner, cell)
+    }
+    fn update_cell(&self, mut cell: Cell) -> Box<Future<Item = Header, Error = WriteError>> {
+        NebRPCServiceInner::update_cell(self.inner, cell)
+    }
+    fn remove_cell(&self, key: Id) -> Box<Future<Item = (), Error = WriteError>> {
+        NebRPCServiceInner::remove_cell(self.inner, key)
+    }
 }
 
 impl NebRPCServiceInner {
@@ -58,8 +77,10 @@ dispatch_rpc_service_functions!(NebRPCService);
 impl NebRPCService {
     pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
-            server: server.clone(),
-            pool: CpuPool::new(4 * num_cpus::get())
+            inner: Arc::new(NebRPCServiceInner {
+                server: server.clone(),
+                pool: CpuPool::new(4 * num_cpus::get())
+            })
         })
     }
 }
