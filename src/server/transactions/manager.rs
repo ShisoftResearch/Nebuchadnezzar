@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
-use bifrost::utils::async_locks::{Mutex, MutexGuard, RwLock};
+use bifrost::utils::async_locks::{Mutex, MutexGuard, AsyncMutexGuard, RwLock};
 use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
 use futures::{Sink};
 use futures::prelude::*;
@@ -680,14 +680,14 @@ impl AwaitingServer {
             receiver: PollableStream::from_stream(receiver)
         }
     }
-    pub fn send(&self)
-        -> impl Future<Item = (), Error = ()>
+    pub fn send(&self) -> impl Future<Item = (), Error = ()>
     {
-        self.sender
-            .lock_async()
-            .map(|tx| tx.clone())
-            .map_err(|_| SendError{0: ()})
-            .and_then(|s| s.send(()))
+        AwaitingServer::send_to_sender(self.sender.lock_async())
+    }
+    #[async]
+    fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>) -> Result<(), ()> {
+        let lock = await!(sender)?;
+        await!(lock.send(()))
             .map(|_| ())
             .map_err(|_| ())
     }
