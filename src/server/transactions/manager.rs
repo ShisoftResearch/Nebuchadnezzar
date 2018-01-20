@@ -587,11 +587,11 @@ impl TransactionManagerInner {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             this.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = &txn.affected_objects;
-            let data_sites = this.data_sites(affected_objs)?;
-            await!(this.sites_end(&tid, affected_objs, &data_sites))
+            let affected_objs = txn.affected_objects;
+            let data_sites = this.data_sites(&affected_objs)?;
+            await!(Self::sites_end(this, tid, affected_objs, data_sites))
         };
-        this.cleanup_transaction(&tid);
+        this.cleanup_transaction(tid);
         return result;
     }
     #[async]
@@ -601,19 +601,19 @@ impl TransactionManagerInner {
             let txn_lock = this.get_transaction(&tid)?;
             let txn = txn_lock.lock();
             if txn.state != TxnState::Aborted {
-                let changed_objs = &txn.affected_objects;
-                let data_sites = this.data_sites(changed_objs)?;
+                let changed_objs = txn.affected_objects;
+                let data_sites = this.data_sites(&changed_objs)?;
                 debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
                 await!(Self::sites_abort(this, tid, changed_objs, data_sites)) // with end
             } else {
                 Ok(AbortResult::Success(None))
             }
         };
-        this.cleanup_transaction(&tid);
+        this.cleanup_transaction(tid);
         return result;
     }
     #[async]
-    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Box<Future<Item = (), Error = ()>> {
+    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         let mut futures = Vec::new();
         for tid in tids {
