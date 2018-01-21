@@ -180,7 +180,6 @@ impl DataManager {
     fn cell_meta_cleanup(&self) {
         let mut cell_lru = self.cell_lru.lock();
         let mut cells = self.cells.lock();
-        let mut evicted_cells = Vec::new();
         let oldest_transaction = {
             let tnx_sorted = self.tnxs_sorted.lock();
             tnx_sorted.iter()
@@ -210,7 +209,7 @@ impl DataManager {
                 break;
             }
         }
-        for evicted_cell in &evicted_cells {
+        for evicted_cell in &cell_to_evict {
             cells.remove(evicted_cell);
             cell_lru.remove(evicted_cell);
         }

@@ -1,4 +1,4 @@
-use bifrost::raft::client::{RaftClient, SubscriptionError};
+use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 

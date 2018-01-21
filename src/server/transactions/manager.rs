@@ -1,12 +1,12 @@
 use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
-use chashmap::{CHashMap, WriteGuard};
+use chashmap::CHashMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use bifrost::utils::async_locks::{Mutex, MutexGuard, AsyncMutexGuard, RwLock};
-use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
+use futures::sync::mpsc::{channel, Sender};
 use futures::{Sink};
 use futures::prelude::*;
 use super::*;

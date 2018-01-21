@@ -5,7 +5,6 @@ use ram::types::{Id, Value};
 use std::sync::Arc;
 use std::io;
 use std::cell::{Cell as StdCell};
-use core::ops::Add;
 
 use bifrost::rpc::RPCError;
 use futures::Future;
