@@ -2,6 +2,7 @@ use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
 use chashmap::CHashMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::DerefMut;
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
@@ -150,16 +151,18 @@ impl TransactionManagerInner {
     }
     fn read_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: TxnId, id: Id, mut txn: TxnGuard, await: TxnAwaits
+        tid: TxnId, id: Id, txn: Arc<TxnGuard>, await: TxnAwaits
     ) -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError> {
         let self_server_id = this.server.server_id;
+        let this_clone = this.clone();
+        let txn_clone = txn.clone();
         server
             .read(
                 &self_server_id,
                 &this.get_clock(),
                 &tid, &id
             )
-            .then(|read_response|
+            .then(move |read_response|
                 match read_response {
                     Ok(dsr) => {
                         let dsr = dsr.unwrap();
@@ -168,29 +171,37 @@ impl TransactionManagerInner {
                         let payload_out = payload.clone();
                         match payload {
                             TxnExecResult::Accepted(cell) => {
-                                txn.data.insert(id, DataObject {
-                                    server: server_id,
-                                    version: Some(cell.header.version),
-                                    cell: Some(cell),
-                                    new: false,
-                                    changed: false,
-                                });
+                                txn.mutate().data.insert(id, DataObject
+                                    {
+                                        server: server_id,
+                                        version: Some(cell.header.version),
+                                        cell: Some(cell),
+                                        new: false,
+                                        changed: false,
+                                    });
                             },
                             TxnExecResult::Wait => {
-                                return
-                                    AwaitManager::txn_wait(&await, server_id)
-                                    .then(|_|
-                                        Self::read_from_site(this, server_id, server, tid, id, txn, await))
+                                return future::err::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>(())
                             }
                             _ => {}
                         }
-                        future::ok(payload_out)
+                        future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>
+                            (Ok(payload_out))
                     },
                     Err(e) => {
                         error!("{:?}", e);
-                        future::err(TMError::RPCErrorFromCellServer)
+                        future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>
+                            (Err(TMError::RPCErrorFromCellServer))
                     }
                 })
+            .or_else(move |_|
+                AwaitManager::txn_wait(&await, server_id)
+                    .then(move |_|
+                        Self::read_from_site(this_clone, server_id, server, tid, id, txn_clone, await)
+                            .then(|r|
+                                future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>(r))))
+            .then(|r|
+                future::result(r.unwrap()))
     }
     #[async]
     fn read_selected_from_site(
@@ -450,6 +461,7 @@ impl TransactionManagerInner {
         let server = this.get_data_site_by_id(&id);
         match server {
             Ok((server_id, server)) => {
+                let txn = Arc::new(txn);
                 let await = this.await_manager.get_txn(&tid);
                 await!(Self::read_from_site(this, server_id, server, tid, id, txn, await))
             },
