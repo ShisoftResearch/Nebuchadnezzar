@@ -148,46 +148,49 @@ impl TransactionManagerInner {
             }
         }
     }
-    #[async]
     fn read_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId, id: Id, mut txn: TxnGuard, await: TxnAwaits
-    ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
+    ) -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError> {
         let self_server_id = this.server.server_id;
-        let read_response = await!(server.read(
-            &self_server_id,
-            &this.get_clock(),
-            &tid, &id
-        ));
-        match read_response {
-            Ok(dsr) => {
-                let dsr = dsr.unwrap();
-                this.merge_clock(&dsr.clock);
-                let payload = dsr.payload;
-                let payload_out = payload.clone();
-                match payload {
-                    TxnExecResult::Accepted(cell) => {
-                        txn.data.insert(id, DataObject {
-                            server: server_id,
-                            version: Some(cell.header.version),
-                            cell: Some(cell),
-                            new: false,
-                            changed: false,
-                        });
+        server
+            .read(
+                &self_server_id,
+                &this.get_clock(),
+                &tid, &id
+            )
+            .then(|read_response|
+                match read_response {
+                    Ok(dsr) => {
+                        let dsr = dsr.unwrap();
+                        this.merge_clock(&dsr.clock);
+                        let payload = dsr.payload;
+                        let payload_out = payload.clone();
+                        match payload {
+                            TxnExecResult::Accepted(cell) => {
+                                txn.data.insert(id, DataObject {
+                                    server: server_id,
+                                    version: Some(cell.header.version),
+                                    cell: Some(cell),
+                                    new: false,
+                                    changed: false,
+                                });
+                            },
+                            TxnExecResult::Wait => {
+                                return
+                                    AwaitManager::txn_wait(&await, server_id)
+                                    .then(|_|
+                                        Self::read_from_site(this, server_id, server, tid, id, txn, await))
+                            }
+                            _ => {}
+                        }
+                        future::ok(payload_out)
                     },
-                    TxnExecResult::Wait => {
-                        await!(AwaitManager::txn_wait(&await, server_id));
-                        return await!(Self::read_from_site(this, server_id, server, tid, id, txn, await));
+                    Err(e) => {
+                        error!("{:?}", e);
+                        future::err(TMError::RPCErrorFromCellServer)
                     }
-                    _ => {}
-                }
-                Ok(payload_out)
-            },
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::RPCErrorFromCellServer)
-            }
-        }
+                })
     }
     #[async]
     fn read_selected_from_site(
