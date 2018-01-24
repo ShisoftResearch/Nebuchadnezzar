@@ -168,30 +168,27 @@ impl TransactionManagerInner {
                         let dsr = dsr.unwrap();
                         this.merge_clock(&dsr.clock);
                         let payload = dsr.payload;
-                        let payload_out = payload.clone();
                         match payload {
-                            TxnExecResult::Accepted(cell) => {
+                            TxnExecResult::Accepted(ref cell) => {
                                 txn.mutate().data.insert(id, DataObject
                                     {
                                         server: server_id,
                                         version: Some(cell.header.version),
-                                        cell: Some(cell),
+                                        cell: Some(cell.clone()),
                                         new: false,
                                         changed: false,
                                     });
                             },
                             TxnExecResult::Wait => {
-                                return future::err::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>(())
+                                return future::err(())
                             }
                             _ => {}
                         }
-                        future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>
-                            (Ok(payload_out))
+                        future::ok(Ok(payload))
                     },
                     Err(e) => {
                         error!("{:?}", e);
-                        future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>
-                            (Err(TMError::RPCErrorFromCellServer))
+                        future::ok(Err(TMError::RPCErrorFromCellServer))
                     }
                 })
             .or_else(move |_|
@@ -199,40 +196,47 @@ impl TransactionManagerInner {
                     .then(move |_|
                         Self::read_from_site(this_clone, server_id, server, tid, id, txn_clone, await)
                             .then(|r|
-                                future::ok::<Result<TxnExecResult<Cell, ReadError>, TMError>, ()>(r))))
-            .then(|r|
+                                future::ok(r))))
+            .then(|r: Result<_, ()>|
                 future::result(r.unwrap()))
     }
-    #[async]
     fn read_selected_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: TxnId, id: Id, fields: Vec<u64>, txn: TxnGuard, await: TxnAwaits
-    ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
+        tid: TxnId, id: Id, fields: Vec<u64>, txn: Arc<TxnGuard>, await: TxnAwaits
+    ) -> impl Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError> {
         let self_server_id = this.server.server_id;
-        let read_response = await!(server.read_selected(
-            &self_server_id,
-            &this.get_clock(),
-            &tid, &id, &fields
-        ));
-        match read_response {
-            Ok(dsr) => {
-                let dsr = dsr.unwrap();
-                this.merge_clock(&dsr.clock);
-                let payload = dsr.payload;
-                match payload {
-                    TxnExecResult::Wait => {
-                        await!(AwaitManager::txn_wait(&await, server_id));
-                        return await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await));
+        let this_clone = this.clone();
+        server
+            .read_selected(
+                &self_server_id,
+                &this.get_clock(),
+                &tid, &id, &fields
+            ).then(move |read_response|
+                match read_response {
+                    Ok(dsr) => {
+                        let dsr = dsr.unwrap();
+                        this.merge_clock(&dsr.clock);
+                        let payload = dsr.payload;
+                        match payload {
+                            TxnExecResult::Wait => {
+                                return future::err(())
+                            }
+                            _ => {}
+                        }
+                        future::ok(Ok(payload))
+                    },
+                    Err(e) => {
+                        error!("{:?}", e);
+                        future::ok(Err(TMError::RPCErrorFromCellServer))
                     }
-                    _ => {}
-                }
-                Ok(payload)
-            },
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::RPCErrorFromCellServer)
-            }
-        }
+                })
+            .or_else(move |_| {
+                AwaitManager::txn_wait(&await, server_id)
+                    .then(move |_|
+                        Self::read_selected_from_site(this_clone, server_id, server, tid, id, fields, txn, await)
+                            .then(|r| future::ok(r)))})
+            .then(|r: Result<_, ()>|
+                future::result(r.unwrap()))
     }
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
@@ -499,6 +503,7 @@ impl TransactionManagerInner {
         match server {
             Ok((server_id, server)) => {
                 let await = this.await_manager.get_txn(&tid);
+                let txn = Arc::new(txn);
                 await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await))
             },
             Err(e) => {
