@@ -323,9 +323,9 @@ impl TransactionManagerInner {
                 DMPrepareResult::Success
             })
     }
-    #[async]
     fn sites_commit(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-                    -> Result<DMCommitResult, TMError> {
+        -> impl Future<Item = DMCommitResult, Error = TMError>
+    {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter()
@@ -344,25 +344,27 @@ impl TransactionManagerInner {
             }).collect();
             data_site.commit(&this.get_clock(), &tid, &ops)
         }).collect();
-        let commit_results = await!(future::join_all(commit_futures));
-        if let Ok(commit_results) = commit_results {
-            for result in commit_results {
-                if let Ok(dsr) = result {
-                    this.merge_clock(&dsr.clock);
-                    match dsr.payload {
-                        DMCommitResult::Success => {},
-                        _ => {
-                            return Ok(dsr.payload);
+        future::join_all(commit_futures)
+            .then(move |commit_results| {
+                if let Ok(commit_results) = commit_results {
+                    for result in commit_results {
+                        if let Ok(dsr) = result {
+                            this.merge_clock(&dsr.clock);
+                            match dsr.payload {
+                                DMCommitResult::Success => {},
+                                _ => {
+                                    return Ok(dsr.payload);
+                                }
+                            }
+                        } else {
+                            return Err(TMError::AssertionError)
                         }
                     }
                 } else {
-                    return Err(TMError::AssertionError)
+                    return Err(TMError::RPCErrorFromCellServer)
                 }
-            }
-        } else {
-            return Err(TMError::RPCErrorFromCellServer)
-        }
-        Ok(DMCommitResult::Success)
+                Ok(DMCommitResult::Success)
+            })
     }
     #[async]
     fn sites_abort(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
