@@ -365,7 +365,8 @@ impl TransactionManagerInner {
     }
     #[async]
     fn sites_abort(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> Result<AbortResult, TMError> {
+        -> Result<AbortResult, TMError>
+    {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&this.get_clock(), &tid)
