@@ -301,9 +301,8 @@ impl TransactionManagerInner {
             .then(|r: Result<_, ()>|
                 future::result(r.unwrap()))
     }
-    #[async]
     fn sites_prepare(this: Arc<Self>, tid: TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> Result<DMPrepareResult, TMError>
+        -> impl Future<Item = DMPrepareResult, Error = TMError>
     {
         let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
@@ -313,14 +312,16 @@ impl TransactionManagerInner {
                 tid.clone(), objs, data_site
             )
         }).collect();
-        let prepare_results = await!(future::join_all(prepare_futures))?;
-        for result in prepare_results {
-            match result {
-                DMPrepareResult::Success => {},
-                _ => {return Ok(result)}
-            }
-        }
-        Ok(DMPrepareResult::Success)
+        future::join_all(prepare_futures)
+            .map(|prepare_results| {
+                for result in prepare_results {
+                    match result {
+                        DMPrepareResult::Success => {},
+                        _ => {return result}
+                    }
+                }
+                DMPrepareResult::Success
+            })
     }
     #[async]
     fn sites_commit(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
