@@ -262,15 +262,14 @@ impl TransactionManagerInner {
             }
         ).collect())
     }
-    #[async]
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> Result<DMPrepareResult, TMError> {
+    ) -> impl Future<Item = DMPrepareResult, Error = TMError> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
-        let prepare_payload = await!(data_site
+        data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
             .map_err(|_| -> TMError {
                 TMError::RPCErrorFromCellServer
@@ -279,23 +278,28 @@ impl TransactionManagerInner {
                 let prepare_res = prepare_res.unwrap();
                 server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
                 prepare_res.payload
-            }));
-        match prepare_payload {
-            Ok(payload) => {
-                match payload {
-                    DMPrepareResult::Wait => {
-                        await!(AwaitManager::txn_wait(&awaits, data_site.server_id));
-                        return await!(TransactionManagerInner::site_prepare(
-                            server, awaits, tid, objs, data_site
-                        )) // after waiting, retry
+            })
+            .then(|prepare_payload|
+                match prepare_payload {
+                    Ok(payload) => {
+                        match payload {
+                            DMPrepareResult::Wait => {
+                                return future::err(())
+                            },
+                            _ => {
+                                return future::ok(Ok(payload))
+                            }
+                        }
                     },
-                    _ => {
-                        return Ok(payload)
-                    }
-                }
-            },
-            Err(e) => Err(e)
-        }
+                    Err(e) => future::ok(Err(e))
+                })
+            .or_else(|_|
+                AwaitManager::txn_wait(&awaits, data_site.server_id)
+                    .then(|_|
+                        TransactionManagerInner::site_prepare(server, awaits, tid, objs, data_site)
+                            .then(|r| future::ok(r))))// after waiting, retry
+            .then(|r: Result<_, ()>|
+                future::result(r.unwrap()))
     }
     #[async]
     fn sites_prepare(this: Arc<Self>, tid: TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
