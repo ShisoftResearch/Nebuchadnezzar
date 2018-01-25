@@ -374,27 +374,29 @@ impl TransactionManagerInner {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&this.get_clock(), &tid)
         }).collect();
-        let abort_results = await!(future::join_all(abort_futures));
-        if abort_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
-        let abort_results = abort_results.unwrap();
-        let mut rollback_failures = Vec::new();
-        for result in abort_results {
-            match result {
-                Ok(asr) => {
-                    let payload = asr.payload;
-                    this.merge_clock(&asr.clock);
-                    match payload {
-                        AbortResult::Success(failures) => {
-                            if let Some(mut failures) = failures {
-                                rollback_failures.append(&mut failures);
+        future::join_all(abort_futures)
+            .map_err(|_| TMError::RPCErrorFromCellServer)
+            .then(|abort_results| {
+                let mut rollback_failures = Vec::new();
+                for result in abort_results {
+                    match result {
+                        Ok(asr) => {
+                            let payload = asr.payload;
+                            this.merge_clock(&asr.clock);
+                            match payload {
+                                AbortResult::Success(failures) => {
+                                    if let Some(mut failures) = failures {
+                                        rollback_failures.append(&mut failures);
+                                    }
+                                },
+                                _ => (return Ok(payload))
                             }
                         },
-                        _ => (return Ok(payload))
+                        Err(_) => {return Err(TMError::AssertionError)}
                     }
-                },
-                Err(_) => {return Err(TMError::AssertionError)}
-            }
-        }
+                }
+            })
+
         await!(Self::sites_end(this, tid, changed_objs, data_sites))?;
         Ok(AbortResult::Success(
             if rollback_failures.is_empty()
