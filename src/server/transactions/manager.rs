@@ -366,17 +366,17 @@ impl TransactionManagerInner {
                 Ok(DMCommitResult::Success)
             })
     }
-    #[async]
     fn sites_abort(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> Result<AbortResult, TMError>
+        -> impl Future<Item = AbortResult, Error = TMError>
     {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&this.get_clock(), &tid)
         }).collect();
+        let this_clone = this.clone();
         future::join_all(abort_futures)
-            .map_err(|_| TMError::RPCErrorFromCellServer)
-            .then(|abort_results| {
+            .map_err(|_| Err(TMError::RPCErrorFromCellServer))
+            .and_then(move |abort_results| {
                 let mut rollback_failures = Vec::new();
                 for result in abort_results {
                     match result {
@@ -389,19 +389,31 @@ impl TransactionManagerInner {
                                         rollback_failures.append(&mut failures);
                                     }
                                 },
-                                _ => (return Ok(payload))
+                                _ => return Err(Ok(payload))
                             }
                         },
-                        Err(_) => {return Err(TMError::AssertionError)}
+                        Err(_) => {return Err(Err(TMError::AssertionError))}
                     }
+                }
+                return Ok(rollback_failures)
+            })
+            .and_then(|rollback_failures|
+                Self::sites_end(this_clone, tid, changed_objs, data_sites)
+                    .map_err(|e| Err(e))
+                    .and_then(|_: EndResult| {
+                        Ok(AbortResult::Success(
+                            if rollback_failures.is_empty()
+                                {None} else {Some(rollback_failures)}
+                        ))
+                    }))
+            .then(|results|{
+                match results {
+                    Err(Err(e)) => Err(e),
+                    Err(Ok(r)) => Ok(r),
+                    Ok(r) => Ok(r)
                 }
             })
 
-        await!(Self::sites_end(this, tid, changed_objs, data_sites))?;
-        Ok(AbortResult::Success(
-            if rollback_failures.is_empty()
-                {None} else {Some(rollback_failures)}
-        ))
     }
     #[async]
     fn sites_end(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
