@@ -664,6 +664,7 @@ impl TransactionManagerInner {
         };
         return Ok(conclusion);
     }
+    //// KEEP ASYNC ATTRIBUTE
     #[async]
     fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError> {
         let result = {
