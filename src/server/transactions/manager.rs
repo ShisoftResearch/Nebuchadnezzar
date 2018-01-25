@@ -472,30 +472,37 @@ impl TransactionManagerInner {
             Ok(id)
         }
     }
-    #[async]
-    fn read(this: Arc<Self>, tid: TxnId, id: Id) -> Result<TxnExecResult<Cell, ReadError>, TMError>
+    fn read(this: Arc<Self>, tid: TxnId, id: Id)
+        -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>
     {
-        let txn_mutex = this.get_transaction(&tid)?;
-        let txn = txn_mutex.lock();
-        this.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(&id) {
-            match data_obj.cell {
-                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
-                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
-            }
-        }
-        let server = this.get_data_site_by_id(&id);
-        match server {
-            Ok((server_id, server)) => {
-                let txn = Arc::new(txn);
-                let await = this.await_manager.get_txn(&tid);
-                await!(Self::read_from_site(this, server_id, server, tid, id, txn, await))
-            },
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::CannotLocateCellServer)
-            }
-        }
+        future::result(this.get_transaction(&tid))
+            .and_then(|txn_mutex| {
+                let txn = txn_mutex.lock();
+                this.ensure_rw_state(&txn)
+                    .map(|_| txn)
+            })
+            .and_then(|txn| {
+                future::result(txn.data.get(&id).ok_or(()))
+                    .and_then(|data_obj| {
+                        // try read from cache
+                        data_obj.cell
+                            .ok_or(TxnExecResult::Error(ReadError::CellDoesNotExisted))
+                            .map(|ref cell| Ok(TxnExecResult::Accepted(cell.clone())))
+                    })
+                    .or_else(|_| {
+                        // not found, fetch from data site
+                        future::result(this.get_data_site_by_id(&id))
+                            .map_err(|e| {
+                                error!("{:?}", e);
+                                TMError::CannotLocateCellServer
+                            })
+                            .and_then(|(server_id, server)| {
+                                let txn = Arc::new(txn);
+                                let await = this.await_manager.get_txn(&tid);
+                                Self::read_from_site(this, server_id, server, tid, id, txn, await)
+                            })
+                    })
+            })
     }
     #[async]
     fn read_selected(this: Arc<Self>, tid: TxnId, id: Id, fields: Vec<u64>)
