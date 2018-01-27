@@ -504,46 +504,54 @@ impl TransactionManagerInner {
                                 let txn = Arc::new(txn);
                                 let await = this_clone2.await_manager.get_txn(&tid);
                                 Self::read_from_site(this_clone2, server_id, server, tid, id, txn, await)
-                            })    
+                            })
                     })
             })
     }
-    #[async]
     fn read_selected(this: Arc<Self>, tid: TxnId, id: Id, fields: Vec<u64>)
-        -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError>
+        -> impl Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>
     {
-        let txn_mutex = this.get_transaction(&tid)?;
-        let txn = txn_mutex.lock();
-        this.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(&id) {
-            match data_obj.cell {
-                Some(ref cell) => {
-                    let mut result = Vec::with_capacity(fields.len());
-                    match cell.data {
-                        Value::Map(ref map) => {
-                            for field in fields {
-                                result.push(map.get_by_key_id(field).clone())
-                            }
-                        },
-                        _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect))
-                    }
-                    return Ok(TxnExecResult::Accepted(result))
-                }, // read from cache
-                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
-            }
-        }
-        let server = this.get_data_site_by_id(&id);
-        match server {
-            Ok((server_id, server)) => {
-                let await = this.await_manager.get_txn(&tid);
-                let txn = Arc::new(txn);
-                await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await))
-            },
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::CannotLocateCellServer)
-            }
-        }
+        let this_clone1 = this.clone();
+        let fields_clone = fields.clone();
+        future::result(this.get_transaction(&tid))
+            .and_then(move |txn_mutex| {
+                let txn = txn_mutex.lock();
+                this.ensure_rw_state(&txn)
+                    .map(|_| txn)
+            })
+            .and_then(move |txn| {
+                future::result(txn.data.get(&id)
+                    .map(|data_obj| {
+                        // try read from cache
+                        match data_obj.cell {
+                            Some(ref cell) => {
+                                let mut result = Vec::with_capacity(fields.len());
+                                match cell.data {
+                                    Value::Map(ref map) => {
+                                        for field in fields {
+                                            result.push(map.get_by_key_id(field).clone())
+                                        }
+                                    },
+                                    _ => return TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect)
+                                }
+                                TxnExecResult::Accepted(result)
+                            },
+                            None => TxnExecResult::Error(ReadError::CellDoesNotExisted)
+                        }
+                    })
+                    .ok_or(()))
+                    .or_else(move |_| {
+                        future::result(this_clone1.get_data_site_by_id(&id))
+                            .map_err(|e| {
+                                TMError::CannotLocateCellServer
+                            })
+                            .and_then(move |(server_id, server)| {
+                                let await = this_clone1.await_manager.get_txn(&tid);
+                                let txn = Arc::new(txn);
+                                Self::read_selected_from_site(this_clone1, server_id, server, tid, id, fields_clone, txn, await)
+                            })
+                    })
+            })
     }
     fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_mutex = self.get_transaction(&tid)?;
