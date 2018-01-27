@@ -646,42 +646,53 @@ impl TransactionManagerInner {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    #[async]
-    fn prepare(this: Arc<Self>, tid: TxnId) -> Result<TMPrepareResult, TMError> {
-        let conclusion = {
-            let txn_mutex = this.get_transaction(&tid)?;
-            let mut txn = txn_mutex.lock();
-            let result = {
-                this.ensure_rw_state(&txn)?;
-                this.generate_affected_objs(&mut txn);
+    fn prepare(this: Arc<Self>, tid: TxnId)
+        -> impl Future<Item = TMPrepareResult, Error = TMError>
+    {
+        let this_clone1 = this.clone();
+        let this_clone2 = this.clone();
+        let this_clone3 = this.clone();
+        let tid_clone = tid.clone();
+        future::result(this.get_transaction(&tid))
+            .map(|txn_mutex| txn_mutex.lock())
+            .and_then(move |txn| {
+                this.ensure_rw_state(&txn)
+                    .map(|_| txn)
+            })
+            .and_then(move |txn| {
                 let affect_objs = txn.affected_objects.clone();
-                let data_sites = this.data_sites(&affect_objs)?;
-                let sites_prepare_result =
-                    await!(Self::sites_prepare(this.clone(), tid.clone(), affect_objs.clone(), data_sites.clone()))?;
-                if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result =
-                        await!(Self::sites_commit(this.clone(), tid, affect_objs, data_sites))?;
-                    match sites_commit_result {
-                        DMCommitResult::Success => {
-                            TMPrepareResult::Success
-                        },
-                        _ => {
-                            TMPrepareResult::DMCommitError(sites_commit_result)
-                        }
+                this_clone1.data_sites(&affect_objs)
+                    .map(|data_sites| {
+                        (data_sites, affect_objs, txn)
+                    })
+            })
+            .and_then(move |(data_sites, affect_objs, txn)| {
+                Self::sites_prepare(this_clone2, tid, affect_objs.clone(), data_sites.clone())
+                    .map(|sites_prepare_result|
+                        (sites_prepare_result, data_sites, affect_objs, txn))
+            })
+            .and_then(move |(sites_prepare_result, data_sites, affect_objs, mut txn)| {
+                future::result(
+                    if sites_prepare_result == DMPrepareResult::Success {
+                        Err(())
+                    } else {
+                        Ok(TMPrepareResult::DMPrepareError(sites_prepare_result))
                     }
-                } else {
-                    TMPrepareResult::DMPrepareError(sites_prepare_result)
-                }
-            };
-            match result {
-                TMPrepareResult::Success => {
-                    txn.state = TxnState::Prepared;
-                },
-                _ => {}
-            }
-            result
-        };
-        return Ok(conclusion);
+                )
+                .or_else(move |_|
+                    Self::sites_commit(this_clone3, tid_clone, affect_objs, data_sites)
+                        .map(move |sites_commit_result| {
+                            match sites_commit_result {
+                                DMCommitResult::Success => {
+                                    txn.state = TxnState::Prepared;
+                                    TMPrepareResult::Success
+                                },
+                                _ => {
+                                    TMPrepareResult::DMCommitError(sites_commit_result)
+                                }
+                            }
+                        }))
+            })
     }
     //// KEEP ASYNC ATTRIBUTE
     #[async]
