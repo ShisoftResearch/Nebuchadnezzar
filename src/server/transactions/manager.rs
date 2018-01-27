@@ -415,30 +415,31 @@ impl TransactionManagerInner {
             })
 
     }
-    #[async]
     fn sites_end(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> Result<EndResult, TMError>
+        -> impl Future<Item = EndResult, Error = TMError>
     {
         let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.end(&this.get_clock(), &tid)
         }).collect();
-        let end_results = await!(future::join_all(end_futures));
-        if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
-        let end_results = end_results.unwrap();
-        for result in end_results {
-            if let Ok(result) = result {
-                this.merge_clock(&result.clock);
-                let payload = result.payload;
-                match payload {
-                    EndResult::Success => {},
-                    _ => {return Ok(payload);}
+        future::join_all(end_futures)
+            .then(move |end_results| {
+                if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
+                let end_results = end_results.unwrap();
+                for result in end_results {
+                    if let Ok(result) = result {
+                        this.merge_clock(&result.clock);
+                        let payload = result.payload;
+                        match payload {
+                            EndResult::Success => {},
+                            _ => {return Ok(payload);}
+                        }
+                    } else {
+                        return Err(TMError::AssertionError);
+                    }
                 }
-            } else {
-                return Err(TMError::AssertionError);
-            }
-        }
-        Ok(EndResult::Success)
+                Ok(EndResult::Success)
+            })
     }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
