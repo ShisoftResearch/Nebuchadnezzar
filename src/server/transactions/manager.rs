@@ -238,7 +238,7 @@ impl TransactionManagerInner {
             .then(|r: Result<_, ()>|
                 future::result(r.unwrap()))
     }
-    fn generate_affected_objs(&self, txn: &mut TxnGuard) {
+    fn generate_affected_objs(txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in &txn.data {
             affected_objs
@@ -660,7 +660,8 @@ impl TransactionManagerInner {
                 this.ensure_rw_state(&txn)
                     .map(|_| txn)
             })
-            .and_then(move |txn| {
+            .and_then(move |mut txn| {
+                Self::generate_affected_objs(&mut txn);
                 let affect_objs = txn.affected_objects.clone();
                 this_clone1.data_sites(&affect_objs)
                     .map(|data_sites| {
