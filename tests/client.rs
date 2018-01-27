@@ -10,6 +10,7 @@ use std::sync::Arc;
 use env_logger;
 use std::time::Duration;
 use parking_lot::Mutex;
+use futures::Future;
 
 use super::*;
 
@@ -39,20 +40,20 @@ pub fn general() {
     let client = Arc::new(client::AsyncClient::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
-    client.new_schema(&mut schema).unwrap();
+    let schema_id = client.new_schema(schema).wait().unwrap().unwrap();
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
-    client.write_cell(&cell_1).unwrap().unwrap();
-    client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    client.write_cell(cell_1.clone()).wait().unwrap().unwrap();
+    client.read_cell(cell_1.clone().id()).wait().unwrap().unwrap();
     client.transaction(|ref mut trans| {
         Ok(()) // empty transaction
-    }).unwrap();
+    }).wait().unwrap();
     let should_aborted = client.transaction(|ref mut trans| {
         trans.abort()
-    });
+    }).wait();
     match should_aborted {
         Err(TxnError::Aborted(_)) => {},
         _ => panic!("{:?}", should_aborted)
@@ -62,10 +63,10 @@ pub fn general() {
 //    client.transaction(|ref mut trans| {
 //        trans.write(&cell_1) // regular fail case
 //    }).err().unwrap();
-    client.transaction(|ref mut trans| {
-        let empty_cell = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(Map::new()));
+    client.transaction(move |ref mut trans| {
+        let empty_cell = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(Map::new()));
         trans.write(&empty_cell) // empty cell write should fail
-    }).err().unwrap();
+    }).wait().err().unwrap();
 
     let cell_1_id = cell_1.id();
     let thread_count = 50;
@@ -73,7 +74,7 @@ pub fn general() {
     for _ in 0..thread_count {
         let client = client.clone();
         threads.push(thread::spawn(move || {
-            client.transaction(|ref mut txn| {
+            client.transaction(move |ref mut txn| {
                 let selected = txn.read_selected(&cell_1_id, &types::key_hashes(
                     &vec![String::from("score")]
                 ))?.unwrap();
@@ -90,13 +91,13 @@ pub fn general() {
                 ))?.unwrap();
                 assert_eq!(selected.first().unwrap().U64().unwrap(), score);
                 Ok(())
-            }).unwrap();
+            }).wait().unwrap();
         }));
     }
     for handle in threads {
         handle.join();
     }
-    let mut cell_1_r = client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let mut cell_1_r = client.read_cell(cell_1.id()).wait().unwrap().unwrap();
     assert_eq!(cell_1_r.data["score"].U64().unwrap(), thread_count as u64);
 }
 
@@ -128,19 +129,20 @@ pub fn multi_cell_update() {
         server_group).unwrap());
     let thread_count = 100;
     let mut threads: Vec<thread::JoinHandle<()>> = Vec::with_capacity(thread_count);
-    client.new_schema(&mut schema).unwrap();
+    let schema_id = schema.id;
+    client.new_schema(schema).wait().unwrap();
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
-    client.write_cell(&cell_1).unwrap().unwrap();
-    client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    client.write_cell(cell_1.clone()).wait().unwrap().unwrap();
+    client.read_cell(cell_1.id()).wait().unwrap().unwrap();
     let cell_1_id = cell_1.id();
     let mut cell_2 = cell_1.clone();
     cell_2.set_id(&Id::rand());
-    client.write_cell(&cell_2).unwrap().unwrap();
-    client.read_cell(&cell_2.id()).unwrap().unwrap();
+    client.write_cell(cell_2.clone()).wait().unwrap().unwrap();
+    client.read_cell(cell_2.id()).wait().unwrap().unwrap();
     let cell_2_id = cell_2.id();
     threads = Vec::new();
     for i in 0..thread_count {
@@ -164,14 +166,14 @@ pub fn multi_cell_update() {
                 txn.update(&cell_1)?;
                 txn.update(&cell_2)?;
                 Ok(())
-            }).unwrap();
+            }).wait().unwrap();
         }));
     }
     for handle in threads {
         handle.join();
     }
-    let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
-    let mut cell_2_r = client.read_cell(&cell_2_id).unwrap().unwrap();
+    let mut cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
+    let mut cell_2_r = client.read_cell(cell_2_id).wait().unwrap().unwrap();
     let cell_1_score = cell_1_r.data["score"].U64().unwrap();
     let cell_2_score = cell_2_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
@@ -204,14 +206,14 @@ pub fn write_skew() {
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
     let thread_count = 100;
-    client.new_schema(&mut schema).unwrap();
+    let schema_id = client.new_schema(schema).wait().unwrap().unwrap();
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
-    client.write_cell(&cell_1).unwrap().unwrap();
-    client.read_cell(&cell_1.id()).unwrap().unwrap();
+    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    client.write_cell(cell_1.clone()).wait().unwrap().unwrap();
+    client.read_cell(cell_1.id()).wait().unwrap().unwrap();
     let cell_1_id = cell_1.id();
     let client_c1 = client.clone();
     let skew_tried = Arc::new(Mutex::new(0));
@@ -221,7 +223,7 @@ pub fn write_skew() {
     let normal_tried_c = normal_tried.clone();
 
     let t1 = thread::spawn(move || {
-        client_c1.transaction(|ref mut txn| {
+        client_c1.transaction(move |ref mut txn| {
             *skew_tried_c.lock() += 1;
             let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
             let mut score_1 = cell_1.data["score"].U64().unwrap();
@@ -236,7 +238,7 @@ pub fn write_skew() {
     });
     let client_c2 = client.clone();
     let t2 = thread::spawn(move || {
-        client_c2.transaction(|ref mut txn| {
+        client_c2.transaction(move |ref mut txn| {
             thread::sleep(Duration::new(1, 0));
             *normal_tried_c.lock() += 1;
             let mut cell_1 = txn.read(&cell_1_id)?.unwrap();
@@ -251,7 +253,7 @@ pub fn write_skew() {
     });
     t2.join();
     t1.join();
-    let mut cell_1_r = client.read_cell(&cell_1_id).unwrap().unwrap();
+    let mut cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
     let cell_1_score = cell_1_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score, 2);
 //    assert_eq!(*skew_tried.lock(), 2);
@@ -319,12 +321,12 @@ pub fn server_isolation() {
         is_dynamic: false
     };
 
-    client1.new_schema_with_id(&schema1).unwrap().unwrap();
-    client2.new_schema_with_id(&schema2).unwrap().unwrap();
+    client1.new_schema_with_id(schema1.clone()).wait().unwrap().unwrap();
+    client2.new_schema_with_id(schema2.clone()).wait().unwrap().unwrap();
 
-    println!("{:?}", client1.schema_client.get(&schema1.id));
+    // println!("{:?}", client1.schema_client.get(&schema1.id));
 
-    let schema_1_got: Schema = client1.get_all_schema().unwrap().first().unwrap().clone();
+    let schema_1_got: Schema = client1.get_all_schema().wait().unwrap().first().unwrap().clone();
     assert_eq!(schema_1_got.id, 1);
     let schema_1_fields = schema1.fields;
     assert_eq!(
@@ -340,7 +342,7 @@ pub fn server_isolation() {
         default_fields().sub_fields.unwrap().get(2).unwrap().name
     );
 
-    let schema_2_got: Schema = client2.get_all_schema().unwrap().first().unwrap().clone();
+    let schema_2_got: Schema = client2.get_all_schema().wait().unwrap().first().unwrap().clone();
     assert_eq!(schema_2_got.id, 1);
     let schema_2_fields = schema2.fields;
     assert_eq!(
