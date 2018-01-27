@@ -716,23 +716,36 @@ impl TransactionManagerInner {
                 return r;
             })
     }
-    #[async]
-    fn abort(this: Arc<Self>, tid: TxnId) -> Result<AbortResult, TMError> {
+    fn abort(this: Arc<Self>, tid: TxnId)
+        -> impl Future<Item = AbortResult, Error = TMError>
+    {
+        let this_clone1 = this.clone();
+        let tid_clone1 = tid.clone();
         debug!("TXN ABORT IN MGR {:?}", &tid);
-        let result = {
-            let txn_lock = this.get_transaction(&tid)?;
-            let txn = txn_lock.lock();
-            if txn.state != TxnState::Aborted {
-                let changed_objs = txn.affected_objects.clone();
-                let data_sites = this.data_sites(&changed_objs)?;
-                debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                await!(Self::sites_abort(this.clone(), tid.clone(), changed_objs, data_sites)) // with end
-            } else {
-                Ok(AbortResult::Success(None))
-            }
-        };
-        this.cleanup_transaction(&tid);
-        return result;
+        future::result(this.get_transaction(&tid))
+            .and_then(|txn_lock| {
+                Ok(txn_lock.lock())
+            })
+            .and_then(move |txn| {
+                future::result(
+                    if txn.state != TxnState::Aborted {
+                        Err(txn)
+                    } else {
+                        Ok(AbortResult::Success(None))
+                    }
+                )
+                .or_else(move |txn| {
+                    let changed_objs = txn.affected_objects.clone();
+                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                    future::result(this.data_sites(&changed_objs))
+                        .and_then(move |data_sites|
+                            Self::sites_abort(this.clone(), tid.clone(), changed_objs, data_sites))
+                })
+            })
+            .then(move |r| {
+                this_clone1.cleanup_transaction(&tid_clone1);
+                return r;
+            })
     }
     #[async]
     fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
