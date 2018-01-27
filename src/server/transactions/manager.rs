@@ -694,19 +694,27 @@ impl TransactionManagerInner {
                         }))
             })
     }
-    //// KEEP ASYNC ATTRIBUTE
-    #[async]
-    fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError> {
-        let result = {
-            let txn_lock = this.get_transaction(&tid)?;
-            let txn = txn_lock.lock();
-            this.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = txn.affected_objects.clone();
-            let data_sites = this.data_sites(&affected_objs)?;
-            await!(Self::sites_end(this.clone(), tid.clone(), affected_objs, data_sites))
-        };
-        this.cleanup_transaction(&tid);
-        return result;
+    fn commit(this: Arc<Self>, tid: TxnId)
+        -> impl Future<Item = EndResult, Error = TMError>
+    {
+        let this_clone1 = this.clone();
+        let this_clone2 = this.clone();
+        let tid_clone = tid.clone();
+        future::result(this.get_transaction(&tid))
+            .and_then(move |txn_lock| {
+                let txn = txn_lock.lock();
+                this.ensure_txn_state(&txn, TxnState::Prepared)?;
+                let affected_objs = txn.affected_objects.clone();
+                let data_sites = this.data_sites(&affected_objs)?;
+                Ok((affected_objs, data_sites, txn))
+            })
+            .and_then(move |(affected_objs, data_sites, txn)| {
+                Self::sites_end(this_clone1, tid, affected_objs, data_sites)
+            })
+            .then(move |r| {
+                this_clone2.cleanup_transaction(&tid_clone);
+                return r;
+            })
     }
     #[async]
     fn abort(this: Arc<Self>, tid: TxnId) -> Result<AbortResult, TMError> {
