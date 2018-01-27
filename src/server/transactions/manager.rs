@@ -747,16 +747,16 @@ impl TransactionManagerInner {
                 return r;
             })
     }
-    #[async]
-    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
+    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64)
+        -> impl Future<Item = (), Error = ()>
+    {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         let mut futures = Vec::new();
         for tid in tids {
             let await_txn = this.await_manager.get_txn(&tid);
             futures.push(AwaitManager::txn_send(&await_txn, server_id));
         }
-        await!(future::join_all(futures));
-        Ok(())
+        future::join_all(futures).map(|_| ())
     }
 }
 
