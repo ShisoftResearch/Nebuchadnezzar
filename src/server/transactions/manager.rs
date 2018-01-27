@@ -475,32 +475,36 @@ impl TransactionManagerInner {
     fn read(this: Arc<Self>, tid: TxnId, id: Id)
         -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>
     {
+        let this_clone1 = this.clone();
+        let this_clone2 = this.clone();
         future::result(this.get_transaction(&tid))
-            .and_then(|txn_mutex| {
+            .and_then(move |txn_mutex| {
                 let txn = txn_mutex.lock();
                 this.ensure_rw_state(&txn)
                     .map(|_| txn)
             })
-            .and_then(|txn| {
-                future::result(txn.data.get(&id).ok_or(()))
-                    .and_then(|data_obj| {
+            .and_then(move |txn| {
+                future::result(txn.data.get(&id)
+                    .map(|data_obj| {
                         // try read from cache
-                        data_obj.cell
-                            .ok_or(TxnExecResult::Error(ReadError::CellDoesNotExisted))
-                            .map(|ref cell| Ok(TxnExecResult::Accepted(cell.clone())))
+                        match data_obj.cell {
+                            Some(ref cell) => TxnExecResult::Accepted(cell.clone()),
+                            None => TxnExecResult::Error(ReadError::CellDoesNotExisted)
+                        }
                     })
-                    .or_else(|_| {
+                    .ok_or(()))
+                    .or_else(move |_| {
                         // not found, fetch from data site
-                        future::result(this.get_data_site_by_id(&id))
+                        future::result(this_clone1.get_data_site_by_id(&id))
                             .map_err(|e| {
                                 error!("{:?}", e);
-                                TMError::CannotLocateCellServer
+                                return TMError::CannotLocateCellServer
                             })
-                            .and_then(|(server_id, server)| {
+                            .and_then(move |(server_id, server)| {
                                 let txn = Arc::new(txn);
-                                let await = this.await_manager.get_txn(&tid);
-                                Self::read_from_site(this, server_id, server, tid, id, txn, await)
-                            })
+                                let await = this_clone2.await_manager.get_txn(&tid);
+                                Self::read_from_site(this_clone2, server_id, server, tid, id, txn, await)
+                            })    
                     })
             })
     }
