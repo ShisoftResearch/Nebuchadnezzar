@@ -152,11 +152,11 @@ impl TransactionManagerInner {
     fn read_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId, id: Id, txn: Arc<TxnGuard>, await: TxnAwaits
-    ) -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError> {
+    ) -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>> {
         let self_server_id = this.server.server_id;
         let this_clone = this.clone();
         let txn_clone = txn.clone();
-        server
+        box server
             .read(
                 &self_server_id,
                 &this.get_clock(),
@@ -203,10 +203,10 @@ impl TransactionManagerInner {
     fn read_selected_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId, id: Id, fields: Vec<u64>, txn: Arc<TxnGuard>, await: TxnAwaits
-    ) -> impl Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError> {
+    ) -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>> {
         let self_server_id = this.server.server_id;
         let this_clone = this.clone();
-        server
+        box server
             .read_selected(
                 &self_server_id,
                 &this.get_clock(),
@@ -265,11 +265,11 @@ impl TransactionManagerInner {
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> impl Future<Item = DMPrepareResult, Error = TMError> {
+    ) -> Box<Future<Item = DMPrepareResult, Error = TMError>> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
-        data_site
+        box data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
             .map_err(|_| -> TMError {
                 TMError::RPCErrorFromCellServer
