@@ -779,12 +779,16 @@ impl AwaitingServer {
     {
         AwaitingServer::send_to_sender(self.sender.lock_async())
     }
-    #[async]
-    fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>) -> Result<(), ()> {
-        let lock = await!(sender)?.clone();
-        await!(lock.send(()))
-            .map(|_| ())
-            .map_err(|_| ())
+    fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>)
+        -> impl Future<Item = (), Error = ()>
+    {
+        sender
+            .map_err(|_| ())        
+            .map(|s| s.clone())
+            .and_then(|lock|
+                lock.send(())
+                    .map(|_| ())
+                    .map_err(|_| ()))
     }
     pub fn wait(&self)
         -> impl Future<Item = (), Error = ()>
