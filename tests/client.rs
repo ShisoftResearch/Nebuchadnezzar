@@ -234,7 +234,7 @@ pub fn write_skew() {
             cell_1.data = Value::Map(data_1);
             txn.update(&cell_1)?;
             Ok(())
-        });
+        }).wait();
     });
     let client_c2 = client.clone();
     let t2 = thread::spawn(move || {
@@ -249,7 +249,7 @@ pub fn write_skew() {
             cell_1.data = Value::Map(data_1);
             txn.update(&cell_1)?;
             Ok(())
-        });
+        }).wait();
     });
     t2.join();
     t1.join();
