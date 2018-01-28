@@ -459,7 +459,7 @@ impl Service for DataManager {
         self.response_with(AbortResult::Success(rollback_failures))
     }
     fn end(&self, clock :StandardVectorClock, tid: TxnId)
-             -> Box<Future<Item = DataSiteResponse<EndResult>, Error = ()>>
+        -> Box<Future<Item = DataSiteResponse<EndResult>, Error = ()>>
     {
         debug!(">> END {:?}", tid);
         let result = {
@@ -511,12 +511,15 @@ impl Service for DataManager {
                     debug!("cannot inform server {} to continue its transactions", server_id);
                 }
             }
-            future::join_all(wake_up_futures).wait();
-            if released_locks == affected_cells {
-                self.response_with(EndResult::Success)
-            } else {
-                self.response_with(EndResult::SomeLocksNotReleased)
-            }
+            future::join_all(wake_up_futures)
+                .then(move|_| {
+                    let _ = txn; // just retain the lock
+                    if released_locks == affected_cells {
+                        self.response_with(EndResult::Success)
+                    } else {
+                        self.response_with(EndResult::SomeLocksNotReleased)
+                    }
+                })
         };
         self.wipe_out_transaction(&tid);
         self.cleanup_sender.lock().send(());
