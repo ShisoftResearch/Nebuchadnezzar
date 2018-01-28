@@ -20,6 +20,7 @@ extern crate rand;
 #[macro_use]
 extern crate lazy_static;
 extern crate parking_lot;
+extern crate futures_await as futures;
 
 use neb::ram::schema::Field;
 

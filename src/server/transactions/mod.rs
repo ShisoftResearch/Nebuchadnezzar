@@ -113,7 +113,7 @@ pub enum CheckError {
     CannotEnd,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CommitOp {
     Write(Cell),
     Update(Cell),
@@ -136,14 +136,11 @@ pub enum TMError {
     CannotLocateCellServer,
     RPCErrorFromCellServer,
     AssertionError,
-    InvalidTransactionState(TxnState)
+    InvalidTransactionState(TxnState),
+    Other
 }
 
 pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
     let client = DEFAULT_CLIENT_POOL.get(address)?;
     Ok(manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
-}
-pub fn new_client(address: &String) -> io::Result<Arc<manager::SyncServiceClient>> {
-    let client = DEFAULT_CLIENT_POOL.get(address)?;
-    Ok(manager::SyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client))
 }

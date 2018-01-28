@@ -1,1 +1,2 @@
-pub mod  rand;
+pub mod rand;
+pub mod stream;

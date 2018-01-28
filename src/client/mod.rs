@@ -14,6 +14,10 @@ use ram::cell::{Cell, Header, ReadError, WriteError};
 use ram::schema::{sm as schema_sm};
 use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::Schema;
+
+use futures::Future;
+use futures::prelude::*;
+
 use self::transaction::*;
 
 static TRANSACTION_MAX_RETRY: u32 = 500;
@@ -26,20 +30,22 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError)
 }
 
-pub struct Client {
+struct AsyncClientInner {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient
 }
 
-impl Client {
-    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str) -> Result<Client, NebClientError> {
+impl AsyncClientInner {
+    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str)
+        -> Result<AsyncClientInner, NebClientError>
+    {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server);
                 assert!(RaftClient::can_callback());
                 match ConsistentHashing::new_client(group, &raft_client) {
-                    Ok(chash) => Ok(Client {
+                    Ok(chash) => Ok(AsyncClientInner {
                         conshash: chash,
                         raft_client: raft_client.clone(),
                         schema_client: SchemaClient::new(schema_sm::generate_sm_id(group), &raft_client)
@@ -56,44 +62,51 @@ impl Client {
             None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, "cannot locate")))
         }
     }
-    pub fn locate_plain_server(&self, id: &Id) -> Result<Arc<plain_server::SyncServiceClient>, RPCError> {
-        let address = self.locate_server_address(id)?;
-        let client = match DEFAULT_CLIENT_POOL.get(&address) {
+    #[async]
+    pub fn locate_plain_server(this: Arc<Self>, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+        let address = this.locate_server_address(&id)?;
+        let client = match await!(DEFAULT_CLIENT_POOL.get_async(&address)) {
             Ok(c) => c,
             Err(e) => return Err(RPCError::IOError(e))
         };
-        Ok(plain_server::SyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
+        Ok(plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
     }
-    pub fn read_cell(&self, id: &Id) -> Result<Result<Cell, ReadError>, RPCError> {
-        let client = self.locate_plain_server(id)?;
-        client.read_cell(id)
+    #[async]
+    pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
+        let client = await!(Self::locate_plain_server(this, id))?;
+        await!(client.read_cell(&id))
     }
-    pub fn write_cell(&self, cell: &Cell) -> Result<Result<Header, WriteError>, RPCError> {
-        let client = self.locate_plain_server(&cell.id())?;
-        client.write_cell(cell)
+    #[async]
+    pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
+        let client = await!(Self::locate_plain_server(this, cell.id()))?;
+        await!(client.write_cell(&cell))
     }
-    pub fn update_cell(&self, cell: &Cell) -> Result<Result<Header, WriteError>, RPCError> {
-        let client = self.locate_plain_server(&cell.id())?;
-        client.update_cell(cell)
+    #[async]
+    pub fn update_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
+        let client = await!(Self::locate_plain_server(this, cell.id()))?;
+        await!(client.update_cell(&cell))
     }
-    pub fn remove_cell(&self, id: &Id) -> Result<Result<(), WriteError>, RPCError> {
-        let client = self.locate_plain_server(id)?;
-        client.remove_cell(id)
+    #[async]
+    pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
+        let client = await!(Self::locate_plain_server(this, id))?;
+        await!(client.remove_cell(&id))
     }
-    pub fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
-        where TFN: Fn(&Transaction) -> Result<TR, TxnError> {
-        let server_name = match self.conshash.rand_server() {
+    #[async]
+    pub fn transaction<TFN, TR>(this: Arc<Self>, func: TFN) -> Result<TR, TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>, TR: 'static, TFN: 'static
+    {
+        let server_name = match this.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer)
         };
-        let txn_client = match txn_server::new_client(&server_name) {
+        let txn_client = match txn_server::new_async_client(&server_name) {
             Ok(client) => client,
             Err(e) => return Err(TxnError::IoError(e))
         };
         let mut txn_id: txn_server::TxnId;
         let mut retried = 0;
         while retried < TRANSACTION_MAX_RETRY {
-            txn_id = match txn_client.begin() {
+            txn_id = match await!(txn_client.begin()) {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin)
             };
@@ -142,18 +155,100 @@ impl Client {
         }
         Err(TxnError::TooManyRetry)
     }
-    pub fn new_schema_with_id(&self, schema: &Schema) -> Result<Result<(), NotifyError>, ExecError> {
-        self.schema_client.new_schema(schema)
+    #[async]
+    pub fn new_schema_with_id(this: Arc<Self>, schema: Schema) -> Result<Result<(), NotifyError>, ExecError> {
+        this.schema_client.new_schema(&schema)
     }
-    pub fn new_schema(&self, schema: &mut Schema) -> Result<Result<(), NotifyError>, ExecError> {
-        let schema_id = self.schema_client.next_id()?.unwrap();
+    #[async]
+    pub fn new_schema(this: Arc<Self>, mut schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
+        let schema_id = this.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
-        self.new_schema_with_id(schema)
+        await!(Self::new_schema_with_id(this, schema)).map(|r| r.map(|_| schema_id))
     }
-    pub fn del_schema(&self, schema_id: &String) -> Result<Result<(), NotifyError>, ExecError> {
-        self.schema_client.del_schema(schema_id)
+    #[async]
+    pub fn del_schema(this: Arc<Self>, name: String) -> Result<Result<(), NotifyError>, ExecError> {
+        this.schema_client.del_schema(&name)
     }
-    pub fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
-        Ok(self.schema_client.get_all()?.unwrap())
+    #[async]
+    pub fn get_all_schema(this: Arc<Self>) -> Result<Vec<Schema>, ExecError> {
+        Ok(this.schema_client.get_all()?.unwrap())
+    }
+}
+
+pub struct AsyncClient {
+    inner: Arc<AsyncClientInner>
+}
+
+impl AsyncClient {
+    pub fn new<'a>(subscription_server: &Arc<RPCServer>, meta_servers: &Vec<String>, group: &'a str)
+                   -> Result<AsyncClient, NebClientError>
+    {
+        AsyncClientInner::new(subscription_server, meta_servers, group)
+            .map(|inner| {
+                AsyncClient {
+                    inner: Arc::new(inner)
+                }
+            })
+    }
+
+    pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
+        self.inner.locate_server_address(id)
+    }
+
+    pub fn locate_plain_server(&self, id: Id)
+        -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError>
+    {
+        AsyncClientInner::locate_plain_server(self.inner.clone(), id)
+    }
+
+    pub fn read_cell(&self, id: Id)
+        -> impl Future<Item = Result<Cell, ReadError>, Error = RPCError>
+    {
+        AsyncClientInner::read_cell(self.inner.clone(), id)
+    }
+
+    pub fn write_cell(&self, cell: Cell)
+        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::write_cell(self.inner.clone(), cell)
+    }
+
+    pub fn update_cell(&self, cell: Cell)
+        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::update_cell(self.inner.clone(), cell)
+    }
+
+    pub fn remove_cell(&self, id: Id)
+        -> impl Future<Item = Result<(), WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::remove_cell(self.inner.clone(), id)
+    }
+
+    pub fn transaction<TFN, TR>(&self, func: TFN)
+        -> impl Future<Item = TR, Error = TxnError>
+        where TFN: Fn(&Transaction) -> Result<TR, TxnError>, TR: 'static, TFN: 'static
+    {
+        AsyncClientInner::transaction(self.inner.clone(), func)
+    }
+    pub fn new_schema_with_id(&self, schema: Schema)
+        -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::new_schema_with_id(self.inner.clone(), schema)
+    }
+    pub fn new_schema(&self, schema: Schema)
+        -> impl Future<Item = Result<u32, NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::new_schema(self.inner.clone(), schema)
+    }
+    pub fn del_schema(&self, name: String)
+        -> impl Future<Item = Result<(), NotifyError>, Error = ExecError>
+    {
+        AsyncClientInner::del_schema(self.inner.clone(), name)
+    }
+    pub fn get_all_schema(&self)
+        -> impl Future<Item = Vec<Schema>, Error = ExecError>
+    {
+        AsyncClientInner::get_all_schema(self.inner.clone())
     }
 }
