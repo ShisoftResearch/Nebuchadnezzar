@@ -1,13 +1,12 @@
 use bifrost::vector_clock::{StandardVectorClock};
 use bifrost::utils::time::get_time;
-use chashmap::CHashMap;
+use chashmap::{CHashMap, WriteGuard};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ops::DerefMut;
 use ram::types::{Id, Value};
 use ram::cell::{Cell, ReadError, WriteError};
 use server::NebServer;
 use bifrost::utils::async_locks::{Mutex, MutexGuard, AsyncMutexGuard, RwLock};
-use futures::sync::mpsc::{channel, Sender};
+use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
 use futures::{Sink};
 use futures::prelude::*;
 use super::*;
@@ -149,96 +148,79 @@ impl TransactionManagerInner {
             }
         }
     }
+    #[async(boxed)]
     fn read_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: TxnId, id: Id, txn: Arc<TxnGuard>, await: TxnAwaits
-    ) -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>> {
+        tid: TxnId, id: Id, mut txn: TxnGuard, await: TxnAwaits
+    ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
         let self_server_id = this.server.server_id;
-        let this_clone = this.clone();
-        let txn_clone = txn.clone();
-        box server
-            .read(
-                &self_server_id,
-                &this.get_clock(),
-                &tid, &id
-            )
-            .then(move |read_response|
-                match read_response {
-                    Ok(dsr) => {
-                        let dsr = dsr.unwrap();
-                        this.merge_clock(&dsr.clock);
-                        let payload = dsr.payload;
-                        match payload {
-                            TxnExecResult::Accepted(ref cell) => {
-                                txn.mutate().data.insert(id, DataObject
-                                    {
-                                        server: server_id,
-                                        version: Some(cell.header.version),
-                                        cell: Some(cell.clone()),
-                                        new: false,
-                                        changed: false,
-                                    });
-                            },
-                            TxnExecResult::Wait => {
-                                return future::err(())
-                            }
-                            _ => {}
-                        }
-                        future::ok(Ok(payload))
+        let read_response = await!(server.read(
+            &self_server_id,
+            &this.get_clock(),
+            &tid, &id
+        ));
+        match read_response {
+            Ok(dsr) => {
+                let dsr = dsr.unwrap();
+                this.merge_clock(&dsr.clock);
+                let payload = dsr.payload;
+                let payload_out = payload.clone();
+                match payload {
+                    TxnExecResult::Accepted(cell) => {
+                        txn.data.insert(id, DataObject {
+                            server: server_id,
+                            version: Some(cell.header.version),
+                            cell: Some(cell),
+                            new: false,
+                            changed: false,
+                        });
                     },
-                    Err(e) => {
-                        error!("{:?}", e);
-                        future::ok(Err(TMError::RPCErrorFromCellServer))
+                    TxnExecResult::Wait => {
+                        await!(AwaitManager::txn_wait(&await, server_id));
+                        return await!(Self::read_from_site(this, server_id, server, tid, id, txn, await));
                     }
-                })
-            .or_else(move |_|
-                AwaitManager::txn_wait(&await, server_id)
-                    .then(move |_|
-                        Self::read_from_site(this_clone, server_id, server, tid, id, txn_clone, await)
-                            .then(|r|
-                                future::ok(r))))
-            .then(|r: Result<_, ()>|
-                future::result(r.unwrap()))
+                    _ => {}
+                }
+                Ok(payload_out)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::RPCErrorFromCellServer)
+            }
+        }
     }
+    #[async(boxed)]
     fn read_selected_from_site(
         this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
-        tid: TxnId, id: Id, fields: Vec<u64>, txn: Arc<TxnGuard>, await: TxnAwaits
-    ) -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>> {
+        tid: TxnId, id: Id, fields: Vec<u64>, txn: TxnGuard, await: TxnAwaits
+    ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
         let self_server_id = this.server.server_id;
-        let this_clone = this.clone();
-        box server
-            .read_selected(
-                &self_server_id,
-                &this.get_clock(),
-                &tid, &id, &fields
-            ).then(move |read_response|
-                match read_response {
-                    Ok(dsr) => {
-                        let dsr = dsr.unwrap();
-                        this.merge_clock(&dsr.clock);
-                        let payload = dsr.payload;
-                        match payload {
-                            TxnExecResult::Wait => {
-                                return future::err(())
-                            }
-                            _ => {}
-                        }
-                        future::ok(Ok(payload))
-                    },
-                    Err(e) => {
-                        error!("{:?}", e);
-                        future::ok(Err(TMError::RPCErrorFromCellServer))
+        let read_response = await!(server.read_selected(
+            &self_server_id,
+            &this.get_clock(),
+            &tid, &id, &fields
+        ));
+        match read_response {
+            Ok(dsr) => {
+                let dsr = dsr.unwrap();
+                this.merge_clock(&dsr.clock);
+                let payload = dsr.payload;
+                match payload {
+                    TxnExecResult::Wait => {
+                        await!(AwaitManager::txn_wait(&await, server_id));
+                        return await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await));
                     }
-                })
-            .or_else(move |_| {
-                AwaitManager::txn_wait(&await, server_id)
-                    .then(move |_|
-                        Self::read_selected_from_site(this_clone, server_id, server, tid, id, fields, txn, await)
-                            .then(|r| future::ok(r)))})
-            .then(|r: Result<_, ()>|
-                future::result(r.unwrap()))
+                    _ => {}
+                }
+                Ok(payload)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::RPCErrorFromCellServer)
+            }
+        }
     }
-    fn generate_affected_objs(txn: &mut TxnGuard) {
+    fn generate_affected_objs(&self, txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in &txn.data {
             affected_objs
@@ -262,14 +244,15 @@ impl TransactionManagerInner {
             }
         ).collect())
     }
+    #[async(boxed)]
     fn site_prepare(
         server: Arc<NebServer>, awaits: TxnAwaits, tid: TxnId, objs: BTreeMap<Id, DataObject>,
         data_site: Arc<data_site::AsyncServiceClient>
-    ) -> Box<Future<Item = DMPrepareResult, Error = TMError>> {
+    ) -> Result<DMPrepareResult, TMError> {
         let self_server_id = server.server_id;
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
-        box data_site
+        let prepare_payload = await!(data_site
             .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
             .map_err(|_| -> TMError {
                 TMError::RPCErrorFromCellServer
@@ -278,31 +261,27 @@ impl TransactionManagerInner {
                 let prepare_res = prepare_res.unwrap();
                 server_for_clock.txn_peer.clock.merge_with(&prepare_res.clock);
                 prepare_res.payload
-            })
-            .then(|prepare_payload|
-                match prepare_payload {
-                    Ok(payload) => {
-                        match payload {
-                            DMPrepareResult::Wait => {
-                                return future::err(())
-                            },
-                            _ => {
-                                return future::ok(Ok(payload))
-                            }
-                        }
+            }));
+        match prepare_payload {
+            Ok(payload) => {
+                match payload {
+                    DMPrepareResult::Wait => {
+                        await!(AwaitManager::txn_wait(&awaits, data_site.server_id));
+                        return await!(TransactionManagerInner::site_prepare(
+                            server, awaits, tid, objs, data_site
+                        )) // after waiting, retry
                     },
-                    Err(e) => future::ok(Err(e))
-                })
-            .or_else(|_|
-                AwaitManager::txn_wait(&awaits, data_site.server_id)
-                    .then(|_|
-                        TransactionManagerInner::site_prepare(server, awaits, tid, objs, data_site)
-                            .then(|r| future::ok(r))))// after waiting, retry
-            .then(|r: Result<_, ()>|
-                future::result(r.unwrap()))
+                    _ => {
+                        return Ok(payload)
+                    }
+                }
+            },
+            Err(e) => Err(e)
+        }
     }
+    #[async]
     fn sites_prepare(this: Arc<Self>, tid: TxnId, affected_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> impl Future<Item = DMPrepareResult, Error = TMError>
+        -> Result<DMPrepareResult, TMError>
     {
         let prepare_futures: Vec<_> = affected_objs.into_iter().map(|(server, objs)| {
             let data_site = data_sites.get(&server).unwrap().clone();
@@ -312,20 +291,18 @@ impl TransactionManagerInner {
                 tid.clone(), objs, data_site
             )
         }).collect();
-        future::join_all(prepare_futures)
-            .map(|prepare_results| {
-                for result in prepare_results {
-                    match result {
-                        DMPrepareResult::Success => {},
-                        _ => {return result}
-                    }
-                }
-                DMPrepareResult::Success
-            })
+        let prepare_results = await!(future::join_all(prepare_futures))?;
+        for result in prepare_results {
+            match result {
+                DMPrepareResult::Success => {},
+                _ => {return Ok(result)}
+            }
+        }
+        Ok(DMPrepareResult::Success)
     }
+    #[async]
     fn sites_commit(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> impl Future<Item = DMCommitResult, Error = TMError>
-    {
+                    -> Result<DMCommitResult, TMError> {
         let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             let ops: Vec<CommitOp> = objs.iter()
@@ -344,102 +321,84 @@ impl TransactionManagerInner {
             }).collect();
             data_site.commit(&this.get_clock(), &tid, &ops)
         }).collect();
-        future::join_all(commit_futures)
-            .then(move |commit_results| {
-                if let Ok(commit_results) = commit_results {
-                    for result in commit_results {
-                        if let Ok(dsr) = result {
-                            this.merge_clock(&dsr.clock);
-                            match dsr.payload {
-                                DMCommitResult::Success => {},
-                                _ => {
-                                    return Ok(dsr.payload);
-                                }
-                            }
-                        } else {
-                            return Err(TMError::AssertionError)
+        let commit_results = await!(future::join_all(commit_futures));
+        if let Ok(commit_results) = commit_results {
+            for result in commit_results {
+                if let Ok(dsr) = result {
+                    this.merge_clock(&dsr.clock);
+                    match dsr.payload {
+                        DMCommitResult::Success => {},
+                        _ => {
+                            return Ok(dsr.payload);
                         }
                     }
                 } else {
-                    return Err(TMError::RPCErrorFromCellServer)
+                    return Err(TMError::AssertionError)
                 }
-                Ok(DMCommitResult::Success)
-            })
+            }
+        } else {
+            return Err(TMError::RPCErrorFromCellServer)
+        }
+        Ok(DMCommitResult::Success)
     }
+    #[async]
     fn sites_abort(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> impl Future<Item = AbortResult, Error = TMError>
-    {
+        -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.abort(&this.get_clock(), &tid)
         }).collect();
-        let this_clone = this.clone();
-        future::join_all(abort_futures)
-            .map_err(|_| Err(TMError::RPCErrorFromCellServer))
-            .and_then(move |abort_results| {
-                let mut rollback_failures = Vec::new();
-                for result in abort_results {
-                    match result {
-                        Ok(asr) => {
-                            let payload = asr.payload;
-                            this.merge_clock(&asr.clock);
-                            match payload {
-                                AbortResult::Success(failures) => {
-                                    if let Some(mut failures) = failures {
-                                        rollback_failures.append(&mut failures);
-                                    }
-                                },
-                                _ => return Err(Ok(payload))
+        let abort_results = await!(future::join_all(abort_futures));
+        if abort_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
+        let abort_results = abort_results.unwrap();
+        let mut rollback_failures = Vec::new();
+        for result in abort_results {
+            match result {
+                Ok(asr) => {
+                    let payload = asr.payload;
+                    this.merge_clock(&asr.clock);
+                    match payload {
+                        AbortResult::Success(failures) => {
+                            if let Some(mut failures) = failures {
+                                rollback_failures.append(&mut failures);
                             }
                         },
-                        Err(_) => {return Err(Err(TMError::AssertionError))}
+                        _ => (return Ok(payload))
                     }
-                }
-                return Ok(rollback_failures)
-            })
-            .and_then(|rollback_failures|
-                Self::sites_end(this_clone, tid, changed_objs, data_sites)
-                    .map_err(|e| Err(e))
-                    .and_then(|_: EndResult| {
-                        Ok(AbortResult::Success(
-                            if rollback_failures.is_empty()
-                                {None} else {Some(rollback_failures)}
-                        ))
-                    }))
-            .then(|results|{
-                match results {
-                    Err(Err(e)) => Err(e),
-                    Err(Ok(r)) => Ok(r),
-                    Ok(r) => Ok(r)
-                }
-            })
-
+                },
+                Err(_) => {return Err(TMError::AssertionError)}
+            }
+        }
+        await!(Self::sites_end(this, tid, changed_objs, data_sites))?;
+        Ok(AbortResult::Success(
+            if rollback_failures.is_empty()
+                {None} else {Some(rollback_failures)}
+        ))
     }
+    #[async]
     fn sites_end(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
-        -> impl Future<Item = EndResult, Error = TMError>
+        -> Result<EndResult, TMError>
     {
         let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
             data_site.end(&this.get_clock(), &tid)
         }).collect();
-        future::join_all(end_futures)
-            .then(move |end_results| {
-                if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
-                let end_results = end_results.unwrap();
-                for result in end_results {
-                    if let Ok(result) = result {
-                        this.merge_clock(&result.clock);
-                        let payload = result.payload;
-                        match payload {
-                            EndResult::Success => {},
-                            _ => {return Ok(payload);}
-                        }
-                    } else {
-                        return Err(TMError::AssertionError);
-                    }
+        let end_results = await!(future::join_all(end_futures));
+        if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
+        let end_results = end_results.unwrap();
+        for result in end_results {
+            if let Ok(result) = result {
+                this.merge_clock(&result.clock);
+                let payload = result.payload;
+                match payload {
+                    EndResult::Success => {},
+                    _ => {return Ok(payload);}
                 }
-                Ok(EndResult::Success)
-            })
+            } else {
+                return Err(TMError::AssertionError);
+            }
+        }
+        Ok(EndResult::Success)
     }
     fn ensure_txn_state(&self, txn: &TxnGuard, state: TxnState) -> Result<(), TMError> {
         if txn.state == state {
@@ -473,86 +432,65 @@ impl TransactionManagerInner {
             Ok(id)
         }
     }
-    fn read(this: Arc<Self>, tid: TxnId, id: Id)
-        -> impl Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>
+    #[async]
+    fn read(this: Arc<Self>, tid: TxnId, id: Id) -> Result<TxnExecResult<Cell, ReadError>, TMError>
     {
-        let this_clone1 = this.clone();
-        let this_clone2 = this.clone();
-        future::result(this.get_transaction(&tid))
-            .and_then(move |txn_mutex| {
-                let txn = txn_mutex.lock();
-                this.ensure_rw_state(&txn)
-                    .map(|_| txn)
-            })
-            .and_then(move |txn| {
-                future::result(txn.data.get(&id)
-                    .map(|data_obj| {
-                        // try read from cache
-                        match data_obj.cell {
-                            Some(ref cell) => TxnExecResult::Accepted(cell.clone()),
-                            None => TxnExecResult::Error(ReadError::CellDoesNotExisted)
-                        }
-                    })
-                    .ok_or(()))
-                    .or_else(move |_| {
-                        // not found, fetch from data site
-                        future::result(this_clone1.get_data_site_by_id(&id))
-                            .map_err(|e| {
-                                error!("{:?}", e);
-                                return TMError::CannotLocateCellServer
-                            })
-                            .and_then(move |(server_id, server)| {
-                                let txn = Arc::new(txn);
-                                let await = this_clone2.await_manager.get_txn(&tid);
-                                Self::read_from_site(this_clone2, server_id, server, tid, id, txn, await)
-                            })
-                    })
-            })
+        let txn_mutex = this.get_transaction(&tid)?;
+        let txn = txn_mutex.lock();
+        this.ensure_rw_state(&txn)?;
+        if let Some(data_obj) = txn.data.get(&id) {
+            match data_obj.cell {
+                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
+                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
+            }
+        }
+        let server = this.get_data_site_by_id(&id);
+        match server {
+            Ok((server_id, server)) => {
+                let await = this.await_manager.get_txn(&tid);
+                await!(Self::read_from_site(this, server_id, server, tid, id, txn, await))
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
     }
+    #[async]
     fn read_selected(this: Arc<Self>, tid: TxnId, id: Id, fields: Vec<u64>)
-        -> impl Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>
+        -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError>
     {
-        let this_clone1 = this.clone();
-        let fields_clone = fields.clone();
-        future::result(this.get_transaction(&tid))
-            .and_then(move |txn_mutex| {
-                let txn = txn_mutex.lock();
-                this.ensure_rw_state(&txn)
-                    .map(|_| txn)
-            })
-            .and_then(move |txn| {
-                future::result(txn.data.get(&id)
-                    .map(|data_obj| {
-                        // try read from cache
-                        match data_obj.cell {
-                            Some(ref cell) => {
-                                let mut result = Vec::with_capacity(fields.len());
-                                match cell.data {
-                                    Value::Map(ref map) => {
-                                        for field in fields {
-                                            result.push(map.get_by_key_id(field).clone())
-                                        }
-                                    },
-                                    _ => return TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect)
-                                }
-                                TxnExecResult::Accepted(result)
-                            },
-                            None => TxnExecResult::Error(ReadError::CellDoesNotExisted)
-                        }
-                    })
-                    .ok_or(()))
-                    .or_else(move |_| {
-                        future::result(this_clone1.get_data_site_by_id(&id))
-                            .map_err(|e| {
-                                TMError::CannotLocateCellServer
-                            })
-                            .and_then(move |(server_id, server)| {
-                                let await = this_clone1.await_manager.get_txn(&tid);
-                                let txn = Arc::new(txn);
-                                Self::read_selected_from_site(this_clone1, server_id, server, tid, id, fields_clone, txn, await)
-                            })
-                    })
-            })
+        let txn_mutex = this.get_transaction(&tid)?;
+        let txn = txn_mutex.lock();
+        this.ensure_rw_state(&txn)?;
+        if let Some(data_obj) = txn.data.get(&id) {
+            match data_obj.cell {
+                Some(ref cell) => {
+                    let mut result = Vec::with_capacity(fields.len());
+                    match cell.data {
+                        Value::Map(ref map) => {
+                            for field in fields {
+                                result.push(map.get_by_key_id(field).clone())
+                            }
+                        },
+                        _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect))
+                    }
+                    return Ok(TxnExecResult::Accepted(result))
+                }, // read from cache
+                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
+            }
+        }
+        let server = this.get_data_site_by_id(&id);
+        match server {
+            Ok((server_id, server)) => {
+                let await = this.await_manager.get_txn(&tid);
+                await!(Self::read_selected_from_site(this, server_id, server, tid, id, fields, txn, await))
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
     }
     fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_mutex = self.get_transaction(&tid)?;
@@ -647,118 +585,84 @@ impl TransactionManagerInner {
             None => Err(TMError::CannotLocateCellServer)
         }
     }
-    fn prepare(this: Arc<Self>, tid: TxnId)
-        -> impl Future<Item = TMPrepareResult, Error = TMError>
-    {
-        let this_clone1 = this.clone();
-        let this_clone2 = this.clone();
-        let this_clone3 = this.clone();
-        let tid_clone = tid.clone();
-        future::result(this.get_transaction(&tid))
-            .map(|txn_mutex| txn_mutex.lock())
-            .and_then(move |txn| {
-                this.ensure_rw_state(&txn)
-                    .map(|_| txn)
-            })
-            .and_then(move |mut txn| {
-                Self::generate_affected_objs(&mut txn);
+    #[async]
+    fn prepare(this: Arc<Self>, tid: TxnId) -> Result<TMPrepareResult, TMError> {
+        let conclusion = {
+            let txn_mutex = this.get_transaction(&tid)?;
+            let mut txn = txn_mutex.lock();
+            let result = {
+                this.ensure_rw_state(&txn)?;
+                this.generate_affected_objs(&mut txn);
                 let affect_objs = txn.affected_objects.clone();
-                this_clone1.data_sites(&affect_objs)
-                    .map(|data_sites| {
-                        (data_sites, affect_objs, txn)
-                    })
-            })
-            .and_then(move |(data_sites, affect_objs, txn)| {
-                Self::sites_prepare(this_clone2, tid, affect_objs.clone(), data_sites.clone())
-                    .map(|sites_prepare_result|
-                        (sites_prepare_result, data_sites, affect_objs, txn))
-            })
-            .and_then(move |(sites_prepare_result, data_sites, affect_objs, mut txn)| {
-                future::result(
-                    if sites_prepare_result == DMPrepareResult::Success {
-                        Err(())
-                    } else {
-                        Ok(TMPrepareResult::DMPrepareError(sites_prepare_result))
+                let data_sites = this.data_sites(&affect_objs)?;
+                let sites_prepare_result =
+                    await!(Self::sites_prepare(this.clone(), tid.clone(), affect_objs.clone(), data_sites.clone()))?;
+                if sites_prepare_result == DMPrepareResult::Success {
+                    let sites_commit_result =
+                        await!(Self::sites_commit(this.clone(), tid, affect_objs, data_sites))?;
+                    match sites_commit_result {
+                        DMCommitResult::Success => {
+                            TMPrepareResult::Success
+                        },
+                        _ => {
+                            TMPrepareResult::DMCommitError(sites_commit_result)
+                        }
                     }
-                )
-                .or_else(move |_|
-                    Self::sites_commit(this_clone3, tid_clone, affect_objs, data_sites)
-                        .map(move |sites_commit_result| {
-                            match sites_commit_result {
-                                DMCommitResult::Success => {
-                                    txn.state = TxnState::Prepared;
-                                    TMPrepareResult::Success
-                                },
-                                _ => {
-                                    TMPrepareResult::DMCommitError(sites_commit_result)
-                                }
-                            }
-                        }))
-            })
+                } else {
+                    TMPrepareResult::DMPrepareError(sites_prepare_result)
+                }
+            };
+            match result {
+                TMPrepareResult::Success => {
+                    txn.state = TxnState::Prepared;
+                },
+                _ => {}
+            }
+            result
+        };
+        return Ok(conclusion);
     }
-    fn commit(this: Arc<Self>, tid: TxnId)
-        -> impl Future<Item = EndResult, Error = TMError>
-    {
-        let this_clone1 = this.clone();
-        let this_clone2 = this.clone();
-        let tid_clone = tid.clone();
-        future::result(this.get_transaction(&tid))
-            .and_then(move |txn_lock| {
-                let txn = txn_lock.lock();
-                this.ensure_txn_state(&txn, TxnState::Prepared)?;
-                let affected_objs = txn.affected_objects.clone();
-                let data_sites = this.data_sites(&affected_objs)?;
-                Ok((affected_objs, data_sites, txn))
-            })
-            .and_then(move |(affected_objs, data_sites, txn)| {
-                Self::sites_end(this_clone1, tid, affected_objs, data_sites)
-            })
-            .then(move |r| {
-                this_clone2.cleanup_transaction(&tid_clone);
-                return r;
-            })
+    #[async]
+    fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError> {
+        let result = {
+            let txn_lock = this.get_transaction(&tid)?;
+            let txn = txn_lock.lock();
+            this.ensure_txn_state(&txn, TxnState::Prepared)?;
+            let affected_objs = txn.affected_objects.clone();
+            let data_sites = this.data_sites(&affected_objs)?;
+            await!(Self::sites_end(this.clone(), tid.clone(), affected_objs, data_sites))
+        };
+        this.cleanup_transaction(&tid);
+        return result;
     }
-    fn abort(this: Arc<Self>, tid: TxnId)
-        -> impl Future<Item = AbortResult, Error = TMError>
-    {
-        let this_clone1 = this.clone();
-        let tid_clone1 = tid.clone();
+    #[async]
+    fn abort(this: Arc<Self>, tid: TxnId) -> Result<AbortResult, TMError> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
-        future::result(this.get_transaction(&tid))
-            .and_then(|txn_lock| {
-                Ok(txn_lock.lock())
-            })
-            .and_then(move |txn| {
-                future::result(
-                    if txn.state != TxnState::Aborted {
-                        Err(txn)
-                    } else {
-                        Ok(AbortResult::Success(None))
-                    }
-                )
-                .or_else(move |txn| {
-                    let changed_objs = txn.affected_objects.clone();
-                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                    future::result(this.data_sites(&changed_objs))
-                        .and_then(move |data_sites|
-                            Self::sites_abort(this.clone(), tid.clone(), changed_objs, data_sites))
-                })
-            })
-            .then(move |r| {
-                this_clone1.cleanup_transaction(&tid_clone1);
-                return r;
-            })
+        let result = {
+            let txn_lock = this.get_transaction(&tid)?;
+            let txn = txn_lock.lock();
+            if txn.state != TxnState::Aborted {
+                let changed_objs = txn.affected_objects.clone();
+                let data_sites = this.data_sites(&changed_objs)?;
+                debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                await!(Self::sites_abort(this.clone(), tid.clone(), changed_objs, data_sites)) // with end
+            } else {
+                Ok(AbortResult::Success(None))
+            }
+        };
+        this.cleanup_transaction(&tid);
+        return result;
     }
-    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64)
-        -> impl Future<Item = (), Error = ()>
-    {
+    #[async]
+    fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
         let mut futures = Vec::new();
         for tid in tids {
             let await_txn = this.await_manager.get_txn(&tid);
             futures.push(AwaitManager::txn_send(&await_txn, server_id));
         }
-        future::join_all(futures).map(|_| ())
+        await!(future::join_all(futures));
+        Ok(())
     }
 }
 
@@ -781,16 +685,12 @@ impl AwaitingServer {
     {
         AwaitingServer::send_to_sender(self.sender.lock_async())
     }
-    fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>)
-        -> impl Future<Item = (), Error = ()>
-    {
-        sender
-            .map_err(|_| ())        
-            .map(|s| s.clone())
-            .and_then(|lock|
-                lock.send(())
-                    .map(|_| ())
-                    .map_err(|_| ()))
+    #[async]
+    fn send_to_sender(sender: AsyncMutexGuard<Sender<()>>) -> Result<(), ()> {
+        let lock = await!(sender)?.clone();
+        await!(lock.send(()))
+            .map(|_| ())
+            .map_err(|_| ())
     }
     pub fn wait(&self)
         -> impl Future<Item = (), Error = ()>
