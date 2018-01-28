@@ -521,8 +521,10 @@ impl Service for DataManager {
                     }
                 })
         };
-        self.wipe_out_transaction(&tid);
-        self.cleanup_sender.lock().send(());
-        return result;
+        box result.then(|r| {
+            self.wipe_out_transaction(&tid);
+            self.cleanup_sender.lock().send(());
+            return r;
+        })
     }
 }
