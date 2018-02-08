@@ -251,4 +251,8 @@ impl AsyncClient {
     {
         AsyncClientInner::get_all_schema(self.inner.clone())
     }
+
+    pub fn raft_client(&self) -> Arc<RaftClient> {
+        self.inner.raft_client.clone()
+    }
 }
