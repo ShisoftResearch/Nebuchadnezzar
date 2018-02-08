@@ -40,7 +40,7 @@ pub fn general() {
     let client = Arc::new(client::AsyncClient::new(
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
-    let schema_id = client.new_schema(schema).wait().unwrap().unwrap();
+    let schema_id = client.new_schema(schema).wait().unwrap().0;
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));
@@ -206,7 +206,7 @@ pub fn write_skew() {
         &server.rpc, &vec!(server_addr),
         server_group).unwrap());
     let thread_count = 100;
-    let schema_id = client.new_schema(schema).wait().unwrap().unwrap();
+    let schema_id = client.new_schema(schema).wait().unwrap().0;
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(0));

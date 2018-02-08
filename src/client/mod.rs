@@ -160,10 +160,15 @@ impl AsyncClientInner {
         this.schema_client.new_schema(&schema)
     }
     #[async]
-    pub fn new_schema(this: Arc<Self>, mut schema: Schema) -> Result<Result<u32, NotifyError>, ExecError> {
+    pub fn new_schema(this: Arc<Self>, mut schema: Schema) -> Result<(u32, Option<NotifyError>), ExecError> {
         let schema_id = this.schema_client.next_id()?.unwrap();
         schema.id = schema_id;
-        await!(Self::new_schema_with_id(this, schema)).map(|r| r.map(|_| schema_id))
+        await!(Self::new_schema_with_id(this, schema)).map(|r| {
+            let error = match r {
+                Ok(_) => None, Err(e) => Some(e)
+            };
+            (schema_id, error)
+        })
     }
     #[async]
     pub fn del_schema(this: Arc<Self>, name: String) -> Result<Result<(), NotifyError>, ExecError> {
@@ -237,7 +242,7 @@ impl AsyncClient {
         AsyncClientInner::new_schema_with_id(self.inner.clone(), schema)
     }
     pub fn new_schema(&self, schema: Schema)
-        -> impl Future<Item = Result<u32, NotifyError>, Error = ExecError>
+        -> impl Future<Item = (u32, Option<NotifyError>), Error = ExecError>
     {
         AsyncClientInner::new_schema(self.inner.clone(), schema)
     }
