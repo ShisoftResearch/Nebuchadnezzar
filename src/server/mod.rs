@@ -13,6 +13,7 @@ use ram::schema::{sm as schema_sm};
 use ram::types::Id;
 use std::sync::Arc;
 use std::io;
+use futures::Future;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -93,7 +94,7 @@ impl NebServer {
     }
     fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
         let member_service = MemberService::new(&opt.address, raft_client);
-        match member_service.join_group(&opt.group_name) {
+        match member_service.join_group(&opt.group_name).wait() {
             Ok(_) => Ok(()),
             Err(e) => {
                 error!("Cannot join cluster group");
@@ -105,7 +106,7 @@ impl NebServer {
         -> Result<Arc<ConsistentHashing>, ServerError> {
         match ConsistentHashing::new(&opt.group_name, raft_client) {
             Ok(ch) => {
-                ch.set_weight(&opt.address, opt.memory_size as u64);
+                ch.set_weight(&opt.address, opt.memory_size as u64).wait();
                 if !ch.init_table().is_ok() {
                     error!("Cannot initialize member table");
                     return Err(ServerError::CannotInitMemberTable);

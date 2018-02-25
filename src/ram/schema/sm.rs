@@ -44,12 +44,12 @@ impl StateMachineCmds for SchemasSM {
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), NotifyError> {
         self.map.new_schema(schema.clone());
-        self.callback.notify(&commands::on_schema_added::new(), Ok(schema))?;
+        self.callback.notify(commands::on_schema_added::new(), Ok(schema))?;
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), NotifyError> {
         self.map.del_schema(&name);
-        self.callback.notify(&commands::on_schema_deleted::new(), Ok(name))?;
+        self.callback.notify(commands::on_schema_deleted::new(), Ok(name))?;
         Ok(())
     }
     fn next_id(&mut self) -> Result<u32, ()> {
@@ -59,6 +59,7 @@ impl StateMachineCmds for SchemasSM {
 
 impl StateMachineCtl for SchemasSM {
     raft_sm_complete!();
+    fn id(&self) -> u64 {self.sm_id }
     fn snapshot(&self) -> Option<Vec<u8>> {
         Some(bincode::serialize(&self.map.get_all()))
     }
@@ -66,7 +67,6 @@ impl StateMachineCtl for SchemasSM {
         let schemas: Vec<Schema> = bincode::deserialize(&data);
         self.map.load_from_list(&schemas);
     }
-    fn id(&self) -> u64 {self.sm_id }
 }
 
 impl SchemasSM {

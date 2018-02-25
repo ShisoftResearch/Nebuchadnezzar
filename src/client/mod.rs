@@ -157,11 +157,11 @@ impl AsyncClientInner {
     }
     #[async]
     pub fn new_schema_with_id(this: Arc<Self>, schema: Schema) -> Result<Result<(), NotifyError>, ExecError> {
-        this.schema_client.new_schema(&schema)
+        await!(this.schema_client.new_schema(&schema))
     }
     #[async]
     pub fn new_schema(this: Arc<Self>, mut schema: Schema) -> Result<(u32, Option<NotifyError>), ExecError> {
-        let schema_id = this.schema_client.next_id()?.unwrap();
+        let schema_id = await!(this.schema_client.next_id())?.unwrap();
         schema.id = schema_id;
         await!(Self::new_schema_with_id(this, schema)).map(|r| {
             let error = match r {
@@ -172,11 +172,11 @@ impl AsyncClientInner {
     }
     #[async]
     pub fn del_schema(this: Arc<Self>, name: String) -> Result<Result<(), NotifyError>, ExecError> {
-        this.schema_client.del_schema(&name)
+        await!(this.schema_client.del_schema(&name))
     }
     #[async]
     pub fn get_all_schema(this: Arc<Self>) -> Result<Vec<Schema>, ExecError> {
-        Ok(this.schema_client.get_all()?.unwrap())
+        Ok(await!(this.schema_client.get_all())?.unwrap())
     }
 }
 
