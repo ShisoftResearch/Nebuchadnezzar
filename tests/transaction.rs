@@ -41,12 +41,12 @@ pub fn workspace_wr() {
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
-    let cell_1_w_res = txn.write(&txn_id, &cell_1).wait().unwrap().unwrap();
+    let cell_1_w_res = txn.write(txn_id.to_owned(), cell_1.to_owned()).wait().unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {},
         _ => {panic!("write cell 1 not accepted {:?}", cell_1_w_res)}
     }
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_r_res = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
@@ -58,13 +58,13 @@ pub fn workspace_wr() {
     }
     data_map.insert(&String::from("score"), Value::U64(90));
     let cell_1_w2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
-    let cell_1_w_res = txn.write(&txn_id, &cell_1_w2).wait().unwrap().unwrap();
+    let cell_1_w_res = txn.write(txn_id.to_owned(), cell_1_w2.to_owned()).wait().unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {panic!("Write existed cell should fail")}
         TxnExecResult::Error(WriteError::CellAlreadyExisted) => {}
         _ => {panic!("Wrong feedback {:?}", cell_1_w_res)}
     }
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_r_res = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
@@ -72,12 +72,12 @@ pub fn workspace_wr() {
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
-    let cell_1_u_res = txn.update(&txn_id, &cell_1_w2).wait().unwrap().unwrap();
+    let cell_1_u_res = txn.update(txn_id.to_owned(), cell_1_w2.to_owned()).wait().unwrap().unwrap();
     match cell_1_u_res {
         TxnExecResult::Accepted(()) => {},
         _ => {panic!("update cell 1 not accepted")}
     }
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_r_res = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
@@ -85,19 +85,19 @@ pub fn workspace_wr() {
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
-    let cell_1_rm_res = txn.remove(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_rm_res = txn.remove(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_rm_res {
         TxnExecResult::Accepted(()) => {},
         _ => {panic!("remove cell 1 not accepted {:?}", cell_1_rm_res)}
     }
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_r_res = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_r_res {
         TxnExecResult::Error(ReadError::CellDoesNotExisted) => {},
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
-    assert_eq!(txn.prepare(&txn_id).wait().unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(&txn_id).wait().unwrap().unwrap(), EndResult::Success);
-    assert_eq!(txn.commit(&txn_id).wait().unwrap(), Err(TMError::TransactionNotFound));
+    assert_eq!(txn.prepare(txn_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
+    assert_eq!(txn.commit(txn_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
+    assert_eq!(txn.commit(txn_id.to_owned()).wait().unwrap(), Err(TMError::TransactionNotFound));
     // committed transaction should have been disposed
 }
 
@@ -131,13 +131,13 @@ pub fn data_site_wr() {
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
-    let cell_1_non_exists_read = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_non_exists_read = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_non_exists_read {
         TxnExecResult::Error(ReadError::CellDoesNotExisted) => {},
         _ => {panic!("read non-existed cell should fail but got {:?}", cell_1_non_exists_read)}
     }
-    let cell_1_write = txn.write(&txn_id, &cell_1).wait().unwrap().unwrap();
-    let cell_1_r_res = txn.read(&txn_id, &cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_write = txn.write(txn_id.to_owned(), cell_1.to_owned()).wait().unwrap().unwrap();
+    let cell_1_r_res = txn.read(txn_id.to_owned(), cell_1.id()).wait().unwrap().unwrap();
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
@@ -149,14 +149,14 @@ pub fn data_site_wr() {
     }
     data_map.insert(&String::from("score"), Value::U64(90));
     let cell_1_w2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
-    let cell_1_w_res = txn.update(&txn_id, &cell_1_w2).wait().unwrap().unwrap();
+    let cell_1_w_res = txn.update(txn_id.to_owned(), cell_1_w2.to_owned()).wait().unwrap().unwrap();
     match cell_1_w_res {
         TxnExecResult::Accepted(()) => {}
         _ => {panic!("Wrong feedback {:?}", cell_1_w_res)}
     }
     assert!(server.chunks.read_cell(&cell_1.id()).is_err()); // isolation test
-    assert_eq!(txn.prepare(&txn_id).wait().unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(&txn_id).wait().unwrap().unwrap(), EndResult::Success);
+    assert_eq!(txn.prepare(txn_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
+    assert_eq!(txn.commit(txn_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
     let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
     assert_eq!(cell_r2.id(), cell_1.id());
     assert_eq!(cell_r2.data["id"].I64().unwrap(), 100);
@@ -195,31 +195,31 @@ pub fn multi_transaction() {
     data_map_1.insert(&String::from("score"), Value::U64(70));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
-    let cell_1_t1_write = txn.update(&txn_1_id, &cell_1).wait().unwrap().unwrap();
+    let cell_1_t1_write = txn.update(txn_1_id.to_owned(), cell_1.to_owned()).wait().unwrap().unwrap();
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), Value::U64(90));
     let cell_2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map_2.clone()));
-    let cell_1_t2_write = txn.write(&txn_2_id, &cell_2).wait().unwrap().unwrap();
-    txn.prepare(&txn_2_id).wait().unwrap().unwrap();
-    txn.commit(&txn_2_id).wait().unwrap().unwrap();
-    assert_eq!(txn.prepare(&txn_1_id).wait().unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(&txn_1_id).wait().unwrap().unwrap(), EndResult::Success);
+    let cell_1_t2_write = txn.write(txn_2_id.to_owned(), cell_2.to_owned()).wait().unwrap().unwrap();
+    txn.prepare(txn_2_id.to_owned()).wait().unwrap().unwrap();
+    txn.commit(txn_2_id.to_owned()).wait().unwrap().unwrap();
+    assert_eq!(txn.prepare(txn_1_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
+    assert_eq!(txn.commit(txn_1_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
     ///////////////// PHASE 2 //////////////////
     let txn_1_id = txn.begin().wait().unwrap().unwrap();
     let txn_2_id = txn.begin().wait().unwrap().unwrap();
-    match txn.read(&txn_2_id, &cell_1.id()).wait().unwrap().unwrap() {
+    match txn.read(txn_2_id.to_owned(), cell_1.id()).wait().unwrap().unwrap() {
         TxnExecResult::Accepted(_) => {},
         _ => {panic!("Cannot read cell 1 for txn 2");}
     }
-    txn.update(&txn_1_id, &cell_1).wait().unwrap().unwrap();
-    assert_eq!(txn.prepare(&txn_1_id).wait().unwrap().unwrap(), // write too late
+    txn.update(txn_1_id.to_owned(), cell_1.to_owned()).wait().unwrap().unwrap();
+    assert_eq!(txn.prepare(txn_1_id.to_owned()).wait().unwrap().unwrap(), // write too late
                TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable));
-    assert_eq!(txn.commit(&txn_1_id).wait().unwrap().err().unwrap(), // commit need prepared
+    assert_eq!(txn.commit(txn_1_id.to_owned()).wait().unwrap().err().unwrap(), // commit need prepared
                TMError::InvalidTransactionState(TxnState::Started));
     let txn_1_id = txn.begin().wait().unwrap().unwrap();
-    txn.update(&txn_1_id, &cell_1).wait().unwrap().unwrap(); // txn_1_id > txn_2_id, realizable
-    assert_eq!(txn.prepare(&txn_1_id).wait().unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(&txn_1_id).wait().unwrap().unwrap(), EndResult::Success);
+    txn.update(txn_1_id.to_owned(), cell_1.to_owned()).wait().unwrap().unwrap(); // txn_1_id > txn_2_id, realizable
+    assert_eq!(txn.prepare(txn_1_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
+    assert_eq!(txn.commit(txn_1_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
 }
 
 #[test]
@@ -262,19 +262,19 @@ pub fn smoke_rw() {
         let txn = txn.clone();
         threads.push(thread::spawn(move || {
             let txn_id = txn.begin().wait().unwrap().unwrap();
-            let read_result = txn.read(&txn_id, &cell_id).wait().unwrap();
+            let read_result = txn.read(txn_id.to_owned(), cell_id.to_owned()).wait().unwrap();
             if let Ok(TxnExecResult::Accepted(mut cell)) = read_result {
                 let mut score = cell.data["score"].U64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
                 cell.data = Value::Map(data);
-                txn.update(&txn_id, &cell);
+                txn.update(txn_id.to_owned(), cell.to_owned());
             } else {
                 // println!("Failed read, {:?}", read_result);
             }
-            if txn.prepare(&txn_id).wait().unwrap() == Ok(TMPrepareResult::Success) {
-                assert_eq!(txn.commit(&txn_id).wait().unwrap().unwrap(), EndResult::Success);
+            if txn.prepare(txn_id.to_owned()).wait().unwrap() == Ok(TMPrepareResult::Success) {
+                assert_eq!(txn.commit(txn_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
             }
         }));
     }

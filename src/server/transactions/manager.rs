@@ -155,9 +155,9 @@ impl TransactionManagerInner {
     ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
         let self_server_id = this.server.server_id;
         let read_response = await!(server.read(
-            &self_server_id,
-            &this.get_clock(),
-            &tid, &id
+            self_server_id,
+            this.get_clock(),
+            tid.to_owned(), id
         ));
         match read_response {
             Ok(dsr) => {
@@ -196,9 +196,9 @@ impl TransactionManagerInner {
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
         let self_server_id = this.server.server_id;
         let read_response = await!(server.read_selected(
-            &self_server_id,
-            &this.get_clock(),
-            &tid, &id, &fields
+            self_server_id,
+            this.get_clock(),
+            tid.to_owned(), id, fields.to_owned()
         ));
         match read_response {
             Ok(dsr) => {
@@ -253,7 +253,7 @@ impl TransactionManagerInner {
         let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
         let server_for_clock = server.clone();
         let prepare_payload = await!(data_site
-            .prepare(&self_server_id, &server.txn_peer.clock.to_clock(), &tid, &cell_ids)
+            .prepare(self_server_id, server.txn_peer.clock.to_clock(), tid.to_owned(), cell_ids)
             .map_err(|_| -> TMError {
                 TMError::RPCErrorFromCellServer
             })
@@ -303,24 +303,27 @@ impl TransactionManagerInner {
     #[async]
     fn sites_commit(this: Arc<Self>, tid: TxnId, changed_objs: AffectedObjs, data_sites: DataSiteClients)
                     -> Result<DMCommitResult, TMError> {
-        let commit_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, ref objs)| {
-            let data_site = data_sites.get(server_id).unwrap().clone();
-            let ops: Vec<CommitOp> = objs.iter()
-                .map(|(cell_id, data_obj)| {
-                if data_obj.version.is_some() && !data_obj.changed {
-                    CommitOp::Read(*cell_id,data_obj.version.unwrap())
-                } else if data_obj.cell.is_none() && !data_obj.new {
-                    CommitOp::Remove(*cell_id)
-                } else if data_obj.new {
-                    CommitOp::Write(data_obj.cell.clone().unwrap())
-                } else if !data_obj.new {
-                    CommitOp::Update(data_obj.cell.clone().unwrap())
-                } else {
-                    CommitOp::None
-                }
-            }).collect();
-            data_site.commit(&this.get_clock(), &tid, &ops)
-        }).collect();
+        let this_clone = this.clone();
+        let commit_futures: Vec<_> = changed_objs.iter()
+            .map(move|(ref server_id, ref objs)| {
+                let data_site = data_sites.get(server_id).unwrap().clone();
+                let ops: Vec<CommitOp> = objs.iter()
+                    .map(|(cell_id, data_obj)| {
+                        if data_obj.version.is_some() && !data_obj.changed {
+                            CommitOp::Read(*cell_id,data_obj.version.unwrap())
+                        } else if data_obj.cell.is_none() && !data_obj.new {
+                            CommitOp::Remove(*cell_id)
+                        } else if data_obj.new {
+                            CommitOp::Write(data_obj.cell.clone().unwrap())
+                        } else if !data_obj.new {
+                            CommitOp::Update(data_obj.cell.clone().unwrap())
+                        } else {
+                            CommitOp::None
+                        }
+                    }).collect();
+                data_site.commit(this_clone.get_clock(), tid.to_owned(), ops)
+            })
+            .collect();
         let commit_results = await!(future::join_all(commit_futures));
         if let Ok(commit_results) = commit_results {
             for result in commit_results {
@@ -346,7 +349,7 @@ impl TransactionManagerInner {
         -> Result<AbortResult, TMError> {
         let abort_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
-            data_site.abort(&this.get_clock(), &tid)
+            data_site.abort(this.get_clock(), tid.to_owned())
         }).collect();
         let abort_results = await!(future::join_all(abort_futures));
         if abort_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}
@@ -381,7 +384,7 @@ impl TransactionManagerInner {
     {
         let end_futures: Vec<_> = changed_objs.iter().map(|(ref server_id, _)| {
             let data_site = data_sites.get(server_id).unwrap().clone();
-            data_site.end(&this.get_clock(), &tid)
+            data_site.end(this.get_clock(), tid.to_owned())
         }).collect();
         let end_results = await!(future::join_all(end_futures));
         if end_results.is_err() {return Err(TMError::RPCErrorFromCellServer)}

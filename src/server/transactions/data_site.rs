@@ -567,7 +567,7 @@ impl DataManagerInner {
             debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
             for (server_id, transactions) in waiting_list { // inform waiting servers to go on
                 if let Ok(client) = this.get_tnx_manager(server_id) {
-                    wake_up_futures.push(client.go_ahead(&transactions, &this.server.server_id));
+                    wake_up_futures.push(client.go_ahead(transactions, this.server.server_id));
                 } else {
                     debug!("cannot inform server {} to continue its transactions", server_id);
                 }

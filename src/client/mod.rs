@@ -74,22 +74,22 @@ impl AsyncClientInner {
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, id))?;
-        await!(client.read_cell(&id))
+        await!(client.read_cell(id))
     }
     #[async]
     pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, cell.id()))?;
-        await!(client.write_cell(&cell))
+        await!(client.write_cell(cell))
     }
     #[async]
     pub fn update_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, cell.id()))?;
-        await!(client.update_cell(&cell))
+        await!(client.update_cell(cell))
     }
     #[async]
     pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, id))?;
-        await!(client.remove_cell(&id))
+        await!(client.remove_cell(id))
     }
     #[async]
     pub fn transaction<TFN, TR>(this: Arc<Self>, func: TFN) -> Result<TR, TxnError>
