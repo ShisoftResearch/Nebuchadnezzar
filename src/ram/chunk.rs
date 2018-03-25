@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
-use ram::schema::SchemasServer;
+use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, Header};
@@ -269,7 +269,7 @@ impl Chunks {
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(count, size, Arc::<ServerMeta>::new(ServerMeta {
-            schemas: SchemasServer::new("", None).unwrap()
+            schemas: LocalSchemasCache::new("", None).unwrap()
         }), None)
     }
     fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {

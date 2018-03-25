@@ -3,12 +3,10 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::{master as sm_master};
-use bifrost::membership::server::Membership;
-use bifrost::membership::member::MemberService;
-use bifrost::conshash::weights::Weights;
 use bifrost::tcp::{STANDALONE_ADDRESS_STRING};
+use bifrost::conshash::weights::Weights;
 use ram::chunk::Chunks;
-use ram::schema::SchemasServer;
+use ram::schema::LocalSchemasCache;
 use ram::schema::{sm as schema_sm};
 use ram::types::Id;
 use std::sync::Arc;
@@ -17,6 +15,8 @@ use futures::Future;
 
 pub mod cell_rpc;
 pub mod transactions;
+
+pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -34,17 +34,12 @@ pub enum ServerError {
 pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,
-    pub standalone: bool,
-    pub is_meta: bool,
-    pub meta_members: Vec<String>,
-    pub address: String,
     pub backup_storage: Option<String>,
-    pub meta_storage: Option<String>,
-    pub group_name: String,
+
 }
 
 pub struct ServerMeta {
-    pub schemas: SchemasServer
+    pub schemas: LocalSchemasCache
 }
 
 pub struct NebServer {
@@ -58,113 +53,43 @@ pub struct NebServer {
     pub server_id: u64
 }
 
+pub fn init_conshash(
+    group_name: &String,
+    address: &String,
+    memory_size: u64,
+    raft_client: &Arc<RaftClient>)
+    -> Result<Arc<ConsistentHashing>, ServerError>
+{
+    match ConsistentHashing::new_with_id(CONS_HASH_ID,group_name, raft_client) {
+        Ok(ch) => {
+            ch.set_weight(address, memory_size).wait();
+            if !ch.init_table().is_ok() {
+                error!("Cannot initialize member table");
+                return Err(ServerError::CannotInitMemberTable);
+            }
+            return Ok(ch);
+        },
+        _ => {
+            error!("Cannot initialize consistent hash table");
+            return Err(ServerError::CannotInitConsistentHashTable);
+        }
+    }
+}
+
 impl NebServer {
-    fn load_meta_server(opt: &ServerOptions, rpc_server: &Arc<rpc::Server>) -> Result<Arc<raft::RaftService>, ServerError> {
-        let server_addr = &opt.address;
-        let raft_service = raft::RaftService::new(raft::Options {
-            storage: match opt.meta_storage {
-                Some(ref path) => raft::Storage::DISK(path.clone()),
-                None => raft::Storage::MEMORY,
-            },
-            address: server_addr.clone(),
-            service_id: raft::DEFAULT_SERVICE_ID,
-        });
-        rpc_server.register_service(
-            raft::DEFAULT_SERVICE_ID,
-            &raft_service
-        );
-        raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(&opt.group_name, &raft_service)));
-        raft::RaftService::start(&raft_service);
-        match raft_service.join(&opt.meta_members) {
-            Err(sm_master::ExecError::CannotConstructClient) => {
-                info!("Cannot join meta cluster, will bootstrap one.");
-                raft_service.bootstrap();
-            },
-            Ok(Ok(())) => {
-                info!("Joined meta cluster, number of members: {}", raft_service.num_members());
-            },
-            e => {
-                error!("Cannot join into cluster: {:?}", e);
-                return Err(ServerError::CannotJoinCluster)
-            }
-        }
-        Membership::new(rpc_server, &raft_service);
-        Weights::new(&raft_service);
-        return Ok(raft_service);
-    }
-    fn join_group(opt: &ServerOptions, raft_client: &Arc<RaftClient>) -> Result<(), ServerError> {
-        let member_service = MemberService::new(&opt.address, raft_client);
-        match member_service.join_group(&opt.group_name).wait() {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                error!("Cannot join cluster group");
-                Err(ServerError::CannotJoinClusterGroup(e))
-            }
-        }
-    }
-    fn init_conshash(opt: &ServerOptions, raft_client: &Arc<RaftClient>)
-        -> Result<Arc<ConsistentHashing>, ServerError> {
-        match ConsistentHashing::new(&opt.group_name, raft_client) {
-            Ok(ch) => {
-                ch.set_weight(&opt.address, opt.memory_size as u64).wait();
-                if !ch.init_table().is_ok() {
-                    error!("Cannot initialize member table");
-                    return Err(ServerError::CannotInitMemberTable);
-                }
-                return Ok(ch);
-            },
-            _ => {
-                error!("Cannot initialize consistent hash table");
-                return Err(ServerError::CannotInitConsistentHashTable);
-            }
-        }
-    }
-    fn load_cluster_clients (
-        opt: &ServerOptions,
-        schemas: &mut SchemasServer,
-        rpc_server: &Arc<rpc::Server>
-    ) -> Result<Arc<ConsistentHashing>, ServerError> {
-        let raft_client =
-            RaftClient::new(&opt.meta_members, raft::DEFAULT_SERVICE_ID);
-        match raft_client {
-            Ok(raft_client) => {
-                RaftClient::prepare_subscription(rpc_server);
-                NebServer::join_group(opt, &raft_client)?;
-                let conshash = NebServer::init_conshash(opt, &raft_client)?;
-                let schema_server = match SchemasServer::new(&opt.group_name, Some(&raft_client)) {
-                    Ok(schema) => schema,
-                    Err(e) => return Err(ServerError::CannotInitializeSchemaServer(e))
-                };
-                *schemas = schema_server;
-                Ok(conshash)
-            },
-            Err(e) => {
-                error!("Cannot load meta client: {:?}", e);
-                Err(ServerError::CannotLoadMetaClient)
-            }
-        }
-    }
-    pub fn new_from_opts(opts: &ServerOptions) -> Result<Arc<NebServer>, ServerError> {
-        let server_addr = if opts.standalone {&STANDALONE_ADDRESS_STRING} else {&opts.address};
-        let rpc_server = rpc::Server::new(server_addr);
-        rpc::Server::listen_and_resume(&rpc_server);
-        return NebServer::new(opts, server_addr, &rpc_server)
-    }
     pub fn new(
         opts: &ServerOptions,
         server_addr: &String,
+        group_name: &String,
         rpc_server: &Arc<rpc::Server>,
+        raft_service: &Option<Arc<raft::RaftService>>,
+        raft_client: &Arc<RaftClient>
     ) -> Result<Arc<NebServer>, ServerError> {
-        let mut raft_service = None;
-        if opts.is_meta {
-            raft_service = Some(NebServer::load_meta_server(&opts, &rpc_server)?);
+        if let &Some(ref raft_service) = raft_service {
+            raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(group_name, raft_service)));
+            Weights::new_with_id(CONS_HASH_ID, raft_service);
         }
-        if !opts.is_meta && opts.standalone {
-            return Err(ServerError::StandaloneMustAlsoBeMetaServer)
-        }
-        let mut schemas = SchemasServer::new(&opts.group_name, None).unwrap();
-        let conshasing =
-            NebServer::load_cluster_clients(&opts, &mut schemas, &rpc_server)?;
+        let schemas = LocalSchemasCache::new(group_name, Some(raft_client)).unwrap();
         let meta_rc = Arc::new(ServerMeta {
             schemas
         });
@@ -174,14 +99,19 @@ impl NebServer {
             meta_rc.clone(),
             opts.backup_storage.clone(),
         );
+        let conshasing = init_conshash(
+            group_name,
+            server_addr,
+            opts.memory_size as u64,
+            raft_client)?;
         let server = Arc::new(NebServer {
             chunks,
             meta: meta_rc,
             rpc: rpc_server.clone(),
-            consh: conshasing,
+            consh: conshasing.clone(),
             member_pool: rpc::ClientPool::new(),
             txn_peer: transactions::Peer::new(server_addr),
-            raft_service,
+            raft_service: raft_service.clone(),
             server_id: rpc_server.server_id
         });
         rpc_server.register_service(

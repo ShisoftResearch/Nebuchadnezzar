@@ -38,7 +38,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
-    let schemas = SchemasServer::new("", None).unwrap();
+    let schemas = LocalSchemasCache::new("", None).unwrap();
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: Header::new(0, schema.id, &id1),

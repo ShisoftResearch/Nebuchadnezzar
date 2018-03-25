@@ -83,13 +83,13 @@ pub struct SchemasMap {
     id_counter: u32,
 }
 
-pub struct SchemasServer {
+pub struct LocalSchemasCache {
     map: Arc<RwLock<SchemasMap>>,
     sm: Option<sm::client::SMClient>,
 }
 
-impl SchemasServer {
-    pub fn new<'a>(group: &'a str, raft_client: Option<&Arc<RaftClient>>) -> Result<SchemasServer, ExecError> {
+impl LocalSchemasCache {
+    pub fn new<'a>(group: &'a str, raft_client: Option<&Arc<RaftClient>>) -> Result<LocalSchemasCache, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let sm = match raft_client {
             Some(raft) => {
@@ -117,7 +117,7 @@ impl SchemasServer {
             },
             None => None
         };
-        let schemas = SchemasServer { map, sm };
+        let schemas = LocalSchemasCache { map, sm };
         return Ok(schemas);
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {

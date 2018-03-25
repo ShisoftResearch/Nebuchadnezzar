@@ -5,6 +5,8 @@
 extern crate neb;
 #[macro_use]
 extern crate dovahkiin;
+#[macro_use]
+extern crate bifrost;
 
 mod chunk;
 mod types;

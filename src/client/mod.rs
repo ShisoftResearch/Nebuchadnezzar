@@ -8,7 +8,7 @@ use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL, Server as RPCServer};
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost::raft::state_machine::callback::server::{NotifyError};
 
-use server::{transactions as txn_server, cell_rpc as plain_server};
+use server::{transactions as txn_server, cell_rpc as plain_server, CONS_HASH_ID};
 use ram::types::Id;
 use ram::cell::{Cell, Header, ReadError, WriteError};
 use ram::schema::{sm as schema_sm};
@@ -44,7 +44,7 @@ impl AsyncClientInner {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server);
                 assert!(RaftClient::can_callback());
-                match ConsistentHashing::new_client(group, &raft_client) {
+                match ConsistentHashing::new_client_with_id(CONS_HASH_ID, group, &raft_client) {
                     Ok(chash) => Ok(AsyncClientInner {
                         conshash: chash,
                         raft_client: raft_client.clone(),
