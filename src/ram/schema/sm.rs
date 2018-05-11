@@ -48,7 +48,7 @@ impl StateMachineCmds for SchemasSM {
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), NotifyError> {
-        self.map.del_schema(&name);
+        self.map.del_schema(&name).unwrap();
         self.callback.notify(commands::on_schema_deleted::new(), Ok(name))?;
         Ok(())
     }

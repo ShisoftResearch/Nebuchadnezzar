@@ -84,8 +84,7 @@ pub struct SchemasMap {
 }
 
 pub struct LocalSchemasCache {
-    map: Arc<RwLock<SchemasMap>>,
-    sm: Option<sm::client::SMClient>,
+    map: Arc<RwLock<SchemasMap>>
 }
 
 impl LocalSchemasCache {
@@ -117,7 +116,7 @@ impl LocalSchemasCache {
             },
             None => None
         };
-        let schemas = LocalSchemasCache { map, sm };
+        let schemas = LocalSchemasCache { map };
         return Ok(schemas);
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {

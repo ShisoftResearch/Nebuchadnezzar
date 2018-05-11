@@ -3,12 +3,11 @@
 #![feature(plugin)]
 #![feature(asm)]
 #![plugin(bifrost_plugins)]
-#![feature(conservative_impl_trait)]
 #![feature(exact_size_is_empty)]
-#![feature(macro_reexport)]
+#![feature(use_extern_macros)]
 #![feature(integer_atomics)]
 
-#![feature(proc_macro, conservative_impl_trait, generators)]
+#![feature(proc_macro, generators)]
 #![feature(box_syntax)]
 
 
@@ -20,7 +19,6 @@ extern crate lazy_static;
 extern crate bifrost;
 extern crate bifrost_hasher;
 #[macro_use]
-#[macro_reexport(data_map)]
 pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;

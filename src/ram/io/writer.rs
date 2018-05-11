@@ -19,7 +19,6 @@ pub fn plan_write_field (
     value: &Value,
     mut ins: &mut Vec<Instruction>
 ) -> Result<(), WriteError> {
-    let data_mismatch = "Data type does not match the schema for";
     if field.nullable {
         let null_bit = match value {
             &Value::Null => 1,
