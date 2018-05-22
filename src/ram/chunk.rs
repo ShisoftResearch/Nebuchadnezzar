@@ -1,6 +1,6 @@
 use libc;
 use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeSet;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
@@ -15,10 +15,11 @@ pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
 
 pub struct Chunk {
     pub id: usize,
-    pub addr: usize,
     pub index: CHashMap<u64, usize>,
-    pub segs: Vec<Segment>,
-    pub seg_round: AtomicUsize,
+    pub segs: CHashMap<usize, Arc<Segment>>,
+    pub seg_counter: AtomicU64,
+    pub header_seg: RwLock<Arc<Segment>>,
+    pub max_seg: usize,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
 }
@@ -29,28 +30,14 @@ pub struct Chunks {
 
 impl Chunk {
     fn new (id: usize, size: usize, meta: Arc<ServerMeta>, back_storage: Option<String>) -> Chunk {
-        let mem_ptr = unsafe {libc::malloc(size)} as usize;
-        let seg_count = size / SEGMENT_SIZE;
-        let mut segments = Vec::<Segment>::new();
-        for seg_idx in 0..seg_count {
-            let seg_addr = mem_ptr + seg_idx * SEGMENT_SIZE;
-            segments.push(Segment {
-                addr: seg_addr,
-                id: seg_idx,
-                bound: seg_addr + SEGMENT_SIZE,
-                append_header: AtomicUsize::new(seg_addr),
-                lock: RwLock::new(()),
-                frags: Mutex::new(BTreeSet::new()),
-            });
-        }
-        debug!("creating chunk at {}, segments {}", mem_ptr, seg_count + 1);
         Chunk {
-            id: id,
-            addr: mem_ptr,
+            id,
             index: CHashMap::new(),
-            meta: meta,
+            meta,
             segs: segments,
-            seg_round: AtomicUsize::new(0),
+            seg_counter: AtomicU64::new(0),
+            header_seg: AtomicUsize::new(0),
+            max_seg: size / SEGMENT_SIZE,
             backup_storage: back_storage
         }
     }
@@ -236,18 +223,6 @@ impl Chunk {
             }
         });
         return result;
-    }
-    fn dispose (&mut self) {
-        debug!("disposing chunk at {}", self.addr);
-        unsafe {
-            libc::free(self.addr as *mut libc::c_void)
-        }
-    }
-}
-
-impl Drop for Chunk {
-    fn drop(&mut self) {
-        self.dispose();
     }
 }
 

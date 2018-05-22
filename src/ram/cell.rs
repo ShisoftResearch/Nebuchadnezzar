@@ -48,8 +48,8 @@ impl Header {
     pub fn new(size: u32, schema: u32, id: &Id) -> Header {
         Header {
             version: 1,
-            size: size,
-            schema: schema,
+            size,
+            schema,
             partition: id.higher,
             hash: id.lower,
         }
