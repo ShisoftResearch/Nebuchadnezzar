@@ -15,7 +15,7 @@ pub type DataMap = Map;
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct Header {
     pub version: u64,
-    pub size: u32,
+    pub checksum: u32,
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
@@ -124,7 +124,7 @@ impl Cell {
     }
 
     pub fn header_from_chunk_raw(ptr: usize) -> Result<Header, ReadError> {
-        if ptr == 0 {return Err(ReadError::CellDoesNotExisted)}
+        if ptr == 0 {return Err(ReadError::CellIdIsUnitId)}
         Ok(unsafe {(*(ptr as *const Header))})
     }
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
@@ -133,7 +133,7 @@ impl Cell {
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
-                header: header,
+                header,
                 data: reader::read_by_schema(data_ptr, &schema)
             })
         } else {

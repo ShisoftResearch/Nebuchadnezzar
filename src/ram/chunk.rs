@@ -1,4 +1,3 @@
-use libc;
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeSet;
@@ -16,7 +15,7 @@ pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
 pub struct Chunk {
     pub id: usize,
     pub index: CHashMap<u64, usize>,
-    pub segs: CHashMap<usize, Arc<Segment>>,
+    pub segs: CHashMap<u64, Arc<Segment>>,
     pub seg_counter: AtomicU64,
     pub header_seg: RwLock<Arc<Segment>>,
     pub max_seg: usize,
@@ -41,22 +40,31 @@ impl Chunk {
             backup_storage: back_storage
         }
     }
+
     pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
         let mut retried = 0;
         loop {
-            let n = self.seg_round.load(Ordering::Relaxed);
-            let seg_id = n % self.segs.len();
-            let seg_acquire = self.segs[seg_id].try_acquire(size);
-            match seg_acquire {
+            let head = self.header_seg.read().clone();
+            let mut head_seg_id = head.id;
+            match head.try_acquire(size) {
+                Some(pair) => return pair,
                 None => {
-                    if retried > self.segs.len() * 2 {return None;}
-                    self.seg_round.fetch_add(1, Ordering::Relaxed);
-                    retried += 1;
-                },
-                _ => {return seg_acquire;}
+                    let acquired_header = self.header_seg.write();
+                    if head_seg_id == acquired_header.id {
+                        // head segment did not changed and locked, suitable for creating a new segment and point it to
+                        let new_seg_id = self.seg_counter.fetch_add(Ordering::Relaxed);
+                        let new_seg = Segment::new_empty(new_seg_id);
+                        let new_seg_ref = Arc::new(new_seg);
+                        *acquired_header = new_seg_ref.clone();
+                        self.segs.insert(new_seg_id, new_seg_ref);
+                    }
+                    // whether the segment acquisition success or not,
+                    // try to get the new segment and try again
+                }
             }
         }
     }
+
     fn locate_segment(&self, location: usize) -> &Segment {
         let offset = location - self.addr;
         let seg_id = offset / SEGMENT_SIZE;
@@ -91,17 +99,15 @@ impl Chunk {
             None => None
         }
     }
-    fn put_tombstone(&self, location: usize) {
-        let seg = self.locate_segment(location);
-        seg.put_cell_tombstone(location);
-        seg.put_frag(location);
-    }
+
     fn head_cell(&self, hash: u64) -> Result<Header, ReadError> {
         Cell::header_from_chunk_raw(*self.location_for_read(hash)?)
     }
+
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
         Cell::from_chunk_raw(*self.location_for_read(hash)?, self)
     }
+
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
         let loc = self.location_for_read(hash)?;
         let selected_data = Cell::select_from_chunk_raw(*loc, self, fields)?;
@@ -116,6 +122,7 @@ impl Chunk {
             _ => Err(ReadError::CellTypeIsNotMapForSelect)
         }
     }
+
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
         let loc = self.location_for_read(hash)?;
         let mut head_ptr = *loc + offset;
@@ -125,6 +132,7 @@ impl Chunk {
         }
         Ok(data.to_vec())
     }
+
     fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if self.location_for_read(hash).is_ok() {
@@ -150,6 +158,7 @@ impl Chunk {
             return Ok(cell.header)
         }
     }
+
     fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_for_write(hash) {
