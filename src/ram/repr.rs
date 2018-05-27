@@ -9,6 +9,7 @@ bitflags! {
     }
 }
 
+#[derive(Copy, Clone)]
 pub struct EntryHeader {
     entry_type: EntryType,
     entry_length: u32,
@@ -61,7 +62,9 @@ impl EntryHeader {
     }
 
     // Returns the entry header and content position
-    pub fn decode_from(mut pos: usize) -> (EntryHeader, usize) {
+    pub fn decode_from<R, RR>(mut pos: usize, read: R) -> (EntryHeader, RR)
+        where R: Fn(usize, EntryHeader) -> RR
+    {
         unsafe {
             let flag_byte = *(pos as *mut u8);
             pos += 1;
@@ -75,11 +78,12 @@ impl EntryHeader {
                 raw_len_bytes as *mut libc::c_void,
                 entry_bytes_len_usize);
             let entry_length = LittleEndian::read_u32(&*Box::from_raw(raw_len_bytes));
-            let enrty = EntryHeader {
+            let entry = EntryHeader {
                 entry_type,
                 entry_length
             };
-            (entry, pos + 1 + entry_bytes_len_usize)
+            pos += entry_bytes_len_usize
+            (entry, read(pos, entry))
         }
     }
 }
