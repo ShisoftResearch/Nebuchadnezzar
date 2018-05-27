@@ -82,7 +82,7 @@ impl EntryHeader {
                 entry_type,
                 entry_length
             };
-            pos += entry_bytes_len_usize
+            pos += entry_bytes_len_usize;
             (entry, read(pos, entry))
         }
     }
