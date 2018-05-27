@@ -61,7 +61,7 @@ impl EntryHeader {
         }
     }
 
-    // Returns the entry header and content position
+    // Returns the entry header reader returns
     pub fn decode_from<R, RR>(mut pos: usize, read: R) -> (EntryHeader, RR)
         where R: Fn(usize, EntryHeader) -> RR
     {
