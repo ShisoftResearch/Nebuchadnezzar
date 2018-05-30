@@ -5,5 +5,6 @@ pub mod schema;
 pub mod io;
 pub mod cleaner;
 pub mod repr;
+pub mod tombstone;
 
 mod segs;

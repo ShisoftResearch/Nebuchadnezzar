@@ -11,14 +11,15 @@ pub const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
 
 pub type DataMap = Map;
 
-#[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct Header {
+pub struct CellHeader {
     pub version: u64,
     pub checksum: u32,
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
+    // this shall be copied from entry header
+    pub size: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -44,28 +45,30 @@ pub enum ReadError {
     CellIdIsUnitId
 }
 
-impl Header {
-    pub fn new(size: u32, schema: u32, id: &Id) -> Header {
-        Header {
+impl CellHeader {
+    pub fn new(size: u32, schema: u32, id: &Id, checksum: u32) -> CellHeader {
+        CellHeader {
             version: 1,
             size,
             schema,
+            checksum,
             partition: id.higher,
             hash: id.lower,
         }
     }
     fn write(&self, location: usize) {
         unsafe {
-            ptr::copy_nonoverlapping(self as *const Header, location as *mut Header, HEADER_SIZE);
+            ptr::copy_nonoverlapping(self as *const CellHeader, location as *mut CellHeader, CELL_HEADER_SIZE);
         }
     }
     pub fn reserve(location: usize, size: usize) {
-        Header {
+        CellHeader {
             version: 0, // default a tombstone
             size: size as u32,
             schema: 0,
             hash: 0,
             partition: 0,
+            checksum: 0,
         }.write(location);
     }
     pub fn id(&self) -> Id {
@@ -80,11 +83,11 @@ impl Header {
     }
 }
 
-pub const HEADER_SIZE :usize = 32;
+pub const CELL_HEADER_SIZE: usize = 32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
-    pub header: Header,
+    pub header: CellHeader,
     pub data: Value
 }
 
@@ -92,7 +95,7 @@ impl Cell {
 
     pub fn new_with_id(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
-            header: Header::new(0, schema_id, id),
+            header: CellHeader::new(0, schema_id, id),
             data: value
         }
     }
@@ -123,13 +126,13 @@ impl Cell {
         Some(Cell::new_with_id(schema_id, &id, value))
     }
 
-    pub fn header_from_chunk_raw(ptr: usize) -> Result<Header, ReadError> {
+    pub fn header_from_chunk_raw(ptr: usize) -> Result<CellHeader, ReadError> {
         if ptr == 0 {return Err(ReadError::CellIdIsUnitId)}
-        Ok(unsafe {(*(ptr as *const Header))})
+        Ok(unsafe {(*(ptr as *const CellHeader))})
     }
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
         let header = Cell::header_from_chunk_raw(ptr)?;
-        let data_ptr = ptr + HEADER_SIZE;
+        let data_ptr = ptr + CELL_HEADER_SIZE;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
@@ -143,7 +146,7 @@ impl Cell {
     }
     pub fn select_from_chunk_raw(ptr: usize, chunk: &Chunk, fields: &[u64]) -> Result<Value, ReadError> {
         let header = Cell::header_from_chunk_raw(ptr)?;
-        let data_ptr = ptr + HEADER_SIZE;
+        let data_ptr = ptr + CELL_HEADER_SIZE;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(reader::read_by_schema_selected(data_ptr, &schema, fields))
@@ -171,7 +174,7 @@ impl Cell {
                 &self.data, &mut instructions
             )?;
         }
-        let total_size = offset + HEADER_SIZE;
+        let total_size = offset + CELL_HEADER_SIZE;
         if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size))}
         let addr_opt = chunk.try_acquire(total_size);
         self.header.size = total_size as u32;
@@ -183,7 +186,7 @@ impl Cell {
             },
             Some((addr, _lock)) => {
                 self.header.write(addr);
-                writer::execute_plan(addr + HEADER_SIZE, instructions);
+                writer::execute_plan(addr + CELL_HEADER_SIZE, instructions);
                 return Ok(addr);
             }
         }
@@ -194,6 +197,8 @@ impl Cell {
     pub fn set_id(&mut self, id: &Id) {
         self.header.set_id(id)
     }
+
+
 }
 
 impl Index<u64> for Cell {

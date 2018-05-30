@@ -41,7 +41,7 @@ pub fn cell_rw () {
     let schemas = LocalSchemasCache::new("", None).unwrap();
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: Header::new(0, schema.id, &id1),
+        header: CellHeader::new(0, schema.id, &id1),
         data: data
     };
     let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
@@ -51,8 +51,8 @@ pub fn cell_rw () {
     let cell_1_ptr = chunks.chunk_ptr(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
@@ -63,7 +63,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header::new(0, schema.id, &id2),
+        header: CellHeader::new(0, schema.id, &id2),
         data: data
     };
     let header = chunks.write_cell(&mut cell).unwrap();
@@ -71,14 +71,14 @@ pub fn cell_rw () {
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
     }
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
@@ -89,7 +89,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header::new(0, schema.id, &id2),
+        header: CellHeader::new(0, schema.id, &id2),
         data: data
     };
     let header = chunks.update_cell(&mut cell).unwrap();

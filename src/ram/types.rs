@@ -1,5 +1,5 @@
 use utils::rand;
-use ram::cell::Header;
+use ram::cell::CellHeader;
 
 pub use dovahkiin::types::*;
 
@@ -15,11 +15,11 @@ impl RandValue for Id {
 }
 
 pub trait FromHeader {
-    fn from_header(header: &Header) -> Self;
+    fn from_header(header: &CellHeader) -> Self;
 }
 
 impl FromHeader for Id {
-    fn from_header(header: &Header) -> Id {
+    fn from_header(header: &CellHeader) -> Id {
         Id {
             higher: header.partition,
             lower: header.hash

@@ -12,7 +12,7 @@ pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[test]
 pub fn header_size() {
-    assert_eq!(mem::size_of::<cell::Header>(), cell::HEADER_SIZE);
+    assert_eq!(mem::size_of::<cell::CellHeader>(), cell::CELL_HEADER_SIZE);
 }
 
 #[test]
@@ -36,15 +36,15 @@ pub fn cell_rw () {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: Header::new(0, schema.id, &id1),
+        header: CellHeader::new(0, schema.id, &id1),
         data: data
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
@@ -55,7 +55,7 @@ pub fn cell_rw () {
         name: "John"
     };
     cell = Cell {
-        header: Header::new(0, schema.id, &id2),
+        header: CellHeader::new(0, schema.id, &id2),
         data: data
     };
     loc = cell.write_to_chunk(&chunk);
@@ -64,14 +64,14 @@ pub fn cell_rw () {
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
     }
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
@@ -101,15 +101,15 @@ pub fn dynamic() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: Header::new(0, schema.id, &id1),
+        header: CellHeader::new(0, schema.id, &id1),
         data: data
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
@@ -123,14 +123,14 @@ pub fn dynamic() {
     data_map.insert("name", Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: Header::new(0, schema.id, &id2),
+        header: CellHeader::new(0, schema.id, &id2),
         data: data
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
-        assert!(stored_cell.header.size > (4 + HEADER_SIZE) as u32);
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "John");

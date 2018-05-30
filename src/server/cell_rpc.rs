@@ -1,4 +1,4 @@
-use ram::cell::{Cell, Header, ReadError, WriteError};
+use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::types::Id;
 use server::NebServer;
 use bifrost::rpc::*;
@@ -28,10 +28,10 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> Box<Future<Item = Cell, Error = ReadError>> {
         NebRPCServiceInner::read_cell(self.inner.clone(), key)
     }
-    fn write_cell(&self, mut cell: Cell) -> Box<Future<Item = Header, Error = WriteError>> {
+    fn write_cell(&self, mut cell: Cell) -> Box<Future<Item =CellHeader, Error = WriteError>> {
         NebRPCServiceInner::write_cell(self.inner.clone(), cell)
     }
-    fn update_cell(&self, mut cell: Cell) -> Box<Future<Item = Header, Error = WriteError>> {
+    fn update_cell(&self, mut cell: Cell) -> Box<Future<Item =CellHeader, Error = WriteError>> {
         NebRPCServiceInner::update_cell(self.inner.clone(), cell)
     }
     fn remove_cell(&self, key: Id) -> Box<Future<Item = (), Error = WriteError>> {
@@ -46,7 +46,7 @@ impl NebRPCServiceInner {
         box this.clone().pool.spawn_fn(move || this.server.chunks.read_cell(&key))
     }
     fn write_cell(this: Arc<Self>, mut cell: Cell)
-        -> Box<Future<Item = Header, Error = WriteError>>
+        -> Box<Future<Item =CellHeader, Error = WriteError>>
     {
         box this.clone().pool.spawn_fn(move ||
             match this.server.chunks.write_cell(&mut cell) {
@@ -56,7 +56,7 @@ impl NebRPCServiceInner {
         )
     }
     fn update_cell(this: Arc<Self>, mut cell: Cell)
-        -> Box<Future<Item = Header, Error = WriteError>>
+        -> Box<Future<Item =CellHeader, Error = WriteError>>
     {
         box this.clone().pool.spawn_fn(move ||
             match this.server.chunks.update_cell(&mut cell) {

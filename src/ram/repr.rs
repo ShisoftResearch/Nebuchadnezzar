@@ -4,8 +4,9 @@ use libc;
 
 bitflags! {
     pub struct EntryType: u8 {
-        const Cell = 0b00010000;
-        const Tomestone = 0b00110000;
+        const Undecided =   0b0000_0000;
+        const Cell =        0b0001_0000;
+        const Tomestone =   0b0010_0000;
     }
 }
 
@@ -68,9 +69,9 @@ impl EntryHeader {
         unsafe {
             let flag_byte = *(pos as *mut u8);
             pos += 1;
-            let entry_type_bits = 0b11110000 & flag_byte;
+            let entry_type_bits = 0b1111_0000 & flag_byte;
             let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
-            let entry_bytes_len = 0b00001111 & flag_byte;
+            let entry_bytes_len = 0b0000_1111 & flag_byte;
             let entry_bytes_len_usize = entry_bytes_len as usize;
             let raw_len_bytes= Box::into_raw(box [0u8; 4]);
             libc::memmove(

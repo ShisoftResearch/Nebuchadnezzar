@@ -1,12 +1,13 @@
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeSet;
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{Mutex, RwLock};
+use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
-use ram::cell::{Cell, ReadError, WriteError, Header};
+use ram::cell::{Cell, ReadError, WriteError, CellHeader};
 use server::ServerMeta;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
@@ -18,9 +19,10 @@ pub struct Chunk {
     pub segs: CHashMap<u64, Arc<Segment>>,
     pub seg_counter: AtomicU64,
     pub header_seg: RwLock<Arc<Segment>>,
-    pub max_seg: usize,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
+    pub total_space: AtomicUsize,
+    pub capacity: usize
 }
 
 pub struct Chunks {
@@ -28,32 +30,44 @@ pub struct Chunks {
 }
 
 impl Chunk {
-    fn new (id: usize, size: usize, meta: Arc<ServerMeta>, back_storage: Option<String>) -> Chunk {
+    fn new (id: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunk {
+        let first_seg_id = 0;
+        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, SEGMENT_SIZE));
+        let segs = CHashMap::new();
+        let index = CHashMap::new();
+        segs.insert(first_seg_id, bootstrap_segment_ref.to_owned());
         Chunk {
             id,
-            index: CHashMap::new(),
+            segs,
+            index,
             meta,
-            segs: segments,
+            backup_storage,
+            capacity: size,
+            total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
-            header_seg: AtomicUsize::new(0),
-            max_seg: size / SEGMENT_SIZE,
-            backup_storage: back_storage
+            header_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
         }
     }
 
-    pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
+    pub fn try_acquire(&self, size: usize) -> Option<(usize, AsyncRwLockReadGuard<()>)> {
         let mut retried = 0;
         loop {
             let head = self.header_seg.read().clone();
             let mut head_seg_id = head.id;
             match head.try_acquire(size) {
-                Some(pair) => return pair,
+                Some(pair) => return Some(pair),
                 None => {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
+                        // No space left
+                        return None;
+                    }
                     let acquired_header = self.header_seg.write();
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_id = self.seg_counter.fetch_add(Ordering::Relaxed);
-                        let new_seg = Segment::new_empty(new_seg_id);
+                        let new_seg_id = self.seg_counter.fetch_add(1, Ordering::Relaxed);
+                        let new_seg = Segment::new(new_seg_id, SEGMENT_SIZE);
+                        // for performance, won't CAS total_space
+                        self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         *acquired_header = new_seg_ref.clone();
                         self.segs.insert(new_seg_id, new_seg_ref);
@@ -65,11 +79,6 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, location: usize) -> &Segment {
-        let offset = location - self.addr;
-        let seg_id = offset / SEGMENT_SIZE;
-        return &self.segs[seg_id];
-    }
     pub fn location_for_read<'a>(&self, hash: u64)
         -> Result<CellReadGuard, ReadError> {
         match self.index.get(&hash) {
@@ -100,7 +109,7 @@ impl Chunk {
         }
     }
 
-    fn head_cell(&self, hash: u64) -> Result<Header, ReadError> {
+    fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
         Cell::header_from_chunk_raw(*self.location_for_read(hash)?)
     }
 
@@ -133,7 +142,7 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
-    fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
+    fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         if self.location_for_read(hash).is_ok() {
             return Err(WriteError::CellAlreadyExisted);
@@ -159,7 +168,7 @@ impl Chunk {
         }
     }
 
-    fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
+    fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_for_write(hash) {
             let new_location = cell.write_to_chunk(self)?;
@@ -275,7 +284,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_partial_raw(hash, offset, len)
     }
-    pub fn head_cell(&self, key: &Id) -> Result<Header, ReadError> {
+    pub fn head_cell(&self, key: &Id) -> Result<CellHeader, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
@@ -283,11 +292,11 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }
-    pub fn write_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
+    pub fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.write_cell(cell);
     }
-    pub fn update_cell(&self, cell: &mut Cell) -> Result<Header, WriteError> {
+    pub fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
     }

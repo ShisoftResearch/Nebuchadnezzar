@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::BTreeSet;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
-use super::cell::Header;
+use super::cell::CellHeader;
 
 pub const SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
@@ -31,10 +31,6 @@ impl Segment {
         }
     }
 
-    pub fn new_empty(id: u64) -> Segment {
-        Segment::new(id, SEGMENT_SIZE)
-    }
-
     // TODO: employ async lock
     pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
         let rl = self.lock.read();
@@ -47,7 +43,7 @@ impl Segment {
                 if self.append_header.compare_and_swap(curr_last, exp_last, Ordering::SeqCst) != curr_last {
                     continue;
                 } else {
-                    Header::reserve(curr_last, size);
+                    CellHeader::reserve(curr_last, size);
                     return Some((curr_last, rl));
                 }
             }

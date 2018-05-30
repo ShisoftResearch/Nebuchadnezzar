@@ -1,5 +1,5 @@
-use super::chunk::{Chunk, Chunks};
-use super::segs::Segment;
+use super::super::chunk::{Chunk, Chunks};
+use super::super::segs::Segment;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;

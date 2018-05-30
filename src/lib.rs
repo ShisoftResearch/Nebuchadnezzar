@@ -37,6 +37,7 @@ extern crate libc;
 extern crate chashmap;
 extern crate num_cpus;
 extern crate byteorder;
+extern crate crc32c;
 
 pub mod utils;
 #[macro_use]

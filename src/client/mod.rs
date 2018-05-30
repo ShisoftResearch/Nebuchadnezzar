@@ -10,7 +10,7 @@ use bifrost::raft::state_machine::callback::server::{NotifyError};
 
 use server::{transactions as txn_server, cell_rpc as plain_server, CONS_HASH_ID};
 use ram::types::Id;
-use ram::cell::{Cell, Header, ReadError, WriteError};
+use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::schema::{sm as schema_sm};
 use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::Schema;
@@ -77,12 +77,12 @@ impl AsyncClientInner {
         await!(client.read_cell(id))
     }
     #[async]
-    pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
+    pub fn write_cell(this: Arc<Self>, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, cell.id()))?;
         await!(client.write_cell(cell))
     }
     #[async]
-    pub fn update_cell(this: Arc<Self>, cell: Cell) -> Result<Result<Header, WriteError>, RPCError> {
+    pub fn update_cell(this: Arc<Self>, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, cell.id()))?;
         await!(client.update_cell(cell))
     }
@@ -213,13 +213,13 @@ impl AsyncClient {
     }
 
     pub fn write_cell(&self, cell: Cell)
-        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+        -> impl Future<Item = Result<CellHeader, WriteError>, Error = RPCError>
     {
         AsyncClientInner::write_cell(self.inner.clone(), cell)
     }
 
     pub fn update_cell(&self, cell: Cell)
-        -> impl Future<Item = Result<Header, WriteError>, Error = RPCError>
+        -> impl Future<Item = Result<CellHeader, WriteError>, Error = RPCError>
     {
         AsyncClientInner::update_cell(self.inner.clone(), cell)
     }
