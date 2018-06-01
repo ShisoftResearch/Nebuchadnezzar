@@ -1,6 +1,6 @@
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use parking_lot::{Mutex, RwLock};
 use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
@@ -8,6 +8,7 @@ use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, CellHeader};
+use ram::tombstone::Tombstone;
 use server::ServerMeta;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
@@ -16,6 +17,9 @@ pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
 pub struct Chunk {
     pub id: usize,
     pub index: CHashMap<u64, usize>,
+    // Used only for locating segment for address
+    // when putting tombstone, not normal data access
+    pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
     pub segs: CHashMap<u64, Arc<Segment>>,
     pub seg_counter: AtomicU64,
     pub header_seg: RwLock<Arc<Segment>>,
@@ -35,8 +39,7 @@ impl Chunk {
         let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, SEGMENT_SIZE));
         let segs = CHashMap::new();
         let index = CHashMap::new();
-        segs.insert(first_seg_id, bootstrap_segment_ref.to_owned());
-        Chunk {
+        let chunk = Chunk {
             id,
             segs,
             index,
@@ -46,10 +49,13 @@ impl Chunk {
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
             header_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
-        }
+            addrs_seg: RwLock::new(BTreeMap::new()),
+        };
+        chunk.put_segment(bootstrap_segment_ref);
+        return chunk;
     }
 
-    pub fn try_acquire(&self, size: usize) -> Option<(usize, AsyncRwLockReadGuard<()>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<(usize, AsyncRwLockReadGuard<()>)> {
         let mut retried = 0;
         loop {
             let head = self.header_seg.read().clone();
@@ -70,7 +76,7 @@ impl Chunk {
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         *acquired_header = new_seg_ref.clone();
-                        self.segs.insert(new_seg_id, new_seg_ref);
+                        self.put_segment(new_seg_ref);
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
@@ -161,7 +167,6 @@ impl Chunk {
                 }
             );
             if need_rollback {
-                self.put_tombstone(loc);
                 return Err(WriteError::CellAlreadyExisted)
             }
             return Ok(cell.header)
@@ -172,9 +177,7 @@ impl Chunk {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_for_write(hash) {
             let new_location = cell.write_to_chunk(self)?;
-            let old_location = *cell_location;
             *cell_location = new_location;
-            self.put_tombstone(old_location);
             return Ok(cell.header);
         } else {
             return Err(WriteError::CellDoesNotExisted)
@@ -189,9 +192,7 @@ impl Chunk {
                     let mut new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
                         let new_location = new_cell.write_to_chunk(self)?;
-                        let old_location = *cell_location;
                         *cell_location = new_location;
-                        self.put_tombstone(old_location);
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
@@ -205,7 +206,7 @@ impl Chunk {
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         if let Some(cell_location) = self.index.remove(&hash) {
-            self.put_tombstone(cell_location);
+            self.put_tombstone_by_cell_loc(cell_location);
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -221,7 +222,7 @@ impl Chunk {
                     match cell {
                         Ok(cell) => {
                             if predict(cell) {
-                                self.put_tombstone(cell_location);
+                                self.put_tombstone_by_cell_loc(cell_location);
                                 None
                             } else {
                                 result = Err(WriteError::CellDoesNotExisted);
@@ -241,6 +242,50 @@ impl Chunk {
             }
         });
         return result;
+    }
+
+    fn put_segment(&self, segment: Arc<Segment>) {
+        let segment_id = segment.id;
+        let segment_addr = segment.addr;
+        self.segs.insert(segment_id, segment);
+        self.addrs_seg.write().insert(segment_addr, segment_id);
+    }
+
+    fn locate_segment(&self, addr: usize) -> Option<Arc<Segment>> {
+        self.addrs_seg.read()
+            .range(addr - SEGMENT_SIZE..addr)
+            .last()
+            .and_then(|(_, seg_id)| {
+                self.segs
+                    .get(seg_id)
+                    .map(|guard| guard.clone())
+                    .and_then(|seg| {
+                        if addr < seg.bound {
+                            return Some(seg);
+                        } else {
+                            return None;
+                        }
+                    })
+            })
+    }
+
+    fn put_tombstone(&self, loc: usize, cell_header: &CellHeader) {
+        let segment = self
+            .locate_segment(loc)
+            .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?}", cell_header.id()).as_str());
+        Tombstone::put(
+            addr, segment.id,
+            cell_header.version,
+            cell_header.partition,
+            cell_header.hash
+        )
+    }
+
+    fn put_tombstone_by_cell_loc(&self, cell_location: usize) {
+        let header =
+            Cell::header_from_chunk_raw(cell_location)
+                .map_err(|e| WriteError::ReadError(e))?;
+        self.put_tombstone(cell_location, &header);
     }
 }
 

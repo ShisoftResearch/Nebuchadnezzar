@@ -6,41 +6,29 @@ bitflags! {
     pub struct EntryType: u8 {
         const Undecided =   0b0000_0000;
         const Cell =        0b0001_0000;
-        const Tomestone =   0b0010_0000;
+        const Tombstone =   0b0010_0000;
     }
 }
 
 #[derive(Copy, Clone)]
-pub struct EntryHeader {
+pub struct Entry {
     entry_type: EntryType,
     entry_length: u32,
-}
-
-fn count_len_bytes(len: u32) -> u8 {
-    let in_bits = 32;
-    let msb = 1 << (in_bits - 1);
-    let mut count: u8 = 0;
-    for i in 0..in_bits
-    {
-        if (len << i) & msb > 0 {
-            break;
-        };
-        count += 1;
-    }
-    let bytes = count / 8;
-    assert!(bytes <= 4);
-    return bytes;
 }
 
 fn encode_len(len: u32, bytes: &mut[u8]) {
     LittleEndian::write_u32(bytes, len);
 }
 
-impl EntryHeader {
-    pub fn encode_to<W>(mut pos: usize, entry_type: EntryType, content_len: u32, write_content: W)
+impl Entry {
+    pub fn encode_to<W>(
+        mut pos: usize,
+        entry_type: EntryType,
+        content_len: u32,
+        len_bytes_count: u8,
+        write_content: W)
         where W: Fn(usize)
     {
-        let len_bytes_count = count_len_bytes(content_len);
         let len_bytes_count_usize = len_bytes_count as usize;
         let flag_byte = len_bytes_count | entry_type.bits;
         let mut len_bytes = [0u8; 4];
@@ -63,8 +51,8 @@ impl EntryHeader {
     }
 
     // Returns the entry header reader returns
-    pub fn decode_from<R, RR>(mut pos: usize, read: R) -> (EntryHeader, RR)
-        where R: Fn(usize, EntryHeader) -> RR
+    pub fn decode_from<R, RR>(mut pos: usize, read: R) -> (Entry, RR)
+        where R: Fn(usize, Entry) -> RR
     {
         unsafe {
             let flag_byte = *(pos as *mut u8);
@@ -79,13 +67,35 @@ impl EntryHeader {
                 raw_len_bytes as *mut libc::c_void,
                 entry_bytes_len_usize);
             let entry_length = LittleEndian::read_u32(&*Box::from_raw(raw_len_bytes));
-            let entry = EntryHeader {
+            let entry = Entry {
                 entry_type,
                 entry_length
             };
             pos += entry_bytes_len_usize;
             (entry, read(pos, entry))
         }
+    }
+
+    #[inline]
+    pub fn size(len_bytes_count: u8, size: u32) -> u32 {
+        1 + len_bytes as u32 + size
+    }
+
+    #[inline]
+    pub fn count_len_bytes(len: u32) -> u8 {
+        let in_bits = 32;
+        let msb = 1 << (in_bits - 1);
+        let mut count: u8 = 0;
+        for i in 0..in_bits
+            {
+                if (len << i) & msb > 0 {
+                    break;
+                };
+                count += 1;
+            }
+        let bytes = count / 8;
+        assert!(bytes <= 4);
+        return bytes;
     }
 }
 

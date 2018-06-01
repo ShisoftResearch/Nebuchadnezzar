@@ -32,7 +32,8 @@ impl Segment {
     }
 
     // TODO: employ async lock
-    pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<(usize, RwLockReadGuard<()>)> {
+        let size = size as usize;
         let rl = self.lock.read();
         loop {
             let curr_last = self.append_header.load(Ordering::SeqCst);

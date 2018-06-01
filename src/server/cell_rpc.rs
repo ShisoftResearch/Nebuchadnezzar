@@ -10,8 +10,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
 service! {
     rpc read_cell(key: Id) -> Cell | ReadError;
-    rpc write_cell(cell: Cell) -> Header | WriteError;
-    rpc update_cell(cell: Cell) -> Header | WriteError;
+    rpc write_cell(cell: Cell) -> CellHeader | WriteError;
+    rpc update_cell(cell: Cell) -> CellHeader | WriteError;
     rpc remove_cell(key: Id) -> () | WriteError;
 }
 
