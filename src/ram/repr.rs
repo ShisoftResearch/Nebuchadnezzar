@@ -78,7 +78,7 @@ impl Entry {
 
     #[inline]
     pub fn size(len_bytes_count: u8, size: u32) -> u32 {
-        1 + len_bytes as u32 + size
+        1 + len_bytes_count as u32 + size
     }
 
     #[inline]

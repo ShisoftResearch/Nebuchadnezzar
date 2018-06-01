@@ -95,7 +95,7 @@ impl Cell {
 
     pub fn new_with_id(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
-            header: CellHeader::new(0, schema_id, id),
+            header: CellHeader::new(0, schema_id, id, 0),
             data: value
         }
     }
@@ -176,7 +176,7 @@ impl Cell {
         }
         let total_size = offset + CELL_HEADER_SIZE;
         if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size))}
-        let addr_opt = chunk.try_acquire(total_size);
+        let addr_opt = chunk.try_acquire(total_size as u32);
         self.header.size = total_size as u32;
         self.header.version += 1;
         match addr_opt {

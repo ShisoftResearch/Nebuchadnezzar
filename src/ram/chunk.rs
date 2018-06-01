@@ -206,7 +206,7 @@ impl Chunk {
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         if let Some(cell_location) = self.index.remove(&hash) {
-            self.put_tombstone_by_cell_loc(cell_location);
+            self.put_tombstone_by_cell_loc(cell_location)?;
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -222,8 +222,13 @@ impl Chunk {
                     match cell {
                         Ok(cell) => {
                             if predict(cell) {
-                                self.put_tombstone_by_cell_loc(cell_location);
-                                None
+                                let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
+                                if put_tombstone_result.is_err() {
+                                    result = put_tombstone_result;
+                                    loc_opt
+                                } else {
+                                    None
+                                }
                             } else {
                                 result = Err(WriteError::CellDoesNotExisted);
                                 loc_opt
@@ -274,18 +279,19 @@ impl Chunk {
             .locate_segment(loc)
             .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?}", cell_header.id()).as_str());
         Tombstone::put(
-            addr, segment.id,
+            loc, segment.id,
             cell_header.version,
             cell_header.partition,
             cell_header.hash
         )
     }
 
-    fn put_tombstone_by_cell_loc(&self, cell_location: usize) {
+    fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
         let header =
             Cell::header_from_chunk_raw(cell_location)
                 .map_err(|e| WriteError::ReadError(e))?;
         self.put_tombstone(cell_location, &header);
+        Ok(())
     }
 }
 
