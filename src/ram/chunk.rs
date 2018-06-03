@@ -116,7 +116,7 @@ impl Chunk {
     }
 
     fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
-        Cell::header_from_chunk_raw(*self.location_for_read(hash)?)
+        Cell::header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
@@ -289,7 +289,7 @@ impl Chunk {
     fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
         let header =
             Cell::header_from_chunk_raw(cell_location)
-                .map_err(|e| WriteError::ReadError(e))?;
+                .map_err(|e| WriteError::ReadError(e))?.0;
         self.put_tombstone(cell_location, &header);
         Ok(())
     }

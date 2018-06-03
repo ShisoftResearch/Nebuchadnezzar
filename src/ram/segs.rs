@@ -44,7 +44,6 @@ impl Segment {
                 if self.append_header.compare_and_swap(curr_last, exp_last, Ordering::SeqCst) != curr_last {
                     continue;
                 } else {
-                    CellHeader::reserve(curr_last, size);
                     return Some((curr_last, rl));
                 }
             }

@@ -12,8 +12,8 @@ bitflags! {
 
 #[derive(Copy, Clone)]
 pub struct Entry {
-    entry_type: EntryType,
-    entry_length: u32,
+    pub entry_type: EntryType,
+    pub entry_length: u32,
 }
 
 fn encode_len(len: u32, bytes: &mut[u8]) {

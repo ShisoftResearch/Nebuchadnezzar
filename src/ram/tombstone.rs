@@ -1,7 +1,8 @@
+use super::mem_cursor::*;
 use std::io::{Cursor, Write, Read};
-use ram::repr::{Entry, EntryType};
+use ram::repr::*;
 use dovahkiin::types::Id;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use byteorder::{ReadBytesExt, WriteBytesExt};
 
 lazy_static! {
     pub static ref LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
@@ -17,24 +18,16 @@ pub struct Tombstone {
 
 pub const TOMBSTONE_SIZE: usize = 32;
 pub const TOMBSTONE_SIZE_U32: u32 = TOMBSTONE_SIZE as u32;
-type Endian = LittleEndian;
-type TombstoneCursor = Cursor<Box<[u8]>>;
 
 fn write_u64<W>(buffer: W, value: u64) where W: Write + Sized {
     buffer.write_u64::<Endian>(value).unwrap();
 }
 
-fn release_cursor(cursor: TombstoneCursor) {
-    Box::into_raw(cursor.into_inner());
-}
+
+def_raw_memory_cursor_for_size!(TOMBSTONE_SIZE, addr_to_cursor);
 
 impl Tombstone {
-    fn addr_to_cursor(addr: usize) -> TombstoneCursor {
-        let ptr = addr as *mut [u8; TOMBSTONE_SIZE];
-        unsafe {
-            Cursor::new(Box::from_raw(ptr as *mut [u8]))
-        }
-    }
+
 
     pub fn write(&self, addr: usize) {
         Entry::encode_to(
@@ -43,7 +36,7 @@ impl Tombstone {
             TOMBSTONE_SIZE_U32,
             *LEN_BYTES_COUNT,
         |addr| {
-            let mut cursor = Tombstone::addr_to_cursor(addr);
+            let mut cursor = addr_to_cursor(addr);
             write_u64(cursor, self.segment_id);
             write_u64(cursor, self.version);
             write_u64(cursor, self.partition);
@@ -56,7 +49,7 @@ impl Tombstone {
         Entry::decode_from(
             addr,
             |addr, _| {
-                let mut cursor = Tombstone::addr_to_cursor(addr);
+                let mut cursor = addr_to_cursor(addr);
                 let tombstone = Tombstone {
                     segment_id: cursor.read_u64::<Endian>().unwrap(),
                     version: cursor.read_u64::<Endian>().unwrap(),
