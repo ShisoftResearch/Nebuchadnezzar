@@ -37,6 +37,8 @@ impl RingBuffer {
     }
 
     pub fn push(&self, val: usize) {
+        // blocking when buffer is full
+        // no resizing occurred in the process
         loop {
             self.wait_lock();
             let size = self.size;

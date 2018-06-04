@@ -61,7 +61,7 @@ impl Tombstone {
     }
 
     pub fn put(
-        addr: usize,
+        tombstone_addr: usize,
         segment_id: u64,
         version: u64,
         partition: u64,
@@ -70,6 +70,6 @@ impl Tombstone {
         Tombstone {
             segment_id, version,
             partition, hash
-        }.write(addr)
+        }.write(tombstone_addr)
     }
 }

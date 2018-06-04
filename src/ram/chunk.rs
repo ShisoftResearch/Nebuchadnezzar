@@ -8,7 +8,9 @@ use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, CellHeader};
-use ram::tombstone::Tombstone;
+use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
+use ram::repr;
+use utils::ring_buffer::RingBuffer;
 use server::ServerMeta;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
@@ -26,6 +28,7 @@ pub struct Chunk {
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub total_space: AtomicUsize,
+    pub dead_entries: RingBuffer,
     pub capacity: usize
 }
 
@@ -50,18 +53,19 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             header_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
             addrs_seg: RwLock::new(BTreeMap::new()),
+            dead_entries: RingBuffer::new(size / SEGMENT_SIZE * 10)
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
     }
 
-    pub fn try_acquire(&self, size: u32) -> Option<(usize, AsyncRwLockReadGuard<()>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<((usize, AsyncRwLockReadGuard<()>), Arc<Segment>)> {
         let mut retried = 0;
         loop {
             let head = self.header_seg.read().clone();
             let mut head_seg_id = head.id;
             match head.try_acquire(size) {
-                Some(pair) => return Some(pair),
+                Some(pair) => return Some((pair, head)),
                 None => {
                     if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
                         // No space left
@@ -278,16 +282,26 @@ impl Chunk {
             })
     }
 
-    fn put_tombstone(&self, loc: usize, cell_header: &CellHeader) {
-        let segment = self
-            .locate_segment(loc)
+    #[inline]
+    fn put_tombstone(&self, cell_location: usize,cell_header: &CellHeader) {
+        let cell_seg = self
+            .locate_segment(cell_location)
             .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?}", cell_header.id()).as_str());
+        let ((tombstone_addr, _lock), head_seg) = (||{
+            loop {
+                if let Some(pair) = self.try_acquire(TOMBSTONE_SIZE_U32) {
+                    return pair;
+                }
+                warn!("Chunk {} is too full to put a tombstone. Will retry.", self.id)
+            }
+        })();
         Tombstone::put(
-            loc, segment.id,
+            tombstone_addr, cell_seg.id,
             cell_header.version,
             cell_header.partition,
             cell_header.hash
-        )
+        );
+        head_seg.live_tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
     fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
@@ -299,11 +313,23 @@ impl Chunk {
         Ok(())
     }
 
-    // put dead entry address in a non-blocking queue and wait for a worker to
+    // put dead entry address in a ideally non-blocking queue and wait for a worker to
     // make the changes in corresponding segments.
     // Because calculate segment from location is computation intensive, it have to be done lazily
+    #[inline]
     fn mark_dead_entry(&self, loc: usize) {
+        self.dead_entries.push(loc);
+    }
 
+    // this function should be invoked repeatedly to flush the queue
+    fn apply_dead_entry(&self) {
+        let marks = self.dead_entries.iter();
+        for addr in marks {
+            if let Some(seg) = self.locate_segment(addr) {
+                let (entry, _) = repr::Entry::decode_from(addr, |_, _| {});
+                seg.dead_space.fetch_add(entry.entry_length as usize, Ordering::Relaxed);
+            }
+        }
     }
 }
 

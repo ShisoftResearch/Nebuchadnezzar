@@ -1,5 +1,5 @@
 use libc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use std::collections::BTreeSet;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
@@ -14,6 +14,8 @@ pub struct Segment {
     pub append_header: AtomicUsize,
     pub total_space: AtomicUsize,
     pub dead_space: AtomicUsize,
+    pub live_tombstones: AtomicU32,
+    pub dead_tombstones: AtomicU32,
     pub lock: RwLock<()>,
 }
 
@@ -27,6 +29,8 @@ impl Segment {
             append_header: AtomicUsize::new(buffer_ptr),
             total_space: AtomicUsize::new(size),
             dead_space: AtomicUsize::new(0),
+            live_tombstones: AtomicU32::new(0),
+            dead_tombstones: AtomicU32::new(0),
             lock: RwLock::new(())
         }
     }
