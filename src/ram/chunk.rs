@@ -302,7 +302,7 @@ impl Chunk {
             cell_header.partition,
             cell_header.hash
         );
-        head_seg.live_tombstones.fetch_add(1, Ordering::Relaxed);
+        head_seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
     fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
@@ -336,16 +336,25 @@ impl Chunk {
     pub fn scan_tombstone_survival(&self) {
         for seg_id in self.addrs_seg.read().values() {
             if let Some(segment) = self.segs.get(seg_id){
+                let now = get_time();
+                let mut death_count = 0;
+                if  // have no tombstone
+                    segment.tombstones.load(Ordering::Relaxed) > 0 ||
+                    // have been cleaned recently
+                    now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
+                    continue;
+                }
                 for (entry, addr) in segment.entry_iter() {
                     if entry.entry_type == repr::EntryType::Tombstone {
                         let tombstone = Tombstone::read(addr);
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
-                            segment.dead_tombstones.fetch_add(1, Ordering::Relaxed);
-                            segment.last_tombstones_scanned.store(get_time(), Ordering::Relaxed);
+                            death_count += 1;
                         }
                     }
                 }
+                segment.dead_tombstones.fetch_add(death_count, Ordering::Relaxed);
+                segment.last_tombstones_scanned.store(now, Ordering::Relaxed);
             } else {
                 warn!("leaked segment in addrs_seg: {}", *seg_id)
             }
