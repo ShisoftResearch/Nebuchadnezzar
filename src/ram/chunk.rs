@@ -337,9 +337,13 @@ impl Chunk {
         for seg_id in self.addrs_seg.read().values() {
             if let Some(segment) = self.segs.get(seg_id){
                 let now = get_time();
+                let tombstones = segment.tombstones.load(Ordering::Relaxed);
+                let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
                 let mut death_count = 0;
-                if  // have no tombstone
-                    segment.tombstones.load(Ordering::Relaxed) > 0 ||
+                if  // have not much tombstones
+                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.1 ||
+                    // large partition have been scanned
+                    (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
                     // have been cleaned recently
                     now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
                     continue;
