@@ -176,8 +176,10 @@ impl Chunk {
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         if let Some(mut cell_location) = self.location_for_write(hash) {
+            let old_location = *cell_location;
             let new_location = cell.write_to_chunk(self)?;
             *cell_location = new_location;
+            self.mark_dead_entry(old_location);
             return Ok(cell.header);
         } else {
             return Err(WriteError::CellDoesNotExisted)
@@ -191,8 +193,10 @@ impl Chunk {
                 Ok(cell) => {
                     let mut new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
+                        let old_location = *cell_location;
                         let new_location = new_cell.write_to_chunk(self)?;
                         *cell_location = new_location;
+                        self.mark_dead_entry(old_location);
                         return Ok(new_cell);
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
@@ -291,7 +295,15 @@ impl Chunk {
             Cell::header_from_chunk_raw(cell_location)
                 .map_err(|e| WriteError::ReadError(e))?.0;
         self.put_tombstone(cell_location, &header);
+        self.mark_dead_entry(cell_location);
         Ok(())
+    }
+
+    // put dead entry address in a non-blocking queue and wait for a worker to
+    // make the changes in corresponding segments.
+    // Because calculate segment from location is computation intensive, it have to be done lazily
+    fn mark_dead_entry(&self, loc: usize) {
+
     }
 }
 

@@ -12,7 +12,7 @@ pub struct Segment {
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
-    pub live_space: AtomicUsize,
+    pub total_space: AtomicUsize,
     pub dead_space: AtomicUsize,
     pub lock: RwLock<()>,
 }
@@ -25,7 +25,7 @@ impl Segment {
             id,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
-            live_space: AtomicUsize::new(0),
+            total_space: AtomicUsize::new(size),
             dead_space: AtomicUsize::new(0),
             lock: RwLock::new(())
         }

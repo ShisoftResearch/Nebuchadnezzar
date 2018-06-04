@@ -22,7 +22,7 @@ pub struct CellHeader {
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
-    // this shall be copied from entry header
+    // this shall be calculated from entry header
     pub size: u32,
 }
 
