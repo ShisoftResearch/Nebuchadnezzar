@@ -13,7 +13,7 @@ bitflags! {
 #[derive(Copy, Clone)]
 pub struct Entry {
     pub entry_type: EntryType,
-    pub entry_length: u32,
+    pub content_length: u32,
 }
 
 fn encode_len(len: u32, bytes: &mut[u8]) {
@@ -69,7 +69,7 @@ impl Entry {
             let entry_length = LittleEndian::read_u32(&*Box::from_raw(raw_len_bytes));
             let entry = Entry {
                 entry_type,
-                entry_length
+                content_length: entry_length
             };
             pos += entry_bytes_len_usize;
             (entry, read(pos, entry))

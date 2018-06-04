@@ -48,7 +48,8 @@ impl Tombstone {
     pub fn read(addr: usize) -> Tombstone {
         Entry::decode_from(
             addr,
-            |addr, _| {
+            |addr, entry| {
+                assert_eq!(entry.entry_type, EntryType::Tombstone, "Reading entry not tombstone");
                 let mut cursor = addr_to_cursor(addr);
                 let tombstone = Tombstone {
                     segment_id: cursor.read_u64::<Endian>().unwrap(),

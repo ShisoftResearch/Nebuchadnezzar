@@ -327,7 +327,25 @@ impl Chunk {
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
                 let (entry, _) = repr::Entry::decode_from(addr, |_, _| {});
-                seg.dead_space.fetch_add(entry.entry_length as usize, Ordering::Relaxed);
+                seg.dead_space.fetch_add(entry.content_length, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn scan_tombstone_survival(&self) {
+        for seg_id in self.addrs_seg.read().values() {
+            if let Some(segment) = self.segs.get(seg_id){
+                for (entry, addr) in segment.entry_iter() {
+                    if entry.entry_type == repr::EntryType::Tombstone {
+                        let tombstone = Tombstone::read(addr);
+                        if !self.segs.contains_key(&tombstone.segment_id) {
+                            // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
+                            segment.dead_tombstones.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            } else {
+                warn!("leaked segment in addrs_seg: {}", *seg_id)
             }
         }
     }

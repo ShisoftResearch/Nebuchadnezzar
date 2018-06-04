@@ -140,7 +140,7 @@ impl Cell {
                     schema: cursor.read_u32::<Endian>().unwrap(),
                     partition: cursor.read_u64::<Endian>().unwrap(),
                     hash: cursor.read_u64::<Endian>().unwrap(),
-                    size: entry_header.entry_length - CELL_HEADER_SIZE as u32,
+                    size: entry_header.content_length - CELL_HEADER_SIZE as u32,
                 };
                 (header, addr + CELL_HEADER_SIZE)
         });

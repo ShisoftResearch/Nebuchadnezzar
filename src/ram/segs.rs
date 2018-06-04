@@ -1,4 +1,5 @@
 use libc;
+use ram::repr;
 use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
 use std::collections::BTreeSet;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
@@ -12,10 +13,11 @@ pub struct Segment {
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
-    pub total_space: AtomicUsize,
-    pub dead_space: AtomicUsize,
+    pub total_space: AtomicU32,
+    pub dead_space: AtomicU32,
     pub live_tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
+    pub last_tombstones_scanned: AtomicU32,
     pub lock: RwLock<()>,
 }
 
@@ -27,11 +29,12 @@ impl Segment {
             id,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
-            total_space: AtomicUsize::new(size),
-            dead_space: AtomicUsize::new(0),
+            total_space: AtomicU32::new(size as u32),
+            dead_space: AtomicU32::new(0),
             live_tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
-            lock: RwLock::new(())
+            last_tombstones_scanned: AtomicU32::new(0),
+            lock: RwLock::new(()),
         }
     }
 
@@ -53,42 +56,13 @@ impl Segment {
             }
         }
     }
-//    TODO: Review if write lock segment is preferred when acquiring space from the segment
-//    pub fn try_acquire(&self, size: usize) -> Option<(usize, RwLockReadGuard<()>)> {
-//        let rl = self.lock.write();
-//        let curr_last = self.last.load(Ordering::SeqCst);
-//        let exp_last = curr_last + size;
-//        if exp_last > self.bound {
-//            return None;
-//        } else {
-//            // once we use write lock here, atomic CAS loop is not required
-//            self.last.store(exp_last, Ordering::SeqCst);
-//            Header::reserve(curr_last, size);
-//            return Some((curr_last, rl.downgrade()));
-//            // we only want exclusive lock when acquire space and reserve seats.
-//            // further cell write operations should use read lock to allow parallel writing to one segment
-//        }
-//    }
-    pub fn cell_val_from_raw<T>(&self, location: usize, offset: usize) -> *mut T {
-        (location + offset) as *mut T
-    }
-    pub fn cell_version(&self, location: usize) -> *mut u64 {
-        self.cell_val_from_raw(location, 0)
-    }
-    pub fn cell_size(&self, location: usize) -> *mut u32 {
-        self.cell_val_from_raw(location, 8)
-    }
-    pub fn cell_hash(&self, location: usize) -> *mut u64 {
-        self.cell_val_from_raw(location, 24)
-    }
-    pub fn put_cell_tombstone(&self, location: usize) {
-        unsafe {
-            *self.cell_version(location) = 0; // set version to 0 to represent tombstone
-        }
-    }
 
-    pub fn no_frags(&self) -> bool {
-        return self.dead_space.load(Ordering::Relaxed) == 0;
+    pub fn entry_iter(&self) -> SegmentEntryIter {
+        SegmentEntryIter {
+            bound: self.bound,
+            cursor: self.addr,
+            lock_guard: self.lock.read()
+        }
     }
 
     fn dispose (&self) {
@@ -96,6 +70,31 @@ impl Segment {
         unsafe {
             libc::free(self.addr as *mut libc::c_void)
         }
+    }
+}
+
+pub struct SegmentEntryIter {
+    bound: usize,
+    cursor: usize,
+    lock_guard: RwLockReadGuard<()>,
+}
+
+impl Iterator for SegmentEntryIter {
+    type Item = (repr::Entry, usize);
+
+    fn next(&mut self) -> Option<<Self as Iterator>::Item> {
+        let cursor = self.cursor;
+        if cursor >= self.bound {
+            return None;
+        }
+        let (entry, entry_size) = repr::Entry::decode_from(
+            cursor,
+            |body_pos, entry| {
+                let entry_header_size = body_pos - cursor;
+                return entry_header_size + entry.content_length as usize;
+            });
+        self.cursor += entry_size;
+        return Some((entry, cursor));
     }
 }
 
