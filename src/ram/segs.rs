@@ -1,6 +1,6 @@
 use libc;
 use ram::repr;
-use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, Ordering};
 use std::collections::BTreeSet;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
@@ -17,7 +17,7 @@ pub struct Segment {
     pub dead_space: AtomicU32,
     pub live_tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
-    pub last_tombstones_scanned: AtomicU32,
+    pub last_tombstones_scanned: AtomicI64,
     pub lock: RwLock<()>,
 }
 
@@ -33,7 +33,7 @@ impl Segment {
             dead_space: AtomicU32::new(0),
             live_tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
-            last_tombstones_scanned: AtomicU32::new(0),
+            last_tombstones_scanned: AtomicI64::new(0),
             lock: RwLock::new(()),
         }
     }

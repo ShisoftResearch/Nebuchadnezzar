@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeMap;
 use parking_lot::{Mutex, RwLock};
 use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
+use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
@@ -341,6 +342,7 @@ impl Chunk {
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
                             segment.dead_tombstones.fetch_add(1, Ordering::Relaxed);
+                            segment.last_tombstones_scanned.store(get_time(), Ordering::Relaxed);
                         }
                     }
                 }
