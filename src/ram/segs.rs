@@ -65,7 +65,7 @@ impl Segment {
         }
     }
 
-    fn total_dead_space(&self) -> u32 {
+    pub fn total_dead_space(&self) -> u32 {
         let dead_tombstones_space = self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
         let dead_cells_space = self.dead_space.load(Ordering::Relaxed);
         return dead_tombstones_space + dead_cells_space;

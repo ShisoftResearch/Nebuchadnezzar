@@ -27,19 +27,16 @@ pub struct CompactCleaner {
 
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
+        let total_dead_space = seg.total_dead_space();
         // Clean only if segment have fragments
-        if seg.no_frags() {return;}
+        if total_dead_space == 0 {return;}
         // Retry cleaning the segment if unexpected state discovered
         let mut retried = 0;
-        // Lock segment exclusively only if it is not rw locked to avoid waiting for disk backups.
-        // There is one potential deadlock with writing cells. Because every cell write operations
-        // locks on cell first and then lock it's underlying segment to acquire space, but cleaner
-        // will lock segments first then lock the cell to move it to fill the fragments.
-        // The solution is to lock the segment first. Before moving the cells, segment lock have to
-        // be released and then lock the cell lock. After cell moved, release the cell lock and do
-        // further operations on segment with a new segment lock guard.
-        // Because the segment will be locked twice, there is no guarantee for not modifying the
-        // segment when moving the cell, extra efforts need to taken care of to ensure correctness.
+        // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
+        // Log-structured cleaner suggests new segment allocation and copy living entries from the
+        // old segment to new segment. The new segment should have smaller sizes than the old one.
+        // In this way lock can be straight forward, copy those entries to the new segment, change
+        // cell indices by lock them first, write lock the old segment, remove the old segment.
         debug!("Cleaning segment: {}", seg.addr);
         let mut defrag_pos = seg.addr;
         while retried < MAX_CLEAN_RETRY {
