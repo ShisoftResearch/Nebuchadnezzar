@@ -18,6 +18,8 @@ pub struct Segment {
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
     pub last_tombstones_scanned: AtomicI64,
+    // this spin lock is used only for preventing early segment deletion on cleaning
+    // all normal operations, including first stage of compaction should use read lock
     pub lock: RwLock<()>,
 }
 
@@ -37,7 +39,6 @@ impl Segment {
         }
     }
 
-    // TODO: employ async lock
     pub fn try_acquire(&self, size: u32) -> Option<(usize, RwLockReadGuard<()>)> {
         let size = size as usize;
         let rl = self.lock.read();
