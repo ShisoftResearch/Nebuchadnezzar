@@ -22,13 +22,13 @@ impl Cleaner {
             stopped: stop_tag.clone(),
             segment_compact_per_turn
         };
-        thread::spawn(|| {
+        thread::spawn(move || {
             while !stop_tag.load(Ordering::Relaxed) {
-                for chunk in chunks.list {
+                for chunk in &chunks.list {
                     chunk.apply_dead_entry();
                     chunk.scan_tombstone_survival();
-                    let segs_to_compact = chunk
-                        .ordered_segs_for_compact_cleaner().iter()
+                    let ordered_segs_for_compact = chunk.ordered_segs_for_compact_cleaner();
+                    let segs_to_compact = ordered_segs_for_compact.iter()
                         .take(segment_compact_per_turn);
                     
                 }

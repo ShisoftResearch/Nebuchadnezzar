@@ -72,7 +72,7 @@ impl Chunk {
                         // No space left
                         return None;
                     }
-                    let acquired_header = self.header_seg.write();
+                    let mut acquired_header = self.header_seg.write();
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.seg_counter.fetch_add(1, Ordering::Relaxed);
@@ -323,7 +323,8 @@ impl Chunk {
     }
 
     pub fn segments(&self) -> Vec<Arc<Segment>> {
-        let segs = self.addrs_seg.read().values();
+        let addr_segs = self.addrs_seg.read();
+        let segs = addr_segs.values();
         let mut list = Vec::with_capacity(self.segs.len());
         for seg_id in segs {
             if let Some(segment) = self.segs.get(seg_id){

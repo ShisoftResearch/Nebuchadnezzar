@@ -109,7 +109,7 @@ pub fn plan_write_dynamic_fields(
     return Ok(())
 }
 
-pub fn execute_plan (ptr: usize, instructions: Vec<Instruction>) {
+pub fn execute_plan (ptr: usize, instructions: &Vec<Instruction>) {
     for ins in instructions {
         types::set_val(ins.type_id, &ins.val, ptr + ins.offset);
     }

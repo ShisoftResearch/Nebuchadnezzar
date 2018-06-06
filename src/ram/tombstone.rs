@@ -19,7 +19,7 @@ pub struct Tombstone {
 pub const TOMBSTONE_SIZE: usize = 32;
 pub const TOMBSTONE_SIZE_U32: u32 = TOMBSTONE_SIZE as u32;
 
-fn write_u64<W>(buffer: W, value: u64) where W: Write + Sized {
+fn write_u64<W>(buffer: &mut W, value: u64) where W: Write + Sized {
     buffer.write_u64::<Endian>(value).unwrap();
 }
 
@@ -37,10 +37,12 @@ impl Tombstone {
             *LEN_BYTES_COUNT,
         |addr| {
             let mut cursor = addr_to_cursor(addr);
-            write_u64(cursor, self.segment_id);
-            write_u64(cursor, self.version);
-            write_u64(cursor, self.partition);
-            write_u64(cursor, self.hash);
+            {
+                write_u64(&mut cursor, self.segment_id);
+                write_u64(&mut cursor, self.version);
+                write_u64(&mut cursor, self.partition);
+                write_u64(&mut cursor, self.hash);
+            }
             release_cursor(cursor);
         })
     }

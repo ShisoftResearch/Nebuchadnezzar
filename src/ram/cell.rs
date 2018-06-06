@@ -208,10 +208,10 @@ impl Cell {
                     repr::EntryType::Cell,
                     total_size,
                     len_bytes,
-                    |content_addr| {
+                    move |content_addr| {
                         let cursor = addr_to_header_cursor(content_addr);
                         self.header.write(cursor);
-                        writer::execute_plan(content_addr + CELL_HEADER_SIZE, instructions);
+                        writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
                     });
                 return Ok(addr);
             }
