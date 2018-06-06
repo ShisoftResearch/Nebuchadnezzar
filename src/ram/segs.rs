@@ -1,5 +1,6 @@
 use libc;
 use ram::repr;
+use ram::tombstone::TOMBSTONE_SIZE_U32;
 use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, Ordering};
 use std::collections::BTreeSet;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
@@ -13,7 +14,6 @@ pub struct Segment {
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
-    pub total_space: AtomicU32,
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
@@ -29,7 +29,6 @@ impl Segment {
             id,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
-            total_space: AtomicU32::new(size as u32),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
@@ -63,6 +62,19 @@ impl Segment {
             cursor: self.addr,
             lock_guard: self.lock.read()
         }
+    }
+
+    fn total_dead_space(&self) -> u32 {
+        let dead_tombstones_space = self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        let dead_cells_space = self.dead_space.load(Ordering::Relaxed);
+        return dead_tombstones_space + dead_cells_space;
+    }
+
+    pub fn living_rate(&self) -> f32 {
+        let used_spaces = (self.append_header.load(Ordering::Relaxed) - self.addr) as f32;
+        let total_dead_space = self.total_dead_space() as f32;
+        let living_space = used_spaces - total_dead_space;
+        return living_space / used_spaces;
     }
 
     fn dispose (&self) {

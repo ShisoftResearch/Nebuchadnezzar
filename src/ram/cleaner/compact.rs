@@ -20,37 +20,12 @@ pub fn ceiling_frag(frags: &MutexGuard<BTreeSet<usize>>, location: usize) -> Opt
     }
 }
 
-pub struct Cleaner {
+pub struct CompactCleaner {
     chunks: Arc<Chunks>,
     closed: AtomicBool
 }
 
-impl Cleaner {
-    pub fn new(chunks: &Arc<Chunks>) -> Arc<Cleaner> {
-        let cleaner = Arc::new(Cleaner {
-            chunks: chunks.clone(),
-            closed: AtomicBool::new(false)
-        });
-        let cleaner_clone = cleaner.clone();
-        thread::spawn(move || {
-            let chunks = &cleaner_clone.chunks;
-            while !cleaner_clone.closed.load(Ordering::Relaxed) {
-                Cleaner::clean_chunks(&chunks);
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
-        return cleaner;
-    }
-    pub fn clean_chunks(chunks: &Arc<Chunks>) {
-        for chunk in &chunks.list { // consider put this in separate thread or fiber
-            Cleaner::clean_chunk(chunk);
-        }
-    }
-    pub fn clean_chunk(chunk: &Chunk) {
-        for seg in &chunk.segs {
-            Cleaner::clean_segment(chunk, seg);
-        }
-    }
+impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
         // Clean only if segment have fragments
         if seg.no_frags() {return;}

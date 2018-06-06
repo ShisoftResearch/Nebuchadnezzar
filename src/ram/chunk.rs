@@ -322,8 +322,19 @@ impl Chunk {
         self.dead_entries.push(loc);
     }
 
+    pub fn segments(&self) -> Vec<Arc<Segment>> {
+        let segs = self.addrs_seg.read().values();
+        let mut list = Vec::with_capacity(self.segs.len());
+        for seg_id in segs {
+            if let Some(segment) = self.segs.get(seg_id){
+                list.push(segment.clone());
+            }
+        }
+        return list;
+    }
+
     // this function should be invoked repeatedly to flush the queue
-    fn apply_dead_entry(&self) {
+    pub fn apply_dead_entry(&self) {
         let marks = self.dead_entries.iter();
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
@@ -333,6 +344,11 @@ impl Chunk {
         }
     }
 
+    // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
+    // and looking for those with entry type tombstone.
+    // It is resource intensive so there will be some rules to skip the scan.
+    // This function should be invoked repeatedly by cleaner
+    // Actual cleaning will be performed by cleaner regardless tombstone survival condition
     pub fn scan_tombstone_survival(&self) {
         for seg_id in self.addrs_seg.read().values() {
             if let Some(segment) = self.segs.get(seg_id){
@@ -341,10 +357,10 @@ impl Chunk {
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
                 let mut death_count = 0;
                 if  // have not much tombstones
-                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.1 ||
+                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
                     // large partition have been scanned
                     (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
-                    // have been cleaned recently
+                    // have been scanned recently
                     now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
                     continue;
                 }
@@ -363,6 +379,14 @@ impl Chunk {
                 warn!("leaked segment in addrs_seg: {}", *seg_id)
             }
         }
+    }
+
+    pub fn ordered_segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
+        let mut list = self.segments();
+        list.sort_by(|seg1, seg2| {
+            seg1.living_rate().partial_cmp(&seg2.living_rate()).unwrap()
+        });
+        return list;
     }
 }
 
