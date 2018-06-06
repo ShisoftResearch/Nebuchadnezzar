@@ -60,7 +60,7 @@ impl Chunk {
         return chunk;
     }
 
-    pub fn try_acquire(&self, size: u32) -> Option<((usize, AsyncRwLockReadGuard<()>), Arc<Segment>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<(usize, Arc<Segment>)> {
         let mut retried = 0;
         loop {
             let head = self.header_seg.read().clone();
@@ -288,7 +288,7 @@ impl Chunk {
         let cell_seg = self
             .locate_segment(cell_location)
             .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?}", cell_header.id()).as_str());
-        let ((tombstone_addr, _lock), head_seg) = (||{
+        let (tombstone_addr, head_seg) = (||{
             loop {
                 if let Some(pair) = self.try_acquire(TOMBSTONE_SIZE_U32) {
                     return pair;

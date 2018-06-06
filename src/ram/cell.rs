@@ -202,7 +202,7 @@ impl Cell {
                 error!("Cannot allocate new spaces in chunk");
                 return Err(WriteError::CannotAllocateSpace);
             },
-            Some(((addr, _lock), _)) => {
+            Some((addr, _)) => {
                 repr::Entry::encode_to(
                     addr,
                     repr::EntryType::Cell,

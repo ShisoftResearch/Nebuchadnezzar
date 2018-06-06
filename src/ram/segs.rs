@@ -17,10 +17,7 @@ pub struct Segment {
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
-    pub last_tombstones_scanned: AtomicI64,
-    // this spin lock is used only for preventing early segment deletion on cleaning
-    // all normal operations, including first stage of compaction should use read lock
-    pub lock: RwLock<()>,
+    pub last_tombstones_scanned: AtomicI64
 }
 
 impl Segment {
@@ -35,13 +32,11 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
-            lock: RwLock::new(()),
         }
     }
 
-    pub fn try_acquire(&self, size: u32) -> Option<(usize, RwLockReadGuard<()>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<usize> {
         let size = size as usize;
-        let rl = self.lock.read();
         loop {
             let curr_last = self.append_header.load(Ordering::SeqCst);
             let exp_last = curr_last + size;
@@ -51,7 +46,7 @@ impl Segment {
                 if self.append_header.compare_and_swap(curr_last, exp_last, Ordering::SeqCst) != curr_last {
                     continue;
                 } else {
-                    return Some((curr_last, rl));
+                    return Some(curr_last);
                 }
             }
         }
@@ -60,8 +55,7 @@ impl Segment {
     pub fn entry_iter(&self) -> SegmentEntryIter {
         SegmentEntryIter {
             bound: self.bound,
-            cursor: self.addr,
-            lock_guard: self.lock.read()
+            cursor: self.addr
         }
     }
 
@@ -88,8 +82,7 @@ impl Segment {
 
 pub struct SegmentEntryIter {
     bound: usize,
-    cursor: usize,
-    lock_guard: RwLockReadGuard<()>,
+    cursor: usize
 }
 
 impl Iterator for SegmentEntryIter {
