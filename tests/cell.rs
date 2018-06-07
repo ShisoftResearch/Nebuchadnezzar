@@ -25,7 +25,7 @@ pub fn cell_rw () {
         name: String::from("dummy"),
         key_field: None,
         str_key_field: None,
-        fields: fields,
+        fields,
         is_dynamic: false
     };
     let mut data = data_map_value!{
@@ -36,7 +36,7 @@ pub fn cell_rw () {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: CellHeader::new(0, schema.id, &id1),
+        header: CellHeader::new(0, schema.id, &id1, 0),
         data: data
     };
     let mut loc = cell.write_to_chunk(&chunk);
@@ -55,8 +55,8 @@ pub fn cell_rw () {
         name: "John"
     };
     cell = Cell {
-        header: CellHeader::new(0, schema.id, &id2),
-        data: data
+        header: CellHeader::new(0, schema.id, &id2, 0),
+        data
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
@@ -88,7 +88,7 @@ pub fn dynamic() {
         name: String::from("dummy"),
         key_field: None,
         str_key_field: None,
-        fields: fields,
+        fields,
         is_dynamic: true
     };
     let mut data_map = Map::new();
@@ -101,8 +101,8 @@ pub fn dynamic() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: CellHeader::new(0, schema.id, &id1),
-        data: data
+        header: CellHeader::new(0, schema.id, &id1, 0),
+        data
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
@@ -123,8 +123,8 @@ pub fn dynamic() {
     data_map.insert("name", Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: CellHeader::new(0, schema.id, &id2),
-        data: data
+        header: CellHeader::new(0, schema.id, &id2, 0),
+        data
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();

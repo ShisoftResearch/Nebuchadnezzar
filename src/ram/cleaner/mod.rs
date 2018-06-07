@@ -27,7 +27,7 @@ impl Cleaner {
                 for chunk in &chunks.list {
                     chunk.apply_dead_entry();
                     chunk.scan_tombstone_survival();
-                    let ordered_segs_for_compact = chunk.ordered_segs_for_compact_cleaner();
+                    let ordered_segs_for_compact = chunk.segs_for_compact_cleaner();
                     // compact
                     ordered_segs_for_compact.iter()
                         .take(segment_compact_per_turn)

@@ -378,13 +378,21 @@ impl Chunk {
         }
     }
 
-    pub fn ordered_segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
-        let mut list = self.segments();
-        list.sort_by(|seg1, seg2| {
-            seg1.living_rate().partial_cmp(&seg2.living_rate()).unwrap()
-        });
+    pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
+        let utilization_selection =
+            self.segments().into_iter()
+                .map(|seg| {
+                    let rate = seg.living_rate();
+                    (seg, rate)
+                })
+                .filter(|(_, utilization)| *utilization < 80f32);
         let head_seg = self.head_seg.read();
-        list.into_iter().filter(|seg| seg.id != head_seg.id).collect()
+        let mut list: Vec<_> = utilization_selection
+            .filter(|(seg, _)| seg.id != head_seg.id)
+            .collect();
+        list.sort_by(|pair1, pair2|
+            pair1.1.partial_cmp(&pair2.1).unwrap());
+        return list.into_iter().map(|pair| pair.0).collect();
     }
 }
 
