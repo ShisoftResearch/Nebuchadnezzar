@@ -44,8 +44,7 @@ impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
         // Clean only if segment have fragments
         if seg.total_dead_space() == 0 {return;}
-        // Retry cleaning the segment if unexpected state discovered
-        let mut retried = 0;
+        
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
         // Log-structured cleaner suggests new segment allocation and copy living entries from the
         // old segment to new segment. The new segment should have smaller sizes than the old one.
@@ -101,7 +100,7 @@ impl CompactCleaner {
         debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
                seg.id, chunk.id, entries.len(), live_size);
         let new_seg_id = chunk.seg_counter.fetch_add(1, Ordering::Relaxed);
-        let new_seg = Segment::new(new_seg_id, live_size);
+        let new_seg = Arc::new(Segment::new(new_seg_id, live_size));
         let mut cursor = new_seg.addr;
         let copied_entries = entries.iter().map(|e: &Entry| {
             let entry_size = e.meta.entry_size;
@@ -115,6 +114,8 @@ impl CompactCleaner {
             cursor += entry_size;
             return result;
         });
+
+        chunk.put_segment(new_seg);
 
         // update cell address chunk index
         copied_entries
@@ -135,5 +136,6 @@ impl CompactCleaner {
                     panic!("not cell after filter")
                 }
             });
+        debug!("Clean finished for segment {} from chunk {}", seg.id, chunk.id);
     }
 }

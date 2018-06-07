@@ -258,11 +258,11 @@ impl Chunk {
         return result;
     }
 
-    fn put_segment(&self, segment: Arc<Segment>) {
+    pub fn put_segment(&self, segment: Arc<Segment>) {
         let segment_id = segment.id;
         let segment_addr = segment.addr;
-        self.segs.insert(segment_id, segment);
         self.addrs_seg.write().insert(segment_addr, segment_id);
+        self.segs.insert(segment_id, segment);
     }
 
     fn locate_segment(&self, addr: usize) -> Option<Arc<Segment>> {
@@ -387,7 +387,8 @@ impl Chunk {
         list.sort_by(|seg1, seg2| {
             seg1.living_rate().partial_cmp(&seg2.living_rate()).unwrap()
         });
-        return list;
+        let head_seg = self.head_seg.read();
+        list.into_iter().filter(|seg| seg.id != head_seg.id).collect()
     }
 }
 
