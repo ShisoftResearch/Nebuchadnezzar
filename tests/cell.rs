@@ -11,11 +11,6 @@ use super::*;
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[test]
-pub fn header_size() {
-    assert_eq!(mem::size_of::<cell::CellHeader>(), cell::CELL_HEADER_SIZE);
-}
-
-#[test]
 pub fn cell_rw () {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
