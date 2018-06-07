@@ -115,5 +115,25 @@ impl CompactCleaner {
             cursor += entry_size;
             return result;
         });
+
+        // update cell address chunk index
+        copied_entries
+            .filter(|pair|
+                pair.0.meta.entry_header.entry_type == EntryType::Cell)
+            .for_each(|(entry, new_addr)| {
+                if let EntryContent::Cell(header) = entry.content {
+                    if let Some(mut cell_guard) = chunk.index.get_mut(&header.hash) {
+                        let old_addr = entry.meta.entry_pos;
+                        if *cell_guard == old_addr {
+                            *cell_guard = new_addr;
+                        } else {
+                            warn!("cell address {} have been changed to {} on relocating on cleaning",
+                                  old_addr, *cell_guard);
+                        }
+                    }
+                } else {
+                    panic!("not cell after filter")
+                }
+            });
     }
 }
