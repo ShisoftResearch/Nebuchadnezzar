@@ -33,10 +33,6 @@ pub struct Chunk {
     pub capacity: usize
 }
 
-pub struct Chunks {
-    pub list: Vec<Chunk>,
-}
-
 impl Chunk {
     fn new (id: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunk {
         let first_seg_id = 0;
@@ -91,7 +87,7 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64)
-        -> Result<CellReadGuard, ReadError> {
+                                 -> Result<CellReadGuard, ReadError> {
         match self.index.get(&hash) {
             Some(index) => {
                 if *index == 0 {
@@ -108,7 +104,7 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64)
-        -> Option<CellWriteGuard> {
+                              -> Option<CellWriteGuard> {
         match self.index.get_mut(&hash) {
             Some(index) => {
                 if *index == 0 {
@@ -359,10 +355,10 @@ impl Chunk {
                 let mut death_count = 0;
                 if  // have not much tombstones
                     (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
-                    // large partition have been scanned
-                    (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
-                    // have been scanned recently
-                    now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
+                        // large partition have been scanned
+                        (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
+                        // have been scanned recently
+                        now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
                     continue;
                 }
                 for entry_meta in segment.entry_iter() {
@@ -391,6 +387,12 @@ impl Chunk {
         list.into_iter().filter(|seg| seg.id != head_seg.id).collect()
     }
 }
+
+pub struct Chunks {
+    pub list: Vec<Chunk>,
+}
+
+
 
 impl Chunks {
     pub fn new (count: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Arc<Chunks> {

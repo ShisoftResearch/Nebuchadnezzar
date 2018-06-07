@@ -41,7 +41,7 @@ struct Entry {
 }
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
+    pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) {
         // Clean only if segment have fragments
         if seg.total_dead_space() == 0 {return;}
         
