@@ -61,15 +61,6 @@ impl CellHeader {
         }
     }
 
-    #[inline]
-    fn write(&self, mut cursor: RawMemCursor) {
-        cursor.write_u64::<Endian>(self.version);
-        cursor.write_u32::<Endian>(self.checksum);
-        cursor.write_u32::<Endian>(self.schema);
-        cursor.write_u64::<Endian>(self.partition);
-        cursor.write_u64::<Endian>(self.hash);
-    }
-
     pub fn id(&self) -> Id {
         Id {
             higher: self.partition,
@@ -127,21 +118,27 @@ impl Cell {
         Some(Cell::new_with_id(schema_id, &id, value))
     }
 
+    pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &repr::Entry) -> CellHeader {
+        let mut cursor = addr_to_header_cursor(addr);
+        let header = CellHeader {
+            version: cursor.read_u64::<Endian>().unwrap(),
+            checksum: cursor.read_u32::<Endian>().unwrap(),
+            schema: cursor.read_u32::<Endian>().unwrap(),
+            partition: cursor.read_u64::<Endian>().unwrap(),
+            hash: cursor.read_u64::<Endian>().unwrap(),
+            size: entry_header.content_length - CELL_HEADER_SIZE as u32,
+        };
+        release_cursor(cursor);
+        return header;
+    }
+
     pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
         if ptr == 0 {return Err(ReadError::CellIdIsUnitId)}
         let (_, header) = repr::Entry::decode_from(
             ptr,
             |addr, entry_header| {
                 assert_eq!(entry_header.entry_type, repr::EntryType::Cell);
-                let mut cursor = addr_to_header_cursor(addr);
-                let header = CellHeader {
-                    version: cursor.read_u64::<Endian>().unwrap(),
-                    checksum: cursor.read_u32::<Endian>().unwrap(),
-                    schema: cursor.read_u32::<Endian>().unwrap(),
-                    partition: cursor.read_u64::<Endian>().unwrap(),
-                    hash: cursor.read_u64::<Endian>().unwrap(),
-                    size: entry_header.content_length - CELL_HEADER_SIZE as u32,
-                };
+                let header = Self::cell_header_from_entry_content_addr(addr, &entry_header);
                 (header, addr + CELL_HEADER_SIZE)
         });
         Ok(header)
@@ -209,8 +206,15 @@ impl Cell {
                     total_size,
                     len_bytes,
                     move |content_addr| {
-                        let cursor = addr_to_header_cursor(content_addr);
-                        self.header.write(cursor);
+                        // write cell header
+                        let header = &self.header;
+                        let mut cursor = addr_to_header_cursor(content_addr);
+                        cursor.write_u64::<Endian>(header.version);
+                        cursor.write_u32::<Endian>(header.checksum);
+                        cursor.write_u32::<Endian>(header.schema);
+                        cursor.write_u64::<Endian>(header.partition);
+                        cursor.write_u64::<Endian>(header.hash);
+                        release_cursor(cursor);
                         writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
                     });
                 return Ok(addr);

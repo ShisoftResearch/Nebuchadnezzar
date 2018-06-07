@@ -1,5 +1,9 @@
 use super::super::chunk::{Chunk, Chunks};
-use super::super::segs::Segment;
+use super::super::segs::{Segment, EntryMeta};
+use ram::repr::EntryType;
+use ram::cell::{Cell, CellHeader};
+use ram::tombstone::Tombstone;
+use dovahkiin::types::Id;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -25,11 +29,21 @@ pub struct CompactCleaner {
     closed: AtomicBool
 }
 
+enum EntryContent {
+    Cell(CellHeader),
+    Tombstone(Tombstone),
+    Undecided
+}
+
+struct Entry {
+    meta: EntryMeta,
+    content: EntryContent
+}
+
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) {
-        let total_dead_space = seg.total_dead_space();
         // Clean only if segment have fragments
-        if total_dead_space == 0 {return;}
+        if seg.total_dead_space() == 0 {return;}
         // Retry cleaning the segment if unexpected state discovered
         let mut retried = 0;
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
@@ -39,9 +53,67 @@ impl CompactCleaner {
         // cell indices by lock cells first, remove the old segment.
         // Segment locks will no long be required for transfer process will ensure there will be no
         // on going read operations to the old segment when the segment to be deleted.
-        debug!("Cleaning segment: {}", seg.addr);
 
-        // scan and mark dead cells and tombstones
+        // Some comments regards to RAMCloud seglets. To compress the actual memory spaces consumed by
+        // segments, RAMCloud introduces seglets as the minimal unit of the memory. It records a mapping
+        // from segment to seglets it consumed. In this case, compacted segments will take less seglets.
+        // Freed seglets will be used by other new allocated segments, which can leads to incontinently.
+        // Actually, malloc already handled this situation to overcome fragmentation, we can simply use
+        // malloc to allocate new memory spaces for segments than maintaining seglets mappings in userspace.
+        debug!("Cleaning segment {} from chunk {}", seg.id, chunk.id);
 
+        // scan and mark live entries
+        let live = seg.entry_iter()
+            .filter_map(|entry_meta| {
+                let entry_size = entry_meta.entry_size;
+                let entry_header = entry_meta.entry_header;
+                match entry_header.entry_type {
+                    EntryType::Cell => {
+                        let cell_header =
+                            Cell::cell_header_from_entry_content_addr(
+                                entry_meta.body_pos, &entry_header);
+                        if chunk.index
+                            .get(&cell_header.hash)
+                            .map(|g| *g) == Some(entry_meta.entry_pos) {
+                            return Some((Entry {
+                                meta: entry_meta,
+                                content: EntryContent::Cell(cell_header)
+                            }, entry_size));
+                        }
+                    },
+                    EntryType::Tombstone => {
+                        let tombstone =
+                            Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
+                        if chunk.segs.contains_key(&tombstone.segment_id) {
+                            return Some((Entry {
+                                meta: entry_meta,
+                                content: EntryContent::Tombstone(tombstone)
+                            }, entry_size));
+                        }
+                    },
+                    _ => panic!("Unexpected cell type on compaction: {:?}, size {}",
+                                entry_header, entry_size)
+                }
+                return None
+            });
+        let (entries, sizes) : (Vec<_>, Vec<_>) = live.unzip();
+        let live_size: usize = sizes.into_iter().sum();
+        debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
+               seg.id, chunk.id, entries.len(), live_size);
+        let new_seg_id = chunk.seg_counter.fetch_add(1, Ordering::Relaxed);
+        let new_seg = Segment::new(new_seg_id, live_size);
+        let mut cursor = new_seg.addr;
+        let copied_entries = entries.iter().map(|e: &Entry| {
+            let entry_size = e.meta.entry_size;
+            let result= (e, cursor);
+            unsafe {
+                libc::memcpy(
+                    cursor as *mut libc::c_void,
+                    e.meta.entry_pos as *mut libc::c_void,
+                    entry_size);
+            }
+            cursor += entry_size;
+            return result;
+        });
     }
 }

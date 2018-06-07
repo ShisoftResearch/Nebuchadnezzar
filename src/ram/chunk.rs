@@ -25,7 +25,7 @@ pub struct Chunk {
     pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
     pub segs: CHashMap<u64, Arc<Segment>>,
     pub seg_counter: AtomicU64,
-    pub header_seg: RwLock<Arc<Segment>>,
+    pub head_seg: RwLock<Arc<Segment>>,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub total_space: AtomicUsize,
@@ -52,7 +52,7 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
-            header_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
+            head_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
             addrs_seg: RwLock::new(BTreeMap::new()),
             dead_entries: RingBuffer::new(size / SEGMENT_SIZE * 10)
         };
@@ -63,7 +63,7 @@ impl Chunk {
     pub fn try_acquire(&self, size: u32) -> Option<(usize, Arc<Segment>)> {
         let mut retried = 0;
         loop {
-            let head = self.header_seg.read().clone();
+            let head = self.head_seg.read().clone();
             let mut head_seg_id = head.id;
             match head.try_acquire(size) {
                 Some(pair) => return Some((pair, head)),
@@ -72,7 +72,7 @@ impl Chunk {
                         // No space left
                         return None;
                     }
-                    let mut acquired_header = self.header_seg.write();
+                    let mut acquired_header = self.head_seg.write();
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.seg_counter.fetch_add(1, Ordering::Relaxed);
@@ -80,8 +80,8 @@ impl Chunk {
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
-                        *acquired_header = new_seg_ref.clone();
-                        self.put_segment(new_seg_ref);
+                        self.put_segment(new_seg_ref.clone());
+                        *acquired_header = new_seg_ref;
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
@@ -365,9 +365,9 @@ impl Chunk {
                     now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
                     continue;
                 }
-                for (entry, addr) in segment.entry_iter() {
-                    if entry.entry_type == repr::EntryType::Tombstone {
-                        let tombstone = Tombstone::read(addr);
+                for entry_meta in segment.entry_iter() {
+                    if entry_meta.entry_header.entry_type == repr::EntryType::Tombstone {
+                        let tombstone = Tombstone::read(entry_meta.body_pos);
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
                             death_count += 1;

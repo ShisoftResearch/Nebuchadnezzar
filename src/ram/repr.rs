@@ -10,7 +10,7 @@ bitflags! {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Entry {
     pub entry_type: EntryType,
     pub content_length: u32,

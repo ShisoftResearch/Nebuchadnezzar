@@ -47,20 +47,25 @@ impl Tombstone {
         })
     }
 
+    pub fn read_from_entry_content_addr(addr: usize) -> Tombstone {
+        let mut cursor = addr_to_cursor(addr);
+        let tombstone = Tombstone {
+            segment_id: cursor.read_u64::<Endian>().unwrap(),
+            version: cursor.read_u64::<Endian>().unwrap(),
+            partition: cursor.read_u64::<Endian>().unwrap(),
+            hash: cursor.read_u64::<Endian>().unwrap()
+        };
+        release_cursor(cursor);
+        return tombstone;
+    }
+
     pub fn read(addr: usize) -> Tombstone {
         Entry::decode_from(
             addr,
             |addr, entry| {
                 assert_eq!(entry.entry_type, EntryType::Tombstone, "Reading entry not tombstone");
-                let mut cursor = addr_to_cursor(addr);
-                let tombstone = Tombstone {
-                    segment_id: cursor.read_u64::<Endian>().unwrap(),
-                    version: cursor.read_u64::<Endian>().unwrap(),
-                    partition: cursor.read_u64::<Endian>().unwrap(),
-                    hash: cursor.read_u64::<Endian>().unwrap()
-                };
-                release_cursor(cursor);
-                return tombstone;}).1
+                return Self::read_from_entry_content_addr(addr);
+            }).1
     }
 
     pub fn put(

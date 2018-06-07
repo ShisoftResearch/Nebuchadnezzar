@@ -80,27 +80,38 @@ impl Segment {
     }
 }
 
+#[derive(Clone)]
+pub struct EntryMeta {
+    pub body_pos: usize,
+    pub entry_pos: usize,
+    pub entry_size: usize,
+    pub entry_header: repr::Entry
+}
+
 pub struct SegmentEntryIter {
     bound: usize,
     cursor: usize
 }
 
 impl Iterator for SegmentEntryIter {
-    type Item = (repr::Entry, usize);
+    type Item = EntryMeta;
 
     fn next(&mut self) -> Option<<Self as Iterator>::Item> {
         let cursor = self.cursor;
         if cursor >= self.bound {
             return None;
         }
-        let (entry, entry_size) = repr::Entry::decode_from(
+        let (_, entry_meta) = repr::Entry::decode_from(
             cursor,
             |body_pos, entry| {
                 let entry_header_size = body_pos - cursor;
-                return entry_header_size + entry.content_length as usize;
+                let entry_size = entry_header_size + entry.content_length as usize;
+                return EntryMeta {
+                    body_pos, entry_header: entry, entry_size, entry_pos: cursor
+                };
             });
-        self.cursor += entry_size;
-        return Some((entry, cursor));
+        self.cursor += entry_meta.entry_size;
+        Some(entry_meta)
     }
 }
 
