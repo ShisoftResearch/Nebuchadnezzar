@@ -73,7 +73,8 @@ impl CellHeader {
     }
 }
 
-pub const CELL_HEADER_SIZE: usize = 32;
+pub const CELL_HEADER_SIZE: usize = CELL_HEADER_SIZE_U32 as usize;
+pub const CELL_HEADER_SIZE_U32: u32 = 32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
@@ -81,7 +82,7 @@ pub struct Cell {
     pub data: Value
 }
 
-def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE, addr_to_header_cursor);
+def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
 
 impl Cell {
 
@@ -126,7 +127,7 @@ impl Cell {
             schema: cursor.read_u32::<Endian>().unwrap(),
             partition: cursor.read_u64::<Endian>().unwrap(),
             hash: cursor.read_u64::<Endian>().unwrap(),
-            size: entry_header.content_length - CELL_HEADER_SIZE as u32,
+            size: entry_header.content_length - CELL_HEADER_SIZE_U32,
         };
         release_cursor(cursor);
         return header;

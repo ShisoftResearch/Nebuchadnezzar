@@ -1,6 +1,7 @@
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeMap;
+use std::ops::Bound::Included;
 use parking_lot::{Mutex, RwLock};
 use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
 use bifrost::utils::time::get_time;
@@ -262,8 +263,10 @@ impl Chunk {
     }
 
     fn locate_segment(&self, addr: usize) -> Option<Arc<Segment>> {
-        self.addrs_seg.read()
-            .range(addr - SEGMENT_SIZE..addr)
+        let segs_addr_range = self.addrs_seg.read();
+        debug!("locating segment addr {} in {:?}", addr, *segs_addr_range);
+        segs_addr_range
+            .range((Included(addr - SEGMENT_SIZE), Included(addr)))
             .last()
             .and_then(|(_, seg_id)| {
                 self.segs
@@ -283,7 +286,8 @@ impl Chunk {
     fn put_tombstone(&self, cell_location: usize,cell_header: &CellHeader) {
         let cell_seg = self
             .locate_segment(cell_location)
-            .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?}", cell_header.id()).as_str());
+            .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?} at {}",
+                            cell_header.id(), cell_location).as_str());
         let (tombstone_addr, head_seg) = (||{
             loop {
                 if let Some(pair) = self.try_acquire(TOMBSTONE_SIZE_U32) {

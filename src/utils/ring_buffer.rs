@@ -46,7 +46,7 @@ impl RingBuffer {
             let end = self.end.load(DEFAULT_ORDERING);
             let start_idx = start % size;
             let end_idx = end % size;
-            if end >= end - size { // one loop ahead
+            if end >= size && start >= end - size { // one loop ahead
                 self.set_free();
                 continue; // try again
             }

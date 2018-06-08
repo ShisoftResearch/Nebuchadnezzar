@@ -63,10 +63,11 @@ impl Entry {
             let entry_bytes_len_usize = entry_bytes_len as usize;
             let raw_len_bytes= Box::into_raw(box [0u8; 4]);
             libc::memmove(
-                pos as *mut libc::c_void,
                 raw_len_bytes as *mut libc::c_void,
+                pos as *mut libc::c_void,
                 entry_bytes_len_usize);
-            let entry_length = LittleEndian::read_u32(&*Box::from_raw(raw_len_bytes));
+            let boxed_raw_len = Box::from_raw(raw_len_bytes);
+            let entry_length = LittleEndian::read_u32(&*boxed_raw_len);
             let entry = Entry {
                 entry_type,
                 content_length: entry_length
