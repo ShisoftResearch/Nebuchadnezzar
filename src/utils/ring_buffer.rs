@@ -46,7 +46,8 @@ impl RingBuffer {
             let end = self.end.load(DEFAULT_ORDERING);
             let start_idx = start % size;
             let end_idx = end % size;
-            if end >= size && start >= end - size { // one loop ahead
+            if end >= size && end - size >= start { // one loop ahead
+                // debug!("Buffer full {} -> {}, {}", start, end, size);
                 self.set_free();
                 continue; // try again
             }
@@ -92,6 +93,7 @@ impl <'a> Iterator for RingBufferIter<'a> {
         let end = inner.end.load(DEFAULT_ORDERING);
         if start >= end {
             // read to end
+            // debug!("Nothing to consume {} - {}", start, end);
             self.set_free();
             return None;
         }

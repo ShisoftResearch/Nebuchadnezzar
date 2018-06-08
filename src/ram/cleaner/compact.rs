@@ -115,6 +115,7 @@ impl CompactCleaner {
             return result;
         });
 
+        new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
         chunk.put_segment(new_seg);
 
         // update cell address chunk index

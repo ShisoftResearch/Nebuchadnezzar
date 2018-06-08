@@ -67,6 +67,7 @@ impl Segment {
 
     pub fn living_rate(&self) -> f32 {
         let used_spaces = (self.append_header.load(Ordering::Relaxed) - self.addr) as f32;
+        if used_spaces == 0f32 { return 1f32 }
         let total_dead_space = self.total_dead_space() as f32;
         let living_space = used_spaces - total_dead_space;
         return living_space / used_spaces;
