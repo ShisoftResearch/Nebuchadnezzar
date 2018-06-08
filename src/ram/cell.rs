@@ -1,24 +1,29 @@
+use ram::mem_cursor::*;
 use ram::schema::{Schema, Field};
 use ram::chunk::Chunk;
+use ram::repr;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id, RandValue};
 use std::sync::Arc;
 use std::ops::{Index, IndexMut};
 use std::ptr;
+use std::io::{Cursor, Read, Write};
 use serde::Serialize;
+use byteorder::{ReadBytesExt, WriteBytesExt};
 
-pub const MAX_CELL_SIZE :usize = 1 * 1024 * 1024;
+pub const MAX_CELL_SIZE :u32 = 1 * 1024 * 1024;
 
 pub type DataMap = Map;
 
-#[repr(C, packed)]
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
-pub struct Header {
+pub struct CellHeader {
     pub version: u64,
-    pub size: u32,
+    pub checksum: u32,
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
+    // this shall be calculated from entry header
+    pub size: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -44,30 +49,18 @@ pub enum ReadError {
     CellIdIsUnitId
 }
 
-impl Header {
-    pub fn new(size: u32, schema: u32, id: &Id) -> Header {
-        Header {
+impl CellHeader {
+    pub fn new(size: u32, schema: u32, id: &Id, checksum: u32) -> CellHeader {
+        CellHeader {
             version: 1,
-            size: size,
-            schema: schema,
+            size,
+            schema,
+            checksum,
             partition: id.higher,
             hash: id.lower,
         }
     }
-    fn write(&self, location: usize) {
-        unsafe {
-            ptr::copy_nonoverlapping(self as *const Header, location as *mut Header, HEADER_SIZE);
-        }
-    }
-    pub fn reserve(location: usize, size: usize) {
-        Header {
-            version: 0, // default a tombstone
-            size: size as u32,
-            schema: 0,
-            hash: 0,
-            partition: 0,
-        }.write(location);
-    }
+
     pub fn id(&self) -> Id {
         Id {
             higher: self.partition,
@@ -80,19 +73,22 @@ impl Header {
     }
 }
 
-pub const HEADER_SIZE :usize = 32;
+pub const CELL_HEADER_SIZE: usize = CELL_HEADER_SIZE_U32 as usize;
+pub const CELL_HEADER_SIZE_U32: u32 = 32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Cell {
-    pub header: Header,
+    pub header: CellHeader,
     pub data: Value
 }
+
+def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
 
 impl Cell {
 
     pub fn new_with_id(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
-            header: Header::new(0, schema_id, id),
+            header: CellHeader::new(0, schema_id, id, 0),
             data: value
         }
     }
@@ -123,17 +119,39 @@ impl Cell {
         Some(Cell::new_with_id(schema_id, &id, value))
     }
 
-    pub fn header_from_chunk_raw(ptr: usize) -> Result<Header, ReadError> {
-        if ptr == 0 {return Err(ReadError::CellDoesNotExisted)}
-        Ok(unsafe {(*(ptr as *const Header))})
+    pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &repr::Entry) -> CellHeader {
+        let mut cursor = addr_to_header_cursor(addr);
+        let header = CellHeader {
+            version: cursor.read_u64::<Endian>().unwrap(),
+            checksum: cursor.read_u32::<Endian>().unwrap(),
+            schema: cursor.read_u32::<Endian>().unwrap(),
+            partition: cursor.read_u64::<Endian>().unwrap(),
+            hash: cursor.read_u64::<Endian>().unwrap(),
+            size: entry_header.content_length - CELL_HEADER_SIZE_U32,
+        };
+        release_cursor(cursor);
+        return header;
     }
+
+    pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
+        if ptr == 0 {return Err(ReadError::CellIdIsUnitId)}
+        let (_, header) = repr::Entry::decode_from(
+            ptr,
+            |addr, entry_header| {
+                assert_eq!(entry_header.entry_type, repr::EntryType::Cell);
+                let header = Self::cell_header_from_entry_content_addr(addr, &entry_header);
+                (header, addr + CELL_HEADER_SIZE)
+        });
+        Ok(header)
+    }
+
+    //TODO: check or set checksum from crc32c cell content
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
-        let header = Cell::header_from_chunk_raw(ptr)?;
-        let data_ptr = ptr + HEADER_SIZE;
+        let (header, data_ptr) = Cell::header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
-                header: header,
+                header,
                 data: reader::read_by_schema(data_ptr, &schema)
             })
         } else {
@@ -142,8 +160,7 @@ impl Cell {
         }
     }
     pub fn select_from_chunk_raw(ptr: usize, chunk: &Chunk, fields: &[u64]) -> Result<Value, ReadError> {
-        let header = Cell::header_from_chunk_raw(ptr)?;
-        let data_ptr = ptr + HEADER_SIZE;
+        let (header, data_ptr) = Cell::header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(reader::read_by_schema_selected(data_ptr, &schema, fields))
@@ -171,8 +188,10 @@ impl Cell {
                 &self.data, &mut instructions
             )?;
         }
-        let total_size = offset + HEADER_SIZE;
-        if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size))}
+        let entry_body_size = offset + CELL_HEADER_SIZE;
+        let len_bytes = repr::Entry::count_len_bytes(entry_body_size as u32);
+        let total_size = repr::Entry::size(len_bytes, entry_body_size as u32);
+        if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size as usize))}
         let addr_opt = chunk.try_acquire(total_size);
         self.header.size = total_size as u32;
         self.header.version += 1;
@@ -181,9 +200,24 @@ impl Cell {
                 error!("Cannot allocate new spaces in chunk");
                 return Err(WriteError::CannotAllocateSpace);
             },
-            Some((addr, _lock)) => {
-                self.header.write(addr);
-                writer::execute_plan(addr + HEADER_SIZE, instructions);
+            Some((addr, _)) => {
+                repr::Entry::encode_to(
+                    addr,
+                    repr::EntryType::Cell,
+                    total_size,
+                    len_bytes,
+                    move |content_addr| {
+                        // write cell header
+                        let header = &self.header;
+                        let mut cursor = addr_to_header_cursor(content_addr);
+                        cursor.write_u64::<Endian>(header.version);
+                        cursor.write_u32::<Endian>(header.checksum);
+                        cursor.write_u32::<Endian>(header.schema);
+                        cursor.write_u64::<Endian>(header.partition);
+                        cursor.write_u64::<Endian>(header.hash);
+                        release_cursor(cursor);
+                        writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
+                    });
                 return Ok(addr);
             }
         }
@@ -194,6 +228,8 @@ impl Cell {
     pub fn set_id(&mut self, id: &Id) {
         self.header.set_id(id)
     }
+
+
 }
 
 impl Index<u64> for Cell {

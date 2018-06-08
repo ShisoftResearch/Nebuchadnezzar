@@ -9,6 +9,7 @@ use ram::chunk::Chunks;
 use ram::schema::LocalSchemasCache;
 use ram::schema::{sm as schema_sm};
 use ram::types::Id;
+use ram::cleaner::Cleaner;
 use std::sync::Arc;
 use std::io;
 use futures::Future;
@@ -50,7 +51,8 @@ pub struct NebServer {
     pub member_pool: rpc::ClientPool,
     pub txn_peer: transactions::Peer,
     pub raft_service: Option<Arc<raft::RaftService>>,
-    pub server_id: u64
+    pub server_id: u64,
+    pub cleaner: Cleaner
 }
 
 pub fn init_conshash(
@@ -99,6 +101,7 @@ impl NebServer {
             meta_rc.clone(),
             opts.backup_storage.clone(),
         );
+        let cleaner = Cleaner::new_and_start(chunks.clone());
         let conshasing = init_conshash(
             group_name,
             server_addr,
@@ -106,13 +109,14 @@ impl NebServer {
             raft_client)?;
         let server = Arc::new(NebServer {
             chunks,
+            cleaner,
             meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             member_pool: rpc::ClientPool::new(),
             txn_peer: transactions::Peer::new(server_addr),
             raft_service: raft_service.clone(),
-            server_id: rpc_server.server_id
+            server_id: rpc_server.server_id,
         });
         rpc_server.register_service(
             cell_rpc::DEFAULT_SERVICE_ID,

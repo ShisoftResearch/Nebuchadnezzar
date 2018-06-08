@@ -28,6 +28,8 @@ byteorder = "1"
 parking_lot = {version = "0.4", features = ["nightly"]}
 rand = "0.3"
 linked-hash-map = "0.4"
+bitflags = "1.0"
+crc32c = "*"
 
 futures-cpupool = "0.1"
 futures-await = "0.1"

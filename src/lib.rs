@@ -22,6 +22,8 @@ extern crate bifrost_hasher;
 pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;
+#[macro_use]
+extern crate bitflags;
 
 extern crate bincode;
 extern crate serde;
@@ -34,6 +36,8 @@ extern crate linked_hash_map;
 extern crate libc;
 extern crate chashmap;
 extern crate num_cpus;
+extern crate byteorder;
+extern crate crc32c;
 
 pub mod utils;
 #[macro_use]
