@@ -351,8 +351,12 @@ impl Chunk {
     // This function should be invoked repeatedly by cleaner
     // Actual cleaning will be performed by cleaner regardless tombstone survival condition
     pub fn scan_tombstone_survival(&self) {
-        for seg_id in self.addrs_seg.read().values() {
-            if let Some(segment) = self.segs.get(seg_id){
+        let seg_ids: Vec<u64> = {
+            let addrs_guard = self.addrs_seg.read();
+            addrs_guard.values().cloned().collect()
+        };
+        for seg_id in seg_ids {
+            if let Some(segment) = self.segs.get(&seg_id){
                 let now = get_time();
                 let tombstones = segment.tombstones.load(Ordering::Relaxed);
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
@@ -377,7 +381,7 @@ impl Chunk {
                 segment.dead_tombstones.fetch_add(death_count, Ordering::Relaxed);
                 segment.last_tombstones_scanned.store(now, Ordering::Relaxed);
             } else {
-                warn!("leaked segment in addrs_seg: {}", *seg_id)
+                warn!("leaked segment in addrs_seg: {}", seg_id)
             }
         }
     }
