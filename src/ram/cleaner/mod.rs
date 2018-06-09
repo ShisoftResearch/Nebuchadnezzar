@@ -33,6 +33,8 @@ impl Cleaner {
                         .take(segment_compact_per_turn) // limit max segment to clean per turn
                         .for_each(|segment|
                             compact::CompactCleaner::clean_segment(chunk, segment));
+
+                    chunk.check_and_archive_segments();
                 }
                 thread::sleep(Duration::from_millis(10));
             }

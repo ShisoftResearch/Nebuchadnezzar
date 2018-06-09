@@ -1,7 +1,7 @@
 use libc;
 use ram::repr;
 use ram::tombstone::TOMBSTONE_SIZE_U32;
-use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::BufWriter;
@@ -24,6 +24,7 @@ pub struct Segment {
     pub dead_tombstones: AtomicU32,
     pub last_tombstones_scanned: AtomicI64,
     pub backup_storage: Option<String>,
+    pub archived: AtomicBool
 }
 
 impl Segment {
@@ -38,7 +39,8 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
-            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.seg", path, id))
+            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.seg", path, id)),
+            archived: AtomicBool::new(false)
         }
     }
 

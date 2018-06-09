@@ -345,16 +345,19 @@ impl Chunk {
         }
     }
 
+    #[inline]
+    pub fn segment_ids(&self) -> Vec<u64> {
+        let addrs_guard = self.addrs_seg.read();
+        addrs_guard.values().cloned().collect()
+    }
+
     // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
     // and looking for those with entry type tombstone.
     // It is resource intensive so there will be some rules to skip the scan.
     // This function should be invoked repeatedly by cleaner
     // Actual cleaning will be performed by cleaner regardless tombstone survival condition
     pub fn scan_tombstone_survival(&self) {
-        let seg_ids: Vec<u64> = {
-            let addrs_guard = self.addrs_seg.read();
-            addrs_guard.values().cloned().collect()
-        };
+        let seg_ids = self.segment_ids();
         for seg_id in seg_ids {
             if let Some(segment) = self.segs.get(&seg_id){
                 let now = get_time();
@@ -401,6 +404,21 @@ impl Chunk {
         list.sort_by(|pair1, pair2|
             pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
+    }
+
+    pub fn check_and_archive_segments(&self) {
+        let seg_ids = self.segment_ids();
+        let head_id = self.head_seg.read().id;
+        for seg_id in seg_ids {
+            if seg_id == head_id { continue; }
+            if let Some(segment) = self.segs.get(&seg_id) {
+                if !segment.archived.compare_and_swap(false, true, Ordering::Relaxed) {
+                    if let Err(e) = segment.archive() {
+                        error!("cannot archive segment {}, reason:{:?}", self.id, e)
+                    }
+                }
+            }
+        }
     }
 }
 
