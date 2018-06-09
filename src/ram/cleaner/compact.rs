@@ -102,20 +102,24 @@ impl CompactCleaner {
         let new_seg_id = chunk.seg_counter.fetch_add(1, Ordering::Relaxed);
         let new_seg = Arc::new(Segment::new(new_seg_id, live_size, &chunk.backup_storage));
         let mut cursor = new_seg.addr;
-        let copied_entries = entries.iter().map(|e: &Entry| {
-            let entry_size = e.meta.entry_size;
-            let result= (e, cursor);
-            unsafe {
-                libc::memcpy(
-                    cursor as *mut libc::c_void,
-                    e.meta.entry_pos as *mut libc::c_void,
-                    entry_size);
-            }
-            cursor += entry_size;
-            return result;
-        });
+        let copied_entries =
+            entries
+                .iter()
+                .map(|e: &Entry| {
+                    let entry_size = e.meta.entry_size;
+                    let result= (e, cursor);
+                    unsafe {
+                        libc::memcpy(
+                            cursor as *mut libc::c_void,
+                            e.meta.entry_pos as *mut libc::c_void,
+                            entry_size);
+                    }
+                    cursor += entry_size;
+                    return result;
+                });
 
         new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
+        // put segment directly into the segment map prior to resetting cell addresses as side logs
         chunk.put_segment(new_seg);
 
         // update cell address chunk index

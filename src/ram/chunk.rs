@@ -410,7 +410,7 @@ impl Chunk {
         let seg_ids = self.segment_ids();
         let head_id = self.head_seg.read().id;
         for seg_id in seg_ids {
-            if seg_id == head_id { continue; }
+            if seg_id == head_id { continue; } // never archive head segments
             if let Some(segment) = self.segs.get(&seg_id) {
                 if !segment.archived.compare_and_swap(false, true, Ordering::Relaxed) {
                     if let Err(e) = segment.archive() {
