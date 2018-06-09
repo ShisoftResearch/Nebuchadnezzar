@@ -3,6 +3,11 @@ use ram::repr;
 use ram::tombstone::TOMBSTONE_SIZE_U32;
 use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, Ordering};
 use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::BufWriter;
+use std::io::prelude::*;
+use std::io;
+use crc32c::crc32c;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
 use super::cell::CellHeader;
@@ -17,7 +22,8 @@ pub struct Segment {
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
-    pub last_tombstones_scanned: AtomicI64
+    pub last_tombstones_scanned: AtomicI64,
+    pub backup_storage: Option<String>,
 }
 
 impl Segment {
@@ -32,6 +38,7 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
+            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.seg", path, id))
         }
     }
 
@@ -71,6 +78,25 @@ impl Segment {
         let total_dead_space = self.total_dead_space() as f32;
         let living_space = used_spaces - total_dead_space;
         return living_space / used_spaces;
+    }
+
+    // archive this segment and write the data to backup storage
+    pub fn archive(&self) -> Result<bool, io::Error> {
+        if let &Some(ref backup_storage) = &self.backup_storage {
+            let file = File::open(backup_storage)?;
+            let mut buffer = BufWriter::new(file);
+            let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
+            unsafe {
+                for offset in 0..seg_size {
+                    let ptr = (self.addr + offset) as *const u8;
+                    let byte = *ptr;
+                    buffer.write(&[byte]);
+                }
+            }
+            buffer.flush()?;
+            return Ok(true);
+        }
+        return Ok(false);
     }
 
     fn dispose (&self) {

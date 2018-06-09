@@ -216,7 +216,7 @@ pub fn write_skew() {
             *skew_tried_c.lock() += 1;
             let mut cell_1 = txn.read(cell_1_id.to_owned())?.unwrap();
             let mut score_1 = cell_1.data["score"].U64().unwrap();
-            thread::sleep(Duration::new(5, 0)); // wait 5 secs to let late write occur
+            thread::sleep(Duration::new(2, 0)); // wait 2 secs to let late write occur
             score_1 += 1;
             let mut data_1 = cell_1.data.Map().unwrap().clone();
             data_1.insert(&String::from("score"), Value::U64(score_1));

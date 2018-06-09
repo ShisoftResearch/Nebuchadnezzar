@@ -413,7 +413,7 @@ impl Chunks {
         debug!("Creating {} chunks, total {} bytes", count, size);
         for i in 0..count {
             let backup_storage = match backup_storage {
-                Some(ref dir) => Some(format!("{}/data-{}", dir, i)),
+                Some(ref dir) => Some(format!("{}/chunk-{}", dir, i)),
                 None => None
             };
             chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage));
