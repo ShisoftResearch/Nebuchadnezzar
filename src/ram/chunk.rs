@@ -262,6 +262,13 @@ impl Chunk {
         self.segs.insert(segment_id, segment);
     }
 
+    pub fn remove_segment(&self, segment_id: u64) {
+        if let Some(seg) = self.segs.remove(&segment_id) {
+            self.addrs_seg.write().remove(&seg.addr).unwrap();
+            seg.dispense();
+        }
+    }
+
     fn locate_segment(&self, addr: usize) -> Option<Arc<Segment>> {
         let segs_addr_range = self.addrs_seg.read();
         debug!("locating segment addr {} in {:?}", addr, *segs_addr_range);

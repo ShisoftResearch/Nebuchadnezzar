@@ -3,10 +3,11 @@ use ram::repr;
 use ram::tombstone::TOMBSTONE_SIZE_U32;
 use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, AtomicBool, Ordering};
 use std::collections::BTreeSet;
-use std::fs::File;
+use std::fs::{File, remove_file};
 use std::io::BufWriter;
 use std::io::prelude::*;
 use std::io;
+use std::path::Path;
 use crc32c::crc32c;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
@@ -39,7 +40,7 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
-            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.seg", path, id)),
+            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
             archived: AtomicBool::new(false)
         }
     }
@@ -101,10 +102,24 @@ impl Segment {
         return Ok(false);
     }
 
-    fn dispose (&self) {
-        debug!("disposing chunk at {}", self.addr);
+    fn mem_drop(&self) {
+        debug!("disposing segment at {}", self.addr);
         unsafe {
             libc::free(self.addr as *mut libc::c_void)
+        }
+    }
+
+    // remove the backup if it have one
+    pub fn dispense(&self) {
+        if let &Some(ref backup_storage) = &self.backup_storage {
+            let path = Path::new(backup_storage);
+            if path.exists() {
+                if let Err(e) = remove_file(path) {
+                    error!("cannot reclaim segment file on dispense {}", backup_storage)
+                }
+            } else {
+                error!("cannot find segment backup {}", backup_storage)
+            }
         }
     }
 }
@@ -146,6 +161,6 @@ impl Iterator for SegmentEntryIter {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        self.dispose()
+        self.mem_drop()
     }
 }

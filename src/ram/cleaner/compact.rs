@@ -141,6 +141,8 @@ impl CompactCleaner {
                     panic!("not cell after filter")
                 }
             });
+
+        chunk.remove_segment(seg.id);
         debug!("Clean finished for segment {} from chunk {}", seg.id, chunk.id);
     }
 }
