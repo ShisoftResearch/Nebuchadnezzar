@@ -37,7 +37,7 @@ pub struct Chunk {
 impl Chunk {
     fn new (id: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunk {
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, SEGMENT_SIZE));
+        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, SEGMENT_SIZE, &backup_storage));
         let segs = CHashMap::new();
         let index = CHashMap::new();
         let chunk = Chunk {
@@ -73,7 +73,7 @@ impl Chunk {
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.seg_counter.fetch_add(1, Ordering::Relaxed);
-                        let new_seg = Segment::new(new_seg_id, SEGMENT_SIZE);
+                        let new_seg = Segment::new(new_seg_id, SEGMENT_SIZE, &self.backup_storage);
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
@@ -413,7 +413,7 @@ impl Chunks {
         debug!("Creating {} chunks, total {} bytes", count, size);
         for i in 0..count {
             let backup_storage = match backup_storage {
-                Some(ref dir) => Some(format!("{}/data-{}.bak", dir, i)),
+                Some(ref dir) => Some(format!("{}/data-{}", dir, i)),
                 None => None
             };
             chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage));

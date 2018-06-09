@@ -21,7 +21,7 @@ pub struct Segment {
 }
 
 impl Segment {
-    pub fn new(id: u64, size: usize) -> Segment {
+    pub fn new(id: u64, size: usize, backup_storage: &Option<String>) -> Segment {
         let buffer_ptr = unsafe { libc::malloc(size) as usize };
         Segment {
             addr: buffer_ptr,
