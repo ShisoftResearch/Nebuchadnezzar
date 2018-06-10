@@ -1,4 +1,6 @@
 use byteorder::{LittleEndian, WriteBytesExt, ByteOrder};
+use ram::cell::CellHeader;
+use ram::tombstone::Tombstone;
 use std::ptr;
 use libc;
 
@@ -11,7 +13,7 @@ bitflags! {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct Entry {
+pub struct EntryHeader {
     pub entry_type: EntryType,
     pub content_length: u32,
 }
@@ -19,6 +21,26 @@ pub struct Entry {
 fn encode_len(len: u32, bytes: &mut[u8]) {
     LittleEndian::write_u32(bytes, len);
 }
+
+#[derive(Clone)]
+pub struct EntryMeta {
+    pub body_pos: usize,
+    pub entry_pos: usize,
+    pub entry_size: usize,
+    pub entry_header: EntryHeader
+}
+
+pub enum EntryContent {
+    Cell(CellHeader),
+    Tombstone(Tombstone),
+    Undecided
+}
+
+pub struct Entry {
+    pub meta: EntryMeta,
+    pub content: EntryContent
+}
+
 
 impl Entry {
     pub fn encode_to<W>(
@@ -51,8 +73,8 @@ impl Entry {
     }
 
     // Returns the entry header reader returns
-    pub fn decode_from<R, RR>(mut pos: usize, read: R) -> (Entry, RR)
-        where R: Fn(usize, Entry) -> RR
+    pub fn decode_from<R, RR>(mut pos: usize, content_read: R) -> (EntryHeader, RR)
+        where R: Fn(usize, EntryHeader) -> RR
     {
         unsafe {
             let flag_byte = *(pos as *mut u8);
@@ -68,12 +90,12 @@ impl Entry {
                 entry_bytes_len_usize);
             let boxed_raw_len = Box::from_raw(raw_len_bytes);
             let entry_length = LittleEndian::read_u32(&*boxed_raw_len);
-            let entry = Entry {
+            let entry = EntryHeader {
                 entry_type,
                 content_length: entry_length
             };
             pos += entry_bytes_len_usize;
-            (entry, read(pos, entry))
+            (entry, content_read(pos, entry))
         }
     }
 
@@ -99,4 +121,3 @@ impl Entry {
         return bytes;
     }
 }
-

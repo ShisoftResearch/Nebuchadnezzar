@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use ram::chunk::Chunks;
+use ram::cell::CellHeader;
+use ram::tombstone::Tombstone;
 
 pub mod combine;
 pub mod compact;

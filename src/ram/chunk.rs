@@ -11,7 +11,7 @@ use ram::types::{Id, Value};
 use ram::segs::{Segment, SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, CellHeader};
 use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
-use ram::repr;
+use ram::entry::{Entry, EntryContent, EntryType};
 use utils::ring_buffer::RingBuffer;
 use server::ServerMeta;
 
@@ -346,7 +346,7 @@ impl Chunk {
         let marks = self.dead_entries.iter();
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
-                let (entry, _) = repr::Entry::decode_from(addr, |_, _| {});
+                let (entry, _) = Entry::decode_from(addr, |_, _| {});
                 seg.dead_space.fetch_add(entry.content_length, Ordering::Relaxed);
             }
         }
@@ -380,7 +380,7 @@ impl Chunk {
                     continue;
                 }
                 for entry_meta in segment.entry_iter() {
-                    if entry_meta.entry_header.entry_type == repr::EntryType::Tombstone {
+                    if entry_meta.entry_header.entry_type == EntryType::Tombstone {
                         let tombstone = Tombstone::read(entry_meta.body_pos);
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
@@ -427,12 +427,48 @@ impl Chunk {
             }
         }
     }
+
+    pub fn live_entries(&self, seg: &Arc<Segment>) -> Vec<Entry> {
+        seg.entry_iter()
+            .filter_map(|entry_meta| {
+                let entry_size = entry_meta.entry_size;
+                let entry_header = entry_meta.entry_header;
+                match entry_header.entry_type {
+                    EntryType::Cell => {
+                        let cell_header =
+                            Cell::cell_header_from_entry_content_addr(
+                                entry_meta.body_pos, &entry_header);
+                        if self.index
+                            .get(&cell_header.hash)
+                            .map(|g| *g) == Some(entry_meta.entry_pos) {
+                            return Some(Entry {
+                                meta: entry_meta,
+                                content: EntryContent::Cell(cell_header)
+                            });
+                        }
+                    },
+                    EntryType::Tombstone => {
+                        let tombstone =
+                            Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
+                        if self.segs.contains_key(&tombstone.segment_id) {
+                            return Some(Entry {
+                                meta: entry_meta,
+                                content: EntryContent::Tombstone(tombstone)
+                            });
+                        }
+                    },
+                    _ => panic!("Unexpected cell type on compaction: {:?}, size {}",
+                                entry_header, entry_size)
+                }
+                return None
+            })
+            .collect()
+    }
 }
 
 pub struct Chunks {
     pub list: Vec<Chunk>,
 }
-
 
 
 impl Chunks {

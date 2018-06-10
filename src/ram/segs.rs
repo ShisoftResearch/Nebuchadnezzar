@@ -1,6 +1,9 @@
 use libc;
-use ram::repr;
-use ram::tombstone::TOMBSTONE_SIZE_U32;
+use ram::entry;
+use ram::tombstone::{TOMBSTONE_SIZE_U32, Tombstone};
+use ram::cell::Cell;
+use ram::chunk::Chunk;
+use ram::entry::EntryMeta;
 use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, AtomicBool, Ordering};
 use std::collections::BTreeSet;
 use std::fs::{File, remove_file};
@@ -124,14 +127,6 @@ impl Segment {
     }
 }
 
-#[derive(Clone)]
-pub struct EntryMeta {
-    pub body_pos: usize,
-    pub entry_pos: usize,
-    pub entry_size: usize,
-    pub entry_header: repr::Entry
-}
-
 pub struct SegmentEntryIter {
     bound: usize,
     cursor: usize
@@ -145,7 +140,7 @@ impl Iterator for SegmentEntryIter {
         if cursor >= self.bound {
             return None;
         }
-        let (_, entry_meta) = repr::Entry::decode_from(
+        let (_, entry_meta) = entry::Entry::decode_from(
             cursor,
             |body_pos, entry| {
                 let entry_header_size = body_pos - cursor;

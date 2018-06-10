@@ -1,6 +1,6 @@
 use super::mem_cursor::*;
 use std::io::{Cursor, Write, Read};
-use ram::repr::*;
+use ram::entry::*;
 use dovahkiin::types::Id;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
@@ -62,8 +62,8 @@ impl Tombstone {
     pub fn read(addr: usize) -> Tombstone {
         Entry::decode_from(
             addr,
-            |addr, entry| {
-                assert_eq!(entry.entry_type, EntryType::Tombstone, "Reading entry not tombstone");
+            |addr, header| {
+                assert_eq!(header.entry_type, EntryType::Tombstone, "Reading entry not tombstone");
                 return Self::read_from_entry_content_addr(addr);
             }).1
     }

@@ -1,7 +1,7 @@
 use ram::mem_cursor::*;
 use ram::schema::{Schema, Field};
 use ram::chunk::Chunk;
-use ram::repr;
+use ram::entry::*;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id, RandValue};
 use std::sync::Arc;
@@ -119,7 +119,7 @@ impl Cell {
         Some(Cell::new_with_id(schema_id, &id, value))
     }
 
-    pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &repr::Entry) -> CellHeader {
+    pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &EntryHeader) -> CellHeader {
         let mut cursor = addr_to_header_cursor(addr);
         let header = CellHeader {
             version: cursor.read_u64::<Endian>().unwrap(),
@@ -135,10 +135,10 @@ impl Cell {
 
     pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
         if ptr == 0 {return Err(ReadError::CellIdIsUnitId)}
-        let (_, header) = repr::Entry::decode_from(
+        let (_, header) = Entry::decode_from(
             ptr,
             |addr, entry_header| {
-                assert_eq!(entry_header.entry_type, repr::EntryType::Cell);
+                assert_eq!(entry_header.entry_type, EntryType::Cell);
                 let header = Self::cell_header_from_entry_content_addr(addr, &entry_header);
                 (header, addr + CELL_HEADER_SIZE)
         });
@@ -189,8 +189,8 @@ impl Cell {
             )?;
         }
         let entry_body_size = offset + CELL_HEADER_SIZE;
-        let len_bytes = repr::Entry::count_len_bytes(entry_body_size as u32);
-        let total_size = repr::Entry::size(len_bytes, entry_body_size as u32);
+        let len_bytes = Entry::count_len_bytes(entry_body_size as u32);
+        let total_size = Entry::size(len_bytes, entry_body_size as u32);
         if total_size > MAX_CELL_SIZE {return Err(WriteError::CellIsTooLarge(total_size as usize))}
         let addr_opt = chunk.try_acquire(total_size);
         self.header.size = total_size as u32;
@@ -201,9 +201,9 @@ impl Cell {
                 return Err(WriteError::CannotAllocateSpace);
             },
             Some((addr, _)) => {
-                repr::Entry::encode_to(
+                Entry::encode_to(
                     addr,
-                    repr::EntryType::Cell,
+                    EntryType::Cell,
                     total_size,
                     len_bytes,
                     move |content_addr| {

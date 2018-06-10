@@ -1,6 +1,7 @@
+use super::*;
 use super::super::chunk::{Chunk, Chunks};
-use super::super::segs::{Segment, EntryMeta};
-use ram::repr::EntryType;
+use super::super::segs::{Segment};
+use ram::entry::*;
 use ram::cell::{Cell, CellHeader};
 use ram::tombstone::Tombstone;
 use dovahkiin::types::Id;
@@ -15,29 +16,9 @@ use std::collections::Bound::{Included, Unbounded};
 use libc;
 use parking_lot::MutexGuard;
 
-static MAX_CLEAN_RETRY: u16 = 100;
-
-pub fn ceiling_frag(frags: &MutexGuard<BTreeSet<usize>>, location: usize) -> Option<usize> {
-    match frags.range((Included(&location), Unbounded)).next() {
-        Some(l) => Some(*l),
-        None => None
-    }
-}
-
 pub struct CompactCleaner {
     chunks: Arc<Chunks>,
     closed: AtomicBool
-}
-
-enum EntryContent {
-    Cell(CellHeader),
-    Tombstone(Tombstone),
-    Undecided
-}
-
-struct Entry {
-    meta: EntryMeta,
-    content: EntryContent
 }
 
 impl CompactCleaner {
@@ -62,41 +43,8 @@ impl CompactCleaner {
         debug!("Cleaning segment {} from chunk {}", seg.id, chunk.id);
 
         // scan and mark live entries
-        let live = seg.entry_iter()
-            .filter_map(|entry_meta| {
-                let entry_size = entry_meta.entry_size;
-                let entry_header = entry_meta.entry_header;
-                match entry_header.entry_type {
-                    EntryType::Cell => {
-                        let cell_header =
-                            Cell::cell_header_from_entry_content_addr(
-                                entry_meta.body_pos, &entry_header);
-                        if chunk.index
-                            .get(&cell_header.hash)
-                            .map(|g| *g) == Some(entry_meta.entry_pos) {
-                            return Some((Entry {
-                                meta: entry_meta,
-                                content: EntryContent::Cell(cell_header)
-                            }, entry_size));
-                        }
-                    },
-                    EntryType::Tombstone => {
-                        let tombstone =
-                            Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if chunk.segs.contains_key(&tombstone.segment_id) {
-                            return Some((Entry {
-                                meta: entry_meta,
-                                content: EntryContent::Tombstone(tombstone)
-                            }, entry_size));
-                        }
-                    },
-                    _ => panic!("Unexpected cell type on compaction: {:?}, size {}",
-                                entry_header, entry_size)
-                }
-                return None
-            });
-        let (entries, sizes) : (Vec<_>, Vec<_>) = live.unzip();
-        let live_size: usize = sizes.into_iter().sum();
+        let entries = chunk.live_entries(seg);
+        let live_size: usize = entries.iter().map(|e| e.meta.entry_size).sum();
         debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
                seg.id, chunk.id, entries.len(), live_size);
         let new_seg_id = chunk.seg_counter.fetch_add(1, Ordering::Relaxed);

@@ -7,7 +7,7 @@ pub mod cell;
 pub mod schema;
 pub mod io;
 pub mod cleaner;
-pub mod repr;
+pub mod entry;
 pub mod tombstone;
 
 mod segs;
