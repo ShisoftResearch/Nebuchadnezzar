@@ -16,10 +16,7 @@ use std::collections::Bound::{Included, Unbounded};
 use libc;
 use parking_lot::MutexGuard;
 
-pub struct CompactCleaner {
-    chunks: Arc<Chunks>,
-    closed: AtomicBool
-}
+pub struct CompactCleaner;
 
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) {
@@ -47,8 +44,7 @@ impl CompactCleaner {
         let live_size: usize = entries.iter().map(|e| e.meta.entry_size).sum();
         debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
                seg.id, chunk.id, entries.len(), live_size);
-        let new_seg_id = chunk.seg_counter.fetch_add(1, Ordering::Relaxed);
-        let new_seg = Arc::new(Segment::new(new_seg_id, live_size, &chunk.backup_storage));
+        let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage));
         let mut cursor = new_seg.addr;
         let copied_entries =
             entries
@@ -67,8 +63,6 @@ impl CompactCleaner {
                 });
 
         new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
-        // put segment directly into the segment map prior to resetting cell addresses as side logs
-        chunk.put_segment(new_seg);
 
         // update cell address chunk index
         copied_entries
@@ -90,7 +84,9 @@ impl CompactCleaner {
                 }
             });
 
-        chunk.remove_segment(seg.id);
+        // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
+        chunk.put_segment(new_seg);
+
         debug!("Clean finished for segment {} from chunk {}", seg.id, chunk.id);
     }
 }
