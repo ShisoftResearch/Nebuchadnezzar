@@ -89,7 +89,12 @@ impl Segment {
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
         if let &Some(ref backup_storage) = &self.backup_storage {
-            let file = File::open(backup_storage)?;
+            let path = Path::new(backup_storage);
+            if path.exists() {
+                warn!("Segment backup {} exists and can't archive twice", backup_storage);
+                return Ok(false);
+            }
+            let file = File::open(path)?;
             let mut buffer = BufWriter::new(file);
             let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
             unsafe {
