@@ -16,7 +16,8 @@ use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
 use super::cell::CellHeader;
 
-pub const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
+pub const MAX_SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
+pub const MAX_SEGMENT_SIZE: usize = MAX_SEGMENT_SIZE_U32 as usize;
 
 pub struct Segment {
     pub id: u64,
@@ -78,12 +79,22 @@ impl Segment {
         return dead_tombstones_space + dead_cells_space;
     }
 
+    pub fn used_spaces(&self) -> u32 {
+        return (self.append_header.load(Ordering::Relaxed) as usize - self.addr) as u32
+    }
+
+    pub fn living_space(&self) -> u32 {
+        let total_dead_space = self.total_dead_space();
+        return self.used_spaces() - total_dead_space;
+    }
+
     pub fn living_rate(&self) -> f32 {
-        let used_spaces = (self.append_header.load(Ordering::Relaxed) - self.addr) as f32;
-        if used_spaces == 0f32 { return 1f32 }
-        let total_dead_space = self.total_dead_space() as f32;
-        let living_space = used_spaces - total_dead_space;
-        return living_space / used_spaces;
+        let used_space = self.used_spaces() as f32;
+        if used_space == 0f32 {
+            // empty segment
+            return 1f32;
+        }
+        return self.living_space() as f32 / used_space;
     }
 
     // archive this segment and write the data to backup storage

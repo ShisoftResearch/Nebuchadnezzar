@@ -12,29 +12,46 @@ pub mod compact;
 pub struct Cleaner {
     chunks: Arc<Chunks>,
     stopped: Arc<AtomicBool>,
-    pub segment_compact_per_turn: usize
+    segments_compact_per_turn: usize,
+    segments_combine_per_turn: usize,
 }
 
+// The two-level cleaner
 impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
         let stop_tag = Arc::new(AtomicBool::new(false));
-        let segment_compact_per_turn = chunks.list[0].segs.len() / 10 + 1;
+        let segments_compact_per_turn = chunks.list[0].segs.len() / 10 + 1;
+        let segments_combine_per_turn = chunks.list[0].segs.len() / 50 + 1;
         let cleaner = Cleaner {
             chunks: chunks.clone(),
             stopped: stop_tag.clone(),
-            segment_compact_per_turn
+            segments_compact_per_turn,
+            segments_combine_per_turn
         };
         thread::spawn(move || {
             while !stop_tag.load(Ordering::Relaxed) {
                 for chunk in &chunks.list {
                     chunk.apply_dead_entry();
                     chunk.scan_tombstone_survival();
-                    let ordered_segs_for_compact = chunk.segs_for_compact_cleaner();
-                    // compact
-                    ordered_segs_for_compact.iter()
-                        .take(segment_compact_per_turn) // limit max segment to clean per turn
-                        .for_each(|segment|
-                            compact::CompactCleaner::clean_segment(chunk, segment));
+
+                    {
+                        // compact
+                        let segments_for_compact = chunk.segs_for_compact_cleaner();
+                        segments_for_compact.iter()
+                            .take(segments_compact_per_turn) // limit max segment to clean per turn
+                            .for_each(|segment|
+                                compact::CompactCleaner::clean_segment(chunk, segment));
+                    }
+
+                    {
+                        // combine
+                        let segments_for_combine: Vec<_> =
+                            chunk.segs_for_combine_cleaner()
+                                .into_iter()
+                                .take(segments_combine_per_turn)
+                                .collect();
+                        combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
+                    }
 
                     chunk.check_and_archive_segments();
                 }

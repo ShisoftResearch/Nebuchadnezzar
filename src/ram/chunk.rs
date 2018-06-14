@@ -8,7 +8,7 @@ use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
-use ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
 use ram::cell::{Cell, ReadError, WriteError, CellHeader};
 use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
 use ram::entry::{Entry, EntryContent, EntryType};
@@ -411,6 +411,22 @@ impl Chunk {
         list.sort_by(|pair1, pair2|
             pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
+    }
+
+    pub fn segs_for_combine_cleaner(&self) -> Vec<Arc<Segment>> {
+        let head_seg = self.head_seg.read();
+        let mut mapping: Vec<_> = self.segments().into_iter()
+            .map(|seg| {
+                let living = seg.living_space() as f32;
+                let segment_utilization = living / MAX_SEGMENT_SIZE_U32 as f32;
+                (seg, segment_utilization)
+            })
+            .filter(|(seg, utilization)|
+                *utilization < 50f32 && head_seg.id != seg.id)
+            .collect();
+        mapping.sort_by(|pair1, pair2|
+            pair1.1.partial_cmp(&pair2.1).unwrap());
+        return mapping.into_iter().map(|(seg, _)| seg).collect();
     }
 
     pub fn check_and_archive_segments(&self) {

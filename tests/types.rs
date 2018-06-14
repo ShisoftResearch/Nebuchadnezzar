@@ -266,3 +266,8 @@ fn index_mut_map() {
     value["b"][0 as usize] = types::Value::U64(10);
     assert_eq!(value["b"][0 as usize].U64().unwrap(), 10);
 }
+
+#[test]
+fn num_cast() {
+    assert_eq!(1u32, 1u64 as u32);
+}
