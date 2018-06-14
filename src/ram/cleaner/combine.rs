@@ -32,6 +32,7 @@ impl DummySegment {
 
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) {
+        if segments.len() < 2 { return }
         debug!("Combining segments");
 
         // get all entries in segments to combine

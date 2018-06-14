@@ -21,7 +21,7 @@ impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
         let stop_tag = Arc::new(AtomicBool::new(false));
         let segments_compact_per_turn = chunks.list[0].segs.len() / 10 + 1;
-        let segments_combine_per_turn = chunks.list[0].segs.len() / 50 + 1;
+        let segments_combine_per_turn = chunks.list[0].segs.len() / 20 + 2;
         let cleaner = Cleaner {
             chunks: chunks.clone(),
             stopped: stop_tag.clone(),
