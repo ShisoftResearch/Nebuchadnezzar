@@ -8,7 +8,7 @@ use bifrost::utils::time::get_time;
 use chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
-use ram::segs::{Segment, SEGMENT_SIZE};
+use ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use ram::cell::{Cell, ReadError, WriteError, CellHeader};
 use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
 use ram::entry::{Entry, EntryContent, EntryType};
@@ -37,7 +37,7 @@ pub struct Chunk {
 impl Chunk {
     fn new (id: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunk {
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, SEGMENT_SIZE, &backup_storage));
+        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, MAX_SEGMENT_SIZE, &backup_storage));
         let segs = CHashMap::new();
         let index = CHashMap::new();
         let chunk = Chunk {
@@ -51,7 +51,7 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.to_owned()),
             addrs_seg: RwLock::new(BTreeMap::new()),
-            dead_entries: RingBuffer::new(size / SEGMENT_SIZE * 10)
+            dead_entries: RingBuffer::new(size / MAX_SEGMENT_SIZE * 10)
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
@@ -65,7 +65,7 @@ impl Chunk {
             match head.try_acquire(size) {
                 Some(pair) => return Some((pair, head)),
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE {
                         // No space left
                         return None;
                     }
@@ -73,9 +73,9 @@ impl Chunk {
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.seg_counter.fetch_add(1, Ordering::Relaxed);
-                        let new_seg = Segment::new(new_seg_id, SEGMENT_SIZE, &self.backup_storage);
+                        let new_seg = Segment::new(new_seg_id, MAX_SEGMENT_SIZE, &self.backup_storage);
                         // for performance, won't CAS total_space
-                        self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
+                        self.total_space.fetch_add(MAX_SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         self.put_segment(new_seg_ref.clone());
                         *acquired_header = new_seg_ref;
@@ -273,7 +273,7 @@ impl Chunk {
         let segs_addr_range = self.addrs_seg.read();
         debug!("locating segment addr {} in {:?}", addr, *segs_addr_range);
         segs_addr_range
-            .range((Included(addr - SEGMENT_SIZE), Included(addr)))
+            .range((Included(addr - MAX_SEGMENT_SIZE), Included(addr)))
             .last()
             .and_then(|(_, seg_id)| {
                 self.segs
@@ -372,7 +372,7 @@ impl Chunk {
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
                 let mut death_count = 0;
                 if  // have not much tombstones
-                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
+                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (MAX_SEGMENT_SIZE as f64) * 0.2 ||
                         // large partition have been scanned
                         (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
                         // have been scanned recently
@@ -403,7 +403,7 @@ impl Chunk {
                     let rate = seg.living_rate();
                     (seg, rate)
                 })
-                .filter(|(_, utilization)| *utilization < 80f32);
+                .filter(|(_, utilization)| *utilization < 90f32);
         let head_seg = self.head_seg.read();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| seg.id != head_seg.id)

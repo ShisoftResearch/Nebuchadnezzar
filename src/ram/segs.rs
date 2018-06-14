@@ -16,7 +16,7 @@ use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 
 use super::cell::CellHeader;
 
-pub const SEGMENT_SIZE: usize = 8 * 1024 * 1024;
+pub const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 pub struct Segment {
     pub id: u64,
