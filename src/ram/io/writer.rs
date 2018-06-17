@@ -1,7 +1,7 @@
 use ram::schema::{Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{Value, Map, NULL_TYPE_ID, Any};
+use ram::types::{Value, Map, NULL_TYPE_ID, Any, Type, type_id_of};
 
 use std::collections::HashSet;
 
@@ -96,7 +96,7 @@ pub fn plan_write_dynamic_fields(
             dynamic_map.insert_key_id(key_id, data_all.get_by_key_id(key_id).clone());
         }
         dynamic_map.fields = dynamic_names;
-        let any_type_id = types::TypeId::Any as u32;
+        let any_type_id = type_id_of(Type::Any);
         let dynamic_value = Value::Any(Any::from(&dynamic_map));
         let dynamic_size = types::get_vsize(any_type_id, &dynamic_value);
         ins.push(Instruction {

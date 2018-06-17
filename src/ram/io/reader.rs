@@ -1,7 +1,7 @@
 use ram::schema::{Schema, Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{u16_io, u8_io, Value, Map};
+use ram::types::{u16_io, u8_io, Value, Map, type_id_of, Type};
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, usize) {
     let mut ptr = ptr;
@@ -51,7 +51,7 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, us
 }
 
 pub fn read_attach_dynamic_part(tail_ptr: usize, dest: &mut Value) {
-    let src = types::get_val(types::TypeId::Any as u32, tail_ptr);
+    let src = types::get_val(type_id_of(Type::Any), tail_ptr);
     if let &mut Value::Map(ref mut map_dest) = dest {
         if let Value::Any(any_src) = src {
             let mut map_src: Map = any_src.to();
