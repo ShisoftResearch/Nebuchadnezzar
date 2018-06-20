@@ -38,7 +38,7 @@ pub fn cell_rw () {
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert_eq!(stored_cell.header.size, 28);
+        assert_eq!(stored_cell.header.size, 24);
         assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
