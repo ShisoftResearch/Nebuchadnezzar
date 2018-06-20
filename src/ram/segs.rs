@@ -35,6 +35,7 @@ pub struct Segment {
 impl Segment {
     pub fn new(id: u64, size: usize, backup_storage: &Option<String>) -> Segment {
         let buffer_ptr = unsafe { libc::malloc(size) as usize };
+        debug!("Creating new segment with id {}, size {}, address {}", id, size, buffer_ptr);
         Segment {
             addr: buffer_ptr,
             id,
@@ -66,9 +67,13 @@ impl Segment {
         }
     }
 
+    fn append_header(&self) -> usize {
+        self.append_header.load(Ordering::Relaxed)
+    }
+
     pub fn entry_iter(&self) -> SegmentEntryIter {
         SegmentEntryIter {
-            bound: self.bound,
+            bound: self.append_header(),
             cursor: self.addr
         }
     }
@@ -158,11 +163,13 @@ impl Iterator for SegmentEntryIter {
         }
         let (_, entry_meta) = entry::Entry::decode_from(
             cursor,
-            |body_pos, entry| {
+            |body_pos, header| {
                 let entry_header_size = body_pos - cursor;
-                let entry_size = entry_header_size + entry.content_length as usize;
+                let entry_size = entry_header_size + header.content_length as usize;
+                debug!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
+                       body_pos, header, entry_header_size, entry_size, cursor, header.content_length, self.bound);
                 return EntryMeta {
-                    body_pos, entry_header: entry, entry_size, entry_pos: cursor
+                    body_pos, entry_header: header, entry_size, entry_pos: cursor
                 };
             });
         self.cursor += entry_meta.entry_size;
@@ -172,6 +179,7 @@ impl Iterator for SegmentEntryIter {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        debug!("Memory dropping segment {}", self.id);
         self.mem_drop()
     }
 }

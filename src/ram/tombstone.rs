@@ -5,8 +5,8 @@ use dovahkiin::types::Id;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 lazy_static! {
-    pub static ref LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
-    pub static ref ENTRY_SIZE: u32 = Entry::size(*LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
+    pub static ref TOMBSTONE_LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
+    pub static ref TOMBSTONE_ENTRY_SIZE: u32 = Entry::size(*TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
 }
 
 pub struct Tombstone {
@@ -34,7 +34,7 @@ impl Tombstone {
             addr,
             EntryType::Tombstone,
             TOMBSTONE_SIZE_U32,
-            *LEN_BYTES_COUNT,
+            *TOMBSTONE_LEN_BYTES_COUNT,
         |addr| {
             let mut cursor = addr_to_cursor(addr);
             {

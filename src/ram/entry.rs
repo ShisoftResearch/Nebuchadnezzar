@@ -51,11 +51,14 @@ impl Entry {
         write_content: W)
         where W: Fn(usize)
     {
+        let entry_type_bit = entry_type.bits;
         let len_bytes_count_usize = len_bytes_count as usize;
-        let flag_byte = len_bytes_count | entry_type.bits;
+        let flag_byte = len_bytes_count | entry_type_bit;
         let mut len_bytes = [0u8; 4];
         encode_len(content_len, &mut len_bytes);
         let raw_len_bytes= Box::into_raw(box len_bytes);
+        debug!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
+               pos, flag_byte, entry_type_bit, len_bytes_count, content_len);
         unsafe {
             // write entry flags
             *(pos as *mut u8) = flag_byte;
@@ -94,6 +97,9 @@ impl Entry {
                 entry_type,
                 content_length: entry_length
             };
+
+            debug!("decode entry header {}, flag {:#010b}, type bit: {:#010b}, len bits {:#010b}, len {}",
+                   pos, flag_byte, entry_type_bits, entry_bytes_len, entry_length);
             pos += entry_bytes_len_usize;
             (entry, content_read(pos, entry))
         }
@@ -106,18 +112,13 @@ impl Entry {
 
     #[inline]
     pub fn count_len_bytes(len: u32) -> u8 {
-        let in_bits = 32;
-        let msb = 1 << (in_bits - 1);
-        let mut count: u8 = 0;
-        for i in 0..in_bits
-            {
-                if (len << i) & msb > 0 {
-                    break;
-                };
-                count += 1;
-            }
-        let bytes = count / 8;
-        assert!(bytes <= 4);
-        return bytes;
+        let mut n = 0;
+        let mut x = len;
+        while x != 0 {
+            x = x >> 8;
+            n += 1;
+        }
+        debug!("count len bytes {} -> {}", len, n);
+        return n;
     }
 }

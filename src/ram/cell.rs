@@ -204,7 +204,7 @@ impl Cell {
                 Entry::encode_to(
                     addr,
                     EntryType::Cell,
-                    total_size,
+                    entry_body_size as u32,
                     len_bytes,
                     move |content_addr| {
                         // write cell header

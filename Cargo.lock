@@ -21,7 +21,7 @@ source = "git+https://github.com/shisoft/bifrost?branch=develop#f4bf5fb589e62a8b
 dependencies = [
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bincode 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bincode 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "byteorder 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "env_logger 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-await 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "bincode"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "byteorder 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -140,12 +140,12 @@ dependencies = [
 [[package]]
 name = "dovahkiin"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#f4eed64f179f054030b6dd2c9894ba172332d964"
+source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#20e0aa27dae8bbb85073be986705cb52051108bf"
 dependencies = [
  "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bincode 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bincode 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "byteorder 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "lazy_static 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -323,7 +323,7 @@ dependencies = [
  "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
- "bincode 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "bincode 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitflags 1.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "byteorder 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "chashmap 2.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -821,7 +821,7 @@ dependencies = [
 "checksum bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)" = "<none>"
 "checksum bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)" = "<none>"
 "checksum bifrost_plugins 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)" = "<none>"
-"checksum bincode 1.0.0 (registry+https://github.com/rust-lang/crates.io-index)" = "bda13183df33055cbb84b847becce220d392df502ebe7a4a78d7021771ed94d0"
+"checksum bincode 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)" = "9f2fb9e29e72fd6bc12071533d5dc7664cb01480c59406f656d7ac25c7bd8ff7"
 "checksum bitflags 1.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "d0c54bb8f454c567f21197eefcdbf5679d0bd99f2ddbe52e84c77061952e6789"
 "checksum byteorder 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)" = "74c0b906e9446b0a2e4f760cdb3fa4b2c48cdc6db8766a845c54b6ff063fd2e9"
 "checksum bytes 0.4.8 (registry+https://github.com/rust-lang/crates.io-index)" = "7dd32989a66957d3f0cba6588f15d4281a733f4e9ffc43fcd2385f57d3bf99ff"
