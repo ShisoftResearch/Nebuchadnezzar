@@ -275,6 +275,7 @@ impl Chunk {
         let segment_addr = segment.addr;
         let original_pos = self.segs.get(&segment_id).map(|seg| seg.addr);
         if let Some(seg_original_pos) = original_pos {
+            // remove old segment by it's position
             seg_index_guard.remove(&seg_original_pos);
         }
         seg_index_guard.insert(segment_addr, segment_id);
