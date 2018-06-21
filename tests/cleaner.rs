@@ -87,18 +87,22 @@ pub fn full_clean_cycle() {
     assert_eq!(all_cell_addresses.len(), 16);
 
     for i in 0..8 {
-        chunks.remove_cell(&Id::new(0, i * 2));
+        chunks.remove_cell(&Id::new(0, i * 2)).unwrap();
     }
+
+    assert_eq!(chunk.segments().len(), 2);
+
     // try to scan first segment expect no panic
     println!("Scanning first segment...");
-    chunk.live_entries(&chunk.segments()[0]);
+    chunk.live_entries(&chunk.segs.get(&0).unwrap());
 
     println!("Scanning second segment for tombstones...");
-    let live_entries = chunk.live_entries(&chunk.segments()[1]);
+    let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
     let tombstones: Vec<_> = live_entries
         .iter()
         .filter(|e| e.meta.entry_header.entry_type == EntryType::Tombstone)
         .collect();
+    assert_eq!(tombstones.len(), 8);
     for i in 0..tombstones.len() {
         let hash = (i * 2) as u64;
         let e = &tombstones[i];
@@ -113,8 +117,10 @@ pub fn full_clean_cycle() {
 
     chunk.apply_dead_entry();
 
-    // Compact all segments
-    chunk.segments().into_iter()
+    // Compact all segments order by id
+    let mut segments = chunk.segments();
+    segments.sort_by_key(|seg| seg.id);
+    segments.into_iter()
         .for_each(|seg|
             compact::CompactCleaner::clean_segment(chunk, &seg));
 
@@ -123,4 +129,44 @@ pub fn full_clean_cycle() {
     assert_eq!(compacted_seg_positions.len(), 2);
     assert_eq!(compacted_cell_addresses.len(), 8);
 
+    // scan segments to check entries
+    let seg0 = &chunk.segs.get(&0).unwrap();
+    let seg1 = &chunk.segs.get(&1).unwrap();
+    let compacted_segment_0_entries = chunk.live_entries(seg0);
+    let compacted_segment_1_entries = chunk.live_entries(seg1);
+    let compacted_segment_0_ids = (0..4).map(|num| num as u64 * 2 + 1);
+    let compacted_segment_1_ids =
+        (4..8).map(|num| num as i64 * 2 + 1)
+        .chain((0..8).map(|i| -1 * i * 2));
+    assert_eq!(seg0.id, 0);
+    assert_eq!(seg1.id, 1);
+    // check for cells continuity
+    compacted_segment_0_entries
+        .iter()
+        .zip(compacted_segment_0_ids)
+        .for_each(|(entry, hash)| {
+            assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+            if let EntryContent::Cell(header) = entry.content {
+                assert_eq!(header.hash, hash)
+            } else { panic!(); }
+        });
+
+    // check for cells and 4 tombstones
+    compacted_segment_1_entries
+        .iter()
+        .zip(compacted_segment_1_ids)
+        .for_each(|(entry, hash)|{
+            if hash > 1 {
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                if let EntryContent::Cell(header) = entry.content {
+                    assert_eq!(header.hash, hash as u64)
+                } else { panic!(); }
+            } else {
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Tombstone);
+                let tombstone = if let EntryContent::Tombstone(ref tombstone) = entry.content {
+                    tombstone
+                } else { panic!() };
+                assert_eq!((hash * -1) as u64, tombstone.hash);
+            }
+        })
 }

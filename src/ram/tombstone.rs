@@ -9,6 +9,7 @@ lazy_static! {
     pub static ref TOMBSTONE_ENTRY_SIZE: u32 = Entry::size(*TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
 }
 
+#[derive(Debug)]
 pub struct Tombstone {
     pub segment_id: u64,
     pub version: u64,
