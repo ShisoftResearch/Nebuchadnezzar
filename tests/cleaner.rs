@@ -150,6 +150,7 @@ pub fn full_clean_cycle() {
                 assert_eq!(header.hash, hash)
             } else { panic!(); }
         });
+    assert_eq!(compacted_segment_0_entries.len(), 4);
 
     // check for cells and 4 tombstones
     compacted_segment_1_entries
@@ -168,5 +169,6 @@ pub fn full_clean_cycle() {
                 } else { panic!() };
                 assert_eq!((hash * -1) as u64, tombstone.hash);
             }
-        })
+        });
+    assert_eq!(compacted_segment_1_entries.len(), 12);
 }
