@@ -135,6 +135,7 @@ impl Segment {
 
     // remove the backup if it have one
     pub fn dispense(&self) {
+        debug!("dispense segment {}", self.id);
         if let &Some(ref backup_storage) = &self.backup_storage {
             let path = Path::new(backup_storage);
             if path.exists() {

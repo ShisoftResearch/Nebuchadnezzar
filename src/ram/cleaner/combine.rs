@@ -1,6 +1,7 @@
 use ram::chunk::Chunk;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::collections::HashSet;
 use ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use ram::entry::{EntryContent, Entry, EntryType};
 use libc;
@@ -35,15 +36,25 @@ impl CombinedCleaner {
         if segments.len() < 2 { return }
         debug!("Combining segments");
 
-        // get all entries in segments to combine
+        let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
+
+        debug!("get all entries in segments to combine");
         let mut entries: Vec<_> = segments
             .iter()
             .flat_map(|seg| {
                 chunk.live_entries(seg)
             })
+            .filter(|entry| {
+                // live entries have done a lot of filtering work already
+                // but we still need to remove those tombstones that pointed to segments we are about to combine
+                if let EntryContent::Tombstone(ref tombstone) = entry.content {
+                    return !segment_ids_to_combine.contains(&tombstone.segment_id);
+                }
+                return true;
+            })
             .collect();
 
-        // sort entries from larger one to smaller
+        debug!("sort entries from larger one to smaller");
         entries.sort_by(|entry1,entry2| {
             let size1 = entry1.meta.entry_size;
             let size2 = entry2.meta.entry_size;
@@ -53,7 +64,7 @@ impl CombinedCleaner {
         // provide additional state for whether entry have been claimed on simulation
         let mut entries: Vec<_> = entries.into_iter().map(|e| (e, false)).collect();
 
-        // simulate the combine process to determine the efficiency
+        debug!("simulate the combine process to determine the efficiency");
         let mut pending_segments = Vec::with_capacity(segments.len());
         let entries_num = entries.len();
         let mut entries_to_claim = entries_num;
@@ -102,12 +113,15 @@ impl CombinedCleaner {
             cursor += 1;
         }
 
+        debug!("Checking combine feasibility");
         let pending_segments_len = pending_segments.len();
         let segments_to_combine_len = segments.len();
         if pending_segments_len >= segments_to_combine_len  {
             warn!("Trying to combine segments but resulting segments still does not go down {}/{}",
                   pending_segments_len, segments_to_combine_len);
         }
+        
+        debug!("Updating cell reference");
         pending_segments
             .iter()
             .map(|dummy_seg| {
@@ -115,6 +129,7 @@ impl CombinedCleaner {
                 let new_seg = Segment::new(new_seg_id, dummy_seg.head, &chunk.backup_storage);
                 let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                 let mut seg_cursor = new_seg.addr;
+                debug!("Combining segment to new one with id {}", new_seg_id);
                 for entry in &dummy_seg.entries {
                     let entry_addr = entry.addr;
                     unsafe {
@@ -124,27 +139,35 @@ impl CombinedCleaner {
                             entry.size);
                     }
                     if let Some(cell_hash) = entry.cell {
+                        debug!("Marked cell relocation hash {}, addr {} to segment {}", cell_hash, entry_addr, new_seg_id);
                         cell_mapping.push((seg_cursor, entry_addr, cell_hash));
                     }
                     seg_cursor += entry.size;
                 }
+                new_seg.append_header.store(seg_cursor, Ordering::Relaxed);
                 return (new_seg, cell_mapping);
             })
             .flat_map(|(segment, cells)| {
+                debug!("Putting new segment {}", segment.id);
                 let seg_ref = Arc::new(segment);
                 chunk.put_segment(seg_ref.clone());
                 seg_ref.archive();
                 return cells;
             })
             .for_each(|(new, old, hash)| {
+                debug!("Reset cell {} ptr from {} to {}", hash, old, new);
                 if let Some(mut actual_addr) = chunk.index.get_mut(&hash) {
                     if *actual_addr == old {
                         *actual_addr = new
                     } else {
-                        warn!("cell address {}, have been changed to {} on combine", old, *actual_addr);
+                        warn!("cell {} with address {}, have been changed to {} on combine", hash, old, *actual_addr);
                     }
+                } else {
+                    warn!("cell {} address {} have been removed on combine", hash, old);
                 }
             });
+
+        debug!("Removing old segments");
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
         }
