@@ -92,6 +92,10 @@ pub fn full_clean_cycle() {
 
     assert_eq!(chunk.segments().len(), 2);
 
+    //count entries, including dead ones
+    assert_eq!(chunk.segs.get(&0).unwrap().entry_iter().count(), 8); // all 8 cells
+    assert_eq!(chunk.segs.get(&1).unwrap().entry_iter().count(), 16); // 8 cells and 8 tombstones
+
     // try to scan first segment expect no panic
     println!("Scanning first segment...");
     chunk.live_entries(&chunk.segs.get(&0).unwrap());
@@ -151,6 +155,7 @@ pub fn full_clean_cycle() {
             } else { panic!(); }
         });
     assert_eq!(compacted_segment_0_entries.len(), 4);
+    assert_eq!(seg0.entry_iter().count(), 4);
 
     // check for cells and 4 tombstones
     compacted_segment_1_entries
@@ -158,11 +163,13 @@ pub fn full_clean_cycle() {
         .zip(compacted_segment_1_ids)
         .for_each(|(entry, hash)|{
             if hash > 1 {
+                // cell
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
                 if let EntryContent::Cell(header) = entry.content {
                     assert_eq!(header.hash, hash as u64)
                 } else { panic!(); }
             } else {
+                // tombstone
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::Tombstone);
                 let tombstone = if let EntryContent::Tombstone(ref tombstone) = entry.content {
                     tombstone
@@ -170,5 +177,7 @@ pub fn full_clean_cycle() {
                 assert_eq!((hash * -1) as u64, tombstone.hash);
             }
         });
+    // 4 remaining cells and 8 deleted cell tombstones
     assert_eq!(compacted_segment_1_entries.len(), 12);
+    assert_eq!(seg1.entry_iter().count(), 12);
 }
