@@ -37,10 +37,10 @@ impl Cleaner {
                     {
                         // compact
                         let segments_for_compact = chunk.segs_for_compact_cleaner();
-                        segments_for_compact.iter()
+                        segments_for_compact.into_iter()
                             .take(segments_compact_per_turn) // limit max segment to clean per turn
                             .for_each(|segment|
-                                compact::CompactCleaner::clean_segment(chunk, segment));
+                                compact::CompactCleaner::clean_segment(chunk, &segment));
                     }
 
                     {
