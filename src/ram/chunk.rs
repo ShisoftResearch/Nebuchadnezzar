@@ -77,6 +77,7 @@ impl Chunk {
                 Some(addr) => {
                     debug!("Chunk {} acquired address {} for size {} in segment {}",
                            self.id, addr, size, head.id);
+                    head.references.fetch_add(1, Ordering::Relaxed);
                     return Some(PendingEntry { addr, seg: head, size })
                 },
                 None => {
@@ -444,7 +445,8 @@ impl Chunk {
                 .filter(|(_, utilization)| *utilization < 90f32);
         let head_seg = self.head_seg.read();
         let mut list: Vec<_> = utilization_selection
-            .filter(|(seg, _)| seg.id != head_seg.id)
+            .filter(|(seg, _)|
+                seg.id != head_seg.id && seg.no_references())
             .collect();
         list.sort_by(|pair1, pair2|
             pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -460,7 +462,7 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)|
-                *utilization < 50f32 && head_seg.id != seg.id)
+                *utilization < 50f32 && head_seg.id != seg.id && seg.no_references())
             .collect();
         mapping.sort_by(|pair1, pair2|
             pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -538,6 +540,7 @@ impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
         self.seg.write_wal(self.addr, self.size);
+        self.seg.references.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

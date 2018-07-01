@@ -30,6 +30,7 @@ pub struct Segment {
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
     pub last_tombstones_scanned: AtomicI64,
+    pub references: AtomicUsize,
     pub backup_file_name: Option<String>,
     pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
@@ -61,6 +62,7 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
+            references: AtomicUsize::new(0),
             backup_file_name: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
             archived: AtomicBool::new(false),
             wal_file,
@@ -123,6 +125,7 @@ impl Segment {
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
         if let &Some(ref backup_file) = &self.backup_file_name {
+            while !self.no_references() { /* wait until all references released */}
             let backup_file_path = Path::new(backup_file);
             if backup_file_path.exists() {
                 warn!("Segment backup {} exists and can't archive twice", backup_file);
@@ -171,6 +174,8 @@ impl Segment {
         return Ok(());
     }
 
+    pub fn no_references(&self) -> bool { self.references.load(Ordering::Relaxed) == 0 }
+
     fn mem_drop(&self) {
         debug!("disposing segment at {}", self.addr);
         unsafe {
@@ -191,6 +196,14 @@ impl Segment {
                 error!("cannot find segment backup {}", backup_storage)
             }
         }
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        debug!("Memory dropping segment {}", self.id);
+        assert_eq!(self.references.load(Ordering::Relaxed), 0);
+        self.mem_drop()
     }
 }
 
@@ -220,12 +233,5 @@ impl Iterator for SegmentEntryIter {
             });
         self.cursor += entry_meta.entry_size;
         Some(entry_meta)
-    }
-}
-
-impl Drop for Segment {
-    fn drop(&mut self) {
-        debug!("Memory dropping segment {}", self.id);
-        self.mem_drop()
     }
 }
