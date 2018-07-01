@@ -29,15 +29,25 @@ pub struct Chunk {
     pub head_seg: RwLock<Arc<Segment>>,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
+    pub wal_storage: Option<String>,
     pub total_space: AtomicUsize,
     pub dead_entries: RingBuffer,
     pub capacity: usize
 }
 
 impl Chunk {
-    fn new (id: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Chunk {
+    fn new (
+        id: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>) -> Chunk {
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(Segment::new(first_seg_id, MAX_SEGMENT_SIZE, &backup_storage));
+        let bootstrap_segment_ref = Arc::new(Segment::new(
+            first_seg_id,
+            MAX_SEGMENT_SIZE,
+            &backup_storage,
+            &wal_storage));
         let segs = CHashMap::new();
         let index = CHashMap::new();
         let chunk = Chunk {
@@ -46,6 +56,7 @@ impl Chunk {
             index,
             meta,
             backup_storage,
+            wal_storage,
             capacity: size,
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
@@ -57,7 +68,7 @@ impl Chunk {
         return chunk;
     }
 
-    pub fn try_acquire(&self, size: u32) -> Option<(usize, Arc<Segment>)> {
+    pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
         let mut retried = 0;
         loop {
             let head = self.head_seg.read().clone();
@@ -66,7 +77,7 @@ impl Chunk {
                 Some(addr) => {
                     debug!("Chunk {} acquired address {} for size {} in segment {}",
                            self.id, addr, size, head.id);
-                    return Some((addr, head))
+                    return Some(PendingEntry { addr, seg: head, size })
                 },
                 None => {
                     if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE {
@@ -77,7 +88,11 @@ impl Chunk {
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.next_segment_id();
-                        let new_seg = Segment::new(new_seg_id, MAX_SEGMENT_SIZE, &self.backup_storage);
+                        let new_seg = Segment::new(
+                            new_seg_id,
+                            MAX_SEGMENT_SIZE,
+                            &self.backup_storage,
+                            &self.wal_storage);
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(MAX_SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
@@ -316,21 +331,22 @@ impl Chunk {
             .locate_segment(cell_location)
             .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?} at {}",
                             cell_header.id(), cell_location).as_str());
-        let (tombstone_addr, head_seg) = (||{
+        let pending_entry = (||{
             loop {
-                if let Some(pair) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
-                    return pair;
+                if let Some(pending_entry) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
+                    return pending_entry;
                 }
                 warn!("Chunk {} is too full to put a tombstone. Will retry.", self.id)
             }
         })();
         Tombstone::put(
-            tombstone_addr, cell_seg.id,
+            pending_entry.addr,
+            cell_seg.id,
             cell_header.version,
             cell_header.partition,
             cell_header.hash
         );
-        head_seg.tombstones.fetch_add(1, Ordering::Relaxed);
+        pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
     fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
@@ -512,22 +528,39 @@ impl Chunk {
     }
 }
 
+pub struct PendingEntry {
+    pub seg: Arc<Segment>,
+    pub addr: usize,
+    pub size: u32
+}
+
+impl Drop for PendingEntry {
+    // dealing with entry write ahead log
+    fn drop(&mut self) {
+        self.seg.write_wal(self.addr, self.size);
+    }
+}
+
 pub struct Chunks {
     pub list: Vec<Chunk>,
 }
 
 
 impl Chunks {
-    pub fn new (count: usize, size: usize, meta: Arc<ServerMeta>, backup_storage: Option<String>) -> Arc<Chunks> {
+    pub fn new (
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>) -> Arc<Chunks>
+    {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         debug!("Creating {} chunks, total {} bytes", count, size);
         for i in 0..count {
-            let backup_storage = match backup_storage {
-                Some(ref dir) => Some(format!("{}/chunk-{}", dir, i)),
-                None => None
-            };
-            chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage));
+            let backup_storage = backup_storage.clone().map(|dir| format!("{}/chunk-bk-{}", dir, i));
+            let wal_storage = wal_storage.clone().map(|dir| format!("{}/chunk-wal-{}", dir, i));
+            chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage, wal_storage));
         }
         Arc::new(Chunks {
             list: chunks
@@ -536,7 +569,7 @@ impl Chunks {
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(count, size, Arc::<ServerMeta>::new(ServerMeta {
             schemas: LocalSchemasCache::new("", None).unwrap()
-        }), None)
+        }), None, None)
     }
     fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {
         let chunk_id = partition as usize % self.list.len();

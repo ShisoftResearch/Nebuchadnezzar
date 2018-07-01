@@ -18,6 +18,7 @@ pub fn workspace_wr() {
         chunk_count: 1,
         memory_size: 16 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     "test");
@@ -104,6 +105,7 @@ pub fn data_site_wr() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     "test");
@@ -163,6 +165,7 @@ pub fn multi_transaction() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     "test");
@@ -220,6 +223,7 @@ pub fn smoke_rw() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     "test");

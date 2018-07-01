@@ -200,7 +200,8 @@ impl Cell {
                 error!("Cannot allocate new spaces in chunk");
                 return Err(WriteError::CannotAllocateSpace);
             },
-            Some((addr, _)) => {
+            Some(pending_entry) => {
+                let addr = pending_entry.addr;
                 Entry::encode_to(
                     addr,
                     EntryType::Cell,

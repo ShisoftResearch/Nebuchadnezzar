@@ -65,7 +65,7 @@ pub fn full_clean_cycle() {
         1, // single chunk
         MAX_SEGMENT_SIZE * 2, // chunk two segments
         Arc::new(ServerMeta { schemas }),
-        None);
+        None, None);
     let chunk = &chunks.list[0];
 
     // provision test data

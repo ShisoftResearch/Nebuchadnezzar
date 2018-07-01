@@ -1,18 +1,20 @@
 use libc;
 use ram::entry;
 use ram::tombstone::{TOMBSTONE_SIZE_U32, Tombstone};
+use ram::cell;
 use ram::cell::Cell;
 use ram::chunk::Chunk;
 use ram::entry::EntryMeta;
 use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, AtomicBool, Ordering};
 use std::collections::BTreeSet;
-use std::fs::{File, remove_file};
+use std::fs::{File, remove_file, copy};
 use std::io::BufWriter;
 use std::io::prelude::*;
 use std::io;
 use std::path::Path;
 use crc32c::crc32c;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
+use parking_lot;
 
 use super::cell::CellHeader;
 
@@ -28,13 +30,27 @@ pub struct Segment {
     pub tombstones: AtomicU32,
     pub dead_tombstones: AtomicU32,
     pub last_tombstones_scanned: AtomicI64,
-    pub backup_storage: Option<String>,
+    pub backup_file_name: Option<String>,
+    pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
+    pub wal_file_name: Option<String>,
     pub archived: AtomicBool
 }
 
 impl Segment {
-    pub fn new(id: u64, size: usize, backup_storage: &Option<String>) -> Segment {
+    pub fn new(id: u64, size: usize,
+               backup_storage: &Option<String>,
+               wal_storage: &Option<String>) -> Segment {
         let buffer_ptr = unsafe { libc::malloc(size) as usize };
+        let mut wal_file_name = None;
+        let mut wal_file = None;
+        if let Some(wal_storage) = wal_storage {
+            let file_name = format!("{}/{}.log", wal_storage, id);
+            let file = BufWriter::with_capacity(
+                4096, // most common disk block size
+                File::open(&file_name).unwrap()); // fast fail
+            wal_file_name = Some(file_name);
+            wal_file = Some(parking_lot::Mutex::new(file));
+        }
         debug!("Creating new segment with id {}, size {}, address {}", id, size, buffer_ptr);
         Segment {
             addr: buffer_ptr,
@@ -45,8 +61,10 @@ impl Segment {
             tombstones: AtomicU32::new(0),
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
-            backup_storage: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
-            archived: AtomicBool::new(false)
+            backup_file_name: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
+            archived: AtomicBool::new(false),
+            wal_file,
+            wal_file_name
         }
     }
 
@@ -104,26 +122,53 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
-        if let &Some(ref backup_storage) = &self.backup_storage {
-            let path = Path::new(backup_storage);
-            if path.exists() {
-                warn!("Segment backup {} exists and can't archive twice", backup_storage);
+        if let &Some(ref backup_file) = &self.backup_file_name {
+            let backup_file_path = Path::new(backup_file);
+            if backup_file_path.exists() {
+                warn!("Segment backup {} exists and can't archive twice", backup_file);
                 return Ok(false);
             }
-            let file = File::open(path)?;
-            let mut buffer = BufWriter::new(file);
-            let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
-            unsafe {
-                for offset in 0..seg_size {
-                    let ptr = (self.addr + offset) as *const u8;
-                    let byte = *ptr;
-                    buffer.write(&[byte]);
+            if let Some(ref wal_file) = self.wal_file_name {
+                // if there is a WAL file ready, copy this file to backup
+                if let Some(ref file_mutex) = self.wal_file {
+                    // this should be redundant but I don't want to take the chance
+                    // obtain the writer lock before continue
+                    let _ = file_mutex.lock();
+                    copy(wal_file, backup_file);
+                    remove_file(wal_file);
+                } else { panic!() }
+
+            } else {
+                let backup_file = File::open(backup_file_path)?;
+                let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
+                let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
+                unsafe {
+                    for offset in 0..seg_size {
+                        let ptr = (self.addr + offset) as *const u8;
+                        let byte = *ptr;
+                        buffer.write(&[byte])?;
+                    }
                 }
+                buffer.flush()?;
+                return Ok(true);
             }
-            buffer.flush()?;
-            return Ok(true);
         }
         return Ok(false);
+    }
+
+    pub fn write_wal(&self, addr: usize, size: u32) -> io::Result<()> {
+        if let Some(ref wal_file) = self.wal_file {
+            let mut file = wal_file.lock();
+            unsafe {
+                for offset in 0..size as usize {
+                    let ptr = (addr + offset) as *const u8;
+                    let byte = *ptr;
+                    file.write(&[byte])?;
+                }
+            }
+            file.flush()?;
+        }
+        return Ok(());
     }
 
     fn mem_drop(&self) {
@@ -136,7 +181,7 @@ impl Segment {
     // remove the backup if it have one
     pub fn dispense(&self) {
         debug!("dispense segment {}", self.id);
-        if let &Some(ref backup_storage) = &self.backup_storage {
+        if let &Some(ref backup_storage) = &self.backup_file_name {
             let path = Path::new(backup_storage);
             if path.exists() {
                 if let Err(e) = remove_file(path) {

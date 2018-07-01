@@ -65,6 +65,7 @@ pub fn init () {
         chunk_count: 1,
         memory_size: 16 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &String::from("127.0.0.1:5100"),
     &String::from("test"));

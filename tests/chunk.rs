@@ -46,7 +46,7 @@ pub fn cell_rw () {
     };
     let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
         schemas
-    }), None);
+    }), None, None);
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_1_ptr = chunks.address_of(&Id::from_header(&header));
     {

@@ -36,6 +36,7 @@ pub struct ServerOptions {
     pub chunk_count: usize,
     pub memory_size: usize,
     pub backup_storage: Option<String>,
+    pub wal_storage: Option<String>,
 
 }
 
@@ -100,6 +101,7 @@ impl NebServer {
             opts.memory_size,
             meta_rc.clone(),
             opts.backup_storage.clone(),
+            opts.wal_storage.clone()
         );
         let cleaner = Cleaner::new_and_start(chunks.clone());
         let conshasing = init_conshash(

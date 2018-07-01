@@ -126,7 +126,7 @@ impl CombinedCleaner {
             .iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();
-                let new_seg = Segment::new(new_seg_id, dummy_seg.head, &chunk.backup_storage);
+                let new_seg = Segment::new(new_seg_id, dummy_seg.head, &chunk.backup_storage, &chunk.wal_storage);
                 let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                 let mut seg_cursor = new_seg.addr;
                 debug!("Combining segment to new one with id {}", new_seg_id);

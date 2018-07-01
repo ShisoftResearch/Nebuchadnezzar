@@ -44,7 +44,7 @@ impl CompactCleaner {
         let live_size: usize = entries.iter().map(|e| e.meta.entry_size).sum();
         debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
                seg.id, chunk.id, entries.len(), live_size);
-        let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage));
+        let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage, &chunk.wal_storage));
         let mut cursor = new_seg.addr;
         let copied_entries =
             entries

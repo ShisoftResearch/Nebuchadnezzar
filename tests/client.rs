@@ -23,6 +23,7 @@ pub fn general() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     &server_group);
@@ -105,7 +106,8 @@ pub fn multi_cell_update() {
     let server = server::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
-        backup_storage: None
+        backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     server_group);
@@ -180,6 +182,7 @@ pub fn write_skew() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     &server_addr,
     server_group);
@@ -261,6 +264,7 @@ pub fn server_isolation() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     server_address_1,
     server_1_group);
@@ -272,6 +276,7 @@ pub fn server_isolation() {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
+        wal_storage: None
     },
     server_address_2,
     server_2_group);
