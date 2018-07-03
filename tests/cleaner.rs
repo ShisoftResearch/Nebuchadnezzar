@@ -29,7 +29,7 @@ fn default_cell(id: &Id) -> Cell {
             .take(DATA_SIZE)
             .collect();
     Cell {
-        header: CellHeader::new(0, 0, id, 0),
+        header: CellHeader::new(0, 0, id),
         data: data_map_value!(id: id.lower as i32, data: data)
     }
 }

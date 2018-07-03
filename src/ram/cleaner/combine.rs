@@ -4,14 +4,18 @@ use std::sync::atomic::Ordering;
 use std::collections::HashSet;
 use ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use ram::entry::{EntryContent, Entry, EntryType};
+use itertools::Itertools;
+
 use libc;
 
 pub struct CombinedCleaner;
 
+#[derive(Clone)]
 struct DummyEntry {
     size: usize,
     addr: usize,
-    cell: Option<u64>
+    cell_hash: Option<u64>,
+    timestamp: u32,
 }
 
 struct DummySegment {
@@ -31,6 +35,9 @@ impl DummySegment {
 // This cleaner will perform a greedy approach to relocate entries from old segments to fewer
 // new segments to reduce number or segments and reclaim spaces from tombstones
 
+// for higher hit rate for fetching cells in segments, we need to put data with close timestamp together
+// this optimization is intended for enabling neb to contain data more than it's memory
+
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) {
         if segments.len() < 2 { return }
@@ -39,7 +46,7 @@ impl CombinedCleaner {
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
         debug!("get all entries in segments to combine");
-        let mut entries: Vec<_> = segments
+        let entries: Vec<_> = segments
             .iter()
             .flat_map(|seg| {
                 chunk.live_entries(seg)
@@ -52,14 +59,38 @@ impl CombinedCleaner {
                 }
                 return true;
             })
+            .map(|entry| {
+                let entry_size = entry.meta.entry_size;
+                let entry_addr = entry.meta.entry_pos;
+                let cell_header = match entry.content {
+                    EntryContent::Cell(header) => Some(header),
+                    _ => None
+                };
+                DummyEntry {
+                    size: entry_size,
+                    addr: entry_addr,
+                    timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
+                    cell_hash: cell_header.map(|h| h.hash),
+                }
+            })
+            .group_by(|entry| {
+                entry.timestamp
+            })
+            .into_iter()
+            .map(|(t, group)| {
+                let mut group: Vec<_> = group.collect();
+                group.sort_by(|entry1,entry2| {
+                    let size1 = entry1.size;
+                    let size2 = entry2.size;
+                    size1.cmp(&size2).reverse()
+                });
+                return (t, group.into_iter());
+            })
+            .sorted_by_key(|&(t, _)| t)
+            .into_iter()
+            .map(|(_, group)| group)
+            .flatten()
             .collect();
-
-        debug!("sort entries from larger one to smaller");
-        entries.sort_by(|entry1,entry2| {
-            let size1 = entry1.meta.entry_size;
-            let size2 = entry2.meta.entry_size;
-            size1.cmp(&size2).reverse()
-        });
 
         // provide additional state for whether entry have been claimed on simulation
         let mut entries: Vec<_> = entries.into_iter().map(|e| (e, false)).collect();
@@ -80,9 +111,9 @@ impl CombinedCleaner {
                 cursor += 1;
                 continue;
             }
-            let entry: &Entry = &entry_pair.0;
-            let entry_size = entry.meta.entry_size;
-            let entry_addr = entry.meta.entry_pos;
+
+            let entry = &entry_pair.0;
+            let entry_size = entry.size;
             if entry_size > segment_space_remains {
                 if index == entries_num - 1 {
                     // iterated to the last one, which means no more entries can be placed
@@ -93,14 +124,7 @@ impl CombinedCleaner {
                 continue;
             }
             let mut last_segment = pending_segments.last_mut().unwrap();
-            last_segment.entries.push(DummyEntry {
-                size: entry_size,
-                addr: entry_addr,
-                cell: match entry.content {
-                    EntryContent::Cell(header) => Some(header.hash),
-                    _ => None
-                }
-            });
+            last_segment.entries.push(entry.clone());
 
             // pump dummy segment head pointer
             last_segment.head += entry_size;
@@ -138,7 +162,7 @@ impl CombinedCleaner {
                             entry_addr as *mut libc::c_void,
                             entry.size);
                     }
-                    if let Some(cell_hash) = entry.cell {
+                    if let Some(cell_hash) = entry.cell_hash {
                         debug!("Marked cell relocation hash {}, addr {} to segment {}", cell_hash, entry_addr, new_seg_id);
                         cell_mapping.push((seg_cursor, entry_addr, cell_hash));
                     }

@@ -41,7 +41,7 @@ pub fn cell_rw () {
     let schemas = LocalSchemasCache::new("", None).unwrap();
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
-        header: CellHeader::new(0, schema.id, &id1, 0),
+        header: CellHeader::new(0, schema.id, &id1),
         data
     };
     let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
@@ -61,7 +61,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: CellHeader::new(0, schema.id, &id2, 0),
+        header: CellHeader::new(0, schema.id, &id2),
         data
     };
     let header = chunks.write_cell(&mut cell).unwrap();
@@ -85,7 +85,7 @@ pub fn cell_rw () {
     data_map.insert(&String::from("name"), Value::String(String::from("John")));
     data = Value::Map(data_map);
     cell = Cell {
-        header: CellHeader::new(0, schema.id, &id2, 0),
+        header: CellHeader::new(0, schema.id, &id2),
         data
     };
     let header = chunks.update_cell(&mut cell).unwrap();

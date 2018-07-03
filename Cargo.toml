@@ -30,6 +30,7 @@ rand = "0.3"
 linked-hash-map = "0.4"
 bitflags = "1.0"
 crc32c = "*"
+itertools = "*"
 
 futures-cpupool = "0.1"
 futures-await = "0.1"

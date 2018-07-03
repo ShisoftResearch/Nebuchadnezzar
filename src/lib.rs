@@ -38,6 +38,8 @@ extern crate chashmap;
 extern crate num_cpus;
 extern crate byteorder;
 extern crate crc32c;
+#[macro_use]
+extern crate itertools;
 
 pub mod utils;
 #[macro_use]

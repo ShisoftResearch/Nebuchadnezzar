@@ -11,3 +11,4 @@ pub mod entry;
 pub mod tombstone;
 
 mod segs;
+mod clock;

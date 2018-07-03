@@ -4,6 +4,7 @@ use ram::chunk::Chunk;
 use ram::entry::*;
 use ram::io::{reader, writer};
 use ram::types::{Map, Value, Id, RandValue};
+use ram::clock;
 use std::sync::Arc;
 use std::ops::{Index, IndexMut};
 use std::ptr;
@@ -18,7 +19,7 @@ pub type DataMap = Map;
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct CellHeader {
     pub version: u64,
-    pub checksum: u32,
+    pub timestamp: u32,
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
@@ -50,12 +51,13 @@ pub enum ReadError {
 }
 
 impl CellHeader {
-    pub fn new(size: u32, schema: u32, id: &Id, checksum: u32) -> CellHeader {
+    pub fn new(size: u32, schema: u32, id: &Id) -> CellHeader {
+        let now = clock::now();
         CellHeader {
             version: 1,
             size,
             schema,
-            checksum,
+            timestamp: now,
             partition: id.higher,
             hash: id.lower,
         }
@@ -88,7 +90,7 @@ impl Cell {
 
     pub fn new_with_id(schema_id: u32, id: &Id, value: Value) -> Cell {
         Cell {
-            header: CellHeader::new(0, schema_id, id, 0),
+            header: CellHeader::new(0, schema_id, id),
             data: value
         }
     }
@@ -123,7 +125,7 @@ impl Cell {
         let mut cursor = addr_to_header_cursor(addr);
         let header = CellHeader {
             version: cursor.read_u64::<Endian>().unwrap(),
-            checksum: cursor.read_u32::<Endian>().unwrap(),
+            timestamp: cursor.read_u32::<Endian>().unwrap(),
             schema: cursor.read_u32::<Endian>().unwrap(),
             partition: cursor.read_u64::<Endian>().unwrap(),
             hash: cursor.read_u64::<Endian>().unwrap(),
@@ -212,7 +214,7 @@ impl Cell {
                         let header = &self.header;
                         let mut cursor = addr_to_header_cursor(content_addr);
                         cursor.write_u64::<Endian>(header.version);
-                        cursor.write_u32::<Endian>(header.checksum);
+                        cursor.write_u32::<Endian>(header.timestamp);
                         cursor.write_u32::<Endian>(header.schema);
                         cursor.write_u64::<Endian>(header.partition);
                         cursor.write_u64::<Endian>(header.hash);
