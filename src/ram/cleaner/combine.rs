@@ -45,8 +45,8 @@ impl CombinedCleaner {
 
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
-        debug!("get all entries in segments to combine");
-        let entries: Vec<_> = segments
+        debug!("get all entries in segments to combine and order them by data tempreture and size");
+        let mut entries: Vec<_> = segments
             .iter()
             .flat_map(|seg| {
                 chunk.live_entries(seg)
@@ -91,6 +91,9 @@ impl CombinedCleaner {
             .map(|(_, group)| group)
             .flatten()
             .collect();
+
+        // order by temperature and size from greater to lesser
+        entries.reverse();
 
         // provide additional state for whether entry have been claimed on simulation
         let mut entries: Vec<_> = entries.into_iter().map(|e| (e, false)).collect();
