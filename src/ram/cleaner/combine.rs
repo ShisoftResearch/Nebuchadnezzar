@@ -79,11 +79,7 @@ impl CombinedCleaner {
             .into_iter()
             .map(|(t, group)| {
                 let mut group: Vec<_> = group.collect();
-                group.sort_by(|entry1,entry2| {
-                    let size1 = entry1.size;
-                    let size2 = entry2.size;
-                    size1.cmp(&size2).reverse()
-                });
+                group.sort_by_key(|entry| entry.size);
                 return (t, group.into_iter());
             })
             .sorted_by_key(|&(t, _)| t)
