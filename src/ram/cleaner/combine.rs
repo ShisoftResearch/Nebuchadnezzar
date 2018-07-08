@@ -45,7 +45,7 @@ impl CombinedCleaner {
 
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
-        debug!("get all entries in segments to combine and order them by data tempreture and size");
+        debug!("get all entries in segments to combine and order them by data temperature and size");
         let mut entries: Vec<_> = segments
             .iter()
             .flat_map(|seg| {
@@ -74,7 +74,7 @@ impl CombinedCleaner {
                 }
             })
             .group_by(|entry| {
-                entry.timestamp
+                entry.timestamp / 10
             })
             .into_iter()
             .map(|(t, group)| {

@@ -31,6 +31,7 @@ linked-hash-map = "0.4"
 bitflags = "1.0"
 crc32c = "*"
 itertools = "*"
+smallvec = "*"
 
 futures-cpupool = "0.1"
 futures-await = "0.1"

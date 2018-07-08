@@ -40,9 +40,12 @@ extern crate byteorder;
 extern crate crc32c;
 #[macro_use]
 extern crate itertools;
+#[macro_use]
+extern crate smallvec;
 
 pub mod utils;
 #[macro_use]
 pub mod ram;
 pub mod server;
 pub mod client;
+pub mod index;
