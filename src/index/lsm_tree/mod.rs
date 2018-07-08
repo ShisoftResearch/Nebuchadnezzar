@@ -30,9 +30,10 @@ trait BTree {
                     return None
                 }
                 else {
-                    match &node.delimiters()[pos] {
-                        Delimiter::External(id) => unimplemented!(), // TODO: read page from remote
-                        Delimiter::Internal(node) => return self.search(node.borrow(), key, ht - 1)
+                    match &node.delimiters().get(pos) {
+                        Some(Delimiter::External(id)) => unimplemented!(), // TODO: read page from remote
+                        Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
+                        None => return None
                     }
                 }
             }
