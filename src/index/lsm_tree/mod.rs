@@ -8,10 +8,10 @@ type EntryKey = SmallVec<[u8; 16]>;
 
 pub struct LSMTree {
     num_levels: u8,
-    levels: Vec<Rc<BTree>>
+    levels: Vec<Rc<BPlusTree>>
 }
 
-trait BTree {
+trait BPlusTree {
     fn root(&self) -> &Node;
     fn root_mut(&self) -> &mut Node;
     fn get_height(&self) -> u32;
@@ -22,34 +22,30 @@ trait BTree {
         self.search(self.root(), key, self.get_height())
     }
     fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<&'a Id> {
-        let children = &node.entries();
-        match node.entries().binary_search_by(|e| e.key.cmp(key)) {
-            Ok(pos) => return Some(&node.entries()[pos].val),
-            Err(pos) => {
-                if ht == 0 {
-                    return None
-                }
-                else {
-                    match &node.delimiters().get(pos) {
-                        Some(Delimiter::External(id)) => unimplemented!(), // TODO: read page from remote
-                        Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
-                        None => return None
-                    }
-                }
-            }
+        let keys = node.keys();
+        let index = keys
+            .binary_search(key)
+            .map(|i| i + 1)
+            .unwrap_or_else(|i| i);
+        match &node.delimiters().get(index) {
+            Some(Delimiter::External(id)) => {
+                // read from leaf
+                unimplemented!()
+            },
+            Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
+            None => return None
         }
     }
 }
 
+enum Delimiter {
+    External(Id), // to leaf
+    Internal(Box<Node>) // to higher level node
+}
 
 struct Entry {
     key: EntryKey,
-    val: Id
-}
-
-enum Delimiter {
-    External(Id),
-    Internal(Box<Node>)
+    id: Id
 }
 
 trait Array<T> {
@@ -59,16 +55,20 @@ trait Array<T> {
     fn size(&self) -> usize;
 }
 
-trait Entries : Array<Entry> {}
+trait Keys : Array<EntryKey> {}
 
 trait Delimiters : Array<Delimiter> {}
 
 trait Node {
-    fn id(&self) -> &Id;
-    fn entries(&self) -> &[Entry];
+    fn keys(&self) -> &[EntryKey];
     fn delimiters(&self) -> &[Delimiter];
-    fn entries_mut(&mut self) -> &mut [Entry];
+    fn keys_mut(&mut self) -> &mut [EntryKey];
     fn delimiters_mut(&mut self) -> &mut [Delimiter];
+}
+
+trait Leaf {
+    fn entries(&self) -> &[Entry];
+    fn entries_mut(&self) -> &mut [Entry];
 }
 
 macro_rules! impl_nodes {
@@ -77,13 +77,13 @@ macro_rules! impl_nodes {
             mod $level {
                 use super::*;
 
-                type LEntries = [Entry; $entry_size];
+                type LEntryKeys = [EntryKey; $entry_size];
 
-                impl Array<Entry> for LEntries {
+                impl Array<EntryKey> for LEntryKeys {
                     #[inline]
                     fn size(&self) -> usize { $entry_size }
                     #[inline]
-                    fn index_of(&self, index: usize) -> &Entry { &self[index] }
+                    fn index_of(&self, index: usize) -> &EntryKey { &self[index] }
                 }
 
                 type LDelimiter = [Delimiter; $delimiter_size];
@@ -99,26 +99,22 @@ macro_rules! impl_nodes {
 
                 struct LNode {
                     id: Id,
-                    entries: LEntries,
+                    keys: LEntryKeys,
                     delimeters: LDelimiter,
                 }
 
                 impl Node for LNode {
                     #[inline]
-                    fn id(&self) -> &Id {
-                        &self.id
-                    }
-                    #[inline]
-                    fn entries(&self) -> &[Entry] {
-                        &self.entries
+                    fn keys(&self) -> &[EntryKey] {
+                        &self.keys
                     }
                     #[inline]
                     fn delimiters(&self) -> &[Delimiter] {
                         &self.delimeters
                     }
                     #[inline]
-                    fn entries_mut(&mut self) -> &mut [Entry] {
-                        &mut self.entries
+                    fn keys_mut(&mut self) -> &mut [EntryKey] {
+                        &mut self.keys
                     }
                     #[inline]
                     fn delimiters_mut(&mut self) -> &mut [Delimiter] {
