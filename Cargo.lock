@@ -148,7 +148,7 @@ dependencies = [
 [[package]]
 name = "dovahkiin"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#56dc9348c58e8da1ef2a7390ea8fae1b94eee75d"
+source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#0b9427d713b495a917ea713a8407934f996c29ab"
 dependencies = [
  "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",

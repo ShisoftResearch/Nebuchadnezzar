@@ -46,14 +46,15 @@ pub fn plan_write_field (
                 plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
         } else if let &Value::PrimArray(ref array) = value {
-            let size = types::u32_io::size(0) + array.size();
             let len = array.len();
+            let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
             ins.push(Instruction {
                 type_id: types::ARRAY_LEN_TYPE_ID,
                 val: Value::U32(len as u32),
                 offset: *offset
             });
+            *offset += types::u32_io::size(0);
             ins.push(Instruction {
                 type_id: field.type_id,
                 val: value.clone(),

@@ -25,7 +25,7 @@ const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 fn default_cell(id: &Id) -> Cell {
     let data: Vec<_> =
-        std::iter::repeat(Value::U8(id.lower as u8))
+        std::iter::repeat(id.lower as u8)
             .take(DATA_SIZE)
             .collect();
     Cell {
@@ -207,4 +207,12 @@ pub fn full_clean_cycle() {
         assert_eq!(chunk.segments()[0].entry_iter().count(), 8);
     }
 
+    // validate cells
+    (0..8)
+        .map(|n| n * 2 + 1)
+        .for_each(|id| {
+            let id = Id::new(0, id);
+            let cell = chunks.read_cell(&id).unwrap();
+            assert_eq!(cell.data, default_cell(&id).data);
+        });
 }
