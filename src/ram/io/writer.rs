@@ -41,10 +41,25 @@ pub fn plan_write_field (
                 val: Value::U32(len as u32),
                 offset: *offset
             });
-            *offset += types::u16_io::size(0);
+            *offset += types::u32_io::size(0);
             for val in array {
                 plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
+        } else if let &Value::PrimArray(ref array) = value {
+            let size = types::u32_io::size(0) + array.size();
+            let len = array.len();
+            // for prim array, just clone it and push into the instruction list with length
+            ins.push(Instruction {
+                type_id: types::ARRAY_LEN_TYPE_ID,
+                val: Value::U32(len as u32),
+                offset: *offset
+            });
+            ins.push(Instruction {
+                type_id: field.type_id,
+                val: value.clone(),
+                offset: *offset
+            });
+            *offset += size;
         } else {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }

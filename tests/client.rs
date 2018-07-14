@@ -77,8 +77,8 @@ pub fn general() {
                     &vec![String::from("score")]
                 ))?.unwrap();
                 let mut cell = txn.read(cell_1_id.to_owned())?.unwrap();
-                let mut score = cell.data["score"].U64().unwrap();
-                assert_eq!(selected.first().unwrap().U64().unwrap(), score);
+                let mut score = *cell.data["score"].U64().unwrap();
+                assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
@@ -87,7 +87,7 @@ pub fn general() {
                 let selected = txn.read_selected(cell_1_id.to_owned(), types::key_hashes(
                     &vec![String::from("score")]
                 ))?.unwrap();
-                assert_eq!(selected.first().unwrap().U64().unwrap(), score);
+                assert_eq!(selected[0].U64().unwrap(), &score);
                 Ok(())
             }).wait().unwrap();
         }));
@@ -96,7 +96,7 @@ pub fn general() {
         handle.join();
     }
     let mut cell_1_r = client.read_cell(cell_1.id()).wait().unwrap().unwrap();
-    assert_eq!(cell_1_r.data["score"].U64().unwrap(), thread_count as u64);
+    assert_eq!(cell_1_r.data["score"].U64().unwrap(), &(thread_count as u64));
 }
 
 #[test]
@@ -148,8 +148,8 @@ pub fn multi_cell_update() {
                 let mut score_2 = 0;
                 let mut cell_1 = txn.read(cell_1_id.to_owned())?.unwrap();
                 let mut cell_2 = txn.read(cell_2_id.to_owned())?.unwrap();
-                score_1 = cell_1.data["score"].U64().unwrap();
-                score_2 = cell_2.data["score"].U64().unwrap();
+                score_1 = *cell_1.data["score"].U64().unwrap();
+                score_2 = *cell_2.data["score"].U64().unwrap();
                 score_1 += 1;
                 score_2 += 1;
                 let mut data_1 = cell_1.data.Map().unwrap().clone();
@@ -218,7 +218,7 @@ pub fn write_skew() {
         client_c1.transaction(move |ref mut txn| {
             *skew_tried_c.lock() += 1;
             let mut cell_1 = txn.read(cell_1_id.to_owned())?.unwrap();
-            let mut score_1 = cell_1.data["score"].U64().unwrap();
+            let mut score_1 = *cell_1.data["score"].U64().unwrap();
             thread::sleep(Duration::new(2, 0)); // wait 2 secs to let late write occur
             score_1 += 1;
             let mut data_1 = cell_1.data.Map().unwrap().clone();
@@ -234,7 +234,7 @@ pub fn write_skew() {
             thread::sleep(Duration::new(1, 0));
             *normal_tried_c.lock() += 1;
             let mut cell_1 = txn.read(cell_1_id.to_owned())?.unwrap();
-            let mut score_1 = cell_1.data["score"].U64().unwrap();
+            let mut score_1 = *cell_1.data["score"].U64().unwrap();
             score_1 += 1;
             let mut data_1 = cell_1.data.Map().unwrap().clone();
             data_1.insert(&String::from("score"), Value::U64(score_1));
@@ -246,7 +246,7 @@ pub fn write_skew() {
     t2.join();
     t1.join();
     let mut cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
-    let cell_1_score = cell_1_r.data["score"].U64().unwrap();
+    let cell_1_score = *cell_1_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score, 2);
 //    assert_eq!(*skew_tried.lock(), 2);
 //    assert_eq!(*normal_tried.lock(), 1);

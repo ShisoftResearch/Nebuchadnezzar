@@ -3,6 +3,18 @@ use std::cell::RefCell;
 use std::borrow::Borrow;
 use dovahkiin::types::custom_types::id::Id;
 use smallvec::SmallVec;
+use std::sync::Arc;
+use ram::chunk::Chunks;
+use ram::cell::Cell;
+use dovahkiin::types::custom_types::map::key_hash;
+use dovahkiin::types::Value;
+use dovahkiin::types::value::ValueIter;
+
+lazy_static! {
+    pub static ref EntriesKeyHash : u64 = key_hash("entries");
+    pub static ref IdKeyHash : u64 = key_hash("id");
+    pub static ref ValKeyHash : u64 = key_hash("value");
+}
 
 type EntryKey = SmallVec<[u8; 16]>;
 
@@ -18,6 +30,12 @@ trait BPlusTree {
     fn set_height(&mut self) -> u32;
     fn get_num_nodes(&self) -> u32;
     fn set_num_nodes(&self) -> u32;
+    fn chunks(&self) -> &Arc<Chunks>;
+    fn get_page(&self, id: &Id) -> &[Entry] {
+        let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
+
+        unimplemented!()
+    }
     fn get(&self, key: &EntryKey) -> Option<&Id> {
         self.search(self.root(), key, self.get_height())
     }
@@ -29,7 +47,7 @@ trait BPlusTree {
             .unwrap_or_else(|i| i);
         match &node.delimiters().get(index) {
             Some(Delimiter::External(id)) => {
-                // read from leaf
+                // search in leaf
                 unimplemented!()
             },
             Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),

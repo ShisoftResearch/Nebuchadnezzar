@@ -32,16 +32,16 @@ pub fn cell_rw () {
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
-        data: data
+        data
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert_eq!(stored_cell.header.size, 24);
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
     }
     data = data_map_value!{
         id: 2 as i64,
@@ -58,15 +58,15 @@ pub fn cell_rw () {
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), &80);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
     }
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
     }
 }
 
@@ -102,10 +102,10 @@ pub fn dynamic() {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), 100);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), 70);
-        assert_eq!(stored_cell.data["year"].U16().unwrap(), 2010);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
+        assert_eq!(stored_cell.data["year"].U16().unwrap(), &2010);
         assert_eq!(stored_cell.data["major"].String().unwrap(), "CS");
     }
 
@@ -123,8 +123,8 @@ pub fn dynamic() {
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), 2);
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), 80);
+        assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);
+        assert_eq!(stored_cell.data["score"].U64().unwrap(), &80);
         assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
         assert!(stored_cell.data["major"].String().is_none());
     }

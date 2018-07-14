@@ -23,7 +23,7 @@ macro_rules! test_nums {
                 for d in test_data {
                     for i in 0..counts {
                         let addr = chunk_addr + i * types::$io::size(0);
-                        types::$io::write(d, addr);
+                        types::$io::write(&d, addr);
                         assert!(types::$io::read(addr) == d);
                     }
                     for i in 0..counts {
@@ -243,17 +243,17 @@ fn _in_map() {
     map.insert(&String::from("A"), types::Value::I32(1));
     map.insert(&String::from("B"), types::Value::Map(map2));
 
-    assert_eq!(map.get(&String::from("A")).I32().unwrap(), 1);
-    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), 1);
+    assert_eq!(map.get(&String::from("A")).I32().unwrap(), &1);
+    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), &1);
 
     map.set_in(&["B", "a"], types::Value::I32(20)).unwrap();
-    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), 20);
+    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), &20);
 
     map.update_in(&["B", "b"], |value: &mut types::Value| {
-        assert_eq!(value.I64().unwrap(), 2);
+        assert_eq!(value.I64().unwrap(), &2);
         *value = types::Value::I64(30);
     });
-    assert_eq!(map.get_in(&["B", "b"]).I64().unwrap(), 30);
+    assert_eq!(map.get_in(&["B", "b"]).I64().unwrap(), &30);
 }
 
 #[test]
@@ -262,9 +262,9 @@ fn index_mut_map() {
     value["a"] = types::Value::String(String::from("A"));
     value["b"] = types::Value::Array(vec![types::Value::U64(5)]);
     assert_eq!(value["a"].String().unwrap(), &String::from("A"));
-    assert_eq!(value["b"][0 as usize].U64().unwrap(), 5);
+    assert_eq!(value["b"][0 as usize].U64().unwrap(), &5);
     value["b"][0 as usize] = types::Value::U64(10);
-    assert_eq!(value["b"][0 as usize].U64().unwrap(), 10);
+    assert_eq!(value["b"][0 as usize].U64().unwrap(), &10);
 }
 
 #[test]

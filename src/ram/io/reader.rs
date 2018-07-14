@@ -1,7 +1,7 @@
 use ram::schema::{Schema, Field};
 use ram::cell::*;
 use ram::types;
-use ram::types::{u16_io, u8_io, Value, Map, type_id_of, Type};
+use ram::types::{u32_io, u8_io, Value, Map, type_id_of, Type};
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, usize) {
     let mut ptr = ptr;
@@ -13,17 +13,28 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, us
         }
     }
     if field.is_array {
-        let len = u16_io::read(ptr);
+        let len = u32_io::read(ptr);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
-        ptr += u16_io::size(ptr);
-        let mut vals = Vec::<Value>::new();
-        for _ in 0..len {
-            let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field, None);
-            ptr = nxt_ptr;
-            vals.push(nxt_val);
+        ptr += u32_io::size(ptr);
+        if field.sub_fields.is_none() {
+            // maybe primitive array
+            let mut ptr = ptr;
+            let val = types::get_prim_array_val(field.type_id, len as usize, &mut ptr);
+            if let Some(prim_arr) = val {
+                return (Value::PrimArray(prim_arr), ptr);
+            } else {
+                panic!("type cannot been convert to prim array: {}", field.type_id)
+            }
+        } else {
+            let mut vals = Vec::<Value>::new();
+            for _ in 0..len {
+                let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field, None);
+                ptr = nxt_ptr;
+                vals.push(nxt_val);
+            }
+            (Value::Array(vals), ptr)
         }
-        (Value::Array(vals), ptr)
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = DataMap::new();
         let mut selected_pos = 0;

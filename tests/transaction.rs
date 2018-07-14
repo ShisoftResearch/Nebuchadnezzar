@@ -47,9 +47,9 @@ pub fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["id"].I64().unwrap(), 100);
+            assert_eq!(cell.data["id"].I64().unwrap(), &100);
             assert_eq!(cell.data["name"].String().unwrap(), "Jack");
-            assert_eq!(cell.data["score"].U64().unwrap(), 70);
+            assert_eq!(cell.data["score"].U64().unwrap(), &70);
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
@@ -65,7 +65,7 @@ pub fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["score"].U64().unwrap(), 70);
+            assert_eq!(cell.data["score"].U64().unwrap(), &70);
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
@@ -78,7 +78,7 @@ pub fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["score"].U64().unwrap(), 90);
+            assert_eq!(cell.data["score"].U64().unwrap(), &90);
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
@@ -135,9 +135,9 @@ pub fn data_site_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["id"].I64().unwrap(), 100);
+            assert_eq!(cell.data["id"].I64().unwrap(), &100);
             assert_eq!(cell.data["name"].String().unwrap(), "Jack");
-            assert_eq!(cell.data["score"].U64().unwrap(), 70);
+            assert_eq!(cell.data["score"].U64().unwrap(), &70);
         },
         _ => {panic!("read cell 1 not accepted {:?}", cell_1_r_res)}
     }
@@ -153,9 +153,9 @@ pub fn data_site_wr() {
     assert_eq!(txn.commit(txn_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
     let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
     assert_eq!(cell_r2.id(), cell_1.id());
-    assert_eq!(cell_r2.data["id"].I64().unwrap(), 100);
+    assert_eq!(cell_r2.data["id"].I64().unwrap(), &100);
     assert_eq!(cell_r2.data["name"].String().unwrap(), "Jack");
-    assert_eq!(cell_r2.data["score"].U64().unwrap(), 90);
+    assert_eq!(cell_r2.data["score"].U64().unwrap(), &90);
 }
 
 #[test]
@@ -252,7 +252,7 @@ pub fn smoke_rw() {
             let txn_id = txn.begin().wait().unwrap().unwrap();
             let read_result = txn.read(txn_id.to_owned(), cell_id.to_owned()).wait().unwrap();
             if let Ok(TxnExecResult::Accepted(mut cell)) = read_result {
-                let mut score = cell.data["score"].U64().unwrap();
+                let mut score = *cell.data["score"].U64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
