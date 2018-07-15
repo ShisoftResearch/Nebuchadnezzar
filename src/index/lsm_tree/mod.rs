@@ -7,13 +7,13 @@ use std::sync::Arc;
 use ram::chunk::Chunks;
 use ram::cell::Cell;
 use dovahkiin::types::custom_types::map::key_hash;
-use dovahkiin::types::Value;
-use dovahkiin::types::value::ValueIter;
+use dovahkiin::types::value::{ValueIter};
+use dovahkiin::types::{Value, PrimitiveArray};
 
 lazy_static! {
-    pub static ref EntriesKeyHash : u64 = key_hash("entries");
-    pub static ref IdKeyHash : u64 = key_hash("id");
-    pub static ref ValKeyHash : u64 = key_hash("value");
+    pub static ref ENTRIES_KEY_HASH : u64 = key_hash("entries");
+    pub static ref KEY_KEY_HASH : u64 = key_hash("id");
+    pub static ref VALUE_KEY_HASH : u64 = key_hash("value");
 }
 
 type EntryKey = SmallVec<[u8; 16]>;
@@ -31,10 +31,18 @@ trait BPlusTree {
     fn get_num_nodes(&self) -> u32;
     fn set_num_nodes(&self) -> u32;
     fn chunks(&self) -> &Arc<Chunks>;
-    fn get_page(&self, id: &Id) -> &[Entry] {
+    fn get_page(&self, id: &Id) -> Vec<Entry> {
         let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
-
-        unimplemented!()
+        let entries = &cell.data[*ENTRIES_KEY_HASH];
+        let mut entry_result = Vec::with_capacity(entries.len().unwrap());
+        for entry in entries.iter_value().unwrap() {
+            let value = entry[*KEY_KEY_HASH].Id().unwrap();
+            let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = entry[*VALUE_KEY_HASH] {
+                array.clone()
+            } else { panic!("invalid entry") };
+            entry_result.push(Entry { key: EntryKey::from(key), id: *value });
+        }
+        return entry_result;
     }
     fn get(&self, key: &EntryKey) -> Option<&Id> {
         self.search(self.root(), key, self.get_height())
