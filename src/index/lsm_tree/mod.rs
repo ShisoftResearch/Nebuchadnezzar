@@ -9,6 +9,8 @@ use ram::cell::Cell;
 use dovahkiin::types::custom_types::map::key_hash;
 use dovahkiin::types::value::{ValueIter};
 use dovahkiin::types::{Value, PrimitiveArray};
+use utils::lru_cache::LRUCache;
+use parking_lot::{Mutex, MutexGuard};
 
 lazy_static! {
     pub static ref ENTRIES_KEY_HASH : u64 = key_hash("entries");
@@ -17,10 +19,11 @@ lazy_static! {
 }
 
 type EntryKey = SmallVec<[u8; 16]>;
+type EntryPage = Arc<Vec<Entry>>;
 
 pub struct LSMTree {
     num_levels: u8,
-    levels: Vec<Rc<BPlusTree>>
+    levels: Vec<Rc<BPlusTree>>,
 }
 
 trait BPlusTree {
@@ -31,7 +34,8 @@ trait BPlusTree {
     fn get_num_nodes(&self) -> u32;
     fn set_num_nodes(&self) -> u32;
     fn chunks(&self) -> &Arc<Chunks>;
-    fn get_page(&self, id: &Id) -> Vec<Entry> {
+    fn page_cache(&self) -> MutexGuard<LRUCache<Id, EntryPage>>;
+    fn get_page_direct(&self, id: &Id) -> EntryPage {
         let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
         let entries = &cell.data[*ENTRIES_KEY_HASH];
         let mut entry_result = Vec::with_capacity(entries.len().unwrap());
@@ -42,21 +46,28 @@ trait BPlusTree {
             } else { panic!("invalid entry") };
             entry_result.push(Entry { key: EntryKey::from(key), id: *value });
         }
-        return entry_result;
+        return Arc::new(entry_result);
     }
-    fn get(&self, key: &EntryKey) -> Option<&Id> {
+    fn get_page(&self, id: &Id) -> EntryPage {
+        self.page_cache().get_or_fetch(id).unwrap().clone()
+    }
+    fn get(&self, key: &EntryKey) -> Option<Id> {
         self.search(self.root(), key, self.get_height())
     }
-    fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<&'a Id> {
+    fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<Id> {
         let keys = node.keys();
         let index = keys
             .binary_search(key)
             .map(|i| i + 1)
             .unwrap_or_else(|i| i);
         match &node.delimiters().get(index) {
-            Some(Delimiter::External(id)) => {
-                // search in leaf
-                unimplemented!()
+            Some(Delimiter::External(ref id)) => {
+                // search in leaf page
+                let mut page = self.get_page(id);
+                return page
+                    .binary_search_by_key(&id, |entry| &entry.id)
+                    .ok()
+                    .map(move |index| page[index].id);
             },
             Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
             None => return None

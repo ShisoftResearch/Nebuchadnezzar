@@ -1,17 +1,19 @@
 use linked_hash_map::*;
 use std::hash::Hash;
 
-pub struct LRUCache<K, V, F> where K: Clone + Eq + Hash, F: Fn(&K) -> Option<V> {
+pub struct LRUCache<K, V> where K: Clone + Eq + Hash {
     capacity: usize,
     map: LinkedHashMap<K, V>,
-    fetch_fn: F
+    fetch_fn: Box<Fn(&K) -> Option<V>>
 }
 
-impl <K, V, F> LRUCache<K, V, F> where K: Clone + Eq + Hash, F: Fn(&K) -> Option<V> {
-    pub fn new(capacity: usize, fetch_fn: F) -> LRUCache<K, V, F> {
+impl <K, V> LRUCache<K, V> where K: Clone + Eq + Hash {
+    pub fn new<F>(capacity: usize, fetch_fn: F) -> LRUCache<K, V>
+        where F: Fn(&K) -> Option<V> + 'static
+    {
         LRUCache {
             capacity,
-            fetch_fn,
+            fetch_fn: Box::new(fetch_fn),
             map: LinkedHashMap::with_capacity(capacity),
         }
     }
