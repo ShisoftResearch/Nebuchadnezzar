@@ -16,7 +16,7 @@ use ram::schema::sm::client::{SMClient as SchemaClient};
 use ram::schema::Schema;
 
 use futures::Future;
-use futures::prelude::*;
+use futures::prelude::{async, await};
 
 use self::transaction::*;
 

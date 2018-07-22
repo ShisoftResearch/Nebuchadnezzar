@@ -8,7 +8,7 @@ use server::NebServer;
 use bifrost::utils::async_locks::{Mutex, MutexGuard, AsyncMutexGuard, RwLock};
 use futures::sync::mpsc::{channel, Sender, Receiver, SendError};
 use futures::{Sink};
-use futures::prelude::*;
+use futures::prelude::{async, await};
 use super::*;
 use utils::stream::PollableStream;
 

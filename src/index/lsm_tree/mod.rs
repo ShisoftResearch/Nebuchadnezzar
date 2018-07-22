@@ -11,78 +11,75 @@ use dovahkiin::types::value::{ValueIter};
 use dovahkiin::types::{Value, PrimitiveArray};
 use utils::lru_cache::LRUCache;
 use parking_lot::{Mutex, MutexGuard};
+use std::io::Cursor;
 
 lazy_static! {
     pub static ref ENTRIES_KEY_HASH : u64 = key_hash("entries");
     pub static ref KEY_KEY_HASH : u64 = key_hash("id");
-    pub static ref VALUE_KEY_HASH : u64 = key_hash("value");
+    pub static ref PREV_PAGE : u64 = key_hash("prev");
+    pub static ref NEXT_PAGE : u64 = key_hash("next");
 }
 
-type EntryKey = SmallVec<[u8; 16]>;
-type EntryPage = Arc<Vec<Entry>>;
+type EntryKey = SmallVec<[u8; 32]>;
 
 pub struct LSMTree {
     num_levels: u8,
     levels: Vec<Rc<BPlusTree>>,
 }
 
-trait BPlusTree {
-    fn root(&self) -> &Node;
-    fn root_mut(&self) -> &mut Node;
-    fn get_height(&self) -> u32;
-    fn set_height(&mut self) -> u32;
-    fn get_num_nodes(&self) -> u32;
-    fn set_num_nodes(&self) -> u32;
-    fn chunks(&self) -> &Arc<Chunks>;
-    fn page_cache(&self) -> MutexGuard<LRUCache<Id, EntryPage>>;
-    fn get_page_direct(&self, id: &Id) -> EntryPage {
-        let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
-        let entries = &cell.data[*ENTRIES_KEY_HASH];
-        let mut entry_result = Vec::with_capacity(entries.len().unwrap());
-        for entry in entries.iter_value().unwrap() {
-            let value = entry[*KEY_KEY_HASH].Id().unwrap();
-            let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = entry[*VALUE_KEY_HASH] {
-                array.clone()
-            } else { panic!("invalid entry") };
-            entry_result.push(Entry { key: EntryKey::from(key), id: *value });
-        }
-        return Arc::new(entry_result);
-    }
-    fn get_page(&self, id: &Id) -> EntryPage {
-        self.page_cache().get_or_fetch(id).unwrap().clone()
-    }
-    fn get(&self, key: &EntryKey) -> Option<Id> {
-        self.search(self.root(), key, self.get_height())
-    }
-    fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<Id> {
-        let keys = node.keys();
-        let index = keys
-            .binary_search(key)
-            .map(|i| i + 1)
-            .unwrap_or_else(|i| i);
-        match &node.delimiters().get(index) {
-            Some(Delimiter::External(ref id)) => {
-                // search in leaf page
-                let mut page = self.get_page(id);
-                return page
-                    .binary_search_by_key(&id, |entry| &entry.id)
-                    .ok()
-                    .map(move |index| page[index].id);
-            },
-            Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
-            None => return None
-        }
-    }
-}
+ trait BPlusTree {
+    //  fn root(&self) -> &Node;
+    //  fn root_mut(&self) -> &mut Node;
+    //  fn get_height(&self) -> u32;
+    //  fn set_height(&mut self) -> u32;
+    //  fn get_num_nodes(&self) -> u32;
+    //  fn set_num_nodes(&self) -> u32;
+    //  fn page_size(&self) -> usize;
+    //  fn chunks(&self) -> &Arc<Chunks>;
+    //  fn page_cache(&self) -> MutexGuard<LRUCache<Id, EntryPage>>;
+    //  fn get_page_direct(&self, id: &Id) -> Node {
+    //      let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
+    //      let entries = &cell.data[*ENTRIES_KEY_HASH];
+    //      let mut entry_result = Vec::with_capacity(entries.len().unwrap());
+    //      for entry in entries.iter_value().unwrap() {
+    //          let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = entry[*VALUE_KEY_HASH] {
+    //              array.clone()
+    //          } else { panic!("invalid entry") };
+    //          let mut id_cursor = Cursor::new(key[key.len() - 17..]);
+    //      }
+    //      return Arc::new(entry_result);
+    //  }
+    //  fn get_page(&self, id: &Id) -> EntryPage {
+    //      self.page_cache().get_or_fetch(id).unwrap().clone()
+    //  }
+    //  fn get(&self, key: &EntryKey) -> Option<Id> {
+    //      self.search(self.root(), key, self.get_height())
+    //  }
+    //  fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<Id> {
+    //      let keys = node.keys();
+    //      let index = keys
+    //          .binary_search(key)
+    //          .map(|i| i + 1)
+    //          .unwrap_or_else(|i| i);
+    //      match &node.delimiters().get(index) {
+    //          Some(Delimiter::External(ref id)) => {
+    //              assert_eq!(ht, 0);
+    //              // search in leaf page
+    //              let mut page = self.get_page(id);
+    //              return page
+    //                  .binary_search_by_key(&id, |entry| &entry.id)
+    //                  .ok()
+    //                  .map(move |index| page[index].id);
+    //          },
+    //          Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
+    //          None => return None
+    //      }
+    //  }
+ }
 
 enum Delimiter {
     External(Id), // to leaf
     Internal(Box<Node>) // to higher level node
-}
-
-struct Entry {
-    key: EntryKey,
-    id: Id
 }
 
 trait Array<T> {
@@ -101,11 +98,6 @@ trait Node {
     fn delimiters(&self) -> &[Delimiter];
     fn keys_mut(&mut self) -> &mut [EntryKey];
     fn delimiters_mut(&mut self) -> &mut [Delimiter];
-}
-
-trait Leaf {
-    fn entries(&self) -> &[Entry];
-    fn entries_mut(&self) -> &mut [Entry];
 }
 
 macro_rules! impl_nodes {

@@ -46,7 +46,7 @@ impl CombinedCleaner {
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
         debug!("get all entries in segments to combine and order them by data temperature and size");
-        let mut entries: Vec<_> = segments
+        let nested_entries = segments
             .iter()
             .flat_map(|seg| {
                 chunk.live_entries(seg)
@@ -84,9 +84,9 @@ impl CombinedCleaner {
             })
             .sorted_by_key(|&(t, _)| t)
             .into_iter()
-            .map(|(_, group)| group)
-            .flatten()
-            .collect();
+            .map(|(_, group)| group);
+
+        let mut entries: Vec<_> = Iterator::flatten(nested_entries).collect();
 
         // order by temperature and size from greater to lesser
         entries.reverse();
