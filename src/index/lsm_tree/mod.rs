@@ -28,12 +28,11 @@ type CachedExtNodeRef = Arc<CachedExtNode>;
 
 pub struct LSMTree {
     num_levels: u8,
-    levels: Vec<Rc<BPlusTree>>,
 }
 
- trait BPlusTree {
-      fn root(&self) -> &Node;
-      fn root_mut(&self) -> &mut Node;
+ trait BPlusTree<N> where N: Node {
+      fn root(&self) -> &N;
+      fn root_mut(&self) -> &mut N;
       fn get_height(&self) -> u32;
       fn set_height(&mut self) -> u32;
       fn get_num_nodes(&self) -> u32;
@@ -66,16 +65,9 @@ pub struct LSMTree {
       fn get(&self, key: &EntryKey) -> Option<Id> {
           self.search(self.root(), key, self.get_height())
       }
-      fn search<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) -> Option<Id> {
+      fn search<'a>(&self, node: &N, key: &EntryKey, ht: u32) -> Option<Id> {
           if ht == 0 { // persist page
-              let search_result = node.keys()
-                  .search(key);
-              let index = if let Ok(i) = search_result { i } else { return None };
-              match &node.delimiters().get(index) {
-                  Some(Delimiter::External(id)) => Some(*id),
-                  Some(Delimiter::Internal(_)) => panic!("Error on leaf delimiter type"),
-                  None => panic!("Error on leaf delimiter is none")
-              }
+              unreachable!();
           } else {
               let index = node.keys()
                   .search(key)
@@ -83,12 +75,22 @@ pub struct LSMTree {
                   .unwrap_or_else(|i| i);
               match &node.delimiters().get(index) {
                   Some(Delimiter::External(ref id)) => {
-                      assert_eq!(ht, 0);
+                      assert_eq!(ht, 1);
                       // search in leaf page
                       let page = self.get_page(id);
-                      return self.search(&*page, key, ht - 1);
+                      let search_result = page.keys()
+                          .search(key);
+                      let index = if let Ok(i) = search_result { i } else { return None };
+                      match &node.delimiters().get(index) {
+                          Some(Delimiter::External(id)) => return Some(*id),
+                          Some(Delimiter::Internal(_)) => panic!("Error on leaf delimiter type"),
+                          None => panic!("Error on leaf delimiter is none")
+                      };
                   },
-                  Some(Delimiter::Internal(node)) => return self.search(node.borrow(), key, ht - 1),
+                  Some(Delimiter::Internal(node)) => {
+                      let node: &N = node.borrow();
+                      return self.search(node, key, ht - 1);
+                  },
                   None => return None
               }
           }
@@ -96,7 +98,7 @@ pub struct LSMTree {
      fn insert(&self, key: &EntryKey, value: &Id) {
          unimplemented!()
      }
-     fn put<'a>(&self, node: &'a Node, key: &EntryKey, ht: u32) {
+     fn put<'a>(&self, node: &N, key: &EntryKey, ht: u32) {
          let keys = node.keys();
          let index = keys
              .search(key)
@@ -108,9 +110,9 @@ pub struct LSMTree {
      }
  }
 
-enum Delimiter {
+enum Delimiter<N> {
     External(Id), // to leaf
-    Internal(Box<Node>) // to higher level node
+    Internal(Box<N>) // to higher level node
 }
 
 trait Array<T> where T: Ord {
@@ -125,9 +127,9 @@ trait Array<T> where T: Ord {
 }
 
 trait Keys : Array<EntryKey> {}
-trait Delimiters : Array<Delimiter> {}
+trait Delimiters<N> : Array<Delimiter<N>> {}
 impl Keys for [EntryKey] {}
-impl Delimiters for [Delimiter] {}
+impl <N> Delimiters<N> for [Delimiter<N>] {}
 impl <T> Array<T> for [T] where T: Ord {
     #[inline]
     fn index_of(&self, index: usize) -> &T { &self[index] }
@@ -164,25 +166,25 @@ impl <T> Array<T> for Vec<T> where T: Ord {
         if index >= self.len() { None } else { Some(&self[index]) }
     }
 }
-impl Delimiters for Vec<Delimiter> {}
+impl <N> Delimiters<N> for Vec<Delimiter<N>> {}
 impl Keys for Vec<EntryKey> {}
 
 trait Node {
     #[inline]
     fn keys(&self) -> &Keys;
     #[inline]
-    fn delimiters(&self) -> &Delimiters;
+    fn delimiters(&self) -> &Delimiters<Self>;
     #[inline]
-    fn add(&mut self, key: EntryKey) -> Option<Node>;
+    fn add(&mut self, key: EntryKey) -> Option<Self> where Self: Sized;
     #[inline]
     fn del(&mut self, key: &EntryKey);
     #[inline]
-    fn merge(&mut self, x: Node);
+    fn merge(&mut self, x: Self);
 }
 
 struct CachedExtNode {
     keys: Vec<EntryKey>,
-    ids: Vec<Delimiter>,
+    ids: Vec<Delimiter<CachedExtNode>>,
     cap: u32,
 }
 
@@ -193,7 +195,7 @@ impl Node for CachedExtNode {
     }
 
     #[inline]
-    fn delimiters(&self) -> &Delimiters {
+    fn delimiters(&self) -> &Delimiters<Self> {
         &self.ids
     }
 
@@ -270,24 +272,24 @@ macro_rules! impl_nodes {
                     }
                 }
 
-                type LDelimiter = [Delimiter; $delimiter_size];
+                type LDelimiter = [Delimiter<LNode>; $delimiter_size];
 
-                impl Array<Delimiter> for LDelimiter {
+                impl Array<Delimiter<LNode>> for LDelimiter {
                     #[inline]
                     fn size(&self) -> usize { $delimiter_size }
                     #[inline]
-                    fn index_of(&self, index: usize) -> &Delimiter { &self[index] }
+                    fn index_of(&self, index: usize) -> &Delimiter<LNode> { &self[index] }
                     #[inline]
-                    fn search(&self, item: &Delimiter) -> Result<usize, usize> {
-                        self.binary_search(item)
+                    fn search(&self, item: &Delimiter<LNode>) -> Result<usize, usize> {
+                        unreachable!()
                     }
                     #[inline]
-                    fn get(&self, index: usize) -> Option<&Delimiter> {
+                    fn get(&self, index: usize) -> Option<&Delimiter<LNode>> {
                         if index >= $entry_size { None } else { Some(&self[index]) }
                     }
                 }
 
-                impl Delimiters for LDelimiter {}
+                impl Delimiters<LNode> for LDelimiter {}
                 impl Keys for LEntryKeys {}
 
                 struct LNode {
@@ -302,11 +304,11 @@ macro_rules! impl_nodes {
                         &self.keys
                     }
                     #[inline]
-                    fn delimiters(&self) -> &Delimiters {
+                    fn delimiters(&self) -> &Delimiters<Self> {
                         &self.delimeters
                     }
                     #[inline]
-                    fn add(&mut self, key: EntryKey) -> Option<Node> {
+                    fn add(&mut self, key: EntryKey) -> Option<Self> {
                         unimplemented!()
                     }
                     #[inline]
@@ -325,19 +327,19 @@ macro_rules! impl_nodes {
 
 impl_nodes!((level_0, 2, 3), (level_1, 20, 21), (level_2, 200, 201), (level_3, 2000, 2001), (level_4, 20000, 20001));
 
-impl Ord for Delimiter {
+impl <N> Ord for Delimiter<N> {
     fn cmp(&self, other: &Self) -> Ordering {
         panic!()
     }
 }
-impl PartialOrd for Delimiter {
-    fn partial_cmp(&self, other: &Delimiter) -> Option<Ordering> {
+impl <N> PartialOrd for Delimiter<N> {
+    fn partial_cmp(&self, other: &Delimiter<N>) -> Option<Ordering> {
         panic!()
     }
 }
-impl Eq for Delimiter {}
-impl PartialEq for Delimiter {
-    fn eq(&self, other: &Delimiter) -> bool {
+impl <N> Eq for Delimiter<N> {}
+impl <N> PartialEq for Delimiter<N> {
+    fn eq(&self, other: &Delimiter<N>) -> bool {
         panic!()
     }
 }
