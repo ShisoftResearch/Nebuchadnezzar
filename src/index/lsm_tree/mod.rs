@@ -173,11 +173,11 @@ trait Node {
     #[inline]
     fn delimiters(&self) -> &Delimiters;
     #[inline]
-    fn add(&mut self, key: EntryKey) -> Option<None>;
+    fn add(&mut self, key: EntryKey) -> Option<Node>;
     #[inline]
     fn del(&mut self, key: &EntryKey);
     #[inline]
-    fn merge(&mut self, x: None);
+    fn merge(&mut self, x: Node);
 }
 
 struct CachedExtNode {
@@ -203,8 +203,8 @@ impl Node for CachedExtNode {
             Err(i) => i
         };
         let id = id_from_key(&key);
-        self.keys.insert(i, key);
-        self.ids.insert(i, Delimiter::External(id));
+        self.keys.insert(insert_pos, key);
+        self.ids.insert(insert_pos, Delimiter::External(id));
         if self.keys.len() > self.cap as usize {
             // need to split
             let mid = self.keys.len() / 2;
