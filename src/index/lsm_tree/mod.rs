@@ -297,7 +297,7 @@ trait SliceNode : Node + Sized {
     #[inline]
     fn moving_keys(slice: &mut [EntryKey]) -> Self::K;
 
-    fn construct(keys: Self::K, delimiters: Self::D, pos: u32) -> Self;
+    fn construct(keys: Self::K, delimiters: Self::D, len: u32) -> Self;
 
     fn insert_to_slice<V>(slice: &mut [V], val: V, pos: u32, len: u32) {
         for i in (pos..len).rev() {
@@ -433,9 +433,9 @@ macro_rules! impl_nodes {
                     }
                 }
 
-                type LDelimiter = [Delimiter<LNode>; $delimiter_size];
+                type LDelimiters = [Delimiter<LNode>; $delimiter_size];
 
-                impl Array<Delimiter<LNode>> for LDelimiter {
+                impl Array<Delimiter<LNode>> for LDelimiters {
                     #[inline]
                     fn size(&self) -> usize { $delimiter_size }
                     #[inline]
@@ -454,13 +454,13 @@ macro_rules! impl_nodes {
                     }
                 }
 
-                impl Delimiters<LNode> for LDelimiter {}
+                impl Delimiters<LNode> for LDelimiters {}
                 impl Keys for LEntryKeys {}
 
                 struct LNode {
                     keys: LEntryKeys,
-                    delimeters: LDelimiter,
-                    pos: u32
+                    delimiters: LDelimiters,
+                    len: u32
                 }
 
                 impl Node for LNode {
@@ -470,19 +470,69 @@ macro_rules! impl_nodes {
                     }
                     #[inline]
                     fn delimiters(&self) -> &Delimiters<Self> {
-                        &self.delimeters
+                        &self.delimiters
                     }
                     #[inline]
                     fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
-                        unimplemented!()
+                        self.slice_add(key, delimiter)
                     }
                     #[inline]
                     fn del(&mut self, key: &EntryKey) {
-                        unimplemented!()
+                        self.slice_del(key)
                     }
                     #[inline]
                     fn merge(&mut self, x: Self) {
-                        unimplemented!()
+                        self.slice_merge(x)
+                    }
+                }
+
+                impl SliceNode for LNode {
+                    type K = LEntryKeys;
+                    type D = LDelimiters;
+
+                    #[inline]
+                    fn keys_mut(&mut self) -> &mut [EntryKey] {
+                        &mut self.keys
+                    }
+
+                    #[inline]
+                    fn delimiters_mut(&mut self) -> &mut [Delimiter<Self>] {
+                        &mut self.delimiters
+                    }
+
+                    #[inline]
+                    fn get_len(&self) -> u32 {
+                        self.len
+                    }
+
+                    #[inline]
+                    fn set_len(&mut self, len: u32) {
+                        self.len = len;
+                    }
+
+                    #[inline]
+                    fn capacity() -> u32 {
+                        $entry_size
+                    }
+
+                    fn moving_delimiters(slice: &mut [Delimiter<Self>]) -> Self::D {
+                        let mut d: LDelimiters = unsafe { mem::uninitialized() };
+                        for i in 0..slice.len() {
+                            d[i] = mem::replace(&mut slice[i], unsafe { mem::uninitialized() });
+                        }
+                        return d;
+                    }
+
+                    fn moving_keys(slice: &mut [EntryKey]) -> Self::K {
+                        let mut k: LEntryKeys = unsafe { mem::uninitialized() };
+                        for i in 0..slice.len() {
+                            k[i] = mem::replace(&mut slice[i], unsafe { mem::uninitialized() });
+                        }
+                        return k;
+                    }
+
+                    fn construct(keys: Self::K, delimiters: Self::D, len: u32) -> Self {
+                        LNode { keys, delimiters, len }
                     }
                 }
             }
