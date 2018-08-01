@@ -25,7 +25,7 @@ lazy_static! {
 }
 
 type EntryKey = SmallVec<[u8; 32]>;
-type CachedExtNodeRef = Arc<CachedExtNode>;
+type CachedExtNodeRef<N> = Arc<CachedExtNode<N>>;
 
 pub struct LSMTree {
     num_levels: u8,
@@ -40,8 +40,8 @@ pub struct LSMTree {
       fn set_num_nodes(&self) -> u32;
       fn page_size(&self) -> u32;
       fn chunks(&self) -> &Arc<Chunks>;
-      fn page_cache(&self) -> MutexGuard<LRUCache<Id, CachedExtNodeRef>>;
-      fn get_page_direct(&self, id: &Id) -> CachedExtNodeRef {
+      fn page_cache(&self) -> MutexGuard<LRUCache<Id, CachedExtNodeRef<N>>>;
+      fn get_page_direct(&self, id: &Id) -> CachedExtNodeRef<N> {
           let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
           let keys = &cell.data[*KEYS_KEY_HASH];
           let keys_len = keys.len().unwrap();
@@ -60,7 +60,7 @@ pub struct LSMTree {
           }
           return Arc::new(v_node);
       }
-      fn get_page(&self, id: &Id) -> CachedExtNodeRef {
+      fn get_page(&self, id: &Id) -> CachedExtNodeRef<N> {
           self.page_cache().get_or_fetch(id).unwrap().clone()
       }
       fn get(&self, key: &EntryKey) -> Option<Id> {
@@ -180,26 +180,26 @@ impl <T> Array<T> for Vec<T> where T: Ord {
 impl <N> Delimiters<N> for Vec<Delimiter<N>> {}
 impl Keys for Vec<EntryKey> {}
 
-trait Node {
+trait Node : Sized {
     #[inline]
     fn keys(&self) -> &Keys;
     #[inline]
     fn delimiters(&self) -> &Delimiters<Self>;
     #[inline]
-    fn add(&mut self, key: EntryKey) -> Option<Self> where Self: Sized;
+    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> ;
     #[inline]
     fn del(&mut self, key: &EntryKey);
     #[inline]
     fn merge(&mut self, x: Self);
 }
 
-struct CachedExtNode {
+struct CachedExtNode<N> {
     keys: Vec<EntryKey>,
-    ids: Vec<Delimiter<CachedExtNode>>,
+    ids: Vec<Delimiter<N>>,
     cap: u32,
 }
 
-impl Node for CachedExtNode {
+impl <N> Node for CachedExtNode<N> {
     #[inline]
     fn keys(&self) -> &Keys {
         &self.keys
@@ -210,7 +210,7 @@ impl Node for CachedExtNode {
         &self.ids
     }
 
-    fn add(&mut self, key: EntryKey) -> Option<Self> {
+    fn add(&mut self, key: EntryKey, _: Delimiter<Self>) -> Option<Self> {
         let insert_pos = match self.keys.binary_search(&key) {
             Ok(_) => return None, // existed
             Err(i) => i
@@ -245,6 +245,29 @@ impl Node for CachedExtNode {
     fn merge(&mut self, mut x: Self) {
         self.keys.append(&mut x.keys);
         self.ids.append(&mut x.ids);
+    }
+}
+
+impl <N> Delimiters<CachedExtNode<N>> for Vec<Delimiter<N>> {}
+impl <N> Array<Delimiter<CachedExtNode<N>>> for Vec<Delimiter<N>> {
+    fn index_of(&self, index: usize) -> & Delimiter<CachedExtNode<N>> {
+        unimplemented!()
+    }
+
+    fn size(&self) -> usize {
+        unimplemented!()
+    }
+
+    fn search(&self, item: & Delimiter<CachedExtNode<N>>) -> Result<usize, usize> {
+        unimplemented!()
+    }
+
+    fn get(&self, index: usize) -> Option<& Delimiter<CachedExtNode<N>>> {
+        unimplemented!()
+    }
+
+    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [Delimiter<CachedExtNode<N>>] {
+        unimplemented!()
     }
 }
 
@@ -293,7 +316,7 @@ trait SliceNode : Node + Sized {
         }
     }
 
-    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
+    fn slice_add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
         let pos = self.get_pos();
         let capacity = Self::capacity();
         let insert_pos = match self.keys().search(&key) {
@@ -415,7 +438,7 @@ macro_rules! impl_nodes {
                         &self.delimeters
                     }
                     #[inline]
-                    fn add(&mut self, key: EntryKey) -> Option<Self> {
+                    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
                         unimplemented!()
                     }
                     #[inline]
