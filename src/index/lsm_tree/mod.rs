@@ -283,10 +283,10 @@ trait SliceNode : Node + Sized {
     fn delimiters_mut(&mut self) -> &mut [Delimiter<Self>];
 
     #[inline]
-    fn get_pos(&self) -> u32;
+    fn get_len(&self) -> u32;
 
     #[inline]
-    fn set_pos(&mut self, pos: u32);
+    fn set_len(&mut self, len: u32);
 
     #[inline]
     fn capacity() -> u32;
@@ -307,27 +307,34 @@ trait SliceNode : Node + Sized {
         slice[pos as usize] = val;
     }
 
-    fn insert_split<V>(value: V, s1: &mut [V], s2: &mut [V], mid: u32, insert_pos: u32, len: u32)
+    fn del_from_slice<V>(slice: &mut[V], pos: u32, len: u32) {
+        for i in pos..len - 1 {
+            let i = i as usize;
+            slice[i] = mem::replace(&mut slice[i + 1], unsafe { mem::uninitialized() });
+        }
+    }
+
+    fn insert_split<V>(value: V, s1: &mut [V], s2: &mut [V], mid: u32, insert_pos: u32, len1: u32, len2: u32)
     {
         if insert_pos <= mid {
-            Self::insert_to_slice(s1, value, insert_pos, len);
+            Self::insert_to_slice(s1, value, insert_pos, len1);
         } else {
-            Self::insert_to_slice(s2, value, insert_pos - mid, len);
+            Self::insert_to_slice(s2, value, insert_pos - mid, len2);
         }
     }
 
     fn slice_add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
-        let pos = self.get_pos();
+        let len = self.get_len();
         let capacity = Self::capacity();
         let insert_pos = match self.keys().search(&key) {
             Ok(pos) => pos, // point to insert to
             _ => return None // already exists, exit
         } as u32;
-        if pos + 1 >= capacity {
+        if len + 1 >= capacity {
             // need to split
-            let mid = self.get_pos() / 2;
-            let pos2 = self.get_pos() - mid;
-            let pos1 = mid - 1;
+            let mid = len / 2;
+            let len1 = mid - 1;
+            let len2 = len - mid;
             let keys_2 = {
                 let mut keys_1 = self.keys_mut();
                 let mut keys_2 =
@@ -336,7 +343,8 @@ trait SliceNode : Node + Sized {
                     key,
                     &mut keys_1,
                     &mut keys_2.as_slice_mut(),
-                    mid, insert_pos, capacity);
+                    mid, insert_pos,
+                    len1, len2);
                 keys_2
             };
             let delis_2 = {
@@ -347,18 +355,45 @@ trait SliceNode : Node + Sized {
                     delimiter,
                     &mut delis_1,
                     &mut delis_2.as_slice_mut(),
-                    mid, insert_pos + 1, capacity + 1);
+                    mid, insert_pos + 1,
+                    len1 + 1, len2 + 1);
                 delis_2
             };
-            self.set_pos(pos1);
+            self.set_len(len1);
 
-            return Some(Self::construct(keys_2, delis_2, pos2))
+            return Some(Self::construct(keys_2, delis_2, len2))
         } else {
-            let pos = self.get_pos();
-            Self::insert_to_slice(self.keys_mut(), key, pos, capacity);
-            Self::insert_to_slice(self.delimiters_mut(), delimiter, pos + 1, capacity + 1);
-            self.set_pos(pos + 1);
+            Self::insert_to_slice(self.keys_mut(), key, len, capacity);
+            Self::insert_to_slice(self.delimiters_mut(), delimiter, len + 1, capacity + 1);
+            self.set_len(len + 1);
             return None;
+        }
+    }
+
+    fn slice_del(&mut self, key: &EntryKey) {
+        let len = self.get_len();
+        let insert_pos = match self.keys().search(&key) {
+            Ok(pos) => pos, // point to insert to
+            _ => return // already exists, exit
+        } as u32;
+        Self::del_from_slice(self.keys_mut(), insert_pos, len);
+        Self::del_from_slice(self.delimiters_mut(), insert_pos + 1, len + 1);
+        self.set_len(len - 1);
+    }
+
+    fn slice_merge(&mut self, mut x: Self) {
+        assert!(self.get_len() + x.get_len() <= Self::capacity());
+        for i in 0..x.get_len() {
+            let src_i = i as usize;
+            let target_i = (i + self.get_len()) as usize;
+            self.keys_mut()[target_i] =
+                mem::replace(&mut x.keys_mut()[src_i], unsafe { mem::uninitialized() });
+        }
+        for i in 0..x.get_len() + 1 {
+            let src_i = i as usize;
+            let target_i = (i + self.get_len() + 1) as usize;
+            self.delimiters_mut()[target_i] =
+                mem::replace(&mut x.delimiters_mut()[src_i], unsafe { mem::uninitialized() });
         }
     }
 }
