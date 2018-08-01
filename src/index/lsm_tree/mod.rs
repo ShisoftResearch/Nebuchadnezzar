@@ -15,6 +15,7 @@ use parking_lot::{Mutex, MutexGuard};
 use std::io::Cursor;
 use std::ops::Index;
 use std::cmp::Ordering;
+use std::mem;
 
 lazy_static! {
     pub static ref ENTRIES_KEY_HASH : u64 = key_hash("entries");
@@ -124,6 +125,8 @@ trait Array<T> where T: Ord {
     fn search(&self, item: &T) -> Result<usize, usize>;
     #[inline]
     fn get(&self, index: usize) -> Option<&T>;
+    #[inline]
+    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [T];
 }
 
 trait Keys : Array<EntryKey> {}
@@ -143,6 +146,10 @@ impl <T> Array<T> for [T] where T: Ord {
     #[inline]
     fn get(&self, index: usize) -> Option<&T> {
         if index >= self.size() { None } else { Some(&self[index]) }
+    }
+
+    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [T] {
+        self
     }
 }
 impl <T> Array<T> for Vec<T> where T: Ord {
@@ -164,6 +171,10 @@ impl <T> Array<T> for Vec<T> where T: Ord {
     #[inline]
     fn get(&self, index: usize) -> Option<&T> {
         if index >= self.len() { None } else { Some(&self[index]) }
+    }
+
+    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [T] {
+        self.as_mut_slice()
     }
 }
 impl <N> Delimiters<N> for Vec<Delimiter<N>> {}
@@ -237,8 +248,96 @@ impl Node for CachedExtNode {
     }
 }
 
-trait InterNode {
+trait SliceNode : Node + Sized {
 
+    type K: Keys;
+    type D: Delimiters<Self>;
+
+    #[inline]
+    fn keys_mut(&mut self) -> &mut [EntryKey];
+
+    #[inline]
+    fn delimiters_mut(&mut self) -> &mut [Delimiter<Self>];
+
+    #[inline]
+    fn get_pos(&self) -> u32;
+
+    #[inline]
+    fn set_pos(&mut self, pos: u32);
+
+    #[inline]
+    fn capacity() -> u32;
+
+    #[inline]
+    fn moving_delimiters(slice: &mut [Delimiter<Self>]) -> Self::D;
+
+    #[inline]
+    fn moving_keys(slice: &mut [EntryKey]) -> Self::K;
+
+    fn construct(keys: Self::K, delimiters: Self::D, pos: u32) -> Self;
+
+    fn insert_to_slice<V>(slice: &mut [V], val: V, pos: u32, len: u32) {
+        for i in (pos..len).rev() {
+            let i = i as usize;
+            slice[i + 1] = mem::replace(&mut slice[i], unsafe { mem::uninitialized() });
+        }
+        slice[pos as usize] = val;
+    }
+
+    fn insert_split<V>(value: V, s1: &mut [V], s2: &mut [V], mid: u32, insert_pos: u32, len: u32)
+    {
+        if insert_pos <= mid {
+            Self::insert_to_slice(s1, value, insert_pos, len);
+        } else {
+            Self::insert_to_slice(s2, value, insert_pos - mid, len);
+        }
+    }
+
+    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
+        let pos = self.get_pos();
+        let capacity = Self::capacity();
+        let insert_pos = match self.keys().search(&key) {
+            Ok(pos) => pos, // point to insert to
+            _ => return None // already exists, exit
+        } as u32;
+        if pos + 1 >= capacity {
+            // need to split
+            let mid = self.get_pos() / 2;
+            let pos2 = self.get_pos() - mid;
+            let pos1 = mid - 1;
+            let keys_2 = {
+                let mut keys_1 = self.keys_mut();
+                let mut keys_2 =
+                    Self::moving_keys(keys_1.split_at_mut(mid as usize).1);
+                Self::insert_split(
+                    key,
+                    &mut keys_1,
+                    &mut keys_2.as_slice_mut(),
+                    mid, insert_pos, capacity);
+                keys_2
+            };
+            let delis_2 = {
+                let mut delis_1 = self.delimiters_mut();
+                let mut delis_2 =
+                    Self::moving_delimiters(delis_1.split_at_mut(mid as usize).1);
+                Self::insert_split(
+                    delimiter,
+                    &mut delis_1,
+                    &mut delis_2.as_slice_mut(),
+                    mid, insert_pos + 1, capacity + 1);
+                delis_2
+            };
+            self.set_pos(pos1);
+
+            return Some(Self::construct(keys_2, delis_2, pos2))
+        } else {
+            let pos = self.get_pos();
+            Self::insert_to_slice(self.keys_mut(), key, pos, capacity);
+            Self::insert_to_slice(self.delimiters_mut(), delimiter, pos + 1, capacity + 1);
+            self.set_pos(pos + 1);
+            return None;
+        }
+    }
 }
 
 impl <T> Index<usize> for Array<T> where T: Ord {
@@ -270,6 +369,10 @@ macro_rules! impl_nodes {
                     fn get(&self, index: usize) -> Option<&EntryKey> {
                         if index >= $entry_size { None } else { Some(&self[index]) }
                     }
+                    #[inline]
+                    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [EntryKey] {
+                        self
+                    }
                 }
 
                 type LDelimiter = [Delimiter<LNode>; $delimiter_size];
@@ -286,6 +389,10 @@ macro_rules! impl_nodes {
                     #[inline]
                     fn get(&self, index: usize) -> Option<&Delimiter<LNode>> {
                         if index >= $entry_size { None } else { Some(&self[index]) }
+                    }
+                    #[inline]
+                    fn as_slice_mut<'a>(&'a mut self) -> &'a mut [Delimiter<LNode>] {
+                        self
                     }
                 }
 
