@@ -128,13 +128,26 @@ pub struct LSMTree {
              if let Some(new_page) = page.add(page_pos, key.clone(), Delimiter::None) {
                  return node.add(
                      index + 1,
-                     page.keys().index_of(0).clone(),
+                     page.keys().first().clone(),
                      Delimiter::External(page.persist_id));
              }
          } else {
-
+             let new_node = {
+                 let mut next_node = match node.mut_delimiter(index) {
+                     Delimiter::Internal(ref mut n) => n,
+                     _ => unreachable!()
+                 };
+                 match self.put(&mut next_node, key, ht + 1) {
+                     None => return None,
+                     Some(n) => n
+                 }
+             };
+             return node.add(
+                 index + 1,
+                 new_node.keys().first().clone(),
+                 Delimiter::Internal(box new_node));
          }
-         unimplemented!()
+         return None;
      }
  }
 
@@ -155,6 +168,10 @@ trait Array<T> where T: Ord {
     fn get(&self, index: usize) -> Option<&T>;
     #[inline]
     fn as_slice_mut<'a>(&'a mut self) -> &'a mut [T];
+    #[inline]
+    fn first(&self) -> &T {
+        self.index_of(0)
+    }
 }
 
 trait Keys : Array<EntryKey> {}
@@ -214,6 +231,8 @@ trait Node : Sized {
     #[inline]
     fn delimiters(&self) -> &Delimiters<Self>;
     #[inline]
+    fn mut_delimiter(&mut self, pos: u32) -> &mut Delimiter<Self>;
+    #[inline]
     fn add(&mut self, pos: u32, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> ;
     #[inline]
     fn del(&mut self, pos: u32);
@@ -237,6 +256,10 @@ impl <N> Node for CachedExtNode<N> {
     #[inline]
     fn delimiters(&self) -> &Delimiters<Self> {
         &self.ids
+    }
+
+    fn mut_delimiter(&mut self, pos: u32) -> &mut Delimiter<Self> {
+        unreachable!()
     }
 
     fn add(&mut self, pos: u32, key: EntryKey, _: Delimiter<Self>) -> Option<Self> {
@@ -485,6 +508,10 @@ macro_rules! impl_nodes {
                     #[inline]
                     fn delimiters(&self) -> &Delimiters<Self> {
                         &self.delimiters
+                    }
+                    #[inline]
+                    fn mut_delimiter(&mut self, pos: u32) -> &mut Delimiter<Self> {
+                        &mut self.delimiters[pos as usize]
                     }
                     #[inline]
                     fn add(&mut self, pos: u32, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
