@@ -186,9 +186,9 @@ trait Node : Sized {
     #[inline]
     fn delimiters(&self) -> &Delimiters<Self>;
     #[inline]
-    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> ;
+    fn add(&mut self, pos: u32, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> ;
     #[inline]
-    fn del(&mut self, key: &EntryKey);
+    fn del(&mut self, pos: u32);
     #[inline]
     fn merge(&mut self, x: Self);
 }
@@ -210,14 +210,10 @@ impl <N> Node for CachedExtNode<N> {
         &self.ids
     }
 
-    fn add(&mut self, key: EntryKey, _: Delimiter<Self>) -> Option<Self> {
-        let insert_pos = match self.keys.binary_search(&key) {
-            Ok(_) => return None, // existed
-            Err(i) => i
-        };
+    fn add(&mut self, pos: u32, key: EntryKey, _: Delimiter<Self>) -> Option<Self> {
         let id = id_from_key(&key);
-        self.keys.insert(insert_pos, key);
-        self.ids.insert(insert_pos, Delimiter::External(id));
+        self.keys.insert(pos as usize, key);
+        self.ids.insert(pos as usize, Delimiter::External(id));
         if self.keys.len() > self.cap as usize {
             // need to split
             let mid = self.keys.len() / 2;
@@ -233,13 +229,9 @@ impl <N> Node for CachedExtNode<N> {
         }
     }
 
-    fn del(&mut self, key: &EntryKey) {
-        let pos = match self.keys.binary_search(&key) {
-            Ok(i) => i, // existed
-            Err(i) => return
-        };
-        self.keys.remove(pos);
-        self.ids.remove(pos);
+    fn del(&mut self, pos: u32) {
+        self.keys.remove(pos as usize);
+        self.ids.remove(pos as usize);
     }
 
     fn merge(&mut self, mut x: Self) {
@@ -323,13 +315,9 @@ trait SliceNode : Node + Sized {
         }
     }
 
-    fn slice_add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
+    fn slice_add(&mut self, pos: u32, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
         let len = self.get_len();
         let capacity = Self::capacity();
-        let insert_pos = match self.keys().search(&key) {
-            Ok(pos) => pos, // point to insert to
-            _ => return None // already exists, exit
-        } as u32;
         if len + 1 >= capacity {
             // need to split
             let mid = len / 2;
@@ -343,7 +331,7 @@ trait SliceNode : Node + Sized {
                     key,
                     &mut keys_1,
                     &mut keys_2.as_slice_mut(),
-                    mid, insert_pos,
+                    mid, pos,
                     len1, len2);
                 keys_2
             };
@@ -355,7 +343,7 @@ trait SliceNode : Node + Sized {
                     delimiter,
                     &mut delis_1,
                     &mut delis_2.as_slice_mut(),
-                    mid, insert_pos + 1,
+                    mid, pos + 1,
                     len1 + 1, len2 + 1);
                 delis_2
             };
@@ -370,14 +358,10 @@ trait SliceNode : Node + Sized {
         }
     }
 
-    fn slice_del(&mut self, key: &EntryKey) {
+    fn slice_del(&mut self, pos: u32) {
         let len = self.get_len();
-        let insert_pos = match self.keys().search(&key) {
-            Ok(pos) => pos, // point to insert to
-            _ => return // already exists, exit
-        } as u32;
-        Self::del_from_slice(self.keys_mut(), insert_pos, len);
-        Self::del_from_slice(self.delimiters_mut(), insert_pos + 1, len + 1);
+        Self::del_from_slice(self.keys_mut(), pos, len);
+        Self::del_from_slice(self.delimiters_mut(), pos + 1, len + 1);
         self.set_len(len - 1);
     }
 
@@ -473,12 +457,12 @@ macro_rules! impl_nodes {
                         &self.delimiters
                     }
                     #[inline]
-                    fn add(&mut self, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
-                        self.slice_add(key, delimiter)
+                    fn add(&mut self, pos: u32, key: EntryKey, delimiter: Delimiter<Self>) -> Option<Self> {
+                        self.slice_add(pos, key, delimiter)
                     }
                     #[inline]
-                    fn del(&mut self, key: &EntryKey) {
-                        self.slice_del(key)
+                    fn del(&mut self, pos: u32) {
+                        self.slice_del(pos)
                     }
                     #[inline]
                     fn merge(&mut self, x: Self) {
