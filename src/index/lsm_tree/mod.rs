@@ -6,6 +6,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use ram::chunk::Chunks;
 use ram::cell::Cell;
+use ram::types::RandValue;
 use dovahkiin::types;
 use dovahkiin::types::custom_types::map::key_hash;
 use dovahkiin::types::value::{ValueIter};
@@ -25,7 +26,7 @@ lazy_static! {
 }
 
 type EntryKey = SmallVec<[u8; 32]>;
-type CachedExtNodeRef<N> = Arc<CachedExtNode<N>>;
+type CachedExtNodeRef<N> = Arc<Mutex<CachedExtNode<N>>>;
 
 pub struct LSMTree {
     num_levels: u8,
@@ -48,7 +49,8 @@ pub struct LSMTree {
           let mut v_node = CachedExtNode {
               keys: Vec::new(),
               ids: Vec::new(),
-              cap: self.page_size()
+              cap: self.page_size(),
+              persist_id: Id::rand()
           };
           for key in keys.iter_value().unwrap() {
               let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key {
@@ -58,7 +60,7 @@ pub struct LSMTree {
               v_node.keys.push(EntryKey::from_slice(key.as_slice()));
               v_node.ids.push(Delimiter::External(id));
           }
-          return Arc::new(v_node);
+          return Arc::new(Mutex::new(v_node));
       }
       fn get_page(&self, id: &Id) -> CachedExtNodeRef<N> {
           self.page_cache().get_or_fetch(id).unwrap().clone()
@@ -66,54 +68,80 @@ pub struct LSMTree {
       fn get(&self, key: &EntryKey) -> Option<Id> {
           self.search(self.root(), key, self.get_height())
       }
+
+      fn search_pos(node: &N, key: &EntryKey) -> u32 {
+          node.keys()
+              .search(key)
+              .map(|i| i + 1)
+              .unwrap_or_else(|i| i) as u32
+      }
+
       fn search<'a>(&self, node: &N, key: &EntryKey, ht: u32) -> Option<Id> {
           if ht == 0 { // persist page
               unreachable!();
           } else {
-              let index = node.keys()
-                  .search(key)
-                  .map(|i| i + 1)
-                  .unwrap_or_else(|i| i);
-              match &node.delimiters().get(index) {
+              let index = Self::search_pos(node, key);
+              match &node.delimiters().get(index as usize) {
                   Some(Delimiter::External(ref id)) => {
                       assert_eq!(ht, 1);
                       // search in leaf page
                       let page = self.get_page(id);
-                      let search_result = page.keys()
+                      let search_result = page
+                          .lock()
+                          .keys()
                           .search(key);
                       let index = if let Ok(i) = search_result { i } else { return None };
                       match &node.delimiters().get(index) {
                           Some(Delimiter::External(id)) => return Some(*id),
                           Some(Delimiter::Internal(_)) => panic!("Error on leaf delimiter type"),
-                          None => panic!("Error on leaf delimiter is none")
+                          None => panic!("Error on leaf delimiter is none"),
+                          _ => unreachable!()
                       };
                   },
                   Some(Delimiter::Internal(node)) => {
                       let node: &N = node.borrow();
                       return self.search(node, key, ht - 1);
                   },
-                  None => return None
+                  None => return None,
+                  _ => unreachable!()
               }
           }
       }
-     fn insert(&self, key: &EntryKey, value: &Id) {
+     fn insert(&mut self, key: &EntryKey, value: &Id) {
          unimplemented!()
      }
-     fn put<'a>(&self, node: &N, key: &EntryKey, ht: u32) {
-         let keys = node.keys();
-         let index = keys
-             .search(key)
-             .map(|i| i + 1)
-             .unwrap_or_else(|i| i);
+     fn put<'a>(&self, node: &mut N, key: &EntryKey, ht: u32) -> Option<N> {
+         let index = Self::search_pos(node, key);
          if ht == 0 {
+             unreachable!()
+         } else if ht == 1 {
+             let id = match node.delimiters().get(index as usize) {
+                 Some(Delimiter::External(id)) => *id,
+                 _ => unreachable!()
+             };
+             let page_ref = self.get_page(&id);
+             let mut page = page_ref.lock();
+             let page_pos = match page.keys().search(key) {
+                 Ok(_) => return None,
+                 Err(i) => i
+             } as u32;
+             if let Some(new_page) = page.add(page_pos, key.clone(), Delimiter::None) {
+                 return node.add(
+                     index + 1,
+                     page.keys().index_of(0).clone(),
+                     Delimiter::External(page.persist_id));
+             }
+         } else {
 
          }
+         unimplemented!()
      }
  }
 
 enum Delimiter<N> {
     External(Id), // to leaf
-    Internal(Box<N>) // to higher level node
+    Internal(Box<N>), // to higher level node
+    None
 }
 
 trait Array<T> where T: Ord {
@@ -197,6 +225,7 @@ struct CachedExtNode<N> {
     keys: Vec<EntryKey>,
     ids: Vec<Delimiter<N>>,
     cap: u32,
+    persist_id: Id
 }
 
 impl <N> Node for CachedExtNode<N> {
@@ -222,7 +251,8 @@ impl <N> Node for CachedExtNode<N> {
             return Some(CachedExtNode {
                 keys: keys_2,
                 ids: ids_2,
-                cap: self.cap
+                cap: self.cap,
+                persist_id: Id::rand()
             });
         } else {
             return None;
