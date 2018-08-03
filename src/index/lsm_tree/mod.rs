@@ -32,133 +32,133 @@ pub struct LSMTree {
     num_levels: u8,
 }
 
- trait BPlusTree<N> where N: Node {
-      fn root(&self) -> &N;
-      fn root_mut(&self) -> &mut N;
-      fn get_height(&self) -> u32;
-      fn set_height(&mut self) -> u32;
-      fn get_num_nodes(&self) -> u32;
-      fn set_num_nodes(&self) -> u32;
-      fn page_size(&self) -> u32;
-      fn chunks(&self) -> &Arc<Chunks>;
-      fn page_cache(&self) -> MutexGuard<LRUCache<Id, CachedExtNodeRef<N>>>;
-      fn get_page_direct(&self, id: &Id) -> CachedExtNodeRef<N> {
-          let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
-          let keys = &cell.data[*KEYS_KEY_HASH];
-          let keys_len = keys.len().unwrap();
-          let mut v_node = CachedExtNode {
-              keys: Vec::new(),
-              ids: Vec::new(),
-              cap: self.page_size(),
-              persist_id: Id::rand()
-          };
-          for key in keys.iter_value().unwrap() {
-              let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key {
-                  EntryKey::from_slice(array.as_slice())
-              } else { panic!("invalid entry") };
-              let id = id_from_key(&key);
-              v_node.keys.push(EntryKey::from_slice(key.as_slice()));
-              v_node.ids.push(Delimiter::External(id));
-          }
-          return Arc::new(Mutex::new(v_node));
-      }
-      fn get_page(&self, id: &Id) -> CachedExtNodeRef<N> {
-          self.page_cache().get_or_fetch(id).unwrap().clone()
-      }
-      fn get(&self, key: &EntryKey) -> Option<Id> {
-          self.search(self.root(), key, self.get_height())
-      }
+trait BPlusTree<N> where N: Node {
+    fn root(&self) -> &N;
+    fn root_mut(&self) -> &mut N;
+    fn get_height(&self) -> u32;
+    fn set_height(&mut self) -> u32;
+    fn get_num_nodes(&self) -> u32;
+    fn set_num_nodes(&self) -> u32;
+    fn page_size(&self) -> u32;
+    fn chunks(&self) -> &Arc<Chunks>;
+    fn page_cache(&self) -> MutexGuard<LRUCache<Id, CachedExtNodeRef<N>>>;
+    fn get_page_direct(&self, id: &Id) -> CachedExtNodeRef<N> {
+        let cell = self.chunks().read_cell(id).unwrap(); // should crash if not exists
+        let keys = &cell.data[*KEYS_KEY_HASH];
+        let keys_len = keys.len().unwrap();
+        let mut v_node = CachedExtNode {
+            keys: Vec::new(),
+            ids: Vec::new(),
+            cap: self.page_size(),
+            persist_id: Id::rand()
+        };
+        for key in keys.iter_value().unwrap() {
+            let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key {
+                EntryKey::from_slice(array.as_slice())
+            } else { panic!("invalid entry") };
+            let id = id_from_key(&key);
+            v_node.keys.push(EntryKey::from_slice(key.as_slice()));
+            v_node.ids.push(Delimiter::External(id));
+        }
+        return Arc::new(Mutex::new(v_node));
+    }
+    fn get_page(&self, id: &Id) -> CachedExtNodeRef<N> {
+        self.page_cache().get_or_fetch(id).unwrap().clone()
+    }
+    fn get(&self, key: &EntryKey) -> Option<Id> {
+        self.search(self.root(), key, self.get_height())
+    }
 
-      fn search_pos(node: &N, key: &EntryKey) -> u32 {
-          node.keys()
-              .search(key)
-              .map(|i| i + 1)
-              .unwrap_or_else(|i| i) as u32
-      }
+    fn search_pos(node: &N, key: &EntryKey) -> u32 {
+        node.keys()
+            .search(key)
+            .map(|i| i + 1)
+            .unwrap_or_else(|i| i) as u32
+    }
 
-      fn search<'a>(&self, node: &N, key: &EntryKey, ht: u32) -> Option<Id> {
-          if ht == 0 { // persist page
-              unreachable!();
-          } else {
-              let index = Self::search_pos(node, key);
-              match &node.delimiters().get(index as usize) {
-                  Some(Delimiter::External(ref id)) => {
-                      assert_eq!(ht, 1);
-                      // search in leaf page
-                      let page = self.get_page(id);
-                      let search_result = page
-                          .lock()
-                          .keys()
-                          .search(key);
-                      let index = if let Ok(i) = search_result { i } else { return None };
-                      match &node.delimiters().get(index) {
-                          Some(Delimiter::External(id)) => return Some(*id),
-                          Some(Delimiter::Internal(_)) => panic!("Error on leaf delimiter type"),
-                          None => panic!("Error on leaf delimiter is none"),
-                          _ => unreachable!()
-                      };
-                  },
-                  Some(Delimiter::Internal(node)) => {
-                      let node: &N = node.borrow();
-                      return self.search(node, key, ht - 1);
-                  },
-                  None => return None,
-                  _ => unreachable!()
-              }
-          }
-      }
-     fn insert(&mut self, key: &EntryKey, value: &Id) {
-         let mut root = self.root_mut();
-         let height = self.get_height();
-         if let Some(new_node) = self.put(root, key, height) {
-             let seed_key = new_node.keys().index_of(0).clone();
-             let original_root = mem::replace(root, unsafe { mem::uninitialized() });
-             let deli1 = Delimiter::Internal(box original_root);
-             let deli2 = Delimiter::Internal(box new_node);
-             let mut new_root = N::construct(seed_key, deli1, deli2);
-             *self.root_mut() = new_root;
-         }
-     }
-     fn put<'a>(&self, node: &mut N, key: &EntryKey, ht: u32) -> Option<N> {
-         let index = Self::search_pos(node, key);
-         if ht == 0 {
-             unreachable!()
-         } else if ht == 1 {
-             let id = match node.delimiters().get(index as usize) {
-                 Some(Delimiter::External(id)) => *id,
-                 _ => unreachable!()
-             };
-             let page_ref = self.get_page(&id);
-             let mut page = page_ref.lock();
-             let page_pos = match page.keys().search(key) {
-                 Ok(_) => return None,
-                 Err(i) => i
-             } as u32;
-             if let Some(new_page) = page.add(page_pos, key.clone(), Delimiter::None) {
-                 return node.add(
-                     index + 1,
-                     page.keys().first().clone(),
-                     Delimiter::External(page.persist_id));
-             }
-         } else {
-             let new_node = {
-                 let mut next_node = match node.mut_delimiter(index) {
-                     Delimiter::Internal(ref mut n) => n,
-                     _ => unreachable!()
-                 };
-                 match self.put(&mut next_node, key, ht + 1) {
-                     None => return None,
-                     Some(n) => n
-                 }
-             };
-             return node.add(
-                 index + 1,
-                 new_node.keys().first().clone(),
-                 Delimiter::Internal(box new_node));
-         }
-         return None;
-     }
- }
+    fn search<'a>(&self, node: &N, key: &EntryKey, ht: u32) -> Option<Id> {
+        if ht == 0 { // persist page
+            unreachable!();
+        } else {
+            let index = Self::search_pos(node, key);
+            match &node.delimiters().get(index as usize) {
+                Some(Delimiter::External(ref id)) => {
+                    assert_eq!(ht, 1);
+                    // search in leaf page
+                    let page = self.get_page(id);
+                    let search_result = page
+                        .lock()
+                        .keys()
+                        .search(key);
+                    let index = if let Ok(i) = search_result { i } else { return None };
+                    match &node.delimiters().get(index) {
+                        Some(Delimiter::External(id)) => return Some(*id),
+                        Some(Delimiter::Internal(_)) => panic!("Error on leaf delimiter type"),
+                        None => panic!("Error on leaf delimiter is none"),
+                        _ => unreachable!()
+                    };
+                },
+                Some(Delimiter::Internal(node)) => {
+                    let node: &N = node.borrow();
+                    return self.search(node, key, ht - 1);
+                },
+                None => return None,
+                _ => unreachable!()
+            }
+        }
+    }
+    fn insert(&mut self, key: &EntryKey, value: &Id) {
+        let mut root = self.root_mut();
+        let height = self.get_height();
+        if let Some(new_node) = self.put(root, key, height) {
+            let seed_key = new_node.keys().index_of(0).clone();
+            let original_root = mem::replace(root, unsafe { mem::uninitialized() });
+            let deli1 = Delimiter::Internal(box original_root);
+            let deli2 = Delimiter::Internal(box new_node);
+            let mut new_root = N::construct(seed_key, deli1, deli2);
+            *self.root_mut() = new_root;
+        }
+    }
+    fn put<'a>(&self, node: &mut N, key: &EntryKey, ht: u32) -> Option<N> {
+        let index = Self::search_pos(node, key);
+        if ht == 0 {
+            unreachable!()
+        } else if ht == 1 {
+            let id = match node.delimiters().get(index as usize) {
+                Some(Delimiter::External(id)) => *id,
+                _ => unreachable!()
+            };
+            let page_ref = self.get_page(&id);
+            let mut page = page_ref.lock();
+            let page_pos = match page.keys().search(key) {
+                Ok(_) => return None,
+                Err(i) => i
+            } as u32;
+            if let Some(new_page) = page.add(page_pos, key.clone(), Delimiter::None) {
+                return node.add(
+                    index + 1,
+                    page.keys().first().clone(),
+                    Delimiter::External(page.persist_id));
+            }
+        } else {
+            let new_node = {
+                let mut next_node = match node.mut_delimiter(index) {
+                    Delimiter::Internal(ref mut n) => n,
+                    _ => unreachable!()
+                };
+                match self.put(&mut next_node, key, ht + 1) {
+                    None => return None,
+                    Some(n) => n
+                }
+            };
+            return node.add(
+                index + 1,
+                new_node.keys().first().clone(),
+                Delimiter::Internal(box new_node));
+        }
+        return None;
+    }
+}
 
 enum Delimiter<N> {
     External(Id), // to leaf
