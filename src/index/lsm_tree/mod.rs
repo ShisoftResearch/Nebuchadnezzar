@@ -108,7 +108,16 @@ pub struct LSMTree {
           }
       }
      fn insert(&mut self, key: &EntryKey, value: &Id) {
-         unimplemented!()
+         let mut root = self.root_mut();
+         let height = self.get_height();
+         if let Some(new_node) = self.put(root, key, height) {
+             let seed_key = new_node.keys().index_of(0).clone();
+             let original_root = mem::replace(root, unsafe { mem::uninitialized() });
+             let deli1 = Delimiter::Internal(box original_root);
+             let deli2 = Delimiter::Internal(box new_node);
+             let mut new_root = N::construct(seed_key, deli1, deli2);
+             *self.root_mut() = new_root;
+         }
      }
      fn put<'a>(&self, node: &mut N, key: &EntryKey, ht: u32) -> Option<N> {
          let index = Self::search_pos(node, key);
@@ -238,6 +247,8 @@ trait Node : Sized {
     fn del(&mut self, pos: u32);
     #[inline]
     fn merge(&mut self, x: Self);
+    #[inline]
+    fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self;
 }
 
 struct CachedExtNode<N> {
@@ -291,6 +302,10 @@ impl <N> Node for CachedExtNode<N> {
         self.keys.append(&mut x.keys);
         self.ids.append(&mut x.ids);
     }
+
+    fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
+        unreachable!() // should always construct from cell
+    }
 }
 
 impl <N> Delimiters<CachedExtNode<N>> for Vec<Delimiter<N>> {}
@@ -342,7 +357,7 @@ trait SliceNode : Node + Sized {
     #[inline]
     fn moving_keys(slice: &mut [EntryKey]) -> Self::K;
 
-    fn construct(keys: Self::K, delimiters: Self::D, len: u32) -> Self;
+    fn construct_slice(keys: Self::K, delimiters: Self::D, len: u32) -> Self;
 
     fn insert_to_slice<V>(slice: &mut [V], val: V, pos: u32, len: u32) {
         for i in (pos..len).rev() {
@@ -402,7 +417,7 @@ trait SliceNode : Node + Sized {
             };
             self.set_len(len1);
 
-            return Some(Self::construct(keys_2, delis_2, len2))
+            return Some(Self::construct_slice(keys_2, delis_2, len2))
         } else {
             Self::insert_to_slice(self.keys_mut(), key, len, capacity);
             Self::insert_to_slice(self.delimiters_mut(), delimiter, len + 1, capacity + 1);
@@ -525,6 +540,16 @@ macro_rules! impl_nodes {
                     fn merge(&mut self, x: Self) {
                         self.slice_merge(x)
                     }
+                    fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
+                        let mut keys: LEntryKeys = unsafe { mem::uninitialized() };
+                        let mut delimiters: LDelimiters = unsafe { mem::uninitialized() };
+
+                        keys[0] = seed_key;
+                        delimiters[0] = seed_delimiter_1;
+                        delimiters[1] = seed_delimiter_2;
+
+                        Self::construct_slice(keys, delimiters, 1)
+                    }
                 }
 
                 impl SliceNode for LNode {
@@ -572,7 +597,7 @@ macro_rules! impl_nodes {
                         return k;
                     }
 
-                    fn construct(keys: Self::K, delimiters: Self::D, len: u32) -> Self {
+                    fn construct_slice(keys: Self::K, delimiters: Self::D, len: u32) -> Self {
                         LNode { keys, delimiters, len }
                     }
                 }
