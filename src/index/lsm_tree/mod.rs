@@ -12,7 +12,7 @@ use dovahkiin::types::custom_types::map::key_hash;
 use dovahkiin::types::value::{ValueIter};
 use dovahkiin::types::{Value, PrimitiveArray};
 use utils::lru_cache::LRUCache;
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 use std::io::Cursor;
 use std::ops::Index;
 use std::cmp::Ordering;
@@ -100,8 +100,8 @@ trait BPlusTree<N> where N: Node {
                     };
                 },
                 Some(Delimiter::Internal(node)) => {
-                    let node = node.borrow();
-                    return self.search(node, key, ht - 1);
+                    let node = node.read();
+                    return self.search(node.borrow(), key, ht - 1);
                 },
                 None => return None,
                 _ => unreachable!()
@@ -114,8 +114,8 @@ trait BPlusTree<N> where N: Node {
         if let Some(new_node) = self.put(root, key, height) {
             let seed_key = new_node.keys().index_of(0).clone();
             let original_root = mem::replace(root, unsafe { mem::uninitialized() });
-            let deli1 = Delimiter::Internal(box original_root);
-            let deli2 = Delimiter::Internal(box new_node);
+            let deli1 = Delimiter::Internal(Arc::new(RwLock::new(original_root)));
+            let deli2 = Delimiter::Internal(Arc::new(RwLock::new(new_node)));
             let mut new_root = N::construct(seed_key, deli1, deli2);
             *root = new_root;
         }
@@ -141,10 +141,10 @@ trait BPlusTree<N> where N: Node {
         } else {
             let new_node = {
                 let mut next_node = match node.mut_delimiter(index) {
-                    Delimiter::Internal(ref mut n) => n.borrow_mut(),
+                    Delimiter::Internal(ref n) => n.write(),
                     _ => unreachable!()
                 };
-                match self.put(next_node, key, ht + 1) {
+                match self.put(next_node.borrow_mut(), key, ht + 1) {
                     None => return None,
                     Some(n) => n
                 }
@@ -152,7 +152,7 @@ trait BPlusTree<N> where N: Node {
             return node.add(
                 index + 1,
                 new_node.keys().first().clone(),
-                Delimiter::Internal(box new_node));
+                Delimiter::Internal(Arc::new(RwLock::new(new_node))));
         }
         return None;
     }
@@ -198,7 +198,7 @@ trait BPlusTree<N> where N: Node {
 
 enum Delimiter<N> {
     External(Id), // to leaf
-    Internal(Box<N>), // to higher level node
+    Internal(Arc<RwLock<N>>), // to higher level node
     None
 }
 
@@ -683,9 +683,9 @@ fn external_id<N>(node: &N, index: u32) -> Id where N: Node {
     }
 }
 
-fn internal_node<N>(node: &mut N, index: u32) -> &mut N where N: Node {
+fn internal_node<N>(node: &mut N, index: u32) -> RwLockWriteGuard<N> where N: Node {
     match node.mut_delimiter(index) {
-        Delimiter::Internal(ref mut n) => n.borrow_mut(),
+        Delimiter::Internal(ref n) => n.write(),
         _ => unreachable!()
     }
 }
