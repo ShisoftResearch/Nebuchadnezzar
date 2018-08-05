@@ -188,13 +188,10 @@ trait BPlusTree<N> where N: Node {
     }
     fn balance_nodes(&self, node: &mut N, index: u32) {
         if node.len() <= self.page_size() / 2 {
-            // need to merge / relocate with page spouse
-            // we will merge the node with right or left spouse
-//            let left_node: CachedExtNode<> = node.
-//            if index >= self.page_size() - 1 {
-//                // the page is at right most, merge with left one
-//
-//            }
+            // need to rebalance
+            // there are two strategy:
+            // 1. moving remaining node items to left or right nodes that have enough spaces left
+            // 2. when no space left for both left and right node to merge with, this node will extract some items from adjacent
         }
     }
 }
