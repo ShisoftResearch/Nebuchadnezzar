@@ -1,5 +1,5 @@
 use std::rc::{Rc, Weak};
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::borrow::Borrow;
 use dovahkiin::types::custom_types::id::Id;
 use smallvec::SmallVec;
@@ -17,6 +17,7 @@ use std::io::Cursor;
 use std::ops::Index;
 use std::cmp::Ordering;
 use std::mem;
+use std::borrow::BorrowMut;
 
 lazy_static! {
     pub static ref ENTRIES_KEY_HASH : u64 = key_hash("entries");
@@ -99,7 +100,7 @@ trait BPlusTree<N> where N: Node {
                     };
                 },
                 Some(Delimiter::Internal(node)) => {
-                    let node: &N = node.borrow();
+                    let node = node.borrow();
                     return self.search(node, key, ht - 1);
                 },
                 None => return None,
@@ -116,7 +117,7 @@ trait BPlusTree<N> where N: Node {
             let deli1 = Delimiter::Internal(box original_root);
             let deli2 = Delimiter::Internal(box new_node);
             let mut new_root = N::construct(seed_key, deli1, deli2);
-            *self.root_mut() = new_root;
+            *root = new_root;
         }
     }
     fn put<'a>(&self, node: &mut N, key: &EntryKey, ht: u32) -> Option<N> {
@@ -124,10 +125,7 @@ trait BPlusTree<N> where N: Node {
         if ht == 0 {
             unreachable!()
         } else if ht == 1 {
-            let id = match node.delimiters().get(index as usize) {
-                Some(Delimiter::External(id)) => *id,
-                _ => unreachable!()
-            };
+            let id = external_id(node, index);
             let page_ref = self.get_page(&id);
             let mut page = page_ref.lock();
             let page_pos = match page.keys().search(key) {
@@ -143,10 +141,10 @@ trait BPlusTree<N> where N: Node {
         } else {
             let new_node = {
                 let mut next_node = match node.mut_delimiter(index) {
-                    Delimiter::Internal(ref mut n) => n,
+                    Delimiter::Internal(ref mut n) => n.borrow_mut(),
                     _ => unreachable!()
                 };
-                match self.put(&mut next_node, key, ht + 1) {
+                match self.put(next_node, key, ht + 1) {
                     None => return None,
                     Some(n) => n
                 }
@@ -157,6 +155,47 @@ trait BPlusTree<N> where N: Node {
                 Delimiter::Internal(box new_node));
         }
         return None;
+    }
+    fn remove(&mut self, key: &EntryKey) -> Option<()> {
+        unimplemented!()
+    }
+    fn delete(&mut self, node: &mut N, key: &EntryKey, ht: u32) -> Option<()> {
+        let index = Self::search_pos(node, key);
+        if ht == 0 {
+            unreachable!()
+        } else if ht == 1 {
+            let id = external_id(node, index);
+            let page_ref = self.get_page(&id);
+            let mut page = page_ref.lock();
+            let page_pos = match page.keys().search(key) {
+                Ok(i) => i,
+                Err(i) => return None
+            } as u32;
+            page.del(page_pos);
+            self.balance_nodes(node, index);
+            return Some(())
+        } else {
+            {
+                let mut innode = internal_node(node, index);
+                if self.delete(innode.borrow_mut(), key, ht - 1).is_none() {
+                    return None;
+                }
+            }
+            self.balance_nodes(node, index);
+            return Some(());
+        }
+        return None;
+    }
+    fn balance_nodes(&self, node: &mut N, index: u32) {
+        if node.len() <= self.page_size() / 2 {
+            // need to merge / relocate with page spouse
+            // we will merge the node with right or left spouse
+//            let left_node: CachedExtNode<> = node.
+//            if index >= self.page_size() - 1 {
+//                // the page is at right most, merge with left one
+//
+//            }
+        }
     }
 }
 
@@ -236,6 +275,8 @@ impl Keys for Vec<EntryKey> {}
 
 trait Node : Sized {
     #[inline]
+    fn len(&self) -> u32;
+    #[inline]
     fn keys(&self) -> &Keys;
     #[inline]
     fn delimiters(&self) -> &Delimiters<Self>;
@@ -246,7 +287,7 @@ trait Node : Sized {
     #[inline]
     fn del(&mut self, pos: u32);
     #[inline]
-    fn merge(&mut self, x: Self);
+    fn merge(mut x: Self, mut y: Self) -> Self;
     #[inline]
     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self;
 }
@@ -259,6 +300,8 @@ struct CachedExtNode<N> {
 }
 
 impl <N> Node for CachedExtNode<N> {
+    #[inline]
+    fn len(&self) -> u32 { self.keys.len() as u32 }
     #[inline]
     fn keys(&self) -> &Keys {
         &self.keys
@@ -298,9 +341,10 @@ impl <N> Node for CachedExtNode<N> {
         self.ids.remove(pos as usize);
     }
 
-    fn merge(&mut self, mut x: Self) {
-        self.keys.append(&mut x.keys);
-        self.ids.append(&mut x.ids);
+    fn merge(mut x: Self, mut y: Self) -> Self {
+        x.keys.append(&mut y.keys);
+        x.ids.append(&mut y.ids);
+        return x;
     }
 
     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
@@ -419,8 +463,8 @@ trait SliceNode : Node + Sized {
 
             return Some(Self::construct_slice(keys_2, delis_2, len2))
         } else {
-            Self::insert_to_slice(self.keys_mut(), key, len, capacity);
-            Self::insert_to_slice(self.delimiters_mut(), delimiter, len + 1, capacity + 1);
+            Self::insert_to_slice(self.keys_mut(), key, pos, len);
+            Self::insert_to_slice(self.delimiters_mut(), delimiter, pos + 1, len);
             self.set_len(len + 1);
             return None;
         }
@@ -429,7 +473,7 @@ trait SliceNode : Node + Sized {
     fn slice_del(&mut self, pos: u32) {
         let len = self.get_len();
         Self::del_from_slice(self.keys_mut(), pos, len);
-        Self::del_from_slice(self.delimiters_mut(), pos + 1, len + 1);
+        Self::del_from_slice(self.delimiters_mut(), pos, len + 1);
         self.set_len(len - 1);
     }
 
@@ -517,6 +561,10 @@ macro_rules! impl_nodes {
 
                 impl Node for LNode {
                     #[inline]
+                    fn len(&self) -> u32 {
+                        self.len
+                    }
+                    #[inline]
                     fn keys(&self) -> &Keys {
                         &self.keys
                     }
@@ -537,8 +585,9 @@ macro_rules! impl_nodes {
                         self.slice_del(pos)
                     }
                     #[inline]
-                    fn merge(&mut self, x: Self) {
-                        self.slice_merge(x)
+                    fn merge(mut x: Self, mut y: Self) -> Self {
+                        x.slice_merge(y);
+                        return x;
                     }
                     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
                         let mut keys: LEntryKeys = unsafe { mem::uninitialized() };
@@ -628,4 +677,18 @@ impl <N> PartialEq for Delimiter<N> {
 fn id_from_key(key: &EntryKey) -> Id {
     let mut id_cursor = Cursor::new(&key[key.len() - 16 ..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
+}
+
+fn external_id<N>(node: &N, index: u32) -> Id where N: Node {
+    match node.delimiters().get(index as usize) {
+        Some(Delimiter::External(id)) => *id,
+        _ => unreachable!()
+    }
+}
+
+fn internal_node<N>(node: &mut N, index: u32) -> &mut N where N: Node {
+    match node.mut_delimiter(index) {
+        Delimiter::Internal(ref mut n) => n.borrow_mut(),
+        _ => unreachable!()
+    }
 }
