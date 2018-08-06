@@ -27,7 +27,7 @@ lazy_static! {
 }
 
 type EntryKey = SmallVec<[u8; 32]>;
-type CachedExtNodeRef<N> = Arc<Mutex<CachedExtNode<N>>>;
+type CachedExtNodeRef<N> = Arc<RwLock<CachedExtNode<N>>>;
 
 pub struct LSMTree {
     num_levels: u8,
@@ -61,7 +61,7 @@ trait BPlusTree<N> where N: Node {
             v_node.keys.push(EntryKey::from_slice(key.as_slice()));
             v_node.ids.push(Delimiter::External(id));
         }
-        return Arc::new(Mutex::new(v_node));
+        return Arc::new(RwLock::new(v_node));
     }
     fn get_page(&self, id: &Id) -> CachedExtNodeRef<N> {
         self.page_cache().get_or_fetch(id).unwrap().clone()
@@ -88,7 +88,7 @@ trait BPlusTree<N> where N: Node {
                     // search in leaf page
                     let page = self.get_page(id);
                     let search_result = page
-                        .lock()
+                        .read()
                         .keys()
                         .search(key);
                     let index = if let Ok(i) = search_result { i } else { return None };
@@ -127,7 +127,7 @@ trait BPlusTree<N> where N: Node {
         } else if ht == 1 {
             let id = external_id(node, index);
             let page_ref = self.get_page(&id);
-            let mut page = page_ref.lock();
+            let mut page = page_ref.write();
             let page_pos = match page.keys().search(key) {
                 Ok(_) => return None,
                 Err(i) => i
@@ -166,13 +166,13 @@ trait BPlusTree<N> where N: Node {
         } else if ht == 1 {
             let id = external_id(node, index);
             let page_ref = self.get_page(&id);
-            let mut page = page_ref.lock();
+            let mut page = page_ref.write();
             let page_pos = match page.keys().search(key) {
                 Ok(i) => i,
                 Err(i) => return None
             } as u32;
             page.del(page_pos);
-            self.balance_nodes(node, index);
+            self.rebalance_external_nodes(node, index);
             return Some(())
         } else {
             {
@@ -181,17 +181,44 @@ trait BPlusTree<N> where N: Node {
                     return None;
                 }
             }
-            self.balance_nodes(node, index);
+            self.rebalance_internal_nodes(node, index);
             return Some(());
         }
         return None;
     }
-    fn balance_nodes(&self, node: &mut N, index: u32) {
+
+    fn external_node(&self, node: &N, index: u32) -> Option<CachedExtNodeRef<N>> where N: Node {
+        match node.delimiters().get(index as usize) {
+            Some(Delimiter::External(id)) => Some(self.get_page(id)),
+            None => None,
+            _ => unreachable!()
+        }
+    }
+
+    // there are two strategy for rebalancing:
+    // 1. moving remaining node items to left or right nodes that have enough spaces left
+    // 2. when no space left for both left and right node to merge with, this node will extract some items from adjacent
+    fn rebalance_external_nodes(&self, node: &mut N, index: u32) {
         if node.len() <= self.page_size() / 2 {
-            // need to rebalance
-            // there are two strategy:
-            // 1. moving remaining node items to left or right nodes that have enough spaces left
-            // 2. when no space left for both left and right node to merge with, this node will extract some items from adjacent
+            let target_lock = self.external_node(node, index).unwrap();
+            let left_lock = if index > 0 { self.external_node(node, index - 1) } else { None };
+            let right_lock = if index < node.len() { self.external_node(node, index + 1) } else { None };
+            let mut target = target_lock.write();
+            let sibling = {
+                let left = left_lock.as_ref().map(|l| l.write());
+                let right = right_lock.as_ref().map(|l| l.write());
+                let left_children = if let &Some(ref l) = &left { l.len() } else { 0 };
+                let right_children = if let &Some(ref l) = &right { l.len() } else { 0 };
+                if left.is_none() && right.is_none() { panic!() }
+                if left_children == 0 && right_children == 0 {  if left.is_some() { left } else { right } }
+                else { if left_children >= right_children { right } else { left } }
+            }.unwrap();
+
+        }
+    }
+    fn rebalance_internal_nodes(&self, node: &mut N, index: u32) {
+        if node.len() <= self.page_size() / 2 {
+            // let sub_node =
         }
     }
 }
@@ -683,9 +710,9 @@ fn external_id<N>(node: &N, index: u32) -> Id where N: Node {
     }
 }
 
-fn internal_node<N>(node: &mut N, index: u32) -> RwLockWriteGuard<N> where N: Node {
-    match node.mut_delimiter(index) {
-        Delimiter::Internal(ref n) => n.write(),
+fn internal_node<N>(node: &N, index: u32) -> RwLockWriteGuard<N> where N: Node {
+    match node.delimiters().get(index as usize) {
+        Some(Delimiter::Internal(ref n)) => n.write(),
         _ => unreachable!()
     }
 }
