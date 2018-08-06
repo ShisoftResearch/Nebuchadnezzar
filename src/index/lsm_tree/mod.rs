@@ -204,16 +204,29 @@ trait BPlusTree<N> where N: Node {
             let left_lock = if index > 0 { self.external_node(node, index - 1) } else { None };
             let right_lock = if index < node.len() { self.external_node(node, index + 1) } else { None };
             let mut target = target_lock.write();
-            let sibling = {
+            if target.len() == 0 { node.del(index); return; }
+            let mut sibling = {
                 let left = left_lock.as_ref().map(|l| l.write());
                 let right = right_lock.as_ref().map(|l| l.write());
                 let left_children = if let &Some(ref l) = &left { l.len() } else { 0 };
                 let right_children = if let &Some(ref l) = &right { l.len() } else { 0 };
-                if left.is_none() && right.is_none() { panic!() }
-                if left_children == 0 && right_children == 0 {  if left.is_some() { left } else { right } }
+                if left_children == 0 && right_children == 0 {  panic!() }
                 else { if left_children >= right_children { right } else { left } }
             }.unwrap();
+            if sibling.len() < self.page_size() / 2 {
+                // merge
+                if sibling.keys().index_of(0) < target.keys().index_of(0) {
+                    sibling.merge(&mut *target);
+                    node.del(index);
+                } else {
+                    target.merge(&mut *sibling);
+                    node.del(index + 1);
+                }
+                return;
+            } else {
+                // relocate
 
+            }
         }
     }
     fn rebalance_internal_nodes(&self, node: &mut N, index: u32) {
@@ -311,7 +324,7 @@ trait Node : Sized {
     #[inline]
     fn del(&mut self, pos: u32);
     #[inline]
-    fn merge(mut x: Self, mut y: Self) -> Self;
+    fn merge(&mut self, y: &mut Self);
     #[inline]
     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self;
 }
@@ -365,10 +378,9 @@ impl <N> Node for CachedExtNode<N> {
         self.ids.remove(pos as usize);
     }
 
-    fn merge(mut x: Self, mut y: Self) -> Self {
-        x.keys.append(&mut y.keys);
-        x.ids.append(&mut y.ids);
-        return x;
+    fn merge(&mut self, y: &mut Self) {
+        self.keys.append(&mut y.keys);
+        self.ids.append(&mut y.ids);
     }
 
     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
@@ -501,7 +513,7 @@ trait SliceNode : Node + Sized {
         self.set_len(len - 1);
     }
 
-    fn slice_merge(&mut self, mut x: Self) {
+    fn slice_merge(&mut self, x: &mut Self) {
         assert!(self.get_len() + x.get_len() <= Self::capacity());
         for i in 0..x.get_len() {
             let src_i = i as usize;
@@ -609,9 +621,8 @@ macro_rules! impl_nodes {
                         self.slice_del(pos)
                     }
                     #[inline]
-                    fn merge(mut x: Self, mut y: Self) -> Self {
-                        x.slice_merge(y);
-                        return x;
+                    fn merge(&mut self, y: &mut Self)  {
+                        self.slice_merge(y);
                     }
                     fn construct(seed_key: EntryKey, seed_delimiter_1: Delimiter<Self>, seed_delimiter_2: Delimiter<Self>) -> Self {
                         let mut keys: LEntryKeys = unsafe { mem::uninitialized() };
