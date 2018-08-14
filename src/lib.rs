@@ -7,7 +7,7 @@
 #![feature(use_extern_macros)]
 #![feature(integer_atomics)]
 
-#![feature(proc_macro, generators)]
+#![feature(generators)]
 #![feature(box_syntax)]
 
 
@@ -34,7 +34,6 @@ extern crate futures_await as futures;
 extern crate futures_cpupool;
 extern crate linked_hash_map;
 extern crate libc;
-extern crate chashmap;
 extern crate num_cpus;
 extern crate byteorder;
 extern crate crc32c;
@@ -42,6 +41,7 @@ extern crate crc32c;
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
+extern crate owning_ref;
 
 pub mod utils;
 #[macro_use]

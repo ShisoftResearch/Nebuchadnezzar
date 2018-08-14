@@ -4,3 +4,4 @@ pub mod lru_cache;
 
 pub mod rand;
 pub mod stream;
+pub mod chashmap;

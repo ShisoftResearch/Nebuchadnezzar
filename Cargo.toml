@@ -13,7 +13,6 @@ name = "tests"
 libc = "*"
 log = "0.3"
 lazy_static = "*"
-chashmap = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 #bifrost = { path = "../bifrost" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
@@ -25,13 +24,14 @@ serde = "*"
 serde_derive = "*"
 bincode = "*"
 byteorder = "1"
-parking_lot = {version = "0.4", features = ["nightly"]}
+parking_lot = {version = "0.6", features = ["nightly"]}
 rand = "0.3"
 linked-hash-map = "0.4"
 bitflags = "1.0"
 crc32c = "*"
 itertools = "*"
 smallvec = "*"
+owning_ref = "0.3"
 
 futures-cpupool = "0.1"
 futures-await = "0.1"

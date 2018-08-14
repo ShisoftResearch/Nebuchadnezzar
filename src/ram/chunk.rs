@@ -5,7 +5,7 @@ use std::ops::Bound::Included;
 use parking_lot::{Mutex, RwLock};
 use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
 use bifrost::utils::time::get_time;
-use chashmap::{CHashMap, ReadGuard, WriteGuard};
+use utils::chashmap::{CHashMap, ReadGuard, WriteGuard};
 use ram::schema::LocalSchemasCache;
 use ram::types::{Id, Value};
 use ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
