@@ -8,30 +8,36 @@ use std::borrow::Cow;
 use parking_lot::Mutex;
 use std::rc::Rc;
 use core::mem;
+use ram::types::RandValue;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::cell::Ref;
+use std::cell::RefMut;
 
 const ID_SIZE: usize = 16;
 const NUM_NODES: usize = 2048;
 
 type EntryKey = SmallVec<[u8; 32]>;
 type ExtNodeCacheMap = Mutex<LRUCache<Id, ExtNodeCached>>;
+type EntryKeySlice = [EntryKey; NUM_NODES];
+type NodePtr = Box<Node>;
+type NodePointerSlice = [NodePtr; NUM_NODES + 1];
 
 struct InNode {
-    keys: [EntryKey; NUM_NODES],
-    pointers: [Box<Node>; NUM_NODES + 1],
+    keys: EntryKeySlice,
+    pointers: NodePointerSlice,
     len: usize
 }
 
 #[derive(Clone)]
 struct ExtNodeCached {
     id: Id,
-    keys: [EntryKey; NUM_NODES],
+    keys: EntryKeySlice,
     next: Id,
     len: usize,
-    version: u64
+    version: u64,
+    removed: bool,
 }
 
 enum ExtNodeInner {
@@ -48,9 +54,10 @@ pub enum Node {
     Internal(Box<InNode>)
 }
 
-pub struct RTCursor<'a> {
+pub struct RTCursor {
     index: usize,
-    node: &'a ExtNodeCached
+    version: u64,
+    id: Id
 }
 
 pub struct BPlusTree {
@@ -60,13 +67,44 @@ pub struct BPlusTree {
     ext_node_cache: ExtNodeCacheMap
 }
 
+struct ExtNodeSplit {
+    node_2: ExtNodeCached,
+    keys_1_len: usize
+}
+
+struct InNodeKeysSplit {
+    keys_2: EntryKeySlice,
+    keys_1_len: usize,
+    keys_2_len: usize,
+    pivot_key: EntryKey
+}
+
+struct InNodePtrSplit {
+    ptrs_2: NodePointerSlice
+}
+
 impl BPlusTree {
     fn search(&self, node: &Node, key: &EntryKey) -> RTCursor {
-        if node.is_ext() {
-            // is external node
-            let pos = node.search(key, self);
+        let pos = node.search(key, self);
+        match node {
+            &Node::External(ref n) => {
+                // preload page from storage
+                let cached = n.get_cached(self);
+                RTCursor {
+                    index: pos,
+                    version: cached.version,
+                    id: cached.id
+                }
+            },
+            &Node::Internal(ref n) => {
+                let next_node = &n.pointers[pos];
+                self.search(next_node.borrow(), key)
+            }
         }
-        unimplemented!()
+    }
+    fn insert(&mut self, node: &Node, key: &EntryKey) {
+        let pos = node.search(key, self);
+
     }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCached {
         let mut map = self.ext_node_cache.lock();
@@ -85,6 +123,103 @@ impl Node {
             &Node::Internal(ref n) => &n.keys
         }.binary_search(key).unwrap_or_else(|i| i + 1)
     }
+    fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
+        match self {
+            &mut Node::External(ref n) => {
+                let mut cached = n.get_cached_mut(tree);
+                let cached_len = cached.len;
+                if cached_len + 1 >= NUM_NODES {
+                    // need to split
+                    let pivot = cached_len / 2;
+                    let split = {
+                        let cached_next = *&cached.next;
+                        let mut keys_1 = &mut cached.keys;
+                        let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
+                        let mut keys_2_len = cached_len - pivot;
+                        let mut keys_1_len = pivot;
+                        if pos <= pivot {
+                            keys_1.insert_at(key, pos, pivot);
+                            keys_1_len += 1;
+                        } else {
+                            keys_2.insert_at(key, pos - pivot, keys_2_len);
+                            keys_2_len += 1;
+                        }
+                        ExtNodeSplit {
+                            keys_1_len,
+                            node_2: ExtNodeCached {
+                                id: Id::rand(),
+                                keys: keys_2,
+                                next: cached_next,
+                                len: keys_2_len,
+                                version: 0,
+                                removed: false
+                            }
+                        }
+                    };
+                    cached.next = split.node_2.id;
+                    cached.len = split.keys_1_len;
+                    return Some((Node::External(box ExtNode::from_cached(split.node_2)), None));
+
+                } else {
+                    cached.keys.insert_at(key, pos, cached_len);
+                    return None;
+                }
+            },
+            &mut Node::Internal(ref mut n) => {
+                let node_len = n.len;
+                let ptr_len = n.len + 1;
+                if node_len + 1 >= NUM_NODES {
+                    let keys_split = {
+                        let pivot = node_len / 2 + 1;
+                        let mut keys_1 = &mut n.keys;
+                        let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
+                        let mut keys_1_len = pivot - 1; // will not count the pivot
+                        let mut keys_2_len = node_len - pivot;
+                        let pivot_key = keys_1[pivot - 1].to_owned();
+                        if pos <= pivot {
+                            keys_1.insert_at(key, pos, keys_1_len);
+                            keys_1_len += 1;
+                        } else {
+                            keys_2.insert_at(key, pos - pivot, keys_2_len);
+                            keys_2_len += 1;
+                        }
+                        InNodeKeysSplit {
+                            keys_2, keys_1_len, keys_2_len, pivot_key
+                        }
+                    };
+                    let ptr_split = {
+                        let pivot = ptr_len / 2;
+                        let mut ptrs_1 = &mut n.pointers;
+                        let mut ptrs_2 = ptrs_1.split_at_pivot(pivot, ptr_len);
+                        let mut ptrs_1_len = pivot;
+                        let mut ptrs_2_len = ptr_len - pivot;
+                        if pos <= pivot {
+                            ptrs_1.insert_at(ptr.unwrap(), pos, ptrs_1_len);
+                            ptrs_1_len += 1;
+                        } else {
+                            ptrs_2.insert_at(ptr.unwrap(), pos - pivot, ptrs_2_len);
+                            ptrs_2_len += 1;
+                        }
+                        assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                        assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                        InNodePtrSplit { ptrs_2 }
+                    };
+                    let node_2 = InNode {
+                        len: keys_split.keys_2_len,
+                        keys: keys_split.keys_2,
+                        pointers: ptr_split.ptrs_2
+                    };
+                    n.len = keys_split.keys_1_len;
+                    return Some((Node::Internal(box node_2), Some(keys_split.pivot_key)));
+                } else {
+                    n.keys.insert_at(key, pos, node_len);
+                    n.pointers.insert_at(ptr.unwrap(), pos + 1, node_len + 1);
+                    n.len += 1;
+                    return None;
+                }
+            }
+        }
+    }
     fn is_ext(&self) -> bool {
         match self {
             &Node::Internal(_) => false,
@@ -94,6 +229,16 @@ impl Node {
 }
 
 impl ExtNode {
+    fn from_id(id: Id) -> Self {
+        Self {
+            inner: RefCell::new(ExtNodeInner::Pointer(id))
+        }
+    }
+    fn from_cached(cached: ExtNodeCached) -> Self {
+        Self {
+            inner: RefCell::new(ExtNodeInner::Cached(cached))
+        }
+    }
     fn get_cached(&self, tree: &BPlusTree) -> Ref<'_, ExtNodeCached> {
         let id = {
             let inner = self.inner.borrow();
@@ -107,6 +252,20 @@ impl ExtNode {
         };
         *self.inner.borrow_mut() = ExtNodeInner::Cached(tree.get_ext_node_cached(&id));
         return self.get_cached(tree);
+    }
+    fn get_cached_mut(&self, tree: &BPlusTree) -> RefMut<'_, ExtNodeCached> {
+        let id = {
+            let inner = self.inner.borrow_mut();
+            if inner.is_cached() {
+                return RefMut::map(inner, |r| if let ExtNodeInner::Cached(c) = r {
+                    return c
+                } else { unreachable!() })
+            } else {
+                inner.get_id()
+            }
+        };
+        *self.inner.borrow_mut() = ExtNodeInner::Cached(tree.get_ext_node_cached(&id));
+        return self.get_cached_mut(tree);
     }
 }
 
@@ -126,6 +285,15 @@ impl ExtNodeInner {
     }
 }
 
+impl ExtNodeCached {
+    fn persist(&self) {
+
+    }
+    fn update(&self) {
+
+    }
+}
+
 fn id_from_key(key: &EntryKey) -> Id {
     let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE ..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
@@ -134,6 +302,43 @@ fn id_from_key(key: &EntryKey) -> Id {
 fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
     return prefix.as_slice() == &x[.. x.len() - ID_SIZE];
 }
+
+trait Slice<T> : Sized {
+    fn as_slice(&mut self) -> &mut [T];
+    fn init() -> Self;
+    fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
+        let mut right_slice = Self::init();
+        {
+            let mut slice1: &mut[T] = self.as_slice();
+            let mut slice2: &mut[T] = right_slice.as_slice();
+            for i in pivot .. len { // leave pivot to the left slice
+                slice2[i - pivot] = mem::replace(
+                    &mut slice1[i],
+                    unsafe { mem::uninitialized() });
+            }
+        }
+        return right_slice;
+    }
+    fn insert_at(&mut self, item: T, pos: usize, len: usize) {
+        let slice = self.as_slice();
+        for i in len .. pos {
+            slice[i] = mem::replace(&mut slice[i - 1], unsafe { mem::uninitialized() });
+        }
+        slice[pos] = item;
+    }
+}
+
+macro_rules! impl_slice_ops {
+    ($t: ty, $et: ty) => {
+        impl Slice<$et> for $t {
+            fn as_slice(&mut self) -> &mut [$et] { self }
+            fn init() -> Self { unsafe { mem::uninitialized() } }
+        }
+    };
+}
+
+impl_slice_ops!(EntryKeySlice, EntryKey);
+impl_slice_ops!(NodePointerSlice, NodePtr);
 
 mod test {
     use std::mem::size_of;
