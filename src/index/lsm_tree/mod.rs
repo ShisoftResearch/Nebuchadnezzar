@@ -61,7 +61,7 @@ pub struct RTCursor {
 }
 
 pub struct BPlusTree {
-    root: Node,
+    root: RefCell<Node>,
     num_nodes: usize,
     height: usize,
     ext_node_cache: ExtNodeCacheMap
@@ -84,6 +84,9 @@ struct InNodePtrSplit {
 }
 
 impl BPlusTree {
+    pub fn seek(&self, key: &EntryKey) -> RTCursor {
+        return self.search(&self.root.borrow(), key);
+    }
     fn search(&self, node: &Node, key: &EntryKey) -> RTCursor {
         let pos = node.search(key, self);
         match node {
@@ -102,9 +105,45 @@ impl BPlusTree {
             }
         }
     }
-    fn insert(&mut self, node: &Node, key: &EntryKey) {
-        let pos = node.search(key, self);
+    pub fn insert(&mut self, mut key: EntryKey, id: Id) {
+        let id_bytes = id.to_binary();
+        key.extend_from_slice(&id_bytes);
 
+        if let Some((new_node, pivotKey)) = self.insert_to_node(&mut *self.root.borrow_mut(), key) {
+            // split root
+            let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
+            let new_root = InNode {
+                keys: unsafe{ mem::uninitialized() },
+                pointers: unsafe{ mem::uninitialized() },
+                len: 1
+            };
+            let old_root = mem::replace(&mut *self.root.borrow_mut(), Node::Internal(box new_root));
+            if let &mut Node::Internal(ref mut new_root) = &mut *self.root.borrow_mut() {
+                new_root.keys[0] = pivot;
+                new_root.pointers[0] = box old_root;
+                new_root.pointers[1] = box new_node;
+            } else { unreachable!() }
+        }
+    }
+    fn insert_to_node(&self, node: &mut Node, key: EntryKey) -> Option<(Node, Option<EntryKey>)> {
+        let pos = node.search(&key, self);
+        let split_node = match node {
+            &mut Node::External(_) => {
+                return node.insert(key, None, pos, self)
+            },
+            &mut Node::Internal(ref mut n) => {
+                let next_node = &mut n.pointers[pos];
+                self.insert_to_node(next_node.as_mut(), key)
+            }
+        };
+        match split_node {
+            Some((new_node, pivotKey)) => {
+                assert!(!(!new_node.is_ext() && pivotKey.is_none()));
+                let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
+                return node.insert(pivot, Some(box new_node), pos + 1, self)
+            },
+            None => return None
+        }
     }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCached {
         let mut map = self.ext_node_cache.lock();
@@ -135,15 +174,13 @@ impl Node {
                         let cached_next = *&cached.next;
                         let mut keys_1 = &mut cached.keys;
                         let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
-                        let mut keys_2_len = cached_len - pivot;
                         let mut keys_1_len = pivot;
-                        if pos <= pivot {
-                            keys_1.insert_at(key, pos, pivot);
-                            keys_1_len += 1;
-                        } else {
-                            keys_2.insert_at(key, pos - pivot, keys_2_len);
-                            keys_2_len += 1;
-                        }
+                        let mut keys_2_len = cached_len - pivot;
+                        insert_into_split(
+                            key,
+                            keys_1, &mut keys_2,
+                            &mut keys_1_len, &mut keys_2_len,
+                            pos, pivot);
                         ExtNodeSplit {
                             keys_1_len,
                             node_2: ExtNodeCached {
@@ -176,13 +213,11 @@ impl Node {
                         let mut keys_1_len = pivot - 1; // will not count the pivot
                         let mut keys_2_len = node_len - pivot;
                         let pivot_key = keys_1[pivot - 1].to_owned();
-                        if pos <= pivot {
-                            keys_1.insert_at(key, pos, keys_1_len);
-                            keys_1_len += 1;
-                        } else {
-                            keys_2.insert_at(key, pos - pivot, keys_2_len);
-                            keys_2_len += 1;
-                        }
+                        insert_into_split(
+                            key,
+                            keys_1, &mut keys_2,
+                            &mut keys_1_len, &mut keys_2_len,
+                            pos, pivot);
                         InNodeKeysSplit {
                             keys_2, keys_1_len, keys_2_len, pivot_key
                         }
@@ -193,13 +228,11 @@ impl Node {
                         let mut ptrs_2 = ptrs_1.split_at_pivot(pivot, ptr_len);
                         let mut ptrs_1_len = pivot;
                         let mut ptrs_2_len = ptr_len - pivot;
-                        if pos <= pivot {
-                            ptrs_1.insert_at(ptr.unwrap(), pos, ptrs_1_len);
-                            ptrs_1_len += 1;
-                        } else {
-                            ptrs_2.insert_at(ptr.unwrap(), pos - pivot, ptrs_2_len);
-                            ptrs_2_len += 1;
-                        }
+                        insert_into_split(
+                            ptr.unwrap(),
+                            ptrs_1, &mut ptrs_2,
+                            &mut ptrs_1_len, &mut ptrs_2_len,
+                            pos, pivot);
                         assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
                         assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
                         InNodePtrSplit { ptrs_2 }
@@ -224,6 +257,12 @@ impl Node {
         match self {
             &Node::Internal(_) => false,
             &Node::External(_) => true
+        }
+    }
+    fn first_key(&self, tree: &BPlusTree) -> EntryKey {
+        match self {
+            &Node::Internal(ref n) => n.keys[0].to_owned(),
+            &Node::External(ref n) => n.get_cached(tree).keys[0].to_owned()
         }
     }
 }
@@ -301,6 +340,23 @@ fn id_from_key(key: &EntryKey) -> Id {
 
 fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
     return prefix.as_slice() == &x[.. x.len() - ID_SIZE];
+}
+
+fn insert_into_split<T, S>(
+    item: T,
+    x: &mut S, y: &mut S,
+    xlen: &mut usize, ylen: &mut usize,
+    pos: usize, pivot: usize
+)
+    where S: Slice<T>
+{
+    if pos <= pivot {
+        x.insert_at(item, pos, *xlen);
+        *xlen += 1;
+    } else {
+        y.insert_at(item, pos - pivot, *ylen);
+        *ylen += 1;
+    }
 }
 
 trait Slice<T> : Sized {
