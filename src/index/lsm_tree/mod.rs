@@ -105,10 +105,8 @@ impl BPlusTree {
             }
         }
     }
-    pub fn insert(&mut self, mut key: EntryKey, id: Id) {
-        let id_bytes = id.to_binary();
-        key.extend_from_slice(&id_bytes);
-
+    pub fn insert(&mut self, mut key: EntryKey, id: &Id) {
+        key_with_id(&mut key, id);
         if let Some((new_node, pivotKey)) = self.insert_to_node(&mut *self.root.borrow_mut(), key) {
             // split root
             let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
@@ -145,6 +143,22 @@ impl BPlusTree {
             None => return None
         }
     }
+    fn remove(&self, key: &EntryKey, id: &Id) {
+        unimplemented!()
+    }
+    fn remove_from_node(&self, node: &mut Node, key: &EntryKey) {
+        let pos = node.search(key, self);
+        match node {
+            &mut Node::External(_) => return node.remove(key, pos, self),
+            &mut Node::Internal(ref mut n) => {
+                let mut child_node = &mut n.pointers[pos];
+                self.remove_from_node(&mut child_node.borrow_mut(), key);
+//                if child_node.len < NUM_NODES / 2 {
+//                    unimplemented!()
+//                }
+            }
+        }
+    }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCached {
         let mut map = self.ext_node_cache.lock();
         return map.get_or_fetch(id).unwrap().clone();
@@ -165,91 +179,20 @@ impl Node {
     fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
         match self {
             &mut Node::External(ref n) => {
-                let mut cached = n.get_cached_mut(tree);
-                let cached_len = cached.len;
-                if cached_len + 1 >= NUM_NODES {
-                    // need to split
-                    let pivot = cached_len / 2;
-                    let split = {
-                        let cached_next = *&cached.next;
-                        let mut keys_1 = &mut cached.keys;
-                        let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
-                        let mut keys_1_len = pivot;
-                        let mut keys_2_len = cached_len - pivot;
-                        insert_into_split(
-                            key,
-                            keys_1, &mut keys_2,
-                            &mut keys_1_len, &mut keys_2_len,
-                            pos, pivot);
-                        ExtNodeSplit {
-                            keys_1_len,
-                            node_2: ExtNodeCached {
-                                id: Id::rand(),
-                                keys: keys_2,
-                                next: cached_next,
-                                len: keys_2_len,
-                                version: 0,
-                                removed: false
-                            }
-                        }
-                    };
-                    cached.next = split.node_2.id;
-                    cached.len = split.keys_1_len;
-                    return Some((Node::External(box ExtNode::from_cached(split.node_2)), None));
-
-                } else {
-                    cached.keys.insert_at(key, pos, cached_len);
-                    return None;
-                }
+                n.insert(key, pos, tree)
             },
             &mut Node::Internal(ref mut n) => {
-                let node_len = n.len;
-                let ptr_len = n.len + 1;
-                if node_len + 1 >= NUM_NODES {
-                    let keys_split = {
-                        let pivot = node_len / 2 + 1;
-                        let mut keys_1 = &mut n.keys;
-                        let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
-                        let mut keys_1_len = pivot - 1; // will not count the pivot
-                        let mut keys_2_len = node_len - pivot;
-                        let pivot_key = keys_1[pivot - 1].to_owned();
-                        insert_into_split(
-                            key,
-                            keys_1, &mut keys_2,
-                            &mut keys_1_len, &mut keys_2_len,
-                            pos, pivot);
-                        InNodeKeysSplit {
-                            keys_2, keys_1_len, keys_2_len, pivot_key
-                        }
-                    };
-                    let ptr_split = {
-                        let pivot = ptr_len / 2;
-                        let mut ptrs_1 = &mut n.pointers;
-                        let mut ptrs_2 = ptrs_1.split_at_pivot(pivot, ptr_len);
-                        let mut ptrs_1_len = pivot;
-                        let mut ptrs_2_len = ptr_len - pivot;
-                        insert_into_split(
-                            ptr.unwrap(),
-                            ptrs_1, &mut ptrs_2,
-                            &mut ptrs_1_len, &mut ptrs_2_len,
-                            pos, pivot);
-                        assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
-                        assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
-                        InNodePtrSplit { ptrs_2 }
-                    };
-                    let node_2 = InNode {
-                        len: keys_split.keys_2_len,
-                        keys: keys_split.keys_2,
-                        pointers: ptr_split.ptrs_2
-                    };
-                    n.len = keys_split.keys_1_len;
-                    return Some((Node::Internal(box node_2), Some(keys_split.pivot_key)));
-                } else {
-                    n.keys.insert_at(key, pos, node_len);
-                    n.pointers.insert_at(ptr.unwrap(), pos + 1, node_len + 1);
-                    n.len += 1;
-                    return None;
-                }
+                n.insert(key, ptr, pos)
+            }
+        }
+    }
+    fn remove(&mut self, key: &EntryKey, pos: usize, tree: &BPlusTree) {
+        match self {
+            &mut Node::Internal(ref mut n) => {
+                n.remove(pos)
+            },
+            &mut Node::External(ref n) => {
+                n.remove(pos, tree)
             }
         }
     }
@@ -306,6 +249,50 @@ impl ExtNode {
         *self.inner.borrow_mut() = ExtNodeInner::Cached(tree.get_ext_node_cached(&id));
         return self.get_cached_mut(tree);
     }
+    fn remove(&self, pos: usize, tree: &BPlusTree) {
+        let mut cached = self.get_cached_mut(tree);
+        let cached_len = cached.len;
+        cached.keys.remove_at(pos, cached_len);
+        cached.len -= 1;
+    }
+    fn insert(&self, key: EntryKey, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
+        let mut cached = self.get_cached_mut(tree);
+        let cached_len = cached.len;
+        if cached_len + 1 >= NUM_NODES {
+            // need to split
+            let pivot = cached_len / 2;
+            let split = {
+                let cached_next = *&cached.next;
+                let mut keys_1 = &mut cached.keys;
+                let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
+                let mut keys_1_len = pivot;
+                let mut keys_2_len = cached_len - pivot;
+                insert_into_split(
+                    key,
+                    keys_1, &mut keys_2,
+                    &mut keys_1_len, &mut keys_2_len,
+                    pos, pivot);
+                ExtNodeSplit {
+                    keys_1_len,
+                    node_2: ExtNodeCached {
+                        id: Id::rand(),
+                        keys: keys_2,
+                        next: cached_next,
+                        len: keys_2_len,
+                        version: 0,
+                        removed: false
+                    }
+                }
+            };
+            cached.next = split.node_2.id;
+            cached.len = split.keys_1_len;
+            return Some((Node::External(box ExtNode::from_cached(split.node_2)), None));
+
+        } else {
+            cached.keys.insert_at(key, pos, cached_len);
+            return None;
+        }
+    }
 }
 
 impl ExtNodeInner {
@@ -330,6 +317,64 @@ impl ExtNodeCached {
     }
     fn update(&self) {
 
+    }
+}
+
+impl InNode {
+    fn remove(&mut self, pos: usize) {
+        let n_len = self.len;
+        self.keys.remove_at(pos, n_len);
+        self.pointers.remove_at(pos + 1, n_len + 1);
+        self.len -= 1;
+    }
+    fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize) -> Option<(Node, Option<EntryKey>)> {
+        let node_len = self.len;
+        let ptr_len = self.len + 1;
+        if node_len + 1 >= NUM_NODES {
+            let keys_split = {
+                let pivot = node_len / 2 + 1;
+                let mut keys_1 = &mut self.keys;
+                let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
+                let mut keys_1_len = pivot - 1; // will not count the pivot
+                let mut keys_2_len = node_len - pivot;
+                let pivot_key = keys_1[pivot - 1].to_owned();
+                insert_into_split(
+                    key,
+                    keys_1, &mut keys_2,
+                    &mut keys_1_len, &mut keys_2_len,
+                    pos, pivot);
+                InNodeKeysSplit {
+                    keys_2, keys_1_len, keys_2_len, pivot_key
+                }
+            };
+            let ptr_split = {
+                let pivot = ptr_len / 2;
+                let mut ptrs_1 = &mut self.pointers;
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot, ptr_len);
+                let mut ptrs_1_len = pivot;
+                let mut ptrs_2_len = ptr_len - pivot;
+                insert_into_split(
+                    ptr.unwrap(),
+                    ptrs_1, &mut ptrs_2,
+                    &mut ptrs_1_len, &mut ptrs_2_len,
+                    pos, pivot);
+                assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                InNodePtrSplit { ptrs_2 }
+            };
+            let node_2 = InNode {
+                len: keys_split.keys_2_len,
+                keys: keys_split.keys_2,
+                pointers: ptr_split.ptrs_2
+            };
+            self.len = keys_split.keys_1_len;
+            return Some((Node::Internal(box node_2), Some(keys_split.pivot_key)));
+        } else {
+            self.keys.insert_at(key, pos, node_len);
+            self.pointers.insert_at(ptr.unwrap(), pos + 1, node_len + 1);
+            self.len += 1;
+            return None;
+        }
     }
 }
 
@@ -359,6 +404,11 @@ fn insert_into_split<T, S>(
     }
 }
 
+fn key_with_id(key: &mut EntryKey, id: &Id) {
+    let id_bytes = id.to_binary();
+    key.extend_from_slice(&id_bytes);
+}
+
 trait Slice<T> : Sized {
     fn as_slice(&mut self) -> &mut [T];
     fn init() -> Self;
@@ -376,11 +426,19 @@ trait Slice<T> : Sized {
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: usize) {
+        assert!(pos < len);
         let slice = self.as_slice();
         for i in len .. pos {
             slice[i] = mem::replace(&mut slice[i - 1], unsafe { mem::uninitialized() });
         }
         slice[pos] = item;
+    }
+    fn remove_at(&mut self, pos: usize, len: usize) {
+        if pos >= len - 1 { return; }
+        let slice  = self.as_slice();
+        for i in pos .. len - 1 {
+            slice[i] = mem::replace(&mut slice[i + 1], unsafe { mem::uninitialized() });
+        }
     }
 }
 
