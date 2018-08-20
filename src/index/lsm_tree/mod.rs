@@ -14,6 +14,7 @@ use std::cell::RefCell;
 use std::ops::Deref;
 use std::cell::Ref;
 use std::cell::RefMut;
+use std::cmp::{max, min};
 
 const ID_SIZE: usize = 16;
 const NUM_NODES: usize = 2048;
@@ -21,7 +22,7 @@ const NUM_NODES: usize = 2048;
 type EntryKey = SmallVec<[u8; 32]>;
 type ExtNodeCacheMap = Mutex<LRUCache<Id, ExtNodeCached>>;
 type EntryKeySlice = [EntryKey; NUM_NODES];
-type NodePtr = Box<Node>;
+type NodePtr = RefCell<Node>;
 type NodePointerSlice = [NodePtr; NUM_NODES + 1];
 
 struct InNode {
@@ -101,7 +102,7 @@ impl BPlusTree {
             },
             &Node::Internal(ref n) => {
                 let next_node = &n.pointers[pos];
-                self.search(next_node.borrow(), key)
+                self.search(&next_node.borrow(), key)
             }
         }
     }
@@ -118,8 +119,8 @@ impl BPlusTree {
             let old_root = mem::replace(&mut *self.root.borrow_mut(), Node::Internal(box new_root));
             if let &mut Node::Internal(ref mut new_root) = &mut *self.root.borrow_mut() {
                 new_root.keys[0] = pivot;
-                new_root.pointers[0] = box old_root;
-                new_root.pointers[1] = box new_node;
+                new_root.pointers[0] = RefCell::new(old_root);
+                new_root.pointers[1] = RefCell::new(new_node);
             } else { unreachable!() }
         }
     }
@@ -130,15 +131,15 @@ impl BPlusTree {
                 return node.insert(key, None, pos, self)
             },
             &mut Node::Internal(ref mut n) => {
-                let next_node = &mut n.pointers[pos];
-                self.insert_to_node(next_node.as_mut(), key)
+                let mut next_node = n.pointers[pos].borrow_mut();
+                self.insert_to_node(&mut *next_node, key)
             }
         };
         match split_node {
             Some((new_node, pivotKey)) => {
                 assert!(!(!new_node.is_ext() && pivotKey.is_none()));
                 let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
-                return node.insert(pivot, Some(box new_node), pos + 1, self)
+                return node.insert(pivot, Some(RefCell::new(new_node)), pos + 1, self)
             },
             None => return None
         }
@@ -147,16 +148,34 @@ impl BPlusTree {
         unimplemented!()
     }
     fn remove_from_node(&self, node: &mut Node, key: &EntryKey) {
-        let pos = node.search(key, self);
-        match node {
-            &mut Node::External(_) => return node.remove(key, pos, self),
-            &mut Node::Internal(ref mut n) => {
-                let mut child_node = &mut n.pointers[pos];
-                self.remove_from_node(&mut child_node.borrow_mut(), key);
-//                if child_node.len < NUM_NODES / 2 {
-//                    unimplemented!()
-//                }
+        let key_pos = node.search(key, self);
+        if let &mut Node::Internal(ref mut n) = node {
+            let pointer_pos = key_pos + 1;
+            self.remove_from_node(&mut *n.pointers[pointer_pos].borrow_mut(), key);
+            if n.pointers[pointer_pos].borrow().is_half_full(self) {
+                // need to rebalance
+                let cand_key_pos = n.rebalance_candidate(key_pos, self);
+                let cand_ptr_pos = cand_key_pos + 1;
+                if n.pointers[cand_ptr_pos].borrow().cannot_merge(self) {
+                    // relocate
+                } else {
+                    // merge
+                    let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
+                    let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
+                    {
+                        let mut left_node = &mut *n.pointers[left_ptr_pos].borrow_mut();
+                        let mut right_node = &mut *n.pointers[right_ptr_pos].borrow_mut();
+                        let mut left_innode = left_node.innode();
+                        let mut right_innode = right_node.innode();
+                        let right_key = right_innode.keys[cand_key_pos].clone();
+                        left_innode.merge_with(right_innode, right_key);
+                    }
+                    n.remove(right_ptr_pos - 1);
+                }
             }
+            unimplemented!()
+        } else if let &mut Node::External(ref n) = node {
+            return n.remove(key_pos, self);
         }
     }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCached {
@@ -186,7 +205,7 @@ impl Node {
             }
         }
     }
-    fn remove(&mut self, key: &EntryKey, pos: usize, tree: &BPlusTree) {
+    fn remove(&mut self, pos: usize, tree: &BPlusTree) {
         match self {
             &mut Node::Internal(ref mut n) => {
                 n.remove(pos)
@@ -206,6 +225,24 @@ impl Node {
         match self {
             &Node::Internal(ref n) => n.keys[0].to_owned(),
             &Node::External(ref n) => n.get_cached(tree).keys[0].to_owned()
+        }
+    }
+    fn len(&self, tree: &BPlusTree) -> usize {
+        match self {
+            &Node::Internal(ref n) => n.len,
+            &Node::External(ref n) => n.get_cached(tree).len
+        }
+    }
+    fn is_half_full(&self, tree: &BPlusTree) -> bool {
+        self.len(tree) >= NUM_NODES / 2
+    }
+    fn cannot_merge(&self, tree: &BPlusTree) -> bool {
+        self.len(tree) >= NUM_NODES / 2 - 1
+    }
+    fn innode(&mut self) -> &mut InNode {
+        match self {
+            &mut Node::Internal(ref mut n) => n.borrow_mut(),
+            _ => unreachable!()
         }
     }
 }
@@ -327,7 +364,9 @@ impl InNode {
         self.pointers.remove_at(pos + 1, n_len + 1);
         self.len -= 1;
     }
-    fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize) -> Option<(Node, Option<EntryKey>)> {
+    fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize)
+        -> Option<(Node, Option<EntryKey>)>
+    {
         let node_len = self.len;
         let ptr_len = self.len + 1;
         if node_len + 1 >= NUM_NODES {
@@ -374,6 +413,35 @@ impl InNode {
             self.pointers.insert_at(ptr.unwrap(), pos + 1, node_len + 1);
             self.len += 1;
             return None;
+        }
+    }
+    fn rebalance_candidate(&self, key_pos: usize, tree: &BPlusTree) -> usize {
+        if key_pos == self.len - 1 {
+            // the last one, pick left
+            return key_pos - 1;
+        } else {
+            // pick the one with least pointers
+            let left = key_pos - 1;
+            let right = key_pos + 1;
+            if self.pointers[left + 1].borrow().len(tree) <= self.pointers[right + 1].borrow().len(tree) {
+                return left
+            } else {
+                return right;
+            }
+        }
+    }
+    fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
+        let mut self_len = self.len;
+        let new_len = self_len + right.len + 1;
+        assert!(new_len <= self.keys.len());
+        // moving keys
+        self.keys[self_len] = right_key;
+        self_len += 1;
+        for i in self_len .. new_len {
+            self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], unsafe { mem::uninitialized() });
+        }
+        for i in self_len .. new_len + 1 {
+            self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], unsafe { mem::uninitialized() });
         }
     }
 }
