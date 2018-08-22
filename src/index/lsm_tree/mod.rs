@@ -503,7 +503,7 @@ impl InNode {
             if i < half_full_pos {
                 new_right_ptrs[i] = ptr_owned;
             } else {
-                new_right_ptrs[i - half_full_pos] = ptr_owned;
+                new_left_ptrs[i - half_full_pos] = ptr_owned;
             }
         }
 
