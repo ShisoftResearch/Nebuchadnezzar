@@ -7,7 +7,6 @@ use parking_lot::RwLock;
 use std::borrow::Cow;
 use parking_lot::Mutex;
 use std::rc::Rc;
-use core::mem;
 use ram::types::RandValue;
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -15,15 +14,18 @@ use std::ops::Deref;
 use std::cell::Ref;
 use std::cell::RefMut;
 use std::cmp::{max, min};
+use std::ptr;
+use std::mem;
 
 const ID_SIZE: usize = 16;
-const NUM_NODES: usize = 2048;
+const NUM_KEYS: usize = 2048;
+const NUM_PTRS: usize = NUM_KEYS + 1;
 
 type EntryKey = SmallVec<[u8; 32]>;
 type ExtNodeCacheMap = Mutex<LRUCache<Id, ExtNodeCached>>;
-type EntryKeySlice = [EntryKey; NUM_NODES];
+type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePtr = RefCell<Node>;
-type NodePointerSlice = [NodePtr; NUM_NODES + 1];
+type NodePointerSlice = [NodePtr; NUM_PTRS];
 
 struct InNode {
     keys: EntryKeySlice,
@@ -52,7 +54,8 @@ struct ExtNode {
 
 pub enum Node {
     External(Box<ExtNode>),
-    Internal(Box<InNode>)
+    Internal(Box<InNode>),
+    None
 }
 
 pub struct RTCursor {
@@ -84,6 +87,18 @@ struct InNodePtrSplit {
     ptrs_2: NodePointerSlice
 }
 
+macro_rules! make_array {
+    ($n: expr, $constructor:expr) => {
+        unsafe {
+            let mut items: [_; $n] = mem::uninitialized();
+            for (i, place) in items.iter_mut().enumerate() {
+                ptr::write(place, $constructor);
+            }
+            items
+        }
+    };
+}
+
 impl BPlusTree {
     pub fn seek(&self, key: &EntryKey) -> RTCursor {
         return self.search(&self.root.borrow(), key);
@@ -103,7 +118,8 @@ impl BPlusTree {
             &Node::Internal(ref n) => {
                 let next_node = &n.pointers[pos];
                 self.search(&next_node.borrow(), key)
-            }
+            },
+            &Node::None => unreachable!()
         }
     }
     pub fn insert(&mut self, mut key: EntryKey, id: &Id) {
@@ -112,8 +128,8 @@ impl BPlusTree {
             // split root
             let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
             let new_root = InNode {
-                keys: unsafe{ mem::uninitialized() },
-                pointers: unsafe{ mem::uninitialized() },
+                keys: make_array!(NUM_KEYS, EntryKey::default()),
+                pointers: make_array!(NUM_PTRS, NodePtr::default()),
                 len: 1
             };
             let old_root = mem::replace(&mut *self.root.borrow_mut(), Node::Internal(box new_root));
@@ -133,7 +149,8 @@ impl BPlusTree {
             &mut Node::Internal(ref mut n) => {
                 let mut next_node = n.pointers[pos].borrow_mut();
                 self.insert_to_node(&mut *next_node, key)
-            }
+            },
+            &mut Node::None => unreachable!()
         };
         match split_node {
             Some((new_node, pivotKey)) => {
@@ -156,24 +173,17 @@ impl BPlusTree {
                 // need to rebalance
                 let cand_key_pos = n.rebalance_candidate(key_pos, self);
                 let cand_ptr_pos = cand_key_pos + 1;
+                let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
+                let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
                 if n.pointers[cand_ptr_pos].borrow().cannot_merge(self) {
                     // relocate
+                    n.rebalance_children(left_ptr_pos, right_ptr_pos);
                 } else {
                     // merge
-                    let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
-                    let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
-                    {
-                        let mut left_node = &mut *n.pointers[left_ptr_pos].borrow_mut();
-                        let mut right_node = &mut *n.pointers[right_ptr_pos].borrow_mut();
-                        let mut left_innode = left_node.innode();
-                        let mut right_innode = right_node.innode();
-                        let right_key = right_innode.keys[cand_key_pos].clone();
-                        left_innode.merge_with(right_innode, right_key);
-                    }
+                    n.merge_children(left_ptr_pos, right_ptr_pos, cand_key_pos);
                     n.remove(right_ptr_pos - 1);
                 }
             }
-            unimplemented!()
         } else if let &mut Node::External(ref n) = node {
             return n.remove(key_pos, self);
         }
@@ -186,14 +196,14 @@ impl BPlusTree {
 
 impl Node {
     fn search(&self, key: &EntryKey, tree: &BPlusTree) -> usize {
-        let mut cached_ref = unsafe { mem::uninitialized() };
         match self {
             &Node::External(ref n) => {
-                cached_ref = n.get_cached(tree);
-                &cached_ref.keys
+                let cached_ref = n.get_cached(tree);
+                cached_ref.keys.binary_search(key).unwrap_or_else(|i| i + 1)
             },
-            &Node::Internal(ref n) => &n.keys
-        }.binary_search(key).unwrap_or_else(|i| i + 1)
+            &Node::Internal(ref n) => n.keys.binary_search(key).unwrap_or_else(|i| i + 1),
+            &Node::None => unreachable!()
+        }
     }
     fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
         match self {
@@ -202,7 +212,8 @@ impl Node {
             },
             &mut Node::Internal(ref mut n) => {
                 n.insert(key, ptr, pos)
-            }
+            },
+            &mut Node::None => unreachable!()
         }
     }
     fn remove(&mut self, pos: usize, tree: &BPlusTree) {
@@ -212,32 +223,36 @@ impl Node {
             },
             &mut Node::External(ref n) => {
                 n.remove(pos, tree)
-            }
+            },
+            &mut Node::None => unreachable!()
         }
     }
     fn is_ext(&self) -> bool {
         match self {
             &Node::Internal(_) => false,
-            &Node::External(_) => true
+            &Node::External(_) => true,
+            &Node::None => unreachable!()
         }
     }
     fn first_key(&self, tree: &BPlusTree) -> EntryKey {
         match self {
             &Node::Internal(ref n) => n.keys[0].to_owned(),
-            &Node::External(ref n) => n.get_cached(tree).keys[0].to_owned()
+            &Node::External(ref n) => n.get_cached(tree).keys[0].to_owned(),
+            &Node::None => unreachable!()
         }
     }
     fn len(&self, tree: &BPlusTree) -> usize {
         match self {
             &Node::Internal(ref n) => n.len,
-            &Node::External(ref n) => n.get_cached(tree).len
+            &Node::External(ref n) => n.get_cached(tree).len,
+            &Node::None => unreachable!()
         }
     }
     fn is_half_full(&self, tree: &BPlusTree) -> bool {
-        self.len(tree) >= NUM_NODES / 2
+        self.len(tree) >= NUM_KEYS / 2
     }
     fn cannot_merge(&self, tree: &BPlusTree) -> bool {
-        self.len(tree) >= NUM_NODES / 2 - 1
+        self.len(tree) >= NUM_KEYS/ 2 - 1
     }
     fn innode(&mut self) -> &mut InNode {
         match self {
@@ -295,7 +310,7 @@ impl ExtNode {
     fn insert(&self, key: EntryKey, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
         let mut cached = self.get_cached_mut(tree);
         let cached_len = cached.len;
-        if cached_len + 1 >= NUM_NODES {
+        if cached_len + 1 >= NUM_KEYS {
             // need to split
             let pivot = cached_len / 2;
             let split = {
@@ -369,7 +384,7 @@ impl InNode {
     {
         let node_len = self.len;
         let ptr_len = self.len + 1;
-        if node_len + 1 >= NUM_NODES {
+        if node_len + 1 >= NUM_KEYS {
             let keys_split = {
                 let pivot = node_len / 2 + 1;
                 let mut keys_1 = &mut self.keys;
@@ -430,19 +445,35 @@ impl InNode {
             }
         }
     }
+    fn merge_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize, cand_key_pos: usize) {
+        let mut left_node = &mut *self.pointers[left_ptr_pos].borrow_mut();
+        let mut right_node = &mut *self.pointers[right_ptr_pos].borrow_mut();
+        let mut left_innode = left_node.innode();
+        let mut right_innode = right_node.innode();
+        let right_key = right_innode.keys[cand_key_pos].clone();
+        left_innode.merge_with(right_innode, right_key);
+    }
     fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         let mut self_len = self.len;
         let new_len = self_len + right.len + 1;
         assert!(new_len <= self.keys.len());
         // moving keys
         self.keys[self_len] = right_key;
+        // TODO: avoid repeatedly default construction
         self_len += 1;
         for i in self_len .. new_len {
-            self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], unsafe { mem::uninitialized() });
+            self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], EntryKey::default());
         }
         for i in self_len .. new_len + 1 {
-            self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], unsafe { mem::uninitialized() });
+            self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], NodePtr::default());
         }
+    }
+    fn rebalance_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
+        let mut left_node = &mut *self.pointers[left_ptr_pos].borrow_mut();
+        let mut right_node = &mut *self.pointers[right_ptr_pos].borrow_mut();
+        let mut left_innode = left_node.innode();
+        let mut right_innode = right_node.innode();
+
     }
 }
 
@@ -461,7 +492,7 @@ fn insert_into_split<T, S>(
     xlen: &mut usize, ylen: &mut usize,
     pos: usize, pivot: usize
 )
-    where S: Slice<T>
+    where S: Slice<T>, T: Default
 {
     if pos <= pivot {
         x.insert_at(item, pos, *xlen);
@@ -477,9 +508,12 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
     key.extend_from_slice(&id_bytes);
 }
 
-trait Slice<T> : Sized {
+trait Slice<T> : Sized where T: Default{
     fn as_slice(&mut self) -> &mut [T];
     fn init() -> Self;
+    fn item_default() -> T {
+        T::default()
+    }
     fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
         let mut right_slice = Self::init();
         {
@@ -488,7 +522,7 @@ trait Slice<T> : Sized {
             for i in pivot .. len { // leave pivot to the left slice
                 slice2[i - pivot] = mem::replace(
                     &mut slice1[i],
-                    unsafe { mem::uninitialized() });
+                    T::default());
             }
         }
         return right_slice;
@@ -497,7 +531,7 @@ trait Slice<T> : Sized {
         assert!(pos < len);
         let slice = self.as_slice();
         for i in len .. pos {
-            slice[i] = mem::replace(&mut slice[i - 1], unsafe { mem::uninitialized() });
+            slice[i] = mem::replace(&mut slice[i - 1], T::default());
         }
         slice[pos] = item;
     }
@@ -505,22 +539,28 @@ trait Slice<T> : Sized {
         if pos >= len - 1 { return; }
         let slice  = self.as_slice();
         for i in pos .. len - 1 {
-            slice[i] = mem::replace(&mut slice[i + 1], unsafe { mem::uninitialized() });
+            slice[i] = mem::replace(&mut slice[i + 1], T::default());
         }
     }
 }
 
 macro_rules! impl_slice_ops {
-    ($t: ty, $et: ty) => {
+    ($t: ty, $et: ty, $n: expr) => {
         impl Slice<$et> for $t {
             fn as_slice(&mut self) -> &mut [$et] { self }
-            fn init() -> Self { unsafe { mem::uninitialized() } }
+            fn init() -> Self { make_array!($n, Self::item_default()) }
         }
     };
 }
 
-impl_slice_ops!(EntryKeySlice, EntryKey);
-impl_slice_ops!(NodePointerSlice, NodePtr);
+impl_slice_ops!(EntryKeySlice, EntryKey, NUM_KEYS);
+impl_slice_ops!(NodePointerSlice, NodePtr, NUM_PTRS);
+
+impl Default for Node {
+    fn default() -> Self {
+        Node::None
+    }
+}
 
 mod test {
     use std::mem::size_of;
