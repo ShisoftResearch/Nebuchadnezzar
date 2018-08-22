@@ -16,6 +16,7 @@ use std::cell::RefMut;
 use std::cmp::{max, min};
 use std::ptr;
 use std::mem;
+use itertools::{Itertools, chain};
 
 const ID_SIZE: usize = 16;
 const NUM_KEYS: usize = 2048;
@@ -91,7 +92,7 @@ macro_rules! make_array {
     ($n: expr, $constructor:expr) => {
         unsafe {
             let mut items: [_; $n] = mem::uninitialized();
-            for (i, place) in items.iter_mut().enumerate() {
+            for place in items.iter_mut() {
                 ptr::write(place, $constructor);
             }
             items
@@ -474,6 +475,44 @@ impl InNode {
         let mut left_innode = left_node.innode();
         let mut right_innode = right_node.innode();
 
+        let mut new_left_keys = EntryKeySlice::init();
+        let mut new_left_ptrs = NodePointerSlice::init();
+
+        let mut new_right_keys = EntryKeySlice::init();
+        let mut new_right_ptrs = NodePointerSlice::init();
+
+        let half_full_pos = NUM_KEYS / 2 + 1;
+        let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
+        for (i, key) in chain(
+            chain(left_innode.keys[..left_innode.len].iter_mut(),[pivot_key].iter_mut()),
+            right_innode.keys[..right_innode.len].iter_mut()
+        ).enumerate() {
+            let key_owned = mem::replace(key, Default::default());
+            if i < half_full_pos {
+                new_left_keys[i] = key_owned;
+            } else {
+                new_right_keys[i - half_full_pos] = key_owned;
+            }
+        }
+
+        for (i, ptr) in chain(
+            left_innode.pointers[..left_innode.len + 1].iter_mut(),
+            right_innode.pointers[..right_innode.len + 1].iter_mut()
+        ).enumerate() {
+            let ptr_owned = mem::replace(ptr, Default::default());
+            if i < half_full_pos {
+                new_right_ptrs[i] = ptr_owned;
+            } else {
+                new_right_ptrs[i - half_full_pos] = ptr_owned;
+            }
+        }
+
+        left_innode.keys = new_left_keys;
+        left_innode.pointers = new_left_ptrs;
+
+        right_innode.keys = new_right_keys;
+        right_innode.pointers = new_right_ptrs;
+        // TODO: update node keys
     }
 }
 
