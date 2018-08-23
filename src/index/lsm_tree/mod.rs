@@ -170,7 +170,13 @@ impl BPlusTree {
         if let &mut Node::Internal(ref mut n) = node {
             let pointer_pos = key_pos + 1;
             self.remove_from_node(&mut *n.pointers[pointer_pos].borrow_mut(), key);
-            if n.pointers[pointer_pos].borrow().is_half_full(self) {
+            if n.pointers[pointer_pos].borrow().len(self) == 0 {
+                // need to remove empty child node
+                // there must be at least one child pointer exists
+                let mut sub_level_pointer = n.pointers[pointer_pos].borrow_mut();
+                let new_ptr = sub_level_pointer.innode().pointers[0].replace(Default::default());
+                mem::replace(&mut *sub_level_pointer, new_ptr);
+            } else if n.pointers[pointer_pos].borrow().is_half_full(self) {
                 // need to rebalance
                 let cand_key_pos = n.rebalance_candidate(key_pos, self);
                 let cand_ptr_pos = cand_key_pos + 1;
@@ -178,7 +184,7 @@ impl BPlusTree {
                 let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
                 if n.pointers[cand_ptr_pos].borrow().cannot_merge(self) {
                     // relocate
-                    n.rebalance_children(left_ptr_pos, right_ptr_pos);
+                    n.relocate_children(left_ptr_pos, right_ptr_pos);
                 } else {
                     // merge
                     n.merge_children(left_ptr_pos, right_ptr_pos);
@@ -469,7 +475,7 @@ impl InNode {
             self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], Default::default());
         }
     }
-    fn rebalance_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
+    fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
         let mut left_node = &mut *self.pointers[left_ptr_pos].borrow_mut();
         let mut right_node = &mut *self.pointers[right_ptr_pos].borrow_mut();
         let mut left_innode = left_node.innode();
