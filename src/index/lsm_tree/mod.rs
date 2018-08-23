@@ -163,19 +163,25 @@ impl BPlusTree {
         }
     }
     fn remove(&self, key: &EntryKey, id: &Id) {
-        unimplemented!()
+        let mut key = key.clone();
+        key_with_id(&mut key, id);
+        let mut root = self.root.borrow_mut();
+        self.remove_from_node(&mut *root, &key);
+        if !root.is_ext() && root.len(self) == 0 {
+            remove_empty_node(root);
+        }
     }
-    fn remove_from_node(&self, node: &mut Node, key: &EntryKey) {
+    fn remove_from_node(&self, node: &mut Node, key: &EntryKey) -> Option<()> {
         let key_pos = node.search(key, self);
         if let &mut Node::Internal(ref mut n) = node {
             let pointer_pos = key_pos + 1;
-            self.remove_from_node(&mut *n.pointers[pointer_pos].borrow_mut(), key);
+            let result = self.remove_from_node(&mut *n.pointers[pointer_pos].borrow_mut(), key);
+            if result.is_none() { return result }
             if n.pointers[pointer_pos].borrow().len(self) == 0 {
                 // need to remove empty child node
                 // there must be at least one child pointer exists
-                let mut sub_level_pointer = n.pointers[pointer_pos].borrow_mut();
-                let new_ptr = sub_level_pointer.innode().pointers[0].replace(Default::default());
-                mem::replace(&mut *sub_level_pointer, new_ptr);
+                let sub_level_pointer = n.pointers[pointer_pos].borrow_mut();
+                remove_empty_node(sub_level_pointer);
             } else if n.pointers[pointer_pos].borrow().is_half_full(self) {
                 // need to rebalance
                 let cand_key_pos = n.rebalance_candidate(key_pos, self);
@@ -191,9 +197,15 @@ impl BPlusTree {
                     n.remove(right_ptr_pos - 1);
                 }
             }
+            return result;
         } else if let &mut Node::External(ref n) = node {
-            return n.remove(key_pos, self);
-        }
+            if &n.get_cached(self).keys[key_pos] == key {
+                n.remove(key_pos, self);
+                return Some(());
+            } else {
+                return None;
+            }
+        } else { unreachable!() }
     }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCached {
         let mut map = self.ext_node_cache.lock();
@@ -562,6 +574,11 @@ fn insert_into_split<T, S>(
 fn key_with_id(key: &mut EntryKey, id: &Id) {
     let id_bytes = id.to_binary();
     key.extend_from_slice(&id_bytes);
+}
+
+fn remove_empty_node(mut sub_level_pointer: RefMut<Node>) {
+    let new_ptr = sub_level_pointer.innode().pointers[0].replace(Default::default());
+    mem::replace(&mut *sub_level_pointer, new_ptr);
 }
 
 trait Slice<T> : Sized where T: Default{
