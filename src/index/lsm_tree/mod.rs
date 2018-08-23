@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use parking_lot::Mutex;
 use std::rc::Rc;
 use ram::types::RandValue;
-use std::cell::Cell;
+use client::AsyncClient;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::cell::Ref;
@@ -16,17 +16,27 @@ use std::cell::RefMut;
 use std::cmp::{max, min};
 use std::ptr;
 use std::mem;
+use std::sync::Arc;
 use itertools::{Itertools, chain};
+use ram::cell::Cell;
+use futures::Future;
+use dovahkiin::types::{Value, PrimitiveArray, key_hash};
 
 const ID_SIZE: usize = 16;
 const NUM_KEYS: usize = 2048;
 const NUM_PTRS: usize = NUM_KEYS + 1;
+const CACHE_SIZE: usize = 2048;
 
 type EntryKey = SmallVec<[u8; 32]>;
 type ExtNodeCacheMap = Mutex<LRUCache<Id, ExtNodeCached>>;
 type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePtr = RefCell<Node>;
 type NodePointerSlice = [NodePtr; NUM_PTRS];
+
+lazy_static! {
+    pub static ref KEYS_KEY_HASH : u64 = key_hash("keys");
+    pub static ref NEXT_PAGE_KEY_HASH : u64 = key_hash("next");
+}
 
 struct InNode {
     keys: EntryKeySlice,
@@ -101,6 +111,19 @@ macro_rules! make_array {
 }
 
 impl BPlusTree {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
+        let neb_client = neb_client.clone();
+        BPlusTree {
+            root: RefCell::new(Node::new_ext_cached()),
+            num_nodes: 0,
+            height: 0,
+            ext_node_cache: Mutex::new(LRUCache::new(CACHE_SIZE, move |id|{
+                neb_client.read_cell(*id).wait().unwrap().map(|cell| {
+                    ExtNodeCached::from_cell(cell)
+                }).ok()
+            }))
+        }
+    }
     pub fn seek(&self, key: &EntryKey) -> RTCursor {
         return self.search(&self.root.borrow(), key);
     }
@@ -154,9 +177,9 @@ impl BPlusTree {
             &mut Node::None => unreachable!()
         };
         match split_node {
-            Some((new_node, pivotKey)) => {
-                assert!(!(!new_node.is_ext() && pivotKey.is_none()));
-                let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(self));
+            Some((new_node, pivot_key)) => {
+                assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                let pivot = pivot_key.unwrap_or_else(|| new_node.first_key(self));
                 return node.insert(pivot, Some(RefCell::new(new_node)), pos + 1, self)
             },
             None => return None
@@ -214,13 +237,16 @@ impl BPlusTree {
 }
 
 impl Node {
+    fn new_ext_cached() -> Self {
+        Node::External(box ExtNode::from_cached(ExtNodeCached::new()))
+    }
     fn search(&self, key: &EntryKey, tree: &BPlusTree) -> usize {
         match self {
             &Node::External(ref n) => {
                 let cached_ref = n.get_cached(tree);
-                cached_ref.keys.binary_search(key).unwrap_or_else(|i| i + 1)
+                cached_ref.keys.binary_search(key).unwrap_or_else(|i| i)
             },
-            &Node::Internal(ref n) => n.keys.binary_search(key).unwrap_or_else(|i| i + 1),
+            &Node::Internal(ref n) => n.keys.binary_search(key).unwrap_or_else(|i| i),
             &Node::None => unreachable!()
         }
     }
@@ -383,6 +409,38 @@ impl ExtNodeInner {
 }
 
 impl ExtNodeCached {
+    fn new() -> Self {
+        ExtNodeCached {
+            id: Id::rand(),
+            keys: EntryKeySlice::init(),
+            next: Id::unit_id(),
+            len: 0,
+            version: 0,
+            removed: false
+        }
+    }
+    fn from_cell(cell: Cell) -> Self {
+        let keys = &cell.data[*KEYS_KEY_HASH];
+        let keys_len = keys.len().unwrap();
+        let mut key_slice = EntryKeySlice::init();
+        let mut key_count = 0;
+        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
+        for (i, key_val) in keys.iter_value().unwrap().enumerate() {
+            let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key_val {
+                EntryKey::from_slice(array.as_slice())
+            } else { panic!("invalid entry") };
+            key_slice[i] = key;
+            key_count += 1;
+        }
+        ExtNodeCached {
+            id: cell.id(),
+            keys: key_slice,
+            next: *next,
+            len: key_count,
+            version: cell.header.version,
+            removed: false
+        }
+    }
     fn persist(&self) {
 
     }
@@ -643,5 +701,10 @@ mod test {
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned.
         assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
+    }
+
+    #[test]
+    fn init_btree() {
+
     }
 }
