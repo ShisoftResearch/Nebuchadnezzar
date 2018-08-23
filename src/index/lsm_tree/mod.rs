@@ -181,7 +181,7 @@ impl BPlusTree {
                     n.rebalance_children(left_ptr_pos, right_ptr_pos);
                 } else {
                     // merge
-                    n.merge_children(left_ptr_pos, right_ptr_pos, cand_key_pos);
+                    n.merge_children(left_ptr_pos, right_ptr_pos);
                     n.remove(right_ptr_pos - 1);
                 }
             }
@@ -446,12 +446,12 @@ impl InNode {
             }
         }
     }
-    fn merge_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize, cand_key_pos: usize) {
+    fn merge_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
         let mut left_node = &mut *self.pointers[left_ptr_pos].borrow_mut();
         let mut right_node = &mut *self.pointers[right_ptr_pos].borrow_mut();
         let mut left_innode = left_node.innode();
         let mut right_innode = right_node.innode();
-        let right_key = right_innode.keys[cand_key_pos].clone();
+        let right_key = right_innode.keys[right_ptr_pos - 1].clone();
         left_innode.merge_with(right_innode, right_key);
     }
     fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
@@ -463,10 +463,10 @@ impl InNode {
         // TODO: avoid repeatedly default construction
         self_len += 1;
         for i in self_len .. new_len {
-            self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], EntryKey::default());
+            self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], Default::default());
         }
         for i in self_len .. new_len + 1 {
-            self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], NodePtr::default());
+            self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], Default::default());
         }
     }
     fn rebalance_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
@@ -483,6 +483,9 @@ impl InNode {
 
         let half_full_pos = NUM_KEYS / 2 + 1;
         let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
+        let mut new_right_node_key = Default::default();
+        let mut new_left_keys_len = 0;
+        let mut new_right_keys_len = 0;
         for (i, key) in chain(
             chain(left_innode.keys[..left_innode.len].iter_mut(),[pivot_key].iter_mut()),
             right_innode.keys[..right_innode.len].iter_mut()
@@ -490,8 +493,13 @@ impl InNode {
             let key_owned = mem::replace(key, Default::default());
             if i < half_full_pos {
                 new_left_keys[i] = key_owned;
+                new_left_keys_len += 1;
+            } else if i == half_full_pos {
+                new_right_node_key = key_owned
             } else {
-                new_right_keys[i - half_full_pos] = key_owned;
+                let nk_index = i - half_full_pos - 1;
+                new_right_keys[nk_index] = key_owned;
+                new_right_keys_len += 1;
             }
         }
 
@@ -509,10 +517,13 @@ impl InNode {
 
         left_innode.keys = new_left_keys;
         left_innode.pointers = new_left_ptrs;
+        left_innode.len = new_left_keys_len;
 
         right_innode.keys = new_right_keys;
         right_innode.pointers = new_right_ptrs;
-        // TODO: update node keys
+        right_innode.len = new_right_keys_len;
+
+        self.keys[right_ptr_pos - 1] = new_right_node_key;
     }
 }
 
