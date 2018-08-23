@@ -20,7 +20,8 @@ use std::sync::Arc;
 use itertools::{Itertools, chain};
 use ram::cell::Cell;
 use futures::Future;
-use dovahkiin::types::{Value, PrimitiveArray, key_hash};
+use dovahkiin::types;
+use dovahkiin::types::{Value, Map, PrimitiveArray, ToValue, key_hash};
 
 const ID_SIZE: usize = 16;
 const NUM_KEYS: usize = 2048;
@@ -36,6 +37,7 @@ type NodePointerSlice = [NodePtr; NUM_PTRS];
 lazy_static! {
     pub static ref KEYS_KEY_HASH : u64 = key_hash("keys");
     pub static ref NEXT_PAGE_KEY_HASH : u64 = key_hash("next");
+    pub static ref PAGE_SCHEMA_ID: u32 = key_hash("BTREE_SCHEMA_ID") as u32;
 }
 
 struct InNode {
@@ -441,8 +443,18 @@ impl ExtNodeCached {
             removed: false
         }
     }
-    fn persist(&self) {
-
+    fn to_cell(&self) -> Cell {
+        let mut value = Value::Map(Map::new());
+        value[*NEXT_PAGE_KEY_HASH] = Value::Id(self.next);
+        value[*KEYS_KEY_HASH] = self
+            .keys[..self.len]
+            .iter()
+            .map(|key| {
+                key.as_slice().to_vec().value()
+            })
+            .collect_vec()
+            .value();
+        Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
     fn update(&self) {
 
