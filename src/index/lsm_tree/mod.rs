@@ -114,16 +114,24 @@ macro_rules! make_array {
 
 impl BPlusTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
-        let neb_client = neb_client.clone();
+        let neb_client_1 = neb_client.clone();
+        let neb_client_2 = neb_client.clone();
         BPlusTree {
             root: RefCell::new(Node::new_ext_cached()),
             num_nodes: 0,
             height: 0,
-            ext_node_cache: Mutex::new(LRUCache::new(CACHE_SIZE, move |id|{
-                neb_client.read_cell(*id).wait().unwrap().map(|cell| {
-                    ExtNodeCached::from_cell(cell)
-                }).ok()
-            }))
+            ext_node_cache:
+            Mutex::new(
+                LRUCache::new(
+                    CACHE_SIZE,
+                    move |id|{
+                        neb_client_1.read_cell(*id).wait().unwrap().map(|cell| {
+                            ExtNodeCached::from_cell(cell)
+                        }).ok()
+                    },
+                    move |_, value| {
+                        neb_client_2.write_cell(value.to_cell()).wait().unwrap().unwrap();
+                    }))
         }
     }
     pub fn seek(&self, key: &EntryKey) -> RTCursor {

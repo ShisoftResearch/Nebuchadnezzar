@@ -87,7 +87,9 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
-
+    pub fn upsert(&self, cell: Cell) -> Result<(), TxnError> {
+        unimplemented!()
+    }
     pub fn prepare(&self) -> Result<(), TxnError> {
         self.state.set(TxnState::Prepared);
         match self.client.prepare(self.tid.to_owned()).wait() {
