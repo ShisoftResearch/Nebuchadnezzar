@@ -1,6 +1,6 @@
 use server::transactions::TxnId;
 use server::transactions::*;
-use ram::cell::{Cell, ReadError, WriteError};
+use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::types::{Id, Value};
 use std::sync::Arc;
 use std::io;
@@ -87,8 +87,23 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e))
         }
     }
+    pub fn head(&self, id: Id) -> Result<Option<CellHeader>, TxnError> {
+        match self.client.head(self.tid.to_owned(), id).wait() {
+            Ok(Ok(TxnExecResult::Accepted(head))) => Ok(Some(head)),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
+            Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
+            Ok(Ok(_)) => Err(TxnError::InternalError),
+            Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
+            Err(e) => Err(TxnError::RPCError(e))
+        }
+    }
     pub fn upsert(&self, cell: Cell) -> Result<(), TxnError> {
-        unimplemented!()
+        match self.head(cell.id()) {
+            Ok(Some(_)) => self.update(cell),
+            Ok(None) => self.write(cell),
+            Err(e) => Err(e)
+        }
     }
     pub fn prepare(&self) -> Result<(), TxnError> {
         self.state.set(TxnState::Prepared);

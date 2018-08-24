@@ -88,6 +88,11 @@ pub fn general() {
                     &vec![String::from("score")]
                 ))?.unwrap();
                 assert_eq!(selected[0].U64().unwrap(), &score);
+
+                let header = txn.head(cell.id())?.unwrap();
+                assert_eq!(header.id(), cell.id());
+                assert!(header.version > 1);
+
                 Ok(())
             }).wait().unwrap();
         }));

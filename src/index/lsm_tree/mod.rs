@@ -130,7 +130,11 @@ impl BPlusTree {
                         }).ok()
                     },
                     move |_, value| {
-                        neb_client_2.write_cell(value.to_cell()).wait().unwrap().unwrap();
+                        let cell = value.to_cell();
+                        neb_client_2.transaction(move |txn| {
+                            let cell_owned = (&cell).to_owned();
+                            txn.upsert(cell_owned)
+                        }).wait().unwrap()
                     }))
         }
     }

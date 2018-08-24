@@ -11,6 +11,7 @@ use futures::{Sink};
 use futures::prelude::{async, await};
 use super::*;
 use utils::stream::PollableStream;
+use ram::cell::CellHeader;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -40,6 +41,7 @@ service! {
     rpc begin() -> TxnId | TMError;
     rpc read(tid: TxnId, id: Id) -> TxnExecResult<Cell, ReadError> | TMError;
     rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> TxnExecResult<Vec<Value>, ReadError> | TMError;
+    rpc head(tid: TxnId, id: Id) -> TxnExecResult<CellHeader, ReadError> | TMError;
     rpc write(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
     rpc update(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
     rpc remove(tid: TxnId, id: Id) -> TxnExecResult<(), WriteError> | TMError;
@@ -96,6 +98,9 @@ impl Service for TransactionManager {
     }
     fn remove(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
         box future::result(self.inner.remove(tid, id))
+    }
+    fn head(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<CellHeader, ReadError>, Error = TMError>> {
+        box TransactionManagerInner::head(self.inner.clone(), tid, id)
     }
     fn prepare(&self, tid: TxnId) -> Box<Future<Item = TMPrepareResult, Error = TMError>> {
         box TransactionManagerInner::prepare(self.inner.clone(), tid)
@@ -182,6 +187,37 @@ impl TransactionManagerInner {
                     _ => {}
                 }
                 Ok(payload_out)
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::RPCErrorFromCellServer)
+            }
+        }
+    }
+    #[async(boxed)]
+    fn head_from_site(
+        this: Arc<Self>, server_id: u64, server: Arc<data_site::AsyncServiceClient>,
+        tid: TxnId, id: Id, mut txn: TxnGuard, await: TxnAwaits
+    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        let self_server_id = this.server.server_id;
+        let head_response = await!(server.head(
+            self_server_id,
+            this.get_clock(),
+            tid.to_owned(), id
+        ));
+        match head_response {
+            Ok(dsr) => {
+                let dsr = dsr.unwrap();
+                this.merge_clock(&dsr.clock);
+                let payload = dsr.payload;
+                match &payload {
+                    &TxnExecResult::Wait => {
+                        await!(AwaitManager::txn_wait(&await, server_id));
+                        return await!(Self::head_from_site(this, server_id, server, tid, id, txn, await));
+                    },
+                    _ => {}
+                }
+                return Ok(payload)
             },
             Err(e) => {
                 error!("{:?}", e);
@@ -452,6 +488,32 @@ impl TransactionManagerInner {
             Ok((server_id, server)) => {
                 let await = this.await_manager.get_txn(&tid);
                 await!(Self::read_from_site(this, server_id, server, tid, id, txn, await))
+            },
+            Err(e) => {
+                error!("{:?}", e);
+                Err(TMError::CannotLocateCellServer)
+            }
+        }
+    }
+
+    #[async]
+    fn head(this: Arc<Self>, tid: TxnId, id: Id)
+        -> Result<TxnExecResult<CellHeader, ReadError>, TMError>
+    {
+        let txn_mutex = this.get_transaction(&tid)?;
+        let txn = txn_mutex.lock();
+        this.ensure_rw_state(&txn)?;
+        if let Some(data_obj) = txn.data.get(&id) {
+            match data_obj.cell {
+                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.header.clone())),
+                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))
+            }
+        }
+        let server = this.get_data_site_by_id(&id);
+        match server {
+            Ok((server_id, server)) => {
+                let await = this.await_manager.get_txn(&tid);
+                await!(Self::head_from_site(this, server_id, server, tid, id, txn, await))
             },
             Err(e) => {
                 error!("{:?}", e);

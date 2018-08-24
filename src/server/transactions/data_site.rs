@@ -3,7 +3,7 @@ use bifrost::utils::time::get_time;
 use std::collections::{BTreeSet, BTreeMap, HashMap};
 use utils::chashmap::{CHashMap, WriteGuard};
 use ram::types::{Id, Value};
-use ram::cell::{Cell, ReadError, WriteError};
+use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use server::NebServer;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::{Mutex, MutexGuard};
@@ -65,6 +65,7 @@ service! {
     rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
     rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>;
     rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
+    rpc head(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
     // two phase commit
     rpc prepare(server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>) -> DataSiteResponse<DMPrepareResult>;
     rpc commit(clock :StandardVectorClock, tid: TxnId, cells: Vec<CommitOp>) -> DataSiteResponse<DMCommitResult>;
@@ -105,6 +106,12 @@ impl Service for DataManager {
     {
         let this = self.inner.clone();
         DataManagerInner::read_partial_raw(this, server_id, clock, tid, id, offset, len)
+    }
+    fn head(&self, server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id)
+        -> Box<Future<Item = DataSiteResponse<TxnExecResult<CellHeader, ReadError>>, Error = ()>>
+    {
+        let this = self.inner.clone();
+        DataManagerInner::head(this, server_id, clock, tid, id)
     }
     fn prepare(&self, server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>)
         -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>>
@@ -319,6 +326,15 @@ impl DataManagerInner {
         if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) { return r; }
         match this.server.chunks.read_selected(&id, &fields[..]) {
             Ok(values) => this.response_with(TxnExecResult::Accepted(values)),
+            Err(read_error) => this.response_with(TxnExecResult::Error(read_error))
+        }
+    }
+    fn head(this: Arc<Self>, server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id)
+        -> Box<Future<Item = DataSiteResponse<TxnExecResult<CellHeader, ReadError>>, Error = ()>>
+    {
+        if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) { return r; }
+        match this.server.chunks.head_cell(&id) {
+            Ok(head) => this.response_with(TxnExecResult::Accepted(head)),
             Err(read_error) => this.response_with(TxnExecResult::Error(read_error))
         }
     }
