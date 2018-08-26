@@ -1,2 +1,2 @@
-mod placement;
-mod lsm_tree;
+pub mod placement;
+pub mod lsm_tree;

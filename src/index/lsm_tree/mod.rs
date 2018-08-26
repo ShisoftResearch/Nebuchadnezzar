@@ -37,6 +37,7 @@ type NodePointerSlice = [NodePtr; NUM_PTRS];
 lazy_static! {
     pub static ref KEYS_KEY_HASH : u64 = key_hash("keys");
     pub static ref NEXT_PAGE_KEY_HASH : u64 = key_hash("next");
+    pub static ref PREV_PAGE_KEY_HASH : u64 = key_hash("prev");
     pub static ref PAGE_SCHEMA_ID: u32 = key_hash("BTREE_SCHEMA_ID") as u32;
 }
 
@@ -51,6 +52,7 @@ struct ExtNodeCached {
     id: Id,
     keys: EntryKeySlice,
     next: Id,
+    prev: Id,
     len: usize,
     version: u64,
     removed: bool,
@@ -65,7 +67,7 @@ struct ExtNode {
     inner: RefCell<ExtNodeInner>
 }
 
-pub enum Node {
+enum Node {
     External(Box<ExtNode>),
     Internal(Box<InNode>),
     None
@@ -116,8 +118,8 @@ impl BPlusTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
-        BPlusTree {
-            root: RefCell::new(Node::new_ext_cached()),
+        let mut tree = BPlusTree {
+            root: RefCell::new(Node::None),
             num_nodes: 0,
             height: 0,
             ext_node_cache:
@@ -136,7 +138,12 @@ impl BPlusTree {
                             txn.upsert(cell_owned)
                         }).wait().unwrap()
                     }))
+        };
+        {
+            let mut tree_root = tree.root.borrow_mut();
+            *tree_root = Node::new_ext_cached(&tree);
         }
+        return tree;
     }
     pub fn seek(&self, key: &EntryKey) -> RTCursor {
         return self.search(&self.root.borrow(), key);
@@ -205,7 +212,7 @@ impl BPlusTree {
         let mut root = self.root.borrow_mut();
         self.remove_from_node(&mut *root, &key);
         if !root.is_ext() && root.len(self) == 0 {
-            remove_empty_node(root);
+            remove_empty_innode_node(root);
         }
     }
     fn remove_from_node(&self, node: &mut Node, key: &EntryKey) -> Option<()> {
@@ -216,10 +223,16 @@ impl BPlusTree {
             if result.is_none() { return result }
             if n.pointers[pointer_pos].borrow().len(self) == 0 {
                 // need to remove empty child node
-                // there must be at least one child pointer exists
-                let sub_level_pointer = n.pointers[pointer_pos].borrow_mut();
-                remove_empty_node(sub_level_pointer);
-            } else if n.pointers[pointer_pos].borrow().is_half_full(self) {
+                if n.pointers[pointer_pos].borrow().is_ext() {
+                    // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
+                    rearrange_empty_extnode(n.pointers[pointer_pos].borrow_mut(), self);
+                    n.remove(pointer_pos);
+                } else {
+                    // empty internal nodes should be replaced with it's only remaining child pointer
+                    // there must be at least one child pointer exists
+                    remove_empty_innode_node(n.pointers[pointer_pos].borrow_mut());
+                }
+            } else if !n.pointers[pointer_pos].borrow().is_half_full(self) {
                 // need to rebalance
                 let cand_key_pos = n.rebalance_candidate(key_pos, self);
                 let cand_ptr_pos = cand_key_pos + 1;
@@ -248,11 +261,15 @@ impl BPlusTree {
         let mut map = self.ext_node_cache.lock();
         return map.get_or_fetch(id).unwrap().clone();
     }
+    fn new_page_id(&self) -> Id {
+        // TODO: achieve locality
+        Id::rand()
+    }
 }
 
 impl Node {
-    fn new_ext_cached() -> Self {
-        Node::External(box ExtNode::from_cached(ExtNodeCached::new()))
+    fn new_ext_cached(tree: &BPlusTree) -> Self {
+        Node::External(box ExtNode::from_cached(ExtNodeCached::new(tree)))
     }
     fn search(&self, key: &EntryKey, tree: &BPlusTree) -> usize {
         match self {
@@ -319,6 +336,12 @@ impl Node {
             _ => unreachable!()
         }
     }
+    fn ext_node(&mut self) -> &mut ExtNode {
+        match self {
+            &mut Node::External(ref mut n) => n.borrow_mut(),
+            _ => unreachable!()
+        }
+    }
 }
 
 impl ExtNode {
@@ -374,6 +397,9 @@ impl ExtNode {
             let pivot = cached_len / 2;
             let split = {
                 let cached_next = *&cached.next;
+                let cached_id = *&cached.id;
+                let new_page_id = tree.new_page_id();
+                cached.next = new_page_id;
                 let mut keys_1 = &mut cached.keys;
                 let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
                 let mut keys_1_len = pivot;
@@ -386,9 +412,10 @@ impl ExtNode {
                 ExtNodeSplit {
                     keys_1_len,
                     node_2: ExtNodeCached {
-                        id: Id::rand(),
+                        id: new_page_id,
                         keys: keys_2,
                         next: cached_next,
+                        prev: cached_id,
                         len: keys_2_len,
                         version: 0,
                         removed: false
@@ -423,11 +450,12 @@ impl ExtNodeInner {
 }
 
 impl ExtNodeCached {
-    fn new() -> Self {
+    fn new(tree: &BPlusTree) -> Self {
         ExtNodeCached {
-            id: Id::rand(),
+            id: tree.new_page_id(),
             keys: EntryKeySlice::init(),
             next: Id::unit_id(),
+            prev: Id::unit_id(),
             len: 0,
             version: 0,
             removed: false
@@ -439,6 +467,7 @@ impl ExtNodeCached {
         let mut key_slice = EntryKeySlice::init();
         let mut key_count = 0;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
+        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         for (i, key_val) in keys.iter_value().unwrap().enumerate() {
             let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key_val {
                 EntryKey::from_slice(array.as_slice())
@@ -450,6 +479,7 @@ impl ExtNodeCached {
             id: cell.id(),
             keys: key_slice,
             next: *next,
+            prev: *prev,
             len: key_count,
             version: cell.header.version,
             removed: false
@@ -658,9 +688,24 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
     key.extend_from_slice(&id_bytes);
 }
 
-fn remove_empty_node(mut sub_level_pointer: RefMut<Node>) {
+fn remove_empty_innode_node(mut sub_level_pointer: RefMut<Node>) {
     let new_ptr = sub_level_pointer.innode().pointers[0].replace(Default::default());
     mem::replace(&mut *sub_level_pointer, new_ptr);
+}
+
+fn rearrange_empty_extnode(mut sub_level_pointer: RefMut<Node>, tree: &BPlusTree) {
+    let node = sub_level_pointer.ext_node();
+    let cached = node.get_cached(tree);
+    let prev = cached.prev;
+    let next = cached.next;
+    if !prev.is_unit_id() {
+        let mut prev_node = tree.get_ext_node_cached(&prev);
+        prev_node.next = next;
+    }
+    if !next.is_unit_id() {
+        let mut next_node = tree.get_ext_node_cached(&next);
+        next_node.prev = prev;
+    }
 }
 
 trait Slice<T> : Sized where T: Default{
@@ -725,10 +770,5 @@ mod test {
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned.
         assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
-    }
-
-    #[test]
-    fn init_btree() {
-
     }
 }

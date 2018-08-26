@@ -15,6 +15,7 @@ mod cell;
 mod transaction;
 mod client;
 mod cleaner;
+mod index;
 
 #[macro_use]
 extern crate log;
