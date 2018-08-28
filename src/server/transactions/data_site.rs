@@ -370,15 +370,8 @@ impl DataManagerInner {
         }
         for cell_mutex in &cell_mutices {
             let mut meta = cell_mutex.lock();
-            if tid < meta.read { // write too late
+            if tid < meta.read || tid < meta.write { // write too late
                 break;
-            }
-            if tid < meta.write {
-                if meta.owner.is_some() { // not committed, should wait and try prepare again
-                    meta.waiting.insert((tid.clone(), server_id));
-                    debug!("-> WRITE {:?} WAITING {:?}", tid, &meta.owner.clone());
-                    return this.response_with(DMPrepareResult::Wait);
-                }
             }
             cell_guards.push(meta);
         }

@@ -90,6 +90,9 @@ impl Service for TransactionManager {
     {
         box TransactionManagerInner::read_selected(self.inner.clone(), tid, id, fields)
     }
+    fn head(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<CellHeader, ReadError>, Error = TMError>> {
+        box TransactionManagerInner::head(self.inner.clone(), tid, id)
+    }
     fn write(&self, tid: TxnId, cell: Cell) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
         box future::result(self.inner.write(tid, cell))
     }
@@ -98,9 +101,6 @@ impl Service for TransactionManager {
     }
     fn remove(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
         box future::result(self.inner.remove(tid, id))
-    }
-    fn head(&self, tid: TxnId, id: Id) -> Box<Future<Item = TxnExecResult<CellHeader, ReadError>, Error = TMError>> {
-        box TransactionManagerInner::head(self.inner.clone(), tid, id)
     }
     fn prepare(&self, tid: TxnId) -> Box<Future<Item = TMPrepareResult, Error = TMError>> {
         box TransactionManagerInner::prepare(self.inner.clone(), tid)

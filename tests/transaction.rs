@@ -193,8 +193,8 @@ pub fn multi_transaction() {
     let cell_1_t2_write = txn.write(txn_2_id.to_owned(), cell_2.to_owned()).wait().unwrap().unwrap();
     txn.prepare(txn_2_id.to_owned()).wait().unwrap().unwrap();
     txn.commit(txn_2_id.to_owned()).wait().unwrap().unwrap();
-    assert_eq!(txn.prepare(txn_1_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
-    assert_eq!(txn.commit(txn_1_id.to_owned()).wait().unwrap().unwrap(), EndResult::Success);
+    assert_ne!(txn.prepare(txn_1_id.to_owned()).wait().unwrap().unwrap(), TMPrepareResult::Success);
+    assert!(txn.commit(txn_1_id.to_owned()).wait().unwrap().is_err());
     ///////////////// PHASE 2 //////////////////
     let txn_1_id = txn.begin().wait().unwrap().unwrap();
     let txn_2_id = txn.begin().wait().unwrap().unwrap();
