@@ -121,7 +121,7 @@ impl BPlusTree {
                 version: extnode.version,
                 id: extnode.id
             })
-        } else if let Node::Internal(n) = *node {
+        } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.pointers[pos];
             self.search(next_node_ref, key, txn, bz)
         } else {
@@ -131,11 +131,17 @@ impl BPlusTree {
     pub fn insert(&self, mut key: EntryKey, id: &Id) {
         key_with_id(&mut key, id);
         self.stm.transaction(|txn| {
+            let key = &key;
             let mut bz = CacheBufferZone::new(self);
-            if let Some((new_node, pivotKey)) = self.insert_to_node(self.root, key, txn, &mut bz)? {
+            if let Some((new_node, pivotKey)) = self.insert_to_node(
+                self.root,
+                key.clone(),
+                txn,
+                &mut bz)? {
                 // split root
+                let first_key = new_node.first_key(&mut bz);
                 let new_node_ref = txn.new_value(new_node);
-                let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(&mut bz));
+                let pivot = pivotKey.unwrap_or_else(|| first_key);
                 let mut new_in_root = InNode {
                     keys: make_array!(NUM_KEYS, Default::default()),
                     pointers: make_array!(NUM_PTRS, Default::default()),
@@ -175,8 +181,9 @@ impl BPlusTree {
         match split_node {
             Some((new_node, pivot_key)) => {
                 assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                let first_key = new_node.first_key(bz);
                 let new_node_ref = txn.new_value(new_node);
-                let pivot = pivot_key.unwrap_or_else(|| new_node.first_key(bz));
+                let pivot = pivot_key.unwrap_or_else(|| first_key);
                 let mut acq_node = txn.read_owned::<Node>(node)?.unwrap();
                 let result = acq_node.insert(
                     pivot,
