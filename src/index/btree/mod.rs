@@ -2,15 +2,9 @@ use smallvec::SmallVec;
 use dovahkiin::types::custom_types::id::Id;
 use utils::lru_cache::LRUCache;
 use std::io::Cursor;
-use std::borrow::{Borrow, BorrowMut};
-use std::borrow::Cow;
 use std::rc::Rc;
 use ram::types::RandValue;
 use client::AsyncClient;
-use std::cell::RefCell;
-use std::ops::Deref;
-use std::cell::Ref;
-use std::cell::RefMut;
 use std::cmp::{max, min};
 use std::ptr;
 use std::mem;
@@ -22,7 +16,9 @@ use dovahkiin::types;
 use dovahkiin::types::{Value, Map, PrimitiveArray, ToValue, key_hash};
 use index::btree::external::*;
 use index::btree::internal::*;
-use parking_lot::RwLock;
+use bifrost::utils::async_locks::RwLock;
+use hermes::stm::{TxnManager, TxnValRef, Txn, TxnErr};
+use bifrost::utils::async_locks::Mutex;
 
 mod internal;
 mod external;
@@ -34,21 +30,13 @@ const CACHE_SIZE: usize = 2048;
 
 type EntryKey = SmallVec<[u8; 32]>;
 type EntryKeySlice = [EntryKey; NUM_KEYS];
-type NodePtr = RefCell<Node>;
-type NodePointerSlice = [NodePtr; NUM_PTRS];
+type NodePointerSlice = [TxnValRef; NUM_PTRS];
 
-
+#[derive(Clone)]
 enum Node {
-    External(Box<Id>),
-    Internal(Box<RwLock<InNode>>),
+    External(Id),
+    Internal(Box<InNode>),
     None
-}
-
-enum AcqNode<'a> {
-    ExternalMut(ExtNodeCachedMut<'a>),
-    ExternalImmut(ExtNodeCachedImmute<'a>),
-    InternalMut(&'a mut InNode),
-    InternalImmut(&'a InNode)
 }
 
 pub struct RTCursor {
@@ -58,10 +46,11 @@ pub struct RTCursor {
 }
 
 pub struct BPlusTree {
-    root: RwLock<Node>,
+    root: TxnValRef,
     num_nodes: usize,
     height: usize,
-    ext_node_cache: ExtNodeCacheMap
+    ext_node_cache: ExtNodeCacheMap,
+    stm: TxnManager,
 }
 
 macro_rules! make_array {
@@ -81,16 +70,17 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: RwLock::new(Node::None),
+            root: Default::default(),
             num_nodes: 0,
             height: 0,
+            stm: txn_manager,
             ext_node_cache:
-            RwLock::new(
+            Mutex::new(
                 LRUCache::new(
                     CACHE_SIZE,
                     move |id|{
                         neb_client_1.read_cell(*id).wait().unwrap().map(|cell| {
-                            RwLock::new(ExtNodeCached::from_cell(cell))
+                            RwLock::new(ExtNode::from_cell(cell))
                         }).ok()
                     },
                     move |_, value| {
@@ -103,112 +93,162 @@ impl BPlusTree {
                     }))
         };
         {
-            let mut tree_root = tree.root.write();
-            *tree_root = tree.new_ext_cached_node();
+            let actual_tree_root = tree.new_ext_cached_node();
+            let root_ref = tree.stm.with_value(actual_tree_root);
+            tree.root = root_ref;
         }
         return tree;
     }
     pub fn seek(&self, key: &EntryKey) -> RTCursor {
-        return self.search(&self.root.borrow().acquire(self), key);
+        return self.stm.transaction(|txn| {
+            let mut bz = CacheBufferZone::new(self);
+            self.search(self.root, key, txn, &mut bz)
+        }).unwrap();
     }
-    fn search(&self, node: &AcqNode, key: &EntryKey) -> RTCursor {
-        let pos = node.search(key);
+    fn search(
+        &self,
+        node: TxnValRef,
+        key: &EntryKey,
+        txn: &mut Txn,
+        bz: &mut CacheBufferZone) -> Result<RTCursor, TxnErr>
+    {
+        let node = txn.read::<Node>(node)?.unwrap();
+        let pos = node.search(key, bz);
         if node.is_ext() {
-            let extnode = node.extnode();
-            RTCursor {
+            let extnode = node.extnode(bz);
+            Ok(RTCursor {
                 index: pos,
                 version: extnode.version,
                 id: extnode.id
-            }
+            })
+        } else if let Node::Internal(n) = *node {
+            let next_node_ref = n.pointers[pos];
+            self.search(next_node_ref, key, txn, bz)
         } else {
-            let next_node = &n.pointers[pos];
-            self.search(&next_node.borrow(), key)
+            unreachable!()
         }
     }
-    pub fn insert(&mut self, mut key: EntryKey, id: &Id) {
+    pub fn insert(&self, mut key: EntryKey, id: &Id) {
         key_with_id(&mut key, id);
-        if let Some((new_node, pivotKey)) = self.insert_to_node(&mut *self.root.borrow_mut(), key) {
-            // split root
-            let acq_new_node = new_node.acquire(self);
-            let pivot = pivotKey.unwrap_or_else(|| acq_new_node.first_key());
-            let new_root = InNode {
-                keys: make_array!(NUM_KEYS, EntryKey::default()),
-                pointers: make_array!(NUM_PTRS, NodePtr::default()),
-                len: 1
-            };
-            let old_root = mem::replace(&mut *self.root.borrow_mut(), Node::Internal(box new_root));
-            if let &mut Node::Internal(ref mut new_root) = &mut *self.root.borrow_mut() {
-                new_root.keys[0] = pivot;
-                new_root.pointers[0] = RefCell::new(old_root);
-                new_root.pointers[1] = RefCell::new(new_node);
-            } else { unreachable!() }
-        }
+        self.stm.transaction(|txn| {
+            let mut bz = CacheBufferZone::new(self);
+            if let Some((new_node, pivotKey)) = self.insert_to_node(self.root, key, txn, &mut bz)? {
+                // split root
+                let new_node_ref = txn.new_value(new_node);
+                let pivot = pivotKey.unwrap_or_else(|| acq_new_node.first_key());
+                let mut new_in_root = InNode {
+                    keys: make_array!(NUM_KEYS, EntryKey::default()),
+                    pointers: make_array!(NUM_PTRS, NodePtr::default()),
+                    len: 1
+                };
+                let old_root = txn.read_owned::<Node>(self.root)?.unwrap();
+                let old_root_ref = txn.new_value(old_root);
+                new_in_root.keys[0] = pivot;
+                new_in_root.pointers[0] = old_root_ref;
+                new_in_root.pointers[1] = new_node_ref;
+                let new_root = Node::Internal(box new_in_root);
+                txn.update(self.root, new_root);
+            }
+            return Ok(bz);
+        }).unwrap().flush();
     }
-    fn insert_to_node(&self, node: &mut Node, key: EntryKey) -> Option<(Node, Option<EntryKey>)> {
-        let mut acq_node = node.acquire_mut(self);
-        let pos = acq_node.search(&key);
-        let split_node = match node {
-            &mut Node::External(_) => {
-                return acq_node.insert(key, None, pos, self)
+    fn insert_to_node(
+        &self,
+        node: TxnValRef,
+        key: EntryKey,
+        txn: &mut Txn,
+        bz: &mut CacheBufferZone
+    ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
+        let mut acq_node = txn.read::<Node>(node)?.unwrap();
+        let pos = acq_node.search(&key, bz);
+        let split_node = match &*acq_node {
+            &Node::External(ref id) => {
+                let node = bz.get_for_mut(id);
+                return Ok(node.insert(key, pos, self));
             },
-            &mut Node::Internal(ref mut n) => {
-                let mut next_node = n.pointers[pos].acquire_mut();
-                self.insert_to_node(next_node.borrow_mut(), key)
+            &Node::Internal(ref n) => {
+                let next_node_ref = n.pointers[pos];
+                self.insert_to_node(next_node_ref, key, txn, bz)?
             },
-            &mut Node::None => unreachable!()
+            &Node::None => unreachable!()
         };
         match split_node {
             Some((new_node, pivot_key)) => {
                 assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                let pivot = pivot_key.unwrap_or_else(|| new_node.first_key(self));
-                return node.insert(pivot, Some(RefCell::new(new_node)), pos + 1, self)
+                let new_node_ref = txn.new_value(new_node);
+                let pivot = pivot_key.unwrap_or_else(|| new_node.first_key(bz));
+                let mut acq_node = txn.read_owned::<Node>(node)?.unwrap();
+                let result = acq_node.insert(
+                    pivot,
+                    Some(new_node_ref),
+                    pos + 1,
+                    self, bz);
+                txn.update(node, acq_node);
+                return Ok(result);
             },
-            None => return None
+            None => return Ok(None)
         }
     }
     fn remove(&self, key: &EntryKey, id: &Id) {
         let mut key = key.clone();
         key_with_id(&mut key, id);
-        let mut root = self.root.borrow_mut();
-        self.remove_from_node(&mut *root, &key);
-        if !root.is_ext() && root.len(self) == 0 {
-            remove_empty_innode_node(root);
-        }
+        self.stm.transaction(|txn| {
+            let mut bz = CacheBufferZone::new(self);
+            self.remove_from_node(self.root, &key, txn, &mut bz)?;
+            if !root.is_ext() && root.len(self) == 0 {
+                remove_empty_innode_node(root);
+            }
+        });
     }
-    fn remove_from_node(&self, node: &mut Node, key: &EntryKey) -> Option<()> {
-        let key_pos = node.search(key, self);
-        if let &mut Node::Internal(ref mut n) = node {
+    fn remove_from_node(
+        &self,
+        node: TxnValRef,
+        key: &EntryKey,
+        txn: &mut Txn,
+        bz: &mut CacheBufferZone
+    ) -> Result<Option<()>, TxnErr> {
+        let node_ref = txn.read::<Node>(node)?.unwrap();
+        let key_pos = node_ref.search(key, bz);
+        if let Node::Internal(n) = &*node_ref {
             let pointer_pos = key_pos + 1;
-            let result = self.remove_from_node(&mut *n.pointers[pointer_pos].borrow_mut(), key);
-            if result.is_none() { return result }
-            let mut acq_node = n.pointers[pointer_pos].acquire_mut();
-            if acq_node.borrow().len(self) == 0 {
-                // need to remove empty child node
-                if acq_node.is_ext() {
-                    // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
-                    rearrange_empty_extnode(acq_node.borrow_mut(), self);
-                    n.remove(pointer_pos);
-                } else {
-                    // empty internal nodes should be replaced with it's only remaining child pointer
-                    // there must be at least one child pointer exists
-                    remove_empty_innode_node(acq_node.borrow_mut());
-                }
-            } else if !acq_node.is_half_full(self) {
-                // need to rebalance
-                let cand_key_pos = n.rebalance_candidate(key_pos, self);
-                let cand_ptr_pos = cand_key_pos + 1;
-                let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
-                let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
-                if acq_node.cannot_merge(self) {
-                    // relocate
-                    n.relocate_children(left_ptr_pos, right_ptr_pos);
-                } else {
-                    // merge
-                    n.merge_children(left_ptr_pos, right_ptr_pos);
-                    n.remove(right_ptr_pos - 1);
+            let result = self.remove_from_node(n.pointers[pointer_pos], key, txn, bz)?;
+            if result.is_none() { return Ok(result) }
+            let sub_node = n.pointers[pointer_pos];
+            let sub_node_ref = txn.read::<Node>(sub_node)?.unwrap();
+            let mut node_owned = txn.read_owned::<Node>(node)?.unwrap();
+            {
+                let mut n = node_owned.innode_mut();
+                if sub_node_ref.len(bz) == 0 {
+                    // need to remove empty child node
+                    if sub_node_ref.is_ext() {
+                        // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
+                        let nid = rearrange_empty_extnode(&*sub_node_ref, bz);
+                        n.remove(pointer_pos);
+                        bz.delete(&nid)
+                    } else {
+                        // empty internal nodes should be replaced with it's only remaining child pointer
+                        // there must be at least one child pointer exists
+                        n.pointers[pointer_pos] = sub_node_ref.innode().pointers[0];
+                    }
+                    txn.delete(sub_node);
+                } else if !sub_node_ref.is_half_full(bz) {
+                    // need to rebalance
+                    let cand_key_pos = n.rebalance_candidate(key_pos, txn, bz)?;
+                    let cand_ptr_pos = cand_key_pos + 1;
+                    let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
+                    let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
+                    if acq_node.cannot_merge(self) {
+                        // relocate
+                        n.relocate_children(left_ptr_pos, right_ptr_pos, txn);
+                    } else {
+                        // merge
+                        n.merge_children(left_ptr_pos, right_ptr_pos);
+                        n.remove(right_ptr_pos - 1);
+                    }
                 }
             }
-            return result;
+            txn.update(node, node_owned);
+            return Ok(result);
         } else if let &mut Node::External(ref n) = node {
             let mut cached_node = &self.get_mut_ext_node_cached(n);
             if &cached_node.keys[key_pos] == key {
@@ -220,11 +260,11 @@ impl BPlusTree {
         } else { unreachable!() }
     }
     fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {
-        let mut map = self.ext_node_cache.read();
+        let mut map = self.ext_node_cache.lock();
         return map.get_or_fetch(id).unwrap().write();
     }
     fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCachedImmute {
-        let mut map = self.ext_node_cache.read();
+        let mut map = self.ext_node_cache.lock();
         return map.get_or_fetch(id).unwrap().read();
     }
     fn new_page_id(&self) -> Id {
@@ -233,103 +273,93 @@ impl BPlusTree {
     }
     fn new_ext_cached_node(&self) -> Node {
         let id = self.new_page_id();
-        let node = ExtNodeCached::new(&id);
-        self.ext_node_cache.write().insert(id, RwLock::new(node));
-        return Node::External(box id);
+        let node = ExtNode::new(&id);
+        self.ext_node_cache.lock().insert(id, RwLock::new(node));
+        return Node::External(id);
     }
 }
 
 impl Node {
-    fn acquire(&self, tree: &BPlusTree) -> AcqNode {
-        match self {
-            &Node::Internal(ref n) => AcqNode::InternalImmut(n),
-            &Node::External(ref n) => AcqNode::ExternalImmut(tree.get_ext_node_cached(n)),
-            _ => unreachable!()
+    fn search(&self, key: &EntryKey, bz: &mut CacheBufferZone) -> usize {
+        if self.is_ext() {
+            self.extnode(bz).keys.binary_search(key).unwrap_or_else(|i| i)
+        } else {
+            self.innode().keys.binary_search(key).unwrap_or_else(|i| i)
         }
     }
-    fn acquire_mut(&mut self, tree: &BPlusTree) -> AcqNode {
-        match self {
-            &mut Node::Internal(ref mut n) => AcqNode::InternalMut(n),
-            &mut Node::External(ref n) => AcqNode::ExternalMut(tree.get_mut_ext_node_cached(n)),
-            _ => unreachable!()
+    fn insert(
+        &mut self,
+        key: EntryKey,
+        ptr: Option<TxnValRef>,
+        pos: usize,
+        tree: &BPlusTree,
+        bz: &mut CacheBufferZone) -> Option<(Node, Option<EntryKey>)>
+    {
+        if let &mut Node::External(ref id) = self {
+            self.extnode_mut(bz).insert(key, pos, tree)
+        } else {
+            self.innode_mut().insert(key, ptr, pos)
         }
     }
-}
-
-impl <'a> AcqNode<'a> {
-    fn keys(&self) -> &EntryKeySlice {
-        &match self {
-            &AcqNode::ExternalImmut(ref n) => n.keys,
-            &AcqNode::ExternalMut(ref n) => n.keys,
-            &AcqNode::InternalImmut(ref n) => n.keys,
-            &AcqNode::InternalMut(ref n) => n.keys,
-        }
-    }
-    fn search(&self, key: &EntryKey) -> usize {
-        self.keys().binary_search(key).unwrap_or_else(|i| i)
-    }
-    fn insert(&mut self, key: EntryKey, ptr: Option<NodePtr>, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
-        match self {
-            &mut AcqNode::ExternalMut(ref mut n) => n.insert(key, pos, tree),
-            &mut AcqNode::InternalMut(ref mut n) => n.insert(key, ptr, pos),
-            _ => unreachable!()
-        }
-    }
-    fn remove(&mut self, pos: usize, tree: &BPlusTree) {
-        match self {
-            &mut AcqNode::ExternalMut(ref mut n) => n.remove(pos, tree),
-            &mut AcqNode::InternalMut(ref mut n) => n.remove(pos),
-            _ => unreachable!()
+    fn remove(&mut self, pos: usize, bz: &mut CacheBufferZone) {
+        if let &mut Node::External(ref id) = self {
+            self.extnode_mut(bz).remove(pos)
+        } else {
+            self.innode_mut().remove(pos)
         }
     }
     fn is_ext(&self) -> bool {
         match self {
-            &AcqNode::ExternalImmut(_) | &AcqNode::ExternalMut(_) => true,
-            &AcqNode::InternalImmut(_) | &AcqNode::InternalMut(ref n) => false
+            &Node::External(_) => true,
+            &Node::Internal(_) => false
         }
     }
-    fn first_key(&self) -> EntryKey {
-        self.keys()[0].to_owned()
-    }
-    fn len(&self) -> usize {
-        match self {
-            &AcqNode::ExternalImmut(ref n) => n.len,
-            &AcqNode::ExternalMut(ref n) => n.len,
-            &AcqNode::InternalImmut(ref n) => n.len,
-            &AcqNode::InternalMut(ref n) => n.len,
+    fn first_key(&self, bz: &mut CacheBufferZone) -> EntryKey {
+        if self.is_ext() {
+            self.extnode(bz).keys[0].to_owned()
+        } else {
+            self.innode().keys[0].to_owned()
         }
     }
-    fn is_half_full(&self) -> bool {
-        self.len() >= NUM_KEYS / 2
+    fn len(&self, bz: &mut CacheBufferZone) -> usize {
+        if self.is_ext() {
+            self.extnode(bz).len
+        } else {
+            self.innode().len
+        }
     }
-    fn cannot_merge(&self, tree: &BPlusTree) -> bool {
-        self.len() >= NUM_KEYS/ 2 - 1
+    fn is_half_full(&self, bz: &mut CacheBufferZone) -> bool {
+        self.len(bz) >= NUM_KEYS / 2
     }
-    fn extnode_mut(&mut self) -> &mut ExtNode {
+    fn cannot_merge(&self, bz: &mut CacheBufferZone) -> bool {
+        self.len(bz) >= NUM_KEYS/ 2 - 1
+    }
+    fn extnode_mut<'a>(&self, bz: &'a mut CacheBufferZone) -> &'a mut ExtNode {
         match self {
-            &mut AcqNode::ExternalMut (ref mut n) => n.borrow_mut(),
+            &Node::External(ref id) => bz.get_for_mut(id),
             _ => unreachable!()
         }
     }
     fn innode_mut(&mut self) -> &mut InNode {
         match self {
-            &mut AcqNode::InternalMut (ref mut n) => n.borrow_mut(),
+            &mut Node::Internal(ref mut n) => n,
             _ => unreachable!()
         }
     }
-    fn extnode(&self) -> &ExtNode {
+    fn extnode<'a>(&self, bz: &'a mut CacheBufferZone) -> &'a ExtNode {
         match self {
-            &AcqNode::ExternalImmut (ref n) => n.borrow(),
+            &Node::External(ref id) => bz.get(id),
             _ => unreachable!()
         }
     }
     fn innode(&self) -> &InNode {
         match self {
-            &AcqNode::InternalImmut (ref n) => n.borrow(),
+            &Node::Internal(ref n) => n,
             _ => unreachable!()
         }
     }
 }
+
 
 fn id_from_key(key: &EntryKey) -> Id {
     let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE ..]);

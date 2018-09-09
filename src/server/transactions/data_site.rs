@@ -349,7 +349,7 @@ impl DataManagerInner {
         }
     }
     fn prepare(this: Arc<Self>, server_id: u64, clock :StandardVectorClock, tid: TxnId, cell_ids: Vec<Id>)
-               -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>>
+        -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>>
     {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id

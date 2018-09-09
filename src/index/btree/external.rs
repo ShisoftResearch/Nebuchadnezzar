@@ -6,11 +6,17 @@ use ram::cell::Cell;
 use std::cell::Ref;
 use std::cell::RefMut;
 use index::btree::*;
-use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
+use bifrost::utils::async_locks::{RwLock, RwLockWriteGuard, RwLockReadGuard, Mutex};
+use std::ops::Deref;
+use std::ops::DerefMut;
+use core::borrow::BorrowMut;
+use dovahkiin::types::value::ToValue;
+use itertools::Itertools;
+use std::collections::BTreeMap;
 
-pub type ExtNodeCacheMap = RwLock<LRUCache<Id, RwLock<ExtNodeCached>>>;
-pub type ExtNodeCachedMut<'a> = RwLockWriteGuard<'a, ExtNodeCached>;
-pub type ExtNodeCachedImmute<'a> = RwLockReadGuard<'a, ExtNodeCached>;
+pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
+pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
+pub type ExtNodeCachedImmute = RwLockReadGuard<ExtNode>;
 
 lazy_static! {
     static ref KEYS_KEY_HASH : u64 = key_hash("keys");
@@ -19,7 +25,8 @@ lazy_static! {
     static ref PAGE_SCHEMA_ID: u32 = key_hash("BTREE_SCHEMA_ID") as u32;
 }
 
-pub struct ExtNodeCached {
+#[derive(Clone)]
+pub struct ExtNode {
     pub id: Id,
     pub keys: EntryKeySlice,
     pub next: Id,
@@ -30,13 +37,13 @@ pub struct ExtNodeCached {
 }
 
 pub struct ExtNodeSplit {
-    pub node_2: ExtNodeCached,
+    pub node_2: ExtNode,
     pub keys_1_len: usize
 }
 
-impl ExtNodeCached {
-    pub fn new(id: &Id) -> ExtNodeCached {
-        ExtNodeCached {
+impl ExtNode {
+    pub fn new(id: &Id) -> ExtNode {
+        ExtNode {
             id: *id,
             keys: EntryKeySlice::init(),
             next: Id::unit_id(),
@@ -60,7 +67,7 @@ impl ExtNodeCached {
             key_slice[i] = key;
             key_count += 1;
         }
-        ExtNodeCached {
+        ExtNode {
             id: cell.id(),
             keys: key_slice,
             next: *next,
@@ -83,7 +90,7 @@ impl ExtNodeCached {
             .value();
         Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
-    pub fn remove(&mut self, pos: usize, tree: &BPlusTree) {
+    pub fn remove(&mut self, pos: usize) {
         let cached_len = self.len;
         self.keys.remove_at(pos, cached_len);
         self.len -= 1;
@@ -110,7 +117,7 @@ impl ExtNodeCached {
                     pos, pivot);
                 ExtNodeSplit {
                     keys_1_len,
-                    node_2: ExtNodeCached {
+                    node_2: ExtNode {
                         id: new_page_id,
                         keys: keys_2,
                         next: cached_next,
@@ -135,17 +142,113 @@ impl ExtNodeCached {
     }
 }
 
-pub fn rearrange_empty_extnode(mut sub_level_pointer: RefMut<Node>, tree: &BPlusTree) {
-    let node = sub_level_pointer.ext_node();
-    let cached = node.get_cached(tree);
-    let prev = cached.prev;
-    let next = cached.next;
+pub fn rearrange_empty_extnode(sub_level_pointer: &Node, bz: &mut CacheBufferZone) -> Id {
+    let node = sub_level_pointer.extnode(bz);
+    let prev = node.prev;
+    let next = node.next;
     if !prev.is_unit_id() {
-        let mut prev_node = tree.get_ext_node_cached(&prev);
+        let mut prev_node = bz.get_for_mut(&prev);
         prev_node.next = next;
     }
     if !next.is_unit_id() {
-        let mut next_node = tree.get_ext_node_cached(&next);
+        let mut next_node = bz.get_for_mut(&next);
         next_node.prev = prev;
+    }
+    return node.id;
+}
+
+#[derive(Clone)]
+pub enum CacheGuardHolder {
+    Read(ExtNodeCachedImmute),
+    Write(ExtNodeCachedMut)
+}
+
+impl Deref for CacheGuardHolder {
+    type Target = ExtNode;
+
+    fn deref(&self) -> &'_ <Self as Deref>::Target {
+        match self {
+            &CacheGuardHolder::Read(l) => &*l,
+            &CacheGuardHolder::Write(l) => &*l,
+        }
+    }
+}
+
+impl DerefMut for CacheGuardHolder {
+    fn deref_mut(&mut self) -> &'_ mut <Self as Deref>::Target {
+        match self {
+            &mut CacheGuardHolder::Write(l) => &mut *l,
+            _ => panic!("")
+        }
+    }
+}
+
+pub struct CacheBufferZone<'a> {
+    tree: &'a BPlusTree,
+    guards: BTreeMap<Id, CacheGuardHolder>,
+    changes: BTreeMap<Id, Option<ExtNode>>
+}
+
+
+impl <'a> CacheBufferZone <'a> {
+    pub fn new(tree: &BPlusTree) -> CacheBufferZone {
+        CacheBufferZone {
+            tree,
+            guards: BTreeMap::new(),
+            changes: BTreeMap::new()
+        }
+    }
+
+    pub fn get(&mut self, id: &Id) -> &ExtNode {
+        match self.changes.get(id) {
+            Some(Some(changed)) => return &*changed,
+            Some(None) => panic!(),
+            _ => {}
+        }
+        if let Some(guard) = self.guards.get(id) {
+            &*guard
+        } else {
+            let guard = self.tree.get_ext_node_cached(id);
+            let holder = CacheGuardHolder::Read(guard);
+            self.guards.insert(*id, holder);
+            self.get(id)
+        }
+    }
+
+    pub fn get_for_mut(&mut self, id: &Id) -> &mut ExtNode {
+        match self.changes.get_mut(id) {
+            Some(Some(ref mut changed)) => return &mut *changed,
+            Some(None) => panic!(),
+            _ => {}
+        }
+        if let Some(guard) = self.guards.get_mut(id) {
+            unreachable!()
+        } else {
+            let guard = self.tree.get_mut_ext_node_cached(id);
+            let holder = CacheGuardHolder::Write(guard);
+            self.changes.insert(*id, Some((*holder).clone()));
+            self.guards.insert(*id, holder);
+            self.get_for_mut(id)
+        }
+    }
+
+    pub fn set(&mut self, id: &Id, data: ExtNode) {
+        self.changes.insert(*id, Some(data));
+    }
+    pub fn delete(&mut self, id: &Id) {
+        self.changes.insert(*id, None);
+    }
+
+    pub fn flush(mut self) {
+        for (id, data) in self.changes {
+            if let Some(node) = data {
+                let mut holder = self.guards.get_mut(&id).unwrap();
+                if let &mut CacheGuardHolder::Write(mut guard) = holder {
+                    *guard = node
+                } else { panic!() }
+            } else {
+                unimplemented!();
+            }
+        }
     }
 }
