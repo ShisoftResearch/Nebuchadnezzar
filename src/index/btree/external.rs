@@ -13,6 +13,7 @@ use core::borrow::BorrowMut;
 use dovahkiin::types::value::ToValue;
 use itertools::Itertools;
 use std::collections::BTreeMap;
+use std::mem;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -130,20 +131,24 @@ impl ExtNode {
             };
             cached.next = split.node_2.id;
             cached.len = split.keys_1_len;
-            return Some((Node::External(box ExtNode::from_cached(split.node_2)), None));
+            return Some((Node::External(cached.id), None));
 
         } else {
             cached.keys.insert_at(key, pos, cached_len);
             return None;
         }
     }
-    pub fn update(&self) {
-
+    pub fn merge_with(&mut self, right: &mut Self) {
+        let self_len = self.len;
+        let new_len = self.len + right.len;
+        assert!(new_len <= self.keys.len());
+        for i in self.len .. new_len {
+            self.keys[i] = mem::replace(&mut right.keys[i - self_len], Default::default());
+        }
     }
 }
 
-pub fn rearrange_empty_extnode(sub_level_pointer: &Node, bz: &mut CacheBufferZone) -> Id {
-    let node = sub_level_pointer.extnode(bz);
+pub fn rearrange_empty_extnode(node: &ExtNode, bz: &mut CacheBufferZone) -> Id {
     let prev = node.prev;
     let next = node.next;
     if !prev.is_unit_id() {
@@ -232,7 +237,7 @@ impl <'a> CacheBufferZone <'a> {
         }
     }
 
-    pub fn set(&mut self, id: &Id, data: ExtNode) {
+    pub fn update(&mut self, id: &Id, data: ExtNode) {
         self.changes.insert(*id, Some(data));
     }
     pub fn delete(&mut self, id: &Id) {

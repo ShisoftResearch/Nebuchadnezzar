@@ -95,23 +95,42 @@ impl InNode {
         } else {
             // pick the one with least pointers
             let left_pos = key_pos - 1;
-            let righ_post = key_pos + 1;
-            let left_node = txn.read::<Node>(self.pointers[left + 1])?.unwrap();
-            let right_node = txn.read::<Node>(self.pointers[right + 1])?.unwrap();
+            let right_pos = key_pos;
+            let left_node = txn.read::<Node>(self.pointers[left_pos + 1])?.unwrap();
+            let right_node = txn.read::<Node>(self.pointers[right_pos + 1])?.unwrap();
             if left_node.len(bz) <= right_node.len(bz) {
-                Ok(left)
+                Ok(left_pos)
             } else {
-                Ok(right)
+                Ok(right_pos)
             }
         }
     }
-    pub fn merge_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
+    pub fn merge_children(
+        &mut self,
+        left_ptr_pos: usize,
+        right_ptr_pos: usize,
+        txn: &mut Txn,
+        bz: &mut CacheBufferZone
+    ) -> Result<(), TxnErr> {
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];
-        let mut left_innode = left_node.innode();
-        let mut right_innode = right_node.innode();
-        let right_key = right_innode.keys[right_ptr_pos - 1].clone();
-        left_innode.merge_with(right_innode, right_key);
+        let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
+        let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
+        assert_eq!(left_node.is_ext(), right_node.is_ext());
+        if !left_node.is_ext() {
+            let mut left_innode = left_node.innode_mut();
+            let mut right_innode = right_node.innode_mut();
+            let right_key = right_innode.keys[right_ptr_pos - 1].clone();
+            left_innode.merge_with(&mut right_innode, right_key);
+            txn.update(left_ref, left_node);
+        } else {
+            let mut left_extnode = left_node.extnode_mut(bz);
+            let mut right_extnode = right_node.extnode_mut(bz);
+            left_extnode.merge_with(right_extnode);
+            bz.delete(&right_extnode.id);
+        }
+        txn.delete(right_ref);
+        Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         let mut self_len = self.len;
@@ -128,11 +147,18 @@ impl InNode {
             self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], Default::default());
         }
     }
-    pub fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize, txn: &mut Txn) {
+    pub fn relocate_children(
+        &mut self,
+        left_ptr_pos: usize,
+        right_ptr_pos: usize,
+        txn: &mut Txn,
+        bz: &mut CacheBufferZone
+    ) -> Result<(), TxnErr> {
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
+        let mut new_right_node_key = Default::default();
         let half_full_pos = NUM_KEYS / 2 + 1;
         assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
@@ -148,7 +174,6 @@ impl InNode {
             let mut new_right_ptrs = NodePointerSlice::init();
 
             let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
-            let mut new_right_node_key = Default::default();
             let mut new_left_keys_len = 0;
             let mut new_right_keys_len = 0;
             for (i, key) in chain(
@@ -191,8 +216,6 @@ impl InNode {
             txn.update(left_ref, left_node);
             txn.update(right_ref, right_node);
 
-            self.keys[right_ptr_pos - 1] = new_right_node_key;
-
         } else if left_node.is_ext() {
             // relocate external sub nodes
 
@@ -202,9 +225,35 @@ impl InNode {
             let mut new_left_keys = EntryKeySlice::init();
             let mut new_right_keys = EntryKeySlice::init();
 
+            let mut new_left_keys_len = 0;
+            let mut new_right_keys_len = 0;
+            for (i, key) in chain(
+                left_extnode.keys[..left_extnode.len].iter_mut(),
+                right_extnode.keys[..right_extnode.len].iter_mut()
+            ).enumerate() {
+                let key_owned = mem::replace(key, Default::default());
+                if i < half_full_pos {
+                    new_left_keys[i] = key_owned;
+                    new_left_keys_len += 1;
+                } else {
+                    if i == half_full_pos {
+                        new_right_node_key = key_owned
+                    }
+                    let nk_index = i - half_full_pos - 1;
+                    new_right_keys[nk_index] = key_owned;
+                    new_right_keys_len += 1;
+                }
+            }
 
+            left_extnode.keys = new_left_keys;
+            left_extnode.len = new_left_keys_len;
+
+            right_extnode.keys = new_right_keys;
+            right_extnode.len = new_right_keys_len;
         }
 
         self.keys[right_ptr_pos - 1] = new_right_node_key;
+
+        Ok(())
     }
 }

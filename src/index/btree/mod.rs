@@ -73,7 +73,7 @@ impl BPlusTree {
             root: Default::default(),
             num_nodes: 0,
             height: 0,
-            stm: txn_manager,
+            stm: TxnManager::new(),
             ext_node_cache:
             Mutex::new(
                 LRUCache::new(
@@ -135,10 +135,10 @@ impl BPlusTree {
             if let Some((new_node, pivotKey)) = self.insert_to_node(self.root, key, txn, &mut bz)? {
                 // split root
                 let new_node_ref = txn.new_value(new_node);
-                let pivot = pivotKey.unwrap_or_else(|| acq_new_node.first_key());
+                let pivot = pivotKey.unwrap_or_else(|| new_node.first_key(&mut bz));
                 let mut new_in_root = InNode {
-                    keys: make_array!(NUM_KEYS, EntryKey::default()),
-                    pointers: make_array!(NUM_PTRS, NodePtr::default()),
+                    keys: make_array!(NUM_KEYS, Default::default()),
+                    pointers: make_array!(NUM_PTRS, Default::default()),
                     len: 1
                 };
                 let old_root = txn.read_owned::<Node>(self.root)?.unwrap();
@@ -189,16 +189,20 @@ impl BPlusTree {
             None => return Ok(None)
         }
     }
-    fn remove(&self, key: &EntryKey, id: &Id) {
+    fn remove(&self, key: &EntryKey, id: &Id) -> bool {
         let mut key = key.clone();
         key_with_id(&mut key, id);
-        self.stm.transaction(|txn| {
+        let (removed, bz) = self.stm.transaction(|txn| {
             let mut bz = CacheBufferZone::new(self);
-            self.remove_from_node(self.root, &key, txn, &mut bz)?;
-            if !root.is_ext() && root.len(self) == 0 {
-                remove_empty_innode_node(root);
+            let removed = self.remove_from_node(self.root, &key, txn, &mut bz)?.is_some();
+            let root_node = txn.read::<Node>(self.root)?.unwrap();
+            if removed && !root_node.is_ext() && root_node.len(&mut bz) == 0 {
+                txn.update(self.root, self.new_ext_cached_node());
             }
-        });
+            Ok((removed, bz))
+        }).unwrap();
+        bz.flush();
+        return removed;
     }
     fn remove_from_node(
         &self,
@@ -222,7 +226,8 @@ impl BPlusTree {
                     // need to remove empty child node
                     if sub_node_ref.is_ext() {
                         // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
-                        let nid = rearrange_empty_extnode(&*sub_node_ref, bz);
+                        let extnode = sub_node_ref.extnode(bz);
+                        let nid = rearrange_empty_extnode(extnode, bz);
                         n.remove(pointer_pos);
                         bz.delete(&nid)
                     } else {
@@ -237,25 +242,25 @@ impl BPlusTree {
                     let cand_ptr_pos = cand_key_pos + 1;
                     let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
                     let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
-                    if acq_node.cannot_merge(self) {
+                    if sub_node_ref.cannot_merge(bz) {
                         // relocate
-                        n.relocate_children(left_ptr_pos, right_ptr_pos, txn);
+                        n.relocate_children(left_ptr_pos, right_ptr_pos, txn, bz)?;
                     } else {
                         // merge
-                        n.merge_children(left_ptr_pos, right_ptr_pos);
+                        n.merge_children(left_ptr_pos, right_ptr_pos, txn, bz);
                         n.remove(right_ptr_pos - 1);
                     }
                 }
             }
             txn.update(node, node_owned);
             return Ok(result);
-        } else if let &mut Node::External(ref n) = node {
-            let mut cached_node = &self.get_mut_ext_node_cached(n);
+        } else if let &Node::External(ref id) = &*node_ref {
+            let mut cached_node = bz.get_for_mut(id);
             if &cached_node.keys[key_pos] == key {
-                cached_node.remove(key_pos, self);
-                return Some(());
+                cached_node.remove(key_pos);
+                return Ok(Some(()));
             } else {
-                return None;
+                return Ok(None);
             }
         } else { unreachable!() }
     }
@@ -311,7 +316,8 @@ impl Node {
     fn is_ext(&self) -> bool {
         match self {
             &Node::External(_) => true,
-            &Node::Internal(_) => false
+            &Node::Internal(_) => false,
+            &Node::None => panic!()
         }
     }
     fn first_key(&self, bz: &mut CacheBufferZone) -> EntryKey {
@@ -392,11 +398,6 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
     key.extend_from_slice(&id_bytes);
 }
 
-fn remove_empty_innode_node(mut sub_level_pointer: RefMut<Node>) {
-    let new_ptr = sub_level_pointer.innode().pointers[0].replace(Default::default());
-    mem::replace(&mut *sub_level_pointer, new_ptr);
-}
-
 trait Slice<T> : Sized where T: Default{
     fn as_slice(&mut self) -> &mut [T];
     fn init() -> Self;
@@ -443,7 +444,7 @@ macro_rules! impl_slice_ops {
 }
 
 impl_slice_ops!(EntryKeySlice, EntryKey, NUM_KEYS);
-impl_slice_ops!(NodePointerSlice, NodePtr, NUM_PTRS);
+impl_slice_ops!(NodePointerSlice, TxnValRef, NUM_PTRS);
 
 impl Default for Node {
     fn default() -> Self {
