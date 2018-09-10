@@ -19,6 +19,8 @@ use index::btree::internal::*;
 use bifrost::utils::async_locks::RwLock;
 use hermes::stm::{TxnManager, TxnValRef, Txn, TxnErr};
 use bifrost::utils::async_locks::Mutex;
+use std::cell::RefMut;
+use std::cell::Ref;
 
 mod internal;
 mod external;
@@ -169,7 +171,7 @@ impl BPlusTree {
         let pos = acq_node.search(&key, bz);
         let split_node = match &*acq_node {
             &Node::External(ref id) => {
-                let node = bz.get_for_mut(id);
+                let mut node = bz.get_for_mut(id);
                 return Ok(node.insert(key, pos, self));
             },
             &Node::Internal(ref n) => {
@@ -233,8 +235,18 @@ impl BPlusTree {
                     // need to remove empty child node
                     if sub_node_ref.is_ext() {
                         // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
-                        let extnode = sub_node_ref.extnode(bz);
-                        let nid = rearrange_empty_extnode(extnode, bz);
+                        let (prev, next, nid) = {
+                            let n = sub_node_ref.extnode(bz);
+                            (n.prev, n.next, n.id)
+                        };
+                        if !prev.is_unit_id() {
+                            let mut prev_node = bz.get_for_mut(&prev);
+                            prev_node.next = next;
+                        }
+                        if !next.is_unit_id() {
+                            let mut next_node = bz.get_for_mut(&next);
+                            next_node.prev = prev;
+                        }
                         n.remove(pointer_pos);
                         bz.delete(&nid)
                     } else {
@@ -347,7 +359,7 @@ impl Node {
     fn cannot_merge(&self, bz: &mut CacheBufferZone) -> bool {
         self.len(bz) >= NUM_KEYS/ 2 - 1
     }
-    fn extnode_mut<'a>(&self, bz: &'a mut CacheBufferZone) -> &'a mut ExtNode {
+    fn extnode_mut<'a>(&self, bz: &'a mut CacheBufferZone) -> RefMut<'a, ExtNode> {
         match self {
             &Node::External(ref id) => bz.get_for_mut(id),
             _ => unreachable!()
@@ -359,7 +371,7 @@ impl Node {
             _ => unreachable!()
         }
     }
-    fn extnode<'a>(&self, bz: &'a mut CacheBufferZone) -> &'a ExtNode {
+    fn extnode<'a>(&self, bz: &'a mut CacheBufferZone) -> Ref<'a, ExtNode> {
         match self {
             &Node::External(ref id) => bz.get(id),
             _ => unreachable!()

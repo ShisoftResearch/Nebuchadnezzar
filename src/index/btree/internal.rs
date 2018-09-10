@@ -118,15 +118,17 @@ impl InNode {
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
         assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
-            let mut left_innode = left_node.innode_mut();
-            let mut right_innode = right_node.innode_mut();
-            let right_key = right_innode.keys[right_ptr_pos - 1].clone();
-            left_innode.merge_with(&mut right_innode, right_key);
+            {
+                let mut left_innode = left_node.innode_mut();
+                let mut right_innode = right_node.innode_mut();
+                let right_key = right_innode.keys[right_ptr_pos - 1].clone();
+                left_innode.merge_with(&mut right_innode, right_key);
+            }
             txn.update(left_ref, left_node);
         } else {
-            let mut left_extnode = left_node.extnode_mut(bz);
             let mut right_extnode = right_node.extnode_mut(bz);
-            left_extnode.merge_with(right_extnode);
+            let mut left_extnode = left_node.extnode_mut(bz);
+            left_extnode.merge_with(&mut right_extnode);
             bz.delete(&right_extnode.id);
         }
         txn.delete(right_ref);
@@ -164,54 +166,56 @@ impl InNode {
         if !left_node.is_ext() {
             // relocate internal sub nodes
 
-            let mut left_innode = left_node.innode_mut();
-            let mut right_innode = right_node.innode_mut();
+            {
+                let mut left_innode = left_node.innode_mut();
+                let mut right_innode = right_node.innode_mut();
 
-            let mut new_left_keys = EntryKeySlice::init();
-            let mut new_left_ptrs = NodePointerSlice::init();
+                let mut new_left_keys = EntryKeySlice::init();
+                let mut new_left_ptrs = NodePointerSlice::init();
 
-            let mut new_right_keys = EntryKeySlice::init();
-            let mut new_right_ptrs = NodePointerSlice::init();
+                let mut new_right_keys = EntryKeySlice::init();
+                let mut new_right_ptrs = NodePointerSlice::init();
 
-            let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
-            let mut new_left_keys_len = 0;
-            let mut new_right_keys_len = 0;
-            for (i, key) in chain(
-                chain(left_innode.keys[..left_innode.len].iter_mut(),[pivot_key].iter_mut()),
-                right_innode.keys[..right_innode.len].iter_mut()
-            ).enumerate() {
-                let key_owned = mem::replace(key, Default::default());
-                if i < half_full_pos {
-                    new_left_keys[i] = key_owned;
-                    new_left_keys_len += 1;
-                } else if i == half_full_pos {
-                    new_right_node_key = key_owned
-                } else {
-                    let nk_index = i - half_full_pos - 1;
-                    new_right_keys[nk_index] = key_owned;
-                    new_right_keys_len += 1;
+                let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
+                let mut new_left_keys_len = 0;
+                let mut new_right_keys_len = 0;
+                for (i, key) in chain(
+                    chain(left_innode.keys[..left_innode.len].iter_mut(),[pivot_key].iter_mut()),
+                    right_innode.keys[..right_innode.len].iter_mut()
+                ).enumerate() {
+                    let key_owned = mem::replace(key, Default::default());
+                    if i < half_full_pos {
+                        new_left_keys[i] = key_owned;
+                        new_left_keys_len += 1;
+                    } else if i == half_full_pos {
+                        new_right_node_key = key_owned
+                    } else {
+                        let nk_index = i - half_full_pos - 1;
+                        new_right_keys[nk_index] = key_owned;
+                        new_right_keys_len += 1;
+                    }
                 }
-            }
 
-            for (i, ptr) in chain(
-                left_innode.pointers[..left_innode.len + 1].iter_mut(),
-                right_innode.pointers[..right_innode.len + 1].iter_mut()
-            ).enumerate() {
-                let ptr_owned = mem::replace(ptr, Default::default());
-                if i < half_full_pos {
-                    new_right_ptrs[i] = ptr_owned;
-                } else {
-                    new_left_ptrs[i - half_full_pos] = ptr_owned;
+                for (i, ptr) in chain(
+                    left_innode.pointers[..left_innode.len + 1].iter_mut(),
+                    right_innode.pointers[..right_innode.len + 1].iter_mut()
+                ).enumerate() {
+                    let ptr_owned = mem::replace(ptr, Default::default());
+                    if i < half_full_pos {
+                        new_right_ptrs[i] = ptr_owned;
+                    } else {
+                        new_left_ptrs[i - half_full_pos] = ptr_owned;
+                    }
                 }
+
+                left_innode.keys = new_left_keys;
+                left_innode.pointers = new_left_ptrs;
+                left_innode.len = new_left_keys_len;
+
+                right_innode.keys = new_right_keys;
+                right_innode.pointers = new_right_ptrs;
+                right_innode.len = new_right_keys_len;
             }
-
-            left_innode.keys = new_left_keys;
-            left_innode.pointers = new_left_ptrs;
-            left_innode.len = new_left_keys_len;
-
-            right_innode.keys = new_right_keys;
-            right_innode.pointers = new_right_ptrs;
-            right_innode.len = new_right_keys_len;
 
             txn.update(left_ref, left_node);
             txn.update(right_ref, right_node);
@@ -237,7 +241,7 @@ impl InNode {
                     new_left_keys_len += 1;
                 } else {
                     if i == half_full_pos {
-                        new_right_node_key = key_owned
+                        new_right_node_key = key_owned.clone()
                     }
                     let nk_index = i - half_full_pos - 1;
                     new_right_keys[nk_index] = key_owned;
