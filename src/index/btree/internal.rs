@@ -229,11 +229,13 @@ impl InNode {
             let mut new_left_keys = EntryKeySlice::init();
             let mut new_right_keys = EntryKeySlice::init();
 
+            let left_len = left_extnode.len;
+            let right_len = right_extnode.len;
             let mut new_left_keys_len = 0;
             let mut new_right_keys_len = 0;
             for (i, key) in chain(
-                left_extnode.keys[..left_extnode.len].iter_mut(),
-                right_extnode.keys[..right_extnode.len].iter_mut()
+                left_extnode.keys[..left_len].iter_mut(),
+                right_extnode.keys[..right_len].iter_mut()
             ).enumerate() {
                 let key_owned = mem::replace(key, Default::default());
                 if i < half_full_pos {

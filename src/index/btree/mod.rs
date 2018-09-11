@@ -359,7 +359,7 @@ impl Node {
     fn cannot_merge(&self, bz: &mut CacheBufferZone) -> bool {
         self.len(bz) >= NUM_KEYS/ 2 - 1
     }
-    fn extnode_mut<'a>(&self, bz: &'a mut CacheBufferZone) -> RefMut<'a, ExtNode> {
+    fn extnode_mut<'a>(&self, bz: &CacheBufferZone) -> RcNodeRefMut {
         match self {
             &Node::External(ref id) => bz.get_for_mut(id),
             _ => unreachable!()
@@ -371,7 +371,7 @@ impl Node {
             _ => unreachable!()
         }
     }
-    fn extnode<'a>(&self, bz: &'a mut CacheBufferZone) -> Ref<'a, ExtNode> {
+    fn extnode<'a>(&self, bz: &CacheBufferZone) -> RcNodeRef {
         match self {
             &Node::External(ref id) => bz.get(id),
             _ => unreachable!()

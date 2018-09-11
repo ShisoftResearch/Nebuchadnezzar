@@ -207,7 +207,7 @@ impl Deref for RcNodeRef {
 
     fn deref(&self) -> &'_ <Self as Deref>::Target {
         unsafe {
-            &* self.reference
+            &*self.reference
         }
     }
 }
@@ -217,7 +217,7 @@ impl Deref for RcNodeRefMut {
 
     fn deref(&self) -> &'_ <Self as Deref>::Target {
         unsafe {
-            &* self.reference
+            &*self.reference
         }
     }
 }
@@ -305,10 +305,11 @@ impl <'a> CacheBufferZone <'a> {
     pub fn flush(self) {
         let mut guards = self.guards.into_inner();
         for (id, data) in self.data.into_inner() {
-            if let Some(node) = data {
+            if let Some(mut node_rc) = data {
                 let mut holder = guards.get_mut(&id).unwrap();
                 if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
-                    **guard = node.into_inner()
+                    let mut ext_node = Rc::get_mut(&mut node_rc).unwrap();
+                    **guard = mem::replace(ext_node.get_mut(), ExtNode::new(&Id::unit_id()))
                 } else { panic!() }
             } else {
                 unimplemented!();
