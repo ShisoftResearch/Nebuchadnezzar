@@ -133,7 +133,7 @@ impl ExtNode {
             };
             cached.next = split.node_2.id;
             cached.len = split.keys_1_len;
-            return Some((Node::External(cached.id), None));
+            return Some((Node::External(box cached.id), None));
 
         } else {
             cached.keys.insert_at(key, pos, cached_len);

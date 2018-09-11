@@ -36,7 +36,7 @@ type NodePointerSlice = [TxnValRef; NUM_PTRS];
 
 #[derive(Clone)]
 enum Node {
-    External(Id),
+    External(Box<Id>),
     Internal(Box<InNode>),
     None
 }
@@ -299,7 +299,7 @@ impl BPlusTree {
         let id = self.new_page_id();
         let node = ExtNode::new(&id);
         self.ext_node_cache.lock().insert(id, RwLock::new(node));
-        return Node::External(id);
+        return Node::External(box id);
     }
 }
 
@@ -478,6 +478,6 @@ mod test {
     #[test]
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned.
-        assert_eq!(size_of::<Node>(), size_of::<usize>() * 3);
+        assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
     }
 }
