@@ -172,8 +172,8 @@ enum CacheGuardHolder {
 
 type NodeRcRefCell = Rc<RefCell<ExtNode>>;
 
-pub type RcNodeRef<'a> = OwningHandle<OwningRef<Rc<RefCell<ExtNode>>, RefCell<ExtNode>>, Ref<'a, ExtNode>>;
-pub type RcNodeRefMut<'a> = OwningHandle<OwningRef<Rc<RefCell<ExtNode>>, RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
+pub type RcNodeRef<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNode>>;
+pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
 
 
 pub struct CacheBufferZone<'a> {
