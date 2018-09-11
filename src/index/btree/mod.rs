@@ -359,7 +359,7 @@ impl Node {
     fn cannot_merge(&self, bz: &mut CacheBufferZone) -> bool {
         self.len(bz) >= NUM_KEYS/ 2 - 1
     }
-    fn extnode_mut<'a>(&self, bz: &CacheBufferZone) -> RcNodeRefMut {
+    fn extnode_mut<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRefMut<'a> {
         match self {
             &Node::External(ref id) => bz.get_for_mut(id),
             _ => unreachable!()
@@ -371,7 +371,7 @@ impl Node {
             _ => unreachable!()
         }
     }
-    fn extnode<'a>(&self, bz: &CacheBufferZone) -> RcNodeRef {
+    fn extnode<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRef<'a> {
         match self {
             &Node::External(ref id) => bz.get(id),
             _ => unreachable!()
@@ -478,6 +478,6 @@ mod test {
     #[test]
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned.
-        assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
+        assert_eq!(size_of::<Node>(), size_of::<usize>() * 3);
     }
 }

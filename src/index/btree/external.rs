@@ -15,7 +15,7 @@ use itertools::Itertools;
 use std::collections::BTreeMap;
 use std::mem;
 use std::rc::Rc;
-use owning_ref::{OwningRefMut, OwningRef, RcRef};
+use owning_ref::{RcRef, OwningHandle, OwningRef};
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -172,63 +172,9 @@ enum CacheGuardHolder {
 
 type NodeRcRefCell = Rc<RefCell<ExtNode>>;
 
-pub struct RcNodeRef {
-    owner: NodeRcRefCell,
-    reference: *const ExtNode
-}
+pub type RcNodeRef<'a> = OwningHandle<OwningRef<Rc<RefCell<ExtNode>>, RefCell<ExtNode>>, Ref<'a, ExtNode>>;
+pub type RcNodeRefMut<'a> = OwningHandle<OwningRef<Rc<RefCell<ExtNode>>, RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
 
-pub struct RcNodeRefMut {
-    owner: NodeRcRefCell,
-    reference: *mut ExtNode
-}
-
-impl RcNodeRef {
-    pub fn new(rc: &NodeRcRefCell) -> RcNodeRef {
-        let rc = rc.clone();
-        RcNodeRef {
-            reference: &*(*rc).borrow(),
-            owner: rc
-        }
-    }
-}
-
-impl RcNodeRefMut {
-    pub fn new(rc: &NodeRcRefCell) -> RcNodeRefMut {
-        let rc = rc.clone();
-        RcNodeRefMut {
-            reference: &mut *(*rc).borrow_mut(),
-            owner: rc
-        }
-    }
-}
-
-impl Deref for RcNodeRef {
-    type Target = ExtNode;
-
-    fn deref(&self) -> &'_ <Self as Deref>::Target {
-        unsafe {
-            &*self.reference
-        }
-    }
-}
-
-impl Deref for RcNodeRefMut {
-    type Target = ExtNode;
-
-    fn deref(&self) -> &'_ <Self as Deref>::Target {
-        unsafe {
-            &*self.reference
-        }
-    }
-}
-
-impl DerefMut for RcNodeRefMut {
-    fn deref_mut(&mut self) -> &'_ mut <Self as Deref>::Target {
-        unsafe {
-            &mut* self.reference
-        }
-    }
-}
 
 pub struct CacheBufferZone<'a> {
     tree: &'a BPlusTree,
@@ -250,8 +196,12 @@ impl <'a> CacheBufferZone <'a> {
         {
             let data = self.data.borrow();
             match data.get(id) {
-                Some(Some(ref data)) =>
-                    return RcNodeRef::new(data),
+                Some(Some(ref data)) => {
+                    let cell = data.clone();
+                    let cell_ref = RcRef::new(cell);
+                    let handle = OwningHandle::new(cell_ref);
+                    return handle
+                },
                 Some(None) => panic!(),
                 _ => {}
             }
@@ -276,7 +226,10 @@ impl <'a> CacheBufferZone <'a> {
                     if let CacheGuardHolder::Read(_) = guards.get(id).unwrap() {
                         panic!("Mutating readonly buffered cache");
                     }
-                    return RcNodeRefMut::new(data);
+                    let cell = data.clone();
+                    let cell_ref = RcRef::new(cell);
+                    let handle = OwningHandle::new_mut(cell_ref);
+                    return handle
                 },
                 Some(None) => panic!(),
                 _ => {}
@@ -293,11 +246,11 @@ impl <'a> CacheBufferZone <'a> {
         self.get_for_mut(id)
     }
 
-    pub fn update(&mut self, id: &Id, node: ExtNode) {
+    pub fn update(&self, id: &Id, node: ExtNode) {
         let mut data = self.data.borrow_mut();
         data.insert(*id, Some(Rc::new(RefCell::new(node))));
     }
-    pub fn delete(&mut self, id: &Id) {
+    pub fn delete(&self, id: &Id) {
         let mut data = self.data.borrow_mut();
         data.insert(*id, None);
     }
