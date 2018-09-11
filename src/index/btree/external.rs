@@ -14,6 +14,8 @@ use dovahkiin::types::value::ToValue;
 use itertools::Itertools;
 use std::collections::BTreeMap;
 use std::mem;
+use std::rc::Rc;
+use owning_ref::{OwningRefMut, OwningRef, RcRef};
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -168,10 +170,70 @@ enum CacheGuardHolder {
     Write(ExtNodeCachedMut)
 }
 
+type NodeRcRefCell = Rc<RefCell<ExtNode>>;
+
+pub struct RcNodeRef {
+    owner: NodeRcRefCell,
+    reference: *const ExtNode
+}
+
+pub struct RcNodeRefMut {
+    owner: NodeRcRefCell,
+    reference: *mut ExtNode
+}
+
+impl RcNodeRef {
+    pub fn new(rc: &NodeRcRefCell) -> RcNodeRef {
+        let rc = rc.clone();
+        RcNodeRef {
+            reference: &*(*rc).borrow(),
+            owner: rc
+        }
+    }
+}
+
+impl RcNodeRefMut {
+    pub fn new(rc: &NodeRcRefCell) -> RcNodeRefMut {
+        let rc = rc.clone();
+        RcNodeRefMut {
+            reference: &mut *(*rc).borrow_mut(),
+            owner: rc
+        }
+    }
+}
+
+impl Deref for RcNodeRef {
+    type Target = ExtNode;
+
+    fn deref(&self) -> &'_ <Self as Deref>::Target {
+        unsafe {
+            &* self.reference
+        }
+    }
+}
+
+impl Deref for RcNodeRefMut {
+    type Target = ExtNode;
+
+    fn deref(&self) -> &'_ <Self as Deref>::Target {
+        unsafe {
+            &* self.reference
+        }
+    }
+}
+
+impl DerefMut for RcNodeRefMut {
+    fn deref_mut(&mut self) -> &'_ mut <Self as Deref>::Target {
+        unsafe {
+            &mut* self.reference
+        }
+    }
+}
+
 pub struct CacheBufferZone<'a> {
     tree: &'a BPlusTree,
-    guards: BTreeMap<Id, CacheGuardHolder>,
-    data: BTreeMap<Id, Option<RefCell<ExtNode>>>
+    guards: RefCell<BTreeMap<Id, CacheGuardHolder>>,
+    data: RefCell<BTreeMap<Id, Option<NodeRcRefCell>>>
 }
 
 
@@ -179,57 +241,72 @@ impl <'a> CacheBufferZone <'a> {
     pub fn new(tree: &BPlusTree) -> CacheBufferZone {
         CacheBufferZone {
             tree,
-            guards: BTreeMap::new(),
-            data: BTreeMap::new()
+            guards: RefCell::new(BTreeMap::new()),
+            data: RefCell::new(BTreeMap::new())
         }
     }
 
-    pub fn get(&mut self, id: &Id) -> Ref<ExtNode> {
+    pub fn get(&self, id: &Id) -> RcNodeRef {
         {
-            match self.data.get(id) {
-                Some(Some(ref data)) => return data.borrow(),
+            let data = self.data.borrow();
+            match data.get(id) {
+                Some(Some(ref data)) =>
+                    return RcNodeRef::new(data),
                 Some(None) => panic!(),
                 _ => {}
             }
         }
-        let guard = self.tree.get_ext_node_cached(id);
-        self.data.insert(*id, Some(RefCell::new((&*guard).clone())));
-        let holder = CacheGuardHolder::Read(guard);
-        self.guards.insert(*id, holder);
+        {
+            let guard = self.tree.get_ext_node_cached(id);
+            let mut data = self.data.borrow_mut();
+            data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
+            let holder = CacheGuardHolder::Read(guard);
+            let mut guards = self.guards.borrow_mut();
+            guards.insert(*id, holder);
+        }
         return self.get(id);
     }
 
-    pub fn get_for_mut(&mut self, id: &Id) -> RefMut<ExtNode> {
+    pub fn get_for_mut(&self, id: &Id) -> RcNodeRefMut {
         {
-            match self.data.get(id) {
+            let data = self.data.borrow();
+            match data.get(id) {
                 Some(Some(ref data)) => {
-                    if let CacheGuardHolder::Read(_) = self.guards.get(id).unwrap() {
+                    let guards = self.guards.borrow();
+                    if let CacheGuardHolder::Read(_) = guards.get(id).unwrap() {
                         panic!("Mutating readonly buffered cache");
                     }
-                    return data.borrow_mut();
+                    return RcNodeRefMut::new(data);
                 },
                 Some(None) => panic!(),
                 _ => {}
             }
         }
-        let guard = self.tree.get_mut_ext_node_cached(id);
-        self.data.insert(*id, Some(RefCell::new((&*guard).clone())));
-        let holder = CacheGuardHolder::Write(guard);
-        self.guards.insert(*id, holder);
+        {
+            let guard = self.tree.get_mut_ext_node_cached(id);
+            let mut data = self.data.borrow_mut();
+            data.borrow_mut().insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
+            let holder = CacheGuardHolder::Write(guard);
+            let mut guards = self.guards.borrow_mut();
+            guards.insert(*id, holder);
+        }
         self.get_for_mut(id)
     }
 
-    pub fn update(&mut self, id: &Id, data: ExtNode) {
-        self.data.insert(*id, Some(RefCell::new(data)));
+    pub fn update(&mut self, id: &Id, node: ExtNode) {
+        let mut data = self.data.borrow_mut();
+        data.insert(*id, Some(Rc::new(RefCell::new(node))));
     }
     pub fn delete(&mut self, id: &Id) {
-        self.data.insert(*id, None);
+        let mut data = self.data.borrow_mut();
+        data.insert(*id, None);
     }
 
-    pub fn flush(mut self) {
-        for (id, data) in self.data {
+    pub fn flush(self) {
+        let mut guards = self.guards.into_inner();
+        for (id, data) in self.data.into_inner() {
             if let Some(node) = data {
-                let mut holder = self.guards.get_mut(&id).unwrap();
+                let mut holder = guards.get_mut(&id).unwrap();
                 if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
                     **guard = node.into_inner()
                 } else { panic!() }
