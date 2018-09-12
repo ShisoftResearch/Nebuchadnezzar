@@ -7,7 +7,7 @@ use neb::server::*;
 //fn init_btree() {
 //    let server_group = "btree_test";
 //    let server_addr = "127.0.0.1:5600";
-//    let server = server::new_from_opts(&ServerOptions {
+//    let server = NebServer::new_from_opts(&ServerOptions {
 //        chunk_count: 1,
 //        memory_size: 16 * 1024 * 1024,
 //        backup_storage: None,

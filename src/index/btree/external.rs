@@ -3,6 +3,7 @@ use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use std::cell::RefCell;
 use ram::cell::Cell;
+use ram::types::*;
 use std::cell::Ref;
 use std::cell::RefMut;
 use index::btree::*;
@@ -16,16 +17,23 @@ use std::collections::BTreeMap;
 use std::mem;
 use std::rc::Rc;
 use owning_ref::{RcRef, OwningHandle, OwningRef};
+use ram::schema::{Schema, Field};
+use dovahkiin::types::type_id_of;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
 pub type ExtNodeCachedImmute = RwLockReadGuard<ExtNode>;
 
+const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
+const KEYS_FIELD: &'static str = "keys";
+const NEXT_FIELD: &'static str = "next";
+const PREV_FIELD: &'static str = "prev";
+
 lazy_static! {
-    static ref KEYS_KEY_HASH : u64 = key_hash("keys");
-    static ref NEXT_PAGE_KEY_HASH : u64 = key_hash("next");
-    static ref PREV_PAGE_KEY_HASH : u64 = key_hash("prev");
-    static ref PAGE_SCHEMA_ID: u32 = key_hash("BTREE_SCHEMA_ID") as u32;
+    static ref KEYS_KEY_HASH : u64 = key_hash(KEYS_FIELD);
+    static ref NEXT_PAGE_KEY_HASH : u64 = key_hash(NEXT_FIELD);
+    static ref PREV_PAGE_KEY_HASH : u64 = key_hash(PREV_FIELD);
+    static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
 }
 
 #[derive(Clone)]
@@ -268,5 +276,23 @@ impl <'a> CacheBufferZone <'a> {
                 self.tree.delete_ext_node(&id);
             }
         }
+    }
+}
+
+pub fn page_schema() -> Schema {
+    Schema {
+        id: *PAGE_SCHEMA_ID,
+        name: String::from(PAGE_SCHEMA),
+        key_field: None,
+        str_key_field: None,
+        is_dynamic: false,
+        fields: Field::new(
+            "*", 0, false, false,
+            Some(vec![
+                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None),
+                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None),
+                Field::new(KEYS_FIELD, type_id_of(Type::U8), false, true, None)
+            ])
+        )
     }
 }

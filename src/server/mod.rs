@@ -5,6 +5,9 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::{master as sm_master};
 use bifrost::tcp::{STANDALONE_ADDRESS_STRING};
 use bifrost::conshash::weights::Weights;
+use bifrost::rpc::Server;
+use bifrost::membership::server::Membership;
+use bifrost::membership::member::MemberService;
 use ram::chunk::Chunks;
 use ram::schema::LocalSchemasCache;
 use ram::schema::{sm as schema_sm};
@@ -134,6 +137,55 @@ impl NebServer {
         );
         Ok(server)
     }
+
+    pub fn new_from_opts<'a>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        group_name: &'a str
+    ) -> Arc<NebServer> {
+        let group_name = &String::from(group_name);
+        let server_addr = &String::from(server_addr);
+        let rpc_server = rpc::Server::new(server_addr);
+        let meta_mambers = &vec![server_addr.to_owned()];
+        let raft_service = raft::RaftService::new(raft::Options {
+            storage: raft::Storage::MEMORY,
+            address: server_addr.to_owned(),
+            service_id: raft::DEFAULT_SERVICE_ID
+        });
+        Server::listen_and_resume(&rpc_server);
+        rpc_server.register_service(
+            raft::DEFAULT_SERVICE_ID,
+            &raft_service
+        );
+        raft::RaftService::start(&raft_service);
+        match raft_service.join(meta_mambers) {
+            Err(sm_master::ExecError::CannotConstructClient) => {
+                info!("Cannot join meta cluster, will bootstrap one.");
+                raft_service.bootstrap();
+            },
+            Ok(Ok(())) => {
+                info!("Joined meta cluster, number of members: {}", raft_service.num_members());
+            },
+            e => {
+                error!("Cannot join into cluster: {:?}", e);
+                panic!("{:?}", ServerError::CannotJoinCluster)
+            }
+        }
+        Membership::new(&rpc_server, &raft_service);
+        let raft_client =
+            RaftClient::new(meta_mambers, raft::DEFAULT_SERVICE_ID).unwrap();
+        RaftClient::prepare_subscription(&rpc_server);
+        let member_service = MemberService::new(server_addr, &raft_client);
+        member_service.join_group(group_name).wait().unwrap();
+        NebServer::new(
+            opts,
+            server_addr,
+            group_name,
+            &rpc_server,
+            &Some(raft_service),
+            &raft_client).unwrap()
+    }
+
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
         if let Some(server_id) = self.consh.get_server_id(id.higher) {
             Some(server_id)

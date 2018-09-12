@@ -14,7 +14,7 @@ use futures::future::Future;
 #[test]
 pub fn workspace_wr() {
     let server_addr = String::from("127.0.0.1:5200");
-    let server = server::new_from_opts(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024,
         backup_storage: None,
@@ -101,7 +101,7 @@ pub fn workspace_wr() {
 #[test]
 pub fn data_site_wr() {
     let server_addr = String::from("127.0.0.1:5201");
-    let server = server::new_from_opts(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
@@ -161,7 +161,7 @@ pub fn data_site_wr() {
 #[test]
 pub fn multi_transaction() {
     let server_addr = String::from("127.0.0.1:5202");
-    let server = server::new_from_opts(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,
@@ -219,7 +219,7 @@ pub fn smoke_rw() {
     // this test is likely to have unrealizable transactions and
     // should not cause any deadlock even if they failed
     let server_addr = String::from("127.0.0.1:5203");
-    let server = server::new_from_opts(&ServerOptions {
+    let server = NebServer::new_from_opts(&ServerOptions {
         chunk_count: 1,
         memory_size: 16 * 1024 * 1024,
         backup_storage: None,

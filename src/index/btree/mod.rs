@@ -480,10 +480,32 @@ impl Default for Node {
 mod test {
     use std::mem::size_of;
     use super::Node;
+    use server::ServerOptions;
+    use server;
+    use std::sync::Arc;
+    use client;
+    use server::NebServer;
 
     #[test]
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned.
         assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
+    }
+
+    #[test]
+    fn init() {
+        let server_group = "index_init";
+        let server_addr = String::from("127.0.0.1:5100");
+        let server = NebServer::new_from_opts(&ServerOptions {
+            chunk_count: 1,
+            memory_size: 16 * 1024 * 1024,
+            backup_storage: None,
+            wal_storage: None
+        }, &server_addr, &server_group);
+        let client = Arc::new(client::AsyncClient::new(
+            &server.rpc, &vec!(server_addr),
+            server_group).unwrap());
+        client.new_schema_with_id(super::external::page_schema());
+
     }
 }
