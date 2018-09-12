@@ -265,7 +265,7 @@ impl <'a> CacheBufferZone <'a> {
                     **guard = mem::replace(ext_node.get_mut(), ExtNode::new(&Id::unit_id()))
                 } else { panic!() }
             } else {
-                unimplemented!();
+                self.tree.delete_ext_node(&id);
             }
         }
     }

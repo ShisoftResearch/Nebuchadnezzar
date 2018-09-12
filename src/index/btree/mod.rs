@@ -53,6 +53,7 @@ pub struct BPlusTree {
     height: usize,
     ext_node_cache: ExtNodeCacheMap,
     stm: TxnManager,
+    storage: Arc<AsyncClient>
 }
 
 macro_rules! make_array {
@@ -76,6 +77,7 @@ impl BPlusTree {
             num_nodes: 0,
             height: 0,
             stm: TxnManager::new(),
+            storage: neb_client.clone(),
             ext_node_cache:
             Mutex::new(
                 LRUCache::new(
@@ -300,6 +302,10 @@ impl BPlusTree {
         let node = ExtNode::new(&id);
         self.ext_node_cache.lock().insert(id, RwLock::new(node));
         return Node::External(box id);
+    }
+    fn delete_ext_node(&self, id: &Id) {
+        self.ext_node_cache.lock().remove(id);
+        self.storage.remove_cell(*id).wait().unwrap();
     }
 }
 
