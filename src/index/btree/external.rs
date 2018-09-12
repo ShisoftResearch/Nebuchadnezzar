@@ -246,7 +246,7 @@ impl <'a> CacheBufferZone <'a> {
         {
             let guard = self.tree.get_mut_ext_node_cached(id);
             let mut data = self.data.borrow_mut();
-            data.borrow_mut().insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
+            data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
             let holder = CacheGuardHolder::Write(guard);
             let mut guards = self.guards.borrow_mut();
             guards.insert(*id, holder);

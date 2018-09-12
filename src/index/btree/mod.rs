@@ -170,6 +170,7 @@ impl BPlusTree {
         bz: &mut CacheBufferZone
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
         let mut acq_node = txn.read::<Node>(node)?.unwrap();
+        acq_node.warm_cache_for_write_intention(bz);
         let pos = acq_node.search(&key, bz);
         let split_node = match &*acq_node {
             &Node::External(ref id) => {
@@ -223,6 +224,7 @@ impl BPlusTree {
         bz: &mut CacheBufferZone
     ) -> Result<Option<()>, TxnErr> {
         let node_ref = txn.read::<Node>(node)?.unwrap();
+        node_ref.warm_cache_for_write_intention(bz);
         let key_pos = node_ref.search(key, bz);
         if let Node::Internal(n) = &*node_ref {
             let pointer_pos = key_pos + 1;
@@ -311,11 +313,15 @@ impl BPlusTree {
 
 impl Node {
     fn search(&self, key: &EntryKey, bz: &mut CacheBufferZone) -> usize {
+        let len = self.len(bz);
         if self.is_ext() {
-            self.extnode(bz).keys.binary_search(key).unwrap_or_else(|i| i)
+            self.extnode(bz).keys[..len].binary_search(key).unwrap_or_else(|i| i)
         } else {
-            self.innode().keys.binary_search(key).unwrap_or_else(|i| i)
+            self.innode().keys[..len].binary_search(key).unwrap_or_else(|i| i)
         }
+    }
+    fn warm_cache_for_write_intention(&self, bz: &mut CacheBufferZone) {
+        if self.is_ext() { self.extnode_mut(bz); }
     }
     fn insert(
         &mut self,
@@ -443,7 +449,7 @@ trait Slice<T> : Sized where T: Default{
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: usize) {
-        assert!(pos < len);
+        assert!(pos <= len, "pos {:?} larger or equals to len {:?}", pos, len);
         let slice = self.as_slice();
         for i in len .. pos {
             slice[i] = mem::replace(&mut slice[i - 1], T::default());
@@ -479,12 +485,14 @@ impl Default for Node {
 
 mod test {
     use std::mem::size_of;
-    use super::Node;
+    use super::{Node, BPlusTree};
     use server::ServerOptions;
     use server;
     use std::sync::Arc;
     use client;
     use server::NebServer;
+    use dovahkiin::types::custom_types::id::Id;
+    use ram::types::RandValue;
 
     #[test]
     fn node_size() {
@@ -506,6 +514,10 @@ mod test {
             &server.rpc, &vec!(server_addr),
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema());
-
+        let tree = BPlusTree::new(&client);
+        let id = Id::rand();
+        tree.insert(Default::default(), &id);
+        let cursor =  tree.seek(&Default::default());
+        assert_eq!(cursor.id, id);
     }
 }
