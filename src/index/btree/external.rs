@@ -111,6 +111,7 @@ impl ExtNode {
         let cached_len = cached.len;
         if cached_len + 1 >= NUM_KEYS {
             // need to split
+            debug!("insert to external with split");
             let pivot = cached_len / 2;
             let split = {
                 let cached_next = *&cached.next;
@@ -144,6 +145,7 @@ impl ExtNode {
             return Some((Node::External(box cached.id), None));
 
         } else {
+            debug!("insert to external without split");
             cached.keys.insert_at(key, pos, cached_len);
             return None;
         }
@@ -173,7 +175,7 @@ pub fn rearrange_empty_extnode(node: &ExtNode, bz: &mut CacheBufferZone) -> Id {
 }
 
 #[derive(Clone)]
-enum CacheGuardHolder {
+pub enum CacheGuardHolder {
     Read(ExtNodeCachedImmute),
     Write(ExtNodeCachedMut)
 }
@@ -185,7 +187,7 @@ pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, Ext
 
 
 pub struct CacheBufferZone<'a> {
-    tree: &'a BPlusTree,
+    pub tree: &'a BPlusTree,
     guards: RefCell<BTreeMap<Id, CacheGuardHolder>>,
     data: RefCell<BTreeMap<Id, Option<NodeRcRefCell>>>
 }
@@ -276,6 +278,10 @@ impl <'a> CacheBufferZone <'a> {
                 self.tree.delete_ext_node(&id);
             }
         }
+    }
+
+    pub fn get_guard(&self, id: &Id) -> Option<CacheGuardHolder> {
+        self.guards.borrow().get(id).map(|rg| rg.clone())
     }
 }
 
