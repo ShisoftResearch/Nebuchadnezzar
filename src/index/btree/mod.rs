@@ -21,6 +21,7 @@ use hermes::stm::{TxnManager, TxnValRef, Txn, TxnErr};
 use bifrost::utils::async_locks::Mutex;
 use std::cell::RefMut;
 use std::cell::Ref;
+use std::fmt::Debug;
 
 mod internal;
 mod external;
@@ -48,16 +49,18 @@ enum Node {
 pub struct RTCursor {
     index: usize,
     version: u64,
+    current: Id,
     ordering: Ordering,
-    page: Option<CacheGuardHolder>,
-    next_page: Option<CacheGuardHolder>
+    page: CacheGuardHolder,
+    next_page: Option<CacheGuardHolder>,
+    bz: Rc<CacheBufferZone>
 }
 
 pub struct BPlusTree {
     root: TxnValRef,
     num_nodes: usize,
     height: usize,
-    ext_node_cache: ExtNodeCacheMap,
+    ext_node_cache: Arc<ExtNodeCacheMap>,
     stm: TxnManager,
     storage: Arc<AsyncClient>
 }
@@ -69,7 +72,7 @@ pub enum Ordering {
 
 pub struct TreeTxn<'a> {
     tree: &'a BPlusTree,
-    bz: CacheBufferZone<'a>,
+    bz: Rc<CacheBufferZone>,
     txn: &'a mut Txn
 }
 
@@ -96,22 +99,24 @@ impl BPlusTree {
             stm: TxnManager::new(),
             storage: neb_client.clone(),
             ext_node_cache:
-            Mutex::new(
+            Arc::new(Mutex::new(
                 LRUCache::new(
                     CACHE_SIZE,
                     move |id|{
+                        debug!("Reading page to cache {:?}", id);
                         neb_client_1.read_cell(*id).wait().unwrap().map(|cell| {
                             RwLock::new(ExtNode::from_cell(cell))
                         }).ok()
                     },
-                    move |_, value| {
+                    move |id, value| {
+                        debug!("Flush page to cache {:?}", &id);
                         let cache = value.read();
                         let cell = cache.to_cell();
                         neb_client_2.transaction(move |txn| {
                             let cell_owned = (&cell).to_owned();
                             txn.upsert(cell_owned)
                         }).wait().unwrap()
-                    }))
+                    })))
         };
         {
             let actual_tree_root = tree.new_ext_cached_node();
@@ -139,21 +144,13 @@ impl BPlusTree {
         where F: Fn(&mut TreeTxn) -> Result<R, TxnErr>
     {
         self.stm.transaction(|txn| {
-            let mut bz = CacheBufferZone::new(self);
             let mut t_txn = TreeTxn::new(self, txn);
-            Ok((func(&mut t_txn)?, bz))
+            let res = func(&mut t_txn)?;
+            Ok((res, t_txn.bz))
         }).map(|(res, mut bz)| {
             bz.flush();
             res
         })
-    }
-    fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {
-        let mut map = self.ext_node_cache.lock();
-        return map.get_or_fetch(id).unwrap().write();
-    }
-    fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCachedImmute {
-        let mut map = self.ext_node_cache.lock();
-        return map.get_or_fetch(id).unwrap().read();
     }
     fn new_page_id(&self) -> Id {
         // TODO: achieve locality
@@ -163,16 +160,13 @@ impl BPlusTree {
         let id = self.new_page_id();
         let node = ExtNode::new(&id);
         self.ext_node_cache.lock().insert(id, RwLock::new(node));
+        debug!("New page id is: {:?}", id);
         return Node::External(box id);
-    }
-    fn delete_ext_node(&self, id: &Id) {
-        self.ext_node_cache.lock().remove(id);
-        self.storage.remove_cell(*id).wait().unwrap();
     }
 }
 
 impl Node {
-    fn search(&self, key: &EntryKey, bz: &mut CacheBufferZone) -> usize {
+    fn search(&self, key: &EntryKey, bz: &CacheBufferZone) -> usize {
         let len = self.len(bz);
         if self.is_ext() {
             self.extnode(bz).keys[..len].binary_search(key).unwrap_or_else(|i| i)
@@ -180,7 +174,7 @@ impl Node {
             self.innode().keys[..len].binary_search(key).unwrap_or_else(|i| i)
         }
     }
-    fn warm_cache_for_write_intention(&self, bz: &mut CacheBufferZone) {
+    fn warm_cache_for_write_intention(&self, bz: &CacheBufferZone) {
         if self.is_ext() { self.extnode_mut(bz); }
     }
     fn insert(
@@ -189,7 +183,7 @@ impl Node {
         ptr: Option<TxnValRef>,
         pos: usize,
         tree: &BPlusTree,
-        bz: &mut CacheBufferZone) -> Option<(Node, Option<EntryKey>)>
+        bz: &CacheBufferZone) -> Option<(Node, Option<EntryKey>)>
     {
         if let &mut Node::External(ref id) = self {
             debug!("inserting to external node at: {:?}, key {:?}", pos, key);
@@ -199,7 +193,7 @@ impl Node {
             self.innode_mut().insert(key, ptr, pos)
         }
     }
-    fn remove(&mut self, pos: usize, bz: &mut CacheBufferZone) {
+    fn remove(&mut self, pos: usize, bz: &CacheBufferZone) {
         if let &mut Node::External(ref id) = self {
             self.extnode_mut(bz).remove(pos)
         } else {
@@ -213,24 +207,24 @@ impl Node {
             &Node::None => panic!()
         }
     }
-    fn first_key(&self, bz: &mut CacheBufferZone) -> EntryKey {
+    fn first_key(&self, bz: &CacheBufferZone) -> EntryKey {
         if self.is_ext() {
             self.extnode(bz).keys[0].to_owned()
         } else {
             self.innode().keys[0].to_owned()
         }
     }
-    fn len(&self, bz: &mut CacheBufferZone) -> usize {
+    fn len(&self, bz: &CacheBufferZone) -> usize {
         if self.is_ext() {
             self.extnode(bz).len
         } else {
             self.innode().len
         }
     }
-    fn is_half_full(&self, bz: &mut CacheBufferZone) -> bool {
+    fn is_half_full(&self, bz: &CacheBufferZone) -> bool {
         self.len(bz) >= NUM_KEYS / 2
     }
-    fn cannot_merge(&self, bz: &mut CacheBufferZone) -> bool {
+    fn cannot_merge(&self, bz: &CacheBufferZone) -> bool {
         self.len(bz) >= NUM_KEYS/ 2 - 1
     }
     fn extnode_mut<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRefMut<'a> {
@@ -262,7 +256,7 @@ impl Node {
 impl <'a> TreeTxn<'a> {
     fn new(tree: &'a BPlusTree, txn: &'a mut Txn) -> TreeTxn<'a> {
         TreeTxn {
-            bz: CacheBufferZone::new(tree), tree, txn
+            bz: Rc::new(CacheBufferZone::new(&tree.ext_node_cache, &tree.storage)), tree, txn
         }
     }
 
@@ -287,16 +281,7 @@ impl <'a> TreeTxn<'a> {
                 let ext_node = node.extnode(&mut self.bz);
                 (ext_node.version, ext_node.id, ext_node.next, ext_node.prev)
             };
-            Ok(RTCursor {
-                index: pos,
-                version: ext_ver,
-                ordering,
-                page: self.bz.get_guard(&ext_id),
-                next_page: self.bz.get_guard(match ordering {
-                    Ordering::Forward => &ext_next,
-                    Ordering::Backward  => &ext_prev
-                })
-            })
+            Ok(RTCursor::new(&ext_id, &self.bz, pos, ext_ver, ordering, &ext_next, &ext_prev))
         } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.pointers[pos];
             self.search(next_node_ref, key, ordering)
@@ -308,10 +293,8 @@ impl <'a> TreeTxn<'a> {
         let mut key = key.clone();
         key_with_id(&mut key, id);
         let root_ref = self.tree.root;
-        if let Some((new_node, pivotKey)) = self.insert_to_node(
-            root_ref,
-            key.clone())? {
-            // split root
+        if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
+            debug!("split root");
             let first_key = new_node.first_key(&mut self.bz);
             let new_node_ref = self.txn.new_value(new_node);
             let pivot = pivotKey.unwrap_or_else(|| first_key);
@@ -335,17 +318,18 @@ impl <'a> TreeTxn<'a> {
         node: TxnValRef,
         key: EntryKey
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
+        debug!("insert to node: {:?}", node);
         let acq_node = self.txn.read::<Node>(node)?.unwrap();
         acq_node.warm_cache_for_write_intention(&mut self.bz);
         let pos = acq_node.search(&key, &mut self.bz);
         let split_node = match &*acq_node {
             &Node::External(ref id) => {
-                debug!("insert into external at {}", pos);
+                debug!("insert into external at {}, key {:?}, id {:?}", pos, key, id);
                 let mut node = self.bz.get_for_mut(id);
                 return Ok(node.insert(key, pos, self.tree));
             },
             &Node::Internal(ref n) => {
-                debug!("insert into external at {}", pos);
+                debug!("insert into internal at {}", pos);
                 let next_node_ref = n.pointers[pos];
                 self.insert_to_node(next_node_ref, key)?
             },
@@ -453,8 +437,39 @@ impl <'a> TreeTxn<'a> {
     }
 }
 
+impl <'a> RTCursor {
+    fn new(
+        id: &Id,
+        bz: &Rc<CacheBufferZone>,
+        pos: usize,
+        version: u64,
+        ordering: Ordering,
+        next: &Id,
+        prev: &Id,
+    ) -> RTCursor {
+        let node = bz.get(&id);
+        let page = bz.get_guard(&id).unwrap();
+        let key = &node.keys[pos];
+        debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
+        debug!("Key at pos {} is {:?}", pos, &key);
+        RTCursor {
+            index: pos,
+            version,
+            ordering,
+            page,
+            bz: bz.clone(),
+            next_page: bz.get_guard(match ordering {
+                Ordering::Forward => next,
+                Ordering::Backward  => prev
+            }),
+            current: id_from_key(key)
+        }
+    }
+
+}
 
 fn id_from_key(key: &EntryKey) -> Id {
+    debug!("Decoding key to id {:?}", key);
     let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE ..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
 }
@@ -469,7 +484,7 @@ fn insert_into_split<T, S>(
     xlen: &mut usize, ylen: &mut usize,
     pos: usize, pivot: usize
 )
-    where S: Slice<T>, T: Default
+    where S: Slice<T>, T: Default + Debug
 {
     if pos <= pivot {
         x.insert_at(item, pos, *xlen);
@@ -485,7 +500,7 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
     key.extend_from_slice(&id_bytes);
 }
 
-trait Slice<T> : Sized where T: Default{
+trait Slice<T> : Sized where T: Default + Debug {
     fn as_slice(&mut self) -> &mut [T];
     fn init() -> Self;
     fn item_default() -> T {
@@ -506,8 +521,10 @@ trait Slice<T> : Sized where T: Default{
     }
     fn insert_at(&mut self, item: T, pos: usize, len: usize) {
         assert!(pos <= len, "pos {:?} larger or equals to len {:?}", pos, len);
-        let slice = self.as_slice();
+        debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
+        let mut slice = self.as_slice();
         for i in len .. pos {
+            debug!("move {} to {}", i - 1, i);
             slice[i] = mem::replace(&mut slice[i - 1], T::default());
         }
         slice[pos] = item;
@@ -579,8 +596,8 @@ mod test {
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        tree.insert(&key, &id);
+        tree.insert(&key, &id).unwrap();
         let cursor =  tree.seek(&key, Ordering::Forward).unwrap();
-        // assert_eq!(cursor.page_id, id);
+        // assert_eq!(cursor.page., id);
     }
 }

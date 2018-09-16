@@ -87,7 +87,7 @@ impl InNode {
         &self,
         key_pos: usize,
         txn: &mut Txn,
-        bz: &mut CacheBufferZone
+        bz: &CacheBufferZone
     ) -> Result<usize, TxnErr> {
         if key_pos == self.len - 1 {
             // the last one, pick left
@@ -110,7 +110,7 @@ impl InNode {
         left_ptr_pos: usize,
         right_ptr_pos: usize,
         txn: &mut Txn,
-        bz: &mut CacheBufferZone
+        bz: &CacheBufferZone
     ) -> Result<(), TxnErr> {
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];
@@ -154,7 +154,7 @@ impl InNode {
         left_ptr_pos: usize,
         right_ptr_pos: usize,
         txn: &mut Txn,
-        bz: &mut CacheBufferZone
+        bz: &CacheBufferZone
     ) -> Result<(), TxnErr> {
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];

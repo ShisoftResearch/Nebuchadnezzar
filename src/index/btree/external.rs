@@ -19,6 +19,9 @@ use std::rc::Rc;
 use owning_ref::{RcRef, OwningHandle, OwningRef};
 use ram::schema::{Schema, Field};
 use dovahkiin::types::type_id_of;
+use std::sync::Arc;
+use client::AsyncClient;
+use futures::Future;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -145,8 +148,9 @@ impl ExtNode {
             return Some((Node::External(box cached.id), None));
 
         } else {
-            debug!("insert to external without split");
+            debug!("insert to external without split at {}, key {:?}", pos, key);
             cached.keys.insert_at(key, pos, cached_len);
+            cached.len += 1;
             return None;
         }
     }
@@ -160,7 +164,7 @@ impl ExtNode {
     }
 }
 
-pub fn rearrange_empty_extnode(node: &ExtNode, bz: &mut CacheBufferZone) -> Id {
+pub fn rearrange_empty_extnode(node: &ExtNode, bz: &CacheBufferZone) -> Id {
     let prev = node.prev;
     let next = node.next;
     if !prev.is_unit_id() {
@@ -186,23 +190,26 @@ pub type RcNodeRef<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNode>>
 pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
 
 
-pub struct CacheBufferZone<'a> {
-    pub tree: &'a BPlusTree,
+pub struct CacheBufferZone {
+    mapper: Arc<ExtNodeCacheMap>,
+    storage: Arc<AsyncClient>,
     guards: RefCell<BTreeMap<Id, CacheGuardHolder>>,
     data: RefCell<BTreeMap<Id, Option<NodeRcRefCell>>>
 }
 
 
-impl <'a> CacheBufferZone <'a> {
-    pub fn new(tree: &BPlusTree) -> CacheBufferZone {
+impl CacheBufferZone {
+    pub fn new(mapper: &Arc<ExtNodeCacheMap>, storage: &Arc<AsyncClient>) -> CacheBufferZone {
         CacheBufferZone {
-            tree,
+            mapper: mapper.clone() ,
+            storage: storage.clone(),
             guards: RefCell::new(BTreeMap::new()),
             data: RefCell::new(BTreeMap::new())
         }
     }
 
     pub fn get(&self, id: &Id) -> RcNodeRef {
+        debug!("Getting cached fo readonly {:?}", id);
         {
             let data = self.data.borrow();
             match data.get(id) {
@@ -217,28 +224,32 @@ impl <'a> CacheBufferZone <'a> {
             }
         }
         {
-            let guard = self.tree.get_ext_node_cached(id);
+            debug!("Buffer zone inserting for readonly");
+            let guard = self.get_ext_node_cached(id);
             let mut data = self.data.borrow_mut();
             data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
             let holder = CacheGuardHolder::Read(guard);
             let mut guards = self.guards.borrow_mut();
             guards.insert(*id, holder);
+            debug!("Buffer zone now have data {}, guards {}", data.len(), guards.len());
         }
         return self.get(id);
     }
 
     pub fn get_for_mut(&self, id: &Id) -> RcNodeRefMut {
+        debug!("Getting cached for mutation {:?}", id);
         {
             let data = self.data.borrow();
             match data.get(id) {
-                Some(Some(ref data)) => {
+                Some(Some(ref extnode)) => {
                     let guards = self.guards.borrow();
                     if let CacheGuardHolder::Read(_) = guards.get(id).unwrap() {
                         panic!("Mutating readonly buffered cache");
                     }
-                    let cell = data.clone();
+                    let cell = extnode.clone();
                     let cell_ref = RcRef::new(cell);
                     let handle = OwningHandle::new_mut(cell_ref);
+                    debug!("Got cached, len {}, cache data {}, cache guards {}", handle.len, data.len(), guards.len());
                     return handle
                 },
                 Some(None) => panic!(),
@@ -246,12 +257,14 @@ impl <'a> CacheBufferZone <'a> {
             }
         }
         {
-            let guard = self.tree.get_mut_ext_node_cached(id);
+            debug!("Buffer zone inserting for mutation");
+            let guard = self.get_mut_ext_node_cached(id);
             let mut data = self.data.borrow_mut();
             data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
             let holder = CacheGuardHolder::Write(guard);
             let mut guards = self.guards.borrow_mut();
             guards.insert(*id, holder);
+            debug!("Buffer zone now have data {}, guards {}", data.len(), guards.len());
         }
         self.get_for_mut(id)
     }
@@ -265,23 +278,37 @@ impl <'a> CacheBufferZone <'a> {
         data.insert(*id, None);
     }
 
-    pub fn flush(self) {
-        let mut guards = self.guards.into_inner();
-        for (id, data) in self.data.into_inner() {
-            if let Some(mut node_rc) = data {
-                let mut holder = guards.get_mut(&id).unwrap();
+    pub fn flush(&self) {
+        let mut guards = self.guards.borrow_mut();
+        let data = self.data.borrow();
+        debug!("Flushing cache buffer, guards: {}, data: {}", guards.len(), data.len());
+        for (id, data) in &*data {
+            debug!("Flushing node: {:?}", id);
+            if let Some(ref node_rc) = data {
+                let mut holder = guards.get_mut(id).unwrap();
                 if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
-                    let mut ext_node = Rc::get_mut(&mut node_rc).unwrap();
-                    **guard = mem::replace(ext_node.get_mut(), ExtNode::new(&Id::unit_id()))
-                } else { panic!() }
+                    let mut ext_node = (*(*node_rc).borrow()).clone();
+                    debug!("flushing {:?} to cache with {} keys", ext_node.id, ext_node.len);
+                    **guard = ext_node
+                }
             } else {
-                self.tree.delete_ext_node(&id);
+                self.mapper.lock().remove(id);
+                self.storage.remove_cell(*id).wait().unwrap();
             }
         }
     }
 
     pub fn get_guard(&self, id: &Id) -> Option<CacheGuardHolder> {
         self.guards.borrow().get(id).map(|rg| rg.clone())
+    }
+
+    pub fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {
+        let mut map = self.mapper.lock();
+        return map.get_or_fetch(id).unwrap().write();
+    }
+    pub fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCachedImmute {
+        let mut map = self.mapper.lock();
+        return map.get_or_fetch(id).unwrap().read();
     }
 }
 
