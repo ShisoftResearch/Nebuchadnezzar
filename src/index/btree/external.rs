@@ -186,9 +186,14 @@ pub enum CacheGuardHolder {
 
 type NodeRcRefCell = Rc<RefCell<ExtNode>>;
 
-pub type RcNodeRef<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNode>>;
+pub type RcNodeRefData<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNode>>;
 pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
 
+
+pub enum RcNodeRef<'a> {
+    Data(RcNodeRefData<'a>),
+    Guard(CacheGuardHolder)
+}
 
 pub struct CacheBufferZone {
     mapper: Arc<ExtNodeCacheMap>,
@@ -197,6 +202,27 @@ pub struct CacheBufferZone {
     data: RefCell<BTreeMap<Id, Option<NodeRcRefCell>>>
 }
 
+impl Deref for CacheGuardHolder {
+    type Target = ExtNode;
+
+    fn deref(&self) -> &'_ <Self as Deref>::Target {
+        match self {
+            &CacheGuardHolder::Read(ref g) => &*g,
+            &CacheGuardHolder::Write(ref g) => &*g
+        }
+    }
+}
+
+impl <'a> Deref for RcNodeRef<'a> {
+    type Target = ExtNode;
+
+    fn deref(&self) -> &'_ <Self as Deref>::Target {
+        match self {
+            &RcNodeRef::Guard(ref g) => &*g,
+            &RcNodeRef::Data(ref g) => &*g
+        }
+    }
+}
 
 impl CacheBufferZone {
     pub fn new(mapper: &Arc<ExtNodeCacheMap>, storage: &Arc<AsyncClient>) -> CacheBufferZone {
@@ -211,27 +237,33 @@ impl CacheBufferZone {
     pub fn get(&self, id: &Id) -> RcNodeRef {
         debug!("Getting cached fo readonly {:?}", id);
         {
+            // read from data (from write)
             let data = self.data.borrow();
             match data.get(id) {
                 Some(Some(ref data)) => {
                     let cell = data.clone();
                     let cell_ref = RcRef::new(cell);
                     let handle = OwningHandle::new(cell_ref);
-                    return handle
+                    return RcNodeRef::Data(handle);
                 },
-                Some(None) => panic!(),
+                Some(None) => panic!(), // deleted
                 _ => {}
+            }
+        }
+        {
+            // read from guards
+            let guard = self.guards.borrow();
+            if let Some(holder) = guard.get(id) {
+                return RcNodeRef::Guard(holder.clone());
             }
         }
         {
             debug!("Buffer zone inserting for readonly");
             let guard = self.get_ext_node_cached(id);
-            let mut data = self.data.borrow_mut();
-            data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
             let holder = CacheGuardHolder::Read(guard);
             let mut guards = self.guards.borrow_mut();
             guards.insert(*id, holder);
-            debug!("Buffer zone now have data {}, guards {}", data.len(), guards.len());
+            debug!("Buffer zone now have data {}", guards.len());
         }
         return self.get(id);
     }

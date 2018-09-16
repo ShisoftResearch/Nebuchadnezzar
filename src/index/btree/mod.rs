@@ -49,7 +49,7 @@ enum Node {
 pub struct RTCursor {
     index: usize,
     version: u64,
-    current: Id,
+    current: Option<Id>,
     ordering: Ordering,
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
@@ -437,7 +437,7 @@ impl <'a> TreeTxn<'a> {
     }
 }
 
-impl <'a> RTCursor {
+impl RTCursor {
     fn new(
         id: &Id,
         bz: &Rc<CacheBufferZone>,
@@ -450,6 +450,7 @@ impl <'a> RTCursor {
         let node = bz.get(&id);
         let page = bz.get_guard(&id).unwrap();
         let key = &node.keys[pos];
+        let current = if key.len() == 0 { None } else { Some(id_from_key(key)) };
         debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
         debug!("Key at pos {} is {:?}", pos, &key);
         RTCursor {
@@ -457,15 +458,17 @@ impl <'a> RTCursor {
             version,
             ordering,
             page,
+            current,
             bz: bz.clone(),
             next_page: bz.get_guard(match ordering {
                 Ordering::Forward => next,
                 Ordering::Backward  => prev
-            }),
-            current: id_from_key(key)
+            })
         }
     }
+    fn next(&mut self) {
 
+    }
 }
 
 fn id_from_key(key: &EntryKey) -> Id {
