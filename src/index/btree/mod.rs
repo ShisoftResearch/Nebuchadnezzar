@@ -49,7 +49,6 @@ enum Node {
 pub struct RTCursor {
     index: usize,
     version: u64,
-    current: Option<Id>,
     ordering: Ordering,
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
@@ -450,7 +449,6 @@ impl RTCursor {
         let node = bz.get(&id);
         let page = bz.get_guard(&id).unwrap();
         let key = &node.keys[pos];
-        let current = if key.len() == 0 { None } else { Some(id_from_key(key)) };
         debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
         debug!("Key at pos {} is {:?}", pos, &key);
         RTCursor {
@@ -458,7 +456,6 @@ impl RTCursor {
             version,
             ordering,
             page,
-            current,
             bz: bz.clone(),
             next_page: bz.get_guard(match ordering {
                 Ordering::Forward => next,
@@ -466,8 +463,49 @@ impl RTCursor {
             })
         }
     }
-    fn next(&mut self) {
+    pub fn next(&mut self) -> bool {
+        match self.ordering {
+            Ordering::Forward => {
+                if self.index >= self.page.len {
+                    // next page
+                    if let Some(next_page) = self.next_page.clone() {
+                        self.next_page = self.bz.get_guard(&next_page.next);
+                        self.index = 0;
+                        self.page = next_page;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    self.index += 1;
+                }
+            },
+            Ordering::Backward => {
+                if self.index <= 0 {
+                    // next page
+                    if let Some(next_page) = self.next_page.clone() {
+                        self.next_page = self.bz.get_guard(&next_page.prev);
+                        self.index = next_page.len - 1;
+                        self.page = next_page;
+                    } else {
+                        return false
+                    }
+                } else {
+                    self.index -= 1;
+                }
+            }
+        }
+        return true;
+    }
 
+    pub fn current(&self) -> Id {
+        id_from_key(&self.page.keys[self.index])
+    }
+
+    pub fn has_next(&self) -> bool {
+        match self.ordering {
+            Ordering::Forward => self.index < self.page.len - 1 || self.next_page.is_some(),
+            Ordering::Backward => self.index > 0 || self.next_page.is_some()
+        }
     }
 }
 
@@ -523,7 +561,7 @@ trait Slice<T> : Sized where T: Default + Debug {
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: usize) {
-        assert!(pos <= len, "pos {:?} larger or equals to len {:?}", pos, len);
+        assert!(pos <= len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
         debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
         let mut slice = self.as_slice();
         for i in len .. pos {
@@ -600,7 +638,33 @@ mod test {
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
         tree.insert(&key, &id).unwrap();
-        let cursor =  tree.seek(&key, Ordering::Forward).unwrap();
-        // assert_eq!(cursor.page., id);
+        let mut cursor =  tree.seek(&key, Ordering::Forward).unwrap();
+        assert_eq!(cursor.current(), id);
+    }
+
+    #[test]
+    fn lots_of_insertions() {
+        env_logger::init();
+        let server_group = "index_insertions";
+        let server_addr = String::from("127.0.0.1:5101");
+        let server = NebServer::new_from_opts(&ServerOptions {
+            chunk_count: 1,
+            memory_size: 16 * 1024 * 1024,
+            backup_storage: None,
+            wal_storage: None
+        }, &server_addr, &server_group);
+        let client = Arc::new(client::AsyncClient::new(
+            &server.rpc, &vec!(server_addr),
+            server_group).unwrap());
+        client.new_schema_with_id(super::external::page_schema());
+        let tree = BPlusTree::new(&client);
+        let key = smallvec![1, 2, 3, 4, 5, 6];
+        info!("test insertion");
+        let num = 2000_000;
+        for i in 0..num {
+            let id = Id::new(0, i);
+            debug!("insert id: {}", i);
+            tree.insert(&key, &id).unwrap();
+        }
     }
 }
