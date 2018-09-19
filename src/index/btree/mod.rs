@@ -27,7 +27,7 @@ mod internal;
 mod external;
 
 const ID_SIZE: usize = 16;
-const NUM_KEYS: usize = 2048;
+const NUM_KEYS: usize = 32;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -186,7 +186,7 @@ impl Node {
     {
         if let &mut Node::External(ref id) = self {
             debug!("inserting to external node at: {:?}, key {:?}", pos, key);
-            self.extnode_mut(bz).insert(key, pos, tree)
+            self.extnode_mut(bz).insert(key, pos, tree, bz)
         } else {
             debug!("inserting to internal node at: {:?}, key {:?}", pos, key);
             self.innode_mut().insert(key, ptr, pos)
@@ -260,8 +260,10 @@ impl <'a> TreeTxn<'a> {
     }
 
     pub fn seek(&mut self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
+//        let mut key = key.clone();
+//        key_with_id(&mut key, &Id::unit_id());
         let root = self.tree.root;
-        self.search(root, key, ordering)
+        self.search(root, &key, ordering)
     }
 
     fn search(
@@ -270,10 +272,11 @@ impl <'a> TreeTxn<'a> {
         key: &EntryKey,
         ordering: Ordering) -> Result<RTCursor, TxnErr>
     {
+        debug!("searching for {:?} at {:?}", key, node);
         let node = self.txn.read::<Node>(node)?.unwrap();
         let pos = node.search(key, &mut self.bz);
         if node.is_ext() {
-            debug!("search in external");
+            debug!("search in external for {:?}", key);
             let (
                 ext_ver, ext_id, ext_next, ext_prev
             ) = {
@@ -293,7 +296,7 @@ impl <'a> TreeTxn<'a> {
         key_with_id(&mut key, id);
         let root_ref = self.tree.root;
         if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
-            debug!("split root");
+            debug!("split root with pivot key {:?}", pivotKey);
             let first_key = new_node.first_key(&mut self.bz);
             let new_node_ref = self.txn.new_value(new_node);
             let pivot = pivotKey.unwrap_or_else(|| first_key);
@@ -318,14 +321,14 @@ impl <'a> TreeTxn<'a> {
         key: EntryKey
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
         debug!("insert to node: {:?}", node);
-        let acq_node = self.txn.read::<Node>(node)?.unwrap();
-        acq_node.warm_cache_for_write_intention(&mut self.bz);
-        let pos = acq_node.search(&key, &mut self.bz);
-        let split_node = match &*acq_node {
+        let ref_node = self.txn.read::<Node>(node)?.unwrap();
+        ref_node.warm_cache_for_write_intention(&mut self.bz);
+        let pos = ref_node.search(&key, &mut self.bz);
+        let split_node = match &*ref_node {
             &Node::External(ref id) => {
                 debug!("insert into external at {}, key {:?}, id {:?}", pos, key, id);
                 let mut node = self.bz.get_for_mut(id);
-                return Ok(node.insert(key, pos, self.tree));
+                return Ok(node.insert(key, pos, self.tree, &*self.bz));
             },
             &Node::Internal(ref n) => {
                 debug!("insert into internal at {}", pos);
@@ -344,7 +347,7 @@ impl <'a> TreeTxn<'a> {
                 let result = acq_node.insert(
                     pivot,
                     Some(new_node_ref),
-                    pos + 1,
+                    pos, // is this the right one?
                     self.tree, &mut self.bz);
                 self.txn.update(node, acq_node);
                 return Ok(result);
@@ -609,6 +612,7 @@ mod test {
     use server::NebServer;
     use dovahkiin::types::custom_types::id::Id;
     use ram::types::RandValue;
+    use index::btree::NUM_KEYS;
 
     extern crate env_logger;
 
@@ -660,11 +664,32 @@ mod test {
         let tree = BPlusTree::new(&client);
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 2000_000;
+        let num = 200;
         for i in 0..num {
             let id = Id::new(0, i);
             debug!("insert id: {}", i);
             tree.insert(&key, &id).unwrap();
+        }
+        tree.transaction(|txn| {
+            let root = txn.txn.read::<Node>(tree.root)?.unwrap();
+            let root_innode = root.innode();
+            debug!("root have {} keys", root_innode.keys.len());
+            for i in 0..root_innode.len {
+                print!("{:?} | ", root_innode.keys[i]);
+            }
+            println!();
+            // debug!("{:?}", root_innode.keys);
+            Ok(())
+        }).unwrap();
+        // sequence check
+        debug!("Scanning for sequence verification");
+        let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
+        for i in 0..num {
+            let expected = Id::new(0, i);
+            debug!("Expecting id {:?}", expected);
+            let id = cursor.current();
+            assert_eq!(id, expected);
+            cursor.next();
         }
     }
 }

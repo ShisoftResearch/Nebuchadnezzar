@@ -109,7 +109,14 @@ impl ExtNode {
         self.keys.remove_at(pos, cached_len);
         self.len -= 1;
     }
-    pub fn insert(&mut self, key: EntryKey, pos: usize, tree: &BPlusTree) -> Option<(Node, Option<EntryKey>)> {
+    pub fn insert(
+        &mut self,
+        key: EntryKey,
+        pos: usize,
+        tree: &BPlusTree,
+        bz: &CacheBufferZone)
+        -> Option<(Node, Option<EntryKey>)>
+    {
         let mut cached = self;
         let cached_len = cached.len;
         if cached_len + 1 >= NUM_KEYS {
@@ -145,7 +152,10 @@ impl ExtNode {
             };
             cached.next = split.node_2.id;
             cached.len = split.keys_1_len;
-            return Some((Node::External(box cached.id), None));
+            let node_2_id = split.node_2.id;
+            let node_2 = Node::External(box node_2_id);
+            bz.new_node(split.node_2);
+            return Some((node_2, None));
 
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
@@ -289,7 +299,7 @@ impl CacheBufferZone {
             }
         }
         {
-            debug!("Buffer zone inserting for mutation");
+            debug!("Buffer zone inserting for mutation {:?}", id);
             let guard = self.get_mut_ext_node_cached(id);
             let mut data = self.data.borrow_mut();
             data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
@@ -301,29 +311,43 @@ impl CacheBufferZone {
         self.get_for_mut(id)
     }
 
-    pub fn update(&self, id: &Id, node: ExtNode) {
-        let mut data = self.data.borrow_mut();
-        data.insert(*id, Some(Rc::new(RefCell::new(node))));
-    }
     pub fn delete(&self, id: &Id) {
         let mut data = self.data.borrow_mut();
         data.insert(*id, None);
     }
 
+    pub fn new_node(&self, node: ExtNode) {
+        let mut mapper = self.mapper.lock();
+        if mapper.get(&node.id).is_some() {
+            panic!()
+        } else {
+            let node_id = node.id;
+            let lock = RwLock::new(ExtNode::new(&node_id));
+            let guard = CacheGuardHolder::Write(lock.write());
+            let mut guards = self.guards.borrow_mut();
+            let mut data = self.data.borrow_mut();
+            debug!("new node in buffered cache: {:?}, was guards: {}, data: {}", node_id, guards.len(), data.len());
+            mapper.insert(node_id, lock);
+            guards.insert(node_id, guard);
+            data.insert(node_id, Some(Rc::new(RefCell::new(node))));
+        }
+    }
+
     pub fn flush(&self) {
         let mut guards = self.guards.borrow_mut();
         let data = self.data.borrow();
-        debug!("Flushing cache buffer, guards: {}, data: {}", guards.len(), data.len());
-        for (id, data) in &*data {
-            debug!("Flushing node: {:?}", id);
+        debug!("Flushing cache buffer, guards: {:?}, data: {:?}", guards.keys(), data.keys());
+        for ((id, data),  (gid, mut holder)) in data.iter().zip(guards.iter_mut()) {
+            assert_eq!(id, gid);
             if let Some(ref node_rc) = data {
-                let mut holder = guards.get_mut(id).unwrap();
+                debug!("Flushing updating node: {:?}", id);
                 if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
                     let mut ext_node = (*(*node_rc).borrow()).clone();
                     debug!("flushing {:?} to cache with {} keys", ext_node.id, ext_node.len);
                     **guard = ext_node
                 }
             } else {
+                debug!("Flushing deleting node: {:?}", id);
                 self.mapper.lock().remove(id);
                 self.storage.remove_cell(*id).wait().unwrap();
             }

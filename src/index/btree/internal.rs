@@ -35,6 +35,7 @@ impl InNode {
     pub fn insert(&mut self, key: EntryKey, ptr: Option<TxnValRef>, pos: usize)
         -> Option<(Node, Option<EntryKey>)>
     {
+        debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
         if node_len + 1 >= NUM_KEYS {
