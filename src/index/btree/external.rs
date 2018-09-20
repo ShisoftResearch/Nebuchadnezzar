@@ -355,7 +355,18 @@ impl CacheBufferZone {
     }
 
     pub fn get_guard(&self, id: &Id) -> Option<CacheGuardHolder> {
-        self.guards.borrow().get(id).map(|rg| rg.clone())
+        if id.is_unit_id() {
+            return None;
+        }
+        let mut guards = self.guards.borrow_mut();
+        {
+            let res = guards.get(id).map(|rg| rg.clone());
+            if res.is_some() { return res; }
+        }
+        let guard = self.get_ext_node_cached(id);
+        let holder = CacheGuardHolder::Read(guard);
+        guards.insert(*id, holder.clone());
+        return Some(holder)
     }
 
     pub fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {

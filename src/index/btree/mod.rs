@@ -48,7 +48,6 @@ enum Node {
 // Ordering are specified that can also change lock pattern
 pub struct RTCursor {
     index: usize,
-    version: u64,
     ordering: Ordering,
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
@@ -244,6 +243,7 @@ impl Node {
             _ => unreachable!()
         }
     }
+    fn ext_id(&self) -> Id { if let &Node::External(ref id) = self { **id } else { panic!() } }
     fn innode(&self) -> &InNode {
         match self {
             &Node::Internal(ref n) => n,
@@ -277,13 +277,7 @@ impl <'a> TreeTxn<'a> {
         let pos = node.search(key, &mut self.bz);
         if node.is_ext() {
             debug!("search in external for {:?}", key);
-            let (
-                ext_ver, ext_id, ext_next, ext_prev
-            ) = {
-                let ext_node = node.extnode(&mut self.bz);
-                (ext_node.version, ext_node.id, ext_node.next, ext_node.prev)
-            };
-            Ok(RTCursor::new(&ext_id, &self.bz, pos, ext_ver, ordering, &ext_next, &ext_prev))
+            Ok(RTCursor::new(pos, &node.ext_id(), &self.bz, ordering))
         } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.pointers[pos];
             self.search(next_node_ref, key, ordering)
@@ -441,28 +435,26 @@ impl <'a> TreeTxn<'a> {
 
 impl RTCursor {
     fn new(
+        pos: usize,
         id: &Id,
         bz: &Rc<CacheBufferZone>,
-        pos: usize,
-        version: u64,
         ordering: Ordering,
-        next: &Id,
-        prev: &Id,
     ) -> RTCursor {
-        let node = bz.get(&id);
-        let page = bz.get_guard(&id).unwrap();
+        let node = bz.get(id);
+        let page = bz.get_guard(id).unwrap();
         let key = &node.keys[pos];
+        let next = page.next;
+        let prev = page.prev;
         debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
-        debug!("Key at pos {} is {:?}", pos, &key);
+        debug!("Key at pos {} is {:?}, next: {:?}, prev: {:?}", pos, &key, next, prev);
         RTCursor {
             index: pos,
-            version,
             ordering,
             page,
             bz: bz.clone(),
             next_page: bz.get_guard(match ordering {
-                Ordering::Forward => next,
-                Ordering::Backward  => prev
+                Ordering::Forward => &next,
+                Ordering::Backward  => &prev
             })
         }
     }
@@ -470,7 +462,7 @@ impl RTCursor {
         debug!("Next id with index: {}, length: {}", self.index + 1, self.page.len);
         match self.ordering {
             Ordering::Forward => {
-                if self.index + 2 >= self.page.len {
+                if self.index + 1 >= self.page.len {
                     // next page
                     if let Some(next_page) = self.next_page.clone() {
                         debug!("Shifting page forward");
@@ -478,10 +470,12 @@ impl RTCursor {
                         self.index = 0;
                         self.page = next_page;
                     } else {
+                        debug!("iterated to end");
                         return false;
                     }
                 } else {
                     self.index += 1;
+                    debug!("Advancing cursor to index {}", self.index);
                 }
             },
             Ordering::Backward => {
@@ -493,10 +487,12 @@ impl RTCursor {
                         self.index = next_page.len - 1;
                         self.page = next_page;
                     } else {
+                        debug!("iterated to end");
                         return false
                     }
                 } else {
                     self.index -= 1;
+                    debug!("Advancing cursor to index {}", self.index);
                 }
             }
         }
@@ -692,7 +688,9 @@ mod test {
             debug!("Expecting id {:?}", expected);
             let id = cursor.current();
             assert_eq!(id, expected);
-            cursor.next();
+            if i + 1 < num {
+                assert!(cursor.next());
+            }
         }
     }
 }
