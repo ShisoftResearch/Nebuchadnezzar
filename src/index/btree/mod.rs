@@ -467,11 +467,13 @@ impl RTCursor {
         }
     }
     pub fn next(&mut self) -> bool {
+        debug!("Next id with index: {}, length: {}", self.index + 1, self.page.len);
         match self.ordering {
             Ordering::Forward => {
-                if self.index >= self.page.len {
+                if self.index + 2 >= self.page.len {
                     // next page
                     if let Some(next_page) = self.next_page.clone() {
+                        debug!("Shifting page forward");
                         self.next_page = self.bz.get_guard(&next_page.next);
                         self.index = 0;
                         self.page = next_page;
@@ -486,6 +488,7 @@ impl RTCursor {
                 if self.index <= 0 {
                     // next page
                     if let Some(next_page) = self.next_page.clone() {
+                        debug!("Shifting page backward");
                         self.next_page = self.bz.get_guard(&next_page.prev);
                         self.index = next_page.len - 1;
                         self.page = next_page;
