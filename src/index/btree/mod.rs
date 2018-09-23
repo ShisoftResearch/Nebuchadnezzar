@@ -314,10 +314,11 @@ impl <'a> TreeTxn<'a> {
         node: TxnValRef,
         key: EntryKey
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
-        debug!("insert to node: {:?}", node);
         let ref_node = self.txn.read::<Node>(node)?.unwrap();
         ref_node.warm_cache_for_write_intention(&mut self.bz);
         let pos = ref_node.search(&key, &mut self.bz);
+        debug!("insert to node: {:?}, len {}, pos: {}, external: {}",
+               node, ref_node.len(&mut self.bz), pos, ref_node.is_ext());
         let split_node = match &*ref_node {
             &Node::External(ref id) => {
                 debug!("insert into external at {}, key {:?}, id {:?}", pos, key, id);
@@ -325,25 +326,32 @@ impl <'a> TreeTxn<'a> {
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));
             },
             &Node::Internal(ref n) => {
-                debug!("insert into internal at {}", pos);
                 let next_node_ref = n.pointers[pos];
+                debug!("insert into internal at {}, has keys {}, ref {:?}", pos, n.len, next_node_ref);
                 self.insert_to_node(next_node_ref, key)?
             },
             &Node::None => unreachable!()
         };
         match split_node {
             Some((new_node, pivot_key)) => {
+                debug!("Sub level node split, shall insert new node to current level, pivot {:?}, current keys: ", pivot_key);
                 assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                let first_key = new_node.first_key(&mut self.bz);
+                let pivot = pivot_key.unwrap_or_else(|| {
+                    let first_key = new_node.first_key(&mut self.bz);
+                    assert_ne!(first_key.len(), 0);
+                    first_key
+                });
                 let new_node_ref = self.txn.new_value(new_node);
-                let pivot = pivot_key.unwrap_or_else(|| first_key);
+                debug!("New node in transaction {:?}, pivot {:?}", new_node_ref, pivot);
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
+                assert!(!acq_node.is_ext());
                 let result = acq_node.insert(
                     pivot,
                     Some(new_node_ref),
                     pos, // is this the right one?
                     self.tree, &mut self.bz);
                 self.txn.update(node, acq_node);
+                if result.is_some() { debug!("Sub level split caused current level split"); }
                 return Ok(result);
             },
             None => return Ok(None)
@@ -554,10 +562,11 @@ trait Slice<T> : Sized where T: Default + Debug {
         {
             let mut slice1: &mut[T] = self.as_slice();
             let mut slice2: &mut[T] = right_slice.as_slice();
-            for i in pivot .. len { // leave pivot to the left slice
-                slice2[i - pivot] = mem::replace(
-                    &mut slice1[i],
-                    T::default());
+            for i in pivot .. len { // leave pivot to the right slice
+                let right_pos = i - pivot;
+                let item = mem::replace(&mut slice1[i], T::default());
+                debug!("Moving from left pos {} to right {}, item {:?} for split", i, right_pos, &item);
+                slice2[right_pos] = item;
             }
         }
         return right_slice;
@@ -567,9 +576,10 @@ trait Slice<T> : Sized where T: Default + Debug {
         debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
         let mut slice = self.as_slice();
         for i in len .. pos {
-            debug!("move {} to {}", i - 1, i);
+            debug!("move {} to {} for insertion", i - 1, i);
             slice[i] = mem::replace(&mut slice[i - 1], T::default());
         }
+        debug!("setting item {:?} at {} for insertion", item, pos);
         slice[pos] = item;
     }
     fn remove_at(&mut self, pos: usize, len: usize) {
@@ -663,7 +673,7 @@ mod test {
         let tree = BPlusTree::new(&client);
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 200;
+        let num = 2048;
         for i in 0..num {
             let id = Id::new(0, i);
             debug!("insert id: {}", i);

@@ -122,6 +122,7 @@ impl ExtNode {
         if cached_len + 1 >= NUM_KEYS {
             // need to split
             debug!("insert to external with split");
+            cached.dump();
             let pivot = cached_len / 2;
             let split = {
                 let cached_next = *&cached.next;
@@ -154,6 +155,9 @@ impl ExtNode {
             cached.len = split.keys_1_len;
             let node_2_id = split.node_2.id;
             let node_2 = Node::External(box node_2_id);
+            debug!("Split to left len {}, right len {}", cached.len, split.node_2.len);
+            cached.dump();
+            split.node_2.dump();
             bz.new_node(split.node_2);
             return Some((node_2, None));
 
@@ -170,6 +174,12 @@ impl ExtNode {
         assert!(new_len <= self.keys.len());
         for i in self.len .. new_len {
             self.keys[i] = mem::replace(&mut right.keys[i - self_len], Default::default());
+        }
+    }
+    pub fn dump(&self) {
+        debug!("Dumping {:?}, keys {}", self.id, self.len);
+        for i in 0..NUM_KEYS {
+            println!("{}\t- {:?}", i, self.keys[i]);
         }
     }
 }
