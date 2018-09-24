@@ -119,7 +119,7 @@ impl ExtNode {
     {
         let mut cached = self;
         let cached_len = cached.len;
-        if cached_len + 1 >= NUM_KEYS {
+        if cached_len >= NUM_KEYS {
             // need to split
             debug!("insert to external with split");
             cached.dump();
