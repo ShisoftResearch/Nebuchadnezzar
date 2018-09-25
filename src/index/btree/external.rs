@@ -121,7 +121,7 @@ impl ExtNode {
         let cached_len = cached.len;
         if cached_len >= NUM_KEYS {
             // need to split
-            debug!("insert to external with split");
+            debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             cached.dump();
             let pivot = cached_len / 2;
             let split = {
@@ -163,8 +163,13 @@ impl ExtNode {
 
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
-            cached.keys.insert_at(key, pos, cached_len);
-            cached.len += 1;
+            let middle_insertion = pos != cached_len;
+            let mut new_cached_len = cached_len;
+            cached.keys.insert_at(key, pos, &mut new_cached_len);
+            cached.len = new_cached_len;
+            if middle_insertion {
+                cached.dump();
+            }
             return None;
         }
     }

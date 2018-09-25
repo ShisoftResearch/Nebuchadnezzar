@@ -78,9 +78,11 @@ impl InNode {
             self.len = keys_split.keys_1_len;
             return Some((Node::Internal(box node_2), Some(keys_split.pivot_key)));
         } else {
-            self.keys.insert_at(key, pos, node_len);
-            self.pointers.insert_at(ptr.unwrap(), pos + 1, node_len + 1);
-            self.len += 1;
+            let mut new_node_len = node_len;
+            let mut new_node_pointers = node_len + 1;
+            self.keys.insert_at(key, pos, &mut new_node_len);
+            self.pointers.insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
+            self.len = new_node_len;
             return None;
         }
     }

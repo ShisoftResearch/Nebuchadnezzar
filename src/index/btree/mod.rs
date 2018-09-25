@@ -22,6 +22,7 @@ use bifrost::utils::async_locks::Mutex;
 use std::cell::RefMut;
 use std::cell::Ref;
 use std::fmt::Debug;
+use std::ops::Range;
 
 mod internal;
 mod external;
@@ -537,12 +538,11 @@ fn insert_into_split<T, S>(
 )
     where S: Slice<T>, T: Default + Debug
 {
+    debug!("insert into split left len {}, right len {}, pos {}, pivot {}", xlen, ylen, pos, pivot);
     if pos <= pivot {
-        x.insert_at(item, pos, *xlen);
-        *xlen += 1;
+        x.insert_at(item, pos, xlen);
     } else {
-        y.insert_at(item, pos - pivot, *ylen);
-        *ylen += 1;
+        y.insert_at(item, pos - pivot, ylen);
     }
 }
 
@@ -571,15 +571,19 @@ trait Slice<T> : Sized where T: Default + Debug {
         }
         return right_slice;
     }
-    fn insert_at(&mut self, item: T, pos: usize, len: usize) {
-        assert!(pos <= len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
+    fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
+        assert!(pos <= *len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
         debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
         let mut slice = self.as_slice();
-        for i in len .. pos {
-            debug!("move {} to {} for insertion", i - 1, i);
-            slice[i] = mem::replace(&mut slice[i - 1], T::default());
+        if *len > 0 {
+            slice[*len] = T::default();
+            for i in (pos ..= *len - 1).rev() {
+                debug!("swap {} with {} for insertion", i, i + 1);
+                slice.swap(i, i + 1);
+            }
         }
         debug!("setting item {:?} at {} for insertion", item, pos);
+        *len += 1;
         slice[pos] = item;
     }
     fn remove_at(&mut self, pos: usize, len: usize) {
