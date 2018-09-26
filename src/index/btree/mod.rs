@@ -350,7 +350,7 @@ impl <'a> TreeTxn<'a> {
                 let result = acq_node.insert(
                     pivot,
                     Some(new_node_ref),
-                    pivot_pos, // is this the right one?
+                    pivot_pos,
                     self.tree, &mut self.bz);
                 self.txn.update(node, acq_node);
                 if result.is_some() { debug!("Sub level split caused current level split"); }
@@ -627,6 +627,7 @@ mod test {
     use dovahkiin::types::custom_types::id::Id;
     use ram::types::RandValue;
     use index::btree::NUM_KEYS;
+    use futures::future::Future;
 
     extern crate env_logger;
 
@@ -674,11 +675,11 @@ mod test {
         let client = Arc::new(client::AsyncClient::new(
             &server.rpc, &vec!(server_addr),
             server_group).unwrap());
-        client.new_schema_with_id(super::external::page_schema());
+        client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 20480;
+        let num = 204800;
         for i in 0..num {
             let id = Id::new(0, i);
             debug!("insert id: {}", i);

@@ -94,6 +94,7 @@ impl ExtNode {
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(self.next);
+        value[*PREV_PAGE_KEY_HASH] = Value::Id(self.prev);
         value[*KEYS_KEY_HASH] = self
             .keys[..self.len]
             .iter()
@@ -406,7 +407,7 @@ pub fn page_schema() -> Schema {
             Some(vec![
                 Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None),
                 Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None),
-                Field::new(KEYS_FIELD, type_id_of(Type::U8), false, true, None)
+                Field::new(KEYS_FIELD, type_id_of(Type::Array), false, true, None)
             ])
         )
     }
