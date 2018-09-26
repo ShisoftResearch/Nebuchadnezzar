@@ -346,10 +346,11 @@ impl <'a> TreeTxn<'a> {
                 debug!("New node in transaction {:?}, pivot {:?}", new_node_ref, pivot);
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
                 assert!(!acq_node.is_ext());
+                let pivot_pos = acq_node.search(&pivot, &mut self.bz);
                 let result = acq_node.insert(
                     pivot,
                     Some(new_node_ref),
-                    pos, // is this the right one?
+                    pivot_pos, // is this the right one?
                     self.tree, &mut self.bz);
                 self.txn.update(node, acq_node);
                 if result.is_some() { debug!("Sub level split caused current level split"); }
@@ -677,7 +678,7 @@ mod test {
         let tree = BPlusTree::new(&client);
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 2048;
+        let num = 20480;
         for i in 0..num {
             let id = Id::new(0, i);
             debug!("insert id: {}", i);
