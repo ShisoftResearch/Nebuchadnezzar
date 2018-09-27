@@ -14,11 +14,8 @@ libc = "*"
 log = "0.3"
 lazy_static = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-#bifrost = { path = "../bifrost" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-#bifrost_plugins = { path = "../bifrost/src/plugins" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
-#bifrost_hasher = { path = "../bifrost/src/hasher" }
 dovahkiin = { git = "https://github.com/ShisoftResearch/Dovahkiin", branch = "develop" }
 hermes = { git = "https://github.com/ShisoftResearch/Hermes.git" }
 serde = "*"

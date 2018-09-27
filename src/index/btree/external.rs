@@ -68,26 +68,27 @@ impl ExtNode {
         }
     }
     pub fn from_cell(cell: Cell) -> Self {
-        let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_len = keys.len().unwrap();
-        let mut key_slice = EntryKeySlice::init();
-        let mut key_count = 0;
+        let cell_id = cell.id();
+        let cell_version = cell.header.version;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
-        for (i, key_val) in keys.iter_value().unwrap().enumerate() {
-            let key = if let Value::PrimArray(PrimitiveArray::U8(ref array)) = key_val {
-                EntryKey::from_slice(array.as_slice())
-            } else { panic!("invalid entry") };
-            key_slice[i] = key;
+        let keys = &cell.data[*KEYS_KEY_HASH];
+        let keys_len = keys.len().unwrap();
+        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys { array } else { panic!() };
+        let mut key_slice = EntryKeySlice::init();
+        let mut key_count = 0;
+        debug!("Reading from persisted cell from storage, keys {:?}", keys);
+        for (i, key_val) in keys_array.iter().enumerate() {;
+            key_slice[i] = EntryKey::from(key_val.as_slice());
             key_count += 1;
         }
         ExtNode {
-            id: cell.id(),
+            id: cell_id,
             keys: key_slice,
             next: *next,
             prev: *prev,
             len: key_count,
-            version: cell.header.version,
+            version: cell_version,
             removed: false
         }
     }
@@ -99,7 +100,7 @@ impl ExtNode {
             .keys[..self.len]
             .iter()
             .map(|key| {
-                key.as_slice().to_vec().value()
+                SmallBytes::from_vec(key.as_slice().to_vec())
             })
             .collect_vec()
             .value();
@@ -407,7 +408,7 @@ pub fn page_schema() -> Schema {
             Some(vec![
                 Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None),
                 Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None),
-                Field::new(KEYS_FIELD, type_id_of(Type::Array), false, true, None)
+                Field::new(KEYS_FIELD, type_id_of(Type::SmallBytes), false, true, None)
             ])
         )
     }

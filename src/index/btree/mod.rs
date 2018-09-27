@@ -668,7 +668,7 @@ mod test {
         let server_addr = String::from("127.0.0.1:5101");
         let server = NebServer::new_from_opts(&ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            memory_size: 160 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None
         }, &server_addr, &server_group);
