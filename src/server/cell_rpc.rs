@@ -12,6 +12,7 @@ service! {
     rpc read_cell(key: Id) -> Cell | ReadError;
     rpc write_cell(cell: Cell) -> CellHeader | WriteError;
     rpc update_cell(cell: Cell) -> CellHeader | WriteError;
+    rpc upsert_cell(cell: Cell) -> CellHeader | WriteError;
     rpc remove_cell(key: Id) -> () | WriteError;
 }
 
@@ -33,6 +34,9 @@ impl Service for NebRPCService {
     }
     fn update_cell(&self, mut cell: Cell) -> Box<Future<Item =CellHeader, Error = WriteError>> {
         NebRPCServiceInner::update_cell(self.inner.clone(), cell)
+    }
+    fn upsert_cell(&self, mut cell: Cell) -> Box<Future<Item =CellHeader, Error = WriteError>> {
+        NebRPCServiceInner::upsert_cell(self.inner.clone(), cell)
     }
     fn remove_cell(&self, key: Id) -> Box<Future<Item = (), Error = WriteError>> {
         NebRPCServiceInner::remove_cell(self.inner.clone(), key)
@@ -69,6 +73,16 @@ impl NebRPCServiceInner {
         -> Box<Future<Item = (), Error = WriteError>>
     {
         box this.clone().pool.spawn_fn(move ||this.server.chunks.remove_cell(&key))
+    }
+    fn upsert_cell(this: Arc<Self>, mut cell: Cell)
+        -> Box<Future<Item =CellHeader, Error = WriteError>>
+    {
+        box this.clone().pool.spawn_fn(move ||
+            match this.server.chunks.upsert_cell(&mut cell) {
+                Ok(header) => Ok(header),
+                Err(e) => Err(e)
+            }
+        )
     }
 }
 

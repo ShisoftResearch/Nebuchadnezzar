@@ -87,6 +87,11 @@ impl AsyncClientInner {
         await!(client.update_cell(cell))
     }
     #[async]
+    pub fn upsert_cell(this: Arc<Self>, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = await!(Self::locate_plain_server(this, cell.id()))?;
+        await!(client.upsert_cell(cell))
+    }
+    #[async]
     pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, id))?;
         await!(client.remove_cell(id))
@@ -222,6 +227,12 @@ impl AsyncClient {
         -> impl Future<Item = Result<CellHeader, WriteError>, Error = RPCError>
     {
         AsyncClientInner::update_cell(self.inner.clone(), cell)
+    }
+
+    pub fn upsert_cell(&self, cell: Cell)
+        -> impl Future<Item = Result<CellHeader, WriteError>, Error = RPCError>
+    {
+        AsyncClientInner::upsert_cell(self.inner.clone(), cell)
     }
 
     pub fn remove_cell(&self, id: Id)

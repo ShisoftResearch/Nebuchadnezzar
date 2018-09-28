@@ -111,10 +111,7 @@ impl BPlusTree {
                         debug!("Flush page to cache {:?}", &id);
                         let cache = value.read();
                         let cell = cache.to_cell();
-                        neb_client_2.transaction(move |txn| {
-                            let cell_owned = (&cell).to_owned();
-                            txn.upsert(cell_owned)
-                        }).wait().unwrap()
+                        neb_client_2.upsert_cell(cell).wait().unwrap();
                     })))
         };
         {
@@ -540,7 +537,7 @@ fn insert_into_split<T, S>(
     where S: Slice<T>, T: Default + Debug
 {
     debug!("insert into split left len {}, right len {}, pos {}, pivot {}", xlen, ylen, pos, pivot);
-    if pos <= pivot {
+    if pos < pivot {
         x.insert_at(item, pos, xlen);
     } else {
         y.insert_at(item, pos - pivot, ylen);
@@ -668,7 +665,7 @@ mod test {
         let server_addr = String::from("127.0.0.1:5101");
         let server = NebServer::new_from_opts(&ServerOptions {
             chunk_count: 1,
-            memory_size: 160 * 1024 * 1024,
+            memory_size: 512 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None
         }, &server_addr, &server_group);
@@ -679,7 +676,7 @@ mod test {
         let tree = BPlusTree::new(&client);
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 204800;
+        let num = 10_000_000;
         for i in 0..num {
             let id = Id::new(0, i);
             debug!("insert id: {}", i);

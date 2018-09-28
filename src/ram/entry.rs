@@ -83,6 +83,7 @@ impl Entry {
             let flag_byte = *(pos as *mut u8);
             pos += 1;
             let entry_type_bits = 0b1111_0000 & flag_byte;
+            debug!("Entry type bits are {:#b}", entry_type_bits);
             let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
             let entry_bytes_len = 0b0000_1111 & flag_byte;
             let entry_bytes_len_usize = entry_bytes_len as usize;
