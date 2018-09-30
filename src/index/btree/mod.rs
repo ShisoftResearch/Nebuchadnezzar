@@ -23,6 +23,8 @@ use std::cell::RefMut;
 use std::cell::Ref;
 use std::fmt::Debug;
 use std::ops::Range;
+use std::fmt::Formatter;
+use std::fmt::Error;
 
 mod internal;
 mod external;
@@ -592,7 +594,6 @@ trait Slice<T> : Sized where T: Default + Debug {
         }
     }
 }
-
 macro_rules! impl_slice_ops {
     ($t: ty, $et: ty, $n: expr) => {
         impl Slice<$et> for $t {
@@ -625,8 +626,85 @@ mod test {
     use ram::types::RandValue;
     use index::btree::NUM_KEYS;
     use futures::future::Future;
+    use std::io::Cursor;
+    use byteorder::BigEndian;
+    use smallvec::SmallVec;
+    use byteorder::WriteBytesExt;
+    use hermes::stm::TxnValRef;
+    use index::btree::external::CacheBufferZone;
+    use std::fs::File;
+    use std::io::Write;
+    use index::btree::id_from_key;
 
     extern crate env_logger;
+    extern crate serde_json;
+
+    #[derive(Serialize, Deserialize)]
+    struct DebugNode {
+        keys: Vec<String>,
+        nodes: Vec<DebugNode>,
+        id: Option<String>,
+        next: Option<String>,
+        prev: Option<String>,
+        is_external: bool
+    }
+
+    fn dump_tree(tree: &BPlusTree) {
+        let mut bz = CacheBufferZone::new(&tree.ext_node_cache, &tree.storage);
+        let debug_root = cascading_dump_node(tree, tree.root, &mut bz);
+        let json = serde_json::to_string_pretty(&debug_root).unwrap();
+        let mut file = File::create("tree_dump.json").unwrap();
+        file.write_all(json.as_bytes());
+    }
+
+    fn cascading_dump_node(tree: &BPlusTree, node: TxnValRef, bz: &mut CacheBufferZone) -> DebugNode {
+        let node = tree.stm.transaction(|txn| {
+           txn.read_owned::<Node>(node).map(|opt| opt.unwrap())
+        }).unwrap();
+        match node {
+            Node::External(id) => {
+                let node = bz.get(&*id);
+                let keys = node.keys
+                    .iter()
+                    .take(node.len)
+                    .map(|key| {
+                        let id = id_from_key(key);
+                        format!("{}\t{:?}", id.lower, key)
+                    })
+                    .collect();
+                return DebugNode {
+                    keys,
+                    nodes: vec![],
+                    id: Some(format!("{:?}", node.id)),
+                    next: Some(format!("{:?}", node.next)),
+                    prev: Some(format!("{:?}", node.prev)),
+                    is_external: true
+                }
+            },
+            Node::Internal(innode) => {
+                let len = innode.len;
+                let nodes = innode.pointers
+                    .iter()
+                    .take(len + 1)
+                    .map(|node_ref| {cascading_dump_node(tree, *node_ref, bz)})
+                    .collect();
+                let keys = innode.keys
+                    .iter()
+                    .take(len )
+                    .map(|key| format!("{:?}", key))
+                    .collect();
+                return DebugNode {
+                    keys,
+                    nodes,
+                    id: None,
+                    next: None,
+                    prev: None,
+                    is_external: false
+                }
+            },
+            Node::None => panic!()
+        }
+    }
 
     #[test]
     fn node_size() {
@@ -674,11 +752,16 @@ mod test {
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
-        let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        let num = 10_000_000;
+        let num = 100_000;
         for i in 0..num {
             let id = Id::new(0, i);
+            let mut key_slice = [0u8; 8];
+            {
+                let mut cursor = Cursor::new(&mut key_slice[..]);
+                cursor.write_u64::<BigEndian>(i);
+            };
+            let key = SmallVec::from_slice(&key_slice);
             debug!("insert id: {}", i);
             tree.insert(&key, &id).unwrap();
         }
@@ -694,13 +777,14 @@ mod test {
             Ok(())
         }).unwrap();
         // sequence check
+        dump_tree(&tree);
         debug!("Scanning for sequence verification");
-        let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
         for i in 0..num {
             let expected = Id::new(0, i);
             debug!("Expecting id {:?}", expected);
             let id = cursor.current();
-            assert_eq!(id, expected);
+            println!("{:?}", id);
             if i + 1 < num {
                 assert!(cursor.next());
             }

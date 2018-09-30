@@ -25,7 +25,7 @@ pub struct Schema {
 }
 
 impl Schema {
-    pub fn new<'a>(name: &'a str, key_field: Option<Vec<String>>, fields: Field, is_dynamic: bool) -> Schema {
+    pub fn new(name: &str, key_field: Option<Vec<String>>, fields: Field, is_dynamic: bool) -> Schema {
         Schema {
             id: 0,
             name: name.to_string(),
@@ -41,7 +41,7 @@ impl Schema {
             is_dynamic
         }
     }
-    pub fn new_with_id<'a>(id: u32, name: &'a str, key_field: Option<Vec<String>>, fields: Field, dynamic: bool) -> Schema {
+    pub fn new_with_id(id: u32, name: &str, key_field: Option<Vec<String>>, fields: Field, dynamic: bool) -> Schema {
         let mut schema = Schema::new(name, key_field, fields, dynamic);
         schema.id = id;
         schema
@@ -59,8 +59,8 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn new<'a>(
-        name: & 'a str,
+    pub fn new(
+        name: &str,
         type_id: u32,
         nullable: bool,
         is_array: bool,
@@ -88,7 +88,7 @@ pub struct LocalSchemasCache {
 }
 
 impl LocalSchemasCache {
-    pub fn new<'a>(group: &'a str, raft_client: Option<&Arc<RaftClient>>) -> Result<LocalSchemasCache, ExecError> {
+    pub fn new(group: &str, raft_client: Option<&Arc<RaftClient>>) -> Result<LocalSchemasCache, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let sm = match raft_client {
             Some(raft) => {
@@ -147,14 +147,14 @@ impl SchemasMap {
         self.schema_map.insert(id, Arc::new(schema.clone()));
         self.name_map.insert(name, id);
     }
-    pub fn del_schema<'a>(&mut self, name: & 'a str) -> Result<(), ()> {
+    pub fn del_schema(&mut self, name: &str) -> Result<(), ()> {
         if let Some(id) =self.name_to_id(name) {
             self.schema_map.remove(&id);
         }
         self.name_map.remove(&name.to_string());
         Ok(())
     }
-    pub fn get_by_name<'a>(&self, name: & 'a str) -> Option<Arc<Schema>> {
+    pub fn get_by_name(&self, name: &str) -> Option<Arc<Schema>> {
         if let Some(id) = self.name_to_id(name) {
             return self.get(&id)
         }
@@ -166,7 +166,7 @@ impl SchemasMap {
         }
         return None;
     }
-    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+    pub fn name_to_id(&self, name: &str) -> Option<u32> {
         self.name_map.get(&name.to_string()).cloned()
     }
     fn next_id(&mut self) -> u32 {

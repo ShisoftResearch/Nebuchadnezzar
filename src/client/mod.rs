@@ -59,7 +59,7 @@ impl AsyncClientInner {
     pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
         match self.conshash.get_server(id.higher) {
             Some(n) => Ok(n),
-            None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, "cannot locate")))
+            None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, format!("cannot locate server for id {:?}", id))))
         }
     }
     #[async]
