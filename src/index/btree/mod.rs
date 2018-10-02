@@ -773,9 +773,8 @@ mod test {
             let root_innode = root.innode();
             debug!("root have {} keys", root_innode.keys.len());
             for i in 0..root_innode.len {
-                print!("{:?} | ", root_innode.keys[i]);
+                debug!("{:?} | ", root_innode.keys[i]);
             }
-            println!();
             // debug!("{:?}", root_innode.keys);
             Ok(())
         }).unwrap();

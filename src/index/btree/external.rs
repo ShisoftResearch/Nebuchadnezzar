@@ -182,7 +182,7 @@ impl ExtNode {
     pub fn dump(&self) {
         debug!("Dumping {:?}, keys {}", self.id, self.len);
         for i in 0..NUM_KEYS {
-            println!("{}\t- {:?}", i, self.keys[i]);
+            debug!("{}\t- {:?}", i, self.keys[i]);
         }
     }
 }
