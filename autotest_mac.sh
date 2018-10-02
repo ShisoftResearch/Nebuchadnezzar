@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export RUST_BACKTRACE=full
-export c
+export RUST_LOG=neb=debug
 
 cargo test -- --nocapture --test-threads=1
 

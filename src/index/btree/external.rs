@@ -158,20 +158,16 @@ impl ExtNode {
             let node_2_id = split.node_2.id;
             let node_2 = Node::External(box node_2_id);
             debug!("Split to left len {}, right len {}", cached.len, split.node_2.len);
-            // cached.dump();
-            // split.node_2.dump();
+            cached.dump();
+            split.node_2.dump();
             bz.new_node(split.node_2);
             return Some((node_2, None));
 
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
-            // let middle_insertion = pos != cached_len;
             let mut new_cached_len = cached_len;
             cached.keys.insert_at(key, pos, &mut new_cached_len);
             cached.len = new_cached_len;
-//            if middle_insertion {
-//                cached.dump();
-//            }
             return None;
         }
     }

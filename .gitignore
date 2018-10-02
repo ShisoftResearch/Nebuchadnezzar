@@ -196,3 +196,4 @@ callgrind.out.*
 
 /rls/
 /tree_dump.json
+*.log

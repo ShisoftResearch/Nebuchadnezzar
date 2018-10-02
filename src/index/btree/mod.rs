@@ -334,7 +334,7 @@ impl <'a> TreeTxn<'a> {
         };
         match split_node {
             Some((new_node, pivot_key)) => {
-                debug!("Sub level node split, shall insert new node to current level, pivot {:?}, current keys: ", pivot_key);
+                debug!("Sub level node split, shall insert new node to current level, pivot {:?}", pivot_key);
                 assert!(!(!new_node.is_ext() && pivot_key.is_none()));
                 let pivot = pivot_key.unwrap_or_else(|| {
                     let first_key = new_node.first_key(&mut self.bz);
@@ -540,9 +540,12 @@ fn insert_into_split<T, S>(
 {
     debug!("insert into split left len {}, right len {}, pos {}, pivot {}", xlen, ylen, pos, pivot);
     if pos < pivot {
+        debug!("insert into left part, pos: {}", pos);
         x.insert_at(item, pos, xlen);
     } else {
-        y.insert_at(item, pos - pivot, ylen);
+        let right_pos = pos - pivot;
+        debug!("insert into right part, pos: {}", right_pos);
+        y.insert_at(item, right_pos, ylen);
     }
 }
 
@@ -778,13 +781,27 @@ mod test {
         }).unwrap();
         // sequence check
         dump_tree(&tree);
+        debug!("Scanning for sequence dump");
+        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
+        for i in 0..num {
+            let id  = cursor.current();
+            let unmatched = i != id.lower;
+            let check_msg = if unmatched { "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-=" } else { "YES" };
+            debug!("Index {} have id {:?} check: {}", i, id, check_msg);
+            if unmatched {
+                debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
+            }
+            if i + 1 < num {
+                assert!(cursor.next());
+            }
+        }
         debug!("Scanning for sequence verification");
         let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
         for i in 0..num {
             let expected = Id::new(0, i);
             debug!("Expecting id {:?}", expected);
             let id = cursor.current();
-            println!("{:?}", id);
+            assert_eq!(id, expected);
             if i + 1 < num {
                 assert!(cursor.next());
             }
