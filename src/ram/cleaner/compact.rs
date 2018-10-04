@@ -37,35 +37,32 @@ impl CompactCleaner {
         // Freed seglets will be used by other new allocated segments, which can leads to incontinently.
         // Actually, malloc already handled this situation to overcome fragmentation, we can simply use
         // malloc to allocate new memory spaces for segments than maintaining seglets mappings in userspace.
-        debug!("Cleaning segment {} from chunk {}", seg.id, chunk.id);
+        debug!("Compact cleaning segment {} from chunk {}", seg.id, chunk.id);
 
         // scan and mark live entries
         let entries = chunk.live_entries(seg);
-        let live_size: usize = entries.iter().map(|e| e.meta.entry_size).sum();
-        debug!("Segment {} from chunk {} have {} live objects. Total size {} bytes for new segment.",
-               seg.id, chunk.id, entries.len(), live_size);
+        // estimate segment live size for new allocation
+        let live_size: usize = seg.living_space() as usize;
+        debug!("Segment {} from chunk {}. Total size {} bytes for new segment.",
+               seg.id, chunk.id, live_size);
         let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage, &chunk.wal_storage));
         let mut cursor = new_seg.addr;
-        let copied_entries =
-            entries
-                .iter()
-                .map(|e: &Entry| {
-                    let entry_size = e.meta.entry_size;
-                    let result= (e, cursor);
-                    unsafe {
-                        libc::memcpy(
-                            cursor as *mut libc::c_void,
-                            e.meta.entry_pos as *mut libc::c_void,
-                            entry_size);
-                    }
-                    cursor += entry_size;
-                    return result;
-                });
-
-        new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
-
-        // update cell address chunk index
-        copied_entries
+        let mut accurate_live_size = 0;
+        entries
+            .map(|e: Entry| {
+                let entry_size = e.meta.entry_size;
+                let entry_pos = e.meta.entry_pos;
+                let result= (e, cursor);
+                accurate_live_size += entry_size;
+                unsafe {
+                    libc::memcpy(
+                        cursor as *mut libc::c_void,
+                        entry_pos as *mut libc::c_void,
+                        entry_size);
+                }
+                cursor += entry_size;
+                return result;
+            })
             .filter(|pair|
                 pair.0.meta.entry_header.entry_type == EntryType::Cell)
             .for_each(|(entry, new_addr)| {
@@ -84,6 +81,7 @@ impl CompactCleaner {
                 }
             });
 
+        new_seg.append_header.store(new_seg.addr + accurate_live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
 

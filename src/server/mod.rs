@@ -91,6 +91,7 @@ impl NebServer {
         raft_service: &Option<Arc<raft::RaftService>>,
         raft_client: &Arc<RaftClient>
     ) -> Result<Arc<NebServer>, ServerError> {
+        debug!("Creating key-value server instance, group name {}", group_name);
         if let &Some(ref raft_service) = raft_service {
             raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(group_name, raft_service)));
             Weights::new_with_id(CONS_HASH_ID, raft_service);
@@ -143,6 +144,7 @@ impl NebServer {
         server_addr: &'a str,
         group_name: &'a str
     ) -> Arc<NebServer> {
+        debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         let rpc_server = rpc::Server::new(server_addr);

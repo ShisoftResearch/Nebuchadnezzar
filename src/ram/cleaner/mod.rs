@@ -19,6 +19,7 @@ pub struct Cleaner {
 // The two-level cleaner
 impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
+        debug!("Starting cleaner for {} chunks", chunks.list.len());
         let stop_tag = Arc::new(AtomicBool::new(false));
         let segments_compact_per_turn = chunks.list[0].segs.len() / 10 + 1;
         let segments_combine_per_turn = chunks.list[0].segs.len() / 20 + 2;
@@ -31,6 +32,7 @@ impl Cleaner {
         thread::spawn(move || {
             while !stop_tag.load(Ordering::Relaxed) {
                 for chunk in &chunks.list {
+                    debug!("Cleaning chunk {}", chunk.id);
                     chunk.apply_dead_entry();
                     chunk.scan_tombstone_survival();
 

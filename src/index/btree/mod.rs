@@ -30,7 +30,7 @@ mod internal;
 mod external;
 
 const ID_SIZE: usize = 16;
-const NUM_KEYS: usize = 32;
+const NUM_KEYS: usize = 2;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 

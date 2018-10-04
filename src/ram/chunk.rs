@@ -14,17 +14,18 @@ use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32, TOMBSTONE_EN
 use ram::entry::{Entry, EntryContent, EntryType};
 use utils::ring_buffer::RingBuffer;
 use server::ServerMeta;
+use std::rc::Rc;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
 pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
 
 pub struct Chunk {
     pub id: usize,
-    pub index: CHashMap<u64, usize>,
+    pub index: Arc<CHashMap<u64, usize>>,
+    pub segs: Arc<CHashMap<u64, Arc<Segment>>>,
     // Used only for locating segment for address
     // when putting tombstone, not normal data access
     pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
-    pub segs: CHashMap<u64, Arc<Segment>>,
     seg_counter: AtomicU64,
     pub head_seg: RwLock<Arc<Segment>>,
     pub meta: Arc<ServerMeta>,
@@ -48,8 +49,8 @@ impl Chunk {
             MAX_SEGMENT_SIZE,
             &backup_storage,
             &wal_storage));
-        let segs = CHashMap::new();
-        let index = CHashMap::new();
+        let segs = Arc::new(CHashMap::new());
+        let index = Arc::new(CHashMap::new());
         let chunk = Chunk {
             id,
             segs,
@@ -502,19 +503,24 @@ impl Chunk {
         }
     }
 
-    pub fn live_entries(&self, seg: &Arc<Segment>) -> Vec<Entry> {
+    pub fn live_entries(&self, seg: &Arc<Segment>) -> impl Iterator<Item = Entry> {
+        let seg_owned = seg.clone();
+        let chunk_id = self.id;
+        let chunk_index = self.index.clone();
+        let chunk_segs = self.segs.clone();
         seg.entry_iter()
-            .filter_map(|entry_meta| {
+            .filter_map(move |entry_meta| {
+                let seg = &seg_owned;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
                 debug!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
-                       self.id, seg.id, entry_header.entry_type, entry_meta.entry_pos, entry_size);
+                       chunk_id, seg.id, entry_header.entry_type, entry_meta.entry_pos, entry_size);
                 match entry_header.entry_type {
                     EntryType::Cell => {
                         let cell_header =
                             Cell::cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
-                        if self.index
+                        if chunk_index
                             .get(&cell_header.hash)
                             .map(|g| *g) == Some(entry_meta.entry_pos) {
                             return Some(Entry {
@@ -526,7 +532,7 @@ impl Chunk {
                     EntryType::Tombstone => {
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if self.segs.contains_key(&tombstone.segment_id) {
+                        if chunk_segs.contains_key(&tombstone.segment_id) {
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Tombstone(tombstone)
@@ -540,11 +546,10 @@ impl Chunk {
                 }
                 return None
             })
-            .collect()
     }
 
     pub fn cell_addresses(&self) -> BTreeMap<u64, usize> {
-        self.index.clone().into_iter().collect()
+        (*self.index).clone().into_iter().collect()
     }
 }
 

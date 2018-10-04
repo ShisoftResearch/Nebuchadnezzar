@@ -106,7 +106,6 @@ pub fn full_clean_cycle() {
         println!("Scanning second segment for tombstones...");
         let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
         let tombstones: Vec<_> = live_entries
-            .iter()
             .filter(|e| e.meta.entry_header.entry_type == EntryType::Tombstone)
             .collect();
         assert_eq!(tombstones.len(), 8);
@@ -125,6 +124,10 @@ pub fn full_clean_cycle() {
         chunk.apply_dead_entry();
     }
 
+    // check integrity
+    chunk.live_entries(&chunk.segs.get(&0).unwrap()).collect::<Vec<_>>();
+    chunk.live_entries(&chunk.segs.get(&1).unwrap()).collect::<Vec<_>>();
+
     // compact
     {
         // Compact all segments order by id
@@ -141,8 +144,8 @@ pub fn full_clean_cycle() {
         // scan segments to check entries
         let seg0 = &chunk.segs.get(&0).unwrap();
         let seg1 = &chunk.segs.get(&1).unwrap();
-        let compacted_segment_0_entries = chunk.live_entries(seg0);
-        let compacted_segment_1_entries = chunk.live_entries(seg1);
+        let compacted_segment_0_entries = chunk.live_entries(seg0).collect::<Vec<_>>();
+        let compacted_segment_1_entries = chunk.live_entries(seg1).collect::<Vec<_>>();
         let compacted_segment_0_ids = (0..4).map(|num| num as u64 * 2 + 1);
         let compacted_segment_1_ids =
             (4..8).map(|num| num as i64 * 2 + 1)
@@ -191,7 +194,6 @@ pub fn full_clean_cycle() {
     {
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         let survival_cells: HashSet<_> = chunk.live_entries(&chunk.segments()[0])
-            .iter()
             .map(|entry| {
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
                 if let EntryContent::Cell(ref header) = entry.content {
