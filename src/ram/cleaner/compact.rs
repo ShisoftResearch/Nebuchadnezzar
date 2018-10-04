@@ -54,6 +54,7 @@ impl CompactCleaner {
                 let entry_pos = e.meta.entry_pos;
                 let result= (e, cursor);
                 accurate_live_size += entry_size;
+                debug!("memcpy entry, size: {}, from {} to {}", entry_size, entry_pos, cursor);
                 unsafe {
                     libc::memcpy(
                         cursor as *mut libc::c_void,
@@ -67,6 +68,7 @@ impl CompactCleaner {
                 pair.0.meta.entry_header.entry_type == EntryType::Cell)
             .for_each(|(entry, new_addr)| {
                 if let EntryContent::Cell(header) = entry.content {
+                    debug!("Acquiring cell guard for update on compact {:?}", header.id());
                     if let Some(mut cell_guard) = chunk.index.get_mut(&header.hash) {
                         let old_addr = entry.meta.entry_pos;
                         if *cell_guard == old_addr {
@@ -76,6 +78,7 @@ impl CompactCleaner {
                                   old_addr, *cell_guard);
                         }
                     }
+                    debug!("Cell location updated for compact");
                 } else {
                     panic!("not cell after filter")
                 }

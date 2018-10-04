@@ -517,26 +517,36 @@ impl Chunk {
                        chunk_id, seg.id, entry_header.entry_type, entry_meta.entry_pos, entry_size);
                 match entry_header.entry_type {
                     EntryType::Cell => {
+                        debug!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             Cell::cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
+                        debug!("Cell header read, id is {:?}", cell_header.id());
                         if chunk_index
                             .get(&cell_header.hash)
                             .map(|g| *g) == Some(entry_meta.entry_pos) {
+                            debug!("Cell entry {:?} is valid", cell_header.id());
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Cell(cell_header)
                             });
+                        } else {
+                            debug!("Cell entry index mismatch for {:?}, will be ditched", cell_header.id());
                         }
                     },
                     EntryType::Tombstone => {
+                        debug!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
                         if chunk_segs.contains_key(&tombstone.segment_id) {
+                            debug!("Tomestone entry {:?} - {:?} at {} is valid",
+                                   tombstone.partition, tombstone.hash, tombstone.segment_id);
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Tombstone(tombstone)
                             });
+                        } else {
+                            debug!("Tombstone target at {} have been removed, will be ditched", tombstone.segment_id)
                         }
                     },
                     _ => panic!("Unexpected cell type on getting live entries at {}: type {:?}, size {}, append header {}, ends at {}",
