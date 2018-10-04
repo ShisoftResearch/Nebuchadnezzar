@@ -117,7 +117,7 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64)
-                                 -> Result<CellReadGuard, ReadError> {
+        -> Result<CellReadGuard, ReadError> {
         match self.index.get(&hash) {
             Some(index) => {
                 if *index == 0 {
@@ -209,35 +209,39 @@ impl Chunk {
         }
     }
 
-    fn update_cell_from_guard(&self, cell: &mut Cell, guard: &mut CellWriteGuard) -> Result<CellHeader, WriteError> {
+    #[inline]
+    fn  update_cell_from_guard(&self, cell: &mut Cell, guard: &mut CellWriteGuard) -> Result<CellHeader, WriteError> {
         let old_location = **guard;
         let new_location = cell.write_to_chunk(self)?;
         **guard = new_location;
-        self.mark_dead_entry(old_location);
         return Ok(cell.header)
     }
 
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        if let Some(mut cell_location) = self.location_for_write(hash) {
-            self.update_cell_from_guard(cell, &mut cell_location)
+        let (res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
+            (self.update_cell_from_guard(cell, &mut cell_location), *cell_location)
         } else {
-            Err(WriteError::CellDoesNotExisted)
-        }
+            return Err(WriteError::CellDoesNotExisted)
+        };
+        self.mark_dead_entry(loc);
+        return res;
     }
 
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        if let Some(mut cell_location) = self.location_for_write(hash) {
-            self.update_cell_from_guard(cell, &mut cell_location)
+        let (update_res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
+            (self.update_cell_from_guard(cell, &mut cell_location), *cell_location)
         } else {
-            self.write_cell(cell)
-        }
+            return self.write_cell(cell)
+        };
+        self.mark_dead_entry(loc);
+        return update_res;
     }
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
         where U: Fn(Cell) -> Option<Cell> {
-        if let Some(mut cell_location) = self.location_for_write(hash) {
+        let (res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
                 Ok(cell) => {
@@ -246,17 +250,18 @@ impl Chunk {
                         let old_location = *cell_location;
                         let new_location = new_cell.write_to_chunk(self)?;
                         *cell_location = new_location;
-                        self.mark_dead_entry(old_location);
-                        return Ok(new_cell);
+                        (Ok(new_cell), old_location)
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
                     }
                 },
-                Err(e) => Err(WriteError::ReadError(e))
+                Err(e) => return Err(WriteError::ReadError(e))
             }
         } else {
             return Err(WriteError::CellDoesNotExisted)
-        }
+        };
+        self.mark_dead_entry(loc);
+        return res;
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         if let Some(cell_location) = self.index.remove(&hash) {
