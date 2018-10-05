@@ -1,7 +1,7 @@
 use std::sync::{Arc};
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::BTreeMap;
-use std::ops::Bound::Included;
+use std::ops::Bound::{Included, Excluded};
 use parking_lot::{Mutex, RwLock};
 use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
 use bifrost::utils::time::get_time;
@@ -334,14 +334,14 @@ impl Chunk {
         let segs_addr_range = self.addrs_seg.read();
         debug!("locating segment addr {} in {:?}", addr, *segs_addr_range);
         segs_addr_range
-            .range((Included(addr - MAX_SEGMENT_SIZE), Included(addr)))
+            .range((Excluded(addr - MAX_SEGMENT_SIZE), Included(addr)))
             .last()
             .and_then(|(_, seg_id)| {
                 self.segs
                     .get(seg_id)
                     .map(|guard| guard.clone())
                     .and_then(|seg| {
-                        if addr < seg.bound {
+                        if addr < seg.bound && addr >= seg.addr {
                             return Some(seg);
                         } else {
                             return None;
