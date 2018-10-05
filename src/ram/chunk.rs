@@ -461,7 +461,8 @@ impl Chunk {
 
     pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
         let utilization_selection =
-            self.segments().into_iter()
+            self.segments()
+                .into_iter()
                 .map(|seg| {
                     let rate = seg.living_rate();
                     (seg, rate)

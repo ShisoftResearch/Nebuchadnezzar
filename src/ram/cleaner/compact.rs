@@ -15,6 +15,7 @@ use std::collections::Bound::{Included, Unbounded};
 
 use libc;
 use parking_lot::MutexGuard;
+use itertools::Itertools;
 
 pub struct CompactCleaner;
 
@@ -40,21 +41,28 @@ impl CompactCleaner {
         debug!("Compact cleaning segment {} from chunk {}", seg.id, chunk.id);
 
         // scan and mark live entries
-        let entries = chunk.live_entries(seg);
         // estimate segment live size for new allocation
-        let live_size: usize = seg.living_space() as usize;
+        let mut live_size: usize = 0;
+        let mut entries = chunk
+            .live_entries(seg)
+            .map(|entry| {
+                live_size += entry.meta.entry_size;
+                entry
+            })
+            .collect_vec();
         debug!("Segment {} from chunk {}. Total size {} bytes for new segment.",
                seg.id, chunk.id, live_size);
         let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage, &chunk.wal_storage));
-        let mut cursor = new_seg.addr;
-        let mut accurate_live_size = 0;
+        let seg_addr = new_seg.addr;
+        let mut cursor = seg_addr;
         entries
+            .into_iter()
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;
                 let entry_pos = e.meta.entry_pos;
                 let result= (e, cursor);
-                accurate_live_size += entry_size;
-                debug!("memcpy entry, size: {}, from {} to {}", entry_size, entry_pos, cursor);
+                debug!("memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {}",
+                       entry_size, entry_pos, cursor, seg_addr + live_size, seg_addr, live_size);
                 unsafe {
                     libc::memcpy(
                         cursor as *mut libc::c_void,
@@ -84,7 +92,7 @@ impl CompactCleaner {
                 }
             });
 
-        new_seg.append_header.store(new_seg.addr + accurate_live_size, Ordering::Relaxed);
+        new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
 
