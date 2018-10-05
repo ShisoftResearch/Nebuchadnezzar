@@ -406,6 +406,7 @@ impl Chunk {
 
     // this function should be invoked repeatedly to flush the queue
     pub fn apply_dead_entry(&self) {
+        debug!("Applying dead entries in buffer");
         let marks = self.dead_entries.iter();
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
@@ -427,6 +428,7 @@ impl Chunk {
     // This function should be invoked repeatedly by cleaner
     // Actual cleaning will be performed by cleaner regardless tombstone survival condition
     pub fn scan_tombstone_survival(&self) {
+        debug!("Scanning tombstones");
         let seg_ids = self.segment_ids();
         for seg_id in seg_ids {
             if let Some(segment) = self.segs.get(&seg_id){
@@ -442,6 +444,7 @@ impl Chunk {
                         now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
                     continue;
                 }
+                debug!("Scanning tombstones in chunk {}, segment {}", self.id, seg_id);
                 for entry_meta in segment.entry_iter() {
                     if entry_meta.entry_header.entry_type == EntryType::Tombstone {
                         let tombstone = Tombstone::read(entry_meta.body_pos);
@@ -453,6 +456,7 @@ impl Chunk {
                 }
                 segment.dead_tombstones.fetch_add(death_count, Ordering::Relaxed);
                 segment.last_tombstones_scanned.store(now, Ordering::Relaxed);
+                debug!("Scanned tombstones in chunk {}, segment {}, death count {}", self.id, seg_id, death_count);
             } else {
                 warn!("leaked segment in addrs_seg: {}", seg_id)
             }

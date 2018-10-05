@@ -739,7 +739,7 @@ mod test {
         assert_eq!(cursor.current(), id);
     }
 
-    #[test]
+    // #[test]
     fn lots_of_insertions() {
         env_logger::init();
         let server_group = "index_insertions";

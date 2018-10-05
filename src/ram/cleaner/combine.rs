@@ -40,7 +40,10 @@ impl DummySegment {
 
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) {
-        if segments.len() < 2 { return }
+        if segments.len() < 2 {
+            debug!("too few segments to combine, chunk {}, segments {}", chunk.id, segments.len());
+            return
+        }
         debug!("Combining segments");
 
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
@@ -193,6 +196,7 @@ impl CombinedCleaner {
         debug!("Removing old segments");
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
+            old_seg.mem_drop();
         }
     }
 

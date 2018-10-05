@@ -34,7 +34,8 @@ pub struct Segment {
     pub backup_file_name: Option<String>,
     pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
-    pub archived: AtomicBool
+    pub archived: AtomicBool,
+    pub dropped: AtomicBool
 }
 
 impl Segment {
@@ -65,6 +66,7 @@ impl Segment {
             references: AtomicUsize::new(0),
             backup_file_name: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
             archived: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
             wal_file,
             wal_file_name
         }
@@ -185,10 +187,12 @@ impl Segment {
 
     pub fn no_references(&self) -> bool { self.references.load(Ordering::Relaxed) == 0 }
 
-    fn mem_drop(&self) {
-        debug!("disposing segment at {}", self.addr);
-        unsafe {
-            libc::free(self.addr as *mut libc::c_void)
+    pub fn mem_drop(&self) {
+        if !self.dropped.compare_and_swap(false, true, Ordering::Relaxed) {
+            debug!("disposing segment at {}", self.addr);
+            unsafe {
+                libc::free(self.addr as *mut libc::c_void)
+            }
         }
     }
 

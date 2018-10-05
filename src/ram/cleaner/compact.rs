@@ -22,7 +22,11 @@ pub struct CompactCleaner;
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) {
         // Clean only if segment have fragments
-        if seg.total_dead_space() == 0 {return;}
+        let dead_space = seg.total_dead_space();
+        if dead_space == 0 {
+            debug!("Skip cleaning chunk {} segment {} for it have no dead spaces", chunk.id, dead_space);
+            return;
+        }
         
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
         // Log-structured cleaner suggests new segment allocation and copy living entries from the
@@ -95,6 +99,7 @@ impl CompactCleaner {
         new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
+        seg.mem_drop();
 
         debug!("Clean finished for segment {} from chunk {}", seg.id, chunk.id);
     }
