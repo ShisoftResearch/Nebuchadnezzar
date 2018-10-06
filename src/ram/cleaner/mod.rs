@@ -32,7 +32,7 @@ impl Cleaner {
         thread::spawn(move || {
             while !stop_tag.load(Ordering::Relaxed) {
                 for chunk in &chunks.list {
-                    debug!("Cleaning chunk {}", chunk.id);
+                    trace!("Cleaning chunk {}", chunk.id);
                     chunk.apply_dead_entry();
                     chunk.scan_tombstone_survival();
 

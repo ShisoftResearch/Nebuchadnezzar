@@ -406,7 +406,7 @@ impl Chunk {
 
     // this function should be invoked repeatedly to flush the queue
     pub fn apply_dead_entry(&self) {
-        debug!("Applying dead entries in buffer");
+        trace!("Applying dead entries in buffer");
         let marks = self.dead_entries.iter();
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
@@ -428,7 +428,7 @@ impl Chunk {
     // This function should be invoked repeatedly by cleaner
     // Actual cleaning will be performed by cleaner regardless tombstone survival condition
     pub fn scan_tombstone_survival(&self) {
-        debug!("Scanning tombstones");
+        trace!("Scanning tombstones");
         let seg_ids = self.segment_ids();
         for seg_id in seg_ids {
             if let Some(segment) = self.segs.get(&seg_id){
