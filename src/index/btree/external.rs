@@ -121,46 +121,38 @@ impl ExtNode {
     {
         let mut cached = self;
         let cached_len = cached.len;
-        if cached_len >= NUM_KEYS {
+        assert!(cached_len <= NUM_KEYS);
+        if cached_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             // cached.dump();
             let pivot = cached_len / 2;
-            let split = {
-                let cached_next = *&cached.next;
-                let cached_id = *&cached.id;
-                let new_page_id = tree.new_page_id();
-                cached.next = new_page_id;
-                let mut keys_1 = &mut cached.keys;
-                let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
-                let mut keys_1_len = pivot;
-                let mut keys_2_len = cached_len - pivot;
-                insert_into_split(
-                    key,
-                    keys_1, &mut keys_2,
-                    &mut keys_1_len, &mut keys_2_len,
-                    pos, pivot);
-                ExtNodeSplit {
-                    keys_1_len,
-                    node_2: ExtNode {
-                        id: new_page_id,
-                        keys: keys_2,
-                        next: cached_next,
-                        prev: cached_id,
-                        len: keys_2_len,
-                        version: 0,
-                        removed: false
-                    }
-                }
+            let cached_next = *&cached.next;
+            let cached_id = *&cached.id;
+            let new_page_id = tree.new_page_id();
+            let mut keys_1 = &mut cached.keys;
+            let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
+            let mut keys_1_len = pivot;
+            let mut keys_2_len = cached_len - pivot;
+            insert_into_split(
+                key,
+                keys_1, &mut keys_2,
+                &mut keys_1_len, &mut keys_2_len,
+                pos, pivot);
+            let extnode_2 = ExtNode {
+                id: new_page_id,
+                keys: keys_2,
+                next: cached_next,
+                prev: cached_id,
+                len: keys_2_len,
+                version: 0,
+                removed: false
             };
-            cached.next = split.node_2.id;
-            cached.len = split.keys_1_len;
-            let node_2_id = split.node_2.id;
-            let node_2 = Node::External(box node_2_id);
-            debug!("Split to left len {}, right len {}", cached.len, split.node_2.len);
-            cached.dump();
-            split.node_2.dump();
-            bz.new_node(split.node_2);
+            cached.next = new_page_id;
+            cached.len = keys_1_len;
+            let node_2 = Node::External(box new_page_id);
+            debug!("Split to left len {}, right len {}", cached.len, extnode_2.len);
+            bz.new_node(extnode_2);
             return Some((node_2, None));
 
         } else {

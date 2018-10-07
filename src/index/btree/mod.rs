@@ -30,7 +30,7 @@ mod internal;
 mod external;
 
 const ID_SIZE: usize = 16;
-const NUM_KEYS: usize = 2;
+const NUM_KEYS: usize = 4;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -739,7 +739,7 @@ mod test {
         assert_eq!(cursor.current(), id);
     }
 
-    // #[test]
+    #[test]
     fn lots_of_insertions() {
         env_logger::init();
         let server_group = "index_insertions";
@@ -756,7 +756,7 @@ mod test {
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
         info!("test insertion");
-        let num = 100_000;
+        let num = 1_000;
         for i in 0..num {
             let id = Id::new(0, i);
             let mut key_slice = [0u8; 8];
@@ -792,6 +792,8 @@ mod test {
             }
             if i + 1 < num {
                 assert!(cursor.next());
+            } else {
+                assert!(!cursor.next());
             }
         }
         debug!("Scanning for sequence verification");
