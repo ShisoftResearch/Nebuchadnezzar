@@ -38,34 +38,34 @@ impl InNode {
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
-        if node_len + 1 >= NUM_KEYS {
+        assert!(node_len <= NUM_KEYS);
+        if node_len == NUM_KEYS {
+            let pivot = node_len / 2; // pivot key will be removed
             let keys_split = {
-                let pivot = node_len / 2 + 1;
                 let mut keys_1 = &mut self.keys;
-                let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
-                let mut keys_1_len = pivot - 1; // will not count the pivot
-                let mut keys_2_len = node_len - pivot;
-                let pivot_key = keys_1[pivot - 1].to_owned();
+                let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
+                let mut keys_1_len = pivot; // will not count the pivot
+                let mut keys_2_len = node_len - pivot - 1;
+                let pivot_key = keys_1[pivot].to_owned();
                 insert_into_split(
                     key,
                     keys_1, &mut keys_2,
                     &mut keys_1_len, &mut keys_2_len,
-                    pos, pivot);
+                    pos, pivot - 1);
                 InNodeKeysSplit {
                     keys_2, keys_1_len, keys_2_len, pivot_key
                 }
             };
             let ptr_split = {
-                let pivot = ptr_len / 2;
                 let mut ptrs_1 = &mut self.pointers;
-                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot, ptr_len);
-                let mut ptrs_1_len = pivot;
-                let mut ptrs_2_len = ptr_len - pivot;
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                let mut ptrs_1_len = pivot + 1;
+                let mut ptrs_2_len = ptr_len - pivot - 1;
                 insert_into_split(
                     ptr.unwrap(),
                     ptrs_1, &mut ptrs_2,
                     &mut ptrs_1_len, &mut ptrs_2_len,
-                    pos, pivot);
+                    pos + 1, pivot);
                 assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
                 assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
                 InNodePtrSplit { ptrs_2 }

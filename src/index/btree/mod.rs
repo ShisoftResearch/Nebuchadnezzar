@@ -344,13 +344,14 @@ impl <'a> TreeTxn<'a> {
                 let new_node_ref = self.txn.new_value(new_node);
                 debug!("New node in transaction {:?}, pivot {:?}", new_node_ref, pivot);
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
-                assert!(!acq_node.is_ext());
-                let pivot_pos = acq_node.search(&pivot, &mut self.bz);
-                let result = acq_node.insert(
-                    pivot,
-                    Some(new_node_ref),
-                    pivot_pos,
-                    self.tree, &mut self.bz);
+                let result = {
+                    let pivot_pos = acq_node.search(&pivot, &mut self.bz);
+                    let mut current_innode = acq_node.innode_mut();
+                    current_innode.insert(
+                        pivot,
+                        Some(new_node_ref),
+                        pivot_pos)
+                };
                 self.txn.update(node, acq_node);
                 if result.is_some() { debug!("Sub level split caused current level split"); }
                 return Ok(result);
@@ -756,8 +757,8 @@ mod test {
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
         info!("test insertion");
-        let num = 1_000;
-        for i in 0..num {
+        let num = 10_000;
+        for i in (0..num).rev() {
             let id = Id::new(0, i);
             let mut key_slice = [0u8; 8];
             {
@@ -791,9 +792,9 @@ mod test {
                 debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
             }
             if i + 1 < num {
-                assert!(cursor.next());
+                assert!(cursor.next(), i);
             } else {
-                assert!(!cursor.next());
+                assert!(!cursor.next(), i);
             }
         }
         debug!("Scanning for sequence verification");
