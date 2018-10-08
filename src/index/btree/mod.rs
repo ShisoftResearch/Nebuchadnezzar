@@ -25,6 +25,8 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::fmt::Formatter;
 use std::fmt::Error;
+use std::io::Write;
+use std;
 
 mod internal;
 mod external;
@@ -263,7 +265,26 @@ impl <'a> TreeTxn<'a> {
 //        let mut key = key.clone();
 //        key_with_id(&mut key, &Id::unit_id());
         let root = self.tree.root;
-        self.search(root, &key, ordering)
+        match ordering {
+            Ordering::Forward => self.search(root, &key, ordering),
+            Ordering::Backward => {
+                // fill highest bits to the end of the search key as the last possible id for backward search
+                let mut key = key.clone();
+                let max_id = Id::new(std::u64::MAX, std::u64::MAX);
+                key_with_id(&mut key, &max_id);
+                debug!("seek backwards with precise key {:?}", &key);
+                self.search(root, &key, ordering)
+                    .map(|mut cursor| {
+                        debug!("found cursor pos {} for backwards, len {}, will be corrected",
+                               cursor.index, cursor.page.len);
+                        let cursor_index = cursor.index;
+                        if cursor_index > 0 { cursor.index -= 1; }
+                        debug!("cursor pos have been corrected to {}, len {}, item {:?}",
+                               cursor.index, cursor.page.len, cursor.page.keys[cursor.index]);
+                        return cursor;
+                    })
+            }
+        }
     }
 
     fn search(
@@ -489,7 +510,7 @@ impl RTCursor {
                 }
             },
             Ordering::Backward => {
-                if self.index <= 0 {
+                if self.index == 0 {
                     // next page
                     if let Some(next_page) = self.next_page.clone() {
                         debug!("Shifting page backward");
@@ -509,8 +530,12 @@ impl RTCursor {
         return true;
     }
 
-    pub fn current(&self) -> Id {
-        id_from_key(&self.page.keys[self.index])
+    pub fn current(&self) -> Option<Id> {
+        if self.index >= 0 && self.index < self.page.len {
+            Some(id_from_key(&self.page.keys[self.index]))
+        } else {
+            None
+        }
     }
 
     pub fn has_next(&self) -> bool {
@@ -737,7 +762,16 @@ mod test {
         info!("test insertion");
         tree.insert(&key, &id).unwrap();
         let mut cursor =  tree.seek(&key, Ordering::Forward).unwrap();
-        assert_eq!(cursor.current(), id);
+        assert_eq!(cursor.current().unwrap(), id);
+    }
+
+    fn u64_to_slice(n: u64) -> [u8; 8] {
+        let mut key_slice = [0u8; 8];
+        {
+            let mut cursor = Cursor::new(&mut key_slice[..]);
+            cursor.write_u64::<BigEndian>(n);
+        };
+        key_slice
     }
 
     #[test]
@@ -760,11 +794,7 @@ mod test {
         let num = 10_000;
         for i in (0..num).rev() {
             let id = Id::new(0, i);
-            let mut key_slice = [0u8; 8];
-            {
-                let mut cursor = Cursor::new(&mut key_slice[..]);
-                cursor.write_u64::<BigEndian>(i);
-            };
+            let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
             debug!("insert id: {}", i);
             tree.insert(&key, &id).unwrap();
@@ -784,7 +814,7 @@ mod test {
         debug!("Scanning for sequence dump");
         let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
         for i in 0..num {
-            let id  = cursor.current();
+            let id  = cursor.current().unwrap();
             let unmatched = i != id.lower;
             let check_msg = if unmatched { "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-=" } else { "YES" };
             debug!("Index {} have id {:?} check: {}", i, id, check_msg);
@@ -797,14 +827,27 @@ mod test {
                 assert!(!cursor.next(), i);
             }
         }
-        debug!("Scanning for sequence verification");
+        debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
         for i in 0..num {
             let expected = Id::new(0, i);
             debug!("Expecting id {:?}", expected);
-            let id = cursor.current();
+            let id = cursor.current().unwrap();
             assert_eq!(id, expected);
             if i + 1 < num {
+                assert!(cursor.next());
+            }
+        }
+
+        debug!("Backward scanning for sequence verification");
+        let backward_start_key_slice = u64_to_slice(num - 1);
+        let mut cursor = tree.seek(&SmallVec::from_slice(&backward_start_key_slice), Ordering::Backward).unwrap();
+        for i in (0..num).rev() {
+            let expected = Id::new(0, i);
+            debug!("Expecting id {:?}", expected);
+            let id = cursor.current().unwrap();
+            assert_eq!(id, expected);
+            if i > 0 {
                 assert!(cursor.next());
             }
         }

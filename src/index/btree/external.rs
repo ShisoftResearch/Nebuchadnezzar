@@ -134,6 +134,11 @@ impl ExtNode {
             let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
             let mut keys_1_len = pivot;
             let mut keys_2_len = cached_len - pivot;
+            // modify next node point previous to new node
+            if !cached_next.is_unit_id() {
+                let mut prev_node = bz.get_for_mut(&cached_next);
+                prev_node.prev = new_page_id;
+            }
             insert_into_split(
                 key,
                 keys_1, &mut keys_2,
@@ -148,6 +153,8 @@ impl ExtNode {
                 version: 0,
                 removed: false
             };
+            debug!("new node have next {:?} prev {:?}, current id {:?}",
+                   extnode_2.next, extnode_2.prev, cached.id);
             cached.next = new_page_id;
             cached.len = keys_1_len;
             let node_2 = Node::External(box new_page_id);
