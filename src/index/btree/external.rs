@@ -23,7 +23,7 @@ use std::sync::Arc;
 use client::AsyncClient;
 use futures::Future;
 
-pub type ExtNodeCacheMap = Mutex<LRUCache<Id, RwLock<ExtNode>>>;
+pub type ExtNodeCacheMap = Mutex<LRUCache<Id, Arc<RwLock<ExtNode>>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
 pub type ExtNodeCachedImmute = RwLockReadGuard<ExtNode>;
 
@@ -121,7 +121,7 @@ impl ExtNode {
     {
         let mut cached = self;
         let cached_len = cached.len;
-        assert!(cached_len <= NUM_KEYS);
+        debug_assert!(cached_len <= NUM_KEYS);
         if cached_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
@@ -173,7 +173,7 @@ impl ExtNode {
     pub fn merge_with(&mut self, right: &mut Self) {
         let self_len = self.len;
         let new_len = self.len + right.len;
-        assert!(new_len <= self.keys.len());
+        debug_assert!(new_len <= self.keys.len());
         for i in self.len .. new_len {
             self.keys[i] = mem::replace(&mut right.keys[i - self_len], Default::default());
         }
@@ -339,7 +339,7 @@ impl CacheBufferZone {
             let mut guards = self.guards.borrow_mut();
             let mut data = self.data.borrow_mut();
             debug!("new node in buffered cache: {:?}, was guards: {}, data: {}", node_id, guards.len(), data.len());
-            mapper.insert(node_id, lock);
+            mapper.insert(node_id, Arc::new(lock));
             guards.insert(node_id, guard);
             data.insert(node_id, Some(Rc::new(RefCell::new(node))));
         }
@@ -350,7 +350,7 @@ impl CacheBufferZone {
         let data = self.data.borrow();
         debug!("Flushing cache buffer, guards: {:?}, data: {:?}", guards.keys(), data.keys());
         for ((id, data),  (gid, mut holder)) in data.iter().zip(guards.iter_mut()) {
-            assert_eq!(id, gid);
+            debug_assert_eq!(id, gid);
             if let Some(ref node_rc) = data {
                 debug!("Flushing updating node: {:?}", id);
                 if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
@@ -381,13 +381,15 @@ impl CacheBufferZone {
         return Some(holder)
     }
 
+    fn get_ext_node_lock(&self, id: &Id) -> Arc<RwLock<ExtNode>> {
+        self.mapper.lock().get_or_fetch(id).unwrap().clone()
+    }
+
     pub fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {
-        let mut map = self.mapper.lock();
-        return map.get_or_fetch(id).unwrap().write();
+        self.get_ext_node_lock(id).write()
     }
     pub fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCachedImmute {
-        let mut map = self.mapper.lock();
-        return map.get_or_fetch(id).unwrap().read();
+        self.get_ext_node_lock(id).read()
     }
 }
 

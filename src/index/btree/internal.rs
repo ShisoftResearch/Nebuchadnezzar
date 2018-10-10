@@ -38,7 +38,7 @@ impl InNode {
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
-        assert!(node_len <= NUM_KEYS);
+        debug_assert!(node_len <= NUM_KEYS);
         if node_len == NUM_KEYS {
             let pivot = node_len / 2; // pivot key will be removed
             let keys_split = {
@@ -66,8 +66,8 @@ impl InNode {
                     ptrs_1, &mut ptrs_2,
                     &mut ptrs_1_len, &mut ptrs_2_len,
                     pos + 1, pivot);
-                assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
-                assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
                 InNodePtrSplit { ptrs_2 }
             };
             let node_2 = InNode {
@@ -92,15 +92,19 @@ impl InNode {
         txn: &mut Txn,
         bz: &CacheBufferZone
     ) -> Result<usize, TxnErr> {
-        if key_pos == self.len - 1 {
+        debug_assert!(key_pos <= self.len);
+        debug!("Searching for rebalance candidate, pos {}, len {}", key_pos, self.len);
+        if key_pos == self.len {
             // the last one, pick left
             Ok(key_pos - 1)
+        } else if key_pos == 0 {
+            Ok(1)
         } else {
             // pick the one with least pointers
             let left_pos = key_pos - 1;
-            let right_pos = key_pos;
-            let left_node = txn.read::<Node>(self.pointers[left_pos + 1])?.unwrap();
-            let right_node = txn.read::<Node>(self.pointers[right_pos + 1])?.unwrap();
+            let right_pos = key_pos + 1;
+            let left_node = txn.read::<Node>(self.pointers[left_pos])?.unwrap();
+            let right_node = txn.read::<Node>(self.pointers[right_pos])?.unwrap();
             if left_node.len(bz) <= right_node.len(bz) {
                 Ok(left_pos)
             } else {
@@ -119,7 +123,7 @@ impl InNode {
         let right_ref = self.pointers[right_ptr_pos];
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
-        assert_eq!(left_node.is_ext(), right_node.is_ext());
+        debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             {
                 let mut left_innode = left_node.innode_mut();
@@ -140,7 +144,7 @@ impl InNode {
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         let mut self_len = self.len;
         let new_len = self_len + right.len + 1;
-        assert!(new_len <= self.keys.len());
+        debug_assert!(new_len <= self.keys.len());
         // moving keys
         self.keys[self_len] = right_key;
         // TODO: avoid repeatedly default construction
@@ -159,13 +163,14 @@ impl InNode {
         txn: &mut Txn,
         bz: &CacheBufferZone
     ) -> Result<(), TxnErr> {
+        debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
         let mut new_right_node_key = Default::default();
         let half_full_pos = NUM_KEYS / 2 + 1;
-        assert_eq!(left_node.is_ext(), right_node.is_ext());
+        debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             // relocate internal sub nodes
 

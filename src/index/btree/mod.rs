@@ -108,7 +108,7 @@ impl BPlusTree {
                     move |id|{
                         debug!("Reading page to cache {:?}", id);
                         neb_client_1.read_cell(*id).wait().unwrap().map(|cell| {
-                            RwLock::new(ExtNode::from_cell(cell))
+                            Arc::new(RwLock::new(ExtNode::from_cell(cell)))
                         }).ok()
                     },
                     move |id, value| {
@@ -159,7 +159,7 @@ impl BPlusTree {
     fn new_ext_cached_node(&self) -> Node {
         let id = self.new_page_id();
         let node = ExtNode::new(&id);
-        self.ext_node_cache.lock().insert(id, RwLock::new(node));
+        self.ext_node_cache.lock().insert(id, Arc::new(RwLock::new(node)));
         debug!("New page id is: {:?}", id);
         return Node::External(box id);
     }
@@ -356,10 +356,10 @@ impl <'a> TreeTxn<'a> {
         match split_node {
             Some((new_node, pivot_key)) => {
                 debug!("Sub level node split, shall insert new node to current level, pivot {:?}", pivot_key);
-                assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
                 let pivot = pivot_key.unwrap_or_else(|| {
                     let first_key = new_node.first_key(&mut self.bz);
-                    assert_ne!(first_key.len(), 0);
+                    debug_assert_ne!(first_key.len(), 0);
                     first_key
                 });
                 let new_node_ref = self.txn.new_value(new_node);
@@ -402,7 +402,7 @@ impl <'a> TreeTxn<'a> {
         node_ref.warm_cache_for_write_intention(&mut self.bz);
         let key_pos = node_ref.search(key, &mut self.bz);
         if let Node::Internal(n) = &*node_ref {
-            let pointer_pos = key_pos + 1;
+            let pointer_pos = key_pos;
             let result = self.remove_from_node(n.pointers[pointer_pos], key)?;
             if result.is_none() { return Ok(result) }
             let sub_node = n.pointers[pointer_pos];
@@ -436,15 +436,18 @@ impl <'a> TreeTxn<'a> {
                     self.txn.delete(sub_node);
                 } else if !sub_node_ref.is_half_full(&mut self.bz) {
                     // need to rebalance
+                    // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
                     let cand_key_pos = n.rebalance_candidate(key_pos, &mut self.txn, &mut self.bz)?;
-                    let cand_ptr_pos = cand_key_pos + 1;
+                    let cand_ptr_pos = cand_key_pos;
                     let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
                     let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
                     if sub_node_ref.cannot_merge(&mut self.bz) {
                         // relocate
+                        debug!("relocating {} to {}", left_ptr_pos, right_ptr_pos);
                         n.relocate_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz)?;
                     } else {
                         // merge
+                        debug!("relocating {} with {}", left_ptr_pos, right_ptr_pos);
                         n.merge_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz);
                         n.remove(right_ptr_pos - 1);
                     }
@@ -601,7 +604,7 @@ trait Slice<T> : Sized where T: Default + Debug {
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
-        assert!(pos <= *len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
+        debug_assert!(pos <= *len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
         debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
         let mut slice = self.as_slice();
         if *len > 0 {
@@ -775,7 +778,7 @@ mod test {
     }
 
     #[test]
-    fn lots_of_insertions() {
+    fn crd() {
         env_logger::init();
         let server_group = "index_insertions";
         let server_addr = String::from("127.0.0.1:5101");
@@ -850,6 +853,16 @@ mod test {
             if i > 0 {
                 assert!(cursor.next());
             }
+        }
+
+        // deletion
+        let deletion_volume = num / 2;
+        for i in (deletion_volume..num).rev() {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let key = SmallVec::from_slice(&key_slice);
+            debug!("delete: {}", i);
+            assert!(tree.remove(&key, &id).unwrap());
         }
     }
 }
