@@ -88,21 +88,21 @@ impl InNode {
     }
     pub fn rebalance_candidate(
         &self,
-        key_pos: usize,
+        pointer_pos: usize,
         txn: &mut Txn,
         bz: &CacheBufferZone
     ) -> Result<usize, TxnErr> {
-        debug_assert!(key_pos <= self.len);
-        debug!("Searching for rebalance candidate, pos {}, len {}", key_pos, self.len);
-        if key_pos == self.len {
-            // the last one, pick left
-            Ok(key_pos - 1)
-        } else if key_pos == 0 {
+        debug_assert!(pointer_pos <= self.len);
+        debug!("Searching for rebalance candidate, pos {}, len {}", pointer_pos, self.len);
+        if pointer_pos == 0 {
             Ok(1)
+        } else if pointer_pos == self.len - 1 {
+            // the last one, pick left
+            Ok(pointer_pos - 1)
         } else {
             // pick the one with least pointers
-            let left_pos = key_pos - 1;
-            let right_pos = key_pos + 1;
+            let left_pos = pointer_pos - 1;
+            let right_pos = pointer_pos + 1;
             let left_node = txn.read::<Node>(self.pointers[left_pos])?.unwrap();
             let right_node = txn.read::<Node>(self.pointers[right_pos])?.unwrap();
             if left_node.len(bz) <= right_node.len(bz) {
@@ -178,6 +178,10 @@ impl InNode {
                 let mut left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
 
+                debug!("Before relocation internal children. left {}:{:?} right {}:{:?}",
+                       left_innode.len, left_innode.keys,
+                       right_innode.len, right_innode.keys);
+
                 let mut new_left_keys = EntryKeySlice::init();
                 let mut new_left_ptrs = NodePointerSlice::init();
 
@@ -223,6 +227,10 @@ impl InNode {
                 right_innode.keys = new_right_keys;
                 right_innode.pointers = new_right_ptrs;
                 right_innode.len = new_right_keys_len;
+
+                debug!("Relocated internal children. left {}:{:?} right {}:{:?}",
+                       left_innode.len, left_innode.keys,
+                       right_innode.len, right_innode.keys);
             }
 
             txn.update(left_ref, left_node);
@@ -233,6 +241,10 @@ impl InNode {
 
             let mut left_extnode = left_node.extnode_mut(bz);
             let mut right_extnode = right_node.extnode_mut(bz);
+
+            debug!("Before relocation external children. left {}:{:?} right {}:{:?}",
+                   left_extnode.len, left_extnode.keys,
+                   right_extnode.len, right_extnode.keys);
 
             let mut new_left_keys = EntryKeySlice::init();
             let mut new_right_keys = EntryKeySlice::init();
@@ -264,6 +276,10 @@ impl InNode {
 
             right_extnode.keys = new_right_keys;
             right_extnode.len = new_right_keys_len;
+
+            debug!("Relocated external children. left {}:{:?} right {}:{:?}",
+                   left_extnode.len, left_extnode.keys,
+                   right_extnode.len, right_extnode.keys);
         }
 
         self.keys[right_ptr_pos - 1] = new_right_node_key;

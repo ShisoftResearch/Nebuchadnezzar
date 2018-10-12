@@ -212,6 +212,12 @@ pub type RcNodeRefData<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNo
 pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
 
 
+enum CachedData {
+    Some(NodeRcRefCell),
+    None,
+    Deleted
+}
+
 pub enum RcNodeRef<'a> {
     Data(RcNodeRefData<'a>),
     Guard(CacheGuardHolder)
@@ -220,8 +226,7 @@ pub enum RcNodeRef<'a> {
 pub struct CacheBufferZone {
     mapper: Arc<ExtNodeCacheMap>,
     storage: Arc<AsyncClient>,
-    guards: RefCell<BTreeMap<Id, CacheGuardHolder>>,
-    data: RefCell<BTreeMap<Id, Option<NodeRcRefCell>>>
+    data: RefCell<BTreeMap<Id, (CacheGuardHolder, CachedData)>>
 }
 
 impl Deref for CacheGuardHolder {
@@ -251,7 +256,6 @@ impl CacheBufferZone {
         CacheBufferZone {
             mapper: mapper.clone() ,
             storage: storage.clone(),
-            guards: RefCell::new(BTreeMap::new()),
             data: RefCell::new(BTreeMap::new())
         }
     }
@@ -262,30 +266,26 @@ impl CacheBufferZone {
             // read from data (from write)
             let data = self.data.borrow();
             match data.get(id) {
-                Some(Some(ref data)) => {
+                Some((guard, CachedData::Some(data))) => {
                     let cell = data.clone();
                     let cell_ref = RcRef::new(cell);
                     let handle = OwningHandle::new(cell_ref);
                     return RcNodeRef::Data(handle);
                 },
-                Some(None) => panic!(), // deleted
+                Some((guard, CachedData::None)) => {
+                    // read from guards
+                    return RcNodeRef::Guard(guard.clone());
+                }
                 _ => {}
-            }
-        }
-        {
-            // read from guards
-            let guard = self.guards.borrow();
-            if let Some(holder) = guard.get(id) {
-                return RcNodeRef::Guard(holder.clone());
             }
         }
         {
             debug!("Buffer zone inserting for readonly");
             let guard = self.get_ext_node_cached(id);
             let holder = CacheGuardHolder::Read(guard);
-            let mut guards = self.guards.borrow_mut();
-            guards.insert(*id, holder);
-            debug!("Buffer zone now have data {}", guards.len());
+            let mut data = self.data.borrow_mut();
+            // data placeholder for aliened flush. None will be ignored in both get and get mut
+            data.insert(*id, (holder, CachedData::None));
         }
         return self.get(id);
     }
@@ -295,37 +295,35 @@ impl CacheBufferZone {
         {
             let data = self.data.borrow();
             match data.get(id) {
-                Some(Some(ref extnode)) => {
-                    let guards = self.guards.borrow();
-                    if let CacheGuardHolder::Read(_) = guards.get(id).unwrap() {
-                        panic!("Mutating readonly buffered cache");
-                    }
+                Some((CacheGuardHolder::Write(_), CachedData::Some(ref extnode))) => {
                     let cell = extnode.clone();
                     let cell_ref = RcRef::new(cell);
                     let handle = OwningHandle::new_mut(cell_ref);
-                    debug!("Got cached, len {}, cache data {}, cache guards {}", handle.len, data.len(), guards.len());
                     return handle
                 },
-                Some(None) => panic!(),
+                Some((CacheGuardHolder::Read(_), _)) => panic!("mutating readonly buffered cache"),
+                Some((CacheGuardHolder::Write(_), _)) => panic!("item not available"),
                 _ => {}
             }
         }
         {
             debug!("Buffer zone inserting for mutation {:?}", id);
             let guard = self.get_mut_ext_node_cached(id);
-            let mut data = self.data.borrow_mut();
-            data.insert(*id, Some(Rc::new(RefCell::new((&*guard).clone()))));
+            let mut data_map = self.data.borrow_mut();
+            let data = RefCell::new((&*guard).clone());
             let holder = CacheGuardHolder::Write(guard);
-            let mut guards = self.guards.borrow_mut();
-            guards.insert(*id, holder);
-            debug!("Buffer zone now have data {}, guards {}", data.len(), guards.len());
+            data_map.insert(*id, (holder, CachedData::Some(Rc::new(data))));
         }
         self.get_for_mut(id)
     }
 
     pub fn delete(&self, id: &Id) {
-        let mut data = self.data.borrow_mut();
-        data.insert(*id, None);
+        let mut data_map = self.data.borrow_mut();
+        match data_map.get_mut(id) {
+            Some((CacheGuardHolder::Write(_), cache)) => *cache = CachedData::Deleted,
+            Some((CacheGuardHolder::Read(_), _)) => panic!("data readonly"),
+            None => panic!("data not loaded")
+        }
     }
 
     pub fn new_node(&self, node: ExtNode) {
@@ -336,32 +334,30 @@ impl CacheBufferZone {
             let node_id = node.id;
             let lock = RwLock::new(ExtNode::new(&node_id));
             let guard = CacheGuardHolder::Write(lock.write());
-            let mut guards = self.guards.borrow_mut();
             let mut data = self.data.borrow_mut();
-            debug!("new node in buffered cache: {:?}, was guards: {}, data: {}", node_id, guards.len(), data.len());
             mapper.insert(node_id, Arc::new(lock));
-            guards.insert(node_id, guard);
-            data.insert(node_id, Some(Rc::new(RefCell::new(node))));
+            data.insert(node_id, (guard, CachedData::Some(Rc::new(RefCell::new(node)))));
         }
     }
 
     pub fn flush(&self) {
-        let mut guards = self.guards.borrow_mut();
-        let data = self.data.borrow();
-        debug!("Flushing cache buffer, guards: {:?}, data: {:?}", guards.keys(), data.keys());
-        for ((id, data),  (gid, mut holder)) in data.iter().zip(guards.iter_mut()) {
-            debug_assert_eq!(id, gid);
-            if let Some(ref node_rc) = data {
+        let mut data_map = self.data.borrow_mut();
+        for ((id, (holder, data))) in data_map.iter_mut() {
+            if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
                 debug!("Flushing updating node: {:?}", id);
-                if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
-                    let mut ext_node = (*(*node_rc).borrow()).clone();
-                    debug!("flushing {:?} to cache with {} keys", ext_node.id, ext_node.len);
-                    **guard = ext_node
+                match data {
+                    CachedData::Some(ref node_rc) => {
+                        let mut ext_node = (*(*node_rc).borrow()).clone();
+                        debug!("flushing {:?} to cache with {} keys", ext_node.id, ext_node.len);
+                        **guard = ext_node
+                    },
+                    CachedData::Deleted => {
+                        debug!("Flushing deleting node: {:?}", id);
+                        self.mapper.lock().remove(id);
+                        self.storage.remove_cell(*id).wait().unwrap();
+                    },
+                    _ => panic!()
                 }
-            } else {
-                debug!("Flushing deleting node: {:?}", id);
-                self.mapper.lock().remove(id);
-                self.storage.remove_cell(*id).wait().unwrap();
             }
         }
     }
@@ -370,14 +366,14 @@ impl CacheBufferZone {
         if id.is_unit_id() {
             return None;
         }
-        let mut guards = self.guards.borrow_mut();
+        let mut data_map = self.data.borrow_mut();
         {
-            let res = guards.get(id).map(|rg| rg.clone());
+            let res = data_map.get(id).map(|(holder, _)| holder.clone());
             if res.is_some() { return res; }
         }
         let guard = self.get_ext_node_cached(id);
         let holder = CacheGuardHolder::Read(guard);
-        guards.insert(*id, holder.clone());
+        data_map.insert(*id, (holder.clone(), CachedData::None)); // act as a read operation
         return Some(holder)
     }
 

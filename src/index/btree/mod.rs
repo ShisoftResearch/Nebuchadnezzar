@@ -73,6 +73,12 @@ pub enum Ordering {
     Forward, Backward
 }
 
+impl Default for Ordering {
+    fn default() -> Self {
+        Ordering::Forward
+    }
+}
+
 pub struct TreeTxn<'a> {
     tree: &'a BPlusTree,
     bz: Rc<CacheBufferZone>,
@@ -169,9 +175,14 @@ impl Node {
     fn search(&self, key: &EntryKey, bz: &CacheBufferZone) -> usize {
         let len = self.len(bz);
         if self.is_ext() {
-            self.extnode(bz).keys[..len].binary_search(key).unwrap_or_else(|i| i)
+            self.extnode(bz).keys[..len]
+                .binary_search(key)
+                .unwrap_or_else(|i| i)
         } else {
-            self.innode().keys[..len].binary_search(key).unwrap_or_else(|i| i)
+            self.innode().keys[..len]
+                .binary_search(key)
+                .map(|i| i + 1)
+                .unwrap_or_else(|i| i)
         }
     }
     fn warm_cache_for_write_intention(&self, bz: &CacheBufferZone) {
@@ -297,7 +308,7 @@ impl <'a> TreeTxn<'a> {
         let node = self.txn.read::<Node>(node)?.unwrap();
         let pos = node.search(key, &mut self.bz);
         if node.is_ext() {
-            debug!("search in external for {:?}", key);
+            debug!("search in external for {:?}, items {:?}", key, node.extnode(&self.bz).keys);
             Ok(RTCursor::new(pos, &node.ext_id(), &self.bz, ordering))
         } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.pointers[pos];
@@ -400,12 +411,11 @@ impl <'a> TreeTxn<'a> {
     ) -> Result<Option<()>, TxnErr> {
         let node_ref = self.txn.read::<Node>(node)?.unwrap();
         node_ref.warm_cache_for_write_intention(&mut self.bz);
-        let key_pos = node_ref.search(key, &mut self.bz);
+        let pos = node_ref.search(key, &mut self.bz);;
         if let Node::Internal(n) = &*node_ref {
-            let pointer_pos = key_pos;
-            let result = self.remove_from_node(n.pointers[pointer_pos], key)?;
+            let result = self.remove_from_node(n.pointers[pos], key)?;
             if result.is_none() { return Ok(result) }
-            let sub_node = n.pointers[pointer_pos];
+            let sub_node = n.pointers[pos];
             let sub_node_ref = self.txn.read::<Node>(sub_node)?.unwrap();
             let mut node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
             {
@@ -426,21 +436,20 @@ impl <'a> TreeTxn<'a> {
                             let mut next_node = self.bz.get_for_mut(&next);
                             next_node.prev = prev;
                         }
-                        n.remove(pointer_pos);
+                        n.remove(pos);
                         self.bz.delete(&nid)
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
-                        n.pointers[pointer_pos] = sub_node_ref.innode().pointers[0];
+                        n.pointers[pos] = sub_node_ref.innode().pointers[0];
                     }
                     self.txn.delete(sub_node);
-                } else if !sub_node_ref.is_half_full(&mut self.bz) {
+                } else if !sub_node_ref.is_half_full(&mut self.bz) && n.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                    let cand_key_pos = n.rebalance_candidate(key_pos, &mut self.txn, &mut self.bz)?;
-                    let cand_ptr_pos = cand_key_pos;
-                    let left_ptr_pos = min(pointer_pos, cand_ptr_pos);
-                    let right_ptr_pos = max(pointer_pos, cand_ptr_pos);
+                    let cand_ptr_pos = n.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
+                    let left_ptr_pos = min(pos, cand_ptr_pos);
+                    let right_ptr_pos = max(pos, cand_ptr_pos);
                     if sub_node_ref.cannot_merge(&mut self.bz) {
                         // relocate
                         debug!("relocating {} to {}", left_ptr_pos, right_ptr_pos);
@@ -457,8 +466,8 @@ impl <'a> TreeTxn<'a> {
             return Ok(result);
         } else if let &Node::External(ref id) = &*node_ref {
             let mut cached_node = self.bz.get_for_mut(id);
-            if &cached_node.keys[key_pos] == key {
-                cached_node.remove(key_pos);
+            if &cached_node.keys[pos] == key {
+                cached_node.remove(pos);
                 return Ok(Some(()));
             } else {
                 return Ok(None);
@@ -476,12 +485,15 @@ impl RTCursor {
     ) -> RTCursor {
         let node = bz.get(id);
         let page = bz.get_guard(id).unwrap();
-        let key = &node.keys[pos];
         let next = page.next;
         let prev = page.prev;
         debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
-        debug!("Key at pos {} is {:?}, next: {:?}, prev: {:?}", pos, &key, next, prev);
-        RTCursor {
+        if pos < node.len {
+            debug!("Key at pos {} is {:?}, next: {:?}, prev: {:?}", pos, &node.keys[pos], next, prev);
+        } else {
+            debug!("Cursor creation without valid pos")
+        }
+        let mut cursor = RTCursor {
             index: pos,
             ordering,
             page,
@@ -490,7 +502,18 @@ impl RTCursor {
                 Ordering::Forward => &next,
                 Ordering::Backward  => &prev
             })
+        };
+
+        match ordering {
+            Ordering::Forward => {
+                if pos >= node.len {
+                    cursor.next();
+                }
+            },
+            Ordering::Backward => {}
         }
+
+        return cursor;
     }
     pub fn next(&mut self) -> bool {
         debug!("Next id with index: {}, length: {}", self.index + 1, self.page.len);
@@ -849,10 +872,18 @@ mod test {
             let expected = Id::new(0, i);
             debug!("Expecting id {:?}", expected);
             let id = cursor.current().unwrap();
-            assert_eq!(id, expected);
+            assert_eq!(id, expected, "{}", i);
             if i > 0 {
                 assert!(cursor.next());
             }
+        }
+
+        // point search
+        for i in 0..num {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let key = SmallVec::from_slice(&key_slice);
+            assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
         }
 
         // deletion
@@ -862,7 +893,7 @@ mod test {
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
             debug!("delete: {}", i);
-            assert!(tree.remove(&key, &id).unwrap());
+            assert!(tree.remove(&key, &id).unwrap(), "{}", i);
         }
     }
 }
