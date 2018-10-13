@@ -136,7 +136,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 [[package]]
 name = "dovahkiin"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#08ef087388723aef8fc8728ca70e3be5e0947c7d"
+source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#70ce3210b6a03c1ab5ebd46bdc439ef4370f3b10"
 dependencies = [
  "bifrost 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",
  "bifrost_hasher 0.1.0 (git+https://github.com/shisoft/bifrost?branch=develop)",

@@ -27,10 +27,10 @@ pub struct InNodePtrSplit {
 
 impl InNode {
     pub fn remove(&mut self, pos: usize) {
-        let n_len = self.len;
-        self.keys.remove_at(pos, n_len);
-        self.pointers.remove_at(pos + 1, n_len + 1);
-        self.len -= 1;
+        let mut n_len = self.len;
+        self.keys.remove_at(pos, &mut n_len);
+        self.pointers.remove_at(pos + 1, &mut (n_len + 1));
+        self.len = n_len;
     }
     pub fn insert(&mut self, key: EntryKey, ptr: Option<TxnValRef>, pos: usize)
         -> Option<(Node, Option<EntryKey>)>
@@ -96,7 +96,7 @@ impl InNode {
         debug!("Searching for rebalance candidate, pos {}, len {}", pointer_pos, self.len);
         if pointer_pos == 0 {
             Ok(1)
-        } else if pointer_pos == self.len - 1 {
+        } else if pointer_pos + 1 >= self.len {
             // the last one, pick left
             Ok(pointer_pos - 1)
         } else {

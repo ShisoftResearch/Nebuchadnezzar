@@ -425,9 +425,11 @@ impl <'a> TreeTxn<'a> {
                     if sub_node_ref.is_ext() {
                         // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
                         let (prev, next, nid) = {
-                            let n = sub_node_ref.extnode(&mut self.bz);
+                            // use ext mut for loading node into cache for delete
+                            let n = sub_node_ref.extnode_mut(&mut self.bz);
                             (n.prev, n.next, n.id)
                         };
+                        debug_assert_ne!(nid, Id::unit_id());
                         if !prev.is_unit_id() {
                             let mut prev_node = self.bz.get_for_mut(&prev);
                             prev_node.next = next;
@@ -436,8 +438,9 @@ impl <'a> TreeTxn<'a> {
                             let mut next_node = self.bz.get_for_mut(&next);
                             next_node.prev = prev;
                         }
+                        debug!("removing node {:?}", nid);
+                        self.bz.delete(&nid);
                         n.remove(pos);
-                        self.bz.delete(&nid)
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
@@ -466,10 +469,17 @@ impl <'a> TreeTxn<'a> {
             return Ok(result);
         } else if let &Node::External(ref id) = &*node_ref {
             let mut cached_node = self.bz.get_for_mut(id);
+            if pos >= cached_node.len {
+                debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}, keys {:?}",
+                       pos, cached_node.len, key, &cached_node.keys);
+                return Ok(None)
+            }
             if &cached_node.keys[pos] == key {
                 cached_node.remove(pos);
                 return Ok(Some(()));
             } else {
+                debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}, keys {:?}",
+                       pos, key, &cached_node.keys[pos], &cached_node.keys);
                 return Ok(None);
             }
         } else { unreachable!() }
@@ -641,12 +651,13 @@ trait Slice<T> : Sized where T: Default + Debug {
         *len += 1;
         slice[pos] = item;
     }
-    fn remove_at(&mut self, pos: usize, len: usize) {
-        if pos >= len - 1 { return; }
+    fn remove_at(&mut self, pos: usize, len: &mut usize) {
+        if pos > *len - 1 { return; }
         let slice  = self.as_slice();
-        for i in pos .. len - 1 {
-            slice[i] = mem::replace(&mut slice[i + 1], T::default());
+        for i in pos .. *len - 1 {
+            slice.swap(pos, pos + 1);
         }
+        *len -= 1;
     }
 }
 macro_rules! impl_slice_ops {
@@ -704,11 +715,11 @@ mod test {
         is_external: bool
     }
 
-    fn dump_tree(tree: &BPlusTree) {
+    fn dump_tree(tree: &BPlusTree, f: &str) {
         let mut bz = CacheBufferZone::new(&tree.ext_node_cache, &tree.storage);
         let debug_root = cascading_dump_node(tree, tree.root, &mut bz);
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
-        let mut file = File::create("tree_dump.json").unwrap();
+        let mut file = File::create(f).unwrap();
         file.write_all(json.as_bytes());
     }
 
@@ -836,7 +847,7 @@ mod test {
             Ok(())
         }).unwrap();
         // sequence check
-        dump_tree(&tree);
+        dump_tree(&tree, "tree_dump.json");
         debug!("Scanning for sequence dump");
         let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
         for i in 0..num {
@@ -893,7 +904,11 @@ mod test {
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
             debug!("delete: {}", i);
-            assert!(tree.remove(&key, &id).unwrap(), "{}", i);
+            let remove_succeed = tree.remove(&key, &id).unwrap();
+            if !remove_succeed {
+                dump_tree(&tree, "removing_dump.json");
+            }
+            assert!(remove_succeed, "{}", i);
         }
     }
 }

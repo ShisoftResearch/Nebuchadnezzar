@@ -107,9 +107,9 @@ impl ExtNode {
         Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
     pub fn remove(&mut self, pos: usize) {
-        let cached_len = self.len;
-        self.keys.remove_at(pos, cached_len);
-        self.len -= 1;
+        let mut cached_len = self.len;
+        self.keys.remove_at(pos, &mut cached_len);
+        self.len = cached_len;
     }
     pub fn insert(
         &mut self,
@@ -319,10 +319,12 @@ impl CacheBufferZone {
 
     pub fn delete(&self, id: &Id) {
         let mut data_map = self.data.borrow_mut();
+        debug!("remove from data map with keys {:?}", data_map.keys());
+        debug_assert!(data_map.contains_key(id), "cannot found {:?}", id);
         match data_map.get_mut(id) {
             Some((CacheGuardHolder::Write(_), cache)) => *cache = CachedData::Deleted,
-            Some((CacheGuardHolder::Read(_), _)) => panic!("data readonly"),
-            None => panic!("data not loaded")
+            Some((CacheGuardHolder::Read(_), _)) => panic!("data readonly {:?}", id),
+            None => panic!("data not loaded {:?}", id)
         }
     }
 
