@@ -396,37 +396,37 @@ impl <'a> TreeTxn<'a> {
         let mut key = key.clone();
         key_with_id(&mut key, id);
         let root = self.tree.root;
-        let removed = self.remove_from_node(root, &key)?.is_some();
+        let removed = self.remove_from_node(root, &key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
-        if removed && !root_node.is_ext() && root_node.len(&mut self.bz) == 0 {
+        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len(&mut self.bz) == 0 {
             self.txn.update(root, self.tree.new_ext_cached_node());
         }
-        Ok(removed)
+        Ok(removed.item_found)
     }
 
     fn remove_from_node(
         &mut self,
         node: TxnValRef,
         key: &EntryKey
-    ) -> Result<Option<()>, TxnErr> {
+    ) -> Result<RemoveStatus, TxnErr> {
         let node_ref = self.txn.read::<Node>(node)?.unwrap();
         node_ref.warm_cache_for_write_intention(&mut self.bz);
         let pos = node_ref.search(key, &mut self.bz);;
         if let Node::Internal(n) = &*node_ref {
-            let result = self.remove_from_node(n.pointers[pos], key)?;
-            if result.is_none() { return Ok(result) }
-            let sub_node = n.pointers[pos];
-            let sub_node_ref = self.txn.read::<Node>(sub_node)?.unwrap();
-            let mut node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
+            let mut status = self.remove_from_node(n.pointers[pos], key)?;
+            if !status.removed { return Ok(status) }
+            let sub_node_ref = n.pointers[pos];
+            let sub_node = self.txn.read::<Node>(sub_node_ref)?.unwrap();
+            let mut current_node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
             {
-                let mut n = node_owned.innode_mut();
-                if sub_node_ref.len(&mut self.bz) == 0 {
+                let mut current_innode = current_node_owned.innode_mut();
+                if sub_node.len(&mut self.bz) == 0 {
                     // need to remove empty child node
-                    if sub_node_ref.is_ext() {
+                    if sub_node.is_ext() {
                         // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
                         let (prev, next, nid) = {
                             // use ext mut for loading node into cache for delete
-                            let n = sub_node_ref.extnode_mut(&mut self.bz);
+                            let n = sub_node.extnode_mut(&mut self.bz);
                             (n.prev, n.next, n.id)
                         };
                         debug_assert_ne!(nid, Id::unit_id());
@@ -440,47 +440,47 @@ impl <'a> TreeTxn<'a> {
                         }
                         debug!("removing node {:?}", nid);
                         self.bz.delete(&nid);
-                        n.remove(pos);
+                        current_innode.remove(pos);
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
-                        n.pointers[pos] = sub_node_ref.innode().pointers[0];
+                        current_innode.pointers[pos] = sub_node.innode().pointers[0];
                     }
-                    self.txn.delete(sub_node);
-                } else if !sub_node_ref.is_half_full(&mut self.bz) && n.len > 1 {
+                    self.txn.delete(sub_node_ref);
+                } else if !sub_node.is_half_full(&mut self.bz) && current_innode.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                    let cand_ptr_pos = n.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
+                    let cand_ptr_pos = current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
-                    if sub_node_ref.cannot_merge(&mut self.bz) {
+                    if sub_node.cannot_merge(&mut self.bz) {
                         // relocate
                         debug!("relocating {} to {}", left_ptr_pos, right_ptr_pos);
-                        n.relocate_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz)?;
+                        current_innode.relocate_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz)?;
                     } else {
                         // merge
                         debug!("relocating {} with {}", left_ptr_pos, right_ptr_pos);
-                        n.merge_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz);
-                        n.remove(right_ptr_pos - 1);
+                        current_innode.merge_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz);
+                        current_innode.remove(right_ptr_pos - 1);
                     }
                 }
             }
-            self.txn.update(node, node_owned);
-            return Ok(result);
+            self.txn.update(node, current_node_owned);
+            return Ok(status);
         } else if let &Node::External(ref id) = &*node_ref {
             let mut cached_node = self.bz.get_for_mut(id);
             if pos >= cached_node.len {
                 debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}, keys {:?}",
                        pos, cached_node.len, key, &cached_node.keys);
-                return Ok(None)
+                return Ok(RemoveStatus{ item_found: false, removed: false })
             }
             if &cached_node.keys[pos] == key {
                 cached_node.remove(pos);
-                return Ok(Some(()));
+                return Ok(RemoveStatus{ item_found: true, removed: true });
             } else {
                 debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}, keys {:?}",
                        pos, key, &cached_node.keys[pos], &cached_node.keys);
-                return Ok(None);
+                return Ok(RemoveStatus{ item_found: false, removed: false });
             }
         } else { unreachable!() }
     }
@@ -669,6 +669,11 @@ macro_rules! impl_slice_ops {
     };
 }
 
+struct RemoveStatus {
+    item_found: bool,
+    removed: bool
+}
+
 impl_slice_ops!(EntryKeySlice, EntryKey, NUM_KEYS);
 impl_slice_ops!(NodePointerSlice, TxnValRef, NUM_PTRS);
 
@@ -725,7 +730,8 @@ mod test {
 
     fn cascading_dump_node(tree: &BPlusTree, node: TxnValRef, bz: &mut CacheBufferZone) -> DebugNode {
         let node = tree.stm.transaction(|txn| {
-           txn.read_owned::<Node>(node).map(|opt| opt.unwrap())
+           txn.read_owned::<Node>(node)
+               .map(|opt| opt.unwrap_or(Node::None))
         }).unwrap();
         match node {
             Node::External(id) => {
@@ -768,7 +774,14 @@ mod test {
                     is_external: false
                 }
             },
-            Node::None => panic!()
+            Node::None => DebugNode {
+                keys: vec![String::from("<NOT FOUND>")],
+                nodes: vec![],
+                id: None,
+                next: None,
+                prev: None,
+                is_external: false
+            }
         }
     }
 
