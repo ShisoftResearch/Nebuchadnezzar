@@ -27,10 +27,11 @@ pub struct InNodePtrSplit {
 
 impl InNode {
     pub fn remove(&mut self, pos: usize) {
-        let mut n_len = self.len;
-        self.keys.remove_at(pos, &mut n_len);
-        self.pointers.remove_at(pos + 1, &mut (n_len + 1));
-        self.len = n_len;
+        let mut n_key_len = self.len;
+        let mut n_ptr_len = n_key_len + 1;
+        self.keys.remove_at(pos, &mut n_key_len);
+        self.pointers.remove_at(pos + 1, &mut n_ptr_len);
+        self.len = n_key_len;
     }
     pub fn insert(&mut self, key: EntryKey, ptr: Option<TxnValRef>, pos: usize)
         -> Option<(Node, Option<EntryKey>)>
@@ -123,12 +124,13 @@ impl InNode {
         let right_ref = self.pointers[right_ptr_pos];
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
+        let right_key_pos = right_ptr_pos - 1;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             {
                 let mut left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
-                let right_key = right_innode.keys[right_ptr_pos - 1].clone();
+                let right_key = self.keys[right_key_pos].clone();
                 left_innode.merge_with(&mut right_innode, right_key);
             }
             txn.update(left_ref, left_node);
@@ -138,6 +140,7 @@ impl InNode {
             left_extnode.merge_with(&mut right_extnode);
             bz.delete(&right_extnode.id);
         }
+        self.remove(right_key_pos);
         txn.delete(right_ref);
         Ok(())
     }
@@ -148,13 +151,13 @@ impl InNode {
         // moving keys
         self.keys[self_len] = right_key;
         // TODO: avoid repeatedly default construction
-        self_len += 1;
-        for i in self_len .. new_len {
+        for i in self_len + 1 .. new_len {
             self.keys[i] = mem::replace(&mut right.keys[i - self_len - 1], Default::default());
         }
         for i in self_len .. new_len + 1 {
             self.pointers[i] = mem::replace(&mut right.pointers[i - self_len - 1], Default::default());
         }
+        self.len += right.len + 1;
     }
     pub fn relocate_children(
         &mut self,

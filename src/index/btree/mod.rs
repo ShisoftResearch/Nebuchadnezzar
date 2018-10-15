@@ -429,6 +429,7 @@ impl <'a> TreeTxn<'a> {
                             let n = sub_node.extnode_mut(&mut self.bz);
                             (n.prev, n.next, n.id)
                         };
+                        let key_pos = pos - 1;
                         debug_assert_ne!(nid, Id::unit_id());
                         if !prev.is_unit_id() {
                             let mut prev_node = self.bz.get_for_mut(&prev);
@@ -440,28 +441,36 @@ impl <'a> TreeTxn<'a> {
                         }
                         debug!("removing node {:?}", nid);
                         self.bz.delete(&nid);
-                        current_innode.remove(pos);
+                        self.txn.delete(sub_node_ref);
+                        current_innode.remove(key_pos);
+                        status.removed = true;
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
-                        current_innode.pointers[pos] = sub_node.innode().pointers[0];
+                        let sub_innode = sub_node.innode();
+                        let sub_sub_node_ref = sub_innode.pointers[0];
+                        debug_assert!(sub_innode.len == 0);
+                        debug_assert!(self.txn.read::<Node>(sub_sub_node_ref).unwrap().is_some());
+                        current_innode.pointers[pos] = sub_sub_node_ref;
+                        status.removed = false;
                     }
-                    self.txn.delete(sub_node_ref);
                 } else if !sub_node.is_half_full(&mut self.bz) && current_innode.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
                     let cand_ptr_pos = current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
-                    if sub_node.cannot_merge(&mut self.bz) {
+                    let cand_node = self.txn.read::<Node>(n.pointers[cand_ptr_pos])?.unwrap();
+                    if sub_node.cannot_merge(&mut self.bz) || cand_node.cannot_merge(&mut self.bz) {
                         // relocate
-                        debug!("relocating {} to {}", left_ptr_pos, right_ptr_pos);
+                        debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
                         current_innode.relocate_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz)?;
+                        status.removed = false;
                     } else {
                         // merge
-                        debug!("relocating {} with {}", left_ptr_pos, right_ptr_pos);
+                        debug!("Merge {} with {}", left_ptr_pos, right_ptr_pos);
                         current_innode.merge_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz);
-                        current_innode.remove(right_ptr_pos - 1);
+                        status.removed = true;
                     }
                 }
             }
@@ -717,6 +726,7 @@ mod test {
         id: Option<String>,
         next: Option<String>,
         prev: Option<String>,
+        len: usize,
         is_external: bool
     }
 
@@ -750,6 +760,7 @@ mod test {
                     id: Some(format!("{:?}", node.id)),
                     next: Some(format!("{:?}", node.next)),
                     prev: Some(format!("{:?}", node.prev)),
+                    len: node.len,
                     is_external: true
                 }
             },
@@ -771,6 +782,7 @@ mod test {
                     id: None,
                     next: None,
                     prev: None,
+                    len,
                     is_external: false
                 }
             },
@@ -780,6 +792,7 @@ mod test {
                 id: None,
                 next: None,
                 prev: None,
+                len: 0,
                 is_external: false
             }
         }
