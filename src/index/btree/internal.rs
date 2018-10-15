@@ -29,6 +29,7 @@ impl InNode {
     pub fn remove(&mut self, pos: usize) {
         let mut n_key_len = self.len;
         let mut n_ptr_len = n_key_len + 1;
+        debug!("Removing from internal node pos {}, len {}", pos, n_key_len);
         self.keys.remove_at(pos, &mut n_key_len);
         self.pointers.remove_at(pos + 1, &mut n_ptr_len);
         self.len = n_key_len;
@@ -101,16 +102,9 @@ impl InNode {
             // the last one, pick left
             Ok(pointer_pos - 1)
         } else {
-            // pick the one with least pointers
-            let left_pos = pointer_pos - 1;
-            let right_pos = pointer_pos + 1;
-            let left_node = txn.read::<Node>(self.pointers[left_pos])?.unwrap();
-            let right_node = txn.read::<Node>(self.pointers[right_pos])?.unwrap();
-            if left_node.len(bz) <= right_node.len(bz) {
-                Ok(left_pos)
-            } else {
-                Ok(right_pos)
-            }
+            // pick the right one
+            // we should pick the one  with least pointers, but it cost for the check is too high
+            Ok(pointer_pos + 1)
         }
     }
     pub fn merge_children(
@@ -124,6 +118,9 @@ impl InNode {
         let right_ref = self.pointers[right_ptr_pos];
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
+        let left_len = left_node.len(bz);
+        let right_len = right_node.len(bz);
+        let mut merged_len = 0;
         let right_key_pos = right_ptr_pos - 1;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
@@ -132,14 +129,18 @@ impl InNode {
                 let mut right_innode = right_node.innode_mut();
                 let right_key = self.keys[right_key_pos].clone();
                 left_innode.merge_with(&mut right_innode, right_key);
+                merged_len = left_innode.len;
             }
             txn.update(left_ref, left_node);
         } else {
             let mut right_extnode = right_node.extnode_mut(bz);
             let mut left_extnode = left_node.extnode_mut(bz);
             left_extnode.merge_with(&mut right_extnode);
+            merged_len = left_extnode.len;
             bz.delete(&right_extnode.id);
         }
+        debug!("Removing merged node, left {}, right {}, merged {}",
+               left_len, right_len, merged_len);
         self.remove(right_key_pos);
         txn.delete(right_ref);
         Ok(())
@@ -172,7 +173,7 @@ impl InNode {
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
         let mut new_right_node_key = Default::default();
-        let half_full_pos = NUM_KEYS / 2 + 1;
+        let half_full_pos = (left_node.len(bz) + right_node.len(bz)) / 2;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             // relocate internal sub nodes
@@ -268,8 +269,7 @@ impl InNode {
                     if i == half_full_pos {
                         new_right_node_key = key_owned.clone()
                     }
-                    let nk_index = i - half_full_pos - 1;
-                    new_right_keys[nk_index] = key_owned;
+                    new_right_keys[i - half_full_pos] = key_owned;
                     new_right_keys_len += 1;
                 }
             }
@@ -285,7 +285,9 @@ impl InNode {
                    right_extnode.len, right_extnode.keys);
         }
 
-        self.keys[right_ptr_pos - 1] = new_right_node_key;
+        let right_key_pos = right_ptr_pos - 1;
+        debug!("Setting key at pos {} to new key {:?}", right_key_pos, new_right_node_key);
+        self.keys[right_key_pos] = new_right_node_key;
 
         Ok(())
     }

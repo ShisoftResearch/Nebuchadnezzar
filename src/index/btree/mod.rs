@@ -32,7 +32,7 @@ mod internal;
 mod external;
 
 const ID_SIZE: usize = 16;
-const NUM_KEYS: usize = 4;
+const NUM_KEYS: usize = 5;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -236,7 +236,7 @@ impl Node {
         self.len(bz) >= NUM_KEYS / 2
     }
     fn cannot_merge(&self, bz: &CacheBufferZone) -> bool {
-        self.len(bz) >= NUM_KEYS/ 2 - 1
+        self.len(bz) > NUM_KEYS / 2
     }
     fn extnode_mut<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRefMut<'a> {
         match self {
@@ -409,6 +409,7 @@ impl <'a> TreeTxn<'a> {
         node: TxnValRef,
         key: &EntryKey
     ) -> Result<RemoveStatus, TxnErr> {
+        debug!("Removing {:?} from node {:?}", key, node);
         let node_ref = self.txn.read::<Node>(node)?.unwrap();
         node_ref.warm_cache_for_write_intention(&mut self.bz);
         let pos = node_ref.search(key, &mut self.bz);;
@@ -439,7 +440,7 @@ impl <'a> TreeTxn<'a> {
                             let mut next_node = self.bz.get_for_mut(&next);
                             next_node.prev = prev;
                         }
-                        debug!("removing node {:?}", nid);
+                        debug!("Removing empty node {:?}, len {}", nid, sub_node.len(&mut self.bz));
                         self.bz.delete(&nid);
                         self.txn.delete(sub_node_ref);
                         current_innode.remove(key_pos);
@@ -461,6 +462,11 @@ impl <'a> TreeTxn<'a> {
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
                     let cand_node = self.txn.read::<Node>(n.pointers[cand_ptr_pos])?.unwrap();
+                    debug_assert_eq!(cand_node.is_ext(), sub_node.is_ext());
+                    if cand_node.is_ext() {
+                        cand_node.extnode_mut(&mut self.bz);
+                        sub_node.extnode_mut(&mut self.bz);
+                    }
                     if sub_node.cannot_merge(&mut self.bz) || cand_node.cannot_merge(&mut self.bz) {
                         // relocate
                         debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
@@ -661,10 +667,13 @@ trait Slice<T> : Sized where T: Default + Debug {
         slice[pos] = item;
     }
     fn remove_at(&mut self, pos: usize, len: &mut usize) {
-        if pos > *len - 1 { return; }
-        let slice  = self.as_slice();
-        for i in pos .. *len - 1 {
-            slice.swap(pos, pos + 1);
+        debug!("remove at {} len {}", pos, len);
+        debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
+        if pos < *len - 1 {
+            let slice  = self.as_slice();
+            for i in pos .. *len - 1 {
+                slice.swap(i, i + 1);
+            }
         }
         *len -= 1;
     }
@@ -924,17 +933,19 @@ mod test {
         }
 
         // deletion
+        debug!("Testing deletion");
         let deletion_volume = num / 2;
-        for i in (deletion_volume..num).rev() {
+        for i in 0..deletion_volume {
+            debug!("delete: {}", i);
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
-            debug!("delete: {}", i);
             let remove_succeed = tree.remove(&key, &id).unwrap();
             if !remove_succeed {
                 dump_tree(&tree, "removing_dump.json");
             }
             assert!(remove_succeed, "{}", i);
         }
+        dump_tree(&tree, "remove_completed_dump.json");
     }
 }

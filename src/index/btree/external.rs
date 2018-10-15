@@ -108,6 +108,7 @@ impl ExtNode {
     }
     pub fn remove(&mut self, pos: usize) {
         let mut cached_len = self.len;
+        debug!("Removing from external pos {}, len {}", pos, cached_len);
         self.keys.remove_at(pos, &mut cached_len);
         self.len = cached_len;
     }
@@ -319,7 +320,7 @@ impl CacheBufferZone {
 
     pub fn delete(&self, id: &Id) {
         let mut data_map = self.data.borrow_mut();
-        debug!("remove from data map with keys {:?}", data_map.keys());
+        debug!("remove {:?} from data map with keys {:?}", id, data_map.keys());
         debug_assert!(data_map.contains_key(id), "cannot found {:?}", id);
         match data_map.get_mut(id) {
             Some((CacheGuardHolder::Write(_), cache)) => *cache = CachedData::Deleted,
