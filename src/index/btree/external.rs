@@ -106,7 +106,7 @@ impl ExtNode {
             .value();
         Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
-    pub fn remove(&mut self, pos: usize) {
+    pub fn remove_at(&mut self, pos: usize) {
         let mut cached_len = self.len;
         debug!("Removing from external pos {}, len {}", pos, cached_len);
         self.keys.remove_at(pos, &mut cached_len);
@@ -184,6 +184,22 @@ impl ExtNode {
         for i in 0..NUM_KEYS {
             debug!("{}\t- {:?}", i, self.keys[i]);
         }
+    }
+    pub fn remove_node(&self, bz: &CacheBufferZone) {
+        let id = &self.id;
+        let prev = &self.prev;
+        let next = &self.next;
+        debug_assert_ne!(id, &Id::unit_id());
+        if !prev.is_unit_id() {
+            let mut prev_node = bz.get_for_mut(&prev);
+            prev_node.next = *next;
+        }
+        if !next.is_unit_id() {
+            let mut next_node = bz.get_for_mut(&next);
+            next_node.prev = *prev;
+        }
+        debug!("Removing node {:?}, len {}", id, self.len);
+        bz.delete(id);
     }
 }
 

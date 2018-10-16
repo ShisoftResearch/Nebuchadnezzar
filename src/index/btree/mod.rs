@@ -206,9 +206,9 @@ impl Node {
     }
     fn remove(&mut self, pos: usize, bz: &CacheBufferZone) {
         if let &mut Node::External(ref id) = self {
-            self.extnode_mut(bz).remove(pos)
+            self.extnode_mut(bz).remove_at(pos)
         } else {
-            self.innode_mut().remove(pos)
+            self.innode_mut().remove_at(pos)
         }
     }
     fn is_ext(&self) -> bool {
@@ -424,26 +424,10 @@ impl <'a> TreeTxn<'a> {
                 if sub_node.len(&mut self.bz) == 0 {
                     // need to remove empty child node
                     if sub_node.is_ext() {
-                        // empty external node should be removed and rearrange 'next' and 'prev' pointer for neighbourhoods
-                        let (prev, next, nid) = {
-                            // use ext mut for loading node into cache for delete
-                            let n = sub_node.extnode_mut(&mut self.bz);
-                            (n.prev, n.next, n.id)
-                        };
-                        let key_pos = pos - 1;
-                        debug_assert_ne!(nid, Id::unit_id());
-                        if !prev.is_unit_id() {
-                            let mut prev_node = self.bz.get_for_mut(&prev);
-                            prev_node.next = next;
-                        }
-                        if !next.is_unit_id() {
-                            let mut next_node = self.bz.get_for_mut(&next);
-                            next_node.prev = prev;
-                        }
-                        debug!("Removing empty node {:?}, len {}", nid, sub_node.len(&mut self.bz));
-                        self.bz.delete(&nid);
+                        debug!("Removing empty node");
+                        current_innode.remove_at(pos);
                         self.txn.delete(sub_node_ref);
-                        current_innode.remove(key_pos);
+                        sub_node.extnode_mut(&self.bz).remove_node(&self.bz);
                         status.removed = true;
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
@@ -490,7 +474,7 @@ impl <'a> TreeTxn<'a> {
                 return Ok(RemoveStatus{ item_found: false, removed: false })
             }
             if &cached_node.keys[pos] == key {
-                cached_node.remove(pos);
+                cached_node.remove_at(pos);
                 return Ok(RemoveStatus{ item_found: true, removed: true });
             } else {
                 debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}, keys {:?}",

@@ -26,12 +26,16 @@ pub struct InNodePtrSplit {
 }
 
 impl InNode {
-    pub fn remove(&mut self, pos: usize) {
+    pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
+        if ptr_pos == self.len { ptr_pos - 1 } else { ptr_pos }
+    }
+    pub fn remove_at(&mut self, ptr_pos: usize) {
         let mut n_key_len = self.len;
         let mut n_ptr_len = n_key_len + 1;
-        debug!("Removing from internal node pos {}, len {}", pos, n_key_len);
-        self.keys.remove_at(pos, &mut n_key_len);
-        self.pointers.remove_at(pos + 1, &mut n_ptr_len);
+        let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
+        debug!("Removing from internal node pos {}, len {}", key_pos, n_key_len);
+        self.keys.remove_at(key_pos, &mut n_key_len);
+        self.pointers.remove_at(ptr_pos, &mut n_ptr_len);
         self.len = n_key_len;
     }
     pub fn insert(&mut self, key: EntryKey, ptr: Option<TxnValRef>, pos: usize)
@@ -121,10 +125,10 @@ impl InNode {
         let left_len = left_node.len(bz);
         let right_len = right_node.len(bz);
         let mut merged_len = 0;
-        let right_key_pos = right_ptr_pos - 1;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             {
+                let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
                 let mut left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
                 let right_key = self.keys[right_key_pos].clone();
@@ -134,15 +138,17 @@ impl InNode {
             txn.update(left_ref, left_node);
         } else {
             let mut right_extnode = right_node.extnode_mut(bz);
-            let mut left_extnode = left_node.extnode_mut(bz);
-            left_extnode.merge_with(&mut right_extnode);
-            merged_len = left_extnode.len;
-            bz.delete(&right_extnode.id);
+            {
+                let mut left_extnode = left_node.extnode_mut(bz);
+                left_extnode.merge_with(&mut right_extnode);
+                merged_len = left_extnode.len;
+            }
+            right_extnode.remove_node(bz);
         }
         debug!("Removing merged node, left {}, right {}, merged {}",
                left_len, right_len, merged_len);
-        self.remove(right_key_pos);
         txn.delete(right_ref);
+        self.remove_at(right_ptr_pos);
         Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
