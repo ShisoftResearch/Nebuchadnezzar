@@ -27,7 +27,7 @@ pub struct InNodePtrSplit {
 
 impl InNode {
     pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
-        if ptr_pos == self.len { ptr_pos - 1 } else { ptr_pos }
+        if ptr_pos == 0 { 0 } else { ptr_pos - 1 }
     }
     pub fn remove_at(&mut self, ptr_pos: usize) {
         let mut n_key_len = self.len;
@@ -145,13 +145,15 @@ impl InNode {
             }
             right_extnode.remove_node(bz);
         }
+        self.remove_at(right_ptr_pos);
         debug!("Removing merged node, left {}, right {}, merged {}",
                left_len, right_len, merged_len);
         txn.delete(right_ref);
-        self.remove_at(right_ptr_pos);
         Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
+        debug!("Merge internal node, left len {}, right len {}, right_key {:?}",
+               self.len, right.len, right_key);
         let mut self_len = self.len;
         let new_len = self_len + right.len + 1;
         debug_assert!(new_len <= self.keys.len());
