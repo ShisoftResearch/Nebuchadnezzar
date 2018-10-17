@@ -399,7 +399,14 @@ impl <'a> TreeTxn<'a> {
         let removed = self.remove_from_node(root, &key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
         if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len(&mut self.bz) == 0 {
-            self.txn.update(root, self.tree.new_ext_cached_node());
+            // When root is external and have no keys but one pointer will take the only sub level
+            // pointer node as the new root node.
+            // It is not possible to change the root reference so the sub level node will be cloned
+            // and removed. Its clone will be used as the new root node.
+            let new_root_ref = root_node.innode().pointers[0];
+            let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
+            self.txn.update(root, new_root_cloned);
+            self.txn.delete(new_root_ref);
         }
         Ok(removed.item_found)
     }
@@ -953,15 +960,23 @@ mod test {
 
             // remove remaining items
             for i in (deletion_volume..num).rev() {
-                debug!("delete: {}", i);
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                let remove_succeed = tree.remove(&key, &id).unwrap();
-                if !remove_succeed {
-                    dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+                {
+                    debug!("delete: {}", i);
+                    let id = Id::new(0, i);
+                    let key_slice = u64_to_slice(i);
+                    let key = SmallVec::from_slice(&key_slice);
+                    let remove_succeed = tree.remove(&key, &id).unwrap();
+                    if !remove_succeed {
+                        dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+                    }
+                    assert!(remove_succeed, "{}", i);
                 }
-                assert!(remove_succeed, "{}", i);
+                for j in deletion_volume..i {
+                    let id = Id::new(0, j);
+                    let key_slice = u64_to_slice(j);
+                    let key = SmallVec::from_slice(&key_slice);
+                    assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{} / {}", i, j);
+                }
             }
             dump_tree(&tree, "remove_remains_dump.json");
 
@@ -971,7 +986,7 @@ mod test {
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
                     tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(Id::new(0, deletion_volume)),  // seek should reach deletion_volume
+                    None, // should always be 'None' for empty tree
                     "{}", i);
             }
         }
