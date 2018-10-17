@@ -399,7 +399,14 @@ impl <'a> TreeTxn<'a> {
         let removed = self.remove_from_node(root, &key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
         if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len(&mut self.bz) == 0 {
-            self.txn.update(root, self.tree.new_ext_cached_node());
+            // When root is external and have no keys but one pointer will take the only sub level
+            // pointer node as the new root node.
+            // It is not possible to change the root reference so the sub level node will be cloned
+            // and removed. Its clone will be used as the new root node.
+            let new_root_ref = root_node.innode().pointers[0];
+            let new_root_cloned = self.txn.read_owned::<Node>(new_root_Ref)?.unwrap();
+            self.txn.update(root, new_root_cloned);
+            self.txn.delete(new_root_ref);
         }
         Ok(removed.item_found)
     }
