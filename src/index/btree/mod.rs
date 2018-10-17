@@ -404,7 +404,7 @@ impl <'a> TreeTxn<'a> {
             // It is not possible to change the root reference so the sub level node will be cloned
             // and removed. Its clone will be used as the new root node.
             let new_root_ref = root_node.innode().pointers[0];
-            let new_root_cloned = self.txn.read_owned::<Node>(new_root_Ref)?.unwrap();
+            let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
             self.txn.update(root, new_root_cloned);
             self.txn.delete(new_root_ref);
         }
@@ -973,12 +973,12 @@ mod test {
             dump_tree(&tree, "remove_remains_dump.json");
 
             // check for removed items
-            for i in deletion_volume..num {
+            for i in 0..num {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
                     tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(Id::new(0, deletion_volume)),  // seek should reach deletion_volume
+                    None,  // should return None for all the time
                     "{}", i);
             }
         }
