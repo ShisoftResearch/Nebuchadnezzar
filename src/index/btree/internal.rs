@@ -120,6 +120,7 @@ impl InNode {
     ) -> Result<(), TxnErr> {
         let left_ref = self.pointers[left_ptr_pos];
         let right_ref = self.pointers[right_ptr_pos];
+        debug_assert_ne!(left_ref, right_ref);
         let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
         let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
         let left_len = left_node.len(bz);

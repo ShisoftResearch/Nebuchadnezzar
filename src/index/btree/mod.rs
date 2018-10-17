@@ -846,88 +846,100 @@ mod test {
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
-        info!("test insertion");
         let num = 10_000;
-        for i in (0..num).rev() {
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            debug!("insert id: {}", i);
-            tree.insert(&key, &id).unwrap();
-        }
-        tree.transaction(|txn| {
-            let root = txn.txn.read::<Node>(tree.root)?.unwrap();
-            let root_innode = root.innode();
-            debug!("root have {} keys", root_innode.keys.len());
-            for i in 0..root_innode.len {
-                debug!("{:?} | ", root_innode.keys[i]);
+        {
+            info!("test insertion");
+            for i in (0..num).rev() {
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                debug!("insert id: {}", i);
+                tree.insert(&key, &id).unwrap();
             }
-            // debug!("{:?}", root_innode.keys);
-            Ok(())
-        }).unwrap();
+            tree.transaction(|txn| {
+                let root = txn.txn.read::<Node>(tree.root)?.unwrap();
+                let root_innode = root.innode();
+                debug!("root have {} keys", root_innode.keys.len());
+                for i in 0..root_innode.len {
+                    debug!("{:?} | ", root_innode.keys[i]);
+                }
+                // debug!("{:?}", root_innode.keys);
+                Ok(())
+            }).unwrap();
+            dump_tree(&tree, "tree_dump.json");
+        }
         // sequence check
-        dump_tree(&tree, "tree_dump.json");
-        debug!("Scanning for sequence dump");
-        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
-        for i in 0..num {
-            let id  = cursor.current().unwrap();
-            let unmatched = i != id.lower;
-            let check_msg = if unmatched { "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-=" } else { "YES" };
-            debug!("Index {} have id {:?} check: {}", i, id, check_msg);
-            if unmatched {
-                debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
+        {
+            debug!("Scanning for sequence dump");
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
+            for i in 0..num {
+                let id  = cursor.current().unwrap();
+                let unmatched = i != id.lower;
+                let check_msg = if unmatched { "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-=" } else { "YES" };
+                debug!("Index {} have id {:?} check: {}", i, id, check_msg);
+                if unmatched {
+                    debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
+                }
+                if i + 1 < num {
+                    assert!(cursor.next(), i);
+                } else {
+                    assert!(!cursor.next(), i);
+                }
             }
-            if i + 1 < num {
-                assert!(cursor.next(), i);
-            } else {
-                assert!(!cursor.next(), i);
-            }
-        }
-        debug!("Forward scanning for sequence verification");
-        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
-        for i in 0..num {
-            let expected = Id::new(0, i);
-            debug!("Expecting id {:?}", expected);
-            let id = cursor.current().unwrap();
-            assert_eq!(id, expected);
-            if i + 1 < num {
-                assert!(cursor.next());
-            }
-        }
-
-        debug!("Backward scanning for sequence verification");
-        let backward_start_key_slice = u64_to_slice(num - 1);
-        let mut cursor = tree.seek(&SmallVec::from_slice(&backward_start_key_slice), Ordering::Backward).unwrap();
-        for i in (0..num).rev() {
-            let expected = Id::new(0, i);
-            debug!("Expecting id {:?}", expected);
-            let id = cursor.current().unwrap();
-            assert_eq!(id, expected, "{}", i);
-            if i > 0 {
-                assert!(cursor.next());
+            debug!("Forward scanning for sequence verification");
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
+            for i in 0..num {
+                let expected = Id::new(0, i);
+                debug!("Expecting id {:?}", expected);
+                let id = cursor.current().unwrap();
+                assert_eq!(id, expected);
+                if i + 1 < num {
+                    assert!(cursor.next());
+                }
             }
         }
 
-        // point search
-        for i in 0..num {
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
+        {
+            debug!("Backward scanning for sequence verification");
+            let backward_start_key_slice = u64_to_slice(num - 1);
+            let mut cursor = tree.seek(&SmallVec::from_slice(&backward_start_key_slice), Ordering::Backward).unwrap();
+            for i in (0..num).rev() {
+                let expected = Id::new(0, i);
+                debug!("Expecting id {:?}", expected);
+                let id = cursor.current().unwrap();
+                assert_eq!(id, expected, "{}", i);
+                if i > 0 {
+                    assert!(cursor.next());
+                }
+            }
         }
 
-        // deletion
-        debug!("Testing deletion");
-        let deletion_volume = num / 2;
-        for i in 0..deletion_volume {
-            debug!("delete: {}", i);
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            let remove_succeed = tree.remove(&key, &id).unwrap();
-            dump_tree(&tree, &format!("removing_{}_dump.json", i));
-            assert!(remove_succeed, "{}", i);
+        {
+            // point search
+            for i in 0..num {
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
+            }
         }
-        dump_tree(&tree, "remove_completed_dump.json");
+
+        {
+            // deletion
+            debug!("Testing deletion");
+            let deletion_volume = num / 2;
+            for i in 0..deletion_volume {
+                debug!("delete: {}", i);
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                let remove_succeed = tree.remove(&key, &id).unwrap();
+                if !remove_succeed {
+                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                }
+                assert!(remove_succeed, "{}", i);
+            }
+            dump_tree(&tree, "remove_completed_dump.json");
+        }
     }
 }
