@@ -981,7 +981,7 @@ mod test {
             dump_tree(&tree, "remove_remains_dump.json");
 
             // check for removed items
-            for i in deletion_volume..num {
+            for i in 0..num {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
