@@ -925,9 +925,7 @@ mod test {
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
             let remove_succeed = tree.remove(&key, &id).unwrap();
-            if !remove_succeed {
-                dump_tree(&tree, "removing_dump.json");
-            }
+            dump_tree(&tree, &format!("removing_{}_dump.json", i));
             assert!(remove_succeed, "{}", i);
         }
         dump_tree(&tree, "remove_completed_dump.json");

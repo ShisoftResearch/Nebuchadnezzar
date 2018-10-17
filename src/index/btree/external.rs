@@ -172,12 +172,14 @@ impl ExtNode {
         }
     }
     pub fn merge_with(&mut self, right: &mut Self) {
+        debug!("Merge external node, left len {}, right len {}", self.len, right.len);
         let self_len = self.len;
         let new_len = self.len + right.len;
         debug_assert!(new_len <= self.keys.len());
         for i in self.len .. new_len {
             self.keys[i] = mem::replace(&mut right.keys[i - self_len], Default::default());
         }
+        self.len = new_len;
     }
     pub fn dump(&self) {
         debug!("Dumping {:?}, keys {}", self.id, self.len);
