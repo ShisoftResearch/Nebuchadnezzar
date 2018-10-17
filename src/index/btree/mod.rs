@@ -950,6 +950,30 @@ mod test {
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
             }
+
+            // remove remaining items
+            for i in (deletion_volume..num).rev() {
+                debug!("delete: {}", i);
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                let remove_succeed = tree.remove(&key, &id).unwrap();
+                if !remove_succeed {
+                    dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+                }
+                assert!(remove_succeed, "{}", i);
+            }
+            dump_tree(&tree, "remove_remains_dump.json");
+
+            // check for removed items
+            for i in deletion_volume..num {
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(
+                    tree.seek(&key, Ordering::default()).unwrap().current(),
+                    Some(Id::new(0, deletion_volume)),  // seek should reach deletion_volume
+                    "{}", i);
+            }
         }
     }
 }
