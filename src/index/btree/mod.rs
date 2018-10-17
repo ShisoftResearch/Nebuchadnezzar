@@ -880,11 +880,7 @@ mod test {
                 if unmatched {
                     debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
                 }
-                if i + 1 < num {
-                    assert!(cursor.next(), i);
-                } else {
-                    assert!(!cursor.next(), i);
-                }
+                assert_eq!(cursor.next(), i + 1 < num);
             }
             debug!("Forward scanning for sequence verification");
             let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
@@ -893,9 +889,7 @@ mod test {
                 debug!("Expecting id {:?}", expected);
                 let id = cursor.current().unwrap();
                 assert_eq!(id, expected);
-                if i + 1 < num {
-                    assert!(cursor.next());
-                }
+                assert_eq!(cursor.next(), i + 1 < num);
             }
         }
 
@@ -908,9 +902,7 @@ mod test {
                 debug!("Expecting id {:?}", expected);
                 let id = cursor.current().unwrap();
                 assert_eq!(id, expected, "{}", i);
-                if i > 0 {
-                    assert!(cursor.next());
-                }
+                assert_eq!(cursor.next(), i > 0);
             }
         }
 
@@ -940,6 +932,24 @@ mod test {
                 assert!(remove_succeed, "{}", i);
             }
             dump_tree(&tree, "remove_completed_dump.json");
+
+            // check for removed items
+            for i in 0..deletion_volume {
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(
+                    tree.seek(&key, Ordering::default()).unwrap().current(),
+                    Some(Id::new(0, deletion_volume)),  // seek should reach deletion_volume
+                    "{}", i);
+            }
+
+            // check for remaining items
+            for i in deletion_volume..num {
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
+            }
         }
     }
 }
