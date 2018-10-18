@@ -225,10 +225,10 @@ impl InNode {
                     right_innode.pointers[..right_innode.len + 1].iter_mut()
                 ).enumerate() {
                     let ptr_owned = mem::replace(ptr, Default::default());
-                    if i < half_full_pos {
+                    if i < half_full_pos + 1 {
                         new_right_ptrs[i] = ptr_owned;
                     } else {
-                        new_left_ptrs[i - half_full_pos] = ptr_owned;
+                        new_left_ptrs[i - half_full_pos - 1] = ptr_owned;
                     }
                 }
 
