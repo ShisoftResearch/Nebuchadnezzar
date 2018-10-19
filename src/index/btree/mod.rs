@@ -27,18 +27,33 @@ use std::fmt::Formatter;
 use std::fmt::Error;
 use std::io::Write;
 use std;
+use index::EntryKey;
+use index::id_from_key;
+use index::Slice;
 
 mod internal;
 mod external;
 
-const ID_SIZE: usize = 16;
 const NUM_KEYS: usize = 5;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
-type EntryKey = SmallVec<[u8; 32]>;
 type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePointerSlice = [TxnValRef; NUM_PTRS];
+
+// B-Tree is the memtable for the LSM-Tree
+// Items can be added and removed in real-time
+// It is not supposed to hold a lot of items when it is actually feasible
+// There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
+// items with number of one page will be merged to next level
+pub struct BPlusTree {
+    root: TxnValRef,
+    num_nodes: usize,
+    height: usize,
+    ext_node_cache: Arc<ExtNodeCacheMap>,
+    stm: TxnManager,
+    storage: Arc<AsyncClient>
+}
 
 #[derive(Clone)]
 enum Node {
@@ -57,15 +72,6 @@ pub struct RTCursor {
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
     bz: Rc<CacheBufferZone>
-}
-
-pub struct BPlusTree {
-    root: TxnValRef,
-    num_nodes: usize,
-    height: usize,
-    ext_node_cache: Arc<ExtNodeCacheMap>,
-    stm: TxnManager,
-    storage: Arc<AsyncClient>
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -588,16 +594,6 @@ impl RTCursor {
     }
 }
 
-fn id_from_key(key: &EntryKey) -> Id {
-    debug!("Decoding key to id {:?}", key);
-    let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE ..]);
-    return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
-}
-
-fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
-    return prefix.as_slice() == &x[.. x.len() - ID_SIZE];
-}
-
 fn insert_into_split<T, S>(
     item: T,
     x: &mut S, y: &mut S,
@@ -622,53 +618,6 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
     key.extend_from_slice(&id_bytes);
 }
 
-trait Slice<T> : Sized where T: Default + Debug {
-    fn as_slice(&mut self) -> &mut [T];
-    fn init() -> Self;
-    fn item_default() -> T {
-        T::default()
-    }
-    fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
-        let mut right_slice = Self::init();
-        {
-            let mut slice1: &mut[T] = self.as_slice();
-            let mut slice2: &mut[T] = right_slice.as_slice();
-            for i in pivot .. len { // leave pivot to the right slice
-                let right_pos = i - pivot;
-                let item = mem::replace(&mut slice1[i], T::default());
-                debug!("Moving from left pos {} to right {}, item {:?} for split", i, right_pos, &item);
-                slice2[right_pos] = item;
-            }
-        }
-        return right_slice;
-    }
-    fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
-        debug_assert!(pos <= *len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
-        debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
-        let mut slice = self.as_slice();
-        if *len > 0 {
-            slice[*len] = T::default();
-            for i in (pos ..= *len - 1).rev() {
-                debug!("swap {} with {} for insertion", i, i + 1);
-                slice.swap(i, i + 1);
-            }
-        }
-        debug!("setting item {:?} at {} for insertion", item, pos);
-        *len += 1;
-        slice[pos] = item;
-    }
-    fn remove_at(&mut self, pos: usize, len: &mut usize) {
-        debug!("remove at {} len {}", pos, len);
-        debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
-        if pos < *len - 1 {
-            let slice  = self.as_slice();
-            for i in pos .. *len - 1 {
-                slice.swap(i, i + 1);
-            }
-        }
-        *len -= 1;
-    }
-}
 macro_rules! impl_slice_ops {
     ($t: ty, $et: ty, $n: expr) => {
         impl Slice<$et> for $t {
@@ -714,7 +663,7 @@ mod test {
     use index::btree::external::CacheBufferZone;
     use std::fs::File;
     use std::io::Write;
-    use index::btree::id_from_key;
+    use index::id_from_key;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -745,6 +694,7 @@ mod test {
         }).unwrap();
         match node {
             Node::External(id) => {
+
                 let node = bz.get(&*id);
                 let keys = node.keys
                     .iter()
