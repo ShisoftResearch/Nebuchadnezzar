@@ -13,7 +13,7 @@ use std::ops::DerefMut;
 use core::borrow::BorrowMut;
 use dovahkiin::types::value::ToValue;
 use itertools::Itertools;
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::mem;
 use std::rc::Rc;
 use owning_ref::{RcRef, OwningHandle, OwningRef};
@@ -245,7 +245,7 @@ pub enum RcNodeRef<'a> {
 pub struct CacheBufferZone {
     mapper: Arc<ExtNodeCacheMap>,
     storage: Arc<AsyncClient>,
-    data: RefCell<BTreeMap<Id, (CacheGuardHolder, CachedData)>>
+    data: RefCell<HashMap<Id, (CacheGuardHolder, CachedData)>>
 }
 
 impl Deref for CacheGuardHolder {
@@ -275,7 +275,7 @@ impl CacheBufferZone {
         CacheBufferZone {
             mapper: mapper.clone() ,
             storage: storage.clone(),
-            data: RefCell::new(BTreeMap::new())
+            data: RefCell::new(HashMap::new())
         }
     }
 
