@@ -34,7 +34,7 @@ use index::Slice;
 mod internal;
 mod external;
 
-const NUM_KEYS: usize = 5;
+const NUM_KEYS: usize = 32;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -848,7 +848,7 @@ mod test {
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
-        let num = 10_000;
+        let num = 70_000;
         {
             info!("test insertion");
             for i in (0..num).rev() {
