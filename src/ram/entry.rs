@@ -123,3 +123,13 @@ impl Entry {
         return n;
     }
 }
+
+impl EntryContent {
+    pub fn as_cell_header(&self) -> &CellHeader {
+        if let EntryContent::Cell(ref header) = self {
+            return header;
+        } else {
+            panic!("entry not header");
+        }
+    }
+}

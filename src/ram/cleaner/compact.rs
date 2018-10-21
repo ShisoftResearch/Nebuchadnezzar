@@ -59,7 +59,7 @@ impl CompactCleaner {
         let new_seg = Arc::new(Segment::new(seg.id, live_size, &chunk.backup_storage, &chunk.wal_storage));
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
-        entries
+        let unstable_guards = entries
             .into_iter()
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;
@@ -78,23 +78,22 @@ impl CompactCleaner {
             })
             .filter(|pair|
                 pair.0.meta.entry_header.entry_type == EntryType::Cell)
-            .for_each(|(entry, new_addr)| {
-                if let EntryContent::Cell(header) = entry.content {
-                    debug!("Acquiring cell guard for update on compact {:?}", header.id());
-                    if let Some(mut cell_guard) = chunk.index.get_mut(&header.hash) {
-                        let old_addr = entry.meta.entry_pos;
-                        if *cell_guard == old_addr {
-                            *cell_guard = new_addr;
-                        } else {
-                            warn!("cell address {} have been changed to {} on relocating on compact",
-                                  old_addr, *cell_guard);
-                        }
+            .map(|(entry, new_addr)| {
+                let header = entry.content.as_cell_header();
+                debug!("Acquiring cell guard for update on compact {:?}", header.id());
+                let unstable_guard = chunk.unstable_cells.lock(header.hash);
+                if let Some(mut cell_guard) = chunk.index.get_mut(&header.hash) {
+                    let old_addr = entry.meta.entry_pos;
+                    if *cell_guard == old_addr {
+                        *cell_guard = new_addr;
+                    } else {
+                        warn!("cell address {} have been changed to {} on relocating on compact",
+                              old_addr, *cell_guard);
                     }
-                    debug!("Cell location updated for compact");
-                } else {
-                    panic!("not cell after filter")
                 }
-            });
+                unstable_guard
+            })
+            .collect_vec();
 
         new_seg.append_header.store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one

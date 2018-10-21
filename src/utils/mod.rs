@@ -5,4 +5,4 @@ pub mod lru_cache;
 pub mod rand;
 pub mod stream;
 pub mod chashmap;
-pub mod rii_mutex_table;
+pub mod raii_mutex_table;

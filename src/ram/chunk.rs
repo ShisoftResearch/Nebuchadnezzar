@@ -15,6 +15,7 @@ use ram::entry::{Entry, EntryContent, EntryType};
 use utils::ring_buffer::RingBuffer;
 use server::ServerMeta;
 use std::rc::Rc;
+use utils::raii_mutex_table::RAIIMutexTable;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
 pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
@@ -33,7 +34,8 @@ pub struct Chunk {
     pub wal_storage: Option<String>,
     pub total_space: AtomicUsize,
     pub dead_entries: RingBuffer,
-    pub capacity: usize
+    pub capacity: usize,
+    pub unstable_cells: RAIIMutexTable<u64>
 }
 
 impl Chunk {
@@ -63,7 +65,8 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
-            dead_entries: RingBuffer::new(size / MAX_SEGMENT_SIZE * 10)
+            dead_entries: RingBuffer::new(size / MAX_SEGMENT_SIZE * 10),
+            unstable_cells: RAIIMutexTable::new()
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
@@ -264,6 +267,7 @@ impl Chunk {
         return res;
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
+        let unstable_guard = self.unstable_cells.lock(hash);
         if let Some(cell_location) = self.index.remove(&hash) {
             self.put_tombstone_by_cell_loc(cell_location)?;
             Ok(())

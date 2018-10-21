@@ -148,7 +148,7 @@ impl CombinedCleaner {
         }
         
         debug!("Updating cell reference");
-        pending_segments
+        let unstable_guards = pending_segments
             .iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();
@@ -180,8 +180,9 @@ impl CombinedCleaner {
                 seg_ref.archive();
                 return cells;
             })
-            .for_each(|(new, old, hash)| {
+            .map(|(new, old, hash)| {
                 debug!("Reset cell {} ptr from {} to {}", hash, old, new);
+                let unstable_guard = chunk.unstable_cells.lock(hash);
                 if let Some(mut actual_addr) = chunk.index.get_mut(&hash) {
                     if *actual_addr == old {
                         *actual_addr = new
@@ -191,7 +192,9 @@ impl CombinedCleaner {
                 } else {
                     warn!("cell {} address {} have been removed on combine", hash, old);
                 }
-            });
+                unstable_guard
+            })
+            .collect_vec();
 
         debug!("Removing old segments");
         for old_seg in segments {
