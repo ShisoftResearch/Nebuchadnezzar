@@ -36,7 +36,7 @@ mod external;
 
 const NUM_KEYS: usize = 32;
 const NUM_PTRS: usize = NUM_KEYS + 1;
-const CACHE_SIZE: usize = 2048;
+const CACHE_SIZE: usize = 4096;
 
 type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePointerSlice = [TxnValRef; NUM_PTRS];
