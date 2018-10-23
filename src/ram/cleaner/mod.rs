@@ -29,6 +29,8 @@ impl Cleaner {
             segments_compact_per_turn,
             segments_combine_per_turn
         };
+        let stop_tag_ref_clone = stop_tag.clone();
+        let checks_ref_clone = chunks.clone();
         thread::Builder::new()
             .name("Cleaner sweeper".into())
             .spawn(move || {
@@ -43,8 +45,8 @@ impl Cleaner {
         thread::Builder::new()
             .name("Cleaner main".into())
             .spawn(move || {
-                while !stop_tag.load(Ordering::Relaxed) {
-                    for chunk in &chunks.list {
+                while !stop_tag_ref_clone.load(Ordering::Relaxed) {
+                    for chunk in &checks_ref_clone.list {
                         trace!("Cleaning chunk {}", chunk.id);
                         {
                             // compact
@@ -75,6 +77,7 @@ impl Cleaner {
 
                         chunk.check_and_archive_segments();
                     }
+                    debug!("Cleaner round finished");
                     thread::sleep(Duration::from_millis(100));
                 }
                 warn!("Cleaner main thread stopped");

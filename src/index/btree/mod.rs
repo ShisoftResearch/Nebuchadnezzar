@@ -36,7 +36,7 @@ mod external;
 
 const NUM_KEYS: usize = 32;
 const NUM_PTRS: usize = NUM_KEYS + 1;
-const CACHE_SIZE: usize = 4096;
+const CACHE_SIZE: usize = 2048;
 
 type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePointerSlice = [TxnValRef; NUM_PTRS];
@@ -314,7 +314,7 @@ impl <'a> TreeTxn<'a> {
         let node = self.txn.read::<Node>(node)?.unwrap();
         let pos = node.search(key, &mut self.bz);
         if node.is_ext() {
-            debug!("search in external for {:?}, items {:?}", key, node.extnode(&self.bz).keys);
+            debug!("search in external for {:?}", key);
             Ok(RTCursor::new(pos, &node.ext_id(), &self.bz, ordering))
         } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.pointers[pos];
@@ -653,7 +653,6 @@ trait BTreeSlice<T> : Sized + Slice<T>
             for i in pivot .. len { // leave pivot to the right slice
                 let right_pos = i - pivot;
                 let item = mem::replace(&mut slice1[i], T::default());
-                debug!("Moving from left pos {} to right {}, item {:?} for split", i, right_pos, &item);
                 slice2[right_pos] = item;
             }
         }
@@ -666,7 +665,6 @@ trait BTreeSlice<T> : Sized + Slice<T>
         if *len > 0 {
             slice[*len] = T::default();
             for i in (pos ..= *len - 1).rev() {
-                debug!("swap {} with {} for insertion", i, i + 1);
                 slice.swap(i, i + 1);
             }
         }
