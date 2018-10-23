@@ -846,7 +846,7 @@ mod test {
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
-        let num = 70_000;
+        let num = 50_000;
         {
             info!("test insertion");
             for i in (0..num).rev() {

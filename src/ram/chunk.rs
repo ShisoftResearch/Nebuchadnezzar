@@ -435,7 +435,7 @@ impl Chunk {
         trace!("Scanning tombstones");
         let seg_ids = self.segment_ids();
         for seg_id in seg_ids {
-            if let Some(segment) = self.segs.get(&seg_id){
+            if let Some(segment) = self.segs.get(&seg_id) {
                 let now = get_time();
                 let tombstones = segment.tombstones.load(Ordering::Relaxed);
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);

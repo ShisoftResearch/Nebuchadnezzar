@@ -39,8 +39,8 @@ impl Cleaner {
                         chunk.apply_dead_entry();
                         chunk.scan_tombstone_survival();
                     }
+                    thread::sleep(Duration::from_millis(100));
                 }
-                thread::sleep(Duration::from_millis(100));
             });
         thread::Builder::new()
             .name("Cleaner main".into())
