@@ -77,7 +77,6 @@ impl ExtNode {
         let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys { array } else { panic!() };
         let mut key_slice = EntryKeySlice::init();
         let mut key_count = 0;
-        debug!("Reading from persisted cell from storage, keys {:?}", keys);
         for (i, key_val) in keys_array.iter().enumerate() {;
             key_slice[i] = EntryKey::from(key_val.as_slice());
             key_count += 1;
