@@ -118,12 +118,7 @@ impl Segment {
     pub fn living_space(&self) -> u32 {
         let total_dead_space = self.total_dead_space();
         let used_space = self.used_spaces();
-        if total_dead_space <= used_space {
-            used_space - total_dead_space
-        } else {
-            warn!("living space check error, used {}, dead {}", used_space, total_dead_space);
-            0
-        }
+        used_space - total_dead_space
     }
 
     pub fn valid_space(&self) -> u32 {

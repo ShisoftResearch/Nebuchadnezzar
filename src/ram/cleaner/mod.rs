@@ -63,9 +63,8 @@ impl Cleaner {
 
                         {
                             // combine
-                            let segments_for_combine: Vec<_> =
-                                chunk.segs_for_combine_cleaner()
-                                    .into_iter()
+                            let segments_candidates_for_combine: Vec<_> = chunk.segs_for_combine_cleaner();
+                            let segments_for_combine: Vec<_> = segments_candidates_for_combine.into_iter()
                                     .take(segments_combine_per_turn)
                                     .collect();
                             if !segments_for_combine.is_empty() {
