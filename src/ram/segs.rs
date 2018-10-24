@@ -117,7 +117,8 @@ impl Segment {
 
     pub fn living_space(&self) -> u32 {
         let total_dead_space = self.total_dead_space();
-        return self.used_spaces() - total_dead_space;
+        let used_space = self.used_spaces();
+        used_space - total_dead_space
     }
 
     pub fn valid_space(&self) -> u32 {
