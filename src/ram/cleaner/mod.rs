@@ -48,16 +48,18 @@ impl Cleaner {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
                     for chunk in &checks_ref_clone.list {
                         trace!("Cleaning chunk {}", chunk.id);
+                        let mut cleaned_space: usize = 0;
                         {
                             // compact
                             let segments_for_compact = chunk.segs_for_compact_cleaner();
                             if !segments_for_compact.is_empty() {
                                 debug!("Chunk {} have {} segments to compact, overflow {}",
                                        chunk.id, segments_for_compact.len(), segments_compact_per_turn);
-                                segments_for_compact.into_iter()
+                                cleaned_space += segments_for_compact.into_iter()
                                     .take(segments_compact_per_turn) // limit max segment to clean per turn
-                                    .for_each(|segment|
-                                        compact::CompactCleaner::clean_segment(chunk, &segment));
+                                    .map(|segment|
+                                        compact::CompactCleaner::clean_segment(chunk, &segment))
+                                    .sum::<usize>();
                             }
                         }
 
@@ -71,11 +73,12 @@ impl Cleaner {
                             if !segments_for_combine.is_empty() {
                                 debug!("Chunk {} have {} segments to combine, overflow {}",
                                        chunk.id, segments_for_combine.len(), segments_combine_per_turn);
-                                combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
+                                cleaned_space += combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
                             }
                         }
 
                         chunk.check_and_archive_segments();
+                        chunk.total_space.fetch_sub(cleaned_space, Ordering::Relaxed);
                     }
                     debug!("Cleaner round finished");
                     thread::sleep(Duration::from_millis(100));
