@@ -76,8 +76,8 @@ impl Cleaner {
                             }
                         }
 
-                        chunk.check_and_archive_segments();
                         chunk.total_space.fetch_sub(cleaned_space, Ordering::Relaxed);
+                        chunk.check_and_archive_segments();
                     }
                     debug!("Cleaner round finished");
                     thread::sleep(Duration::from_millis(100));
