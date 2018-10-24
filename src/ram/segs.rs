@@ -106,14 +106,9 @@ impl Segment {
 
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
-        let total_dead_space = self.total_dead_space();
-        let used_space = self.used_spaces();
-        if total_dead_space <= used_space {
-            used_space - total_dead_space
-        } else {
-            warn!("living space check error, used {}, dead {}", used_space, total_dead_space);
-            0
-        }
+        let dead_tombstones_space = self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        let dead_cells_space = self.dead_space();
+        return dead_tombstones_space + dead_cells_space;
     }
 
     pub fn used_spaces(&self) -> u32 {
@@ -123,7 +118,12 @@ impl Segment {
     pub fn living_space(&self) -> u32 {
         let total_dead_space = self.total_dead_space();
         let used_space = self.used_spaces();
-        used_space - total_dead_space
+        if total_dead_space <= used_space {
+            used_space - total_dead_space
+        } else {
+            warn!("living space check error, used {}, dead {}", used_space, total_dead_space);
+            0
+        }
     }
 
     pub fn valid_space(&self) -> u32 {
