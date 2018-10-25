@@ -707,6 +707,7 @@ mod test {
     use std::fs::File;
     use std::io::Write;
     use index::id_from_key;
+    use std::env;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -837,7 +838,7 @@ mod test {
         let server_addr = String::from("127.0.0.1:5101");
         let server = NebServer::new_from_opts(&ServerOptions {
             chunk_count: 1,
-            memory_size: 512 * 1024 * 1024,
+            memory_size: 1024 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None
         }, &server_addr, &server_group);
@@ -846,7 +847,9 @@ mod test {
             server_group).unwrap());
         client.new_schema_with_id(super::external::page_schema()).wait();
         let tree = BPlusTree::new(&client);
-        let num = 70_000;
+        let num = env::var("BTREE_TEST_ITEMS")
+            .unwrap_or("1000".to_string())
+            .parse::<u64>().unwrap();
         {
             info!("test insertion");
             for i in (0..num).rev() {

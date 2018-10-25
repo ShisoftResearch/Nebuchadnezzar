@@ -121,7 +121,8 @@ impl Segment {
         if total_dead_space <= used_space {
             used_space - total_dead_space
         } else {
-            warn!("living space check error, used {}, dead {}", used_space, total_dead_space);
+            warn!("living space check error for segment {}, used {}, dead {}",
+                  self.id, used_space, total_dead_space);
             0
         }
     }
