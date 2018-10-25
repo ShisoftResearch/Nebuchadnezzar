@@ -36,7 +36,6 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
         xtombstones: &mut TombstoneSet,
         ytombstones: &mut TombstoneSet
     ) -> Self {
-        let total_len = *xlen + *ylen;
         let mut x_pos = 0;
         let mut y_pos = 0;
         let mut pos = 0;
@@ -70,7 +69,9 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
                     use_slice_at(x_slice, &mut x_pos)
                 } else if y_pos < *ylen {
                     use_slice_at(y_slice, &mut y_pos)
-                } else { unreachable!() };
+                } else {
+                    break
+                };
 
                 if let Some(item) = item_or_removed {
                     if pos < x_slice_len {
