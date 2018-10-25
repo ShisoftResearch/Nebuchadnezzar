@@ -20,12 +20,12 @@ use itertools::Itertools;
 pub struct CompactCleaner;
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) {
+    pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) -> usize {
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
             debug!("Skip cleaning chunk {} segment {} for it have no dead spaces", chunk.id, dead_space);
-            return;
+            return 0;
         }
         
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
@@ -100,6 +100,8 @@ impl CompactCleaner {
         chunk.put_segment(new_seg);
         seg.mem_drop();
 
-        debug!("Clean finished for segment {} from chunk {}", seg.id, chunk.id);
+        let space_cleaned = seg.used_spaces() as usize - live_size;
+        debug!("Clean finished for segment {} from chunk {}, cleaned {}", seg.id, chunk.id, space_cleaned);
+        space_cleaned
     }
 }

@@ -133,8 +133,9 @@ pub fn full_clean_cycle() {
         // Compact all segments order by id
         chunk.segments()
             .into_iter()
-            .for_each(|seg|
-                compact::CompactCleaner::clean_segment(chunk, &seg));
+            .for_each(|seg| {
+                compact::CompactCleaner::clean_segment(chunk, &seg);
+            });
 
         let compacted_seg_positions = seg_positions(chunk);
         let compacted_cell_addresses = chunk.cell_addresses();

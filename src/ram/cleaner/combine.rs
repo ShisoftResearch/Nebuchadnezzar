@@ -39,13 +39,14 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) {
+    pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
         if segments.len() < 2 {
             debug!("too few segments to combine, chunk {}, segments {}", chunk.id, segments.len());
-            return
+            return 0;
         }
         debug!("Combining segments");
 
+        let space_to_collect = segments.iter().map(|seg| seg.used_spaces() as usize).sum::<usize>();
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
         debug!("get all entries in segments to combine and order them by data temperature and size");
@@ -89,13 +90,12 @@ impl CombinedCleaner {
             .into_iter()
             .map(|(_, group)| group);
 
-        let mut entries: Vec<_> = Iterator::flatten(nested_entries).collect();
-
-        // order by temperature and size from greater to lesser
-        entries.reverse();
-
-        // provide additional state for whether entry have been claimed on simulation
-        let mut entries: Vec<_> = entries.into_iter().map(|e| (e, false)).collect();
+        let mut entries: Vec<_> = Iterator::flatten(nested_entries)
+            // order by temperature and size from greater to lesser
+            .rev()
+            // provide additional state for whether entry have been claimed on simulation
+            .map(|e| (e, false))
+            .collect();
 
         debug!("simulate the combine process to determine the efficiency");
         let mut pending_segments = Vec::with_capacity(segments.len());
@@ -142,6 +142,7 @@ impl CombinedCleaner {
         debug!("Checking combine feasibility");
         let pending_segments_len = pending_segments.len();
         let segments_to_combine_len = segments.len();
+        let mut cleaned_total_live_space = 0;
         if pending_segments_len >= segments_to_combine_len  {
             warn!("Trying to combine segments but resulting segments still does not go down {}/{}",
                   pending_segments_len, segments_to_combine_len);
@@ -171,6 +172,7 @@ impl CombinedCleaner {
                     seg_cursor += entry.size;
                 }
                 new_seg.append_header.store(seg_cursor, Ordering::Relaxed);
+                cleaned_total_live_space += new_seg.used_spaces() as usize;
                 return (new_seg, cell_mapping);
             })
             .flat_map(|(segment, cells)| {
@@ -201,6 +203,10 @@ impl CombinedCleaner {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop();
         }
+        let space_cleaned = space_to_collect - cleaned_total_live_space;
+        debug!("Combined {} segments to {}, total {} bytes",
+               segments_to_combine_len, pending_segments.len(), space_cleaned);
+        space_cleaned
     }
 
 }
