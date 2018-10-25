@@ -58,7 +58,7 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
                     Some(item)
                 }
             };
-            while pos < total_len {
+            loop {
                 let item_or_removed = if x_pos < *xlen && y_pos < *ylen {
                     if x_slice[x_pos] < y_slice[y_pos] {
                         use_slice_at(x_slice, &mut x_pos)
