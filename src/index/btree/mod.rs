@@ -849,7 +849,7 @@ mod test {
         let tree = BPlusTree::new(&client);
         let num = env::var("BTREE_TEST_ITEMS")
             .unwrap_or("1000".to_string())
-            .parse::<usize>().unwrap();
+            .parse::<u64>().unwrap();
         {
             info!("test insertion");
             for i in (0..num).rev() {
