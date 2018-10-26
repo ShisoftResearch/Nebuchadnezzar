@@ -579,6 +579,8 @@ pub struct CHashMap<K, V> {
     ///
     /// This is used to calculate the load factor.
     len: AtomicUsize,
+    // This is used to calculate the removed factor.
+    rm: AtomicUsize,
 }
 
 impl<K, V> CHashMap<K, V> {
@@ -590,6 +592,7 @@ impl<K, V> CHashMap<K, V> {
         CHashMap {
             // Start at 0 KV pairs.
             len: AtomicUsize::new(0),
+            rm: AtomicUsize::new(0),
             // Make a new empty table. We will make sure that it is at least one.
             table: RwLock::new(Table::with_capacity(cap)),
         }
@@ -648,6 +651,7 @@ impl<K, V> CHashMap<K, V> {
             )),
             // Replace the length with 0 and use the old length.
             len: AtomicUsize::new(self.len.swap(0, ORDERING)),
+            rm: AtomicUsize::new(self.rm.swap(0, ORDERING)),
         }
     }
 
@@ -910,25 +914,35 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// This removes and returns the entry with key `key`. If no entry with said key exists, it
     /// will simply return `None`.
     pub fn remove(&self, key: &K) -> Option<V> {
-        // Acquire the read lock of the table.
-        let lock = self.table.read();
+        let (removed, len, buckets) = {
+            // Acquire the read lock of the table.
+            let lock = self.table.read();
 
-        // Lookup the table, mutably.
-        let mut bucket = lock.lookup_mut(&key);
-        // Remove the bucket.
-        match &mut *bucket {
-            // There was nothing to remove.
-            &mut Bucket::Removed | &mut Bucket::Empty => None,
-            // TODO: We know that this is a `Bucket::Contains` variant, but to bypass borrowck
-            //       madness, we do weird weird stuff.
-            bucket => {
-                // Decrement the length of the map.
-                self.len.fetch_sub(1, ORDERING);
+            // Lookup the table, mutably.
+            let mut bucket = lock.lookup_mut(&key);
+            // Remove the bucket.
+            match &mut *bucket {
+                // There was nothing to remove.
+                &mut Bucket::Removed | &mut Bucket::Empty => return None,
+                // TODO: We know that this is a `Bucket::Contains` variant, but to bypass borrowck
+                //       madness, we do weird weird stuff.
+                bucket => {
+                    // Decrement the length of the map.
+                    let len = self.len.fetch_sub(1, ORDERING);
 
-                // Set the bucket to "removed" and return its value.
-                mem::replace(bucket, Bucket::Removed).value()
+                    (
+                        // Set the bucket to "removed" and return its value.
+                        mem::replace(bucket, Bucket::Removed).value().unwrap(),
+                        len,
+                        lock.buckets.len()
+                    )
+                }
             }
+        };
+        if self.rm.fetch_add(1, ORDERING) + len >= buckets {
+            self.shrink_to_fit();
         }
+        Some(removed)
     }
 
     /// Reserve additional space.
@@ -996,6 +1010,7 @@ impl<K: Clone, V: Clone> Clone for CHashMap<K, V> {
         CHashMap {
             table: RwLock::new(self.table.read().clone()),
             len: AtomicUsize::new(self.len.load(ORDERING)),
+            rm: AtomicUsize::new(self.rm.load(ORDERING))
         }
     }
 }
@@ -1034,6 +1049,7 @@ impl<K: PartialEq + Hash, V> iter::FromIterator<(K, V)> for CHashMap<K, V> {
         CHashMap {
             table: RwLock::new(table),
             len: AtomicUsize::new(len),
+            rm: AtomicUsize::new(0)
         }
     }
 }
