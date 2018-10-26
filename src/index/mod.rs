@@ -6,7 +6,7 @@ use std::mem;
 
 pub mod placement;
 pub mod btree;
-pub mod lsmtree;
+pub mod sstable;
 
 const ID_SIZE: usize = 16;
 type EntryKey = SmallVec<[u8; 32]>;

@@ -3,6 +3,9 @@ use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
 use std::mem;
+use std::sync::Arc;
+use std::collections::BTreeSet;
+use parking_lot::RwLock;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -10,22 +13,29 @@ use std::mem;
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
 pub struct LevelTree<S>
-    where S: Slice<EntryKey> + SortableSlice<EntryKey>
+    where S: Slice<EntryKey> + SortableEntrySlice
 {
     index: BTreeMap<EntryKey, SSIndex<S>>
 }
 
-struct SSIndex<S>
-    where S: Slice<EntryKey> + SortableSlice<EntryKey>
+type TombstoneSet = BTreeSet<EntryKey>;
+
+struct SSIndex<S> where S: Slice<EntryKey> + SortableEntrySlice
 {
-    slice: S
+    slice: S,
+    tombstones: TombstoneSet
 }
 
-pub trait SortableSlice<T>: Sized + Slice<T>
-    where T: Default + Debug + Ord
+pub trait SortableEntrySlice: Sized + Slice<EntryKey>
 {
-    fn merge_sorted_with(&mut self,  y_slice: &mut [T], xlen: &mut usize, ylen: &mut usize) -> Self {
-        let total_len = *xlen + *ylen;
+    fn merge_sorted_with(
+        &mut self,
+        y_slice: &mut [EntryKey],
+        xlen: &mut usize,
+        ylen: &mut usize,
+        xtombstones: &mut TombstoneSet,
+        ytombstones: &mut TombstoneSet
+    ) -> Self {
         let mut x_pos = 0;
         let mut y_pos = 0;
         let mut pos = 0;
@@ -39,13 +49,17 @@ pub trait SortableSlice<T>: Sized + Slice<T>
             let mut new_slice_y = new_y.as_slice();
             let mut new_x_len = 0;
             let mut new_y_len = 0;
-            let mut use_slice_at = | slice: &mut[T], pos: &mut usize| {
-                let item = mem::replace(&mut slice[*pos], T::default());
-                *pos += 1;
-                item
+            let mut use_slice_at = | slice: &mut[EntryKey], slice_pos: &mut usize| {
+                let item = mem::replace(&mut slice[*slice_pos], EntryKey::default());
+                *slice_pos += 1;
+                if xtombstones.remove(&item) || ytombstones.remove(&item) {
+                    None
+                } else {
+                    Some(item)
+                }
             };
-            while pos < total_len {
-                let item = if x_pos < *xlen && y_pos < *ylen {
+            loop {
+                let item_or_removed = if x_pos < *xlen && y_pos < *ylen {
                     if x_slice[x_pos] < y_slice[y_pos] {
                         use_slice_at(x_slice, &mut x_pos)
                     } else {
@@ -55,14 +69,19 @@ pub trait SortableSlice<T>: Sized + Slice<T>
                     use_slice_at(x_slice, &mut x_pos)
                 } else if y_pos < *ylen {
                     use_slice_at(y_slice, &mut y_pos)
-                } else { unreachable!() };
-
-                if pos < x_slice_len {
-                    new_slice_x[pos] = item;
-                    new_x_len += 1;
                 } else {
-                    new_slice_y[pos - x_slice_len] = item;
-                    new_y_len += 1;
+                    break
+                };
+
+                if let Some(item) = item_or_removed {
+                    if pos < x_slice_len {
+                        new_slice_x[pos] = item;
+                        new_x_len += 1;
+                    } else {
+                        new_slice_y[pos - x_slice_len] = item;
+                        new_y_len += 1;
+                    }
+                    pos += 1;
                 }
             }
             *xlen = new_x_len;
