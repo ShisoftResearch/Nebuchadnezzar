@@ -939,7 +939,8 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                 }
             }
         };
-        if self.rm.fetch_add(1, ORDERING) + len >= buckets {
+        let rm_count = self.rm.fetch_add(1, ORDERING);
+        if rm_count + len >= buckets || rm_count >= len / 2 {
             self.shrink_to_fit();
         }
         Some(removed)

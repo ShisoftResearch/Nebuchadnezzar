@@ -6,24 +6,38 @@ use std::mem;
 use std::sync::Arc;
 use std::collections::BTreeSet;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
 // Deletion will be performed when merging to or from higher level tree
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
-pub struct LevelTree<S>
-    where S: Slice<EntryKey> + SortableEntrySlice
-{
-    index: BTreeMap<EntryKey, SSIndex<S>>
-}
 
 type TombstoneSet = BTreeSet<EntryKey>;
 
+pub struct LevelTree<S>
+    where S: Slice<EntryKey> + SortableEntrySlice
+{
+    index: BTreeMap<EntryKey, SSIndex<S>>,
+    tombstones: RefCell<TombstoneSet>
+}
 struct SSIndex<S> where S: Slice<EntryKey> + SortableEntrySlice
 {
-    slice: S,
-    tombstones: TombstoneSet
+    slice: S
+}
+
+impl <S> LevelTree<S>
+    where S: Slice<EntryKey> + SortableEntrySlice
+{
+    pub fn new() -> Self {
+        Self {
+            index: BTreeMap::new(),
+            tombstones: RefCell::new(TombstoneSet::new())
+        }
+    }
+
+
 }
 
 pub trait SortableEntrySlice: Sized + Slice<EntryKey>
