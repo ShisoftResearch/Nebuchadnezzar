@@ -40,11 +40,11 @@
 //! named items in libstd, matches in semantics and behavior.
 
 use owning_ref::{OwningHandle, OwningRef};
-use parking_lot::{RwLock, RwLockWriteGuard, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::hash_map;
-use std::hash::{Hash, Hasher, BuildHasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{self, AtomicUsize};
-use std::{mem, ops, cmp, fmt, iter};
+use std::{cmp, fmt, iter, mem, ops};
 
 /// The atomic ordering used throughout the code.
 const ORDERING: atomic::Ordering = atomic::Ordering::Relaxed;
@@ -92,12 +92,20 @@ enum Bucket<K, V> {
 impl<K, V> Bucket<K, V> {
     /// Is this bucket 'empty'?
     fn is_empty(&self) -> bool {
-        if let Bucket::Empty = *self { true } else { false }
+        if let Bucket::Empty = *self {
+            true
+        } else {
+            false
+        }
     }
 
     /// Is this bucket 'removed'?
     fn is_removed(&self) -> bool {
-        if let Bucket::Removed = *self { true } else { false }
+        if let Bucket::Removed = *self {
+            true
+        } else {
+            false
+        }
     }
 
     /// Is this bucket free?
@@ -120,7 +128,9 @@ impl<K, V> Bucket<K, V> {
     fn value(self) -> Option<V> {
         if let Bucket::Contains(_, val) = self {
             Some(val)
-        } else { None }
+        } else {
+            None
+        }
     }
 
     /// Get a reference to the value of the bucket (if any).
@@ -143,7 +153,9 @@ impl<K, V> Bucket<K, V> {
     ///
     /// This returns `true` if the bucket is a KV pair with key `key`. If not, `false` is returned.
     fn key_matches(&self, key: &K) -> bool
-        where K: PartialEq {
+    where
+        K: PartialEq,
+    {
         if let Bucket::Contains(ref candidate_key, _) = *self {
             // Check if the keys matches.
             candidate_key == key
@@ -220,7 +232,9 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
     ///
     /// The read guard from the RW-lock of the bucket is returned.
     fn scan<F>(&self, key: &K, matches: F) -> RwLockReadGuard<Bucket<K, V>>
-        where F: Fn(&Bucket<K, V>) -> bool {
+    where
+        F: Fn(&Bucket<K, V>) -> bool,
+    {
         // Hash the key.
         let hash = self.hash(key);
 
@@ -244,7 +258,9 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
     /// This is similar to `scan`, but instead of an immutable lock guard, a mutable lock guard is
     /// returned.
     fn scan_mut<F>(&self, key: &K, matches: F) -> RwLockWriteGuard<Bucket<K, V>>
-        where F: Fn(&Bucket<K, V>) -> bool {
+    where
+        F: Fn(&Bucket<K, V>) -> bool,
+    {
         // Hash the key.
         let hash = self.hash(key);
 
@@ -268,7 +284,9 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
     /// This is similar to `scan_mut`, but it safely bypasses the locks by making use of the
     /// aliasing invariants of `&mut`.
     fn scan_mut_no_lock<F>(&mut self, key: &K, matches: F) -> &mut Bucket<K, V>
-        where F: Fn(&Bucket<K, V>) -> bool {
+    where
+        F: Fn(&Bucket<K, V>) -> bool,
+    {
         // Hash the key.
         let hash = self.hash(key);
         // TODO: To tame the borrowchecker, we fetch this in advance.
@@ -411,7 +429,11 @@ impl<K: Clone, V: Clone> Clone for Table<K, V> {
             // hash function.
             hash_builder: self.hash_builder.clone(),
             // Lock and clone every bucket individually.
-            buckets: self.buckets.iter().map(|x| RwLock::new(x.read().clone())).collect(),
+            buckets: self
+                .buckets
+                .iter()
+                .map(|x| RwLock::new(x.read().clone()))
+                .collect(),
         }
     }
 }
@@ -464,9 +486,7 @@ impl<K, V> IntoIterator for Table<K, V> {
     type IntoIter = IntoIter<K, V>;
 
     fn into_iter(self) -> IntoIter<K, V> {
-        IntoIter {
-            table: self,
-        }
+        IntoIter { table: self }
     }
 }
 
@@ -476,7 +496,10 @@ impl<K, V> IntoIterator for Table<K, V> {
 /// on drop.
 pub struct ReadGuard<'a, K: 'a, V: 'a> {
     /// The inner hecking long type.
-    inner: OwningRef<OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>, V>,
+    inner: OwningRef<
+        OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockReadGuard<'a, Bucket<K, V>>>,
+        V,
+    >,
 }
 
 impl<'a, K, V> ops::Deref for ReadGuard<'a, K, V> {
@@ -506,7 +529,10 @@ impl<'a, K: fmt::Debug, V: fmt::Debug> fmt::Debug for ReadGuard<'a, K, V> {
 /// on drop.
 pub struct WriteGuard<'a, K: 'a, V: 'a> {
     /// The inner hecking long type.
-    inner: OwningHandle<OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockWriteGuard<'a, Bucket<K, V>>>, &'a mut V>,
+    inner: OwningHandle<
+        OwningHandle<RwLockReadGuard<'a, Table<K, V>>, RwLockWriteGuard<'a, Bucket<K, V>>>,
+        &'a mut V,
+    >,
 }
 
 impl<'a, K, V> ops::Deref for WriteGuard<'a, K, V> {
@@ -616,7 +642,10 @@ impl<K, V> CHashMap<K, V> {
         let mut lock = self.table.write();
         CHashMap {
             // Replace the old table with an empty initial table.
-            table: RwLock::new(mem::replace(&mut *lock, Table::new(DEFAULT_INITIAL_CAPACITY))),
+            table: RwLock::new(mem::replace(
+                &mut *lock,
+                Table::new(DEFAULT_INITIAL_CAPACITY),
+            )),
             // Replace the length with 0 and use the old length.
             len: AtomicUsize::new(self.len.swap(0, ORDERING)),
         }
@@ -625,7 +654,9 @@ impl<K, V> CHashMap<K, V> {
     /// Deprecated. Do not use.
     #[deprecated]
     pub fn filter<F>(&self, predicate: F)
-        where F: Fn(&K, &V) -> bool {
+    where
+        F: Fn(&K, &V) -> bool,
+    {
         // Following the naming conventions of the standard library...
         self.retain(predicate)
     }
@@ -639,7 +670,9 @@ impl<K, V> CHashMap<K, V> {
     /// must lock on every table entry. However, it won't block other operations of the table,
     /// while filtering.
     pub fn retain<F>(&self, predicate: F)
-        where F: Fn(&K, &V) -> bool {
+    where
+        F: Fn(&K, &V) -> bool,
+    {
         // Acquire the read lock to the table.
         let table = self.table.read();
         // Run over every bucket and apply the filter.
@@ -673,13 +706,13 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// is held.
     pub fn get(&self, key: &K) -> Option<ReadGuard<K, V>> {
         // Acquire the read lock and lookup in the table.
-        if let Ok(inner) = OwningRef::new(
-            OwningHandle::new_with_fn(self.table.read(), |x| unsafe { &*x }.lookup(key))
-        ).try_map(|x| x.value_ref()) {
+        if let Ok(inner) = OwningRef::new(OwningHandle::new_with_fn(self.table.read(), |x| {
+            unsafe { &*x }.lookup(key)
+        }))
+        .try_map(|x| x.value_ref())
+        {
             // The bucket contains data.
-            Some(ReadGuard {
-                inner: inner,
-            })
+            Some(ReadGuard { inner })
         } else {
             // The bucket is empty/removed.
             None
@@ -693,25 +726,24 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// is held.
     pub fn get_mut(&self, key: &K) -> Option<WriteGuard<K, V>> {
         // Acquire the write lock and lookup in the table.
-        if let Ok(inner) = OwningHandle::try_new(OwningHandle::new_with_fn(
-            self.table.read(),
-            |x| unsafe { &*x }.lookup_mut(key)),
-                                                 |x| {
-                                                     if let &mut Bucket::Contains(_, ref mut val) = unsafe {
-                                                         &mut *(x as *mut Bucket<K, V>)
-                                                     } {
-                                                         // The bucket contains data.
-                                                         Ok(val)
-                                                     } else {
-                                                         // The bucket is empty/removed.
-                                                         Err(())
-                                                     }
-                                                 }
+        if let Ok(inner) = OwningHandle::try_new(
+            OwningHandle::new_with_fn(self.table.read(), |x| unsafe { &*x }.lookup_mut(key)),
+            |x| {
+                if let &mut Bucket::Contains(_, ref mut val) =
+                    unsafe { &mut *(x as *mut Bucket<K, V>) }
+                {
+                    // The bucket contains data.
+                    Ok(val)
+                } else {
+                    // The bucket is empty/removed.
+                    Err(())
+                }
+            },
         ) {
-            Some(WriteGuard {
-                inner: inner,
-            })
-        } else { None }
+            Some(WriteGuard { inner: inner })
+        } else {
+            None
+        }
     }
 
     /// Does the hash map contain this key?
@@ -749,8 +781,11 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     ///
     /// This might perform checks in debug mode testing if the key exists already.
     pub fn insert_new(&self, key: K, val: V) {
-        debug_assert!(!self.contains_key(&key), "Hash table contains already key, contrary to \
-                      the assumptions about `insert_new`'s arguments.");
+        debug_assert!(
+            !self.contains_key(&key),
+            "Hash table contains already key, contrary to \
+             the assumptions about `insert_new`'s arguments."
+        );
 
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
         let lock = self.table.read();
@@ -794,9 +829,9 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// This looks up `key`. If it exists, the reference to its value is passed through closure
     /// `update`.  If it doesn't exist, the result of closure `insert` is inserted.
     pub fn upsert<F, G>(&self, key: K, insert: F, update: G)
-        where
-            F: FnOnce() -> V,
-            G: FnOnce(&mut V),
+    where
+        F: FnOnce() -> V,
+        G: FnOnce(&mut V),
     {
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
         let lock = self.table.read();
@@ -812,7 +847,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                     // TODO: We return to stop the borrowck to yell at us. This prevents the control flow
                     //       from reaching the expansion after the match if it has been right here.
                     return;
-                },
+                }
                 // The bucket was empty, simply insert.
                 ref mut x => *x = Bucket::Contains(key, insert()),
             }
@@ -830,7 +865,9 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     ///
     /// Note that if `f` returns `None`, the entry of key `key` is removed unconditionally.
     pub fn alter<F>(&self, key: K, f: F)
-        where F: FnOnce(Option<V>) -> Option<V> {
+    where
+        F: FnOnce(Option<V>) -> Option<V>,
+    {
         // Expand and lock the table. We need to expand to ensure the bounds on the load factor.
         let lock = self.table.read();
         {
@@ -838,23 +875,29 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
             let mut bucket = lock.lookup_or_free(&key);
 
             match mem::replace(&mut *bucket, Bucket::Removed) {
-                Bucket::Contains(_, val) => if let Some(new_val) = f(Some(val)) {
-                    // Set the bucket to a KV pair with the new value.
-                    *bucket = Bucket::Contains(key, new_val);
-                    // No extension required, as the bucket already had a KV pair previously.
-                    return;
-                } else {
-                    // The old entry was removed, so we decrement the length of the map.
-                    self.len.fetch_sub(1, ORDERING);
-                    // TODO: We return as a hack to avoid the borrowchecker from thinking we moved a
-                    //       referenced object. Namely, under this match arm the expansion after the match
-                    //       statement won't ever be reached.
-                    return;
-                },
-                _ => if let Some(new_val) = f(None) {
-                    // The previously free cluster will get a KV pair with the new value.
-                    *bucket = Bucket::Contains(key, new_val);
-                } else { return; },
+                Bucket::Contains(_, val) => {
+                    if let Some(new_val) = f(Some(val)) {
+                        // Set the bucket to a KV pair with the new value.
+                        *bucket = Bucket::Contains(key, new_val);
+                        // No extension required, as the bucket already had a KV pair previously.
+                        return;
+                    } else {
+                        // The old entry was removed, so we decrement the length of the map.
+                        self.len.fetch_sub(1, ORDERING);
+                        // TODO: We return as a hack to avoid the borrowchecker from thinking we moved a
+                        //       referenced object. Namely, under this match arm the expansion after the match
+                        //       statement won't ever be reached.
+                        return;
+                    }
+                }
+                _ => {
+                    if let Some(new_val) = f(None) {
+                        // The previously free cluster will get a KV pair with the new value.
+                        *bucket = Bucket::Contains(key, new_val);
+                    } else {
+                        return;
+                    }
+                }
             }
         }
 
@@ -884,7 +927,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
 
                 // Set the bucket to "removed" and return its value.
                 mem::replace(bucket, Bucket::Removed).value()
-            },
+            }
         }
     }
 
@@ -996,20 +1039,20 @@ impl<K: PartialEq + Hash, V> iter::FromIterator<(K, V)> for CHashMap<K, V> {
 }
 
 mod test {
-// Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
-// file at the top-level directory of this distribution and at
-// http://rust-lang.org/COPYRIGHT.
-//
-// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
-// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
-// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
-// option. This file may not be copied, modified, or distributed
-// except according to those terms.
+    // Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
+    // file at the top-level directory of this distribution and at
+    // http://rust-lang.org/COPYRIGHT.
+    //
+    // Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+    // http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+    // <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+    // option. This file may not be copied, modified, or distributed
+    // except according to those terms.
 
-    use std::thread;
+    use super::CHashMap;
     use std::cell::RefCell;
     use std::sync::Arc;
-    use super::CHashMap;
+    use std::thread;
 
     #[test]
     fn spam_insert() {
@@ -1317,7 +1360,7 @@ mod test {
 
     #[derive(Hash, PartialEq, Eq)]
     struct Dropable {
-        k: usize
+        k: usize,
     }
 
     impl Dropable {
@@ -1361,7 +1404,7 @@ mod test {
 
             for i in 0..100 {
                 let d1 = Dropable::new(i);
-                let d2 = Dropable::new(i+100);
+                let d2 = Dropable::new(i + 100);
                 m.insert(d1, d2);
             }
 
@@ -1379,19 +1422,19 @@ mod test {
 
                 DROP_VECTOR.with(|v| {
                     assert_eq!(v.borrow()[i], 1);
-                    assert_eq!(v.borrow()[i+100], 1);
+                    assert_eq!(v.borrow()[i + 100], 1);
                 });
             }
 
             DROP_VECTOR.with(|v| {
                 for i in 0..50 {
                     assert_eq!(v.borrow()[i], 0);
-                    assert_eq!(v.borrow()[i+100], 0);
+                    assert_eq!(v.borrow()[i + 100], 0);
                 }
 
                 for i in 50..100 {
                     assert_eq!(v.borrow()[i], 1);
-                    assert_eq!(v.borrow()[i+100], 1);
+                    assert_eq!(v.borrow()[i + 100], 1);
                 }
             });
         }
@@ -1420,7 +1463,7 @@ mod test {
 
             for i in 0..100 {
                 let d1 = Dropable::new(i);
-                let d2 = Dropable::new(i+100);
+                let d2 = Dropable::new(i + 100);
                 hm.insert(d1, d2);
             }
 
@@ -1448,13 +1491,9 @@ mod test {
             for _ in half.by_ref() {}
 
             DROP_VECTOR.with(|v| {
-                let nk = (0..100).filter(|&i| {
-                    v.borrow()[i] == 1
-                }).count();
+                let nk = (0..100).filter(|&i| v.borrow()[i] == 1).count();
 
-                let nv = (0..100).filter(|&i| {
-                    v.borrow()[i+100] == 1
-                }).count();
+                let nv = (0..100).filter(|&i| v.borrow()[i + 100] == 1).count();
 
                 assert_eq!(nk, 50);
                 assert_eq!(nv, 50);
@@ -1485,12 +1524,12 @@ mod test {
             for i in 1..1001 {
                 assert!(m.insert(i, i).is_none());
 
-                for j in 1..i+1 {
+                for j in 1..i + 1 {
                     let r = m.get(&j);
                     assert_eq!(*r.unwrap(), j);
                 }
 
-                for j in i+1..1001 {
+                for j in i + 1..1001 {
                     let r = m.get(&j);
                     assert_eq!(r, None);
                 }
@@ -1504,11 +1543,11 @@ mod test {
             for i in 1..1001 {
                 assert!(m.remove(&i).is_some());
 
-                for j in 1..i+1 {
+                for j in 1..i + 1 {
                     assert!(!m.contains_key(&j));
                 }
 
-                for j in i+1..1001 {
+                for j in i + 1..1001 {
                     assert!(m.contains_key(&j));
                 }
             }
@@ -1544,7 +1583,8 @@ mod test {
         assert!(m.insert(5, 14).is_none());
         let new = 100;
         match m.get_mut(&5) {
-            None => panic!(), Some(mut x) => *x = new
+            None => panic!(),
+            Some(mut x) => *x = new,
         }
         assert_eq!(*m.get(&5).unwrap(), new);
     }
@@ -1615,7 +1655,7 @@ mod test {
         let lock = m.get(&1);
         match lock {
             None => panic!(),
-            Some(v) => assert_eq!(*v, 2)
+            Some(v) => assert_eq!(*v, 2),
         }
     }
 
