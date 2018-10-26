@@ -979,6 +979,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         let table = mem::replace(&mut *lock, Table::with_capacity(self.len()));
         // Fill the new table with the data from the old table.
         lock.fill(table);
+        self.rm.store(0, ORDERING);
     }
 
     /// Increment the size of the hash map and expand it so one more entry can fit in.
