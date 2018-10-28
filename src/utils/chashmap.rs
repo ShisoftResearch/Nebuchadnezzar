@@ -250,6 +250,7 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
                 return lock;
             }
         }
+        self.dump_on_scan_failure();
         panic!("`CHashMap` scan failed! No entry found.");
     }
 
@@ -276,6 +277,7 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
                 return lock;
             }
         }
+        self.dump_on_scan_failure();
         panic!("`CHashMap` scan_mut failed! No entry found.");
     }
 
@@ -309,6 +311,7 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
                 return self.buckets[idx].get_mut();
             }
         }
+        self.dump_on_scan_failure();
         panic!("`CHashMap` scan_mut_no_lock failed! No entry found.");
     }
 
@@ -419,6 +422,19 @@ impl<K: PartialEq + Hash, V> Table<K, V> {
                 *bucket = Bucket::Contains(key, val);
             }
         }
+    }
+    fn dump_on_scan_failure(&self) {
+        println!("Dumping buckets");
+        for bucket in &self.buckets {
+            let lock = bucket.read();
+            match *lock {
+                Bucket::Contains(_, _) => print!("Contains, "),
+                Bucket::Removed => print!("Removed, "),
+                Bucket::Empty => print!("Empty, "),
+            }
+        }
+        println!();
+        println!("Dump ended")
     }
 }
 

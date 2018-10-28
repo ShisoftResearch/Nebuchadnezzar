@@ -37,7 +37,13 @@ impl <S> LevelTree<S>
         }
     }
 
+    pub fn merge(&self, slices: &[&[EntryKey]]) {
+        let starting_key = &slices[0][0];
+        // let local_pages = self.index.range(starting_key..);
+        
+        // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());
 
+    }
 }
 
 pub trait SortableEntrySlice: Sized + Slice<EntryKey>
