@@ -85,4 +85,16 @@ pub fn smoke_test () {
             client.remove_cell(id).wait();
         }
     }
+
+    for i in 0..num {
+        let id = Id::new(0, num);
+        let mut value = Value::Map(Map::new());
+        value[DATA] = Value::U64(num * 2);
+        let cell = Cell::new_with_id(schema_id, &id, value);
+        client.upsert_cell(cell).wait();
+
+        // verify
+        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
+        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), num * 2);
+    }
 }
