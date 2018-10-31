@@ -71,7 +71,7 @@ pub fn smoke_test () {
 
     for i in 0..num * 2 {
         // intense upsert, half delete
-        let id = Id::new(0, num);
+        let id = Id::new(0, num / 2);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(num);
         let cell = Cell::new_with_id(schema_id, &id, value);
