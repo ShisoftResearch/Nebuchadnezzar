@@ -112,7 +112,9 @@ impl Segment {
     }
 
     pub fn used_spaces(&self) -> u32 {
-        return (self.append_header.load(Ordering::Relaxed) as usize - self.addr) as u32
+        let space = (self.append_header.load(Ordering::Relaxed) as usize - self.addr);
+        debug_assert!(space <= MAX_SEGMENT_SIZE);
+        return space as u32
     }
 
     pub fn living_space(&self) -> u32 {

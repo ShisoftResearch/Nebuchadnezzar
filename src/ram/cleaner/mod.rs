@@ -37,7 +37,6 @@ impl Cleaner {
                 while !stop_tag.load(Ordering::Relaxed) {
                     for chunk in &chunks.list {
                         chunk.apply_dead_entry();
-                        chunk.scan_tombstone_survival();
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
@@ -47,6 +46,8 @@ impl Cleaner {
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
                     for chunk in &checks_ref_clone.list {
+                        // have to put it right here for cleaners will clear the tombstone death counter
+                        chunk.scan_tombstone_survival();
                         trace!("Cleaning chunk {}", chunk.id);
                         let mut cleaned_space: usize = 0;
                         {

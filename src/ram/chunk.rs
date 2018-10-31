@@ -458,7 +458,8 @@ impl Chunk {
                         }
                     }
                 }
-                segment.dead_tombstones.fetch_add(death_count, Ordering::Relaxed);
+                // store the death count for following cleaners will just reset it
+                segment.dead_tombstones.store(death_count, Ordering::Relaxed);
                 segment.last_tombstones_scanned.store(now, Ordering::Relaxed);
                 debug!("Scanned tombstones in chunk {}, segment {}, death count {}", self.id, seg_id, death_count);
             } else {
