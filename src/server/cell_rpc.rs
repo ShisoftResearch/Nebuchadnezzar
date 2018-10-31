@@ -3,7 +3,7 @@ use ram::types::Id;
 use server::NebServer;
 use bifrost::rpc::*;
 
-use futures_cpupool::{CpuPool};
+use futures::prelude::*;
 use num_cpus;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
@@ -21,8 +21,7 @@ pub struct NebRPCService {
 }
 
 pub struct NebRPCServiceInner {
-    server: Arc<NebServer>,
-    pool: CpuPool
+    server: Arc<NebServer>
 }
 
 impl Service for NebRPCService {
@@ -47,42 +46,27 @@ impl NebRPCServiceInner {
     fn read_cell(this: Arc<Self>, key: Id)
         -> Box<Future<Item = Cell, Error = ReadError>>
     {
-        box this.clone().pool.spawn_fn(move || this.server.chunks.read_cell(&key))
+        box future::result(this.server.chunks.read_cell(&key))
     }
     fn write_cell(this: Arc<Self>, mut cell: Cell)
         -> Box<Future<Item =CellHeader, Error = WriteError>>
     {
-        box this.clone().pool.spawn_fn(move ||
-            match this.server.chunks.write_cell(&mut cell) {
-                Ok(header) => Ok(header),
-                Err(e) => Err(e)
-            }
-        )
+        box future::result(this.server.chunks.write_cell(&mut cell))
     }
     fn update_cell(this: Arc<Self>, mut cell: Cell)
         -> Box<Future<Item =CellHeader, Error = WriteError>>
     {
-        box this.clone().pool.spawn_fn(move ||
-            match this.server.chunks.update_cell(&mut cell) {
-                Ok(header) => Ok(header),
-                Err(e) => Err(e)
-            }
-        )
+        box future::result(this.server.chunks.update_cell(&mut cell))
     }
     fn remove_cell(this: Arc<Self>, key: Id)
         -> Box<Future<Item = (), Error = WriteError>>
     {
-        box this.clone().pool.spawn_fn(move ||this.server.chunks.remove_cell(&key))
+        box future::result(this.server.chunks.remove_cell(&key))
     }
     fn upsert_cell(this: Arc<Self>, mut cell: Cell)
         -> Box<Future<Item =CellHeader, Error = WriteError>>
     {
-        box this.clone().pool.spawn_fn(move ||
-            match this.server.chunks.upsert_cell(&mut cell) {
-                Ok(header) => Ok(header),
-                Err(e) => Err(e)
-            }
-        )
+        box future::result(this.server.chunks.upsert_cell(&mut cell))
     }
 }
 
@@ -92,8 +76,7 @@ impl NebRPCService {
     pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
             inner: Arc::new(NebRPCServiceInner {
-                server: server.clone(),
-                pool: CpuPool::new(4 * num_cpus::get())
+                server: server.clone()
             })
         })
     }
