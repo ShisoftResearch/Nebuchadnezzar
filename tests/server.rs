@@ -36,7 +36,7 @@ pub fn init () {
 pub fn smoke_test () {
     const DATA: &'static str = "DATA";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
-        .unwrap_or("10000".to_string())
+        .unwrap_or("1000".to_string())
         .parse::<u64>().unwrap();
     env_logger::init();
     let server_addr = String::from("127.0.0.1:5300");
@@ -69,27 +69,15 @@ pub fn smoke_test () {
         &server_group).unwrap());
     client.new_schema_with_id(schema).wait();
 
-    for _ in 0..num {
-        // write
+    for i in 0..num * 2 {
+        // intense upsert, half delete
         let id = Id::new(0, num);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(num);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client.write_cell(cell).wait();
-
-        // verify
-        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), num);
-    }
-
-    for _ in 0..num * 2 {
-        // intense upsert, random delete
-        for _ in 0..num {
-            let id = Id::new(0, num);
-            let mut value = Value::Map(Map::new());
-            value[DATA] = Value::U64(num);
-            let cell = Cell::new_with_id(schema_id, &id, value);
-            client.upsert_cell(cell).wait();
+        client.upsert_cell(cell).wait();
+        if i % 2 == 0 {
+            client.remove_cell(id).wait();
         }
     }
 }

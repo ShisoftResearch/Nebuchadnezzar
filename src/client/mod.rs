@@ -56,20 +56,24 @@ impl AsyncClientInner {
             Err(err) => Err(NebClientError::RaftClientError(err))
         }
     }
-    pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
-        match self.conshash.get_server(id.higher) {
+    pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
+        match self.conshash.get_server_id(id.higher) {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(io::ErrorKind::NotFound, format!("cannot locate server for id {:?}", id))))
         }
     }
-    #[async]
-    pub fn locate_plain_server(this: Arc<Self>, id: Id) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        let address = this.locate_server_address(&id)?;
-        let client = match await!(DEFAULT_CLIENT_POOL.get_async(&address)) {
-            Ok(c) => c,
-            Err(e) => return Err(RPCError::IOError(e))
-        };
-        Ok(plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &client))
+
+    pub fn locate_plain_server(this: Arc<Self>, id: Id)
+        -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError>
+    {
+        let id = this.locate_server_id(&id).unwrap();
+        DEFAULT_CLIENT_POOL
+            .get_by_id_async(
+            id, move |sid| this.conshash.to_server_name(sid))
+            .map_err(|e| RPCError::IOError(e))
+            .map(|c|
+                plain_server::AsyncServiceClient::new(
+                    plain_server::DEFAULT_SERVICE_ID, &c))
     }
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
@@ -201,8 +205,8 @@ impl AsyncClient {
             })
     }
 
-    pub fn locate_server_address(&self, id: &Id) -> Result<String, RPCError> {
-        self.inner.locate_server_address(id)
+    pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
+        self.inner.locate_server_id(id)
     }
 
     pub fn locate_plain_server(&self, id: Id)
