@@ -451,7 +451,7 @@ impl Chunk {
                 debug!("Scanning tombstones in chunk {}, segment {}", self.id, seg_id);
                 for entry_meta in segment.entry_iter() {
                     if entry_meta.entry_header.entry_type == EntryType::Tombstone {
-                        let tombstone = Tombstone::read(entry_meta.body_pos);
+                        let tombstone = Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
                             death_count += 1;
