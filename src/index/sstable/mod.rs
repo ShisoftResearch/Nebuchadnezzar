@@ -38,8 +38,10 @@ impl <S> LevelTree<S>
     }
 
     pub fn merge(&self, slices: &[&[EntryKey]]) {
-        let starting_key = &slices[0][0];
-        // let local_pages = self.index.range(starting_key..);
+        // let incomming = slices.iter().flatten().cloned().collect::<Vec<_>>();
+        // let local_pages = self.index.range(incomming.first()..=incomming.last());
+        // debug_assert!(incomming.count() <= local_pages.f)
+        //
         
         // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());
 
