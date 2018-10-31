@@ -21,6 +21,7 @@ impl RingBuffer {
         for _ in 0..size {
             buffer.push(AtomicUsize::new(0));
         }
+        assert!(size > 0);
         RingBuffer {
             size,
             buffer,

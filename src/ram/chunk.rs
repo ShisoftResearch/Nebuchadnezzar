@@ -65,7 +65,7 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
-            dead_entries: RingBuffer::new(size / MAX_SEGMENT_SIZE * 10),
+            dead_entries: RingBuffer::new((size / MAX_SEGMENT_SIZE + 1) * 10),
             unstable_cells: RAIIMutexTable::new()
         };
         chunk.put_segment(bootstrap_segment_ref);
