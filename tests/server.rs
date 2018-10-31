@@ -19,6 +19,12 @@ use neb::ram::types::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use neb::ram::cell::Cell;
+use rayon::prelude::*;
+use rayon::iter::IntoParallelRefIterator;
+use std::thread;
+use itertools::Itertools;
+use std::time::Duration;
+use parking_lot::deadlock;
 
 #[test]
 pub fn init () {
@@ -69,32 +75,60 @@ pub fn smoke_test () {
         &server_group).unwrap());
     client.new_schema_with_id(schema).wait();
 
-    for i in 0..num * 2 {
-        // intense upsert, half delete
-        let id = Id::new(0, num / 2);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(num);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).wait();
+    // Create a background thread which checks for deadlocks every 10s
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(1));
+            let deadlocks = deadlock::check_deadlock();
+            if deadlocks.is_empty() {
+                continue;
+            }
 
-        // verify
-        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), num);
-
-        if i % 2 == 0 {
-            client.remove_cell(id).wait();
+            error!("{} deadlocks detected", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                error!("Deadlock #{}", i);
+                for t in threads {
+                    error!("Thread Id {:#?}", t.thread_id());
+                    error!("{:#?}", t.backtrace());
+                }
+            }
+            panic!();
         }
-    }
+    });
 
-    for i in 0..num {
-        let id = Id::new(0, num);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(num * 2);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).wait();
+    (0..num)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|i| {
+            let client_clone = client.clone();
+            // intense upsert, half delete
+            let id = Id::new(0, i / 2);
+            let mut value = Value::Map(Map::new());
+            value[DATA] = Value::U64(i);
+            let cell = Cell::new_with_id(schema_id, &id, value);
+            client_clone.upsert_cell(cell).wait();
 
-        // verify
-        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), num * 2);
-    }
+            // read
+            let read_cell = client_clone.read_cell(id).wait().unwrap().unwrap();
+            assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
+
+            if i % 2 == 0 {
+                client_clone.remove_cell(id).wait();
+            }
+        });
+
+    (0..num)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|i| {
+            let id = Id::new(0, i);
+            let mut value = Value::Map(Map::new());
+            value[DATA] = Value::U64(i * 2);
+            let cell = Cell::new_with_id(schema_id, &id, value);
+            client.upsert_cell(cell).wait();
+
+            // verify
+            let read_cell = client.read_cell(id).wait().unwrap().unwrap();
+            assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
+        });
 }

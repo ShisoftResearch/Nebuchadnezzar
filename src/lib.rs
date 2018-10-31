@@ -43,6 +43,7 @@ extern crate itertools;
 extern crate smallvec;
 extern crate owning_ref;
 extern crate hermes;
+extern crate rayon;
 
 pub mod utils;
 #[macro_use]

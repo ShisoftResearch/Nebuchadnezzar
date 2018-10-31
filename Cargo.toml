@@ -22,7 +22,7 @@ serde = "*"
 serde_derive = "*"
 bincode = "*"
 byteorder = "1"
-parking_lot = {version = "0.6", features = ["nightly"]}
+parking_lot = {version = "0.6", features = ["nightly", "deadlock_detection"]}
 rand = "0.3"
 linked-hash-map = "0.4"
 bitflags = "1.0"
@@ -30,6 +30,7 @@ crc32c = "*"
 itertools = "*"
 smallvec = "*"
 owning_ref = "0.3"
+rayon = "1.0"
 
 futures-cpupool = "0.1"
 futures-await = "0.1"
