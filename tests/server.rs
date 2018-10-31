@@ -76,6 +76,11 @@ pub fn smoke_test () {
         value[DATA] = Value::U64(num);
         let cell = Cell::new_with_id(schema_id, &id, value);
         client.upsert_cell(cell).wait();
+
+        // verify
+        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
+        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), num);
+
         if i % 2 == 0 {
             client.remove_cell(id).wait();
         }
