@@ -1,50 +1,52 @@
+use super::*;
+use env_logger;
 use neb::ram::cell;
 use neb::ram::cell::*;
-use neb::ram::schema::*;
+use neb::ram::chunk::Chunk;
 use neb::ram::chunk::Chunks;
+use neb::ram::cleaner::Cleaner;
+use neb::ram::cleaner::*;
+use neb::ram::entry::{EntryContent, EntryType};
+use neb::ram::io::writer;
+use neb::ram::schema::Field;
+use neb::ram::schema::*;
+use neb::ram::tombstone::Tombstone;
 use neb::ram::types;
 use neb::ram::types::*;
-use neb::ram::io::writer;
-use neb::ram::cleaner::Cleaner;
-use neb::ram::schema::Field;
 use neb::server::ServerMeta;
-use neb::ram::cleaner::*;
-use neb::ram::tombstone::Tombstone;
-use neb::ram::entry::{EntryType, EntryContent};
-use env_logger;
+use std;
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std;
-use std::rc::Rc;
-use std::collections::HashSet;
-use super::*;
-use neb::ram::chunk::Chunk;
 
 pub const DATA_SIZE: usize = 1000 * 1024; // nearly 1MB
 const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 fn default_cell(id: &Id) -> Cell {
-    let data: Vec<_> =
-        std::iter::repeat(id.lower as u8)
-            .take(DATA_SIZE)
-            .collect();
+    let data: Vec<_> = std::iter::repeat(id.lower as u8).take(DATA_SIZE).collect();
     Cell {
         header: CellHeader::new(0, 0, id),
-        data: data_map_value!(id: id.lower as i32, data: data)
+        data: data_map_value!(id: id.lower as i32, data: data),
     }
 }
 
-fn default_fields () -> Field {
-    Field::new ("*", 0, false, false, Some(
-        vec![
+fn default_fields() -> Field {
+    Field::new(
+        "*",
+        0,
+        false,
+        false,
+        Some(vec![
             Field::new("id", type_id_of(Type::I32), false, false, None),
-            Field::new("data", type_id_of(Type::U8), false, true, None)
-        ]
-    ))
+            Field::new("data", type_id_of(Type::U8), false, true, None),
+        ]),
+    )
 }
 
 fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
-    chunk.addrs_seg
+    chunk
+        .addrs_seg
         .read()
         .iter()
         .map(|(pos, hash)| (*hash, *pos))
@@ -54,18 +56,16 @@ fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
 #[test]
 pub fn full_clean_cycle() {
     env_logger::init();
-    let schema = Schema::new(
-        "cleaner_test",
-        None,
-        default_fields(),
-        false);
+    let schema = Schema::new("cleaner_test", None, default_fields(), false);
     let schemas = LocalSchemasCache::new("", None).unwrap();
     schemas.new_schema(schema);
     let chunks = Chunks::new(
-        1, // single chunk
+        1,                    // single chunk
         MAX_SEGMENT_SIZE * 2, // chunk two segments
         Arc::new(ServerMeta { schemas }),
-        None, None);
+        None,
+        None,
+    );
     let chunk = &chunks.list[0];
 
     // provision test data
@@ -76,7 +76,6 @@ pub fn full_clean_cycle() {
         for i in 0..16 {
             let mut cell = default_cell(&Id::new(0, i));
             chunks.write_cell(&mut cell).unwrap();
-
         }
 
         assert_eq!(chunk.segments().len(), 2);
@@ -116,7 +115,9 @@ pub fn full_clean_cycle() {
             if let EntryContent::Tombstone(ref t) = e.content {
                 assert_eq!(t.hash, hash);
                 assert_eq!(t.partition, 0);
-            } else { panic!(); }
+            } else {
+                panic!();
+            }
         }
 
         assert_eq!(chunk.cell_addresses().len(), 8);
@@ -125,17 +126,19 @@ pub fn full_clean_cycle() {
     }
 
     // check integrity
-    chunk.live_entries(&chunk.segs.get(&0).unwrap()).collect::<Vec<_>>();
-    chunk.live_entries(&chunk.segs.get(&1).unwrap()).collect::<Vec<_>>();
+    chunk
+        .live_entries(&chunk.segs.get(&0).unwrap())
+        .collect::<Vec<_>>();
+    chunk
+        .live_entries(&chunk.segs.get(&1).unwrap())
+        .collect::<Vec<_>>();
 
     // compact
     {
         // Compact all segments order by id
-        chunk.segments()
-            .into_iter()
-            .for_each(|seg| {
-                compact::CompactCleaner::clean_segment(chunk, &seg);
-            });
+        chunk.segments().into_iter().for_each(|seg| {
+            compact::CompactCleaner::clean_segment(chunk, &seg);
+        });
 
         let compacted_seg_positions = seg_positions(chunk);
         let compacted_cell_addresses = chunk.cell_addresses();
@@ -148,9 +151,9 @@ pub fn full_clean_cycle() {
         let compacted_segment_0_entries = chunk.live_entries(seg0).collect::<Vec<_>>();
         let compacted_segment_1_entries = chunk.live_entries(seg1).collect::<Vec<_>>();
         let compacted_segment_0_ids = (0..4).map(|num| num as u64 * 2 + 1);
-        let compacted_segment_1_ids =
-            (4..8).map(|num| num as i64 * 2 + 1)
-                .chain((0..8).map(|i| -1 * i * 2));
+        let compacted_segment_1_ids = (4..8)
+            .map(|num| num as i64 * 2 + 1)
+            .chain((0..8).map(|i| -1 * i * 2));
         assert_eq!(seg0.id, 0);
         assert_eq!(seg1.id, 1);
         // check for cells continuity
@@ -161,7 +164,9 @@ pub fn full_clean_cycle() {
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
                 if let EntryContent::Cell(header) = entry.content {
                     assert_eq!(header.hash, hash)
-                } else { panic!(); }
+                } else {
+                    panic!();
+                }
             });
         assert_eq!(compacted_segment_0_entries.len(), 4);
         assert_eq!(seg0.entry_iter().count(), 4);
@@ -170,19 +175,23 @@ pub fn full_clean_cycle() {
         compacted_segment_1_entries
             .iter()
             .zip(compacted_segment_1_ids)
-            .for_each(|(entry, hash)|{
+            .for_each(|(entry, hash)| {
                 if hash > 1 {
                     // cell
                     assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
                     if let EntryContent::Cell(header) = entry.content {
                         assert_eq!(header.hash, hash as u64)
-                    } else { panic!(); }
+                    } else {
+                        panic!();
+                    }
                 } else {
                     // tombstone
                     assert_eq!(entry.meta.entry_header.entry_type, EntryType::Tombstone);
                     let tombstone = if let EntryContent::Tombstone(ref tombstone) = entry.content {
                         tombstone
-                    } else { panic!() };
+                    } else {
+                        panic!()
+                    };
                     assert_eq!((hash * -1) as u64, tombstone.hash);
                 }
             });
@@ -194,12 +203,15 @@ pub fn full_clean_cycle() {
     // combine
     {
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
-        let survival_cells: HashSet<_> = chunk.live_entries(&chunk.segments()[0])
+        let survival_cells: HashSet<_> = chunk
+            .live_entries(&chunk.segments()[0])
             .map(|entry| {
                 assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
                 if let EntryContent::Cell(ref header) = entry.content {
-                    return header.hash
-                } else { panic!() }
+                    return header.hash;
+                } else {
+                    panic!()
+                }
             })
             .collect();
         (0..8)
@@ -211,11 +223,9 @@ pub fn full_clean_cycle() {
     }
 
     // validate cells
-    (0..8)
-        .map(|n| n * 2 + 1)
-        .for_each(|id| {
-            let id = Id::new(0, id);
-            let cell = chunks.read_cell(&id).unwrap();
-            assert_eq!(cell.data, default_cell(&id).data);
-        });
+    (0..8).map(|n| n * 2 + 1).for_each(|id| {
+        let id = Id::new(0, id);
+        let cell = chunks.read_cell(&id).unwrap();
+        assert_eq!(cell.data, default_cell(&id).data);
+    });
 }

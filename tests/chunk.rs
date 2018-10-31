@@ -1,23 +1,23 @@
+use super::*;
+use env_logger;
 use neb::ram::cell;
 use neb::ram::cell::*;
-use neb::ram::schema::*;
 use neb::ram::chunk::Chunks;
+use neb::ram::cleaner::Cleaner;
+use neb::ram::io::writer;
+use neb::ram::schema::*;
 use neb::ram::types;
 use neb::ram::types::*;
-use neb::ram::io::writer;
-use neb::ram::cleaner::Cleaner;
 use neb::server::ServerMeta;
-use env_logger;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
 use std;
 use std::rc::Rc;
-use super::*;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 pub const CHUNK_SIZE: usize = 1 * 8 * 1024 * 1024;
 
 #[test]
-pub fn round_robin_segment () {
+pub fn round_robin_segment() {
     let num = AtomicU8::new(std::u8::MAX);
     assert_eq!(num.load(Ordering::SeqCst), 255);
     assert_eq!(num.fetch_add(1, Ordering::SeqCst), 255);
@@ -26,7 +26,7 @@ pub fn round_robin_segment () {
 }
 
 #[test]
-pub fn cell_rw () {
+pub fn cell_rw() {
     env_logger::init();
     info!("START");
     let id1 = Id::new(1, 1);
@@ -42,11 +42,15 @@ pub fn cell_rw () {
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
-        data
+        data,
     };
-    let chunks = Chunks::new(1, CHUNK_SIZE, Arc::<ServerMeta>::new(ServerMeta {
-        schemas
-    }), None, None);
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::<ServerMeta>::new(ServerMeta { schemas }),
+        None,
+        None,
+    );
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_1_ptr = chunks.address_of(&Id::from_header(&header));
     {
@@ -62,7 +66,7 @@ pub fn cell_rw () {
     data = Value::Map(data_map);
     cell = Cell {
         header: CellHeader::new(0, schema.id, &id2),
-        data
+        data,
     };
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_2_ptr = chunks.address_of(&Id::from_header(&header));
@@ -86,7 +90,7 @@ pub fn cell_rw () {
     data = Value::Map(data_map);
     cell = Cell {
         header: CellHeader::new(0, schema.id, &id2),
-        data
+        data,
     };
     let header = chunks.update_cell(&mut cell).unwrap();
     let cell_2_ptr = chunks.address_of(&Id::from_header(&header));
@@ -102,15 +106,17 @@ pub fn cell_rw () {
         assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
     }
-    chunks.update_cell_by(&id2, |mut cell| {
-        let mut data_map = Map::new();
-        data_map.insert(&String::from("id"), Value::I64(2));
-        data_map.insert(&String::from("score"), Value::U64(100));
-        data_map.insert(&String::from("name"), Value::String(String::from("John")));
-        let data = Value::Map(data_map);
-        cell.data = data;
-        Some(cell)
-    }).unwrap();
+    chunks
+        .update_cell_by(&id2, |mut cell| {
+            let mut data_map = Map::new();
+            data_map.insert(&String::from("id"), Value::I64(2));
+            data_map.insert(&String::from("score"), Value::U64(100));
+            data_map.insert(&String::from("name"), Value::String(String::from("John")));
+            let data = Value::Map(data_map);
+            cell.data = data;
+            Some(cell)
+        })
+        .unwrap();
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);

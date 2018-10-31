@@ -1,5 +1,5 @@
-use std::io::Cursor;
 use byteorder::LittleEndian;
+use std::io::Cursor;
 
 pub type RawMemCursor = Cursor<Box<[u8]>>;
 pub type Endian = LittleEndian;
@@ -13,7 +13,7 @@ macro_rules! def_raw_memory_cursor_for_size {
                 Cursor::new(Box::from_raw(ptr as *mut [u8]))
             }
         }
-     };
+    };
 }
 
 pub fn release_cursor(cursor: RawMemCursor) {

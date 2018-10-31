@@ -950,7 +950,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                         // Set the bucket to "removed" and return its value.
                         mem::replace(bucket, Bucket::Removed).value().unwrap(),
                         len,
-                        lock.buckets.len()
+                        lock.buckets.len(),
                     )
                 }
             }
@@ -1028,7 +1028,7 @@ impl<K: Clone, V: Clone> Clone for CHashMap<K, V> {
         CHashMap {
             table: RwLock::new(self.table.read().clone()),
             len: AtomicUsize::new(self.len.load(ORDERING)),
-            rm: AtomicUsize::new(self.rm.load(ORDERING))
+            rm: AtomicUsize::new(self.rm.load(ORDERING)),
         }
     }
 }
@@ -1067,7 +1067,7 @@ impl<K: PartialEq + Hash, V> iter::FromIterator<(K, V)> for CHashMap<K, V> {
         CHashMap {
             table: RwLock::new(table),
             len: AtomicUsize::new(len),
-            rm: AtomicUsize::new(0)
+            rm: AtomicUsize::new(0),
         }
     }
 }

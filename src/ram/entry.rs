@@ -1,8 +1,8 @@
-use byteorder::{LittleEndian, WriteBytesExt, ByteOrder};
+use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use libc;
 use ram::cell::CellHeader;
 use ram::tombstone::Tombstone;
 use std::ptr;
-use libc;
 
 bitflags! {
     pub struct EntryType: u8 {
@@ -18,7 +18,7 @@ pub struct EntryHeader {
     pub content_length: u32,
 }
 
-fn encode_len(len: u32, bytes: &mut[u8]) {
+fn encode_len(len: u32, bytes: &mut [u8]) {
     LittleEndian::write_u32(bytes, len);
 }
 
@@ -27,20 +27,19 @@ pub struct EntryMeta {
     pub body_pos: usize,
     pub entry_pos: usize,
     pub entry_size: usize,
-    pub entry_header: EntryHeader
+    pub entry_header: EntryHeader,
 }
 
 pub enum EntryContent {
     Cell(CellHeader),
     Tombstone(Tombstone),
-    Undecided
+    Undecided,
 }
 
 pub struct Entry {
     pub meta: EntryMeta,
-    pub content: EntryContent
+    pub content: EntryContent,
 }
-
 
 impl Entry {
     pub fn encode_to<W>(
@@ -48,15 +47,16 @@ impl Entry {
         entry_type: EntryType,
         content_len: u32,
         len_bytes_count: u8,
-        write_content: W)
-        where W: Fn(usize)
+        write_content: W,
+    ) where
+        W: Fn(usize),
     {
         let entry_type_bit = entry_type.bits;
         let len_bytes_count_usize = len_bytes_count as usize;
         let flag_byte = len_bytes_count | entry_type_bit;
         let mut len_bytes = [0u8; 4];
         encode_len(content_len, &mut len_bytes);
-        let raw_len_bytes= Box::into_raw(box len_bytes);
+        let raw_len_bytes = Box::into_raw(box len_bytes);
         debug!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
                pos, flag_byte, entry_type_bit, len_bytes_count, content_len);
         unsafe {
@@ -67,7 +67,8 @@ impl Entry {
             libc::memmove(
                 pos as *mut libc::c_void,
                 raw_len_bytes as *mut libc::c_void,
-                len_bytes_count_usize);
+                len_bytes_count_usize,
+            );
             pos += len_bytes_count_usize;
             write_content(pos);
             // release raw pointers
@@ -77,7 +78,8 @@ impl Entry {
 
     // Returns the entry header reader returns
     pub fn decode_from<R, RR>(mut pos: usize, content_read: R) -> (EntryHeader, RR)
-        where R: Fn(usize, EntryHeader) -> RR
+    where
+        R: Fn(usize, EntryHeader) -> RR,
     {
         unsafe {
             let flag_byte = *(pos as *mut u8);
@@ -87,16 +89,17 @@ impl Entry {
             let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
             let entry_bytes_len = 0b0000_1111 & flag_byte;
             let entry_bytes_len_usize = entry_bytes_len as usize;
-            let raw_len_bytes= Box::into_raw(box [0u8; 4]);
+            let raw_len_bytes = Box::into_raw(box [0u8; 4]);
             libc::memmove(
                 raw_len_bytes as *mut libc::c_void,
                 pos as *mut libc::c_void,
-                entry_bytes_len_usize);
+                entry_bytes_len_usize,
+            );
             let boxed_raw_len = Box::from_raw(raw_len_bytes);
             let entry_length = LittleEndian::read_u32(&*boxed_raw_len);
             let entry = EntryHeader {
                 entry_type,
-                content_length: entry_length
+                content_length: entry_length,
             };
 
             debug!("decode entry header {}, flag {:#010b}, type bit: {:#010b}, len bits {:#010b}, len {}",

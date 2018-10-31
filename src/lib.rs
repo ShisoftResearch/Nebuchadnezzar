@@ -6,10 +6,8 @@
 #![feature(exact_size_is_empty)]
 #![feature(use_extern_macros)]
 #![feature(integer_atomics)]
-
 #![feature(generators)]
 #![feature(box_syntax)]
-
 
 #[macro_use]
 extern crate log;
@@ -26,28 +24,27 @@ extern crate serde_derive;
 extern crate bitflags;
 
 extern crate bincode;
-extern crate serde;
-extern crate parking_lot;
-extern crate core;
-extern crate rand;
-extern crate futures_await as futures;
-extern crate futures_cpupool;
-extern crate linked_hash_map;
-extern crate libc;
-extern crate num_cpus;
 extern crate byteorder;
+extern crate core;
 extern crate crc32c;
+extern crate futures_await as futures;
+extern crate libc;
+extern crate linked_hash_map;
+extern crate num_cpus;
+extern crate parking_lot;
+extern crate rand;
+extern crate serde;
 #[macro_use]
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
-extern crate owning_ref;
 extern crate hermes;
+extern crate owning_ref;
 extern crate rayon;
 
 pub mod utils;
 #[macro_use]
 pub mod ram;
-pub mod server;
 pub mod client;
 pub mod index;
+pub mod server;

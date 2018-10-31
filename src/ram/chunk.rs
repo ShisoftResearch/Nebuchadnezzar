@@ -1,21 +1,21 @@
-use std::sync::{Arc};
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-use std::collections::BTreeMap;
-use std::ops::Bound::{Included, Excluded};
-use parking_lot::{Mutex, RwLock};
-use bifrost::utils::async_locks::{RwLockReadGuard as AsyncRwLockReadGuard};
+use bifrost::utils::async_locks::RwLockReadGuard as AsyncRwLockReadGuard;
 use bifrost::utils::time::get_time;
-use utils::chashmap::{CHashMap, ReadGuard, WriteGuard};
-use ram::schema::LocalSchemasCache;
-use ram::types::{Id, Value};
-use ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
-use ram::cell::{Cell, ReadError, WriteError, CellHeader};
-use ram::tombstone::{Tombstone, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32, TOMBSTONE_ENTRY_SIZE};
+use parking_lot::{Mutex, RwLock};
+use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::entry::{Entry, EntryContent, EntryType};
-use utils::ring_buffer::RingBuffer;
+use ram::schema::LocalSchemasCache;
+use ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
+use ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
+use ram::types::{Id, Value};
 use server::ServerMeta;
+use std::collections::BTreeMap;
+use std::ops::Bound::{Excluded, Included};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
+use utils::chashmap::{CHashMap, ReadGuard, WriteGuard};
 use utils::raii_mutex_table::RAIIMutexTable;
+use utils::ring_buffer::RingBuffer;
 
 pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
 pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
@@ -35,22 +35,24 @@ pub struct Chunk {
     pub total_space: AtomicUsize,
     pub dead_entries: RingBuffer,
     pub capacity: usize,
-    pub unstable_cells: RAIIMutexTable<u64>
+    pub unstable_cells: RAIIMutexTable<u64>,
 }
 
 impl Chunk {
-    fn new (
+    fn new(
         id: usize,
         size: usize,
         meta: Arc<ServerMeta>,
         backup_storage: Option<String>,
-        wal_storage: Option<String>) -> Chunk {
+        wal_storage: Option<String>,
+    ) -> Chunk {
         let first_seg_id = 0;
         let bootstrap_segment_ref = Arc::new(Segment::new(
             first_seg_id,
             MAX_SEGMENT_SIZE,
             &backup_storage,
-            &wal_storage));
+            &wal_storage,
+        ));
         let segs = Arc::new(CHashMap::new());
         let index = Arc::new(CHashMap::new());
         let chunk = Chunk {
@@ -66,7 +68,7 @@ impl Chunk {
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
             dead_entries: RingBuffer::new((size / MAX_SEGMENT_SIZE + 1) * 100),
-            unstable_cells: RAIIMutexTable::new()
+            unstable_cells: RAIIMutexTable::new(),
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
@@ -79,13 +81,20 @@ impl Chunk {
             let mut head_seg_id = head.id;
             match head.try_acquire(size) {
                 Some(addr) => {
-                    debug!("Chunk {} acquired address {} for size {} in segment {}",
-                           self.id, addr, size, head.id);
+                    debug!(
+                        "Chunk {} acquired address {} for size {} in segment {}",
+                        self.id, addr, size, head.id
+                    );
                     head.references.fetch_add(1, Ordering::Relaxed);
-                    return Some(PendingEntry { addr, seg: head, size })
-                },
+                    return Some(PendingEntry {
+                        addr,
+                        seg: head,
+                        size,
+                    });
+                }
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE
+                    {
                         // No space left
                         return None;
                     }
@@ -97,16 +106,24 @@ impl Chunk {
                             new_seg_id,
                             MAX_SEGMENT_SIZE,
                             &self.backup_storage,
-                            &self.wal_storage);
+                            &self.wal_storage,
+                        );
                         // for performance, won't CAS total_space
-                        self.total_space.fetch_add(MAX_SEGMENT_SIZE, Ordering::Relaxed);
+                        self.total_space
+                            .fetch_add(MAX_SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         self.put_segment(new_seg_ref.clone());
-                        debug!("Dropping old header segment {}. Reference count: {}",
-                               acquired_header.id, Arc::strong_count(&*acquired_header));
+                        debug!(
+                            "Dropping old header segment {}. Reference count: {}",
+                            acquired_header.id,
+                            Arc::strong_count(&*acquired_header)
+                        );
                         *acquired_header = new_seg_ref;
-                        debug!("Dropped old header segment, new {}. Reference count: {}",
-                               acquired_header.id, Arc::strong_count(&*acquired_header));
+                        debug!(
+                            "Dropped old header segment, new {}. Reference count: {}",
+                            acquired_header.id,
+                            Arc::strong_count(&*acquired_header)
+                        );
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
@@ -119,33 +136,33 @@ impl Chunk {
         self.seg_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    pub fn location_for_read<'a>(&self, hash: u64)
-        -> Result<CellReadGuard, ReadError> {
+    pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
         match self.index.get(&hash) {
             Some(index) => {
                 if *index == 0 {
-                    return Err(ReadError::CellDoesNotExisted)
+                    return Err(ReadError::CellDoesNotExisted);
                 }
                 return Ok(index);
-            },
-            None => if hash == 0 {
-                Err(ReadError::CellIdIsUnitId)
-            } else {
-                Err(ReadError::CellDoesNotExisted)
+            }
+            None => {
+                if hash == 0 {
+                    Err(ReadError::CellIdIsUnitId)
+                } else {
+                    Err(ReadError::CellDoesNotExisted)
+                }
             }
         }
     }
 
-    pub fn location_for_write(&self, hash: u64)
-                              -> Option<CellWriteGuard> {
+    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
         match self.index.get_mut(&hash) {
             Some(index) => {
                 if *index == 0 {
-                    return None
+                    return None;
                 }
                 return Some(index);
-            },
-            None => None
+            }
+            None => None,
         }
     }
 
@@ -166,9 +183,9 @@ impl Chunk {
                 for field_id in fields {
                     result.push(map.get_by_key_id(*field_id).clone())
                 }
-                return Ok(result)
-            },
-            _ => Err(ReadError::CellTypeIsNotMapForSelect)
+                return Ok(result);
+            }
+            _ => Err(ReadError::CellTypeIsNotMapForSelect),
         }
     }
 
@@ -177,7 +194,7 @@ impl Chunk {
         let mut head_ptr = *loc + offset;
         let mut data = Vec::with_capacity(len);
         for ptr in head_ptr..(head_ptr + len) {
-            data.push(unsafe {(*(ptr as *const u8))});
+            data.push(unsafe { (*(ptr as *const u8)) });
         }
         Ok(data.to_vec())
     }
@@ -188,19 +205,19 @@ impl Chunk {
         let mut need_rollback = false;
         self.index.upsert(
             cell.header.hash,
-            ||{loc},
+            || loc,
             |inserted_loc| {
                 if *inserted_loc == 0 {
                     *inserted_loc = loc
                 } else {
                     need_rollback = true;
                 }
-            }
+            },
         );
         if need_rollback {
-            return Err(WriteError::CellAlreadyExisted)
+            return Err(WriteError::CellAlreadyExisted);
         }
-        return Ok(cell.header)
+        return Ok(cell.header);
     }
 
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
@@ -213,19 +230,26 @@ impl Chunk {
     }
 
     #[inline]
-    fn  update_cell_from_guard(&self, cell: &mut Cell, guard: &mut CellWriteGuard) -> Result<CellHeader, WriteError> {
+    fn update_cell_from_guard(
+        &self,
+        cell: &mut Cell,
+        guard: &mut CellWriteGuard,
+    ) -> Result<CellHeader, WriteError> {
         let old_location = **guard;
         let new_location = cell.write_to_chunk(self)?;
         **guard = new_location;
-        return Ok(cell.header)
+        return Ok(cell.header);
     }
 
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         let (res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
-            (self.update_cell_from_guard(cell, &mut cell_location), *cell_location)
+            (
+                self.update_cell_from_guard(cell, &mut cell_location),
+                *cell_location,
+            )
         } else {
-            return Err(WriteError::CellDoesNotExisted)
+            return Err(WriteError::CellDoesNotExisted);
         };
         self.mark_dead_entry(loc);
         return res;
@@ -234,16 +258,21 @@ impl Chunk {
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         let (update_res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
-            (self.update_cell_from_guard(cell, &mut cell_location), *cell_location)
+            (
+                self.update_cell_from_guard(cell, &mut cell_location),
+                *cell_location,
+            )
         } else {
-            return self.write_cell(cell)
+            return self.write_cell(cell);
         };
         self.mark_dead_entry(loc);
         return update_res;
     }
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
-        where U: Fn(Cell) -> Option<Cell> {
+    where
+        U: Fn(Cell) -> Option<Cell>,
+    {
         let (res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
@@ -257,11 +286,11 @@ impl Chunk {
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
                     }
-                },
-                Err(e) => return Err(WriteError::ReadError(e))
+                }
+                Err(e) => return Err(WriteError::ReadError(e)),
             }
         } else {
-            return Err(WriteError::CellDoesNotExisted)
+            return Err(WriteError::CellDoesNotExisted);
         };
         self.mark_dead_entry(loc);
         return res;
@@ -276,44 +305,48 @@ impl Chunk {
         }
     }
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
-        where P: Fn(Cell) -> bool {
+    where
+        P: Fn(Cell) -> bool,
+    {
         let mut result = Ok(());
-        self.index.alter(hash, |loc_opt|{
-            match loc_opt {
-                Some(cell_location) => {
-                    let cell = Cell::from_chunk_raw(cell_location, self);
-                    match cell {
-                        Ok(cell) => {
-                            if predict(cell) {
-                                let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
-                                if put_tombstone_result.is_err() {
-                                    result = put_tombstone_result;
-                                    loc_opt
-                                } else {
-                                    None
-                                }
-                            } else {
-                                result = Err(WriteError::CellDoesNotExisted);
+        self.index.alter(hash, |loc_opt| match loc_opt {
+            Some(cell_location) => {
+                let cell = Cell::from_chunk_raw(cell_location, self);
+                match cell {
+                    Ok(cell) => {
+                        if predict(cell) {
+                            let put_tombstone_result =
+                                self.put_tombstone_by_cell_loc(cell_location);
+                            if put_tombstone_result.is_err() {
+                                result = put_tombstone_result;
                                 loc_opt
+                            } else {
+                                None
                             }
-                        },
-                        Err(e) => {
-                            result = Err(WriteError::ReadError(e));
-                            None
+                        } else {
+                            result = Err(WriteError::CellDoesNotExisted);
+                            loc_opt
                         }
                     }
-                },
-                None => {
-                    result = Err(WriteError::CellDoesNotExisted);
-                    None
+                    Err(e) => {
+                        result = Err(WriteError::ReadError(e));
+                        None
+                    }
                 }
+            }
+            None => {
+                result = Err(WriteError::CellDoesNotExisted);
+                None
             }
         });
         return result;
     }
 
     pub fn put_segment(&self, segment: Arc<Segment>) {
-        debug!("Putting segment for chunk {} with id {}", self.id, segment.id);
+        debug!(
+            "Putting segment for chunk {} with id {}",
+            self.id, segment.id
+        );
         let mut seg_index_guard = self.addrs_seg.write();
         let segment_id = segment.id;
         let segment_addr = segment.addr;
@@ -327,7 +360,10 @@ impl Chunk {
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
-        debug!("Removing segment for chunk {} with id {}", self.id, segment_id);
+        debug!(
+            "Removing segment for chunk {} with id {}",
+            self.id, segment_id
+        );
         if let Some(seg) = self.segs.remove(&segment_id) {
             self.addrs_seg.write().remove(&seg.addr).unwrap();
             seg.dispense();
@@ -355,34 +391,42 @@ impl Chunk {
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_location: usize,cell_header: &CellHeader) {
-        let cell_seg = self
-            .locate_segment(cell_location)
-            .expect(format!("cannot locate cell segment for tombstone. Cell id: {:?} at {}",
-                            cell_header.id(), cell_location).as_str());
-        let pending_entry = (||{
-            loop {
-                if let Some(pending_entry) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
-                    return pending_entry;
-                }
-                warn!("Chunk {} is too full to put a tombstone. Will retry.", self.id)
+    fn put_tombstone(&self, cell_location: usize, cell_header: &CellHeader) {
+        let cell_seg = self.locate_segment(cell_location).expect(
+            format!(
+                "cannot locate cell segment for tombstone. Cell id: {:?} at {}",
+                cell_header.id(),
+                cell_location
+            )
+            .as_str(),
+        );
+        let pending_entry = (|| loop {
+            if let Some(pending_entry) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
+                return pending_entry;
             }
+            warn!(
+                "Chunk {} is too full to put a tombstone. Will retry.",
+                self.id
+            )
         })();
         Tombstone::put(
             pending_entry.addr,
             cell_seg.id,
             cell_header.version,
             cell_header.partition,
-            cell_header.hash
+            cell_header.hash,
         );
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
     fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
-        debug!("Put tombstone for chunk {} for cell {}", self.id, cell_location);
-        let header =
-            Cell::header_from_chunk_raw(cell_location)
-                .map_err(|e| WriteError::ReadError(e))?.0;
+        debug!(
+            "Put tombstone for chunk {} for cell {}",
+            self.id, cell_location
+        );
+        let header = Cell::header_from_chunk_raw(cell_location)
+            .map_err(|e| WriteError::ReadError(e))?
+            .0;
         self.put_tombstone(cell_location, &header);
         self.mark_dead_entry(cell_location);
         Ok(())
@@ -401,7 +445,7 @@ impl Chunk {
         let segs = addr_segs.values();
         let mut list = Vec::with_capacity(self.segs.len());
         for seg_id in segs {
-            if let Some(segment) = self.segs.get(seg_id){
+            if let Some(segment) = self.segs.get(seg_id) {
                 list.push(segment.clone());
             }
         }
@@ -415,7 +459,8 @@ impl Chunk {
         for addr in marks {
             if let Some(seg) = self.locate_segment(addr) {
                 let (entry, _) = Entry::decode_from(addr, |_, _| {});
-                seg.dead_space.fetch_add(entry.content_length, Ordering::Relaxed);
+                seg.dead_space
+                    .fetch_add(entry.content_length, Ordering::Relaxed);
             }
         }
     }
@@ -440,18 +485,24 @@ impl Chunk {
                 let tombstones = segment.tombstones.load(Ordering::Relaxed);
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
                 let mut death_count = 0;
-                if  // have not much tombstones
-                    (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (MAX_SEGMENT_SIZE as f64) * 0.2 ||
+                if
+                // have not much tombstones
+                (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (MAX_SEGMENT_SIZE as f64) * 0.2 ||
                         // large partition have been scanned
                         (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
                         // have been scanned recently
-                        now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000 {
+                        now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000
+                {
                     continue;
                 }
-                debug!("Scanning tombstones in chunk {}, segment {}", self.id, seg_id);
+                debug!(
+                    "Scanning tombstones in chunk {}, segment {}",
+                    self.id, seg_id
+                );
                 for entry_meta in segment.entry_iter() {
                     if entry_meta.entry_header.entry_type == EntryType::Tombstone {
-                        let tombstone = Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
+                        let tombstone =
+                            Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
                         if !self.segs.contains_key(&tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
                             death_count += 1;
@@ -459,9 +510,16 @@ impl Chunk {
                     }
                 }
                 // store the death count for following cleaners will just reset it
-                segment.dead_tombstones.store(death_count, Ordering::Relaxed);
-                segment.last_tombstones_scanned.store(now, Ordering::Relaxed);
-                debug!("Scanned tombstones in chunk {}, segment {}, death count {}", self.id, seg_id, death_count);
+                segment
+                    .dead_tombstones
+                    .store(death_count, Ordering::Relaxed);
+                segment
+                    .last_tombstones_scanned
+                    .store(now, Ordering::Relaxed);
+                debug!(
+                    "Scanned tombstones in chunk {}, segment {}, death count {}",
+                    self.id, seg_id, death_count
+                );
             } else {
                 warn!("leaked segment in addrs_seg: {}", seg_id)
             }
@@ -469,37 +527,37 @@ impl Chunk {
     }
 
     pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
-        let utilization_selection =
-            self.segments()
-                .into_iter()
-                .map(|seg| {
-                    let rate = seg.living_rate();
-                    (seg, rate)
-                })
-                .filter(|(_, utilization)| *utilization < 90f32);
+        let utilization_selection = self
+            .segments()
+            .into_iter()
+            .map(|seg| {
+                let rate = seg.living_rate();
+                (seg, rate)
+            })
+            .filter(|(_, utilization)| *utilization < 90f32);
         let head_seg = self.head_seg.read();
         let mut list: Vec<_> = utilization_selection
-            .filter(|(seg, _)|
-                seg.id != head_seg.id && seg.no_references())
+            .filter(|(seg, _)| seg.id != head_seg.id && seg.no_references())
             .collect();
-        list.sort_by(|pair1, pair2|
-            pair1.1.partial_cmp(&pair2.1).unwrap());
+        list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<Arc<Segment>> {
         let head_seg = self.head_seg.read();
-        let mut mapping: Vec<_> = self.segments().into_iter()
+        let mut mapping: Vec<_> = self
+            .segments()
+            .into_iter()
             .map(|seg| {
                 let living = seg.living_space() as f32;
                 let segment_utilization = living / MAX_SEGMENT_SIZE_U32 as f32;
                 (seg, segment_utilization)
             })
-            .filter(|(seg, utilization)|
-                *utilization < 50f32 && head_seg.id != seg.id && seg.no_references())
+            .filter(|(seg, utilization)| {
+                *utilization < 50f32 && head_seg.id != seg.id && seg.no_references()
+            })
             .collect();
-        mapping.sort_by(|pair1, pair2|
-            pair1.1.partial_cmp(&pair2.1).unwrap());
+        mapping.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         return mapping.into_iter().map(|(seg, _)| seg).collect();
     }
 
@@ -507,9 +565,14 @@ impl Chunk {
         let seg_ids = self.segment_ids();
         let head_id = self.head_seg.read().id;
         for seg_id in seg_ids {
-            if seg_id == head_id { continue; } // never archive head segments
+            if seg_id == head_id {
+                continue;
+            } // never archive head segments
             if let Some(segment) = self.segs.get(&seg_id) {
-                if !segment.archived.compare_and_swap(false, true, Ordering::Relaxed) {
+                if !segment
+                    .archived
+                    .compare_and_swap(false, true, Ordering::Relaxed)
+                {
                     if let Err(e) = segment.archive() {
                         error!("cannot archive segment {}, reason:{:?}", self.id, e)
                     }
@@ -581,7 +644,7 @@ impl Chunk {
 pub struct PendingEntry {
     pub seg: Arc<Segment>,
     pub addr: usize,
-    pub size: u32
+    pub size: u32,
 }
 
 impl Drop for PendingEntry {
@@ -596,31 +659,44 @@ pub struct Chunks {
     pub list: Vec<Chunk>,
 }
 
-
 impl Chunks {
-    pub fn new (
+    pub fn new(
         count: usize,
         size: usize,
         meta: Arc<ServerMeta>,
         backup_storage: Option<String>,
-        wal_storage: Option<String>) -> Arc<Chunks>
-    {
+        wal_storage: Option<String>,
+    ) -> Arc<Chunks> {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         debug!("Creating {} chunks, total {} bytes", count, size);
         for i in 0..count {
-            let backup_storage = backup_storage.clone().map(|dir| format!("{}/chunk-bk-{}", dir, i));
-            let wal_storage = wal_storage.clone().map(|dir| format!("{}/chunk-wal-{}", dir, i));
-            chunks.push(Chunk::new(i, chunk_size, meta.clone(), backup_storage, wal_storage));
+            let backup_storage = backup_storage
+                .clone()
+                .map(|dir| format!("{}/chunk-bk-{}", dir, i));
+            let wal_storage = wal_storage
+                .clone()
+                .map(|dir| format!("{}/chunk-wal-{}", dir, i));
+            chunks.push(Chunk::new(
+                i,
+                chunk_size,
+                meta.clone(),
+                backup_storage,
+                wal_storage,
+            ));
         }
-        Arc::new(Chunks {
-            list: chunks
-        })
+        Arc::new(Chunks { list: chunks })
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
-        Chunks::new(count, size, Arc::<ServerMeta>::new(ServerMeta {
-            schemas: LocalSchemasCache::new("", None).unwrap()
-        }), None, None)
+        Chunks::new(
+            count,
+            size,
+            Arc::<ServerMeta>::new(ServerMeta {
+                schemas: LocalSchemasCache::new("", None).unwrap(),
+            }),
+            None,
+            None,
+        )
     }
     fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {
         let chunk_id = partition as usize % self.list.len();
@@ -635,11 +711,16 @@ impl Chunks {
     }
     pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.read_selected(hash, fields)
+        return chunk.read_selected(hash, fields);
     }
-    pub fn read_partial_raw(&self, key: &Id, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
+    pub fn read_partial_raw(
+        &self,
+        key: &Id,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<u8>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return chunk.read_partial_raw(hash, offset, len)
+        return chunk.read_partial_raw(hash, offset, len);
     }
     pub fn head_cell(&self, key: &Id) -> Result<CellHeader, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
@@ -658,7 +739,9 @@ impl Chunks {
         return chunk.update_cell(cell);
     }
     pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<Cell, WriteError>
-        where U: Fn(Cell) -> Option<Cell>{
+    where
+        U: Fn(Cell) -> Option<Cell>,
+    {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
     }
@@ -671,12 +754,14 @@ impl Chunks {
         return chunk.remove_cell(hash);
     }
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
-        where P: Fn(Cell) -> bool {
+    where
+        P: Fn(Cell) -> bool,
+    {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);
     }
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
-        return *chunk.location_for_read(hash).unwrap()
+        return *chunk.location_for_read(hash).unwrap();
     }
 }

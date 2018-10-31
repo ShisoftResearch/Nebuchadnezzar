@@ -1,12 +1,12 @@
-use std::collections::BTreeMap;
 use index::EntryKey;
 use index::Slice;
+use parking_lot::RwLock;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
-use std::collections::BTreeSet;
-use parking_lot::RwLock;
-use std::cell::RefCell;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -17,44 +17,46 @@ use std::cell::RefCell;
 type TombstoneSet = BTreeSet<EntryKey>;
 
 pub struct LevelTree<S>
-    where S: Slice<EntryKey> + SortableEntrySlice
+where
+    S: Slice<EntryKey> + SortableEntrySlice,
 {
     index: BTreeMap<EntryKey, SSIndex<S>>,
-    tombstones: RefCell<TombstoneSet>
+    tombstones: RefCell<TombstoneSet>,
 }
-struct SSIndex<S> where S: Slice<EntryKey> + SortableEntrySlice
+struct SSIndex<S>
+where
+    S: Slice<EntryKey> + SortableEntrySlice,
 {
-    slice: S
+    slice: S,
 }
 
-impl <S> LevelTree<S>
-    where S: Slice<EntryKey> + SortableEntrySlice
+impl<S> LevelTree<S>
+where
+    S: Slice<EntryKey> + SortableEntrySlice,
 {
     pub fn new() -> Self {
         Self {
             index: BTreeMap::new(),
-            tombstones: RefCell::new(TombstoneSet::new())
+            tombstones: RefCell::new(TombstoneSet::new()),
         }
     }
 
     pub fn merge(&self, slices: &[&[EntryKey]]) {
         let starting_key = &slices[0][0];
         // let local_pages = self.index.range(starting_key..);
-        
-        // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());
 
+        // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());
     }
 }
 
-pub trait SortableEntrySlice: Sized + Slice<EntryKey>
-{
+pub trait SortableEntrySlice: Sized + Slice<EntryKey> {
     fn merge_sorted_with(
         &mut self,
         y_slice: &mut [EntryKey],
         xlen: &mut usize,
         ylen: &mut usize,
         xtombstones: &mut TombstoneSet,
-        ytombstones: &mut TombstoneSet
+        ytombstones: &mut TombstoneSet,
     ) -> Self {
         let mut x_pos = 0;
         let mut y_pos = 0;
@@ -69,7 +71,7 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
             let mut new_slice_y = new_y.as_slice();
             let mut new_x_len = 0;
             let mut new_y_len = 0;
-            let mut use_slice_at = | slice: &mut[EntryKey], slice_pos: &mut usize| {
+            let mut use_slice_at = |slice: &mut [EntryKey], slice_pos: &mut usize| {
                 let item = mem::replace(&mut slice[*slice_pos], EntryKey::default());
                 *slice_pos += 1;
                 if xtombstones.remove(&item) || ytombstones.remove(&item) {
@@ -90,7 +92,7 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
                 } else if y_pos < *ylen {
                     use_slice_at(y_slice, &mut y_pos)
                 } else {
-                    break
+                    break;
                 };
 
                 if let Some(item) = item_or_removed {
@@ -113,6 +115,4 @@ pub trait SortableEntrySlice: Sized + Slice<EntryKey>
 }
 
 #[cfg(test)]
-mod test {
-
-}
+mod test {}

@@ -1,7 +1,7 @@
-use ram::schema::{Schema, Field};
 use ram::cell::*;
+use ram::schema::{Field, Schema};
 use ram::types;
-use ram::types::{u32_io, u8_io, Value, Map, type_id_of, Type};
+use ram::types::{type_id_of, u32_io, u8_io, Map, Type, Value};
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, usize) {
     let mut ptr = ptr;
@@ -44,12 +44,12 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, us
             map.insert_key_id(sub.name_id, cval);
             ptr = cptr;
             match selected {
-                None => {},
+                None => {}
                 Some(field_ids) => {
                     if field_ids[selected_pos] == sub.name_id {
                         selected_pos += 1;
                         if field_ids.len() <= selected_pos {
-                            return (Value::Map(map), ptr)
+                            return (Value::Map(map), ptr);
                         }
                     }
                 }
@@ -58,7 +58,10 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, us
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         (Value::Map(map), ptr)
     } else {
-        (types::get_val(field.type_id, ptr), ptr + types::get_size(field.type_id, ptr))
+        (
+            types::get_val(field.type_id, ptr),
+            ptr + types::get_size(field.type_id, ptr),
+        )
     }
 }
 

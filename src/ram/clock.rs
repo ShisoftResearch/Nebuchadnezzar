@@ -1,8 +1,8 @@
-use std::time::SystemTime;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use std::thread::{spawn, sleep};
+use std::thread::{sleep, spawn};
 use std::time::Duration;
+use std::time::SystemTime;
 
 // A not so accurate but fast wall clock for cell timestamp
 lazy_static! {
@@ -18,7 +18,10 @@ lazy_static! {
 }
 
 fn actual_now() -> u32 {
-    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() as u32
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
 }
 
 pub fn now() -> u32 {

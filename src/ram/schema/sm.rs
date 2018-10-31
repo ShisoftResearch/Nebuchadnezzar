@@ -1,7 +1,7 @@
 use super::*;
 
+use bifrost::raft::state_machine::callback::server::{NotifyError, SMCallback};
 use bifrost::raft::state_machine::StateMachineCtl;
-use bifrost::raft::state_machine::callback::server::{SMCallback, NotifyError};
 use bifrost::raft::RaftService;
 use bifrost::utils::bincode;
 use bifrost_hasher::hash_str;
@@ -17,7 +17,7 @@ pub fn generate_sm_id<'a>(group: &'a str) -> u64 {
 pub struct SchemasSM {
     callback: SMCallback,
     map: SchemasMap,
-    sm_id: u64
+    sm_id: u64,
 }
 
 raft_state_machine! {
@@ -35,21 +35,21 @@ impl StateMachineCmds for SchemasSM {
         Ok(self.map.get_all())
     }
     fn get(&self, id: u32) -> Result<Option<Schema>, ()> {
-        Ok(self.map.get(&id).map(
-            |r| -> Schema {
-                let borrow: &Schema = r.borrow();
-                borrow.clone()
-            }
-        ))
+        Ok(self.map.get(&id).map(|r| -> Schema {
+            let borrow: &Schema = r.borrow();
+            borrow.clone()
+        }))
     }
     fn new_schema(&mut self, schema: Schema) -> Result<(), NotifyError> {
         self.map.new_schema(schema.clone());
-        self.callback.notify(commands::on_schema_added::new(), Ok(schema))?;
+        self.callback
+            .notify(commands::on_schema_added::new(), Ok(schema))?;
         Ok(())
     }
     fn del_schema(&mut self, name: String) -> Result<(), NotifyError> {
         self.map.del_schema(&name).unwrap();
-        self.callback.notify(commands::on_schema_deleted::new(), Ok(name))?;
+        self.callback
+            .notify(commands::on_schema_deleted::new(), Ok(name))?;
         Ok(())
     }
     fn next_id(&mut self) -> Result<u32, ()> {
@@ -59,7 +59,9 @@ impl StateMachineCmds for SchemasSM {
 
 impl StateMachineCtl for SchemasSM {
     raft_sm_complete!();
-    fn id(&self) -> u64 {self.sm_id }
+    fn id(&self) -> u64 {
+        self.sm_id
+    }
     fn snapshot(&self) -> Option<Vec<u8>> {
         Some(bincode::serialize(&self.map.get_all()))
     }
@@ -75,7 +77,7 @@ impl SchemasSM {
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()),
             map: SchemasMap::new(),
-            sm_id
+            sm_id,
         }
     }
 }

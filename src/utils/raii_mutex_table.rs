@@ -1,21 +1,27 @@
 use parking_lot::Mutex;
-use std::collections::HashSet;
 use std::cmp::Eq;
+use std::collections::HashSet;
 use std::hash::Hash;
 
 pub struct RAIIMutexTable<K> {
-    map: Mutex<HashSet<K>>
+    map: Mutex<HashSet<K>>,
 }
 
-pub struct RAIIMutexGuard<'a, K>  where K: Eq + Clone + Hash {
+pub struct RAIIMutexGuard<'a, K>
+where
+    K: Eq + Clone + Hash,
+{
     parent: &'a RAIIMutexTable<K>,
-    key: K
+    key: K,
 }
 
-impl <K> RAIIMutexTable<K> where K: Eq + Clone + Hash {
+impl<K> RAIIMutexTable<K>
+where
+    K: Eq + Clone + Hash,
+{
     pub fn new() -> RAIIMutexTable<K> {
         RAIIMutexTable {
-            map: Mutex::new(HashSet::new())
+            map: Mutex::new(HashSet::new()),
         }
     }
 
@@ -24,7 +30,10 @@ impl <K> RAIIMutexTable<K> where K: Eq + Clone + Hash {
             let mut map_guard = self.map.lock();
             if !map_guard.contains(&k) {
                 map_guard.insert(k.clone());
-                return RAIIMutexGuard { parent: self, key: k }
+                return RAIIMutexGuard {
+                    parent: self,
+                    key: k,
+                };
             }
         }
     }
@@ -36,7 +45,10 @@ impl <K> RAIIMutexTable<K> where K: Eq + Clone + Hash {
     }
 }
 
-impl <'a, K> Drop for RAIIMutexGuard<'a, K> where K: Eq + Clone + Hash {
+impl<'a, K> Drop for RAIIMutexGuard<'a, K>
+where
+    K: Eq + Clone + Hash,
+{
     fn drop(&mut self) {
         self.parent.unlock(&self.key)
     }

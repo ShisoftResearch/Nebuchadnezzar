@@ -1,5 +1,5 @@
-use utils::rand;
 use ram::cell::CellHeader;
+use utils::rand;
 
 pub use dovahkiin::types::*;
 
@@ -22,7 +22,7 @@ impl FromHeader for Id {
     fn from_header(header: &CellHeader) -> Id {
         Id {
             higher: header.partition,
-            lower: header.hash
+            lower: header.hash,
         }
     }
 }

@@ -1,8 +1,8 @@
-use rand::{OsRng, Rng};
 use parking_lot::Mutex;
+use rand::{OsRng, Rng};
 
 pub struct RandGen {
-    generator: OsRng
+    generator: OsRng,
 }
 
 impl RandGen {
@@ -10,8 +10,8 @@ impl RandGen {
         RandGen {
             generator: match OsRng::new() {
                 Ok(g) => g,
-                Err(e) => panic!("Failed to obtain OS RNG: {}", e)
-            }
+                Err(e) => panic!("Failed to obtain OS RNG: {}", e),
+            },
         }
     }
     fn next(&mut self) -> u64 {

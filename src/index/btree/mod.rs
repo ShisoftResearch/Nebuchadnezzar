@@ -1,38 +1,38 @@
-use smallvec::SmallVec;
-use dovahkiin::types::custom_types::id::Id;
-use utils::lru_cache::LRUCache;
-use std::io::Cursor;
-use std::rc::Rc;
-use ram::types::RandValue;
+use bifrost::utils::async_locks::Mutex;
+use bifrost::utils::async_locks::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use client::AsyncClient;
-use std::cmp::{max, min};
-use std::ptr;
-use std::mem;
-use std::sync::Arc;
-use itertools::{Itertools, chain};
-use ram::cell::Cell;
-use futures::Future;
 use dovahkiin::types;
-use dovahkiin::types::{Value, Map, PrimitiveArray, ToValue, key_hash};
+use dovahkiin::types::custom_types::id::Id;
+use dovahkiin::types::{key_hash, Map, PrimitiveArray, ToValue, Value};
+use futures::Future;
+use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 use index::btree::external::*;
 use index::btree::internal::*;
-use bifrost::utils::async_locks::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use hermes::stm::{TxnManager, TxnValRef, Txn, TxnErr};
-use bifrost::utils::async_locks::Mutex;
-use std::cell::RefMut;
-use std::cell::Ref;
-use std::fmt::Debug;
-use std::ops::Range;
-use std::fmt::Formatter;
-use std::fmt::Error;
-use std::io::Write;
-use std;
-use index::EntryKey;
 use index::id_from_key;
+use index::EntryKey;
 use index::Slice;
+use itertools::{chain, Itertools};
+use ram::cell::Cell;
+use ram::types::RandValue;
+use smallvec::SmallVec;
+use std;
+use std::cell::Ref;
+use std::cell::RefMut;
+use std::cmp::{max, min};
+use std::fmt::Debug;
+use std::fmt::Error;
+use std::fmt::Formatter;
+use std::io::Cursor;
+use std::io::Write;
+use std::mem;
+use std::ops::Range;
+use std::ptr;
+use std::rc::Rc;
+use std::sync::Arc;
+use utils::lru_cache::LRUCache;
 
-mod internal;
 mod external;
+mod internal;
 
 const NUM_KEYS: usize = 32;
 const NUM_PTRS: usize = NUM_KEYS + 1;
@@ -52,14 +52,14 @@ pub struct BPlusTree {
     height: usize,
     ext_node_cache: Arc<ExtNodeCacheMap>,
     stm: TxnManager,
-    storage: Arc<AsyncClient>
+    storage: Arc<AsyncClient>,
 }
 
 #[derive(Clone)]
 enum Node {
     External(Box<Id>),
     Internal(Box<InNode>),
-    None
+    None,
 }
 
 // This is the runtime cursor on iteration
@@ -71,12 +71,13 @@ pub struct RTCursor {
     ordering: Ordering,
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
-    bz: Rc<CacheBufferZone>
+    bz: Rc<CacheBufferZone>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Ordering {
-    Forward, Backward
+    Forward,
+    Backward,
 }
 
 impl Default for Ordering {
@@ -88,7 +89,7 @@ impl Default for Ordering {
 pub struct TreeTxn<'a> {
     tree: &'a BPlusTree,
     bz: Rc<CacheBufferZone>,
-    txn: &'a mut Txn
+    txn: &'a mut Txn,
 }
 
 macro_rules! make_array {
@@ -113,22 +114,24 @@ impl BPlusTree {
             height: 0,
             stm: TxnManager::new(),
             storage: neb_client.clone(),
-            ext_node_cache:
-            Arc::new(Mutex::new(
-                LRUCache::new(
-                    CACHE_SIZE,
-                    move |id|{
-                        debug!("Reading page to cache {:?}", id);
-                        neb_client_1.read_cell(*id).wait().unwrap().map(|cell| {
-                            Arc::new(RwLock::new(ExtNode::from_cell(cell)))
-                        }).ok()
-                    },
-                    move |id, value| {
-                        debug!("Flush page to cache {:?}", &id);
-                        let cache = value.read();
-                        let cell = cache.to_cell();
-                        neb_client_2.upsert_cell(cell).wait().unwrap();
-                    })))
+            ext_node_cache: Arc::new(Mutex::new(LRUCache::new(
+                CACHE_SIZE,
+                move |id| {
+                    debug!("Reading page to cache {:?}", id);
+                    neb_client_1
+                        .read_cell(*id)
+                        .wait()
+                        .unwrap()
+                        .map(|cell| Arc::new(RwLock::new(ExtNode::from_cell(cell))))
+                        .ok()
+                },
+                move |id, value| {
+                    debug!("Flush page to cache {:?}", &id);
+                    let cache = value.read();
+                    let cell = cache.to_cell();
+                    neb_client_2.upsert_cell(cell).wait().unwrap();
+                },
+            ))),
         };
         {
             let actual_tree_root = tree.new_ext_cached_node();
@@ -153,16 +156,19 @@ impl BPlusTree {
     }
 
     pub fn transaction<R, F>(&self, func: F) -> Result<R, TxnErr>
-        where F: Fn(&mut TreeTxn) -> Result<R, TxnErr>
+    where
+        F: Fn(&mut TreeTxn) -> Result<R, TxnErr>,
     {
-        self.stm.transaction(|txn| {
-            let mut t_txn = TreeTxn::new(self, txn);
-            let res = func(&mut t_txn)?;
-            Ok((res, t_txn.bz))
-        }).map(|(res, mut bz)| {
-            bz.flush();
-            res
-        })
+        self.stm
+            .transaction(|txn| {
+                let mut t_txn = TreeTxn::new(self, txn);
+                let res = func(&mut t_txn)?;
+                Ok((res, t_txn.bz))
+            })
+            .map(|(res, mut bz)| {
+                bz.flush();
+                res
+            })
     }
     fn new_page_id(&self) -> Id {
         // TODO: achieve locality
@@ -171,7 +177,9 @@ impl BPlusTree {
     fn new_ext_cached_node(&self) -> Node {
         let id = self.new_page_id();
         let node = ExtNode::new(&id);
-        self.ext_node_cache.lock().insert(id, Arc::new(RwLock::new(node)));
+        self.ext_node_cache
+            .lock()
+            .insert(id, Arc::new(RwLock::new(node)));
         debug!("New page id is: {:?}", id);
         return Node::External(box id);
     }
@@ -192,7 +200,9 @@ impl Node {
         }
     }
     fn warm_cache_for_write_intention(&self, bz: &CacheBufferZone) {
-        if self.is_ext() { self.extnode_mut(bz); }
+        if self.is_ext() {
+            self.extnode_mut(bz);
+        }
     }
     fn insert(
         &mut self,
@@ -200,8 +210,8 @@ impl Node {
         ptr: Option<TxnValRef>,
         pos: usize,
         tree: &BPlusTree,
-        bz: &CacheBufferZone) -> Option<(Node, Option<EntryKey>)>
-    {
+        bz: &CacheBufferZone,
+    ) -> Option<(Node, Option<EntryKey>)> {
         if let &mut Node::External(ref id) = self {
             debug!("inserting to external node at: {:?}, key {:?}", pos, key);
             self.extnode_mut(bz).insert(key, pos, tree, bz)
@@ -221,7 +231,7 @@ impl Node {
         match self {
             &Node::External(_) => true,
             &Node::Internal(_) => false,
-            &Node::None => panic!()
+            &Node::None => panic!(),
         }
     }
     fn first_key(&self, bz: &CacheBufferZone) -> EntryKey {
@@ -247,40 +257,48 @@ impl Node {
     fn extnode_mut<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRefMut<'a> {
         match self {
             &Node::External(ref id) => bz.get_for_mut(id),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
     fn innode_mut(&mut self) -> &mut InNode {
         match self {
             &mut Node::Internal(ref mut n) => n,
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
     fn extnode<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRef<'a> {
         match self {
             &Node::External(ref id) => bz.get(id),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
-    fn ext_id(&self) -> Id { if let &Node::External(ref id) = self { **id } else { panic!() } }
+    fn ext_id(&self) -> Id {
+        if let &Node::External(ref id) = self {
+            **id
+        } else {
+            panic!()
+        }
+    }
     fn innode(&self) -> &InNode {
         match self {
             &Node::Internal(ref n) => n,
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
 }
 
-impl <'a> TreeTxn<'a> {
+impl<'a> TreeTxn<'a> {
     fn new(tree: &'a BPlusTree, txn: &'a mut Txn) -> TreeTxn<'a> {
         TreeTxn {
-            bz: Rc::new(CacheBufferZone::new(&tree.ext_node_cache, &tree.storage)), tree, txn
+            bz: Rc::new(CacheBufferZone::new(&tree.ext_node_cache, &tree.storage)),
+            tree,
+            txn,
         }
     }
 
     pub fn seek(&mut self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
-//        let mut key = key.clone();
-//        key_with_id(&mut key, &Id::unit_id());
+        //        let mut key = key.clone();
+        //        key_with_id(&mut key, &Id::unit_id());
         let root = self.tree.root;
         match ordering {
             Ordering::Forward => self.search(root, &key, ordering),
@@ -290,16 +308,21 @@ impl <'a> TreeTxn<'a> {
                 let max_id = Id::new(std::u64::MAX, std::u64::MAX);
                 key_with_id(&mut key, &max_id);
                 debug!("seek backwards with precise key {:?}", &key);
-                self.search(root, &key, ordering)
-                    .map(|mut cursor| {
-                        debug!("found cursor pos {} for backwards, len {}, will be corrected",
-                               cursor.index, cursor.page.len);
-                        let cursor_index = cursor.index;
-                        if cursor_index > 0 { cursor.index -= 1; }
-                        debug!("cursor pos have been corrected to {}, len {}, item {:?}",
-                               cursor.index, cursor.page.len, cursor.page.keys[cursor.index]);
-                        return cursor;
-                    })
+                self.search(root, &key, ordering).map(|mut cursor| {
+                    debug!(
+                        "found cursor pos {} for backwards, len {}, will be corrected",
+                        cursor.index, cursor.page.len
+                    );
+                    let cursor_index = cursor.index;
+                    if cursor_index > 0 {
+                        cursor.index -= 1;
+                    }
+                    debug!(
+                        "cursor pos have been corrected to {}, len {}, item {:?}",
+                        cursor.index, cursor.page.len, cursor.page.keys[cursor.index]
+                    );
+                    return cursor;
+                })
             }
         }
     }
@@ -308,8 +331,8 @@ impl <'a> TreeTxn<'a> {
         &mut self,
         node: TxnValRef,
         key: &EntryKey,
-        ordering: Ordering) -> Result<RTCursor, TxnErr>
-    {
+        ordering: Ordering,
+    ) -> Result<RTCursor, TxnErr> {
         debug!("searching for {:?} at {:?}", key, node);
         let node = self.txn.read::<Node>(node)?.unwrap();
         let pos = node.search(key, &mut self.bz);
@@ -335,7 +358,7 @@ impl <'a> TreeTxn<'a> {
             let mut new_in_root = InNode {
                 keys: make_array!(NUM_KEYS, Default::default()),
                 pointers: make_array!(NUM_PTRS, Default::default()),
-                len: 1
+                len: 1,
             };
             let old_root = self.txn.read_owned::<Node>(self.tree.root)?.unwrap();
             let old_root_ref = self.txn.new_value(old_root);
@@ -350,29 +373,43 @@ impl <'a> TreeTxn<'a> {
     fn insert_to_node(
         &mut self,
         node: TxnValRef,
-        key: EntryKey
+        key: EntryKey,
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
         let ref_node = self.txn.read::<Node>(node)?.unwrap();
         ref_node.warm_cache_for_write_intention(&mut self.bz);
         let pos = ref_node.search(&key, &mut self.bz);
-        debug!("insert to node: {:?}, len {}, pos: {}, external: {}",
-               node, ref_node.len(&mut self.bz), pos, ref_node.is_ext());
+        debug!(
+            "insert to node: {:?}, len {}, pos: {}, external: {}",
+            node,
+            ref_node.len(&mut self.bz),
+            pos,
+            ref_node.is_ext()
+        );
         let split_node = match &*ref_node {
             &Node::External(ref id) => {
-                debug!("insert into external at {}, key {:?}, id {:?}", pos, key, id);
+                debug!(
+                    "insert into external at {}, key {:?}, id {:?}",
+                    pos, key, id
+                );
                 let mut node = self.bz.get_for_mut(id);
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));
-            },
+            }
             &Node::Internal(ref n) => {
                 let next_node_ref = n.pointers[pos];
-                debug!("insert into internal at {}, has keys {}, ref {:?}", pos, n.len, next_node_ref);
+                debug!(
+                    "insert into internal at {}, has keys {}, ref {:?}",
+                    pos, n.len, next_node_ref
+                );
                 self.insert_to_node(next_node_ref, key)?
-            },
-            &Node::None => unreachable!()
+            }
+            &Node::None => unreachable!(),
         };
         match split_node {
             Some((new_node, pivot_key)) => {
-                debug!("Sub level node split, shall insert new node to current level, pivot {:?}", pivot_key);
+                debug!(
+                    "Sub level node split, shall insert new node to current level, pivot {:?}",
+                    pivot_key
+                );
                 debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
                 let pivot = pivot_key.unwrap_or_else(|| {
                     let first_key = new_node.first_key(&mut self.bz);
@@ -380,21 +417,23 @@ impl <'a> TreeTxn<'a> {
                     first_key
                 });
                 let new_node_ref = self.txn.new_value(new_node);
-                debug!("New node in transaction {:?}, pivot {:?}", new_node_ref, pivot);
+                debug!(
+                    "New node in transaction {:?}, pivot {:?}",
+                    new_node_ref, pivot
+                );
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
                 let result = {
                     let pivot_pos = acq_node.search(&pivot, &mut self.bz);
                     let mut current_innode = acq_node.innode_mut();
-                    current_innode.insert(
-                        pivot,
-                        Some(new_node_ref),
-                        pivot_pos)
+                    current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
                 };
                 self.txn.update(node, acq_node);
-                if result.is_some() { debug!("Sub level split caused current level split"); }
+                if result.is_some() {
+                    debug!("Sub level split caused current level split");
+                }
                 return Ok(result);
-            },
-            None => return Ok(None)
+            }
+            None => return Ok(None),
         }
     }
 
@@ -404,7 +443,11 @@ impl <'a> TreeTxn<'a> {
         let root = self.tree.root;
         let removed = self.remove_from_node(root, &key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
-        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len(&mut self.bz) == 0 {
+        if removed.item_found
+            && removed.removed
+            && !root_node.is_ext()
+            && root_node.len(&mut self.bz) == 0
+        {
             // When root is external and have no keys but one pointer will take the only sub level
             // pointer node as the new root node.
             // It is not possible to change the root reference so the sub level node will be cloned
@@ -420,7 +463,7 @@ impl <'a> TreeTxn<'a> {
     fn remove_from_node(
         &mut self,
         node: TxnValRef,
-        key: &EntryKey
+        key: &EntryKey,
     ) -> Result<RemoveStatus, TxnErr> {
         debug!("Removing {:?} from node {:?}", key, node);
         let node_ref = self.txn.read::<Node>(node)?.unwrap();
@@ -428,7 +471,9 @@ impl <'a> TreeTxn<'a> {
         let pos = node_ref.search(key, &mut self.bz);;
         if let Node::Internal(n) = &*node_ref {
             let mut status = self.remove_from_node(n.pointers[pos], key)?;
-            if !status.removed { return Ok(status) }
+            if !status.removed {
+                return Ok(status);
+            }
             let sub_node_ref = n.pointers[pos];
             let sub_node = self.txn.read::<Node>(sub_node_ref)?.unwrap();
             let mut current_node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
@@ -455,7 +500,8 @@ impl <'a> TreeTxn<'a> {
                 } else if !sub_node.is_half_full(&mut self.bz) && current_innode.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                    let cand_ptr_pos = current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
+                    let cand_ptr_pos =
+                        current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
                     let cand_node = self.txn.read::<Node>(n.pointers[cand_ptr_pos])?.unwrap();
@@ -467,12 +513,22 @@ impl <'a> TreeTxn<'a> {
                     if sub_node.cannot_merge(&mut self.bz) || cand_node.cannot_merge(&mut self.bz) {
                         // relocate
                         debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
-                        current_innode.relocate_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz)?;
+                        current_innode.relocate_children(
+                            left_ptr_pos,
+                            right_ptr_pos,
+                            &mut self.txn,
+                            &mut self.bz,
+                        )?;
                         status.removed = false;
                     } else {
                         // merge
                         debug!("Merge {} with {}", left_ptr_pos, right_ptr_pos);
-                        current_innode.merge_children(left_ptr_pos, right_ptr_pos, &mut self.txn, &mut self.bz);
+                        current_innode.merge_children(
+                            left_ptr_pos,
+                            right_ptr_pos,
+                            &mut self.txn,
+                            &mut self.bz,
+                        );
                         status.removed = true;
                     }
                 }
@@ -484,34 +540,43 @@ impl <'a> TreeTxn<'a> {
             if pos >= cached_node.len {
                 debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}, keys {:?}",
                        pos, cached_node.len, key, &cached_node.keys);
-                return Ok(RemoveStatus{ item_found: false, removed: false })
+                return Ok(RemoveStatus {
+                    item_found: false,
+                    removed: false,
+                });
             }
             if &cached_node.keys[pos] == key {
                 cached_node.remove_at(pos);
-                return Ok(RemoveStatus{ item_found: true, removed: true });
+                return Ok(RemoveStatus {
+                    item_found: true,
+                    removed: true,
+                });
             } else {
                 debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}, keys {:?}",
                        pos, key, &cached_node.keys[pos], &cached_node.keys);
-                return Ok(RemoveStatus{ item_found: false, removed: false });
+                return Ok(RemoveStatus {
+                    item_found: false,
+                    removed: false,
+                });
             }
-        } else { unreachable!() }
+        } else {
+            unreachable!()
+        }
     }
 }
 
 impl RTCursor {
-    fn new(
-        pos: usize,
-        id: &Id,
-        bz: &Rc<CacheBufferZone>,
-        ordering: Ordering,
-    ) -> RTCursor {
+    fn new(pos: usize, id: &Id, bz: &Rc<CacheBufferZone>, ordering: Ordering) -> RTCursor {
         let node = bz.get(id);
         let page = bz.get_guard(id).unwrap();
         let next = page.next;
         let prev = page.prev;
         debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
         if pos < node.len {
-            debug!("Key at pos {} is {:?}, next: {:?}, prev: {:?}", pos, &node.keys[pos], next, prev);
+            debug!(
+                "Key at pos {} is {:?}, next: {:?}, prev: {:?}",
+                pos, &node.keys[pos], next, prev
+            );
         } else {
             debug!("Cursor creation without valid pos")
         }
@@ -522,8 +587,8 @@ impl RTCursor {
             bz: bz.clone(),
             next_page: bz.get_guard(match ordering {
                 Ordering::Forward => &next,
-                Ordering::Backward  => &prev
-            })
+                Ordering::Backward => &prev,
+            }),
         };
 
         match ordering {
@@ -531,14 +596,18 @@ impl RTCursor {
                 if pos >= node.len {
                     cursor.next();
                 }
-            },
+            }
             Ordering::Backward => {}
         }
 
         return cursor;
     }
     pub fn next(&mut self) -> bool {
-        debug!("Next id with index: {}, length: {}", self.index + 1, self.page.len);
+        debug!(
+            "Next id with index: {}, length: {}",
+            self.index + 1,
+            self.page.len
+        );
         match self.ordering {
             Ordering::Forward => {
                 if self.index + 1 >= self.page.len {
@@ -556,7 +625,7 @@ impl RTCursor {
                     self.index += 1;
                     debug!("Advancing cursor to index {}", self.index);
                 }
-            },
+            }
             Ordering::Backward => {
                 if self.index == 0 {
                     // next page
@@ -567,7 +636,7 @@ impl RTCursor {
                         self.page = next_page;
                     } else {
                         debug!("iterated to end");
-                        return false
+                        return false;
                     }
                 } else {
                     self.index -= 1;
@@ -589,20 +658,27 @@ impl RTCursor {
     pub fn has_next(&self) -> bool {
         match self.ordering {
             Ordering::Forward => self.index < self.page.len - 1 || self.next_page.is_some(),
-            Ordering::Backward => self.index > 0 || self.next_page.is_some()
+            Ordering::Backward => self.index > 0 || self.next_page.is_some(),
         }
     }
 }
 
 fn insert_into_split<T, S>(
     item: T,
-    x: &mut S, y: &mut S,
-    xlen: &mut usize, ylen: &mut usize,
-    pos: usize, pivot: usize
-)
-    where S: Slice<T> + BTreeSlice<T>, T: Default + Debug
+    x: &mut S,
+    y: &mut S,
+    xlen: &mut usize,
+    ylen: &mut usize,
+    pos: usize,
+    pivot: usize,
+) where
+    S: Slice<T> + BTreeSlice<T>,
+    T: Default + Debug,
 {
-    debug!("insert into split left len {}, right len {}, pos {}, pivot {}", xlen, ylen, pos, pivot);
+    debug!(
+        "insert into split left len {}, right len {}, pos {}, pivot {}",
+        xlen, ylen, pos, pivot
+    );
     if pos < pivot {
         debug!("insert into left part, pos: {}", pos);
         x.insert_at(item, pos, xlen);
@@ -621,8 +697,12 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
 macro_rules! impl_slice_ops {
     ($t: ty, $et: ty, $n: expr) => {
         impl Slice<$et> for $t {
-            fn as_slice(&mut self) -> &mut [$et] { self }
-            fn init() -> Self { make_array!($n, Self::item_default()) }
+            fn as_slice(&mut self) -> &mut [$et] {
+                self
+            }
+            fn init() -> Self {
+                make_array!($n, Self::item_default())
+            }
         }
         impl BTreeSlice<$et> for $t {}
     };
@@ -630,7 +710,7 @@ macro_rules! impl_slice_ops {
 
 struct RemoveStatus {
     item_found: bool,
-    removed: bool
+    removed: bool,
 }
 
 impl_slice_ops!(EntryKeySlice, EntryKey, NUM_KEYS);
@@ -642,15 +722,17 @@ impl Default for Node {
     }
 }
 
-trait BTreeSlice<T> : Sized + Slice<T>
-    where T: Default + Debug
+trait BTreeSlice<T>: Sized + Slice<T>
+where
+    T: Default + Debug,
 {
     fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
         let mut right_slice = Self::init();
         {
-            let mut slice1: &mut[T] = self.as_slice();
-            let mut slice2: &mut[T] = right_slice.as_slice();
-            for i in pivot .. len { // leave pivot to the right slice
+            let mut slice1: &mut [T] = self.as_slice();
+            let mut slice2: &mut [T] = right_slice.as_slice();
+            for i in pivot..len {
+                // leave pivot to the right slice
                 let right_pos = i - pivot;
                 let item = mem::replace(&mut slice1[i], T::default());
                 slice2[right_pos] = item;
@@ -659,12 +741,21 @@ trait BTreeSlice<T> : Sized + Slice<T>
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
-        debug_assert!(pos <= *len, "pos {:?} larger or equals to len {:?}, item: {:?}", pos, len, item);
-        debug!("insert into slice, pos: {}, len {}, item {:?}", pos, len, item);
+        debug_assert!(
+            pos <= *len,
+            "pos {:?} larger or equals to len {:?}, item: {:?}",
+            pos,
+            len,
+            item
+        );
+        debug!(
+            "insert into slice, pos: {}, len {}, item {:?}",
+            pos, len, item
+        );
         let mut slice = self.as_slice();
         if *len > 0 {
             slice[*len] = T::default();
-            for i in (pos ..= *len - 1).rev() {
+            for i in (pos..=*len - 1).rev() {
                 slice.swap(i, i + 1);
             }
         }
@@ -676,8 +767,8 @@ trait BTreeSlice<T> : Sized + Slice<T>
         debug!("remove at {} len {}", pos, len);
         debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
         if pos < *len - 1 {
-            let slice  = self.as_slice();
-            for i in pos .. *len - 1 {
+            let slice = self.as_slice();
+            for i in pos..*len - 1 {
                 slice.swap(i, i + 1);
             }
         }
@@ -687,27 +778,27 @@ trait BTreeSlice<T> : Sized + Slice<T>
 
 #[cfg(test)]
 mod test {
-    use std::mem::size_of;
-    use super::{Node, BPlusTree, Ordering};
-    use server::ServerOptions;
-    use server;
-    use std::sync::Arc;
-    use client;
-    use server::NebServer;
-    use dovahkiin::types::custom_types::id::Id;
-    use ram::types::RandValue;
-    use index::btree::NUM_KEYS;
-    use futures::future::Future;
-    use std::io::Cursor;
+    use super::{BPlusTree, Node, Ordering};
     use byteorder::BigEndian;
-    use smallvec::SmallVec;
     use byteorder::WriteBytesExt;
+    use client;
+    use dovahkiin::types::custom_types::id::Id;
+    use futures::future::Future;
     use hermes::stm::TxnValRef;
     use index::btree::external::CacheBufferZone;
-    use std::fs::File;
-    use std::io::Write;
+    use index::btree::NUM_KEYS;
     use index::id_from_key;
+    use ram::types::RandValue;
+    use server;
+    use server::NebServer;
+    use server::ServerOptions;
+    use smallvec::SmallVec;
     use std::env;
+    use std::fs::File;
+    use std::io::Cursor;
+    use std::io::Write;
+    use std::mem::size_of;
+    use std::sync::Arc;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -720,7 +811,7 @@ mod test {
         next: Option<String>,
         prev: Option<String>,
         len: usize,
-        is_external: bool
+        is_external: bool,
     }
 
     fn dump_tree(tree: &BPlusTree, f: &str) {
@@ -731,16 +822,23 @@ mod test {
         file.write_all(json.as_bytes());
     }
 
-    fn cascading_dump_node(tree: &BPlusTree, node: TxnValRef, bz: &mut CacheBufferZone) -> DebugNode {
-        let node = tree.stm.transaction(|txn| {
-           txn.read_owned::<Node>(node)
-               .map(|opt| opt.unwrap_or(Node::None))
-        }).unwrap();
+    fn cascading_dump_node(
+        tree: &BPlusTree,
+        node: TxnValRef,
+        bz: &mut CacheBufferZone,
+    ) -> DebugNode {
+        let node = tree
+            .stm
+            .transaction(|txn| {
+                txn.read_owned::<Node>(node)
+                    .map(|opt| opt.unwrap_or(Node::None))
+            })
+            .unwrap();
         match node {
             Node::External(id) => {
-
                 let node = bz.get(&*id);
-                let keys = node.keys
+                let keys = node
+                    .keys
                     .iter()
                     .take(node.len)
                     .map(|key| {
@@ -755,19 +853,21 @@ mod test {
                     next: Some(format!("{:?}", node.next)),
                     prev: Some(format!("{:?}", node.prev)),
                     len: node.len,
-                    is_external: true
-                }
-            },
+                    is_external: true,
+                };
+            }
             Node::Internal(innode) => {
                 let len = innode.len;
-                let nodes = innode.pointers
+                let nodes = innode
+                    .pointers
                     .iter()
                     .take(len + 1)
-                    .map(|node_ref| {cascading_dump_node(tree, *node_ref, bz)})
+                    .map(|node_ref| cascading_dump_node(tree, *node_ref, bz))
                     .collect();
-                let keys = innode.keys
+                let keys = innode
+                    .keys
                     .iter()
-                    .take(len )
+                    .take(len)
                     .map(|key| format!("{:?}", key))
                     .collect();
                 return DebugNode {
@@ -777,9 +877,9 @@ mod test {
                     next: None,
                     prev: None,
                     len,
-                    is_external: false
-                }
-            },
+                    is_external: false,
+                };
+            }
             Node::None => DebugNode {
                 keys: vec![String::from("<NOT FOUND>")],
                 nodes: vec![],
@@ -787,8 +887,8 @@ mod test {
                 next: None,
                 prev: None,
                 len: 0,
-                is_external: false
-            }
+                is_external: false,
+            },
         }
     }
 
@@ -803,22 +903,26 @@ mod test {
         env_logger::init();
         let server_group = "index_init";
         let server_addr = String::from("127.0.0.1:5100");
-        let server = NebServer::new_from_opts(&ServerOptions {
-            chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None
-        }, &server_addr, &server_group);
-        let client = Arc::new(client::AsyncClient::new(
-            &server.rpc, &vec!(server_addr),
-            server_group).unwrap());
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
         client.new_schema_with_id(super::external::page_schema());
         let tree = BPlusTree::new(&client);
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
         tree.insert(&key, &id).unwrap();
-        let mut cursor =  tree.seek(&key, Ordering::Forward).unwrap();
+        let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
         assert_eq!(cursor.current().unwrap(), id);
     }
 
@@ -836,20 +940,27 @@ mod test {
         env_logger::init();
         let server_group = "index_insertions";
         let server_addr = String::from("127.0.0.1:5101");
-        let server = NebServer::new_from_opts(&ServerOptions {
-            chunk_count: 1,
-            memory_size: 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None
-        }, &server_addr, &server_group);
-        let client = Arc::new(client::AsyncClient::new(
-            &server.rpc, &vec!(server_addr),
-            server_group).unwrap());
-        client.new_schema_with_id(super::external::page_schema()).wait();
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 1024 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client
+            .new_schema_with_id(super::external::page_schema())
+            .wait();
         let tree = BPlusTree::new(&client);
         let num = env::var("BTREE_TEST_ITEMS")
             .unwrap_or("1000".to_string())
-            .parse::<u64>().unwrap();
+            .parse::<u64>()
+            .unwrap();
         {
             info!("test insertion");
             for i in (0..num).rev() {
@@ -868,7 +979,8 @@ mod test {
                 }
                 // debug!("{:?}", root_innode.keys);
                 Ok(())
-            }).unwrap();
+            })
+            .unwrap();
             dump_tree(&tree, "tree_dump.json");
         }
         // sequence check
@@ -876,12 +988,20 @@ mod test {
             debug!("Scanning for sequence dump");
             let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
             for i in 0..num {
-                let id  = cursor.current().unwrap();
+                let id = cursor.current().unwrap();
                 let unmatched = i != id.lower;
-                let check_msg = if unmatched { "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-=" } else { "YES" };
+                let check_msg = if unmatched {
+                    "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-="
+                } else {
+                    "YES"
+                };
                 debug!("Index {} have id {:?} check: {}", i, id, check_msg);
                 if unmatched {
-                    debug!("Expecting index {} encoded {:?}", i, Id::new(0, i).to_binary());
+                    debug!(
+                        "Expecting index {} encoded {:?}",
+                        i,
+                        Id::new(0, i).to_binary()
+                    );
                 }
                 assert_eq!(cursor.next(), i + 1 < num);
             }
@@ -899,7 +1019,12 @@ mod test {
         {
             debug!("Backward scanning for sequence verification");
             let backward_start_key_slice = u64_to_slice(num - 1);
-            let mut cursor = tree.seek(&SmallVec::from_slice(&backward_start_key_slice), Ordering::Backward).unwrap();
+            let mut cursor = tree
+                .seek(
+                    &SmallVec::from_slice(&backward_start_key_slice),
+                    Ordering::Backward,
+                )
+                .unwrap();
             for i in (0..num).rev() {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
@@ -915,7 +1040,12 @@ mod test {
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
+                assert_eq!(
+                    tree.seek(&key, Ordering::default()).unwrap().current(),
+                    Some(id),
+                    "{}",
+                    i
+                );
             }
         }
 
@@ -942,8 +1072,10 @@ mod test {
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
                     tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(Id::new(0, deletion_volume)),  // seek should reach deletion_volume
-                    "{}", i);
+                    Some(Id::new(0, deletion_volume)), // seek should reach deletion_volume
+                    "{}",
+                    i
+                );
             }
 
             // check for remaining items
@@ -951,7 +1083,12 @@ mod test {
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{}", i);
+                assert_eq!(
+                    tree.seek(&key, Ordering::default()).unwrap().current(),
+                    Some(id),
+                    "{}",
+                    i
+                );
             }
 
             // remove remaining items
@@ -971,7 +1108,13 @@ mod test {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
                     let key = SmallVec::from_slice(&key_slice);
-                    assert_eq!(tree.seek(&key, Ordering::default()).unwrap().current(), Some(id), "{} / {}", i, j);
+                    assert_eq!(
+                        tree.seek(&key, Ordering::default()).unwrap().current(),
+                        Some(id),
+                        "{} / {}",
+                        i,
+                        j
+                    );
                 }
             }
             dump_tree(&tree, "remove_remains_dump.json");
@@ -983,7 +1126,9 @@ mod test {
                 assert_eq!(
                     tree.seek(&key, Ordering::default()).unwrap().current(),
                     None, // should always be 'None' for empty tree
-                    "{}", i);
+                    "{}",
+                    i
+                );
             }
         }
     }
