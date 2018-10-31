@@ -323,11 +323,6 @@ impl Chunk {
             seg_index_guard.remove(&seg_original_pos);
         }
         seg_index_guard.insert(segment_addr, segment_id);
-        if self.segs
-            .get_mut(&segment_id)
-            .map(|mut seg| *seg = (&segment).clone())
-            .is_some()
-            { return }
         self.segs.insert(segment_id, segment);
     }
 
