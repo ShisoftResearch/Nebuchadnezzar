@@ -6,3 +6,4 @@ pub mod rand;
 pub mod stream;
 pub mod chashmap;
 pub mod raii_mutex_table;
+pub mod futures_executor;
