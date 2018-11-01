@@ -16,6 +16,7 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
+use bifrost::utils::fut_exec::wait;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -66,7 +67,7 @@ pub fn init_conshash(
 ) -> Result<Arc<ConsistentHashing>, ServerError> {
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client) {
         Ok(ch) => {
-            ch.set_weight(address, memory_size).wait();
+            wait(ch.set_weight(address, memory_size));
             if !ch.init_table().is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
@@ -180,7 +181,7 @@ impl NebServer {
         let raft_client = RaftClient::new(meta_mambers, raft::DEFAULT_SERVICE_ID).unwrap();
         RaftClient::prepare_subscription(&rpc_server);
         let member_service = MemberService::new(server_addr, &raft_client);
-        member_service.join_group(group_name).wait().unwrap();
+        wait(member_service.join_group(group_name)).unwrap();
         NebServer::new(
             opts,
             server_addr,

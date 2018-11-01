@@ -97,7 +97,6 @@ impl Cleaner {
                             .fetch_sub(cleaned_space, Ordering::Relaxed);
                         chunk.check_and_archive_segments();
                     }
-                    debug!("Cleaner round finished");
                     thread::sleep(Duration::from_millis(100));
                 }
                 warn!("Cleaner main thread stopped");

@@ -10,6 +10,7 @@ use core::borrow::Borrow;
 use std::string::String;
 use std::sync::Arc;
 
+use bifrost::utils::fut_exec::wait;
 use futures::Future;
 
 pub mod sm;
@@ -106,27 +107,24 @@ impl LocalSchemasCache {
                 let m1 = map.clone();
                 let m2 = map.clone();
                 let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft);
-                let mut sm_data = sm.get_all().wait()?.unwrap();
+                let mut sm_data = wait(sm.get_all())?.unwrap();
                 {
                     let mut map = map.write();
                     for schema in sm_data {
                         map.new_schema(schema);
                     }
                 }
-                let _ = sm
-                    .on_schema_added(move |r| {
-                        let schema = r.unwrap();
-                        debug!("Add schema {} from subscription", schema.id);
-                        let mut m1 = m1.write();
-                        m1.new_schema(schema);
-                    })
-                    .wait()?;
-                let _ = sm
+                let _ = wait(sm.on_schema_added(move |r| {
+                    let schema = r.unwrap();
+                    debug!("Add schema {} from subscription", schema.id);
+                    let mut m1 = m1.write();
+                    m1.new_schema(schema);
+                }))?;
+                let _ = wait(sm
                     .on_schema_deleted(move |r| {
                         let mut m2 = m2.write();
                         m2.del_schema(&r.unwrap());
-                    })
-                    .wait()?;
+                    }))?;
                 Some(sm)
             }
             None => None,

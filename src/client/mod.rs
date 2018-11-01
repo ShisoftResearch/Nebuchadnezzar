@@ -75,11 +75,13 @@ impl AsyncClientInner {
         this: Arc<Self>,
         id: Id,
     ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
-        let id = this.locate_server_id(&id).unwrap();
+        let server_id = this.locate_server_id(&id).unwrap();
         DEFAULT_CLIENT_POOL
-            .get_by_id_async(id, move |sid| this.conshash.to_server_name(sid))
+            .get_by_id_async(server_id, move |sid| this.conshash.to_server_name(sid))
             .map_err(|e| RPCError::IOError(e))
-            .map(|c| plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &c))
+            .map(move |c| {
+                plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &c)
+            })
     }
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {

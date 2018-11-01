@@ -1,5 +1,6 @@
 use bifrost::utils::async_locks::Mutex;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use bifrost::utils::fut_exec::wait;
 use client::AsyncClient;
 use dovahkiin::types;
 use dovahkiin::types::custom_types::id::Id;
@@ -118,9 +119,7 @@ impl BPlusTree {
                 CACHE_SIZE,
                 move |id| {
                     debug!("Reading page to cache {:?}", id);
-                    neb_client_1
-                        .read_cell(*id)
-                        .wait()
+                    wait(neb_client_1.read_cell(*id))
                         .unwrap()
                         .map(|cell| Arc::new(RwLock::new(ExtNode::from_cell(cell))))
                         .ok()
@@ -129,7 +128,7 @@ impl BPlusTree {
                     debug!("Flush page to cache {:?}", &id);
                     let cache = value.read();
                     let cell = cache.to_cell();
-                    neb_client_2.upsert_cell(cell).wait().unwrap();
+                    wait(neb_client_2.upsert_cell(cell)).unwrap();
                 },
             ))),
         };
@@ -799,6 +798,7 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
+    use bifrost::utils::fut_exec::wait;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -953,9 +953,7 @@ mod test {
         let client = Arc::new(
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
-        client
-            .new_schema_with_id(super::external::page_schema())
-            .wait();
+        wait(client.new_schema_with_id(super::external::page_schema())).unwrap();
         let tree = BPlusTree::new(&client);
         let num = env::var("BTREE_TEST_ITEMS")
             .unwrap_or("1000".to_string())

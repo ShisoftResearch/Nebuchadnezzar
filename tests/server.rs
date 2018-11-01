@@ -5,6 +5,7 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
 use bifrost::rpc::Server;
+use bifrost::utils::fut_exec::wait;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
@@ -84,7 +85,7 @@ pub fn smoke_test() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap());
-    client.new_schema_with_id(schema).wait();
+    wait(client.new_schema_with_id(schema));
 
     (0..num).collect::<Vec<_>>().into_iter().for_each(|i| {
         let client_clone = client.clone();
@@ -93,14 +94,14 @@ pub fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).wait();
+        wait(client_clone.upsert_cell(cell));
 
         // read
-        let read_cell = client_clone.read_cell(id).wait().unwrap().unwrap();
+        let read_cell = wait(client_clone.read_cell(id)).unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            client_clone.remove_cell(id).wait();
+            wait(client_clone.remove_cell(id));
         }
     });
 
@@ -109,10 +110,10 @@ pub fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).wait();
+        wait(client.upsert_cell(cell));
 
         // verify
-        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
+        let read_cell = wait(client.read_cell(id)).unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
     });
 }
@@ -126,7 +127,7 @@ pub fn smoke_test_parallel() {
         .unwrap();
     env_logger::init();
     let server_addr = String::from("127.0.0.1:5300");
-    let server_group = String::from("smoke_test");
+    let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
@@ -161,7 +162,7 @@ pub fn smoke_test_parallel() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap());
-    client.new_schema_with_id(schema).wait();
+    wait(client.new_schema_with_id(schema));
 
     // Create a background thread which checks for deadlocks every 10s
     thread::Builder::new()
@@ -187,30 +188,31 @@ pub fn smoke_test_parallel() {
     (0..num).collect::<Vec<_>>().into_par_iter().for_each(|i| {
         let client_clone = client.clone();
         // intense upsert, half delete
-        let id = Id::new(0, i / 2);
+        let id = Id::new(0, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).wait();
+        wait(client_clone.upsert_cell(cell));
 
         // read
-        let read_cell = client_clone.read_cell(id).wait().unwrap().unwrap();
+        let read_cell = wait(client_clone.read_cell(id)).unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            client_clone.remove_cell(id).wait();
+            wait(client_clone.remove_cell(id));
         }
     });
 
     (0..num).collect::<Vec<_>>().into_par_iter().for_each(|i| {
+        if i % 2 == 0 { return }
         let id = Id::new(0, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).wait();
+        wait(client.upsert_cell(cell));
 
         // verify
-        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
+        let read_cell = wait(client.read_cell(id)).unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
     });
 }

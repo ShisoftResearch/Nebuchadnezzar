@@ -1,4 +1,5 @@
 use bifrost::utils::async_locks::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use bifrost::utils::fut_exec::wait;
 use client::AsyncClient;
 use core::borrow::BorrowMut;
 use dovahkiin::types::custom_types::id::Id;
@@ -394,7 +395,7 @@ impl CacheBufferZone {
                     CachedData::Deleted => {
                         debug!("Flushing deleting node: {:?}", id);
                         self.mapper.lock().remove(id);
-                        self.storage.remove_cell(*id).wait().unwrap();
+                        wait(self.storage.remove_cell(*id)).unwrap();
                     }
                     _ => panic!(),
                 }

@@ -2,6 +2,7 @@ use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::types::{Id, Value};
 use server::transactions::TxnId;
 use server::transactions::*;
+use bifrost::utils::fut_exec::wait;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
@@ -35,7 +36,7 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn read(&self, id: Id) -> Result<Option<Cell>, TxnError> {
-        match self.client.read(self.tid.to_owned(), id).wait() {
+        match wait(self.client.read(self.tid.to_owned(), id)) {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
@@ -46,10 +47,7 @@ impl Transaction {
         }
     }
     pub fn read_selected(&self, id: Id, fields: Vec<u64>) -> Result<Option<Vec<Value>>, TxnError> {
-        match self
-            .client
-            .read_selected(self.tid.to_owned(), id, fields)
-            .wait()
+        match wait(self.client.read_selected(self.tid.to_owned(), id, fields))
         {
             Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -61,7 +59,7 @@ impl Transaction {
         }
     }
     pub fn write(&self, cell: Cell) -> Result<(), TxnError> {
-        match self.client.write(self.tid.to_owned(), cell).wait() {
+        match wait(self.client.write(self.tid.to_owned(), cell)) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
@@ -71,7 +69,7 @@ impl Transaction {
         }
     }
     pub fn update(&self, cell: Cell) -> Result<(), TxnError> {
-        match self.client.update(self.tid.to_owned(), cell).wait() {
+        match wait(self.client.update(self.tid.to_owned(), cell)) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
@@ -81,7 +79,7 @@ impl Transaction {
         }
     }
     pub fn remove(&self, id: Id) -> Result<(), TxnError> {
-        match self.client.remove(self.tid.to_owned(), id).wait() {
+        match wait(self.client.remove(self.tid.to_owned(), id)) {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
@@ -91,7 +89,7 @@ impl Transaction {
         }
     }
     pub fn head(&self, id: Id) -> Result<Option<CellHeader>, TxnError> {
-        match self.client.head(self.tid.to_owned(), id).wait() {
+        match wait(self.client.head(self.tid.to_owned(), id)) {
             Ok(Ok(TxnExecResult::Accepted(head))) => Ok(Some(head)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
@@ -110,7 +108,7 @@ impl Transaction {
     }
     pub fn prepare(&self) -> Result<(), TxnError> {
         self.state.set(TxnState::Prepared);
-        match self.client.prepare(self.tid.to_owned()).wait() {
+        match wait(self.client.prepare(self.tid.to_owned())) {
             Ok(Ok(TMPrepareResult::Success)) => return Ok(()),
             Ok(Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))) => {
                 Err(TxnError::NotRealizable)
@@ -125,7 +123,7 @@ impl Transaction {
     }
     pub fn commit(&self) -> Result<(), TxnError> {
         self.state.set(TxnState::Committed);
-        match self.client.commit(self.tid.to_owned()).wait() {
+        match wait(self.client.commit(self.tid.to_owned())) {
             Ok(Ok(EndResult::Success)) => return Ok(()),
             Ok(Ok(EndResult::SomeLocksNotReleased)) => return Ok(()),
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
@@ -138,7 +136,7 @@ impl Transaction {
             return Ok(());
         }
         self.state.set(TxnState::Aborted);
-        match self.client.abort(self.tid.to_owned()).wait() {
+        match wait(self.client.abort(self.tid.to_owned())) {
             Ok(Ok(AbortResult::Success(rollback_failures))) => {
                 Err(TxnError::Aborted(rollback_failures))
             }
