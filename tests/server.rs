@@ -5,7 +5,6 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
 use bifrost::rpc::Server;
-use bifrost::utils::fut_exec::wait;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
@@ -85,7 +84,7 @@ pub fn smoke_test() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap());
-    wait(client.new_schema_with_id(schema));
+    client.new_schema_with_id(schema).wait();
 
     (0..num).collect::<Vec<_>>().into_iter().for_each(|i| {
         let client_clone = client.clone();
@@ -94,14 +93,14 @@ pub fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        wait(client_clone.upsert_cell(cell));
+        client_clone.upsert_cell(cell).wait();
 
         // read
-        let read_cell = wait(client_clone.read_cell(id)).unwrap().unwrap();
+        let read_cell = client_clone.read_cell(id).wait().unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            wait(client_clone.remove_cell(id));
+            client_clone.remove_cell(id).wait();
         }
     });
 
@@ -110,10 +109,10 @@ pub fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        wait(client.upsert_cell(cell));
+        client.upsert_cell(cell).wait();
 
         // verify
-        let read_cell = wait(client.read_cell(id)).unwrap().unwrap();
+        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
     });
 }
@@ -162,7 +161,7 @@ pub fn smoke_test_parallel() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap());
-    wait(client.new_schema_with_id(schema));
+    client.new_schema_with_id(schema).wait();
 
     // Create a background thread which checks for deadlocks every 10s
     thread::Builder::new()
@@ -192,14 +191,14 @@ pub fn smoke_test_parallel() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        wait(client_clone.upsert_cell(cell));
+        client_clone.upsert_cell(cell).wait();
 
         // read
-        let read_cell = wait(client_clone.read_cell(id)).unwrap().unwrap();
+        let read_cell = client_clone.read_cell(id).wait().unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            wait(client_clone.remove_cell(id));
+            client_clone.remove_cell(id).wait();
         }
     });
 
@@ -209,10 +208,10 @@ pub fn smoke_test_parallel() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        wait(client.upsert_cell(cell));
+        client.upsert_cell(cell).wait();
 
         // verify
-        let read_cell = wait(client.read_cell(id)).unwrap().unwrap();
+        let read_cell = client.read_cell(id).wait().unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
     });
 }
