@@ -1,10 +1,10 @@
-use ram::chunk::Chunk;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::collections::HashSet;
-use ram::segs::{Segment, MAX_SEGMENT_SIZE};
-use ram::entry::{EntryContent, Entry, EntryType};
 use itertools::Itertools;
+use ram::chunk::Chunk;
+use ram::entry::{Entry, EntryContent, EntryType};
+use ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use std::collections::HashSet;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use libc;
 
@@ -20,13 +20,14 @@ struct DummyEntry {
 
 struct DummySegment {
     head: usize,
-    entries: Vec<DummyEntry>
+    entries: Vec<DummyEntry>,
 }
 
 impl DummySegment {
     fn new() -> DummySegment {
         DummySegment {
-            head: 0, entries: Vec::new()
+            head: 0,
+            entries: Vec::new(),
         }
     }
 }
@@ -41,20 +42,27 @@ impl DummySegment {
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
         if segments.len() < 2 {
-            debug!("too few segments to combine, chunk {}, segments {}", chunk.id, segments.len());
+            debug!(
+                "too few segments to combine, chunk {}, segments {}",
+                chunk.id,
+                segments.len()
+            );
             return 0;
         }
         debug!("Combining segments");
 
-        let space_to_collect = segments.iter().map(|seg| seg.used_spaces() as usize).sum::<usize>();
+        let space_to_collect = segments
+            .iter()
+            .map(|seg| seg.used_spaces() as usize)
+            .sum::<usize>();
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
 
-        debug!("get all entries in segments to combine and order them by data temperature and size");
+        debug!(
+            "get all entries in segments to combine and order them by data temperature and size"
+        );
         let nested_entries = segments
             .iter()
-            .flat_map(|seg| {
-                chunk.live_entries(seg)
-            })
+            .flat_map(|seg| chunk.live_entries(seg))
             .filter(|entry| {
                 // live entries have done a lot of filtering work already
                 // but we still need to remove those tombstones that pointed to segments we are about to combine
@@ -68,7 +76,7 @@ impl CombinedCleaner {
                 let entry_addr = entry.meta.entry_pos;
                 let cell_header = match entry.content {
                     EntryContent::Cell(header) => Some(header),
-                    _ => None
+                    _ => None,
                 };
                 DummyEntry {
                     size: entry_size,
@@ -77,9 +85,7 @@ impl CombinedCleaner {
                     cell_hash: cell_header.map(|h| h.hash),
                 }
             })
-            .group_by(|entry| {
-                entry.timestamp / 10
-            })
+            .group_by(|entry| entry.timestamp / 10)
             .into_iter()
             .map(|(t, group)| {
                 let mut group: Vec<_> = group.collect();
@@ -104,8 +110,7 @@ impl CombinedCleaner {
         let mut cursor = 0;
         pending_segments.push(DummySegment::new());
         while entries_to_claim > 0 {
-            let segment_space_remains =
-                MAX_SEGMENT_SIZE - pending_segments.last().unwrap().head;
+            let segment_space_remains = MAX_SEGMENT_SIZE - pending_segments.last().unwrap().head;
             let index = cursor % entries_num;
             let entry_pair = entries.get_mut(index).unwrap();
             if entry_pair.1 {
@@ -143,17 +148,24 @@ impl CombinedCleaner {
         let pending_segments_len = pending_segments.len();
         let segments_to_combine_len = segments.len();
         let mut cleaned_total_live_space = 0;
-        if pending_segments_len >= segments_to_combine_len  {
-            warn!("Trying to combine segments but resulting segments still does not go down {}/{}",
-                  pending_segments_len, segments_to_combine_len);
+        if pending_segments_len >= segments_to_combine_len {
+            warn!(
+                "Trying to combine segments but resulting segments still does not go down {}/{}",
+                pending_segments_len, segments_to_combine_len
+            );
         }
-        
+
         debug!("Updating cell reference");
         let unstable_guards = pending_segments
             .iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();
-                let new_seg = Segment::new(new_seg_id, dummy_seg.head, &chunk.backup_storage, &chunk.wal_storage);
+                let new_seg = Segment::new(
+                    new_seg_id,
+                    dummy_seg.head,
+                    &chunk.backup_storage,
+                    &chunk.wal_storage,
+                );
                 let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                 let mut seg_cursor = new_seg.addr;
                 debug!("Combining segment to new one with id {}", new_seg_id);
@@ -163,10 +175,14 @@ impl CombinedCleaner {
                         libc::memcpy(
                             seg_cursor as *mut libc::c_void,
                             entry_addr as *mut libc::c_void,
-                            entry.size);
+                            entry.size,
+                        );
                     }
                     if let Some(cell_hash) = entry.cell_hash {
-                        debug!("Marked cell relocation hash {}, addr {} to segment {}", cell_hash, entry_addr, new_seg_id);
+                        debug!(
+                            "Marked cell relocation hash {}, addr {} to segment {}",
+                            cell_hash, entry_addr, new_seg_id
+                        );
                         cell_mapping.push((seg_cursor, entry_addr, cell_hash));
                     }
                     seg_cursor += entry.size;
@@ -189,7 +205,10 @@ impl CombinedCleaner {
                     if *actual_addr == old {
                         *actual_addr = new
                     } else {
-                        warn!("cell {} with address {}, have been changed to {} on combine", hash, old, *actual_addr);
+                        warn!(
+                            "cell {} with address {}, have been changed to {} on combine",
+                            hash, old, *actual_addr
+                        );
                     }
                 } else {
                     warn!("cell {} address {} have been removed on combine", hash, old);
@@ -204,9 +223,12 @@ impl CombinedCleaner {
             old_seg.mem_drop();
         }
         let space_cleaned = space_to_collect - cleaned_total_live_space;
-        debug!("Combined {} segments to {}, total {} bytes",
-               segments_to_combine_len, pending_segments.len(), space_cleaned);
+        debug!(
+            "Combined {} segments to {}, total {} bytes",
+            segments_to_combine_len,
+            pending_segments.len(),
+            space_cleaned
+        );
         space_cleaned
     }
-
 }

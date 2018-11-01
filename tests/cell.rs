@@ -1,17 +1,17 @@
 use neb::ram::cell;
 use neb::ram::cell::*;
-use neb::ram::schema::*;
 use neb::ram::chunk::Chunks;
-use neb::ram::types::*;
 use neb::ram::io::writer;
+use neb::ram::schema::*;
+use neb::ram::types::*;
 
-use std::mem;
 use super::*;
+use std::mem;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 #[test]
-pub fn cell_rw () {
+pub fn cell_rw() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
@@ -21,7 +21,7 @@ pub fn cell_rw () {
         key_field: None,
         str_key_field: None,
         fields,
-        is_dynamic: false
+        is_dynamic: false,
     };
     let mut data = data_map_value!{
         id: 100 as i64,
@@ -32,7 +32,7 @@ pub fn cell_rw () {
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
-        data
+        data,
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
@@ -50,7 +50,7 @@ pub fn cell_rw () {
     };
     cell = Cell {
         header: CellHeader::new(0, schema.id, &id2),
-        data
+        data,
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
@@ -81,7 +81,7 @@ pub fn dynamic() {
         key_field: None,
         str_key_field: None,
         fields,
-        is_dynamic: true
+        is_dynamic: true,
     };
     let mut data_map = Map::new();
     data_map.insert("id", Value::I64(100));
@@ -94,7 +94,7 @@ pub fn dynamic() {
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
-        data
+        data,
     };
     let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
@@ -116,7 +116,7 @@ pub fn dynamic() {
     data = Value::Map(data_map);
     cell = Cell {
         header: CellHeader::new(0, schema.id, &id2),
-        data
+        data,
     };
     loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();

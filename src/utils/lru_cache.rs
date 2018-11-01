@@ -1,17 +1,24 @@
 use linked_hash_map::*;
 use std::hash::Hash;
 
-pub struct LRUCache<K, V> where K: Clone + Eq + Hash {
+pub struct LRUCache<K, V>
+where
+    K: Clone + Eq + Hash,
+{
     capacity: usize,
     map: LinkedHashMap<K, V>,
     fetch_fn: Box<Fn(&K) -> Option<V>>,
-    evict_fn: Box<Fn(K, V)>
+    evict_fn: Box<Fn(K, V)>,
 }
 
-impl <K, V> LRUCache<K, V> where K: Clone + Eq + Hash {
+impl<K, V> LRUCache<K, V>
+where
+    K: Clone + Eq + Hash,
+{
     pub fn new<FF, EF>(capacity: usize, fetch_fn: FF, evict_fn: EF) -> LRUCache<K, V>
-        where FF: Fn(&K) -> Option<V> + 'static,
-              EF: Fn(K, V) + 'static
+    where
+        FF: Fn(&K) -> Option<V> + 'static,
+        EF: Fn(K, V) + 'static,
     {
         LRUCache {
             capacity,
@@ -39,8 +46,7 @@ impl <K, V> LRUCache<K, V> where K: Clone + Eq + Hash {
         self.get_or_fetch(key)
     }
 
-    pub fn get_or_fetch(&mut self, key: &K) -> Option<&mut V>
-    {
+    pub fn get_or_fetch(&mut self, key: &K) -> Option<&mut V> {
         // TODO: one search only
         if self.map.contains_key(key) {
             return self.map.get_refresh(key);

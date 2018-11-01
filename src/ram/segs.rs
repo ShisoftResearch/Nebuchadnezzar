@@ -1,20 +1,20 @@
+use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
+use crc32c::crc32c;
 use libc;
-use ram::entry;
-use ram::tombstone::{TOMBSTONE_SIZE_U32, Tombstone};
+use parking_lot;
 use ram::cell;
 use ram::cell::Cell;
 use ram::chunk::Chunk;
+use ram::entry;
 use ram::entry::EntryMeta;
-use std::sync::atomic::{AtomicUsize, AtomicU32, AtomicI64, AtomicBool, Ordering};
+use ram::tombstone::{Tombstone, TOMBSTONE_SIZE_U32};
 use std::collections::BTreeSet;
-use std::fs::{File, remove_file, copy};
-use std::io::BufWriter;
-use std::io::prelude::*;
+use std::fs::{copy, remove_file, File};
 use std::io;
+use std::io::prelude::*;
+use std::io::BufWriter;
 use std::path::Path;
-use crc32c::crc32c;
-use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
-use parking_lot;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 use super::cell::CellHeader;
 
@@ -35,13 +35,16 @@ pub struct Segment {
     pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
-    pub dropped: AtomicBool
+    pub dropped: AtomicBool,
 }
 
 impl Segment {
-    pub fn new(id: u64, size: usize,
-               backup_storage: &Option<String>,
-               wal_storage: &Option<String>) -> Segment {
+    pub fn new(
+        id: u64,
+        size: usize,
+        backup_storage: &Option<String>,
+        wal_storage: &Option<String>,
+    ) -> Segment {
         let buffer_ptr = unsafe { libc::malloc(size) as usize };
         let mut wal_file_name = None;
         let mut wal_file = None;
@@ -49,11 +52,15 @@ impl Segment {
             let file_name = format!("{}/{}.log", wal_storage, id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
-                File::open(&file_name).unwrap()); // fast fail
+                File::open(&file_name).unwrap(),
+            ); // fast fail
             wal_file_name = Some(file_name);
             wal_file = Some(parking_lot::Mutex::new(file));
         }
-        debug!("Creating new segment with id {}, size {}, address {}", id, size, buffer_ptr);
+        debug!(
+            "Creating new segment with id {}, size {}, address {}",
+            id, size, buffer_ptr
+        );
         Segment {
             addr: buffer_ptr,
             id,
@@ -64,11 +71,13 @@ impl Segment {
             dead_tombstones: AtomicU32::new(0),
             last_tombstones_scanned: AtomicI64::new(0),
             references: AtomicUsize::new(0),
-            backup_file_name: backup_storage.clone().map(|path| format!("{}/{}.backup", path, id)),
+            backup_file_name: backup_storage
+                .clone()
+                .map(|path| format!("{}/{}.backup", path, id)),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             wal_file,
-            wal_file_name
+            wal_file_name,
         }
     }
 
@@ -80,7 +89,11 @@ impl Segment {
             if exp_last > self.bound {
                 return None;
             } else {
-                if self.append_header.compare_and_swap(curr_last, exp_last, Ordering::SeqCst) != curr_last {
+                if self
+                    .append_header
+                    .compare_and_swap(curr_last, exp_last, Ordering::SeqCst)
+                    != curr_last
+                {
                     continue;
                 } else {
                     return Some(curr_last);
@@ -96,7 +109,7 @@ impl Segment {
     pub fn entry_iter(&self) -> SegmentEntryIter {
         SegmentEntryIter {
             bound: self.append_header(),
-            cursor: self.addr
+            cursor: self.addr,
         }
     }
 
@@ -106,7 +119,8 @@ impl Segment {
 
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
-        let dead_tombstones_space = self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        let dead_tombstones_space =
+            self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
         let dead_cells_space = self.dead_space();
         return dead_tombstones_space + dead_cells_space;
     }
@@ -114,7 +128,7 @@ impl Segment {
     pub fn used_spaces(&self) -> u32 {
         let space = (self.append_header.load(Ordering::Relaxed) as usize - self.addr);
         debug_assert!(space <= MAX_SEGMENT_SIZE);
-        return space as u32
+        return space as u32;
     }
 
     pub fn living_space(&self) -> u32 {
@@ -123,8 +137,10 @@ impl Segment {
         if total_dead_space <= used_space {
             used_space - total_dead_space
         } else {
-            warn!("living space check error for segment {}, used {}, dead {}",
-                  self.id, used_space, total_dead_space);
+            warn!(
+                "living space check error for segment {}, used {}, dead {}",
+                self.id, used_space, total_dead_space
+            );
             0
         }
     }
@@ -145,10 +161,13 @@ impl Segment {
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
         if let &Some(ref backup_file) = &self.backup_file_name {
-            while !self.no_references() { /* wait until all references released */}
+            while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
             if backup_file_path.exists() {
-                warn!("Segment backup {} exists and can't archive twice", backup_file);
+                warn!(
+                    "Segment backup {} exists and can't archive twice",
+                    backup_file
+                );
                 return Ok(false);
             }
             if let Some(ref wal_file) = self.wal_file_name {
@@ -159,8 +178,9 @@ impl Segment {
                     let _ = file_mutex.lock();
                     copy(wal_file, backup_file);
                     remove_file(wal_file);
-                } else { panic!() }
-
+                } else {
+                    panic!()
+                }
             } else {
                 let backup_file = File::open(backup_file_path)?;
                 let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
@@ -194,14 +214,17 @@ impl Segment {
         return Ok(());
     }
 
-    pub fn no_references(&self) -> bool { self.references.load(Ordering::Relaxed) == 0 }
+    pub fn no_references(&self) -> bool {
+        self.references.load(Ordering::Relaxed) == 0
+    }
 
     pub fn mem_drop(&self) {
-        if !self.dropped.compare_and_swap(false, true, Ordering::Relaxed) {
+        if !self
+            .dropped
+            .compare_and_swap(false, true, Ordering::Relaxed)
+        {
             debug!("disposing segment at {}", self.addr);
-            unsafe {
-                libc::free(self.addr as *mut libc::c_void)
-            }
+            unsafe { libc::free(self.addr as *mut libc::c_void) }
         }
     }
 
@@ -231,7 +254,7 @@ impl Drop for Segment {
 
 pub struct SegmentEntryIter {
     bound: usize,
-    cursor: usize
+    cursor: usize,
 }
 
 impl Iterator for SegmentEntryIter {
@@ -242,17 +265,18 @@ impl Iterator for SegmentEntryIter {
         if cursor >= self.bound {
             return None;
         }
-        let (_, entry_meta) = entry::Entry::decode_from(
-            cursor,
-            |body_pos, header| {
-                let entry_header_size = body_pos - cursor;
-                let entry_size = entry_header_size + header.content_length as usize;
-                debug!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
+        let (_, entry_meta) = entry::Entry::decode_from(cursor, |body_pos, header| {
+            let entry_header_size = body_pos - cursor;
+            let entry_size = entry_header_size + header.content_length as usize;
+            debug!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
                        body_pos, header, entry_header_size, entry_size, cursor, header.content_length, self.bound);
-                return EntryMeta {
-                    body_pos, entry_header: header, entry_size, entry_pos: cursor
-                };
-            });
+            return EntryMeta {
+                body_pos,
+                entry_header: header,
+                entry_size,
+                entry_pos: cursor,
+            };
+        });
         self.cursor += entry_meta.entry_size;
         Some(entry_meta)
     }
