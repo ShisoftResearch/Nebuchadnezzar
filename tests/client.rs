@@ -84,13 +84,14 @@ pub fn general() {
         threads.push(thread::spawn(move || {
             client
                 .transaction(move |ref mut txn| {
+                    let mut cell = txn.read(cell_1_id.to_owned())?.unwrap();
+                    // WARNING: read_selected is subject to dirty read
                     let selected = txn
                         .read_selected(
                             cell_1_id.to_owned(),
                             types::key_hashes(&vec![String::from("score")]),
                         )?
                         .unwrap();
-                    let mut cell = txn.read(cell_1_id.to_owned())?.unwrap();
                     let mut score = *cell.data["score"].U64().unwrap();
                     assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
                     score += 1;
