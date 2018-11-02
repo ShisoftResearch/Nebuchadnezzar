@@ -20,7 +20,7 @@ use futures::Future;
 
 use self::transaction::*;
 
-static TRANSACTION_MAX_RETRY: u32 = 500;
+static TRANSACTION_MAX_RETRY: u32 = 1000;
 
 pub mod transaction;
 

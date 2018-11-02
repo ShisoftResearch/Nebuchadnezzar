@@ -49,9 +49,9 @@ use std::{cmp, fmt, iter, mem, ops};
 /// The atomic ordering used throughout the code.
 const ORDERING: atomic::Ordering = atomic::Ordering::Relaxed;
 /// The length-to-capacity factor.
-const LENGTH_MULTIPLIER: usize = 4;
+const LENGTH_MULTIPLIER: usize = 2;
 /// The maximal load factor's numerator.
-const MAX_LOAD_FACTOR_NUM: usize = 100 - 15;
+const MAX_LOAD_FACTOR_NUM: usize = 100 - 10;
 /// The maximal load factor's denominator.
 const MAX_LOAD_FACTOR_DENOM: usize = 100;
 /// The default initial capacity.
@@ -957,7 +957,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         };
         let rm_count = self.rm.fetch_add(1, ORDERING);
         if rm_count + len >= buckets || rm_count >= len / 2 {
-            self.shrink_to_fit();
+            self.reserve(0);
         }
         Some(removed)
     }
@@ -973,11 +973,13 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         let mut lock = self.table.write();
         // Handle the case where another thread has resized the table while we were acquiring the
         // lock.
-        if lock.buckets.len() < len * LENGTH_MULTIPLIER {
+        let desired_len = len * LENGTH_MULTIPLIER;
+        if lock.buckets.len() < desired_len {
             // Swap the table out with a new table of desired size (multiplied by some factor).
-            let table = mem::replace(&mut *lock, Table::with_capacity(len));
+            let table = mem::replace(&mut *lock, Table::with_capacity(desired_len));
             // Fill the new table with the data from the old table.
             lock.fill(table);
+            self.rm.store(0, ORDERING);
         }
     }
 
@@ -1005,9 +1007,10 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     fn expand(&self, lock: RwLockReadGuard<Table<K, V>>) {
         // Increment the length to take the new element into account.
         let len = self.len.fetch_add(1, ORDERING) + 1;
+        let buckets_len = lock.buckets.len();
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
-        if len * MAX_LOAD_FACTOR_DENOM > lock.buckets.len() * MAX_LOAD_FACTOR_NUM {
+        if len * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM || len >= buckets_len {
             // Drop the read lock to avoid deadlocks when acquiring the write lock.
             drop(lock);
             // Reserve 1 entry in space (the function will handle the excessive space logic).
@@ -1758,8 +1761,6 @@ mod test {
             a.insert(item, 0);
             item += 1;
         }
-
-        assert_eq!(a.len(), a.capacity());
 
         // Insert at capacity should cause allocation.
         a.insert(item, 0);
