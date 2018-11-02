@@ -51,7 +51,7 @@ const ORDERING: atomic::Ordering = atomic::Ordering::Relaxed;
 /// The length-to-capacity factor.
 const LENGTH_MULTIPLIER: usize = 2;
 /// The maximal load factor's numerator.
-const MAX_LOAD_FACTOR_NUM: usize = 100 - 15;
+const MAX_LOAD_FACTOR_NUM: usize = 100 - 10;
 /// The maximal load factor's denominator.
 const MAX_LOAD_FACTOR_DENOM: usize = 100;
 /// The default initial capacity.
@@ -1009,7 +1009,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         let buckets_len = lock.buckets.len();
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
-        if len * MAX_LOAD_FACTOR_DENOM >= buckets_len * MAX_LOAD_FACTOR_NUM || len >= buckets_len {
+        if len * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM || len >= buckets_len {
             // Drop the read lock to avoid deadlocks when acquiring the write lock.
             drop(lock);
             // Reserve 1 entry in space (the function will handle the excessive space logic).
@@ -1760,8 +1760,6 @@ mod test {
             a.insert(item, 0);
             item += 1;
         }
-
-        assert_eq!(a.len(), a.capacity());
 
         // Insert at capacity should cause allocation.
         a.insert(item, 0);
