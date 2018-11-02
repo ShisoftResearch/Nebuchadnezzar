@@ -1005,9 +1005,10 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     fn expand(&self, lock: RwLockReadGuard<Table<K, V>>) {
         // Increment the length to take the new element into account.
         let len = self.len.fetch_add(1, ORDERING) + 1;
+        let buckets_len = lock.buckets.len();
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
-        if len * MAX_LOAD_FACTOR_DENOM > lock.buckets.len() * MAX_LOAD_FACTOR_NUM {
+        if len * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM || len + 1 >= buckets_len {
             // Drop the read lock to avoid deadlocks when acquiring the write lock.
             drop(lock);
             // Reserve 1 entry in space (the function will handle the excessive space logic).
