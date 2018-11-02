@@ -126,7 +126,7 @@ pub fn smoke_test_parallel() {
         .parse::<u64>()
         .unwrap();
     env_logger::init();
-    let server_addr = String::from("127.0.0.1:5300");
+    let server_addr = String::from("127.0.0.1:5301");
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
