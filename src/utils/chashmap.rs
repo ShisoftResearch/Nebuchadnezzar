@@ -49,7 +49,7 @@ use std::{cmp, fmt, iter, mem, ops};
 /// The atomic ordering used throughout the code.
 const ORDERING: atomic::Ordering = atomic::Ordering::Relaxed;
 /// The length-to-capacity factor.
-const LENGTH_MULTIPLIER: usize = 4;
+const LENGTH_MULTIPLIER: usize = 2;
 /// The maximal load factor's numerator.
 const MAX_LOAD_FACTOR_NUM: usize = 100 - 15;
 /// The maximal load factor's denominator.
@@ -973,9 +973,10 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         let mut lock = self.table.write();
         // Handle the case where another thread has resized the table while we were acquiring the
         // lock.
-        if lock.buckets.len() < len * LENGTH_MULTIPLIER {
+        let desired_len = len * LENGTH_MULTIPLIER;
+        if lock.buckets.len() < desired_len {
             // Swap the table out with a new table of desired size (multiplied by some factor).
-            let table = mem::replace(&mut *lock, Table::with_capacity(len));
+            let table = mem::replace(&mut *lock, Table::with_capacity(desired_len));
             // Fill the new table with the data from the old table.
             lock.fill(table);
         }
@@ -1008,7 +1009,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         let buckets_len = lock.buckets.len();
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
-        if len * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM || len + 1 >= buckets_len {
+        if len * MAX_LOAD_FACTOR_DENOM >= buckets_len * MAX_LOAD_FACTOR_NUM || len >= buckets_len {
             // Drop the read lock to avoid deadlocks when acquiring the write lock.
             drop(lock);
             // Reserve 1 entry in space (the function will handle the excessive space logic).
