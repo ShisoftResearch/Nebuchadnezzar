@@ -957,7 +957,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         };
         let rm_count = self.rm.fetch_add(1, ORDERING);
         if rm_count + len >= buckets || rm_count >= len / 2 {
-            self.reserve(len);
+            self.reserve(0);
         }
         Some(removed)
     }
