@@ -955,6 +955,10 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         removed
     }
 
+    fn removed(&self) -> usize {
+        self.rm.load(ORDERING)
+    }
+
     /// Reserve additional space.
     ///
     /// This reserves additional `additional` buckets to the table. Note that it might reserve more
@@ -967,7 +971,8 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         // Handle the case where another thread has resized the table while we were acquiring the
         // lock.
         let desired_len = len * LENGTH_MULTIPLIER;
-        if lock.buckets.len() < desired_len {
+        let available_buckets = lock.buckets.len() - self.removed();
+        if  available_buckets < desired_len {
             // Swap the table out with a new table of desired size (multiplied by some factor).
             let table = mem::replace(&mut *lock, Table::with_capacity(desired_len));
             // Fill the new table with the data from the old table.
@@ -1005,7 +1010,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     fn resize(&self, lock: RwLockReadGuard<Table<K, V>>) {
         let len = self.len.load(ORDERING);
         let buckets_len = lock.buckets.len();
-        let rm = self.rm.load(ORDERING);
+        let rm = self.removed();
         let fill_rate = len + rm;
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
