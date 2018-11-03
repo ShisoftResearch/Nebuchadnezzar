@@ -760,7 +760,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                 }
             },
         ) {
-            Some(WriteGuard { inner: inner })
+            Some(WriteGuard { inner })
         } else {
             None
         }
@@ -930,13 +930,11 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     /// This removes and returns the entry with key `key`. If no entry with said key exists, it
     /// will simply return `None`.
     pub fn remove(&self, key: &K) -> Option<V> {
-        let (removed, len, buckets) = {
-            // Acquire the read lock of the table.
-            let lock = self.table.read();
-
-            // Lookup the table, mutably.
+        // Acquire the read lock of the table.
+        let lock = self.table.read();
+        // Remove the bucket.
+        let removed = {
             let mut bucket = lock.lookup_mut(&key);
-            // Remove the bucket.
             match &mut *bucket {
                 // There was nothing to remove.
                 &mut Bucket::Removed | &mut Bucket::Empty => return None,
@@ -944,22 +942,17 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
                 //       madness, we do weird weird stuff.
                 bucket => {
                     // Decrement the length of the map.
-                    let len = self.len.fetch_sub(1, ORDERING);
-
-                    (
-                        // Set the bucket to "removed" and return its value.
-                        mem::replace(bucket, Bucket::Removed).value().unwrap(),
-                        len,
-                        lock.buckets.len(),
-                    )
+                    self.len.fetch_sub(1, ORDERING);
+                    self.rm.fetch_add(1, ORDERING);
+                    // Set the bucket to "removed" and return its value.
+                    Some(mem::replace(bucket, Bucket::Removed).value().unwrap())
                 }
             }
         };
-        let rm_count = self.rm.fetch_add(1, ORDERING);
-        if rm_count + len >= buckets || rm_count >= len / 2 {
-            self.reserve(0);
+        if removed.is_some() {
+            self.resize(lock);
         }
-        Some(removed)
+        removed
     }
 
     /// Reserve additional space.
@@ -1005,16 +998,22 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
     ///
     /// This returns the read lock, such that the caller won't have to acquire it twice.
     fn expand(&self, lock: RwLockReadGuard<Table<K, V>>) {
-        // Increment the length to take the new element into account.
-        let len = self.len.fetch_add(1, ORDERING) + 1;
+        self.len.fetch_add(1, ORDERING);
+        self.resize(lock)
+    }
+
+    fn resize(&self, lock: RwLockReadGuard<Table<K, V>>) {
+        let len = self.len.load(ORDERING);
         let buckets_len = lock.buckets.len();
+        let rm = self.rm.load(ORDERING);
+        let fill_rate = len + rm;
 
         // Extend if necessary. We multiply by some constant to adjust our load factor.
-        if len * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM || len >= buckets_len {
+        if fill_rate * MAX_LOAD_FACTOR_DENOM > buckets_len * MAX_LOAD_FACTOR_NUM {
             // Drop the read lock to avoid deadlocks when acquiring the write lock.
             drop(lock);
-            // Reserve 1 entry in space (the function will handle the excessive space logic).
-            self.reserve(1);
+            // Refill entry in space (the function will handle the excessive space logic).
+            self.reserve(0);
         }
     }
 }
@@ -1673,7 +1672,7 @@ mod test {
         assert!(m.insert(1, 2).is_none());
         assert!(!m.is_empty());
         assert!(m.remove(&1).is_some());
-        assert!(m.is_empty());
+        assert!(m.is_empty(), "len {}", m.len());
     }
 
     #[test]
