@@ -120,11 +120,10 @@ impl LocalSchemasCache {
                     let mut m1 = m1.write();
                     m1.new_schema(schema);
                 }))?;
-                let _ = wait(sm
-                    .on_schema_deleted(move |r| {
-                        let mut m2 = m2.write();
-                        m2.del_schema(&r.unwrap());
-                    }))?;
+                let _ = wait(sm.on_schema_deleted(move |r| {
+                    let mut m2 = m2.write();
+                    m2.del_schema(&r.unwrap());
+                }))?;
                 Some(sm)
             }
             None => None,

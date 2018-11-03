@@ -972,7 +972,7 @@ impl<K: PartialEq + Hash, V> CHashMap<K, V> {
         // lock.
         let desired_len = len * LENGTH_MULTIPLIER;
         let available_buckets = lock.buckets.len() - self.removed();
-        if  available_buckets < desired_len {
+        if available_buckets < desired_len {
             // Swap the table out with a new table of desired size (multiplied by some factor).
             let table = mem::replace(&mut *lock, Table::with_capacity(desired_len));
             // Fill the new table with the data from the old table.

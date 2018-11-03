@@ -203,7 +203,9 @@ pub fn smoke_test_parallel() {
     });
 
     (0..num).collect::<Vec<_>>().into_par_iter().for_each(|i| {
-        if i % 2 == 0 { return }
+        if i % 2 == 0 {
+            return;
+        }
         let id = Id::new(0, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);

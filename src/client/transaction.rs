@@ -1,8 +1,8 @@
+use bifrost::utils::fut_exec::wait;
 use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::types::{Id, Value};
 use server::transactions::TxnId;
 use server::transactions::*;
-use bifrost::utils::fut_exec::wait;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
@@ -47,8 +47,7 @@ impl Transaction {
         }
     }
     pub fn read_selected(&self, id: Id, fields: Vec<u64>) -> Result<Option<Vec<Value>>, TxnError> {
-        match wait(self.client.read_selected(self.tid.to_owned(), id, fields))
-        {
+        match wait(self.client.read_selected(self.tid.to_owned(), id, fields)) {
             Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),

@@ -778,6 +778,7 @@ where
 #[cfg(test)]
 mod test {
     use super::{BPlusTree, Node, Ordering};
+    use bifrost::utils::fut_exec::wait;
     use byteorder::BigEndian;
     use byteorder::WriteBytesExt;
     use client;
@@ -798,7 +799,6 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
-    use bifrost::utils::fut_exec::wait;
 
     extern crate env_logger;
     extern crate serde_json;

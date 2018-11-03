@@ -8,6 +8,7 @@ use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
 use bifrost::rpc::Server;
 use bifrost::tcp::STANDALONE_ADDRESS_STRING;
+use bifrost::utils::fut_exec::wait;
 use futures::Future;
 use ram::chunk::Chunks;
 use ram::cleaner::Cleaner;
@@ -16,7 +17,6 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
-use bifrost::utils::fut_exec::wait;
 
 pub mod cell_rpc;
 pub mod transactions;
