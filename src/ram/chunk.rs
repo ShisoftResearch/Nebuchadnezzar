@@ -347,15 +347,17 @@ impl Chunk {
             "Putting segment for chunk {} with id {}",
             self.id, segment.id
         );
-        let mut seg_index_guard = self.addrs_seg.write();
         let segment_id = segment.id;
         let segment_addr = segment.addr;
         let original_pos = self.segs.get(&segment_id).map(|seg| seg.addr);
-        if let Some(seg_original_pos) = original_pos {
-            // remove old segment by it's position
-            seg_index_guard.remove(&seg_original_pos);
+        {
+            let mut seg_index_guard = self.addrs_seg.write();
+            if let Some(seg_original_pos) = original_pos {
+                // remove old segment by it's position
+                seg_index_guard.remove(&seg_original_pos);
+            }
+            seg_index_guard.insert(segment_addr, segment_id);
         }
-        seg_index_guard.insert(segment_addr, segment_id);
         self.segs.insert(segment_id, segment);
     }
 
@@ -480,7 +482,7 @@ impl Chunk {
         trace!("Scanning tombstones");
         let seg_ids = self.segment_ids();
         for seg_id in seg_ids {
-            if let Some(segment) = self.segs.get(&seg_id) {
+            if let Some(segment) = self.segs.get(&seg_id).map(|s| (*s).clone()) {
                 let now = get_time();
                 let tombstones = segment.tombstones.load(Ordering::Relaxed);
                 let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
