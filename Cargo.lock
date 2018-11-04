@@ -191,6 +191,17 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
+name = "cuckoofilter"
+version = "0.4.0"
+source = "git+https://github.com/ShisoftResearch/rust-cuckoofilter.git#ced11f3d0086ec38b8949c10520d844cb201169f"
+dependencies = [
+ "byteorder 1.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.3.22 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 1.0.80 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 1.0.80 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "dovahkiin"
 version = "0.1.0"
 source = "git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop#70ce3210b6a03c1ab5ebd46bdc439ef4370f3b10"
@@ -436,6 +447,7 @@ dependencies = [
  "bitflags 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "byteorder 1.2.7 (registry+https://github.com/rust-lang/crates.io-index)",
  "crc32c 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "cuckoofilter 0.4.0 (git+https://github.com/ShisoftResearch/rust-cuckoofilter.git)",
  "dovahkiin 0.1.0 (git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop)",
  "env_logger 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures-await 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1093,6 +1105,7 @@ dependencies = [
 "checksum crossbeam-epoch 0.5.2 (registry+https://github.com/rust-lang/crates.io-index)" = "30fecfcac6abfef8771151f8be4abc9e4edc112c2bcb233314cafde2680536e9"
 "checksum crossbeam-utils 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)" = "2760899e32a1d58d5abb31129f8fae5de75220bc2176e77ff7c627ae45c918d9"
 "checksum crossbeam-utils 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)" = "677d453a17e8bd2b913fa38e8b9cf04bcdbb5be790aa294f2389661d72036015"
+"checksum cuckoofilter 0.4.0 (git+https://github.com/ShisoftResearch/rust-cuckoofilter.git)" = "<none>"
 "checksum dovahkiin 0.1.0 (git+https://github.com/ShisoftResearch/Dovahkiin?branch=develop)" = "<none>"
 "checksum either 1.5.0 (registry+https://github.com/rust-lang/crates.io-index)" = "3be565ca5c557d7f59e7cfcf1844f9e3033650c929c6566f511e8005f205c1d0"
 "checksum env_logger 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)" = "3ddf21e73e016298f5cb37d6ef8e8da8e39f91f9ec8b0df44b7deb16a9f8cd5b"

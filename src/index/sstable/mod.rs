@@ -1,7 +1,10 @@
+use cuckoofilter::*;
 use index::EntryKey;
 use index::Slice;
 use parking_lot::RwLock;
+use ram::types::Id;
 use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
@@ -22,6 +25,7 @@ where
 {
     index: BTreeMap<EntryKey, SSIndex<S>>,
     tombstones: RefCell<TombstoneSet>,
+    filter: CuckooFilter<DefaultHasher>,
 }
 struct SSIndex<S>
 where
@@ -38,11 +42,21 @@ where
         Self {
             index: BTreeMap::new(),
             tombstones: RefCell::new(TombstoneSet::new()),
+            filter: CuckooFilter::new(), // TODO: carefully set the capacity
         }
     }
 
-    pub fn merge(&self, slices: &[&[EntryKey]]) {
-        let starting_key = &slices[0][0];
+    pub fn merge(&mut self, slices: &[&[EntryKey]]) {
+        let source = slices
+            .iter()
+            .flat_map(|x| *x)
+            .collect::<Vec<_>>();
+
+        let first = *source.first().unwrap();
+        let last = *source.last().unwrap();
+
+        let target_pages = self.index.range_mut::<EntryKey, _>(first..=last);
+
         // let local_pages = self.index.range(starting_key..);
 
         // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());

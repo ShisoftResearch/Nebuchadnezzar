@@ -41,6 +41,7 @@ extern crate smallvec;
 extern crate hermes;
 extern crate owning_ref;
 extern crate rayon;
+extern crate cuckoofilter;
 
 pub mod utils;
 #[macro_use]
