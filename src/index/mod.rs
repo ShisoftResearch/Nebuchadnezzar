@@ -21,13 +21,19 @@ pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
     return prefix.as_slice() == &x[..x.len() - ID_SIZE];
 }
 
-pub trait Slice<T>: Sized
-where
-    T: Default + Debug,
+pub trait Slice: Sized
 {
-    fn as_slice(&mut self) -> &mut [T];
+    type Item: Default + Debug;
+
+    fn as_slice(&mut self) -> &mut [Self::Item];
+    fn len(&self) -> usize {
+        unsafe {
+            let raw = self as *const Self as *mut Self;
+            (*raw).as_slice().len()
+        }
+    }
     fn init() -> Self;
-    fn item_default() -> T {
-        T::default()
+    fn item_default() -> Self::Item {
+        Self::Item::default()
     }
 }

@@ -1,6 +1,7 @@
 use cuckoofilter::*;
 use index::EntryKey;
 use index::Slice;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::types::Id;
 use std::cell::RefCell;
@@ -17,60 +18,112 @@ use std::sync::Arc;
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
-type TombstoneSet = BTreeSet<EntryKey>;
+type Tombstones = BTreeSet<EntryKey>;
 
 pub struct LevelTree<S>
 where
-    S: Slice<EntryKey> + SortableEntrySlice,
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
-    index: BTreeMap<EntryKey, SSIndex<S>>,
-    tombstones: RefCell<TombstoneSet>,
+    index: BTreeMap<EntryKey, SSPage<S>>,
+    tombstones: Tombstones,
     filter: CuckooFilter<DefaultHasher>,
 }
-struct SSIndex<S>
+struct SSPage<S>
 where
-    S: Slice<EntryKey> + SortableEntrySlice,
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     slice: S,
 }
 
 impl<S> LevelTree<S>
 where
-    S: Slice<EntryKey> + SortableEntrySlice,
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn new() -> Self {
         Self {
             index: BTreeMap::new(),
-            tombstones: RefCell::new(TombstoneSet::new()),
+            tombstones: Tombstones::new(),
             filter: CuckooFilter::new(), // TODO: carefully set the capacity
         }
     }
 
-    pub fn merge(&mut self, slices: &[&[EntryKey]]) {
-        let source = slices
-            .iter()
-            .flat_map(|x| *x)
-            .collect::<Vec<_>>();
+    pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
+        let (keys_to_removed, mut merged) = {
+            let (target_keys, target_pages) : (Vec<_>, Vec<_>) = {
+                let first = source.first().unwrap();
+                let last = source.last().unwrap();
+                self.index.range_mut::<EntryKey, _>(first ..= last).unzip()
+            };
+            let page_size = target_pages.first().unwrap().slice.len();
+            let mut target = target_pages
+                .into_iter()
+                .map(|p| p.slice.as_slice())
+                .flat_map(|ps| ps)
+                .map(|x| mem::replace(x, EntryKey::default()))
+                .collect_vec();
 
-        let first = *source.first().unwrap();
-        let last = *source.last().unwrap();
+            let mut merged: Vec<S> = vec![S::init()];
+            let src_len = source.len();
+            let tgt_len = target.len();
+            let mut srci = 0;
+            let mut tgti = 0;
 
-        let target_pages = self.index.range_mut::<EntryKey, _>(first..=last);
+            let mut merging_slice_i = 0;
 
-        // let local_pages = self.index.range(starting_key..);
+            while srci < src_len || tgti < tgt_len {
+                let mut lowest = if srci >= src_len {
+                    // source overflowed
+                    tgti += 1;
+                    &mut target[tgti - 1]
+                } else if tgti >= tgt_len {
+                    // target overflowed
+                    srci += 1;
+                    &mut source[srci - 1]
+                } else {
+                    // normal case, compare
+                    let t = &mut target[tgti];
+                    let s = &mut source[srci];
+                    if t <= s {
+                        tgti += 1;
+                        t
+                    } else {
+                        srci += 1;
+                        s
+                    }
+                };
+                mem::swap(&mut merged.last_mut().unwrap().as_slice()[merging_slice_i], lowest);
+                merging_slice_i += 1;
+                if merging_slice_i >= page_size {
+                    merging_slice_i = 0;
+                    merged.push(S::init());
+                }
+            }
+            if merging_slice_i == 0 {
+                let merged_len = merged.len();
+                merged.remove( merged_len - 1);
+            }
+            (target_keys.into_iter().map(|x| x.clone()).collect_vec(), merged)
+        };
 
-        // debug_assert!(slices.iter().map(|s| s.len()).sum() <= S.len());
+        for k in keys_to_removed {
+            self.index.remove(&k).unwrap();
+        }
+
+        for mut page in merged {
+            let index = page.as_slice()[0].clone();
+            self.index.insert(index, SSPage { slice: page });
+        }
     }
 }
 
-pub trait SortableEntrySlice: Sized + Slice<EntryKey> {
+pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {
     fn merge_sorted_with(
         &mut self,
         y_slice: &mut [EntryKey],
         xlen: &mut usize,
         ylen: &mut usize,
-        xtombstones: &mut TombstoneSet,
-        ytombstones: &mut TombstoneSet,
+        xtombstones: &mut Tombstones,
+        ytombstones: &mut Tombstones,
     ) -> Self {
         let mut x_pos = 0;
         let mut y_pos = 0;

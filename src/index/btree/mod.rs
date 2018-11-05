@@ -671,7 +671,7 @@ fn insert_into_split<T, S>(
     pos: usize,
     pivot: usize,
 ) where
-    S: Slice<T> + BTreeSlice<T>,
+    S: Slice<Item = T> + BTreeSlice<T>,
     T: Default + Debug,
 {
     debug!(
@@ -695,7 +695,9 @@ fn key_with_id(key: &mut EntryKey, id: &Id) {
 
 macro_rules! impl_slice_ops {
     ($t: ty, $et: ty, $n: expr) => {
-        impl Slice<$et> for $t {
+        impl Slice for $t {
+            type Item = $et;
+
             fn as_slice(&mut self) -> &mut [$et] {
                 self
             }
@@ -721,7 +723,7 @@ impl Default for Node {
     }
 }
 
-trait BTreeSlice<T>: Sized + Slice<T>
+trait BTreeSlice<T>: Sized + Slice<Item = T>
 where
     T: Default + Debug,
 {
