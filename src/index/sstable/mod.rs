@@ -71,6 +71,7 @@ where
             let mut merging_slice_i = 0;
 
             while srci < src_len || tgti < tgt_len {
+                let mut from_source = false;
                 let mut lowest = if srci >= src_len {
                     // source overflowed
                     tgti += 1;
@@ -78,6 +79,7 @@ where
                 } else if tgti >= tgt_len {
                     // target overflowed
                     srci += 1;
+                    from_source = true;
                     &mut source[srci - 1]
                 } else {
                     // normal case, compare
@@ -88,9 +90,19 @@ where
                         t
                     } else {
                         srci += 1;
+                        from_source = true;
                         s
                     }
                 };
+                if from_source {
+                    if tombstones.remove(lowest) {
+                        continue
+                    }
+                } else {
+                    if self.tombstones.remove(lowest) {
+                        continue
+                    }
+                }
                 mem::swap(&mut merged.last_mut().unwrap().as_slice()[merging_slice_i], lowest);
                 merging_slice_i += 1;
                 if merging_slice_i >= page_size {
