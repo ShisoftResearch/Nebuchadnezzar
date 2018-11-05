@@ -646,18 +646,11 @@ impl RTCursor {
         return true;
     }
 
-    pub fn current(&self) -> Option<Id> {
+    pub fn current(&self) -> Option<&EntryKey> {
         if self.index >= 0 && self.index < self.page.len {
-            Some(id_from_key(&self.page.keys[self.index]))
+            Some(&self.page.keys[self.index])
         } else {
             None
-        }
-    }
-
-    pub fn has_next(&self) -> bool {
-        match self.ordering {
-            Ordering::Forward => self.index < self.page.len - 1 || self.next_page.is_some(),
-            Ordering::Backward => self.index > 0 || self.next_page.is_some(),
         }
     }
 }
@@ -925,7 +918,7 @@ mod test {
         info!("test insertion");
         tree.insert(&key, &id).unwrap();
         let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
-        assert_eq!(cursor.current().unwrap(), id);
+        assert_eq!(id_from_key(cursor.current().unwrap()), id);
     }
 
     fn u64_to_slice(n: u64) -> [u8; 8] {
@@ -988,7 +981,7 @@ mod test {
             debug!("Scanning for sequence dump");
             let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
             for i in 0..num {
-                let id = cursor.current().unwrap();
+                let id = id_from_key(cursor.current().unwrap());
                 let unmatched = i != id.lower;
                 let check_msg = if unmatched {
                     "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-="
@@ -1010,7 +1003,7 @@ mod test {
             for i in 0..num {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
-                let id = cursor.current().unwrap();
+                let id = id_from_key(cursor.current().unwrap());
                 assert_eq!(id, expected);
                 assert_eq!(cursor.next(), i + 1 < num);
             }
@@ -1028,7 +1021,7 @@ mod test {
             for i in (0..num).rev() {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
-                let id = cursor.current().unwrap();
+                let id = id_from_key(cursor.current().unwrap());
                 assert_eq!(id, expected, "{}", i);
                 assert_eq!(cursor.next(), i > 0);
             }
@@ -1041,8 +1034,8 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(id),
+                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    id,
                     "{}",
                     i
                 );
@@ -1071,8 +1064,8 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(Id::new(0, deletion_volume)), // seek should reach deletion_volume
+                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    Id::new(0, deletion_volume), // seek should reach deletion_volume
                     "{}",
                     i
                 );
@@ -1084,8 +1077,8 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    tree.seek(&key, Ordering::default()).unwrap().current(),
-                    Some(id),
+                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    id,
                     "{}",
                     i
                 );
@@ -1109,8 +1102,8 @@ mod test {
                     let key_slice = u64_to_slice(j);
                     let key = SmallVec::from_slice(&key_slice);
                     assert_eq!(
-                        tree.seek(&key, Ordering::default()).unwrap().current(),
-                        Some(id),
+                        id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                        id,
                         "{} / {}",
                         i,
                         j

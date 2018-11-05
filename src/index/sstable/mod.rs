@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::Arc;
+use index::id_from_key;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -50,14 +51,35 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<S> {
-        let range = match ordering {
+        let mut range = match ordering {
             Ordering::Forward => self.index.range::<EntryKey, _>(key..),
-            Ordering::Backward => self.index.range::<EntryKey, _>(..=key)
+            Ordering::Backward => self.index.range::<EntryKey, _>(..=key),
         };
-        RTCursor {
-            ordering,
-            range
+        let first = match ordering {
+            Ordering::Forward => range.next(),
+            Ordering::Backward => range.next_back()
+        }.map(|(_, page)| page);
+
+        let (pos, page_len) = if let Some(page) = first {
+            (
+                page.slice.as_slice_immute().binary_search(key).unwrap_or_else(|i| i),
+                page.slice.as_slice_immute().len()
+            )
+        } else { (0, 0) };
+        let mut cursor = RTCursor { ordering, range, page_len, current: first, index: pos};
+
+        if cursor.current.is_some() {
+            match ordering {
+                Ordering::Forward => {
+                    if pos >= page_len {
+                        cursor.next();
+                    }
+                }
+                Ordering::Backward => {}
+            }
         }
+
+        cursor
     }
 
     pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
@@ -147,77 +169,64 @@ where
     }
 }
 
-pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {
-    fn merge_sorted_with(
-        &mut self,
-        y_slice: &mut [EntryKey],
-        xlen: &mut usize,
-        ylen: &mut usize,
-        xtombstones: &mut Tombstones,
-        ytombstones: &mut Tombstones,
-    ) -> Self {
-        let mut x_pos = 0;
-        let mut y_pos = 0;
-        let mut pos = 0;
-        let mut new_x = Self::init();
-        let mut new_y = Self::init();
-        {
-            let mut x_slice = self.as_slice();
-            let x_slice_len = x_slice.len();
-            debug_assert!(*ylen <= x_slice_len);
-            let mut new_slice_x = new_x.as_slice();
-            let mut new_slice_y = new_y.as_slice();
-            let mut new_x_len = 0;
-            let mut new_y_len = 0;
-            let mut use_slice_at = |slice: &mut [EntryKey], slice_pos: &mut usize| {
-                let item = mem::replace(&mut slice[*slice_pos], EntryKey::default());
-                *slice_pos += 1;
-                if xtombstones.remove(&item) || ytombstones.remove(&item) {
-                    None
-                } else {
-                    Some(item)
-                }
-            };
-            loop {
-                let item_or_removed = if x_pos < *xlen && y_pos < *ylen {
-                    if x_slice[x_pos] < y_slice[y_pos] {
-                        use_slice_at(x_slice, &mut x_pos)
-                    } else {
-                        use_slice_at(y_slice, &mut y_pos)
-                    }
-                } else if x_pos < *xlen {
-                    use_slice_at(x_slice, &mut x_pos)
-                } else if y_pos < *ylen {
-                    use_slice_at(y_slice, &mut y_pos)
-                } else {
-                    break;
-                };
-
-                if let Some(item) = item_or_removed {
-                    if pos < x_slice_len {
-                        new_slice_x[pos] = item;
-                        new_x_len += 1;
-                    } else {
-                        new_slice_y[pos - x_slice_len] = item;
-                        new_y_len += 1;
-                    }
-                    pos += 1;
-                }
-            }
-            *xlen = new_x_len;
-            *ylen = new_y_len;
-        }
-        mem::swap(self, &mut new_x);
-        return new_y;
-    }
-}
+pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
 
 pub struct RTCursor<'a, S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
+    index: usize,
     ordering: Ordering,
+    page_len: usize,
     range: Range<'a, EntryKey, SSPage<S>>,
+    current: Option<&'a SSPage<S>>
+}
+
+impl<'a, S> RTCursor<'a, S> where S: Slice<Item = EntryKey> + SortableEntrySlice {
+    pub fn next(&mut self) -> bool {
+        if self.current.is_some() {
+            match self.ordering {
+                Ordering::Forward => {
+                    if self.index + 1 >= self.page_len {
+                        if let Some((_, next_page)) = self.range.next() {
+                            self.current = Some(next_page);
+                            self.index = 0;
+                        } else {
+                            self.current = None;
+                            return false;
+                        }
+                    } else {
+                        self.index += 1;
+                    }
+                },
+                Ordering::Backward => {
+                    if self.index == 0 {
+                        if let Some((_, next_page)) = self.range.next_back() {
+                            self.current = Some(next_page);
+                            self.index = self.page_len - 1;
+                        } else {
+                            self.current = None;
+                            return false;
+                        }
+                    } else {
+                        self.index -= 1;
+                    }
+                }
+            }
+            true
+        } else { false }
+    }
+
+    pub fn current(&self) -> Option<&EntryKey> {
+        if self.index <= 0 || self.index >= self.page_len {
+            return None;
+        }
+        if let Some(ref page) = self.current {
+            Some(&page.slice.as_slice_immute()[self.index])
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

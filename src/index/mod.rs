@@ -26,11 +26,14 @@ pub trait Slice: Sized
     type Item: Default + Debug;
 
     fn as_slice(&mut self) -> &mut [Self::Item];
-    fn len(&self) -> usize {
+    fn as_slice_immute(&self) -> &[Self::Item] {
         unsafe {
             let raw = self as *const Self as *mut Self;
-            (*raw).as_slice().len()
+            (*raw).as_slice()
         }
+    }
+    fn len(&self) -> usize {
+        self.as_slice_immute().len()
     }
     fn init() -> Self;
     fn item_default() -> Self::Item {
