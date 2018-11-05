@@ -1,10 +1,12 @@
 use cuckoofilter::*;
+use index::btree::Ordering;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::types::Id;
 use std::cell::RefCell;
+use std::collections::btree_map::Range;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -47,12 +49,23 @@ where
         }
     }
 
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<S> {
+        let range = match ordering {
+            Ordering::Forward => self.index.range::<EntryKey, _>(key..),
+            Ordering::Backward => self.index.range::<EntryKey, _>(..=key)
+        };
+        RTCursor {
+            ordering,
+            range
+        }
+    }
+
     pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
         let (keys_to_removed, mut merged) = {
-            let (target_keys, target_pages) : (Vec<_>, Vec<_>) = {
+            let (target_keys, target_pages): (Vec<_>, Vec<_>) = {
                 let first = source.first().unwrap();
                 let last = source.last().unwrap();
-                self.index.range_mut::<EntryKey, _>(first ..= last).unzip()
+                self.index.range_mut::<EntryKey, _>(first..=last).unzip()
             };
             let page_size = target_pages.first().unwrap().slice.len();
             let mut target = target_pages
@@ -96,14 +109,17 @@ where
                 };
                 if from_source {
                     if tombstones.remove(lowest) {
-                        continue
+                        continue;
                     }
                 } else {
                     if self.tombstones.remove(lowest) {
-                        continue
+                        continue;
                     }
                 }
-                mem::swap(&mut merged.last_mut().unwrap().as_slice()[merging_slice_i], lowest);
+                mem::swap(
+                    &mut merged.last_mut().unwrap().as_slice()[merging_slice_i],
+                    lowest,
+                );
                 merging_slice_i += 1;
                 if merging_slice_i >= page_size {
                     merging_slice_i = 0;
@@ -112,9 +128,12 @@ where
             }
             if merging_slice_i == 0 {
                 let merged_len = merged.len();
-                merged.remove( merged_len - 1);
+                merged.remove(merged_len - 1);
             }
-            (target_keys.into_iter().map(|x| x.clone()).collect_vec(), merged)
+            (
+                target_keys.into_iter().map(|x| x.clone()).collect_vec(),
+                merged,
+            )
         };
 
         for k in keys_to_removed {
@@ -191,6 +210,14 @@ pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {
         mem::swap(self, &mut new_x);
         return new_y;
     }
+}
+
+pub struct RTCursor<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
+{
+    ordering: Ordering,
+    range: Range<'a, EntryKey, SSPage<S>>,
 }
 
 #[cfg(test)]
