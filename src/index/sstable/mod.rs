@@ -23,6 +23,8 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use ram::schema::Schema;
+use ram::schema::Field;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -36,7 +38,7 @@ type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 const PAGE_SCHEMA: &'static str = "NEB_SSTABLE_PAGE";
 
 lazy_static! {
-    static ref PAGE_SCHEMA_HASH: u32 = key_hash(PAGE_SCHEMA) as u32;
+    static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
 }
 
 pub struct LevelTree<S>
@@ -93,7 +95,7 @@ where
         .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
         .collect_vec()
         .value();
-    Cell::new_with_id(*PAGE_SCHEMA_HASH, id, value)
+    Cell::new_with_id(*PAGE_SCHEMA_ID, id, value)
 }
 
 impl<S> LevelTree<S>
@@ -345,5 +347,24 @@ where
     }
 }
 
+pub fn get_schema() -> Schema {
+    Schema {
+        id: *PAGE_SCHEMA_ID,
+        name: String::from(PAGE_SCHEMA),
+        key_field: None,
+        str_key_field: None,
+        is_dynamic: false,
+        fields: Field::new(
+            "*",
+            type_id_of(Type::SmallBytes),
+            false,
+            true,
+            None
+        )
+    }
+}
+
 #[cfg(test)]
-mod test {}
+mod test {
+
+}
