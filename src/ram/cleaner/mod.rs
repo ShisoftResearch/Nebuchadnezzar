@@ -11,9 +11,7 @@ pub mod compact;
 
 pub struct Cleaner {
     chunks: Arc<Chunks>,
-    stopped: Arc<AtomicBool>,
-    segments_compact_per_turn: usize,
-    segments_combine_per_turn: usize,
+    stopped: Arc<AtomicBool>
 }
 
 // The two-level cleaner
@@ -21,13 +19,9 @@ impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
         debug!("Starting cleaner for {} chunks", chunks.list.len());
         let stop_tag = Arc::new(AtomicBool::new(false));
-        let segments_compact_per_turn = chunks.list[0].segs.len() / 10 + 1;
-        let segments_combine_per_turn = chunks.list[0].segs.len() / 20 + 2;
         let cleaner = Cleaner {
             chunks: chunks.clone(),
-            stopped: stop_tag.clone(),
-            segments_compact_per_turn,
-            segments_combine_per_turn,
+            stopped: stop_tag.clone()
         };
         let stop_tag_ref_clone = stop_tag.clone();
         let checks_ref_clone = chunks.clone();
@@ -46,6 +40,8 @@ impl Cleaner {
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
                     for chunk in &checks_ref_clone.list {
+                        let segments_compact_per_turn = chunk.segs.len() / 10 + 1;
+                        let segments_combine_per_turn = chunk.segs.len() / 20 + 2;
                         // have to put it right here for cleaners will clear the tombstone death counter
                         chunk.scan_tombstone_survival();
                         trace!("Cleaning chunk {}", chunk.id);
