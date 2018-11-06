@@ -34,6 +34,7 @@ impl Cleaner {
             .name("Cleaner sweeper".into())
             .spawn(move || {
                 while !stop_tag.load(Ordering::Relaxed) {
+                    debug!("Apply dead entry");
                     for chunk in &chunks.list {
                         chunk.apply_dead_entry();
                     }
