@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::env;
 
 pub mod combine;
 pub mod compact;
@@ -25,6 +26,10 @@ impl Cleaner {
         };
         let stop_tag_ref_clone = stop_tag.clone();
         let checks_ref_clone = chunks.clone();
+        let sleep_interval_ms = env::var("NEB_CLEANER_SLEEP_INTERVAL_MS")
+            .unwrap_or("100".to_string())
+            .parse::<u64>()
+            .unwrap();
         thread::Builder::new()
             .name("Cleaner sweeper".into())
             .spawn(move || {
@@ -32,7 +37,7 @@ impl Cleaner {
                     for chunk in &chunks.list {
                         chunk.apply_dead_entry();
                     }
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
             });
         thread::Builder::new()
@@ -93,7 +98,7 @@ impl Cleaner {
                             .fetch_sub(cleaned_space, Ordering::Relaxed);
                         chunk.check_and_archive_segments();
                     }
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");
             });
