@@ -1087,7 +1087,7 @@ mod test {
             debug!("remove remaining items, with extensive point search");
             for i in (deletion_volume..num).rev() {
                 {
-                    debug!("delete: {}", i);
+                    debug!("delete and scan: {}", i);
                     let id = Id::new(0, i);
                     let key_slice = u64_to_slice(i);
                     let key = SmallVec::from_slice(&key_slice);
