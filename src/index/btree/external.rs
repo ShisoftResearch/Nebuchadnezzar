@@ -48,7 +48,7 @@ pub struct ExtNode {
     pub prev: Id,
     pub len: usize,
     pub version: u64,
-    pub removed: bool,
+    pub dirty: bool,
 }
 
 pub struct ExtNodeSplit {
@@ -65,7 +65,7 @@ impl ExtNode {
             prev: Id::unit_id(),
             len: 0,
             version: 0,
-            removed: false,
+            dirty: false,
         }
     }
     pub fn from_cell(cell: Cell) -> Self {
@@ -93,7 +93,7 @@ impl ExtNode {
             prev: *prev,
             len: key_count,
             version: cell_version,
-            removed: false,
+            dirty: false,
         }
     }
     pub fn to_cell(&self) -> Cell {
@@ -156,7 +156,7 @@ impl ExtNode {
                 prev: cached_id,
                 len: keys_2_len,
                 version: 0,
-                removed: false,
+                dirty: true,
             };
             debug!(
                 "new node have next {:?} prev {:?}, current id {:?}",
@@ -337,7 +337,8 @@ impl CacheBufferZone {
         }
         {
             debug!("Buffer zone inserting for mutation {:?}", id);
-            let guard = self.get_mut_ext_node_cached(id);
+            let mut guard = self.get_mut_ext_node_cached(id);
+            guard.dirty = true;
             let mut data_map = self.data.borrow_mut();
             let data = RefCell::new((&*guard).clone());
             let holder = CacheGuardHolder::Write(guard);
@@ -367,6 +368,7 @@ impl CacheBufferZone {
             panic!()
         } else {
             let node_id = node.id;
+            // a placeholder guard
             let lock = RwLock::new(ExtNode::new(&node_id));
             let guard = CacheGuardHolder::Write(lock.write());
             let mut data = self.data.borrow_mut();

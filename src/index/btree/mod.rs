@@ -127,8 +127,10 @@ impl BPlusTree {
                 move |id, value| {
                     debug!("Flush page to cache {:?}", &id);
                     let cache = value.read();
-                    let cell = cache.to_cell();
-                    wait(neb_client_2.upsert_cell(cell)).unwrap();
+                    if cache.dirty {
+                        let cell = cache.to_cell();
+                        wait(neb_client_2.upsert_cell(cell)).unwrap();
+                    }
                 },
             ))),
         };
@@ -175,7 +177,8 @@ impl BPlusTree {
     }
     fn new_ext_cached_node(&self) -> Node {
         let id = self.new_page_id();
-        let node = ExtNode::new(&id);
+        let mut node = ExtNode::new(&id);
+        node.dirty = true;
         self.ext_node_cache
             .lock()
             .insert(id, Arc::new(RwLock::new(node)));
