@@ -810,6 +810,7 @@ mod test {
     }
 
     fn dump_tree(tree: &BPlusTree, f: &str) {
+        debug!("dumping {}", f);
         let mut bz = CacheBufferZone::new(&tree.ext_node_cache, &tree.storage);
         let debug_root = cascading_dump_node(tree, tree.root, &mut bz);
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
@@ -976,9 +977,9 @@ mod test {
             .unwrap();
             dump_tree(&tree, "tree_dump.json");
         }
-        // sequence check
+
         {
-            debug!("Scanning for sequence dump");
+            debug!("Scanning for sequence");
             let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
             for i in 0..num {
                 let id = id_from_key(cursor.current().unwrap());
@@ -1028,7 +1029,7 @@ mod test {
         }
 
         {
-            // point search
+            debug!("point search");
             for i in 0..num {
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
@@ -1043,7 +1044,6 @@ mod test {
         }
 
         {
-            // deletion
             debug!("Testing deletion");
             let deletion_volume = num / 2;
             for i in 0..deletion_volume {
@@ -1059,7 +1059,7 @@ mod test {
             }
             dump_tree(&tree, "remove_completed_dump.json");
 
-            // check for removed items
+            debug!("check for removed items");
             for i in 0..deletion_volume {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
@@ -1071,7 +1071,7 @@ mod test {
                 );
             }
 
-            // check for remaining items
+            debug!("check for remaining items");
             for i in deletion_volume..num {
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
@@ -1084,7 +1084,7 @@ mod test {
                 );
             }
 
-            // remove remaining items
+            debug!("remove remaining items, with extensive point search");
             for i in (deletion_volume..num).rev() {
                 {
                     debug!("delete: {}", i);
@@ -1112,7 +1112,7 @@ mod test {
             }
             dump_tree(&tree, "remove_remains_dump.json");
 
-            // check for removed items
+            debug!("check for removed items");
             for i in 0..num {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
