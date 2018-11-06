@@ -1,19 +1,30 @@
-use cuckoofilter::*;
+use bifrost::utils::fut_exec::wait;
+use client::AsyncClient;
+use dovahkiin::types::custom_types::bytes::SmallBytes;
+use dovahkiin::types::custom_types::id::Id;
+use dovahkiin::types::custom_types::map::Map;
+use dovahkiin::types::type_id_of;
+use dovahkiin::types::value::ToValue;
 use index::btree::Ordering;
+use index::id_from_key;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use parking_lot::RwLock;
-use ram::types::Id;
+use ram::cell::Cell;
+use ram::types::*;
 use std::cell::RefCell;
 use std::collections::btree_map::Range;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, LinkedList};
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
-use index::id_from_key;
+use utils::lru_cache::LRUCache;
+use ram::schema::Schema;
+use ram::schema::Field;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -22,31 +33,95 @@ use index::id_from_key;
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
 type Tombstones = BTreeSet<EntryKey>;
+type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
+
+const PAGE_SCHEMA: &'static str = "NEB_SSTABLE_PAGE";
+
+lazy_static! {
+    static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
+}
 
 pub struct LevelTree<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
-    index: BTreeMap<EntryKey, SSPage<S>>,
+    neb_client: Arc<AsyncClient>,
+    index: BTreeMap<EntryKey, Id>,
     tombstones: Tombstones,
-    filter: CuckooFilter<DefaultHasher>,
+    pages: PageCache<S>,
+    marker: PhantomData<S>,
 }
 struct SSPage<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
+    id: Id,
     slice: S,
+}
+
+impl<S> SSPage<S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
+{
+    pub fn from_cell(cell: Cell) -> Self {
+        let mut slice = S::init();
+        let slice_len = slice.as_slice().len();
+        let cell_id = cell.id();
+        let keys = cell.data;
+        let keys_len = keys.len().unwrap();
+        debug_assert!(slice_len == keys_len);
+        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+            array
+        } else {
+            panic!()
+        };
+        for (i, val) in keys_array.iter().enumerate() {
+            slice.as_slice()[i] = EntryKey::from(val.as_slice());
+        }
+        Self {
+            id: cell_id,
+            slice,
+        }
+    }
+}
+
+pub fn page_slice_to_cell<S>(slice: S, id: &Id) -> Cell
+where
+    S: Slice<Item = EntryKey>,
+{
+    let value = slice
+        .as_slice_immute()
+        .iter()
+        .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
+        .collect_vec()
+        .value();
+    Cell::new_with_id(*PAGE_SCHEMA_ID, id, value)
 }
 
 impl<S> LevelTree<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
-    pub fn new() -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+        let client = neb_client.clone();
         Self {
+            neb_client: neb_client.clone(),
             index: BTreeMap::new(),
             tombstones: Tombstones::new(),
-            filter: CuckooFilter::new(), // TODO: carefully set the capacity
+            // TODO: carefully set the capacity
+            pages: Arc::new(Mutex::new(LRUCache::new(
+                100,
+                move |id| {
+                    wait(client.read_cell(*id))
+                        .unwrap()
+                        .map(|cell| Arc::new(SSPage::from_cell(cell)))
+                        .ok()
+                },
+                |_, _| {
+                    // will do nothing on evict for pages will be write to back storage once updated
+                },
+            ))),
+            marker: PhantomData {},
         }
     }
 
@@ -57,16 +132,29 @@ where
         };
         let first = match ordering {
             Ordering::Forward => range.next(),
-            Ordering::Backward => range.next_back()
-        }.map(|(_, page)| page);
+            Ordering::Backward => range.next_back(),
+        }
+        .map(|(_, page_id)| self.pages.lock().get_or_fetch(page_id).unwrap().clone());
 
-        let (pos, page_len) = if let Some(page) = first {
+        let (pos, page_len) = if let Some(ref page) = first {
             (
-                page.slice.as_slice_immute().binary_search(key).unwrap_or_else(|i| i),
-                page.slice.as_slice_immute().len()
+                page.slice
+                    .as_slice_immute()
+                    .binary_search(key)
+                    .unwrap_or_else(|i| i),
+                page.slice.as_slice_immute().len(),
             )
-        } else { (0, 0) };
-        let mut cursor = RTCursor { ordering, range, page_len, current: first, index: pos};
+        } else {
+            (0, 0)
+        };
+        let mut cursor = RTCursor {
+            ordering,
+            range,
+            page_len,
+            current: first,
+            index: pos,
+            cache: self.pages.clone(),
+        };
 
         if cursor.current.is_some() {
             match ordering {
@@ -83,18 +171,23 @@ where
     }
 
     pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
-        let (keys_to_removed, mut merged) = {
+        let mut pages_cache = self.pages.lock();
+        let (keys_to_removed, mut merged, mut ids_to_reuse) = {
             let (target_keys, target_pages): (Vec<_>, Vec<_>) = {
                 let first = source.first().unwrap();
                 let last = source.last().unwrap();
-                self.index.range_mut::<EntryKey, _>(first..=last).unzip()
+                self.index
+                    .range::<EntryKey, _>(first..=last)
+                    .map(|(k, id)| (k, pages_cache.get_or_fetch(id).unwrap().clone()))
+                    .unzip()
             };
             let page_size = target_pages.first().unwrap().slice.len();
+            let target_page_ids = target_pages.iter().map(|p| p.id).collect::<LinkedList<_>>();
             let mut target = target_pages
-                .into_iter()
-                .map(|p| p.slice.as_slice())
-                .flat_map(|ps| ps)
-                .map(|x| mem::replace(x, EntryKey::default()))
+                .iter()
+                .map(|page| page.slice.as_slice_immute())
+                .flat_map(|x| x)
+                .map(|x| (*x).clone())
                 .collect_vec();
 
             let mut merged: Vec<S> = vec![S::init()];
@@ -107,7 +200,7 @@ where
 
             while srci < src_len || tgti < tgt_len {
                 let mut from_source = false;
-                let mut lowest = if srci >= src_len {
+                let mut lowest: &mut EntryKey = if srci >= src_len {
                     // source overflowed
                     tgti += 1;
                     &mut target[tgti - 1]
@@ -155,6 +248,7 @@ where
             (
                 target_keys.into_iter().map(|x| x.clone()).collect_vec(),
                 merged,
+                target_page_ids
             )
         };
 
@@ -162,9 +256,21 @@ where
             self.index.remove(&k).unwrap();
         }
 
+        for id in &ids_to_reuse {
+            pages_cache.remove(id);
+        }
+
         for mut page in merged {
-            let index = page.as_slice()[0].clone();
-            self.index.insert(index, SSPage { slice: page });
+            let index_key = page.as_slice()[0].clone();
+            let reuse_id = ids_to_reuse.pop_back();
+            let id = reuse_id.unwrap_or_else(|| Id::rand());
+            let cell = page_slice_to_cell(page, &id);
+            if reuse_id.is_some() {
+                wait(self.neb_client.update_cell(cell)).unwrap();
+            } else {
+                wait(self.neb_client.write_cell(cell)).unwrap();
+            }
+            self.index.insert(index_key, id);
         }
     }
 }
@@ -178,17 +284,22 @@ where
     index: usize,
     ordering: Ordering,
     page_len: usize,
-    range: Range<'a, EntryKey, SSPage<S>>,
-    current: Option<&'a SSPage<S>>
+    range: Range<'a, EntryKey, Id>,
+    current: Option<Arc<SSPage<S>>>,
+    cache: PageCache<S>,
 }
 
-impl<'a, S> RTCursor<'a, S> where S: Slice<Item = EntryKey> + SortableEntrySlice {
+impl<'a, S> RTCursor<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
+{
     pub fn next(&mut self) -> bool {
         if self.current.is_some() {
             match self.ordering {
                 Ordering::Forward => {
                     if self.index + 1 >= self.page_len {
-                        if let Some((_, next_page)) = self.range.next() {
+                        if let Some((_, page_id)) = self.range.next() {
+                            let next_page = self.get_page(page_id);
                             self.current = Some(next_page);
                             self.index = 0;
                         } else {
@@ -198,10 +309,11 @@ impl<'a, S> RTCursor<'a, S> where S: Slice<Item = EntryKey> + SortableEntrySlice
                     } else {
                         self.index += 1;
                     }
-                },
+                }
                 Ordering::Backward => {
                     if self.index == 0 {
-                        if let Some((_, next_page)) = self.range.next_back() {
+                        if let Some((_, page_id)) = self.range.next_back() {
+                            let next_page = self.get_page(page_id);
                             self.current = Some(next_page);
                             self.index = self.page_len - 1;
                         } else {
@@ -214,7 +326,9 @@ impl<'a, S> RTCursor<'a, S> where S: Slice<Item = EntryKey> + SortableEntrySlice
                 }
             }
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     pub fn current(&self) -> Option<&EntryKey> {
@@ -227,7 +341,30 @@ impl<'a, S> RTCursor<'a, S> where S: Slice<Item = EntryKey> + SortableEntrySlice
             None
         }
     }
+
+    fn get_page(&self, id: &Id) -> Arc<SSPage<S>> {
+        self.cache.lock().get_or_fetch(id).unwrap().clone()
+    }
+}
+
+pub fn get_schema() -> Schema {
+    Schema {
+        id: *PAGE_SCHEMA_ID,
+        name: String::from(PAGE_SCHEMA),
+        key_field: None,
+        str_key_field: None,
+        is_dynamic: false,
+        fields: Field::new(
+            "*",
+            type_id_of(Type::SmallBytes),
+            false,
+            true,
+            None
+        )
+    }
 }
 
 #[cfg(test)]
-mod test {}
+mod test {
+
+}
