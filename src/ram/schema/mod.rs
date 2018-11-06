@@ -140,7 +140,7 @@ impl LocalSchemasCache {
         let mut m = self.map.write();
         m.new_schema(schema)
     }
-    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+    pub fn name_to_id(&self, name: &str) -> Option<u32> {
         let m = self.map.read();
         m.name_to_id(name)
     }
