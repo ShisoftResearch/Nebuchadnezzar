@@ -1,6 +1,5 @@
 use bifrost::utils::fut_exec::wait;
 use client::AsyncClient;
-use cuckoofilter::*;
 use dovahkiin::types::custom_types::bytes::SmallBytes;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
@@ -47,7 +46,6 @@ where
     neb_client: Arc<AsyncClient>,
     index: BTreeMap<EntryKey, Id>,
     tombstones: Tombstones,
-    filter: CuckooFilter<DefaultHasher>,
     pages: PageCache<S>,
     marker: PhantomData<S>,
 }
@@ -108,7 +106,7 @@ where
             neb_client: neb_client.clone(),
             index: BTreeMap::new(),
             tombstones: Tombstones::new(),
-            filter: CuckooFilter::new(), // TODO: carefully set the capacity
+            // TODO: carefully set the capacity
             pages: Arc::new(Mutex::new(LRUCache::new(
                 100,
                 move |id| {
