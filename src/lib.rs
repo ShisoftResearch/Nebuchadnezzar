@@ -38,10 +38,10 @@ extern crate serde;
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
+extern crate cuckoofilter;
 extern crate hermes;
 extern crate owning_ref;
 extern crate rayon;
-extern crate cuckoofilter;
 
 pub mod utils;
 #[macro_use]

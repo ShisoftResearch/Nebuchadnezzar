@@ -21,8 +21,7 @@ pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
     return prefix.as_slice() == &x[..x.len() - ID_SIZE];
 }
 
-pub trait Slice: Sized
-{
+pub trait Slice: Sized {
     type Item: Default + Debug;
 
     fn as_slice(&mut self) -> &mut [Self::Item];

@@ -1,18 +1,18 @@
 use ram::cell::CellHeader;
 use ram::chunk::Chunks;
 use ram::tombstone::Tombstone;
+use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::env;
 
 pub mod combine;
 pub mod compact;
 
 pub struct Cleaner {
     chunks: Arc<Chunks>,
-    stopped: Arc<AtomicBool>
+    stopped: Arc<AtomicBool>,
 }
 
 // The two-level cleaner
@@ -22,7 +22,7 @@ impl Cleaner {
         let stop_tag = Arc::new(AtomicBool::new(false));
         let cleaner = Cleaner {
             chunks: chunks.clone(),
-            stopped: stop_tag.clone()
+            stopped: stop_tag.clone(),
         };
         let stop_tag_ref_clone = stop_tag.clone();
         let checks_ref_clone = chunks.clone();

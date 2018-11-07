@@ -13,6 +13,8 @@ use itertools::Itertools;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use ram::cell::Cell;
+use ram::schema::Field;
+use ram::schema::Schema;
 use ram::types::*;
 use std::cell::RefCell;
 use std::collections::btree_map::Range;
@@ -23,8 +25,6 @@ use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use ram::schema::Schema;
-use ram::schema::Field;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -78,10 +78,7 @@ where
         for (i, val) in keys_array.iter().enumerate() {
             slice.as_slice()[i] = EntryKey::from(val.as_slice());
         }
-        Self {
-            id: cell_id,
-            slice,
-        }
+        Self { id: cell_id, slice }
     }
 }
 
@@ -248,7 +245,7 @@ where
             (
                 target_keys.into_iter().map(|x| x.clone()).collect_vec(),
                 merged,
-                target_page_ids
+                target_page_ids,
             )
         };
 
@@ -354,17 +351,9 @@ pub fn get_schema() -> Schema {
         key_field: None,
         str_key_field: None,
         is_dynamic: false,
-        fields: Field::new(
-            "*",
-            type_id_of(Type::SmallBytes),
-            false,
-            true,
-            None
-        )
+        fields: Field::new("*", type_id_of(Type::SmallBytes), false, true, None),
     }
 }
 
 #[cfg(test)]
-mod test {
-
-}
+mod test {}

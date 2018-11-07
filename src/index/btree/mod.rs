@@ -798,6 +798,7 @@ mod test {
     use index::btree::NUM_KEYS;
     use index::id_from_key;
     use ram::types::RandValue;
+    use rand::distributions::Uniform;
     use rand::prelude::*;
     use server;
     use server::NebServer;
@@ -809,7 +810,6 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
-    use rand::distributions::Uniform;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1134,10 +1134,14 @@ mod test {
                     }
                     assert!(remove_succeed, "{}", i);
                 }
-                if roll_die.next().unwrap() != 6 { continue; }
+                if roll_die.next().unwrap() != 6 {
+                    continue;
+                }
                 debug!("sampling for remaining integrity for {}", i);
                 for j in deletion_volume..i {
-                    if roll_die.next().unwrap() != 6 { continue; }
+                    if roll_die.next().unwrap() != 6 {
+                        continue;
+                    }
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
                     let key = SmallVec::from_slice(&key_slice);
