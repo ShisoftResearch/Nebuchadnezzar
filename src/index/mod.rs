@@ -4,6 +4,8 @@ use std::fmt::Debug;
 use std::io::Cursor;
 use std::mem;
 
+#[macro_use]
+mod macros;
 pub mod btree;
 pub mod placement;
 pub mod sstable;
@@ -15,6 +17,11 @@ fn id_from_key(key: &EntryKey) -> Id {
     debug!("Decoding key to id {:?}", key);
     let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
+}
+
+fn key_with_id(key: &mut EntryKey, id: &Id) {
+    let id_bytes = id.to_binary();
+    key.extend_from_slice(&id_bytes);
 }
 
 pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {

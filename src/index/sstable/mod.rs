@@ -6,9 +6,9 @@ use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
 use index::btree::Ordering;
-use index::id_from_key;
 use index::EntryKey;
 use index::Slice;
+use index::{id_from_key, key_with_id};
 use itertools::Itertools;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -178,7 +178,7 @@ where
                     .map(|(k, id)| (k, pages_cache.get_or_fetch(id).unwrap().clone()))
                     .unzip()
             };
-            let page_size = target_pages.first().unwrap().slice.len();
+            let page_size = target_pages.first().map(|p| p.slice.len()).unwrap_or(0);
             let target_page_ids = target_pages.iter().map(|p| p.id).collect::<LinkedList<_>>();
             let mut target = target_pages
                 .iter()
@@ -355,5 +355,56 @@ pub fn get_schema() -> Schema {
     }
 }
 
+macro_rules! impl_sspage_slice {
+    ($t: ty, $et: ty, $n: expr) => {
+        impl_slice_ops!($t, $et, $n);
+        impl SortableEntrySlice for $t {}
+    };
+}
+
 #[cfg(test)]
-mod test {}
+mod test {
+    use super::*;
+    use client;
+    use index::sstable::LevelTree;
+    use server::NebServer;
+    use server::ServerOptions;
+    use std::ptr;
+    use std::sync::Arc;
+
+    impl_sspage_slice!([EntryKey; 1000], EntryKey, 1000);
+
+
+    pub fn init() {
+        env_logger::init();
+        let server_group = "sstable_index_init";
+        let server_addr = String::from("127.0.0.1:5200");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::get_schema());
+
+        let mut tree: LevelTree<[EntryKey; 1000]> = LevelTree::new(&client);
+        let id = Id::unit_id();
+        let key = smallvec![1, 2, 3, 4, 5, 6];
+        let mut tombstones = BTreeSet::new();
+        info!("test insertion");
+
+        let mut key_id = key.clone();
+        key_with_id(&mut key_id, &id);
+
+        tree.merge(vec![key_id], &mut tombstones);
+        let mut cursor = tree.seek(&key, Ordering::Forward);
+        assert_eq!(id_from_key(cursor.current().unwrap()), id);
+    }
+}

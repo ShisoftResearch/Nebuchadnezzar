@@ -31,6 +31,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::key_with_id;
 
 mod external;
 mod internal;
@@ -91,18 +92,6 @@ pub struct TreeTxn<'a> {
     tree: &'a BPlusTree,
     bz: Rc<CacheBufferZone>,
     txn: &'a mut Txn,
-}
-
-macro_rules! make_array {
-    ($n: expr, $constructor:expr) => {
-        unsafe {
-            let mut items: [_; $n] = mem::uninitialized();
-            for place in items.iter_mut() {
-                ptr::write(place, $constructor);
-            }
-            items
-        }
-    };
 }
 
 impl BPlusTree {
@@ -695,34 +684,20 @@ fn insert_into_split<T, S>(
     }
 }
 
-fn key_with_id(key: &mut EntryKey, id: &Id) {
-    let id_bytes = id.to_binary();
-    key.extend_from_slice(&id_bytes);
-}
-
-macro_rules! impl_slice_ops {
+macro_rules! impl_btree_slice {
     ($t: ty, $et: ty, $n: expr) => {
-        impl Slice for $t {
-            type Item = $et;
-
-            fn as_slice(&mut self) -> &mut [$et] {
-                self
-            }
-            fn init() -> Self {
-                make_array!($n, Self::item_default())
-            }
-        }
+        impl_slice_ops!($t, $et, $n);
         impl BTreeSlice<$et> for $t {}
     };
 }
+
+impl_btree_slice!(EntryKeySlice, EntryKey, NUM_KEYS);
+impl_btree_slice!(NodePointerSlice, TxnValRef, NUM_PTRS);
 
 struct RemoveStatus {
     item_found: bool,
     removed: bool,
 }
-
-impl_slice_ops!(EntryKeySlice, EntryKey, NUM_KEYS);
-impl_slice_ops!(NodePointerSlice, TxnValRef, NUM_PTRS);
 
 impl Default for Node {
     fn default() -> Self {
@@ -913,7 +888,7 @@ mod test {
     #[test]
     fn init() {
         env_logger::init();
-        let server_group = "index_init";
+        let server_group = "bree_index_init";
         let server_addr = String::from("127.0.0.1:5100");
         let server = NebServer::new_from_opts(
             &ServerOptions {
