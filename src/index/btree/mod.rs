@@ -1118,9 +1118,13 @@ mod test {
             tree.flush_all();
 
             debug!("remove remaining items, with extensive point search");
+            // die-rolling
+            let mut rng = thread_rng();
+            let die_range = Uniform::new_inclusive(1, 6);
+            let mut roll_die = rng.sample_iter(&die_range);
             for i in (deletion_volume..num).rev() {
                 {
-                    debug!("delete and scan: {}", i);
+                    debug!("delete and sampling: {}", i);
                     let id = Id::new(0, i);
                     let key_slice = u64_to_slice(i);
                     let key = SmallVec::from_slice(&key_slice);
@@ -1130,11 +1134,7 @@ mod test {
                     }
                     assert!(remove_succeed, "{}", i);
                 }
-
-                // die-rolling
-                let mut rng = thread_rng();
-                let die_range = Uniform::new_inclusive(1, 6);
-                let mut roll_die = rng.sample_iter(&die_range);
+                if roll_die.next().unwrap() != 6 { continue; }
                 for j in deletion_volume..i {
                     if roll_die.next().unwrap() != 6 { continue; }
                     let id = Id::new(0, j);
