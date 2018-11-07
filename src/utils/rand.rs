@@ -15,7 +15,7 @@ impl RandGen {
         }
     }
     fn next(&mut self) -> u64 {
-        self.generator.next_u64()
+        self.generator.gen()
     }
     fn next_two(&mut self) -> (u64, u64) {
         (self.next(), self.next())

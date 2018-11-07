@@ -14,6 +14,7 @@ service! {
     rpc update_cell(cell: Cell) -> CellHeader | WriteError;
     rpc upsert_cell(cell: Cell) -> CellHeader | WriteError;
     rpc remove_cell(key: Id) -> () | WriteError;
+    rpc count() -> u64;
 }
 
 pub struct NebRPCService {
@@ -39,6 +40,9 @@ impl Service for NebRPCService {
     }
     fn remove_cell(&self, key: Id) -> Box<Future<Item = (), Error = WriteError>> {
         NebRPCServiceInner::remove_cell(self.inner.clone(), key)
+    }
+    fn count(&self) -> Box<Future<Item = u64, Error = ()>> {
+        NebRPCServiceInner::count(self.inner.clone())
     }
 }
 
@@ -66,6 +70,9 @@ impl NebRPCServiceInner {
         mut cell: Cell,
     ) -> Box<Future<Item = CellHeader, Error = WriteError>> {
         box future::result(this.server.chunks.upsert_cell(&mut cell))
+    }
+    fn count(this: Arc<Self>) -> Box<Future<Item = u64, Error = ()>> {
+        box future::ok(this.server.chunks.count() as u64)
     }
 }
 

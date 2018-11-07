@@ -641,6 +641,10 @@ impl Chunk {
     pub fn cell_addresses(&self) -> BTreeMap<u64, usize> {
         (*self.index).clone().into_iter().collect()
     }
+
+    pub fn count(&self) -> usize {
+        self.index.len()
+    }
 }
 
 pub struct PendingEntry {
@@ -765,5 +769,9 @@ impl Chunks {
     pub fn address_of(&self, key: &Id) -> usize {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return *chunk.location_for_read(hash).unwrap();
+    }
+
+    pub fn count(&self) -> usize {
+        self.list.iter().map(|c| c.count()).sum()
     }
 }

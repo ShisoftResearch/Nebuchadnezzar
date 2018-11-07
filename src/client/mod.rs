@@ -71,17 +71,24 @@ impl AsyncClientInner {
         }
     }
 
-    pub fn locate_plain_server(
+    fn client_by_server_id(
         this: Arc<Self>,
-        id: Id,
+        server_id: u64,
     ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
-        let server_id = this.locate_server_id(&id).unwrap();
         DEFAULT_CLIENT_POOL
             .get_by_id_async(server_id, move |sid| this.conshash.to_server_name(sid))
             .map_err(|e| RPCError::IOError(e))
             .map(move |c| {
                 plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &c)
             })
+    }
+
+    pub fn locate_plain_server(
+        this: Arc<Self>,
+        id: Id,
+    ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
+        let server_id = this.locate_server_id(&id).unwrap();
+        Self::client_by_server_id(this, server_id)
     }
     #[async]
     pub fn read_cell(this: Arc<Self>, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
@@ -116,6 +123,20 @@ impl AsyncClientInner {
     pub fn remove_cell(this: Arc<Self>, id: Id) -> Result<Result<(), WriteError>, RPCError> {
         let client = await!(Self::locate_plain_server(this, id))?;
         await!(client.remove_cell(id))
+    }
+    #[async]
+    pub fn count(this: Arc<Self>) -> Result<u64, ()> {
+        let (members, _) = await!(this.conshash.membership().all_members(true)).map_err(|_| ())??;
+        let mut sum = 0;
+        for m in members {
+            let client_res = await!(Self::client_by_server_id(this.clone(), m.id));
+            sum += if let Ok(c) = client_res {
+                await!(c.count().map_err(|_|()))??
+            } else {
+                0
+            };
+        }
+        Ok(sum)
     }
     #[async]
     pub fn transaction<TFN, TR>(this: Arc<Self>, func: TFN) -> Result<TR, TxnError>
