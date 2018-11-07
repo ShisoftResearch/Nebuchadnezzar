@@ -1135,6 +1135,7 @@ mod test {
                     assert!(remove_succeed, "{}", i);
                 }
                 if roll_die.next().unwrap() != 6 { continue; }
+                debug!("sampling for remaining integrity for {}", i);
                 for j in deletion_volume..i {
                     if roll_die.next().unwrap() != 6 { continue; }
                     let id = Id::new(0, j);
