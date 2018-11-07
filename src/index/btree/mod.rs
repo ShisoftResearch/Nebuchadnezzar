@@ -1133,7 +1133,6 @@ mod test {
 
                 // die-rolling
                 let mut rng = thread_rng();
-                Uniform::new_inclusive(1, 6);
                 let die_range = Uniform::new_inclusive(1, 6);
                 let mut roll_die = rng.sample_iter(&die_range);
                 for j in deletion_volume..i {
