@@ -174,7 +174,7 @@ impl BPlusTree {
         }
     }
 
-    fn flush_item(client: &Arc<AsyncClient>,value: &Arc<RwLock<ExtNode>>) {
+    fn flush_item(client: &Arc<AsyncClient>, value: &Arc<RwLock<ExtNode>>) {
         let cache = value.read();
         if cache.dirty {
             let cell = cache.to_cell();
@@ -798,6 +798,7 @@ mod test {
     use index::btree::NUM_KEYS;
     use index::id_from_key;
     use ram::types::RandValue;
+    use rand::prelude::*;
     use server;
     use server::NebServer;
     use server::ServerOptions;
@@ -808,6 +809,7 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
+    use rand::distributions::Uniform;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1049,7 +1051,12 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    id_from_key(
+                        tree.seek(&key, Ordering::default())
+                            .unwrap()
+                            .current()
+                            .unwrap()
+                    ),
                     id,
                     "{}",
                     i
@@ -1078,7 +1085,12 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    id_from_key(
+                        tree.seek(&key, Ordering::default())
+                            .unwrap()
+                            .current()
+                            .unwrap()
+                    ),
                     Id::new(0, deletion_volume), // seek should reach deletion_volume
                     "{}",
                     i
@@ -1091,7 +1103,12 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                    id_from_key(
+                        tree.seek(&key, Ordering::default())
+                            .unwrap()
+                            .current()
+                            .unwrap()
+                    ),
                     id,
                     "{}",
                     i
@@ -1113,13 +1130,24 @@ mod test {
                     }
                     assert!(remove_succeed, "{}", i);
                 }
+
+                // die-rolling
+                let mut rng = thread_rng();
+                Uniform::new_inclusive(1, 6);
+                let die_range = Uniform::new_inclusive(1, 6);
+                let mut roll_die = rng.sample_iter(&die_range);
                 for j in deletion_volume..i {
-                    // sampling
+                    if roll_die.next().unwrap() != 6 { continue; }
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
                     let key = SmallVec::from_slice(&key_slice);
                     assert_eq!(
-                        id_from_key(tree.seek(&key, Ordering::default()).unwrap().current().unwrap()),
+                        id_from_key(
+                            tree.seek(&key, Ordering::default())
+                                .unwrap()
+                                .current()
+                                .unwrap()
+                        ),
                         id,
                         "{} / {}",
                         i,
