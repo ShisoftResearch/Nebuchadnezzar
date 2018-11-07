@@ -338,4 +338,15 @@ mod tests {
             Cell::new_with_id(1, &id, value);
         })
     }
+
+    #[bench]
+    fn cell_clone(b: &mut Bencher) {
+        let id = Id::new(0, 1);
+        let mut value = Value::Map(Map::new());
+        value["DATA"] = Value::U64(2);
+        let cell = Cell::new_with_id(1, &id, value);
+        b.iter(|| {
+            cell.clone();
+        })
+    }
 }
