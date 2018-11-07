@@ -217,3 +217,61 @@ pub fn smoke_test_parallel() {
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
     });
 }
+
+#[test]
+pub fn txn() {
+    const DATA: &'static str = "DATA";
+    let num = env::var("NEB_KV_TXN_TEST_ITEMS")
+        .unwrap_or("1000".to_string())
+        .parse::<u64>()
+        .unwrap();
+    env_logger::init();
+    let server_addr = String::from("127.0.0.1:5303");
+    let server_group = String::from("bench_test");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 1,
+            memory_size: 512 * 1024 * 1024,
+            backup_storage: None,
+            wal_storage: None,
+        },
+        &server_addr,
+        &server_group,
+    );
+    let schema_id = 123;
+    let schema = Schema {
+        id: schema_id,
+        name: String::from("schema"),
+        key_field: None,
+        str_key_field: None,
+        is_dynamic: false,
+        fields: Field::new(
+            "*",
+            0,
+            false,
+            false,
+            Some(vec![Field::new(
+                DATA,
+                type_id_of(Type::U64),
+                false,
+                false,
+                None,
+            )]),
+        ),
+    };
+
+    let client = Arc::new(
+        client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
+    );
+    client.new_schema_with_id(schema).wait();
+
+    (0..num).collect::<Vec<_>>().into_iter().for_each(|_| {
+        client.transaction(move |txn| {
+            let id = Id::new(0, 1);
+            let mut value = Value::Map(Map::new());
+            value[DATA] = Value::U64(2);
+            let cell = Cell::new_with_id(schema_id, &id, value);
+            txn.upsert(cell)
+        }).wait();
+    })
+}
