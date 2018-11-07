@@ -126,11 +126,7 @@ impl BPlusTree {
                 },
                 move |id, value| {
                     debug!("Flush page to cache {:?}", &id);
-                    let cache = value.read();
-                    if cache.dirty {
-                        let cell = cache.to_cell();
-                        wait(neb_client_2.upsert_cell(cell)).unwrap();
-                    }
+                    Self::flush_item(&neb_client_2, &value);
                 },
             ))),
         };
@@ -171,6 +167,21 @@ impl BPlusTree {
                 res
             })
     }
+
+    pub fn flush_all(&self) {
+        for (_, value) in self.ext_node_cache.lock().iter() {
+            Self::flush_item(&self.storage, value)
+        }
+    }
+
+    fn flush_item(client: &Arc<AsyncClient>,value: &Arc<RwLock<ExtNode>>) {
+        let cache = value.read();
+        if cache.dirty {
+            let cell = cache.to_cell();
+            wait(client.upsert_cell(cell)).unwrap();
+        }
+    }
+
     fn new_page_id(&self) -> Id {
         // TODO: achieve locality
         Id::rand()
@@ -1087,6 +1098,8 @@ mod test {
                 );
             }
 
+            tree.flush_all();
+
             debug!("remove remaining items, with extensive point search");
             for i in (deletion_volume..num).rev() {
                 {
@@ -1127,6 +1140,9 @@ mod test {
                     i
                 );
             }
+
+            tree.flush_all();
+            assert_eq!(wait(client.count()).unwrap(), 1);
         }
     }
 }

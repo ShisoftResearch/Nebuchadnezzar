@@ -125,16 +125,15 @@ impl AsyncClientInner {
         await!(client.remove_cell(id))
     }
     #[async]
-    pub fn count(this: Arc<Self>) -> Result<u64, ()> {
-        let (members, _) = await!(this.conshash.membership().all_members(true)).map_err(|_| ())??;
+    pub fn count(this: Arc<Self>) -> Result<u64, RPCError> {
+        let (members, _) = await!(this.conshash.membership().all_members(true))
+            .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e)))?
+            .unwrap();
         let mut sum = 0;
         for m in members {
-            let client_res = await!(Self::client_by_server_id(this.clone(), m.id));
-            sum += if let Ok(c) = client_res {
-                await!(c.count().map_err(|_|()))??
-            } else {
-                0
-            };
+            let client = await!(Self::client_by_server_id(this.clone(), m.id))?;
+            let count = await!(client.count())?.unwrap();
+            sum += count
         }
         Ok(sum)
     }
@@ -294,6 +293,10 @@ impl AsyncClient {
         id: Id,
     ) -> impl Future<Item = Result<(), WriteError>, Error = RPCError> {
         AsyncClientInner::remove_cell(self.inner.clone(), id)
+    }
+
+    pub fn count(&self) -> impl Future<Item = u64, Error = RPCError> {
+        AsyncClientInner::count(self.inner.clone())
     }
 
     pub fn transaction<TFN, TR>(&self, func: TFN) -> impl Future<Item = TR, Error = TxnError>

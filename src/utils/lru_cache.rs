@@ -62,6 +62,10 @@ where
         self.map.remove(key)
     }
 
+    pub fn iter(&self) -> Iter<K, V> {
+        self.map.iter()
+    }
+
     fn pop_overflows(&mut self) {
         while self.map.len() >= self.capacity {
             if let Some((key, value)) = self.map.pop_front() {
