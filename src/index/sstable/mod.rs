@@ -70,7 +70,6 @@ where
         let cell_id = cell.id();
         let keys = cell.data;
         let keys_len = keys.len().unwrap();
-        debug_assert!(slice_len == keys_len);
         let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
             array
         } else {
@@ -152,16 +151,20 @@ where
         });
 
         let (pos, page_len) = if let Some(ref page) = first {
+            debug!("First page has {} elements", page.len);
             (
                 page.slice
-                    .as_slice_immute()
+                    .as_slice_immute()[..page.len]
                     .binary_search(key)
                     .unwrap_or_else(|i| i),
-                page.slice.as_slice_immute().len(),
+                page.len,
             )
         } else {
             (0, 0)
         };
+
+        debug!("First page search pos is {}", pos);
+
         let mut cursor = RTCursor {
             ordering,
             range,
@@ -362,7 +365,7 @@ where
     }
 
     pub fn current(&self) -> Option<&EntryKey> {
-        if self.index <= 0 || self.index >= self.page_len {
+        if self.index < 0 || self.index >= self.page_len {
             return None;
         }
         if let Some(ref page) = self.current {
@@ -404,12 +407,13 @@ mod test {
     use server::ServerOptions;
     use std::ptr;
     use std::sync::Arc;
+    use futures::prelude::*;
 
     type SmallPage = [EntryKey; 5];
 
     impl_sspage_slice!(SmallPage, EntryKey, 5);
 
-
+    #[test]
     pub fn init() {
         env_logger::init();
         let server_group = "sstable_index_init";
@@ -427,7 +431,7 @@ mod test {
         let client = Arc::new(
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
-        client.new_schema_with_id(super::get_schema());
+        client.new_schema_with_id(super::get_schema()).wait();
 
         let mut tree: LevelTree<SmallPage> = LevelTree::new(&client);
         let id = Id::unit_id();
