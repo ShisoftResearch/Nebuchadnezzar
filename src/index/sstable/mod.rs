@@ -57,6 +57,7 @@ where
 {
     id: Id,
     slice: S,
+    len: usize,
 }
 
 impl<S> SSPage<S>
@@ -78,21 +79,33 @@ where
         for (i, val) in keys_array.iter().enumerate() {
             slice.as_slice()[i] = EntryKey::from(val.as_slice());
         }
-        Self { id: cell_id, slice }
+        Self {
+            id: cell_id,
+            slice,
+            len: keys_array.len(),
+        }
     }
-}
 
-pub fn page_slice_to_cell<S>(slice: S, id: &Id) -> Cell
-where
-    S: Slice<Item = EntryKey>,
-{
-    let value = slice
-        .as_slice_immute()
-        .iter()
-        .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
-        .collect_vec()
-        .value();
-    Cell::new_with_id(*PAGE_SCHEMA_ID, id, value)
+    pub fn to_cell(&self) -> Cell
+    {
+        let value = self
+            .slice
+            .as_slice_immute()
+            .iter()
+            .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
+            .take(self.len)
+            .collect_vec()
+            .value();
+        Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
+    }
+
+    pub fn new() -> Self {
+        SSPage {
+            slice: S::init(),
+            id: Id::unit_id(),
+            len: 0,
+        }
+    }
 }
 
 impl<S> LevelTree<S>
@@ -101,9 +114,10 @@ where
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         let client = neb_client.clone();
+        let mut index = BTreeMap::new();
         Self {
             neb_client: neb_client.clone(),
-            index: BTreeMap::new(),
+            index,
             tombstones: Tombstones::new(),
             // TODO: carefully set the capacity
             pages: Arc::new(Mutex::new(LRUCache::new(
@@ -123,6 +137,7 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<S> {
+        debug!("Seeking for {:?}, in index len {}", key, self.index.len());
         let mut range = match ordering {
             Ordering::Forward => self.index.range::<EntryKey, _>(key..),
             Ordering::Backward => self.index.range::<EntryKey, _>(..=key),
@@ -131,7 +146,10 @@ where
             Ordering::Forward => range.next(),
             Ordering::Backward => range.next_back(),
         }
-        .map(|(_, page_id)| self.pages.lock().get_or_fetch(page_id).unwrap().clone());
+        .map(|(_, page_id)| {
+            debug!("First page id is {:?}", page_id);
+            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+        });
 
         let (pos, page_len) = if let Some(ref page) = first {
             (
@@ -178,22 +196,23 @@ where
                     .map(|(k, id)| (k, pages_cache.get_or_fetch(id).unwrap().clone()))
                     .unzip()
             };
-            let page_size = target_pages.first().map(|p| p.slice.len()).unwrap_or(0);
+            let mut merged: Vec<SSPage<S>> = vec![SSPage::new()];
+            let page_size = merged[0].slice.len();
             let target_page_ids = target_pages.iter().map(|p| p.id).collect::<LinkedList<_>>();
             let mut target = target_pages
                 .iter()
-                .map(|page| page.slice.as_slice_immute())
+                .map(|page| &page.slice.as_slice_immute()[..page.len])
                 .flat_map(|x| x)
                 .map(|x| (*x).clone())
                 .collect_vec();
 
-            let mut merged: Vec<S> = vec![S::init()];
             let src_len = source.len();
             let tgt_len = target.len();
+
+            debug!("Src len {}, target len {}", src_len, tgt_len);
+
             let mut srci = 0;
             let mut tgti = 0;
-
-            let mut merging_slice_i = 0;
 
             while srci < src_len || tgti < tgt_len {
                 let mut from_source = false;
@@ -219,6 +238,7 @@ where
                         s
                     }
                 };
+
                 if from_source {
                     if tombstones.remove(lowest) {
                         continue;
@@ -228,17 +248,21 @@ where
                         continue;
                     }
                 }
-                mem::swap(
-                    &mut merged.last_mut().unwrap().as_slice()[merging_slice_i],
-                    lowest,
-                );
-                merging_slice_i += 1;
-                if merging_slice_i >= page_size {
-                    merging_slice_i = 0;
-                    merged.push(S::init());
+
+                let merging_page_len = {
+                    let merging_page = merged.last_mut().unwrap();
+                    let page_len = merging_page.len;
+                    debug!("i is {}, picking {:?}", page_len, lowest);
+                    mem::swap(&mut merging_page.slice.as_slice()[page_len], lowest);
+                    merging_page.len += 1;
+                    merging_page.len
+                };
+
+                if merging_page_len >= page_size {
+                    merged.push(SSPage::new());
                 }
             }
-            if merging_slice_i == 0 {
+            if merged.last().unwrap().len == 0 {
                 let merged_len = merged.len();
                 merged.remove(merged_len - 1);
             }
@@ -249,24 +273,33 @@ where
             )
         };
 
+        debug!("Merged {} pages", merged.len());
+
         for k in keys_to_removed {
+            debug!("Remove stale page index {:?}", k);
             self.index.remove(&k).unwrap();
         }
 
         for id in &ids_to_reuse {
+            debug!("Remove stale page cache {:?}", id);
             pages_cache.remove(id);
         }
 
         for mut page in merged {
-            let index_key = page.as_slice()[0].clone();
             let reuse_id = ids_to_reuse.pop_back();
             let id = reuse_id.unwrap_or_else(|| Id::rand());
-            let cell = page_slice_to_cell(page, &id);
+            let index_key = page.slice.as_slice_immute()[0].clone();
+            page.id = id;
+            let cell = page.to_cell();
             if reuse_id.is_some() {
+                debug!("Reuse page id by updating {:?}", cell.id());
                 wait(self.neb_client.update_cell(cell)).unwrap();
             } else {
+                debug!("Inserting page with id {:?}", cell.id());
                 wait(self.neb_client.write_cell(cell)).unwrap();
             }
+
+            debug!("Insert page index key {:?}, id {:?}", index_key, id);
             self.index.insert(index_key, id);
         }
     }
@@ -372,7 +405,9 @@ mod test {
     use std::ptr;
     use std::sync::Arc;
 
-    impl_sspage_slice!([EntryKey; 1000], EntryKey, 1000);
+    type SmallPage = [EntryKey; 5];
+
+    impl_sspage_slice!(SmallPage, EntryKey, 5);
 
 
     pub fn init() {
@@ -394,7 +429,7 @@ mod test {
         );
         client.new_schema_with_id(super::get_schema());
 
-        let mut tree: LevelTree<[EntryKey; 1000]> = LevelTree::new(&client);
+        let mut tree: LevelTree<SmallPage> = LevelTree::new(&client);
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
         let mut tombstones = BTreeSet::new();
