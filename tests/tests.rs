@@ -1,4 +1,5 @@
 #![feature(integer_atomics)]
+#![feature(test)]
 
 #[macro_use]
 extern crate neb;
@@ -26,6 +27,7 @@ extern crate futures_await as futures;
 extern crate itertools;
 extern crate parking_lot;
 extern crate rayon;
+extern crate test;
 
 use neb::ram::schema::Field;
 

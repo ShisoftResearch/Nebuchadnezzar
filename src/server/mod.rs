@@ -205,3 +205,137 @@ impl NebServer {
             .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate test;
+
+    use client;
+    use dovahkiin::types::custom_types::id::Id;
+    use dovahkiin::types::custom_types::map::Map;
+    use dovahkiin::types::type_id_of;
+    use futures::Future;
+    use ram::cell::Cell;
+    use ram::schema::Field;
+    use ram::schema::Schema;
+    use server::NebServer;
+    use server::ServerOptions;
+    use std::sync::Arc;
+    use test::Bencher;
+    use ram::types::*;
+
+    #[bench]
+    fn wr(b: &mut Bencher) {
+        const DATA: &'static str = "DATA";
+        env_logger::init();
+        let server_addr = String::from("127.0.0.1:5302");
+        let server_group = String::from("bench_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 512 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let schema_id = 123;
+        let schema = Schema {
+            id: schema_id,
+            name: String::from("schema"),
+            key_field: None,
+            str_key_field: None,
+            is_dynamic: false,
+            fields: Field::new(
+                "*",
+                0,
+                false,
+                false,
+                Some(vec![Field::new(
+                    DATA,
+                    type_id_of(Type::U64),
+                    false,
+                    false,
+                    None,
+                )]),
+            ),
+        };
+
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
+        );
+        client.new_schema_with_id(schema).wait();
+
+        let id = Id::new(0, 1);
+        let mut value = Value::Map(Map::new());
+        value[DATA] = Value::U64(2);
+        let cell = Cell::new_with_id(schema_id, &id, value);
+        b.iter(|| {
+            client.upsert_cell(cell.clone()).wait();
+        })
+    }
+
+    #[bench]
+    fn txn(b: &mut Bencher) {
+        const DATA: &'static str = "DATA";
+        env_logger::init();
+        let server_addr = String::from("127.0.0.1:5303");
+        let server_group = String::from("bench_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 512 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let schema_id = 123;
+        let schema = Schema {
+            id: schema_id,
+            name: String::from("schema"),
+            key_field: None,
+            str_key_field: None,
+            is_dynamic: false,
+            fields: Field::new(
+                "*",
+                0,
+                false,
+                false,
+                Some(vec![Field::new(
+                    DATA,
+                    type_id_of(Type::U64),
+                    false,
+                    false,
+                    None,
+                )]),
+            ),
+        };
+
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
+        );
+        client.new_schema_with_id(schema).wait();
+        b.iter(|| {
+            client.transaction(move |txn| {
+                let id = Id::new(0, 1);
+                let mut value = Value::Map(Map::new());
+                value[DATA] = Value::U64(2);
+                let cell = Cell::new_with_id(schema_id, &id, value);
+                txn.upsert(cell)
+            }).wait()
+        })
+    }
+
+    #[bench]
+    fn cell_construct(b: &mut Bencher) {
+        b.iter(|| {
+            let id = Id::new(0, 1);
+            let mut value = Value::Map(Map::new());
+            value["DATA"] = Value::U64(2);
+            Cell::new_with_id(1, &id, value);
+        })
+    }
+}

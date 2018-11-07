@@ -8,6 +8,7 @@
 #![feature(integer_atomics)]
 #![feature(generators)]
 #![feature(box_syntax)]
+#![feature(test)]
 
 #[macro_use]
 extern crate log;
@@ -42,6 +43,7 @@ extern crate cuckoofilter;
 extern crate hermes;
 extern crate owning_ref;
 extern crate rayon;
+extern crate test;
 
 pub mod utils;
 #[macro_use]
