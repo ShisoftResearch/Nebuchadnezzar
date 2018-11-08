@@ -457,8 +457,8 @@ impl DataManagerInner {
             return this.response_with(DMPrepareResult::StateError(txn.state));
         }
 
-        let mut cell_mutices = Vec::new();
-        let mut cell_guards = Vec::new();
+        let mut cell_mutices = Vec::with_capacity(cell_ids.len());
+        let mut cell_guards = Vec::with_capacity(cell_ids.len());
 
         for cell_id in &cell_ids {
             cell_mutices.push(this.cell_meta_mutex(cell_id));
