@@ -5,6 +5,7 @@ use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
+use futures::prelude::*;
 use index::btree::Ordering;
 use index::EntryKey;
 use index::Slice;
@@ -42,8 +43,8 @@ lazy_static! {
 }
 
 pub struct LevelTree<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     neb_client: Arc<AsyncClient>,
     index: BTreeMap<EntryKey, Id>,
@@ -52,8 +53,8 @@ pub struct LevelTree<S>
     marker: PhantomData<S>,
 }
 struct SSPage<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     id: Id,
     slice: S,
@@ -61,8 +62,8 @@ struct SSPage<S>
 }
 
 impl<S> SSPage<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn from_cell(cell: Cell) -> Self {
         let mut slice = S::init();
@@ -85,8 +86,7 @@ impl<S> SSPage<S>
         }
     }
 
-    pub fn to_cell(&self) -> Cell
-    {
+    pub fn to_cell(&self) -> Cell {
         let value = self
             .slice
             .as_slice_immute()
@@ -108,8 +108,8 @@ impl<S> SSPage<S>
 }
 
 impl<S> LevelTree<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         let client = neb_client.clone();
@@ -122,7 +122,9 @@ impl<S> LevelTree<S>
             pages: Arc::new(Mutex::new(LRUCache::new(
                 100,
                 move |id| {
-                    wait(client.read_cell(*id))
+                    client
+                        .read_cell(*id)
+                        .wait()
                         .unwrap()
                         .map(|cell| Arc::new(SSPage::from_cell(cell)))
                         .ok()
@@ -145,16 +147,15 @@ impl<S> LevelTree<S>
             Ordering::Forward => range.next(),
             Ordering::Backward => range.next_back(),
         }
-            .map(|(_, page_id)| {
-                debug!("First page id is {:?}", page_id);
-                self.pages.lock().get_or_fetch(page_id).unwrap().clone()
-            });
+        .map(|(_, page_id)| {
+            debug!("First page id is {:?}", page_id);
+            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+        });
 
         let (pos, page_len) = if let Some(ref page) = first {
             debug!("First page has {} elements", page.len);
             (
-                page.slice
-                    .as_slice_immute()[..page.len]
+                page.slice.as_slice_immute()[..page.len]
                     .binary_search(key)
                     .unwrap_or_else(|i| i),
                 page.len,
@@ -296,10 +297,10 @@ impl<S> LevelTree<S>
             let cell = page.to_cell();
             if reuse_id.is_some() {
                 debug!("Reuse page id by updating {:?}", cell.id());
-                wait(self.neb_client.update_cell(cell)).unwrap();
+                self.neb_client.update_cell(cell).wait().unwrap();
             } else {
                 debug!("Inserting page with id {:?}", cell.id());
-                wait(self.neb_client.write_cell(cell)).unwrap();
+                self.neb_client.write_cell(cell).wait().unwrap();
             }
 
             debug!("Insert page index key {:?}, id {:?}", index_key, id);
@@ -311,8 +312,8 @@ impl<S> LevelTree<S>
 pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
 
 pub struct RTCursor<'a, S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     index: usize,
     ordering: Ordering,
@@ -323,8 +324,8 @@ pub struct RTCursor<'a, S>
 }
 
 impl<'a, S> RTCursor<'a, S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn next(&mut self) -> bool {
         if self.current.is_some() {
@@ -402,12 +403,12 @@ macro_rules! impl_sspage_slice {
 mod test {
     use super::*;
     use client;
+    use futures::prelude::*;
+    use index::sstable::level::LevelTree;
     use server::NebServer;
     use server::ServerOptions;
     use std::ptr;
     use std::sync::Arc;
-    use futures::prelude::*;
-    use index::sstable::level::LevelTree;
 
     type SmallPage = [EntryKey; 5];
 

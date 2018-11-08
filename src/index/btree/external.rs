@@ -397,7 +397,7 @@ impl CacheBufferZone {
                     CachedData::Deleted => {
                         debug!("Flushing deleting node: {:?}", id);
                         self.mapper.lock().remove(id);
-                        wait(self.storage.remove_cell(*id)).unwrap();
+                        self.storage.remove_cell(*id).wait().unwrap();
                     }
                     _ => panic!(),
                 }

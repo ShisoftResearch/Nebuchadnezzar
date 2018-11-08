@@ -107,23 +107,27 @@ impl LocalSchemasCache {
                 let m1 = map.clone();
                 let m2 = map.clone();
                 let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft);
-                let mut sm_data = wait(sm.get_all())?.unwrap();
+                let mut sm_data = sm.get_all().wait()?.unwrap();
                 {
                     let mut map = map.write();
                     for schema in sm_data {
                         map.new_schema(schema);
                     }
                 }
-                let _ = wait(sm.on_schema_added(move |r| {
-                    let schema = r.unwrap();
-                    debug!("Add schema {} from subscription", schema.id);
-                    let mut m1 = m1.write();
-                    m1.new_schema(schema);
-                }))?;
-                let _ = wait(sm.on_schema_deleted(move |r| {
-                    let mut m2 = m2.write();
-                    m2.del_schema(&r.unwrap());
-                }))?;
+                let _ = sm
+                    .on_schema_added(move |r| {
+                        let schema = r.unwrap();
+                        debug!("Add schema {} from subscription", schema.id);
+                        let mut m1 = m1.write();
+                        m1.new_schema(schema);
+                    })
+                    .wait()?;
+                let _ = sm
+                    .on_schema_deleted(move |r| {
+                        let mut m2 = m2.write();
+                        m2.del_schema(&r.unwrap()).unwrap();
+                    })
+                    .wait()?;
                 Some(sm)
             }
             None => None,

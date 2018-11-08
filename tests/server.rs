@@ -260,18 +260,19 @@ pub fn txn() {
         ),
     };
 
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap());
     client.new_schema_with_id(schema).wait();
 
     (0..num).collect::<Vec<_>>().into_iter().for_each(|_| {
-        client.transaction(move |txn| {
-            let id = Id::new(0, 1);
-            let mut value = Value::Map(Map::new());
-            value[DATA] = Value::U64(2);
-            let cell = Cell::new_with_id(schema_id, &id, value);
-            txn.upsert(cell)
-        }).wait();
+        client
+            .transaction(move |txn| {
+                let id = Id::new(0, 1);
+                let mut value = Value::Map(Map::new());
+                value[DATA] = Value::U64(2);
+                let cell = Cell::new_with_id(schema_id, &id, value);
+                txn.upsert(cell)
+            })
+            .wait();
     })
 }

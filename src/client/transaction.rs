@@ -47,7 +47,11 @@ impl Transaction {
         }
     }
     pub fn read_selected(&self, id: Id, fields: Vec<u64>) -> Result<Option<Vec<Value>>, TxnError> {
-        match self.client.read_selected(self.tid.to_owned(), id, fields).wait() {
+        match self
+            .client
+            .read_selected(self.tid.to_owned(), id, fields)
+            .wait()
+        {
             Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),

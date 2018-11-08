@@ -10,6 +10,7 @@ use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 use index::btree::external::*;
 use index::btree::internal::*;
 use index::id_from_key;
+use index::key_with_id;
 use index::EntryKey;
 use index::Slice;
 use itertools::{chain, Itertools};
@@ -31,7 +32,6 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::key_with_id;
 
 mod external;
 mod internal;
@@ -108,7 +108,9 @@ impl BPlusTree {
                 CACHE_SIZE,
                 move |id| {
                     debug!("Reading page to cache {:?}", id);
-                    wait(neb_client_1.read_cell(*id))
+                    neb_client_1
+                        .read_cell(*id)
+                        .wait()
                         .unwrap()
                         .map(|cell| Arc::new(RwLock::new(ExtNode::from_cell(cell))))
                         .ok()
@@ -167,7 +169,7 @@ impl BPlusTree {
         let cache = value.read();
         if cache.dirty {
             let cell = cache.to_cell();
-            wait(client.upsert_cell(cell)).unwrap();
+            client.upsert_cell(cell).wait().unwrap();
         }
     }
 
@@ -940,7 +942,10 @@ mod test {
         let client = Arc::new(
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
-        wait(client.new_schema_with_id(super::external::page_schema())).unwrap();
+        client
+            .new_schema_with_id(super::external::page_schema())
+            .wait()
+            .unwrap();
         let tree = BPlusTree::new(&client);
         let num = env::var("BTREE_TEST_ITEMS")
             .unwrap_or("1000".to_string())

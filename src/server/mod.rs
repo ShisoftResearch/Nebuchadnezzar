@@ -67,7 +67,7 @@ pub fn init_conshash(
 ) -> Result<Arc<ConsistentHashing>, ServerError> {
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client) {
         Ok(ch) => {
-            wait(ch.set_weight(address, memory_size));
+            ch.set_weight(address, memory_size).wait();
             if !ch.init_table().is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
@@ -181,7 +181,7 @@ impl NebServer {
         let raft_client = RaftClient::new(meta_mambers, raft::DEFAULT_SERVICE_ID).unwrap();
         RaftClient::prepare_subscription(&rpc_server);
         let member_service = MemberService::new(server_addr, &raft_client);
-        wait(member_service.join_group(group_name)).unwrap();
+        member_service.join_group(group_name).wait().unwrap();
         NebServer::new(
             opts,
             server_addr,
@@ -211,6 +211,7 @@ mod tests {
     extern crate test;
 
     use client;
+    use client::AsyncClient;
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::type_id_of;
@@ -218,17 +219,15 @@ mod tests {
     use ram::cell::Cell;
     use ram::schema::Field;
     use ram::schema::Schema;
+    use ram::types::*;
     use server::NebServer;
     use server::ServerOptions;
     use std::sync::Arc;
     use test::Bencher;
-    use ram::types::*;
-    use client::AsyncClient;
 
     const DATA: &'static str = "DATA";
 
     fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
-
         env_logger::init();
         let server_addr = String::from(format!("127.0.0.1:{}", port));
         let server_group = String::from("bench_test");
@@ -284,27 +283,43 @@ mod tests {
     }
 
     #[bench]
-    fn txn(b: &mut Bencher) {
+    fn txn_upsert(b: &mut Bencher) {
         let (_, client, schema_id) = init_service(5303);
         b.iter(|| {
-            client.transaction(move |txn| {
-                let id = Id::new(0, 1);
-                let mut value = Value::Map(Map::new());
-                value[DATA] = Value::U64(2);
-                let cell = Cell::new_with_id(schema_id, &id, value);
-                txn.upsert(cell)
-            }).wait()
+            client
+                .transaction(move |txn| {
+                    let id = Id::new(0, 1);
+                    let mut value = Value::Map(Map::new());
+                    value[DATA] = Value::U64(2);
+                    let cell = Cell::new_with_id(schema_id, &id, value);
+                    txn.upsert(cell)
+                })
+                .wait()
+        })
+    }
+
+    #[bench]
+    fn txn_insert(b: &mut Bencher) {
+        let (_, client, schema_id) = init_service(5305);
+        let mut i = 0;
+        b.iter(|| {
+            client
+                .transaction(move |txn| {
+                    let id = Id::new(0, i);
+                    let mut value = Value::Map(Map::new());
+                    value[DATA] = Value::U64(i);
+                    let cell = Cell::new_with_id(schema_id, &id, value);
+                    txn.write(cell)
+                })
+                .wait();
+            i += 1;
         })
     }
 
     #[bench]
     fn noop_txn(b: &mut Bencher) {
         let (_, client, schema_id) = init_service(5304);
-        b.iter(|| {
-            client.transaction(move |txn| {
-                Ok(())
-            }).wait()
-        })
+        b.iter(|| client.transaction(move |txn| Ok(())).wait())
     }
 
     #[bench]
