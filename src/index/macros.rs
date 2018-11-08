@@ -24,3 +24,10 @@ macro_rules! impl_slice_ops {
         }
     };
 }
+
+macro_rules! impl_sspage_slice {
+    ($t: ty, $et: ty, $n: expr) => {
+        impl_slice_ops!($t, $et, $n);
+        impl SortableEntrySlice for $t {}
+    };
+}

@@ -43,8 +43,8 @@ lazy_static! {
 }
 
 pub struct LevelTree<S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     neb_client: Arc<AsyncClient>,
     index: BTreeMap<EntryKey, Id>,
@@ -53,8 +53,8 @@ where
     marker: PhantomData<S>,
 }
 struct SSPage<S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     id: Id,
     slice: S,
@@ -62,8 +62,8 @@ where
 }
 
 impl<S> SSPage<S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn from_cell(cell: Cell) -> Self {
         let mut slice = S::init();
@@ -108,8 +108,8 @@ where
 }
 
 impl<S> LevelTree<S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         let client = neb_client.clone();
@@ -147,10 +147,10 @@ where
             Ordering::Forward => range.next(),
             Ordering::Backward => range.next_back(),
         }
-        .map(|(_, page_id)| {
-            debug!("First page id is {:?}", page_id);
-            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
-        });
+            .map(|(_, page_id)| {
+                debug!("First page id is {:?}", page_id);
+                self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+            });
 
         let (pos, page_len) = if let Some(ref page) = first {
             debug!("First page has {} elements", page.len);
@@ -312,8 +312,8 @@ where
 pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
 
 pub struct RTCursor<'a, S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     index: usize,
     ordering: Ordering,
@@ -324,8 +324,8 @@ where
 }
 
 impl<'a, S> RTCursor<'a, S>
-where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    where
+        S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn next(&mut self) -> bool {
         if self.current.is_some() {
@@ -392,19 +392,12 @@ pub fn get_schema() -> Schema {
     }
 }
 
-macro_rules! impl_sspage_slice {
-    ($t: ty, $et: ty, $n: expr) => {
-        impl_slice_ops!($t, $et, $n);
-        impl SortableEntrySlice for $t {}
-    };
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
     use client;
     use futures::prelude::*;
-    use index::sstable::level::LevelTree;
+    use index::sstable::LevelTree;
     use server::NebServer;
     use server::ServerOptions;
     use std::ptr;
