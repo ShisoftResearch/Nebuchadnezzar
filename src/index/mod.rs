@@ -11,7 +11,8 @@ pub mod placement;
 pub mod sstable;
 
 const ID_SIZE: usize = 16;
-type EntryKey = SmallVec<[u8; 32]>;
+const KEY_SIZE: usize = ID_SIZE + 16; // 16 is the estimate length of: schema id u32 (4) + field id u32(4) and value u64(8)+
+type EntryKey = SmallVec<[u8; KEY_SIZE]>;
 
 fn id_from_key(key: &EntryKey) -> Id {
     debug!("Decoding key to id {:?}", key);

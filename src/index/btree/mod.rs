@@ -36,7 +36,7 @@ use utils::lru_cache::LRUCache;
 mod external;
 mod internal;
 
-const NUM_KEYS: usize = 32;
+pub const NUM_KEYS: usize = 24;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
