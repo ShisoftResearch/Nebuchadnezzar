@@ -235,8 +235,8 @@ mod tests {
             &ServerOptions {
                 chunk_count: 1,
                 memory_size: 512 * 1024 * 1024,
-                backup_storage: None,
-                wal_storage: None,
+                backup_storage: Some(format!("test-data/{}-bak", port)),
+                wal_storage: Some(format!("test-data/{}-wal", port)),
             },
             &server_addr,
             &server_group,

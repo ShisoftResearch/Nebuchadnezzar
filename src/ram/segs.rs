@@ -9,7 +9,7 @@ use ram::entry;
 use ram::entry::EntryMeta;
 use ram::tombstone::{Tombstone, TOMBSTONE_SIZE_U32};
 use std::collections::BTreeSet;
-use std::fs::{copy, remove_file, File};
+use std::fs::{copy, remove_file, File, create_dir_all};
 use std::io;
 use std::io::prelude::*;
 use std::io::BufWriter;
@@ -49,10 +49,11 @@ impl Segment {
         let mut wal_file_name = None;
         let mut wal_file = None;
         if let Some(wal_storage) = wal_storage {
+            create_dir_all(wal_storage);
             let file_name = format!("{}/{}.log", wal_storage, id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
-                File::open(&file_name).unwrap(),
+                File::create(&file_name).unwrap(),
             ); // fast fail
             wal_file_name = Some(file_name);
             wal_file = Some(parking_lot::Mutex::new(file));
@@ -182,7 +183,7 @@ impl Segment {
                     panic!()
                 }
             } else {
-                let backup_file = File::open(backup_file_path)?;
+                let backup_file = File::create(backup_file_path)?;
                 let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
                 let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
                 unsafe {

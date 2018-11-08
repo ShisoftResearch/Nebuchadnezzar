@@ -197,3 +197,4 @@ callgrind.out.*
 /rls/
 /*_dump.json
 *.log
+/test-data/
