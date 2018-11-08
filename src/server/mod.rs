@@ -223,12 +223,14 @@ mod tests {
     use std::sync::Arc;
     use test::Bencher;
     use ram::types::*;
+    use client::AsyncClient;
 
-    #[bench]
-    fn wr(b: &mut Bencher) {
-        const DATA: &'static str = "DATA";
+    const DATA: &'static str = "DATA";
+
+    fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
+
         env_logger::init();
-        let server_addr = String::from("127.0.0.1:5302");
+        let server_addr = String::from(format!("127.0.0.1:{}", port));
         let server_group = String::from("bench_test");
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -266,7 +268,12 @@ mod tests {
             client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
         );
         client.new_schema_with_id(schema).wait();
+        (server, client, schema_id)
+    }
 
+    #[bench]
+    fn wr(b: &mut Bencher) {
+        let (_, client, schema_id) = init_service(5302);
         let id = Id::new(0, 1);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(2);
@@ -278,46 +285,7 @@ mod tests {
 
     #[bench]
     fn txn(b: &mut Bencher) {
-        const DATA: &'static str = "DATA";
-        env_logger::init();
-        let server_addr = String::from("127.0.0.1:5303");
-        let server_group = String::from("bench_test");
-        let server = NebServer::new_from_opts(
-            &ServerOptions {
-                chunk_count: 1,
-                memory_size: 512 * 1024 * 1024,
-                backup_storage: None,
-                wal_storage: None,
-            },
-            &server_addr,
-            &server_group,
-        );
-        let schema_id = 123;
-        let schema = Schema {
-            id: schema_id,
-            name: String::from("schema"),
-            key_field: None,
-            str_key_field: None,
-            is_dynamic: false,
-            fields: Field::new(
-                "*",
-                0,
-                false,
-                false,
-                Some(vec![Field::new(
-                    DATA,
-                    type_id_of(Type::U64),
-                    false,
-                    false,
-                    None,
-                )]),
-            ),
-        };
-
-        let client = Arc::new(
-            client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
-        );
-        client.new_schema_with_id(schema).wait();
+        let (_, client, schema_id) = init_service(5303);
         b.iter(|| {
             client.transaction(move |txn| {
                 let id = Id::new(0, 1);
@@ -325,6 +293,16 @@ mod tests {
                 value[DATA] = Value::U64(2);
                 let cell = Cell::new_with_id(schema_id, &id, value);
                 txn.upsert(cell)
+            }).wait()
+        })
+    }
+
+    #[bench]
+    fn noop_txn(b: &mut Bencher) {
+        let (_, client, schema_id) = init_service(5304);
+        b.iter(|| {
+            client.transaction(move |txn| {
+                Ok(())
             }).wait()
         })
     }
