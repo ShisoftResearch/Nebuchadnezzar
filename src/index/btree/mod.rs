@@ -33,6 +33,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use bifrost_hasher::hash_bytes;
+use byteorder::{LittleEndian, WriteBytesExt};
 
 mod external;
 mod internal;
@@ -584,8 +586,10 @@ impl<'a> TreeTxn<'a> {
     }
 }
 
-fn defer_id(id: &Id, act: usize) -> usize {
-    key_hash(&format!("{}-{}:{}", id.higher, id.lower, act)) as usize
+fn defer_id(id: &Id, act: u64) -> usize {
+    let mut bytes = id.to_binary().to_vec();
+    bytes.write_u64::<LittleEndian>(act).unwrap();
+    hash_bytes(bytes.as_slice()) as usize
 }
 
 impl RTCursor {
