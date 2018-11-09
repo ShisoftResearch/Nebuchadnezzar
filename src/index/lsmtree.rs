@@ -6,11 +6,13 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::{mem, ptr};
 
+const LEVEL_PAGES_MULTIPLIER: usize = 10000;
+const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
-const LEVEL_1: usize = LEVEL_M * 10;
-const LEVEL_2: usize = LEVEL_1 * 10;
-const LEVEL_3: usize = LEVEL_2 * 10;
-const LEVEL_4: usize = LEVEL_3 * 10;
+const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;
+const LEVEL_2: usize = LEVEL_1 * LEVEL_DIFF_MULTIPLIER;
+const LEVEL_3: usize = LEVEL_2 * LEVEL_DIFF_MULTIPLIER;
+const LEVEL_4: usize = LEVEL_3 * LEVEL_DIFF_MULTIPLIER;
 // TODO: debug assert the last one will not overflow MAX_SEGMENT_SIZE
 
 macro_rules! with_levels {
