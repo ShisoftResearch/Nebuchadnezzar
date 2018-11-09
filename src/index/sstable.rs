@@ -24,6 +24,8 @@ use std::collections::{BTreeMap, BTreeSet, LinkedList};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::Bound::*;
+use std::ops::RangeBounds;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 
@@ -35,6 +37,7 @@ use utils::lru_cache::LRUCache;
 
 type Tombstones = BTreeSet<EntryKey>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
+type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
 
 const PAGE_SCHEMA: &'static str = "NEB_SSTABLE_PAGE";
 
@@ -47,7 +50,7 @@ where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     neb_client: Arc<AsyncClient>,
-    index: BTreeMap<EntryKey, Id>,
+    index: PageIndex,
     tombstones: Tombstones,
     pages: PageCache<S>,
     marker: PhantomData<S>,
@@ -107,13 +110,18 @@ where
     }
 }
 
+pub trait Tree {
+    fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
+    fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones);
+}
+
 impl<S> LevelTree<S>
 where
-    S: Slice<Item = EntryKey> + SortableEntrySlice,
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         let client = neb_client.clone();
-        let mut index = BTreeMap::new();
+        let mut index = Arc::new(RwLock::new(BTreeMap::new()));
         Self {
             neb_client: neb_client.clone(),
             index,
@@ -137,11 +145,12 @@ where
         }
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> impl Cursor {
-        debug!("Seeking for {:?}, in index len {}", key, self.index.len());
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
+        let index = self.index.read();
+        debug!("Seeking for {:?}, in index len {}", key, index.len());
         let mut range = match ordering {
-            Ordering::Forward => self.index.range::<EntryKey, _>(key..),
-            Ordering::Backward => self.index.range::<EntryKey, _>(..=key),
+            Ordering::Forward => index.range::<EntryKey, _>(key..),
+            Ordering::Backward => index.range::<EntryKey, _>(..=key),
         };
         let first = match ordering {
             Ordering::Forward => range.next(),
@@ -168,11 +177,11 @@ where
 
         let mut cursor = RTCursor {
             ordering,
-            range,
             page_len,
             current: first,
-            index: pos,
+            pos,
             cache: self.pages.clone(),
+            index: self.index.clone(),
         };
 
         if cursor.current.is_some() {
@@ -186,16 +195,17 @@ where
             }
         }
 
-        cursor
+        box cursor
     }
 
     pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
         let mut pages_cache = self.pages.lock();
+        let mut index = self.index.write();
         let (keys_to_removed, mut merged, mut ids_to_reuse) = {
             let (target_keys, target_pages): (Vec<_>, Vec<_>) = {
                 let first = source.first().unwrap();
                 let last = source.last().unwrap();
-                self.index
+                index
                     .range::<EntryKey, _>(first..=last)
                     .map(|(k, id)| (k, pages_cache.get_or_fetch(id).unwrap().clone()))
                     .unzip()
@@ -281,7 +291,7 @@ where
 
         for k in keys_to_removed {
             debug!("Remove stale page index {:?}", k);
-            self.index.remove(&k).unwrap();
+            index.remove(&k).unwrap();
         }
 
         for id in &ids_to_reuse {
@@ -304,31 +314,31 @@ where
             }
 
             debug!("Insert page index key {:?}, id {:?}", index_key, id);
-            self.index.insert(index_key, id);
+            index.insert(index_key, id);
         }
     }
 }
 
 pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
 
-pub trait Cursor<'a> {
+pub trait Cursor {
     fn next(&mut self) -> bool;
     fn current(&self) -> Option<&EntryKey>;
 }
 
-pub struct RTCursor<'a, S>
+pub struct RTCursor<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
-    index: usize,
+    pos: usize,
     ordering: Ordering,
     page_len: usize,
-    range: Range<'a, EntryKey, Id>,
     current: Option<Arc<SSPage<S>>>,
     cache: PageCache<S>,
+    index: PageIndex,
 }
 
-impl<'a, S> Cursor<'a> for RTCursor<'a, S>
+impl<S> Cursor for RTCursor<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
@@ -336,31 +346,41 @@ where
         if self.current.is_some() {
             match self.ordering {
                 Ordering::Forward => {
-                    if self.index + 1 >= self.page_len {
-                        if let Some((_, page_id)) = self.range.next() {
+                    if self.pos + 1 >= self.page_len {
+                        if let Some((_, page_id)) = self
+                            .index
+                            .read()
+                            .range::<EntryKey, _>((Excluded(self.current().unwrap()), Unbounded))
+                            .next()
+                        {
                             let next_page = self.get_page(page_id);
                             self.current = Some(next_page);
-                            self.index = 0;
+                            self.pos = 0;
                         } else {
                             self.current = None;
                             return false;
                         }
                     } else {
-                        self.index += 1;
+                        self.pos += 1;
                     }
                 }
                 Ordering::Backward => {
-                    if self.index == 0 {
-                        if let Some((_, page_id)) = self.range.next_back() {
+                    if self.pos == 0 {
+                        if let Some((_, page_id)) = self
+                            .index
+                            .read()
+                            .range::<EntryKey, _>((Unbounded, Excluded(self.current().unwrap())))
+                            .next_back()
+                        {
                             let next_page = self.get_page(page_id);
                             self.current = Some(next_page);
-                            self.index = self.page_len - 1;
+                            self.pos = self.page_len - 1;
                         } else {
                             self.current = None;
                             return false;
                         }
                     } else {
-                        self.index -= 1;
+                        self.pos -= 1;
                     }
                 }
             }
@@ -371,18 +391,18 @@ where
     }
 
     fn current(&self) -> Option<&EntryKey> {
-        if self.index < 0 || self.index >= self.page_len {
+        if self.pos < 0 || self.pos >= self.page_len {
             return None;
         }
         if let Some(ref page) = self.current {
-            Some(&page.slice.as_slice_immute()[self.index])
+            Some(&page.slice.as_slice_immute()[self.pos])
         } else {
             None
         }
     }
 }
 
-impl<'a, S> RTCursor<'a, S>
+impl<S> RTCursor<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
