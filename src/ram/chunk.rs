@@ -263,7 +263,7 @@ impl Chunk {
                 *cell_location,
             )
         } else {
-            return self.write_cell(cell);
+            return self.write_cell_unchecked(cell);
         };
         self.mark_dead_entry(loc);
         return update_res;

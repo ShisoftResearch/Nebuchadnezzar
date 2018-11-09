@@ -239,7 +239,7 @@ impl Segment {
                     error!("cannot reclaim segment file on dispense {}", backup_storage)
                 }
             } else {
-                error!("cannot find segment backup {}", backup_storage)
+                error!("cannot find segment backup to dispense {}", backup_storage)
             }
         }
     }
