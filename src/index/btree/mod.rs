@@ -30,8 +30,8 @@ use std::mem;
 use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 
 mod external;
@@ -54,7 +54,7 @@ pub struct BPlusTree {
     ext_node_cache: Arc<ExtNodeCacheMap>,
     stm: TxnManager,
     storage: Arc<AsyncClient>,
-    len: Arc<AtomicUsize>
+    len: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
@@ -378,7 +378,9 @@ impl<'a> TreeTxn<'a> {
             self.txn.update(self.tree.root, new_root);
         }
         let len_counter = self.len.clone();
-        self.txn.defer(defer_id(id, 0), move || { len_counter.fetch_add(1, Relaxed); });
+        self.txn.defer(defer_id(id, 0), move || {
+            len_counter.fetch_add(1, Relaxed);
+        });
         Ok(())
     }
     fn insert_to_node(
@@ -470,7 +472,9 @@ impl<'a> TreeTxn<'a> {
         }
         if removed.item_found {
             let len_counter = self.len.clone();
-            self.txn.defer(defer_id(id, 1), move || { len_counter.fetch_sub(1, Relaxed); });
+            self.txn.defer(defer_id(id, 1), move || {
+                len_counter.fetch_sub(1, Relaxed);
+            });
         }
         Ok(removed.item_found)
     }

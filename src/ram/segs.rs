@@ -9,7 +9,7 @@ use ram::entry;
 use ram::entry::EntryMeta;
 use ram::tombstone::{Tombstone, TOMBSTONE_SIZE_U32};
 use std::collections::BTreeSet;
-use std::fs::{copy, remove_file, File, create_dir_all};
+use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
 use std::io::prelude::*;
 use std::io::BufWriter;
