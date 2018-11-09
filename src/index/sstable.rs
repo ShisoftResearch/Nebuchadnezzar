@@ -43,8 +43,8 @@ lazy_static! {
 }
 
 pub struct LevelTree<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     neb_client: Arc<AsyncClient>,
     index: BTreeMap<EntryKey, Id>,
@@ -53,8 +53,8 @@ pub struct LevelTree<S>
     marker: PhantomData<S>,
 }
 struct SSPage<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     id: Id,
     slice: S,
@@ -62,8 +62,8 @@ struct SSPage<S>
 }
 
 impl<S> SSPage<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn from_cell(cell: Cell) -> Self {
         let mut slice = S::init();
@@ -108,8 +108,8 @@ impl<S> SSPage<S>
 }
 
 impl<S> LevelTree<S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         let client = neb_client.clone();
@@ -137,7 +137,7 @@ impl<S> LevelTree<S>
         }
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<S> {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> impl Cursor {
         debug!("Seeking for {:?}, in index len {}", key, self.index.len());
         let mut range = match ordering {
             Ordering::Forward => self.index.range::<EntryKey, _>(key..),
@@ -147,10 +147,10 @@ impl<S> LevelTree<S>
             Ordering::Forward => range.next(),
             Ordering::Backward => range.next_back(),
         }
-            .map(|(_, page_id)| {
-                debug!("First page id is {:?}", page_id);
-                self.pages.lock().get_or_fetch(page_id).unwrap().clone()
-            });
+        .map(|(_, page_id)| {
+            debug!("First page id is {:?}", page_id);
+            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+        });
 
         let (pos, page_len) = if let Some(ref page) = first {
             debug!("First page has {} elements", page.len);
@@ -311,9 +311,14 @@ impl<S> LevelTree<S>
 
 pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
 
+pub trait Cursor<'a> {
+    fn next(&mut self) -> bool;
+    fn current(&self) -> Option<&EntryKey>;
+}
+
 pub struct RTCursor<'a, S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
     index: usize,
     ordering: Ordering,
@@ -323,11 +328,11 @@ pub struct RTCursor<'a, S>
     cache: PageCache<S>,
 }
 
-impl<'a, S> RTCursor<'a, S>
-    where
-        S: Slice<Item = EntryKey> + SortableEntrySlice,
+impl<'a, S> Cursor<'a> for RTCursor<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
 {
-    pub fn next(&mut self) -> bool {
+    fn next(&mut self) -> bool {
         if self.current.is_some() {
             match self.ordering {
                 Ordering::Forward => {
@@ -365,7 +370,7 @@ impl<'a, S> RTCursor<'a, S>
         }
     }
 
-    pub fn current(&self) -> Option<&EntryKey> {
+    fn current(&self) -> Option<&EntryKey> {
         if self.index < 0 || self.index >= self.page_len {
             return None;
         }
@@ -375,7 +380,12 @@ impl<'a, S> RTCursor<'a, S>
             None
         }
     }
+}
 
+impl<'a, S> RTCursor<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
+{
     fn get_page(&self, id: &Id) -> Arc<SSPage<S>> {
         self.cache.lock().get_or_fetch(id).unwrap().clone()
     }
