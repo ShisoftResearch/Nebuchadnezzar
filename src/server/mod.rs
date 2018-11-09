@@ -283,6 +283,22 @@ mod tests {
     }
 
     #[bench]
+    fn w(b: &mut Bencher) {
+        let (_, client, schema_id) = init_service(5306);
+        let id = Id::new(0, 1);
+        let mut value = Value::Map(Map::new());
+        value[DATA] = Value::U64(2);
+        let mut cell = Cell::new_with_id(schema_id, &id, value);
+        let mut i = 0;
+        b.iter(|| {
+            let mut cell = cell.clone();
+            cell.header.hash = i;
+            client.write_cell(cell).wait();
+            i += 1
+        })
+    }
+
+    #[bench]
     fn txn_upsert(b: &mut Bencher) {
         let (_, client, schema_id) = init_service(5303);
         b.iter(|| {
