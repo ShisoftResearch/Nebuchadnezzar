@@ -1,7 +1,9 @@
 use super::btree::BPlusTree;
-use super::sstable::SortableEntrySlice;
+use super::sstable::*;
 use super::*;
+use client::AsyncClient;
 use parking_lot::RwLock;
+use std::sync::Arc;
 use std::{mem, ptr};
 
 const LEVEL_M: usize = super::btree::NUM_KEYS;
@@ -20,9 +22,17 @@ macro_rules! with_levels {
 
         pub struct LSMTree {
             level_m: BPlusTree,
-            $(
-                $sym: RwLock<$sym>,
-            )*
+            trees: Vec<Box<Tree>> // use Vec here for convenience
+        }
+
+        impl LSMTree {
+            pub fn new(neb_client: &Arc<AsyncClient>) {
+                let mtree = BPlusTree::new(neb_client);
+                let mut trees: Vec<Box<Tree>> = vec![];
+                $(
+                    trees.push(box LevelTree::<$sym>::new(neb_client));
+                )*
+            }
         }
     };
 }

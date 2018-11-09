@@ -144,8 +144,13 @@ where
             marker: PhantomData {},
         }
     }
+}
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
+impl<S> Tree for LevelTree<S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
+{
+    fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
         let index = self.index.read();
         debug!("Seeking for {:?}, in index len {}", key, index.len());
         let mut range = match ordering {
@@ -198,7 +203,7 @@ where
         box cursor
     }
 
-    pub fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
+    fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
         let (keys_to_removed, mut merged, mut ids_to_reuse) = {
