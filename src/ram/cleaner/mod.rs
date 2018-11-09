@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rayon::prelude::*;
 
 pub mod combine;
 pub mod compact;
@@ -35,9 +36,9 @@ impl Cleaner {
             .spawn(move || {
                 while !stop_tag.load(Ordering::Relaxed) {
                     debug!("Apply dead entry");
-                    for chunk in &chunks.list {
+                    chunks.list.par_iter().for_each(|chunk| {
                         chunk.apply_dead_entry();
-                    }
+                    });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
             });
@@ -63,7 +64,7 @@ impl Cleaner {
                                     segments_compact_per_turn
                                 );
                                 cleaned_space += segments_for_compact
-                                    .into_iter()
+                                    .into_par_iter()
                                     .take(segments_compact_per_turn) // limit max segment to clean per turn
                                     .map(|segment| {
                                         compact::CompactCleaner::clean_segment(chunk, &segment)

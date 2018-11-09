@@ -5,6 +5,8 @@ use ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use libc;
 
@@ -147,7 +149,7 @@ impl CombinedCleaner {
         debug!("Checking combine feasibility");
         let pending_segments_len = pending_segments.len();
         let segments_to_combine_len = segments.len();
-        let mut cleaned_total_live_space = 0;
+        let cleaned_total_live_space = AtomicUsize::new(0);
         if pending_segments_len >= segments_to_combine_len {
             warn!(
                 "Trying to combine segments but resulting segments still does not go down {}/{}",
@@ -157,7 +159,7 @@ impl CombinedCleaner {
 
         debug!("Updating cell reference");
         let unstable_guards = pending_segments
-            .iter()
+            .par_iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();
                 let new_seg = Segment::new(
@@ -188,7 +190,7 @@ impl CombinedCleaner {
                     seg_cursor += entry.size;
                 }
                 new_seg.append_header.store(seg_cursor, Ordering::Relaxed);
-                cleaned_total_live_space += new_seg.used_spaces() as usize;
+                cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
                 return (new_seg, cell_mapping);
             })
             .flat_map(|(segment, cells)| {
@@ -215,14 +217,14 @@ impl CombinedCleaner {
                 }
                 unstable_guard
             })
-            .collect_vec();
+            .collect::<Vec<_>>();
 
         debug!("Removing old segments");
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop();
         }
-        let space_cleaned = space_to_collect - cleaned_total_live_space;
+        let space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
         debug!(
             "Combined {} segments to {}, total {} bytes",
             segments_to_combine_len,
