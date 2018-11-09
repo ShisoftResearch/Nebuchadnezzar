@@ -31,6 +31,7 @@ use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use utils::lru_cache::LRUCache;
 
 mod external;
@@ -50,11 +51,10 @@ type NodePointerSlice = [TxnValRef; NUM_PTRS];
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
     root: TxnValRef,
-    num_nodes: usize,
-    height: usize,
     ext_node_cache: Arc<ExtNodeCacheMap>,
     stm: TxnManager,
     storage: Arc<AsyncClient>,
+    len: Arc<AtomicUsize>
 }
 
 #[derive(Clone)]
@@ -91,6 +91,7 @@ impl Default for Ordering {
 pub struct TreeTxn<'a> {
     tree: &'a BPlusTree,
     bz: Rc<CacheBufferZone>,
+    len: Arc<AtomicUsize>,
     txn: &'a mut Txn,
 }
 
@@ -100,10 +101,9 @@ impl BPlusTree {
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
             root: Default::default(),
-            num_nodes: 0,
-            height: 0,
             stm: TxnManager::new(),
             storage: neb_client.clone(),
+            len: Arc::new(AtomicUsize::new(0)),
             ext_node_cache: Arc::new(Mutex::new(LRUCache::new(
                 CACHE_SIZE,
                 move |id| {
@@ -163,6 +163,10 @@ impl BPlusTree {
         for (_, value) in self.ext_node_cache.lock().iter() {
             Self::flush_item(&self.storage, value)
         }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len.load(Relaxed)
     }
 
     fn flush_item(client: &Arc<AsyncClient>, value: &Arc<RwLock<ExtNode>>) {
@@ -295,6 +299,7 @@ impl<'a> TreeTxn<'a> {
     fn new(tree: &'a BPlusTree, txn: &'a mut Txn) -> TreeTxn<'a> {
         TreeTxn {
             bz: Rc::new(CacheBufferZone::new(&tree.ext_node_cache, &tree.storage)),
+            len: tree.len.clone(),
             tree,
             txn,
         }
@@ -350,7 +355,7 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
-    fn insert(&mut self, key: &EntryKey, id: &Id) -> Result<(), TxnErr> {
+    pub fn insert(&mut self, key: &EntryKey, id: &Id) -> Result<(), TxnErr> {
         let mut key = key.clone();
         key_with_id(&mut key, id);
         let root_ref = self.tree.root;
@@ -372,6 +377,8 @@ impl<'a> TreeTxn<'a> {
             let new_root = Node::Internal(box new_in_root);
             self.txn.update(self.tree.root, new_root);
         }
+        let len_counter = self.len.clone();
+        self.txn.defer(defer_id(id, 0), move || { len_counter.fetch_add(1, Relaxed); });
         Ok(())
     }
     fn insert_to_node(
@@ -441,7 +448,7 @@ impl<'a> TreeTxn<'a> {
         }
     }
 
-    fn remove(&mut self, key: &EntryKey, id: &Id) -> Result<bool, TxnErr> {
+    pub fn remove(&mut self, key: &EntryKey, id: &Id) -> Result<bool, TxnErr> {
         let mut key = key.clone();
         key_with_id(&mut key, id);
         let root = self.tree.root;
@@ -460,6 +467,10 @@ impl<'a> TreeTxn<'a> {
             let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
             self.txn.update(root, new_root_cloned);
             self.txn.delete(new_root_ref);
+        }
+        if removed.item_found {
+            let len_counter = self.len.clone();
+            self.txn.defer(defer_id(id, 1), move || { len_counter.fetch_sub(1, Relaxed); });
         }
         Ok(removed.item_found)
     }
@@ -567,6 +578,10 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
+}
+
+fn defer_id(id: &Id, act: usize) -> usize {
+    key_hash(&format!("{}-{}:{}", id.higher, id.lower, act)) as usize
 }
 
 impl RTCursor {
@@ -971,6 +986,7 @@ mod test {
                 Ok(())
             })
             .unwrap();
+            assert_eq!(tree.len(), num as usize);
             dump_tree(&tree, "tree_dump.json");
         }
 
@@ -1058,6 +1074,8 @@ mod test {
                 }
                 assert!(remove_succeed, "{}", i);
             }
+
+            assert_eq!(tree.len(), (num - deletion_volume) as usize);
             dump_tree(&tree, "remove_completed_dump.json");
 
             debug!("check for removed items");
@@ -1154,7 +1172,8 @@ mod test {
             }
 
             tree.flush_all();
-            assert_eq!(wait(client.count()).unwrap(), 1);
+            assert_eq!(tree.len(), 0);
+            assert_eq!(client.count().wait().unwrap(), 1);
         }
     }
 }
