@@ -347,15 +347,21 @@ where
             match self.ordering {
                 Ordering::Forward => {
                     if self.pos + 1 >= self.page_len {
+                        let current_key = self.current().unwrap().clone();
                         if let Some((_, page_id)) = self
                             .index
                             .read()
-                            .range::<EntryKey, _>((Excluded(self.current().unwrap()), Unbounded))
+                            .range::<EntryKey, _>((Excluded(&current_key), Unbounded))
                             .next()
                         {
                             let next_page = self.get_page(page_id);
+                            self.pos = next_page
+                                .slice
+                                .as_slice_immute()
+                                .binary_search(&current_key)
+                                .map(|i| if i < self.page_len - 1 { i + 1 } else { i })
+                                .unwrap_or_else(|i| i);
                             self.current = Some(next_page);
-                            self.pos = 0;
                         } else {
                             self.current = None;
                             return false;
@@ -366,15 +372,21 @@ where
                 }
                 Ordering::Backward => {
                     if self.pos == 0 {
+                        let current_key = self.current().unwrap().clone();
                         if let Some((_, page_id)) = self
                             .index
                             .read()
-                            .range::<EntryKey, _>((Unbounded, Excluded(self.current().unwrap())))
+                            .range::<EntryKey, _>((Unbounded, Excluded(&current_key)))
                             .next_back()
                         {
                             let next_page = self.get_page(page_id);
+                            self.pos = next_page
+                                .slice
+                                .as_slice_immute()
+                                .binary_search(&current_key)
+                                .map(|i| if i != 0 { i - 1 } else { i })
+                                .unwrap_or_else(|i| i);
                             self.current = Some(next_page);
-                            self.pos = self.page_len - 1;
                         } else {
                             self.current = None;
                             return false;
