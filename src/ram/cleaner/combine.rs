@@ -2,11 +2,11 @@ use itertools::Itertools;
 use ram::chunk::Chunk;
 use ram::entry::{Entry, EntryContent, EntryType};
 use ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 
 use libc;
 

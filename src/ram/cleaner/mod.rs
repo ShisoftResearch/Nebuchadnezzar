@@ -1,12 +1,12 @@
 use ram::cell::CellHeader;
 use ram::chunk::Chunks;
 use ram::tombstone::Tombstone;
+use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use rayon::prelude::*;
 
 pub mod combine;
 pub mod compact;
@@ -46,7 +46,7 @@ impl Cleaner {
             .name("Cleaner main".into())
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
-                    for chunk in &checks_ref_clone.list {
+                    checks_ref_clone.list.par_iter().for_each(|chunk| {
                         let segments_compact_per_turn = chunk.segs.len() / 10 + 1;
                         let segments_combine_per_turn = chunk.segs.len() / 20 + 2;
                         // have to put it right here for cleaners will clear the tombstone death counter
@@ -99,7 +99,7 @@ impl Cleaner {
                             .total_space
                             .fetch_sub(cleaned_space, Ordering::Relaxed);
                         chunk.check_and_archive_segments();
-                    }
+                    });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");

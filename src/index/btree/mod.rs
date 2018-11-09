@@ -1,6 +1,8 @@
 use bifrost::utils::async_locks::Mutex;
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use bifrost::utils::fut_exec::wait;
+use bifrost_hasher::hash_bytes;
+use byteorder::{LittleEndian, WriteBytesExt};
 use client::AsyncClient;
 use dovahkiin::types;
 use dovahkiin::types::custom_types::id::Id;
@@ -33,8 +35,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use bifrost_hasher::hash_bytes;
-use byteorder::{LittleEndian, WriteBytesExt};
 
 mod external;
 mod internal;
