@@ -2,6 +2,7 @@ use super::btree::BPlusTree;
 use super::sstable::*;
 use super::*;
 use client::AsyncClient;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::{mem, ptr};
@@ -47,7 +48,7 @@ pub struct LSMTree {
     level_m: BPlusTree,
     trees: LevelTrees,
     // use Vec here for convenience
-    sizes: Vec<usize>
+    sizes: Vec<usize>,
 }
 
 impl LSMTree {
@@ -56,7 +57,25 @@ impl LSMTree {
         LSMTree {
             level_m: BPlusTree::new(neb_client),
             trees,
-            sizes
+            sizes,
         }
+    }
+
+    pub fn insert(&self, mut key: EntryKey, id: &Id) -> Result<(), ()> {
+        key_with_id(&mut key, id);
+        self.level_m.insert(&key).map_err(|e| ())
+    }
+
+    pub fn remove(&self, mut key: EntryKey, id: &Id) -> Result<bool, ()> {
+        key_with_id(&mut key, id);
+        let m_deleted = self.level_m.remove(&key).map_err(|e| ())?;
+        let levels_deleted = self
+            .trees
+            .iter()
+            .map(|tree| tree.mark_deleted(&key))
+            .collect_vec() // collect here to prevent short circuit
+            .into_iter()
+            .any(|d| d);
+        Ok(m_deleted || levels_deleted)
     }
 }

@@ -116,7 +116,7 @@ where
 pub trait Tree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &mut TombstonesInner);
-    fn mark_deleted(&self, key: &EntryKey);
+    fn mark_deleted(&self, key: &EntryKey) -> bool;
     fn is_deleted(&self, key: &EntryKey) -> bool;
     fn len(&self) -> usize;
 }
@@ -338,11 +338,18 @@ where
         self.len.fetch_add(num_new_merged, Relaxed);
     }
 
-    fn mark_deleted(&self, key: &EntryKey) {
+    fn mark_deleted(&self, key: &EntryKey) -> bool {
         if self.seek(key, Ordering::Forward).current() == Some(key) {
-            self.tombstones.write().insert(key.clone());
-            self.len.fetch_sub(1, Relaxed);
+            let mut tombstones = self.tombstones.write();
+            if tombstones.contains(key) {
+                return false;
+            } else {
+                tombstones.insert(key.clone());
+                self.len.fetch_sub(1, Relaxed);
+                return true;
+            }
         }
+        false
     }
 
     fn is_deleted(&self, key: &EntryKey) -> bool {

@@ -138,7 +138,7 @@ impl BPlusTree {
         self.transaction(|txn| txn.insert(key))
     }
 
-    fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
+    pub fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
         debug!("removing {:?}", &key);
         self.transaction(|txn| txn.remove(key))
     }
