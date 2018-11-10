@@ -26,9 +26,9 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Bound::*;
 use std::ops::RangeBounds;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
