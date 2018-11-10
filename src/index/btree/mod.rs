@@ -11,8 +11,6 @@ use futures::Future;
 use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 use index::btree::external::*;
 use index::btree::internal::*;
-use index::id_from_key;
-use index::key_with_id;
 use index::EntryKey;
 use index::Slice;
 use itertools::{chain, Itertools};
@@ -135,14 +133,14 @@ impl BPlusTree {
         self.transaction(|txn| txn.seek(key, ordering))
     }
 
-    pub fn insert(&self, key: &EntryKey, id: &Id) -> Result<(), TxnErr> {
+    pub fn insert(&self, key: &EntryKey) -> Result<(), TxnErr> {
         debug!("inserting {:?}", &key);
-        self.transaction(|txn| txn.insert(key, id))
+        self.transaction(|txn| txn.insert(key))
     }
 
-    fn remove(&self, key: &EntryKey, id: &Id) -> Result<bool, TxnErr> {
+    fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
         debug!("removing {:?}", &key);
-        self.transaction(|txn| txn.remove(key, id))
+        self.transaction(|txn| txn.remove(key))
     }
 
     pub fn transaction<R, F>(&self, func: F) -> Result<R, TxnErr>
@@ -308,18 +306,13 @@ impl<'a> TreeTxn<'a> {
     }
 
     pub fn seek(&mut self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
-        //        let mut key = key.clone();
-        //        key_with_id(&mut key, &Id::unit_id());
         let root = self.tree.root;
         match ordering {
-            Ordering::Forward => self.search(root, &key, ordering),
+            Ordering::Forward => self.search(root, key, ordering),
             Ordering::Backward => {
                 // fill highest bits to the end of the search key as the last possible id for backward search
-                let mut key = key.clone();
-                let max_id = Id::new(std::u64::MAX, std::u64::MAX);
-                key_with_id(&mut key, &max_id);
-                debug!("seek backwards with precise key {:?}", &key);
-                self.search(root, &key, ordering).map(|mut cursor| {
+                debug!("seek backwards with precise key {:?}", key);
+                self.search(root, key, ordering).map(|mut cursor| {
                     debug!(
                         "found cursor pos {} for backwards, len {}, will be corrected",
                         cursor.index, cursor.page.len
@@ -357,9 +350,7 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
-    pub fn insert(&mut self, key: &EntryKey, id: &Id) -> Result<(), TxnErr> {
-        let mut key = key.clone();
-        key_with_id(&mut key, id);
+    pub fn insert(&mut self, key: &EntryKey) -> Result<(), TxnErr> {
         let root_ref = self.tree.root;
         if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
             debug!("split root with pivot key {:?}", pivotKey);
@@ -380,7 +371,7 @@ impl<'a> TreeTxn<'a> {
             self.txn.update(self.tree.root, new_root);
         }
         let len_counter = self.len.clone();
-        self.txn.defer(defer_id(id, 0), move || {
+        self.txn.defer(move || {
             len_counter.fetch_add(1, Relaxed);
         });
         Ok(())
@@ -452,11 +443,9 @@ impl<'a> TreeTxn<'a> {
         }
     }
 
-    pub fn remove(&mut self, key: &EntryKey, id: &Id) -> Result<bool, TxnErr> {
-        let mut key = key.clone();
-        key_with_id(&mut key, id);
+    pub fn remove(&mut self, key: &EntryKey) -> Result<bool, TxnErr> {
         let root = self.tree.root;
-        let removed = self.remove_from_node(root, &key)?;
+        let removed = self.remove_from_node(root, key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
         if removed.item_found
             && removed.removed
@@ -474,7 +463,7 @@ impl<'a> TreeTxn<'a> {
         }
         if removed.item_found {
             let len_counter = self.len.clone();
-            self.txn.defer(defer_id(id, 1), move || {
+            self.txn.defer(move || {
                 len_counter.fetch_sub(1, Relaxed);
             });
         }
@@ -584,12 +573,6 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
-}
-
-fn defer_id(id: &Id, act: u64) -> usize {
-    let mut bytes = id.to_binary().to_vec();
-    bytes.write_u64::<LittleEndian>(act).unwrap();
-    hash_bytes(bytes.as_slice()) as usize
 }
 
 impl RTCursor {

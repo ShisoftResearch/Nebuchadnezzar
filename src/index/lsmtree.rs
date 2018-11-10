@@ -15,6 +15,8 @@ const LEVEL_3: usize = LEVEL_2 * LEVEL_DIFF_MULTIPLIER;
 const LEVEL_4: usize = LEVEL_3 * LEVEL_DIFF_MULTIPLIER;
 // TODO: debug assert the last one will not overflow MAX_SEGMENT_SIZE
 
+type LevelTrees = Vec<Box<Tree>>;
+
 macro_rules! with_levels {
     ($($sym:ident, $level:ident;)*) => {
         $(
@@ -22,21 +24,28 @@ macro_rules! with_levels {
             impl_sspage_slice!($sym, EntryKey, $level);
         )*
 
-        pub struct LSMTree {
-            level_m: BPlusTree,
-            trees: Vec<Box<Tree>> // use Vec here for convenience
-        }
-
-        impl LSMTree {
-            pub fn new(neb_client: &Arc<AsyncClient>) {
-                let mtree = BPlusTree::new(neb_client);
-                let mut trees: Vec<Box<Tree>> = vec![];
-                $(
-                    trees.push(box LevelTree::<$sym>::new(neb_client));
-                )*
-            }
+        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> LevelTrees {
+            let mut trees = LevelTrees::new();
+            $(
+                trees.push(box LevelTree::<$sym>::new(neb_client));
+            )*
+            return trees;
         }
     };
+}
+
+pub struct LSMTree {
+    level_m: BPlusTree,
+    trees: LevelTrees // use Vec here for convenience
+}
+
+impl LSMTree {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+        LSMTree {
+            level_m: BPlusTree::new(neb_client),
+            trees: init_lsm_level_trees(neb_client)
+        }
+    }
 }
 
 with_levels!{
