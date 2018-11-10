@@ -24,28 +24,16 @@ macro_rules! with_levels {
             impl_sspage_slice!($sym, EntryKey, $level);
         )*
 
-        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> LevelTrees {
+        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> (LevelTrees, Vec<usize>) {
             let mut trees = LevelTrees::new();
+            let mut sizes = Vec::new();
             $(
                 trees.push(box LevelTree::<$sym>::new(neb_client));
+                sizes.push($level);
             )*
-            return trees;
+            return (trees, sizes);
         }
     };
-}
-
-pub struct LSMTree {
-    level_m: BPlusTree,
-    trees: LevelTrees // use Vec here for convenience
-}
-
-impl LSMTree {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
-        LSMTree {
-            level_m: BPlusTree::new(neb_client),
-            trees: init_lsm_level_trees(neb_client)
-        }
-    }
 }
 
 with_levels!{
@@ -53,4 +41,22 @@ with_levels!{
     L2, LEVEL_2;
     L3, LEVEL_3;
     L4, LEVEL_4;
+}
+
+pub struct LSMTree {
+    level_m: BPlusTree,
+    trees: LevelTrees,
+    // use Vec here for convenience
+    sizes: Vec<usize>
+}
+
+impl LSMTree {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+        let (trees, sizes) = init_lsm_level_trees(neb_client);
+        LSMTree {
+            level_m: BPlusTree::new(neb_client),
+            trees,
+            sizes
+        }
+    }
 }
