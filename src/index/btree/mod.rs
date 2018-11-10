@@ -779,7 +779,7 @@ mod test {
     use hermes::stm::TxnValRef;
     use index::btree::external::CacheBufferZone;
     use index::btree::NUM_KEYS;
-    use index::id_from_key;
+    use index::{id_from_key, key_with_id};
     use ram::types::RandValue;
     use rand::distributions::Uniform;
     use rand::prelude::*;
@@ -916,7 +916,9 @@ mod test {
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
-        tree.insert(&key, &id).unwrap();
+        let mut entry_key = key.clone();
+        key_with_id(&mut entry_key, &id);
+        tree.insert(&entry_key).unwrap();
         let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
     }
@@ -964,7 +966,9 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 debug!("insert id: {}", i);
-                tree.insert(&key, &id).unwrap();
+                let mut entry_key = key.clone();
+                key_with_id(&mut entry_key, &id);
+                tree.insert(&entry_key).unwrap();
             }
             tree.transaction(|txn| {
                 let root = txn.txn.read::<Node>(tree.root)?.unwrap();
@@ -1016,12 +1020,10 @@ mod test {
         {
             debug!("Backward scanning for sequence verification");
             let backward_start_key_slice = u64_to_slice(num - 1);
-            let mut cursor = tree
-                .seek(
-                    &SmallVec::from_slice(&backward_start_key_slice),
-                    Ordering::Backward,
-                )
-                .unwrap();
+            let mut entry_key = SmallVec::from_slice(&backward_start_key_slice);
+            // search backward required max possible id
+            key_with_id(&mut entry_key, &Id::new(::std::u64::MAX, ::std::u64::MAX));
+            let mut cursor = tree.seek(&entry_key, Ordering::Backward).unwrap();
             for i in (0..num).rev() {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
@@ -1059,7 +1061,9 @@ mod test {
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
-                let remove_succeed = tree.remove(&key, &id).unwrap();
+                let mut entry_key = key.clone();
+                key_with_id(&mut entry_key, &id);
+                let remove_succeed = tree.remove(&entry_key).unwrap();
                 if !remove_succeed {
                     dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 }
@@ -1117,7 +1121,9 @@ mod test {
                     let id = Id::new(0, i);
                     let key_slice = u64_to_slice(i);
                     let key = SmallVec::from_slice(&key_slice);
-                    let remove_succeed = tree.remove(&key, &id).unwrap();
+                    let mut entry_key = key.clone();
+                    key_with_id(&mut entry_key, &id);
+                    let remove_succeed = tree.remove(&entry_key).unwrap();
                     if !remove_succeed {
                         dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
                     }
