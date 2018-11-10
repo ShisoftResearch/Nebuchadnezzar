@@ -507,12 +507,13 @@ mod test {
         let mut tree: LevelTree<SmallPage> = LevelTree::new(&client);
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
+        let mut tombstones = BTreeSet::new();
         info!("test insertion");
 
         let mut key_id = key.clone();
         key_with_id(&mut key_id, &id);
 
-        tree.merge(vec![key_id], &mut TreeSet::new());
+        tree.merge(vec![key_id], &mut tombstones);
         let mut cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
         assert_eq!(tree.len(), 1);
