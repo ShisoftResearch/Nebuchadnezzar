@@ -28,6 +28,7 @@ use std::ops::Bound::*;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -54,6 +55,7 @@ where
     tombstones: Tombstones,
     pages: PageCache<S>,
     marker: PhantomData<S>,
+    len: AtomicUsize,
 }
 struct SSPage<S>
 where
@@ -128,6 +130,7 @@ where
             neb_client: neb_client.clone(),
             index,
             tombstones: Tombstones::new(BTreeSet::new()),
+            len: AtomicUsize::new(0),
             // TODO: carefully set the capacity
             pages: Arc::new(Mutex::new(LRUCache::new(
                 100,
@@ -210,6 +213,7 @@ where
         let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
+        let mut num_new_merged = 0;
         let (keys_to_removed, mut merged, mut ids_to_reuse) = {
             let (target_keys, target_pages): (Vec<_>, Vec<_>) = {
                 let first = source.first().unwrap();
@@ -272,6 +276,11 @@ where
                     }
                 }
 
+                if from_source {
+                    target_tombstones.remove(lowest);
+                    num_new_merged += 1;
+                }
+
                 let merging_page_len = {
                     let merging_page = merged.last_mut().unwrap();
                     let page_len = merging_page.len;
@@ -325,11 +334,13 @@ where
             debug!("Insert page index key {:?}, id {:?}", index_key, id);
             index.insert(index_key, id);
         }
+        self.len.fetch_add(num_new_merged, Relaxed);
     }
 
     fn mark_deleted(&self, key: &EntryKey) {
         if self.seek(key, Ordering::Forward).current() == Some(key) {
             self.tombstones.write().insert(key.clone());
+            self.len.fetch_sub(1, Relaxed);
         }
     }
 
