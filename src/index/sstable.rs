@@ -36,7 +36,8 @@ use utils::lru_cache::LRUCache;
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
-type Tombstones = RwLock<BTreeSet<EntryKey>>;
+type TombstonesInner = BTreeSet<EntryKey>;
+type Tombstones = RwLock<TombstonesInner>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
 
@@ -114,9 +115,10 @@ where
 
 pub trait Tree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
-    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &Tombstones);
+    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &mut TombstonesInner);
     fn mark_deleted(&self, key: &EntryKey);
     fn is_deleted(&self, key: &EntryKey) -> bool;
+    fn len(&self) -> usize;
 }
 
 impl<S> LevelTree<S>
@@ -208,8 +210,7 @@ where
         box cursor
     }
 
-    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &Tombstones) {
-        let mut source_tombstones = source_tombstones.write();
+    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &mut TombstonesInner) {
         let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
@@ -346,6 +347,10 @@ where
 
     fn is_deleted(&self, key: &EntryKey) -> bool {
         self.tombstones.read().contains(key)
+    }
+
+    fn len(&self) -> usize {
+        self.len.load(Relaxed)
     }
 }
 
@@ -502,14 +507,14 @@ mod test {
         let mut tree: LevelTree<SmallPage> = LevelTree::new(&client);
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
-        let mut tombstones = BTreeSet::new();
         info!("test insertion");
 
         let mut key_id = key.clone();
         key_with_id(&mut key_id, &id);
 
-        tree.merge(vec![key_id], &mut tombstones);
+        tree.merge(vec![key_id], &mut TreeSet::new());
         let mut cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
+        assert_eq!(tree.len(), 1);
     }
 }
