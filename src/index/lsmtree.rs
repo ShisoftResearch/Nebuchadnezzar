@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 use std::{mem, ptr};
 
-const LEVEL_PAGES_MULTIPLIER: usize = 10000;
+const LEVEL_PAGES_MULTIPLIER: usize = 1000;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
 const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;

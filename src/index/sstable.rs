@@ -35,7 +35,7 @@ use utils::lru_cache::LRUCache;
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
-type Tombstones = BTreeSet<EntryKey>;
+type Tombstones = RwLock<BTreeSet<EntryKey>>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
 
@@ -112,7 +112,9 @@ where
 
 pub trait Tree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
-    fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones);
+    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &Tombstones);
+    fn mark_deleted(&self, key: &EntryKey);
+    fn is_deleted(&self, key: &EntryKey) -> bool;
 }
 
 impl<S> LevelTree<S>
@@ -125,7 +127,7 @@ where
         Self {
             neb_client: neb_client.clone(),
             index,
-            tombstones: Tombstones::new(),
+            tombstones: Tombstones::new(BTreeSet::new()),
             // TODO: carefully set the capacity
             pages: Arc::new(Mutex::new(LRUCache::new(
                 100,
@@ -203,7 +205,9 @@ where
         box cursor
     }
 
-    fn merge(&mut self, mut source: Vec<EntryKey>, tombstones: &mut Tombstones) {
+    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &Tombstones) {
+        let mut source_tombstones = source_tombstones.write();
+        let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
         let (keys_to_removed, mut merged, mut ids_to_reuse) = {
@@ -259,11 +263,11 @@ where
                 };
 
                 if from_source {
-                    if tombstones.remove(lowest) {
+                    if source_tombstones.remove(lowest) {
                         continue;
                     }
                 } else {
-                    if self.tombstones.remove(lowest) {
+                    if target_tombstones.remove(lowest) {
                         continue;
                     }
                 }
@@ -321,6 +325,16 @@ where
             debug!("Insert page index key {:?}, id {:?}", index_key, id);
             index.insert(index_key, id);
         }
+    }
+
+    fn mark_deleted(&self, key: &EntryKey) {
+        if self.seek(key, Ordering::Forward).current() == Some(key) {
+            self.tombstones.write().insert(key.clone());
+        }
+    }
+
+    fn is_deleted(&self, key: &EntryKey) -> bool {
+        self.tombstones.read().contains(key)
     }
 }
 
