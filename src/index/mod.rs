@@ -1,7 +1,7 @@
 use dovahkiin::types::custom_types::id::Id;
 use smallvec::SmallVec;
 use std::fmt::Debug;
-use std::io::Cursor;
+use std::io::{Cursor as StdCursor};
 use std::mem;
 
 #[macro_use]
@@ -17,7 +17,7 @@ type EntryKey = SmallVec<[u8; KEY_SIZE]>;
 
 fn id_from_key(key: &EntryKey) -> Id {
     debug!("Decoding key to id {:?}", key);
-    let mut id_cursor = Cursor::new(&key[key.len() - ID_SIZE..]);
+    let mut id_cursor = StdCursor::new(&key[key.len() - ID_SIZE..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
 }
 
@@ -47,4 +47,9 @@ pub trait Slice: Sized {
     fn item_default() -> Self::Item {
         Self::Item::default()
     }
+}
+
+pub trait Cursor {
+    fn next(&mut self) -> bool;
+    fn current(&self) -> Option<&EntryKey>;
 }

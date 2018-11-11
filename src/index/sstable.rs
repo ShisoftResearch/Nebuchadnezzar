@@ -29,6 +29,7 @@ use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::Cursor;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -362,11 +363,6 @@ where
 }
 
 pub trait SortableEntrySlice: Sized + Slice<Item = EntryKey> {}
-
-pub trait Cursor {
-    fn next(&mut self) -> bool;
-    fn current(&self) -> Option<&EntryKey>;
-}
 
 pub struct RTCursor<S>
 where

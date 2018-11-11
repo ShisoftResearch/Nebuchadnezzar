@@ -24,7 +24,6 @@ use std::cmp::{max, min};
 use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
-use std::io::Cursor;
 use std::io::Write;
 use std::mem;
 use std::ops::Range;
@@ -33,6 +32,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::{Cursor as IndexCursor};
 
 mod external;
 mod internal;
@@ -128,9 +128,10 @@ impl BPlusTree {
         }
         return tree;
     }
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Result<Box<IndexCursor>, TxnErr> {
         debug!("searching for {:?}", key);
         self.transaction(|txn| txn.seek(key, ordering))
+            .map(|c| c.boxed())
     }
 
     pub fn insert(&self, key: &EntryKey) -> Result<(), TxnErr> {
@@ -612,7 +613,13 @@ impl RTCursor {
 
         return cursor;
     }
-    pub fn next(&mut self) -> bool {
+    fn boxed(self) -> Box<IndexCursor> {
+        box self
+    }
+}
+
+impl IndexCursor for RTCursor {
+    fn next(&mut self) -> bool {
         debug!(
             "Next id with index: {}, length: {}",
             self.index + 1,
@@ -657,7 +664,7 @@ impl RTCursor {
         return true;
     }
 
-    pub fn current(&self) -> Option<&EntryKey> {
+    fn current(&self) -> Option<&EntryKey> {
         if self.index >= 0 && self.index < self.page.len {
             Some(&self.page.keys[self.index])
         } else {
