@@ -1,4 +1,4 @@
-use super::btree::BPlusTree;
+use super::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use super::sstable::*;
 use super::*;
 use client::AsyncClient;
@@ -77,5 +77,40 @@ impl LSMTree {
             .into_iter()
             .any(|d| d);
         Ok(m_deleted || levels_deleted)
+    }
+}
+
+pub struct LSMTreeCursor {
+    level_cursors: Vec<Box<Cursor>>,
+}
+
+impl LSMTreeCursor {
+    fn new(cursors: Vec<Box<Cursor>>) -> Self {
+        LSMTreeCursor {
+            level_cursors: cursors,
+        }
+    }
+}
+
+impl Cursor for LSMTreeCursor {
+    fn next(&mut self) -> bool {
+        let min_tree = self
+            .level_cursors
+            .iter()
+            .enumerate()
+            .map(|(i, cursor)| (i, cursor.current()))
+            .filter_map(|(i, current)| current.map(|current_val| (i, current_val)))
+            .min_by_key(|(i, val)| *val)
+            .map(|(id, _)| id);
+        if let Some(id) = min_tree {
+            self.level_cursors[id].next();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    fn current(&self) -> Option<&EntryKey> {
+        self.level_cursors.iter().filter_map(|c| c.current()).min()
     }
 }
