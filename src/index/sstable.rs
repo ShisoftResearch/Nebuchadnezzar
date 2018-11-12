@@ -116,7 +116,7 @@ where
 
 pub trait Tree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
-    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &mut TombstonesInner);
+    fn merge(&self, source: &mut[EntryKey], source_tombstones: &mut TombstonesInner);
     fn mark_deleted(&self, key: &EntryKey) -> bool;
     fn is_deleted(&self, key: &EntryKey) -> bool;
     fn len(&self) -> usize;
@@ -211,7 +211,7 @@ where
         box cursor
     }
 
-    fn merge(&self, mut source: Vec<EntryKey>, source_tombstones: &mut TombstonesInner) {
+    fn merge(&self, source: &mut[EntryKey], source_tombstones: &mut TombstonesInner) {
         let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();

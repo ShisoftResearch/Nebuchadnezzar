@@ -53,3 +53,8 @@ pub trait Cursor {
     fn next(&mut self) -> bool;
     fn current(&self) -> Option<&EntryKey>;
 }
+
+pub trait MergingPage {
+    fn next(&self) -> Self;
+    fn keys(&self) -> &[EntryKey];
+}
