@@ -6,6 +6,7 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::{mem, ptr};
+use index::btree::Ordering;
 
 const LEVEL_PAGES_MULTIPLIER: usize = 1000;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
@@ -77,6 +78,18 @@ impl LSMTree {
             .into_iter()
             .any(|d| d);
         Ok(m_deleted || levels_deleted)
+    }
+
+    pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
+        match ordering {
+            Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
+            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX))
+        };
+        let mut cursors = vec![self.level_m.seek(&key, ordering).unwrap()];
+        for tree in &self.trees {
+            cursors.push(tree.seek(&key, ordering));
+        }
+        return LSMTreeCursor::new(cursors);
     }
 }
 
