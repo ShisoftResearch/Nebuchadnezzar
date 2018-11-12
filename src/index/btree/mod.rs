@@ -74,6 +74,7 @@ pub struct RTCursor {
     page: CacheGuardHolder,
     next_page: Option<CacheGuardHolder>,
     bz: Rc<CacheBufferZone>,
+    ended: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -596,6 +597,7 @@ impl RTCursor {
             ordering,
             page,
             bz: bz.clone(),
+            ended: false,
             next_page: bz.get_guard(match ordering {
                 Ordering::Forward => &next,
                 Ordering::Backward => &prev,
@@ -636,6 +638,7 @@ impl IndexCursor for RTCursor {
                         self.page = next_page;
                     } else {
                         debug!("iterated to end");
+                        self.ended = true;
                         return false;
                     }
                 } else {
@@ -653,6 +656,7 @@ impl IndexCursor for RTCursor {
                         self.page = next_page;
                     } else {
                         debug!("iterated to end");
+                        self.ended = true;
                         return false;
                     }
                 } else {
@@ -665,7 +669,7 @@ impl IndexCursor for RTCursor {
     }
 
     fn current(&self) -> Option<&EntryKey> {
-        if self.index >= 0 && self.index < self.page.len {
+        if !self.ended && self.index >= 0 && self.index < self.page.len {
             Some(&self.page.keys[self.index])
         } else {
             None
@@ -1022,6 +1026,7 @@ mod test {
                 assert_eq!(id, expected);
                 assert_eq!(cursor.next(), i + 1 < num);
             }
+            assert!(cursor.current().is_none());
         }
 
         {
@@ -1038,6 +1043,7 @@ mod test {
                 assert_eq!(id, expected, "{}", i);
                 assert_eq!(cursor.next(), i > 0);
             }
+            assert!(cursor.current().is_none());
         }
 
         {
