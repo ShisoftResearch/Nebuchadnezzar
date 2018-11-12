@@ -116,8 +116,12 @@ impl Cursor for LSMTreeCursor {
             .min_by_key(|(i, val)| *val)
             .map(|(id, _)| id);
         if let Some(id) = min_tree {
-            self.level_cursors[id].next();
-            return true;
+            let min_has_next = self.level_cursors[id].next();
+            if !min_has_next {
+                return self.level_cursors.iter().any(|level| level.current().is_some());
+            } else {
+                return true;
+            }
         } else {
             return false;
         }
