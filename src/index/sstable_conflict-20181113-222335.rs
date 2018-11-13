@@ -430,7 +430,6 @@ where
             .iter()
             .map(|page| page.first().unwrap())
             .for_each(|page_index| {
-                // pages cache will be evicted by new requesting pages
                 index.remove(page_index);
             });
     }
@@ -604,7 +603,7 @@ mod test {
         let mut key_id = key.clone();
         key_with_id(&mut key_id, &id);
 
-        tree.merge(vec![key_id].as_mut_slice(), &mut tombstones);
+        tree.merge(vec![key_id], &mut tombstones);
         let mut cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
         assert_eq!(tree.len(), 1);
