@@ -23,6 +23,7 @@ use std::ops::DerefMut;
 use std::rc::Rc;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::sync::atomic::AtomicBool;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, Arc<RwLock<ExtNode>>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -47,8 +48,8 @@ pub struct ExtNode {
     pub next: Id,
     pub prev: Id,
     pub len: usize,
-    pub version: u64,
     pub dirty: bool,
+    pub removed: Arc<AtomicBool>
 }
 
 pub struct ExtNodeSplit {
@@ -64,8 +65,8 @@ impl ExtNode {
             next: Id::unit_id(),
             prev: Id::unit_id(),
             len: 0,
-            version: 0,
             dirty: false,
+            removed: Arc::new(AtomicBool::new(false))
         }
     }
     pub fn from_cell(cell: Cell) -> Self {
@@ -92,8 +93,8 @@ impl ExtNode {
             next: *next,
             prev: *prev,
             len: key_count,
-            version: cell_version,
             dirty: false,
+            removed: Arc::new(AtomicBool::new(false))
         }
     }
     pub fn to_cell(&self) -> Cell {
@@ -155,8 +156,8 @@ impl ExtNode {
                 next: cached_next,
                 prev: cached_id,
                 len: keys_2_len,
-                version: 0,
                 dirty: true,
+                removed: Arc::new(AtomicBool::new(false))
             };
             debug!(
                 "new node have next {:?} prev {:?}, current id {:?}",

@@ -400,6 +400,9 @@ impl<'a> TreeTxn<'a> {
                     pos, key, id
                 );
                 let mut node = self.bz.get_for_mut(id);
+                if node.removed.load(Relaxed) {
+                    return Err(TxnErr::NotRealizable)
+                }
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));
             }
             &Node::Internal(ref n) => {
