@@ -82,7 +82,7 @@ impl LSMTree {
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
         match ordering {
             Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
-            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX))
+            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
         };
         let mut cursors = vec![self.level_m.seek(&key, ordering).unwrap()];
         for tree in &self.trees {
@@ -117,7 +117,10 @@ impl Cursor for LSMTreeCursor {
         if let Some(id) = min_tree {
             let min_has_next = self.level_cursors[id].next();
             if !min_has_next {
-                return self.level_cursors.iter().any(|level| level.current().is_some());
+                return self
+                    .level_cursors
+                    .iter()
+                    .any(|level| level.current().is_some());
             } else {
                 return true;
             }

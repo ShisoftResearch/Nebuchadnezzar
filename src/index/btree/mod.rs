@@ -12,7 +12,11 @@ use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 use index::btree::external::*;
 use index::btree::internal::*;
 use index::EntryKey;
+use index::MergeableTree;
+use index::MergingPage;
+use index::MergingTreeGuard;
 use index::Slice;
+use index::{Cursor as IndexCursor, Ordering};
 use itertools::{chain, Itertools};
 use ram::cell::Cell;
 use ram::types::RandValue;
@@ -32,9 +36,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::{Cursor as IndexCursor, Ordering};
-use index::MergingPage;
-use index::MergeableTree;
 
 mod external;
 mod internal;
@@ -397,7 +398,7 @@ impl<'a> TreeTxn<'a> {
                 );
                 let mut node = self.bz.get_for_mut(id);
                 if node.merging.load(Relaxed) {
-                    return Err(TxnErr::NotRealizable)
+                    return Err(TxnErr::NotRealizable);
                 }
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));
             }
@@ -715,7 +716,7 @@ impl MergingPage for BPlusTreeMergingPage {
         next_page.merging.store(true, Relaxed);
         box BPlusTreeMergingPage {
             page: next_page,
-            mapper: self.mapper.clone()
+            mapper: self.mapper.clone(),
         }
     }
 
@@ -725,7 +726,7 @@ impl MergingPage for BPlusTreeMergingPage {
 }
 
 impl MergeableTree for BPlusTree {
-    fn last_page(&self) -> Box<MergingPage> {
+    fn prepare_level_merge(&self) -> Box<MergingTreeGuard> {
         unimplemented!()
     }
 }

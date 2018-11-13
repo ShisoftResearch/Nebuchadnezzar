@@ -366,17 +366,10 @@ impl<S> MergeableTree for LevelTree<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
 {
-    fn last_page(&self) -> Box<MergingPage> {
-        let index = OwningHandle::new_with_fn(self.index.clone(), |x| unsafe { &*x }.read());
-        let page = {
-            let (_, page_id) = index.iter().last().unwrap();
-            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
-        };
-        box LevelMergingPage {
-            page,
-            lock: index,
+    fn prepare_level_merge(&self) -> Box<MergingTreeGuard> {
+        box LevelTreeMergeGuard {
             index: self.index.clone(),
-            page_cache: self.pages.clone(),
+            pages: self.pages.clone(),
         }
     }
 }
@@ -416,6 +409,43 @@ where
 
     fn keys(&self) -> &[EntryKey] {
         &self.page.slice.as_slice_immute()[..self.page.len]
+    }
+}
+
+pub struct LevelTreeMergeGuard<S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice,
+{
+    index: PageIndex,
+    pages: PageCache<S>,
+}
+
+impl<S> MergingTreeGuard for LevelTreeMergeGuard<S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
+{
+    fn remove_pages(&self, pages: &[&[EntryKey]]) {
+        let mut index = self.index.write();
+        pages
+            .iter()
+            .map(|page| page.first().unwrap())
+            .for_each(|page_index| {
+                index.remove(page_index);
+            });
+    }
+
+    fn last_page(&self) -> Box<MergingPage> {
+        let index = OwningHandle::new_with_fn(self.index.clone(), |x| unsafe { &*x }.read());
+        let page = {
+            let (_, page_id) = index.iter().last().unwrap();
+            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+        };
+        box LevelMergingPage {
+            page,
+            lock: index,
+            index: self.index.clone(),
+            page_cache: self.pages.clone(),
+        }
     }
 }
 

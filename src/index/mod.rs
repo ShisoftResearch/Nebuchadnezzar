@@ -1,7 +1,7 @@
 use dovahkiin::types::custom_types::id::Id;
 use smallvec::SmallVec;
 use std::fmt::Debug;
-use std::io::{Cursor as StdCursor};
+use std::io::Cursor as StdCursor;
 use std::mem;
 
 #[macro_use]
@@ -60,6 +60,11 @@ pub trait MergingPage {
 }
 
 pub trait MergeableTree {
+    fn prepare_level_merge(&self) -> Box<MergingTreeGuard>;
+}
+
+pub trait MergingTreeGuard {
+    fn remove_pages(&self, pages: &[&[EntryKey]]);
     fn last_page(&self) -> Box<MergingPage>;
 }
 
