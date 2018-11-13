@@ -34,6 +34,7 @@ use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 use index::{Cursor as IndexCursor, Ordering};
 use index::MergingPage;
+use index::MergeableTree;
 
 mod external;
 mod internal;
@@ -702,24 +703,30 @@ fn insert_into_split<T, S>(
 }
 
 pub struct BPlusTreeMergingPage {
-    page: CacheGuardHolder,
-    bz: Rc<CacheBufferZone>
+    page: RwLockReadGuard<ExtNode>,
+    mapper: Arc<ExtNodeCacheMap>,
 }
 
 impl MergingPage for BPlusTreeMergingPage {
     fn next(&self) -> Box<MergingPage> {
         let next_id = &self.page.prev;
         debug_assert_ne!(next_id, &Id::unit_id());
-        let next_page = self.bz.get_guard(next_id).unwrap();
+        let next_page = self.mapper.lock().get_or_fetch(next_id).unwrap().read();
         next_page.merging.store(true, Relaxed);
         box BPlusTreeMergingPage {
             page: next_page,
-            bz: self.bz.clone()
+            mapper: self.mapper.clone()
         }
     }
 
     fn keys(&self) -> &[EntryKey] {
         &self.page.keys[..self.page.len]
+    }
+}
+
+impl MergeableTree for BPlusTree {
+    fn last_page(&self) -> Box<MergingPage> {
+        unimplemented!()
     }
 }
 
