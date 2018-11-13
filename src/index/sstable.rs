@@ -25,10 +25,10 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Bound::*;
 use std::ops::RangeBounds;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::rc::Rc;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -372,7 +372,12 @@ where
             let (_, page_id) = index.iter().last().unwrap();
             self.pages.lock().get_or_fetch(page_id).unwrap().clone()
         };
-        box LevelMergingPage { page, lock: index, index: self.index.clone(), page_cache: self.pages.clone() }
+        box LevelMergingPage {
+            page,
+            lock: index,
+            index: self.index.clone(),
+            page_cache: self.pages.clone(),
+        }
     }
 }
 
@@ -395,9 +400,18 @@ where
         let page = {
             let current_last = self.page.slice.as_slice_immute().first().unwrap();
             let (_, page_id) = index.range::<EntryKey, _>(..current_last).last().unwrap();
-            self.page_cache.lock().get_or_fetch(page_id).unwrap().clone()
+            self.page_cache
+                .lock()
+                .get_or_fetch(page_id)
+                .unwrap()
+                .clone()
         };
-        box LevelMergingPage { page, lock: index, index: self.index.clone(), page_cache: self.page_cache.clone() }
+        box LevelMergingPage {
+            page,
+            lock: index,
+            index: self.index.clone(),
+            page_cache: self.page_cache.clone(),
+        }
     }
 
     fn keys(&self) -> &[EntryKey] {
