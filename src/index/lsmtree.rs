@@ -6,7 +6,6 @@ use itertools::Itertools;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use std::{mem, ptr};
-use index::btree::Ordering;
 
 const LEVEL_PAGES_MULTIPLIER: usize = 1000;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;

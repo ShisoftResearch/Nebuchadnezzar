@@ -32,7 +32,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::{Cursor as IndexCursor};
+use index::{Cursor as IndexCursor, Ordering};
 
 mod external;
 mod internal;
@@ -75,12 +75,6 @@ pub struct RTCursor {
     next_page: Option<CacheGuardHolder>,
     bz: Rc<CacheBufferZone>,
     ended: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Ordering {
-    Forward,
-    Backward,
 }
 
 impl Default for Ordering {
@@ -400,7 +394,7 @@ impl<'a> TreeTxn<'a> {
                     pos, key, id
                 );
                 let mut node = self.bz.get_for_mut(id);
-                if node.removed.load(Relaxed) {
+                if node.merging.load(Relaxed) {
                     return Err(TxnErr::NotRealizable)
                 }
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));

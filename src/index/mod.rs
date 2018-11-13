@@ -55,6 +55,16 @@ pub trait Cursor {
 }
 
 pub trait MergingPage {
-    fn next(&self) -> Self;
+    fn next(&self) -> Box<MergingPage>;
     fn keys(&self) -> &[EntryKey];
+}
+
+pub trait MergeableTree {
+    fn last_page(&self) -> Box<MergingPage>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Ordering {
+    Forward,
+    Backward,
 }

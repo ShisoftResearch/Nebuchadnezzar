@@ -6,13 +6,12 @@ use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
 use futures::prelude::*;
-use index::btree::Ordering;
-use index::EntryKey;
-use index::Slice;
-use index::{id_from_key, key_with_id};
+use index::*;
 use itertools::Itertools;
+use owning_ref::OwningHandle;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
+use parking_lot::RwLockReadGuard;
 use ram::cell::Cell;
 use ram::schema::Field;
 use ram::schema::Schema;
@@ -29,7 +28,7 @@ use std::ops::RangeBounds;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::Cursor;
+use std::rc::Rc;
 
 // LevelTree items cannot been added or removed individually
 // Items must been merged from higher level in bulk
@@ -41,6 +40,7 @@ type TombstonesInner = BTreeSet<EntryKey>;
 type Tombstones = RwLock<TombstonesInner>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
+type IndexHandle<'a> = OwningHandle<PageIndex, RwLockReadGuard<'a, BTreeMap<EntryKey, Id>>>;
 
 const PAGE_SCHEMA: &'static str = "NEB_SSTABLE_PAGE";
 
@@ -114,9 +114,9 @@ where
     }
 }
 
-pub trait Tree {
+pub trait Tree: MergeableTree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
-    fn merge(&self, source: &mut[EntryKey], source_tombstones: &mut TombstonesInner);
+    fn merge(&self, source: &mut [EntryKey], source_tombstones: &mut TombstonesInner);
     fn mark_deleted(&self, key: &EntryKey) -> bool;
     fn is_deleted(&self, key: &EntryKey) -> bool;
     fn len(&self) -> usize;
@@ -211,7 +211,7 @@ where
         box cursor
     }
 
-    fn merge(&self, source: &mut[EntryKey], source_tombstones: &mut TombstonesInner) {
+    fn merge(&self, source: &mut [EntryKey], source_tombstones: &mut TombstonesInner) {
         let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
@@ -359,6 +359,49 @@ where
 
     fn len(&self) -> usize {
         self.len.load(Relaxed)
+    }
+}
+
+impl<S> MergeableTree for LevelTree<S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
+{
+    fn last_page(&self) -> Box<MergingPage> {
+        let index = OwningHandle::new_with_fn(self.index.clone(), |x| unsafe { &*x }.read());
+        let page = {
+            let (_, page_id) = index.iter().last().unwrap();
+            self.pages.lock().get_or_fetch(page_id).unwrap().clone()
+        };
+        box LevelMergingPage { page, lock: index, index: self.index.clone(), page_cache: self.pages.clone() }
+    }
+}
+
+pub struct LevelMergingPage<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
+{
+    index: PageIndex,
+    page: Arc<SSPage<S>>,
+    page_cache: PageCache<S>,
+    lock: IndexHandle<'a>,
+}
+
+impl<'a, S> MergingPage for LevelMergingPage<'a, S>
+where
+    S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
+{
+    fn next(&self) -> Box<MergingPage> {
+        let index = OwningHandle::new_with_fn(self.index.clone(), |x| unsafe { &*x }.read());
+        let page = {
+            let current_last = self.page.slice.as_slice_immute().first().unwrap();
+            let (_, page_id) = index.range::<EntryKey, _>(..current_last).last().unwrap();
+            self.page_cache.lock().get_or_fetch(page_id).unwrap().clone()
+        };
+        box LevelMergingPage { page, lock: index, index: self.index.clone(), page_cache: self.page_cache.clone() }
+    }
+
+    fn keys(&self) -> &[EntryKey] {
+        &self.page.slice.as_slice_immute()[..self.page.len]
     }
 }
 
