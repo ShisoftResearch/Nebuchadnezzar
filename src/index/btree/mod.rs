@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 use index::{Cursor as IndexCursor, Ordering};
+use index::MergingPage;
 
 mod external;
 mod internal;
@@ -697,6 +698,28 @@ fn insert_into_split<T, S>(
         let right_pos = pos - pivot;
         debug!("insert into right part, pos: {}", right_pos);
         y.insert_at(item, right_pos, ylen);
+    }
+}
+
+pub struct BPlusTreeMergingPage {
+    page: CacheGuardHolder,
+    bz: Rc<CacheBufferZone>
+}
+
+impl MergingPage for BPlusTreeMergingPage {
+    fn next(&self) -> Box<MergingPage> {
+        let next_id = &self.page.prev;
+        debug_assert_ne!(next_id, &Id::unit_id());
+        let next_page = self.bz.get_guard(next_id).unwrap();
+        next_page.merging.store(true, Relaxed);
+        box BPlusTreeMergingPage {
+            page: next_page,
+            bz: self.bz.clone()
+        }
+    }
+
+    fn keys(&self) -> &[EntryKey] {
+        &self.page.keys[..self.page.len]
     }
 }
 
