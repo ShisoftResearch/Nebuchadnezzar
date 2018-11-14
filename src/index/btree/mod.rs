@@ -734,7 +734,7 @@ fn insert_into_split<T, S>(
 pub struct BPlusTreeMergingPage {
     page: RwLockReadGuard<ExtNode>,
     mapper: Arc<ExtNodeCacheMap>,
-    pages: Rc<RefCell<Vec<Id>>>
+    pages: Rc<RefCell<Vec<Id>>>,
 }
 
 impl MergingPage for BPlusTreeMergingPage {
@@ -747,7 +747,7 @@ impl MergingPage for BPlusTreeMergingPage {
         box BPlusTreeMergingPage {
             page: next_page,
             mapper: self.mapper.clone(),
-            pages: self.pages.clone()
+            pages: self.pages.clone(),
         }
     }
 
@@ -778,7 +778,7 @@ impl MergeableTree for BPlusTree {
             storage: self.storage.clone(),
             pages: Rc::new(RefCell::new(vec![])),
             last_node,
-            last_node_ref
+            last_node_ref,
         }
     }
 }
@@ -789,7 +789,7 @@ pub struct BPlusTreeMergingTreeGuard {
     last_node: Arc<Node>,
     last_node_ref: TxnValRef,
     storage: Arc<AsyncClient>,
-    pages: Rc<RefCell<Vec<Id>>>
+    pages: Rc<RefCell<Vec<Id>>>,
 }
 
 impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
@@ -803,7 +803,9 @@ impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
             self.storage.remove_cell(*page_id).wait();
         }
         unsafe {
-            self.txn.borrow_mut().force_update(self.last_node_ref, last_node_owned);
+            self.txn
+                .borrow_mut()
+                .force_update(self.last_node_ref, last_node_owned);
         }
     }
 
@@ -818,7 +820,7 @@ impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
         box BPlusTreeMergingPage {
             page: last_extnode,
             mapper: self.cache.clone(),
-            pages: self.pages.clone()
+            pages: self.pages.clone(),
         }
     }
 }
