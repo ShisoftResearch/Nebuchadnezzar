@@ -734,17 +734,20 @@ fn insert_into_split<T, S>(
 pub struct BPlusTreeMergingPage {
     page: RwLockReadGuard<ExtNode>,
     mapper: Arc<ExtNodeCacheMap>,
+    pages: Rc<RefCell<Vec<Id>>>
 }
 
 impl MergingPage for BPlusTreeMergingPage {
     fn next(&self) -> Box<MergingPage> {
         let next_id = &self.page.prev;
         debug_assert_ne!(next_id, &Id::unit_id());
+        self.pages.borrow_mut().push(*next_id);
         let next_page = self.mapper.lock().get_or_fetch(next_id).unwrap().read();
         next_page.merging.store(true, Relaxed);
         box BPlusTreeMergingPage {
             page: next_page,
             mapper: self.mapper.clone(),
+            pages: self.pages.clone()
         }
     }
 
@@ -755,7 +758,7 @@ impl MergingPage for BPlusTreeMergingPage {
 
 impl MergeableTree for BPlusTree {
     fn prepare_level_merge(&self) -> Box<MergingTreeGuard> {
-        let (txn, last_node) = self
+        let (txn, (last_node, last_node_ref)) = self
             .stm
             .transaction_optional_commit(
                 |txn| {
@@ -764,7 +767,7 @@ impl MergeableTree for BPlusTree {
                     let mut txn = tree_txn.txn;
                     txn.exclusive(last_node_ref);
                     let node = txn.read::<Node>(last_node_ref)?.unwrap();
-                    Ok(node)
+                    Ok((node, last_node_ref))
                 },
                 false,
             )
@@ -772,7 +775,10 @@ impl MergeableTree for BPlusTree {
         box BPlusTreeMergingTreeGuard {
             cache: self.ext_node_cache.clone(),
             txn: RefCell::new(txn),
+            storage: self.storage.clone(),
+            pages: Rc::new(RefCell::new(vec![])),
             last_node,
+            last_node_ref
         }
     }
 }
@@ -781,11 +787,24 @@ pub struct BPlusTreeMergingTreeGuard {
     cache: Arc<ExtNodeCacheMap>,
     txn: RefCell<Txn>,
     last_node: Arc<Node>,
+    last_node_ref: TxnValRef,
+    storage: Arc<AsyncClient>,
+    pages: Rc<RefCell<Vec<Id>>>
 }
 
 impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
     fn remove_pages(&self, pages: &[&[EntryKey]]) {
-        unimplemented!()
+        let mut last_node_owned = (&*self.last_node).clone();
+        {
+            let mut innode = last_node_owned.innode_mut();
+            innode.len -= pages.len();
+        }
+        for page_id in self.pages.borrow().iter() {
+            self.storage.remove_cell(*page_id).wait();
+        }
+        unsafe {
+            self.txn.borrow_mut().force_update(self.last_node_ref, last_node_owned);
+        }
     }
 
     fn last_page(&self) -> Box<MergingPage> {
@@ -793,11 +812,20 @@ impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
         let last_ext_ref = innode.pointers.last().unwrap();
         let mut txn_mutable = self.txn.borrow_mut();
         let last_node = txn_mutable.read::<Node>(*last_ext_ref).unwrap().unwrap();
-        let last_extnode = self.cache.lock().get_or_fetch(&last_node.ext_id()).unwrap().read();
+        let last_ext_id = last_node.ext_id();
+        let last_extnode = self.cache.lock().get_or_fetch(&last_ext_id).unwrap().read();
+        self.pages.borrow_mut().push(last_ext_id);
         box BPlusTreeMergingPage {
             page: last_extnode,
-            mapper: self.cache.clone()
+            mapper: self.cache.clone(),
+            pages: self.pages.clone()
         }
+    }
+}
+
+impl Drop for BPlusTreeMergingTreeGuard {
+    fn drop(&mut self) {
+        self.txn.borrow_mut().commit();
     }
 }
 

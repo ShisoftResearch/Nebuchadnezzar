@@ -300,7 +300,7 @@ dependencies = [
 [[package]]
 name = "hermes"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Hermes.git#03deb24fe3c3be75fb28a0c54b0c02c43f21e28a"
+source = "git+https://github.com/ShisoftResearch/Hermes.git#9ec5d0d5dec6eca78ee28678d5eff8d7a3c25ab7"
 dependencies = [
  "log 0.4.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "parking_lot 0.6.4 (registry+https://github.com/rust-lang/crates.io-index)",
