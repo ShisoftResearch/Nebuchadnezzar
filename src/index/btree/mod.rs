@@ -23,6 +23,7 @@ use ram::types::RandValue;
 use smallvec::SmallVec;
 use std;
 use std::cell::Ref;
+use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cmp::{max, min};
 use std::fmt::Debug;
@@ -58,6 +59,7 @@ pub struct BPlusTree {
     stm: TxnManager,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
+    merging: RwLock<Option<TxnValRef>>,
 }
 
 #[derive(Clone)]
@@ -102,6 +104,7 @@ impl BPlusTree {
             stm: TxnManager::new(),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
+            merging: RwLock::new(None),
             ext_node_cache: Arc::new(Mutex::new(LRUCache::new(
                 CACHE_SIZE,
                 move |id| {
@@ -349,6 +352,29 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
+    fn last_node(&mut self, node_ref: TxnValRef) -> Result<Option<TxnValRef>, TxnErr> {
+        let node = self.txn.read::<Node>(node_ref)?.unwrap();
+        if node.is_ext() {
+            return Ok(None);
+        } else if let Node::Internal(ref n) = *node {
+            let sub_level = self.last_node(*n.pointers.last().unwrap())?;
+            if sub_level.is_none() {
+                return Ok(Some(node_ref));
+            } else {
+                return Ok(sub_level);
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn check_merging(&self, node: TxnValRef) -> Result<(), TxnErr> {
+        match &*self.tree.merging.read() {
+            &Some(r) if r == node => Err(TxnErr::NotRealizable),
+            _ => Ok(()),
+        }
+    }
+
     pub fn insert(&mut self, key: &EntryKey) -> Result<(), TxnErr> {
         let root_ref = self.tree.root;
         if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
@@ -380,6 +406,7 @@ impl<'a> TreeTxn<'a> {
         node: TxnValRef,
         key: EntryKey,
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
+        self.check_merging(node)?;
         let ref_node = self.txn.read::<Node>(node)?.unwrap();
         ref_node.warm_cache_for_write_intention(&mut self.bz);
         let pos = ref_node.search(&key, &mut self.bz);
@@ -478,6 +505,7 @@ impl<'a> TreeTxn<'a> {
         key: &EntryKey,
     ) -> Result<RemoveStatus, TxnErr> {
         debug!("Removing {:?} from node {:?}", key, node);
+        self.check_merging(node)?;
         let node_ref = self.txn.read::<Node>(node)?.unwrap();
         node_ref.warm_cache_for_write_intention(&mut self.bz);
         let pos = node_ref.search(key, &mut self.bz);;
@@ -727,7 +755,49 @@ impl MergingPage for BPlusTreeMergingPage {
 
 impl MergeableTree for BPlusTree {
     fn prepare_level_merge(&self) -> Box<MergingTreeGuard> {
+        let (txn, last_node) = self
+            .stm
+            .transaction_optional_commit(
+                |txn| {
+                    let mut tree_txn = TreeTxn::new(self, txn);
+                    let last_node_ref = tree_txn.last_node(self.root)?.unwrap();
+                    let mut txn = tree_txn.txn;
+                    txn.exclusive(last_node_ref);
+                    let node = txn.read::<Node>(last_node_ref)?.unwrap();
+                    Ok(node)
+                },
+                false,
+            )
+            .unwrap();
+        box BPlusTreeMergingTreeGuard {
+            cache: self.ext_node_cache.clone(),
+            txn: RefCell::new(txn),
+            last_node,
+        }
+    }
+}
+
+pub struct BPlusTreeMergingTreeGuard {
+    cache: Arc<ExtNodeCacheMap>,
+    txn: RefCell<Txn>,
+    last_node: Arc<Node>,
+}
+
+impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
+    fn remove_pages(&self, pages: &[&[EntryKey]]) {
         unimplemented!()
+    }
+
+    fn last_page(&self) -> Box<MergingPage> {
+        let innode = self.last_node.innode();
+        let last_ext_ref = innode.pointers.last().unwrap();
+        let mut txn_mutable = self.txn.borrow_mut();
+        let last_node = txn_mutable.read::<Node>(*last_ext_ref).unwrap().unwrap();
+        let last_extnode = self.cache.lock().get_or_fetch(&last_node.ext_id()).unwrap().read();
+        box BPlusTreeMergingPage {
+            page: last_extnode,
+            mapper: self.cache.clone()
+        }
     }
 }
 
