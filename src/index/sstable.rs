@@ -114,7 +114,7 @@ where
     }
 }
 
-pub trait Tree: MergeableTree {
+pub trait SSLevelTree: MergeableTree {
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn merge(&self, source: &mut [EntryKey], source_tombstones: &mut TombstonesInner);
     fn mark_deleted(&self, key: &EntryKey) -> bool;
@@ -154,7 +154,7 @@ where
     }
 }
 
-impl<S> Tree for LevelTree<S>
+impl<S> SSLevelTree for LevelTree<S>
 where
     S: Slice<Item = EntryKey> + SortableEntrySlice + 'static,
 {

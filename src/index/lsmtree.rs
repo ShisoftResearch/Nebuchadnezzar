@@ -5,6 +5,8 @@ use client::AsyncClient;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 use std::{mem, ptr};
 
 const LEVEL_PAGES_MULTIPLIER: usize = 1000;
@@ -16,7 +18,7 @@ const LEVEL_3: usize = LEVEL_2 * LEVEL_DIFF_MULTIPLIER;
 const LEVEL_4: usize = LEVEL_3 * LEVEL_DIFF_MULTIPLIER;
 // TODO: debug assert the last one will not overflow MAX_SEGMENT_SIZE
 
-type LevelTrees = Vec<Box<Tree>>;
+type LevelTrees = Vec<Box<SSLevelTree>>;
 
 macro_rules! with_levels {
     ($($sym:ident, $level:ident;)*) => {
@@ -51,14 +53,24 @@ pub struct LSMTree {
     sizes: Vec<usize>,
 }
 
+unsafe impl Send for LSMTree {}
+unsafe impl Sync for LSMTree {}
+
 impl LSMTree {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
         let (trees, sizes) = init_lsm_level_trees(neb_client);
-        LSMTree {
+        let lsm_tree = Arc::new(LSMTree {
             level_m: BPlusTree::new(neb_client),
             trees,
             sizes,
-        }
+        });
+
+        let tree_clone = lsm_tree.clone();
+        thread::spawn(move || {
+            tree_clone.sentinel();
+        });
+
+        lsm_tree
     }
 
     pub fn insert(&self, mut key: EntryKey, id: &Id) -> Result<(), ()> {
@@ -89,6 +101,24 @@ impl LSMTree {
             cursors.push(tree.seek(&key, ordering));
         }
         return LSMTreeCursor::new(cursors);
+    }
+
+    fn sentinel(&self) {
+        self.check_and_merge(&self.level_m, &*self.trees[0]);
+        for i in 0..self.trees.len() - 1 {
+            let upper = &*self.trees[i];
+            let lower = &*self.trees[i + 1];
+            self.check_and_merge(upper, lower);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    fn check_and_merge<U, L>(&self, upper_level: &U, lower_level: &L)
+    where
+        U: MergeableTree + ?Sized,
+        L: SSLevelTree + ?Sized,
+    {
+
     }
 }
 
