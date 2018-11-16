@@ -19,7 +19,6 @@ const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;
 const LEVEL_2: usize = LEVEL_1 * LEVEL_DIFF_MULTIPLIER;
 const LEVEL_3: usize = LEVEL_2 * LEVEL_DIFF_MULTIPLIER;
 const LEVEL_4: usize = LEVEL_3 * LEVEL_DIFF_MULTIPLIER;
-// TODO: debug assert the last one will not overflow MAX_SEGMENT_SIZE
 
 type LevelTrees = Vec<Box<SSLevelTree>>;
 
