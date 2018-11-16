@@ -32,10 +32,9 @@ itertools = "*"
 smallvec = "*"
 owning_ref = "0.3"
 rayon = "1.0"
-
 futures-await = "0.1"
-
 num_cpus = "1.0"
+static_assertions = "*"
 
 [dev-dependencies]
 env_logger = "0.4"

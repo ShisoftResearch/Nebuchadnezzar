@@ -781,6 +781,10 @@ impl MergeableTree for BPlusTree {
             last_node_ref,
         }
     }
+
+    fn elements(&self) -> usize {
+        self.len()
+    }
 }
 
 pub struct BPlusTreeMergingTreeGuard {

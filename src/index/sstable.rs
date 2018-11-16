@@ -372,6 +372,10 @@ where
             pages: self.pages.clone(),
         }
     }
+
+    fn elements(&self) -> usize {
+        self.len()
+    }
 }
 
 pub struct LevelMergingPage<'a, S>

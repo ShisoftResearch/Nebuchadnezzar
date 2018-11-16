@@ -61,6 +61,7 @@ pub trait MergingPage {
 
 pub trait MergeableTree {
     fn prepare_level_merge(&self) -> Box<MergingTreeGuard>;
+    fn elements(&self) -> usize;
 }
 
 pub trait MergingTreeGuard {

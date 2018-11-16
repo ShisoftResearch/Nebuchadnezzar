@@ -9,6 +9,6 @@ pub mod io;
 pub mod schema;
 pub mod tombstone;
 pub mod types;
+pub mod segs;
 
 mod clock;
-mod segs;

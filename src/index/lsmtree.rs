@@ -8,8 +8,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
+use ram::segs::MAX_SEGMENT_SIZE;
 
-const LEVEL_PAGES_MULTIPLIER: usize = 1000;
+const LEVEL_M_MAX_PAGES_COUNT: usize = 1000;
+const LEVEL_PAGES_MULTIPLIER: usize = 100;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
 const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;
@@ -33,6 +35,7 @@ macro_rules! with_levels {
             $(
                 trees.push(box LevelTree::<$sym>::new(neb_client));
                 sizes.push($level);
+                const_assert!($level * KEY_SIZE <= MAX_SEGMENT_SIZE);
             )*
             return (trees, sizes);
         }
@@ -64,12 +67,10 @@ impl LSMTree {
             trees,
             sizes,
         });
-
         let tree_clone = lsm_tree.clone();
         thread::spawn(move || {
             tree_clone.sentinel();
         });
-
         lsm_tree
     }
 
@@ -118,6 +119,7 @@ impl LSMTree {
         U: MergeableTree + ?Sized,
         L: SSLevelTree + ?Sized,
     {
+        let num_upper_nodes = upper_level.elements();
 
     }
 }
