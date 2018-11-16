@@ -37,7 +37,7 @@ use utils::lru_cache::LRUCache;
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
 pub type TombstonesInner = BTreeSet<EntryKey>;
-type Tombstones = RwLock<TombstonesInner>;
+pub type Tombstones = RwLock<TombstonesInner>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
 type IndexHandle<'a> = OwningHandle<PageIndex, RwLockReadGuard<'a, BTreeMap<EntryKey, Id>>>;
@@ -54,7 +54,7 @@ where
 {
     neb_client: Arc<AsyncClient>,
     index: PageIndex,
-    tombstones: Tombstones,
+    tombstones: Arc<Tombstones>,
     pages: PageCache<S>,
     marker: PhantomData<S>,
     len: AtomicUsize,
@@ -120,7 +120,7 @@ pub trait SSLevelTree: MergeableTree {
     fn mark_deleted(&self, key: &EntryKey) -> bool;
     fn is_deleted(&self, key: &EntryKey) -> bool;
     fn len(&self) -> usize;
-    fn tombstones(&self) -> &Tombstones;
+    fn tombstones(&self) -> Arc<Tombstones>;
 }
 
 impl<S> LevelTree<S>
@@ -133,7 +133,7 @@ where
         Self {
             neb_client: neb_client.clone(),
             index,
-            tombstones: Tombstones::new(BTreeSet::new()),
+            tombstones: Arc::new(Tombstones::new(BTreeSet::new())),
             len: AtomicUsize::new(0),
             // TODO: carefully set the capacity
             pages: Arc::new(Mutex::new(LRUCache::new(
@@ -362,8 +362,8 @@ where
         self.len.load(Relaxed)
     }
 
-    fn tombstones(&self) -> &Tombstones {
-        &self.tombstones
+    fn tombstones(&self) -> Arc<Tombstones> {
+        self.tombstones.clone()
     }
 }
 
@@ -617,5 +617,10 @@ mod test {
         let mut cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
         assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    pub fn crd() {
+
     }
 }

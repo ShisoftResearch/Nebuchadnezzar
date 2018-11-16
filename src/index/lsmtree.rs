@@ -108,7 +108,10 @@ impl LSMTree {
         for tree in &self.trees {
             cursors.push(tree.seek(&key, ordering));
         }
-        return LSMTreeCursor::new(cursors);
+        return LSMTreeCursor::new(
+            cursors,
+            self.trees.iter().map(|t| t.tombstones()).collect_vec(),
+        );
     }
 
     fn sentinel(&self) {
@@ -122,7 +125,8 @@ impl LSMTree {
         for i in 0..self.trees.len() - 1 {
             let upper = &*self.trees[i];
             let lower = &*self.trees[i + 1];
-            let mut upper_tombstones = upper.tombstones().write();
+            let upper_tombstons_ref = upper.tombstones();
+            let mut upper_tombstones = upper_tombstons_ref.write();
             self.check_and_merge(
                 self.max_sizes[i],
                 self.page_sizes[i + 1],
@@ -167,18 +171,18 @@ impl LSMTree {
 
 pub struct LSMTreeCursor {
     level_cursors: Vec<Box<Cursor>>,
+    tombstones: Vec<Arc<Tombstones>>,
 }
 
 impl LSMTreeCursor {
-    fn new(cursors: Vec<Box<Cursor>>) -> Self {
+    fn new(cursors: Vec<Box<Cursor>>, tombstones: Vec<Arc<Tombstones>>) -> Self {
         LSMTreeCursor {
+            tombstones,
             level_cursors: cursors,
         }
     }
-}
 
-impl Cursor for LSMTreeCursor {
-    fn next(&mut self) -> bool {
+    fn next_candidate(&mut self) -> (bool, usize) {
         let min_tree = self
             .level_cursors
             .iter()
@@ -190,16 +194,44 @@ impl Cursor for LSMTreeCursor {
         if let Some(id) = min_tree {
             let min_has_next = self.level_cursors[id].next();
             if !min_has_next {
-                return self
+                let next = self
                     .level_cursors
                     .iter()
-                    .any(|level| level.current().is_some());
+                    .enumerate()
+                    .filter_map(|(level, cursor)| cursor.current().map(|key| (id, key)))
+                    .min_by_key(|(level, key)| *key);
+                if let Some((id, _)) = next {
+                    return (true, id);
+                }
             } else {
-                return true;
+                return (true, id);
             }
-        } else {
-            return false;
         }
+        return (false, 0);
+    }
+}
+
+impl Cursor for LSMTreeCursor {
+    fn next(&mut self) -> bool {
+        loop {
+            let (has_next, candidate_level) = self.next_candidate();
+            if !has_next {
+                break;
+            }
+            if candidate_level == 0 {
+                return has_next;
+            }
+            let candidate_key = self.level_cursors[candidate_level].current().unwrap();
+            if self.tombstones[candidate_level + 1]
+                .read()
+                .contains(candidate_key)
+            {
+                // marked in tombstone, skip
+                continue;
+            }
+            return true;
+        }
+        return false;
     }
 
     fn current(&self) -> Option<&EntryKey> {
