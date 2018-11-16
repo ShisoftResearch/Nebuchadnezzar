@@ -4,11 +4,12 @@ use super::*;
 use client::AsyncClient;
 use itertools::Itertools;
 use parking_lot::RwLock;
+use ram::segs::MAX_SEGMENT_SIZE;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use ram::segs::MAX_SEGMENT_SIZE;
 
 const LEVEL_M_MAX_PAGES_COUNT: usize = 1000;
 const LEVEL_PAGES_MULTIPLIER: usize = 100;
@@ -23,21 +24,25 @@ const LEVEL_4: usize = LEVEL_3 * LEVEL_DIFF_MULTIPLIER;
 type LevelTrees = Vec<Box<SSLevelTree>>;
 
 macro_rules! with_levels {
-    ($($sym:ident, $level:ident;)*) => {
+    ($($sym:ident, $level_size:ident;)*) => {
         $(
-            type $sym = [EntryKey; $level];
-            impl_sspage_slice!($sym, EntryKey, $level);
+            type $sym = [EntryKey; $level_size];
+            impl_sspage_slice!($sym, EntryKey, $level_size);
         )*
 
-        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> (LevelTrees, Vec<usize>) {
+        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> (LevelTrees, Vec<usize>, Vec<usize>) {
             let mut trees = LevelTrees::new();
-            let mut sizes = Vec::new();
+            let mut max_pages_list = Vec::new();
+            let mut max_pages = LEVEL_M_MAX_PAGES_COUNT;
+            let mut page_sizes = Vec::new();
             $(
+                max_pages *= LEVEL_PAGES_MULTIPLIER;
                 trees.push(box LevelTree::<$sym>::new(neb_client));
-                sizes.push($level);
-                const_assert!($level * KEY_SIZE <= MAX_SEGMENT_SIZE);
+                max_pages_list.push(max_pages * $level_size);
+                page_sizes.push($level_size);
+                const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
             )*
-            return (trees, sizes);
+            return (trees, max_pages_list, page_sizes);
         }
     };
 }
@@ -53,7 +58,8 @@ pub struct LSMTree {
     level_m: BPlusTree,
     trees: LevelTrees,
     // use Vec here for convenience
-    sizes: Vec<usize>,
+    max_sizes: Vec<usize>,
+    page_sizes: Vec<usize>,
 }
 
 unsafe impl Send for LSMTree {}
@@ -61,11 +67,12 @@ unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
-        let (trees, sizes) = init_lsm_level_trees(neb_client);
+        let (trees, max_sizes, page_sizes) = init_lsm_level_trees(neb_client);
         let lsm_tree = Arc::new(LSMTree {
             level_m: BPlusTree::new(neb_client),
             trees,
-            sizes,
+            max_sizes,
+            page_sizes,
         });
         let tree_clone = lsm_tree.clone();
         thread::spawn(move || {
@@ -105,22 +112,56 @@ impl LSMTree {
     }
 
     fn sentinel(&self) {
-        self.check_and_merge(&self.level_m, &*self.trees[0]);
+        self.check_and_merge(
+            LEVEL_M_MAX_PAGES_COUNT,
+            self.page_sizes[0],
+            &mut BTreeSet::new(),
+            &self.level_m,
+            &*self.trees[0],
+        );
         for i in 0..self.trees.len() - 1 {
             let upper = &*self.trees[i];
             let lower = &*self.trees[i + 1];
-            self.check_and_merge(upper, lower);
+            let mut upper_tombstones = upper.tombstones().write();
+            self.check_and_merge(
+                self.max_sizes[i],
+                self.page_sizes[i + 1],
+                &mut *upper_tombstones,
+                upper,
+                lower,
+            );
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    fn check_and_merge<U, L>(&self, upper_level: &U, lower_level: &L)
-    where
+    fn check_and_merge<U, L>(
+        &self,
+        max_elements: usize,
+        upper_page_size: usize,
+        upper_tombstones: &mut TombstonesInner,
+        upper_level: &U,
+        lower_level: &L,
+    ) where
         U: MergeableTree + ?Sized,
         L: SSLevelTree + ?Sized,
     {
-        let num_upper_nodes = upper_level.elements();
-
+        if upper_level.elements() > max_elements {
+            let entries_to_merge = (upper_page_size as f64 / 1.2) as usize;
+            let guard = upper_level.prepare_level_merge();
+            let mut collected_entries = 1;
+            let mut pages = vec![guard.last_page()];
+            while collected_entries < entries_to_merge {
+                let next_page = pages.last().unwrap().next();
+                collected_entries += next_page.keys().len();
+                pages.push(next_page);
+            }
+            let mut entries = vec![];
+            for page in &pages {
+                entries.append(&mut Vec::from(page.keys()));
+            }
+            lower_level.merge(entries.as_mut_slice(), upper_tombstones);
+            guard.remove_pages(pages.iter().map(|p| p.keys()).collect_vec().as_slice())
+        }
     }
 }
 

@@ -36,7 +36,7 @@ use utils::lru_cache::LRUCache;
 // Because tree update will not to be performed in parallel. Unlike memtable, a single r/w lock
 // should be sufficient. Thus concurrency control will be simple and efficient.
 
-type TombstonesInner = BTreeSet<EntryKey>;
+pub type TombstonesInner = BTreeSet<EntryKey>;
 type Tombstones = RwLock<TombstonesInner>;
 type PageCache<S> = Arc<Mutex<LRUCache<Id, Arc<SSPage<S>>>>>;
 type PageIndex = Arc<RwLock<BTreeMap<EntryKey, Id>>>;
@@ -120,6 +120,7 @@ pub trait SSLevelTree: MergeableTree {
     fn mark_deleted(&self, key: &EntryKey) -> bool;
     fn is_deleted(&self, key: &EntryKey) -> bool;
     fn len(&self) -> usize;
+    fn tombstones(&self) -> &Tombstones;
 }
 
 impl<S> LevelTree<S>
@@ -359,6 +360,10 @@ where
 
     fn len(&self) -> usize {
         self.len.load(Relaxed)
+    }
+
+    fn tombstones(&self) -> &Tombstones {
+        &self.tombstones
     }
 }
 
