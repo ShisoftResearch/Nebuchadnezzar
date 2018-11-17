@@ -581,8 +581,13 @@ mod test {
     use std::sync::Arc;
 
     type SmallPage = [EntryKey; 5];
+    type L1Page = SmallPage;
+    type L2Page = [EntryKey; 50];
+    type L3Page = [EntryKey; 500];
 
     impl_sspage_slice!(SmallPage, EntryKey, 5);
+    impl_sspage_slice!(L2Page, EntryKey, 50);
+    impl_sspage_slice!(L3Page, EntryKey, 500);
 
     #[test]
     pub fn init() {
@@ -621,6 +626,36 @@ mod test {
 
     #[test]
     pub fn crd() {
+        env_logger::init();
+        let server_group = "sstable_index_init";
+        let server_addr = String::from("127.0.0.1:5201");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::get_schema()).wait();
 
+        let mut tree_1: LevelTree<L1Page> = LevelTree::new(&client);
+        let mut tree_2: LevelTree<L2Page> = LevelTree::new(&client);
+        let mut tombstones = BTreeSet::new();
+
+        // merge
+        let mut small_page_data = vec![];
+        for i in 0..100 {
+            let id = Id::new(0, i);
+            let mut key = smallvec![1, 2, 3, 4];
+            key_with_id(&mut key, &id);
+            small_page_data.push(key);
+        }
+        tree_1.merge(small_page_data.as_mut_slice(), &mut tombstones);
     }
 }
