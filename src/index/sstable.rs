@@ -479,9 +479,12 @@ where
 {
     fn next(&mut self) -> bool {
         if self.current.is_some() {
+            debug!("Next item");
             match self.ordering {
                 Ordering::Forward => {
+                    debug!("pos: {}, page_len: {}", self.pos, self.page_len);
                     if self.pos + 1 >= self.page_len {
+                        debug!("Switching page");
                         let current_key = self.current().unwrap().clone();
                         if let Some((_, page_id)) = self
                             .index
@@ -502,6 +505,7 @@ where
                             return false;
                         }
                     } else {
+                        debug!("increasing pos by one");
                         self.pos += 1;
                     }
                 }
@@ -531,6 +535,7 @@ where
                     }
                 }
             }
+            debug!("return true for next");
             true
         } else {
             false
@@ -539,11 +544,14 @@ where
 
     fn current(&self) -> Option<&EntryKey> {
         if self.pos < 0 || self.pos >= self.page_len {
+            debug!("out of flow, exit");
             return None;
         }
         if let Some(ref page) = self.current {
+            debug!("has current page, return {}", self.pos);
             Some(&page.slice.as_slice_immute()[self.pos])
         } else {
+            debug!("have no current page, return none");
             None
         }
     }
@@ -650,12 +658,29 @@ mod test {
 
         // merge
         let mut small_page_data = vec![];
-        for i in 0..100 {
+        let small_page_len = 100;
+        let key_prefix = smallvec![1, 2, 3, 4];
+        for i in 0..small_page_len {
             let id = Id::new(0, i);
-            let mut key = smallvec![1, 2, 3, 4];
+            let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
             small_page_data.push(key);
         }
         tree_1.merge(small_page_data.as_mut_slice(), &mut tombstones);
+        for i in 0..small_page_len {
+            let id = Id::new(0, i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
+            for j in 0..=i {
+                let id = Id::new(0, j);
+                let mut key = key_prefix.clone();
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                if i != 0 {
+                    assert_eq!(cursor.next(), j != small_page_len - 1, "{}/{}", i, j);
+                }
+            }
+        }
     }
 }
