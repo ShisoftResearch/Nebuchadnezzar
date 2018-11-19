@@ -633,7 +633,7 @@ mod test {
     }
 
     #[test]
-    pub fn crd() {
+    pub fn merging() {
         env_logger::init();
         let server_group = "sstable_index_init";
         let server_addr = String::from("127.0.0.1:5201");
@@ -705,6 +705,30 @@ mod test {
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                 assert_eq!(cursor.next(), j != 199, "{}/{}", i, j);
+            }
+        }
+
+        //merge to right
+        let mut right_parts = vec![];
+        let right_parts_starting = 200;
+        for i in 0..merging_count {
+            let id = Id::new(0, right_parts_starting + i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            right_parts.push(key);
+        }
+        tree_1.merge(right_parts.as_mut_slice(), &mut tombstones);
+        for i in 0..merging_count * 3 {
+            let id = Id::new(0, i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
+            for j in 0..=i {
+                let id = Id::new(0, j);
+                let mut key = key_prefix.clone();
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                assert_eq!(cursor.next(), j != 299, "{}/{}", i, j);
             }
         }
     }
