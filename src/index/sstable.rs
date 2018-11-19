@@ -656,18 +656,45 @@ mod test {
         let mut tree_2: LevelTree<L2Page> = LevelTree::new(&client);
         let mut tombstones = BTreeSet::new();
 
-        // merge
-        let mut small_page_data = vec![];
-        let small_page_len = 100;
+        let merging_count = 100;
+
+        // merge to empty
+        let mut initial_parts = vec![];
         let key_prefix = smallvec![1, 2, 3, 4];
-        for i in 0..small_page_len {
+        let initial_offset = merging_count;
+        for i in 0..merging_count {
+            let id = Id::new(0, initial_offset + i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            initial_parts.push(key);
+        }
+        tree_1.merge(initial_parts.as_mut_slice(), &mut tombstones);
+        for i in 0..merging_count {
+            let id = Id::new(0, initial_offset + i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
+            for j in 0..=i {
+                let id = Id::new(0, initial_offset + j);
+                let mut key = key_prefix.clone();
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                if i != 0 {
+                    assert_eq!(cursor.next(), j != merging_count - 1, "{}/{}", i, j);
+                }
+            }
+        }
+
+        // merge to left
+        let mut left_parts = vec![];
+        for i in 0..merging_count {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            small_page_data.push(key);
+            left_parts.push(key);
         }
-        tree_1.merge(small_page_data.as_mut_slice(), &mut tombstones);
-        for i in 0..small_page_len {
+        tree_1.merge(left_parts.as_mut_slice(), &mut tombstones);
+        for i in 0..merging_count * 2 {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
@@ -677,9 +704,7 @@ mod test {
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                if i != 0 {
-                    assert_eq!(cursor.next(), j != small_page_len - 1, "{}/{}", i, j);
-                }
+                assert_eq!(cursor.next(), j != 199, "{}/{}", i, j);
             }
         }
     }
