@@ -148,11 +148,13 @@ impl LSMTree {
         U: MergeableTree + ?Sized,
         L: SSLevelTree + ?Sized,
     {
-        if upper_level.elements() > max_elements {
-            let entries_to_merge = (upper_page_size as f64 / 1.2) as usize;
+        let elements = upper_level.elements();
+        if elements > max_elements {
+            debug!("upper level have elements {} exceeds {}, start level merging", elements, max_elements);
+            let entries_to_merge = upper_page_size;
             let guard = upper_level.prepare_level_merge();
-            let mut collected_entries = 1;
             let mut pages = vec![guard.last_page()];
+            let mut collected_entries = pages.last().unwrap().keys().len();
             while collected_entries < entries_to_merge {
                 let next_page = pages.last().unwrap().next();
                 collected_entries += next_page.keys().len();
@@ -162,6 +164,7 @@ impl LSMTree {
             for page in &pages {
                 entries.append(&mut Vec::from(page.keys()));
             }
+            debug!("going to merge {} entries", entries.len());
             lower_level.merge(entries.as_mut_slice(), upper_tombstones);
             guard.remove_pages(pages.iter().map(|p| p.keys()).collect_vec().as_slice())
         }
