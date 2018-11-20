@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
 
-const LEVEL_M_MAX_PAGES_COUNT: usize = 1000;
+const LEVEL_M_MAX_ELEMENTS_COUNT: usize = LEVEL_M * LEVEL_M * LEVEL_M;
 const LEVEL_PAGES_MULTIPLIER: usize = 100;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
@@ -115,7 +115,7 @@ impl LSMTree {
 
     fn sentinel(&self) {
         self.check_and_merge(
-            LEVEL_M_MAX_PAGES_COUNT,
+            LEVEL_M_MAX_ELEMENTS_COUNT,
             self.page_sizes[0],
             &mut BTreeSet::new(),
             &self.level_m,
