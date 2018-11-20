@@ -229,6 +229,7 @@ where
     }
 
     fn merge(&self, source: &mut [EntryKey], source_tombstones: &mut TombstonesInner) {
+        debug!("Merging with slice with {} elements", source.len());
         let mut target_tombstones = self.tombstones.write();
         let mut pages_cache = self.pages.lock();
         let mut index = self.index.write();
@@ -237,8 +238,15 @@ where
             let (target_keys, target_pages): (Vec<_>, Vec<_>) = {
                 let first = source.first().unwrap();
                 let last = source.last().unwrap();
+                let self_first_key = index.iter().next();
+                let zero_key = smallvec!(0);
+                let tgt_first_page = index
+                    .range::<EntryKey, _>(..=first)
+                    .last()
+                    .map(|pair| pair.0)
+                    .unwrap_or(&zero_key);
                 index
-                    .range::<EntryKey, _>(first..=last)
+                    .range::<EntryKey, _>(tgt_first_page..=last)
                     .map(|(k, id)| (k, pages_cache.get_or_fetch(id).unwrap().clone()))
                     .unzip()
             };
@@ -811,15 +819,13 @@ mod test {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
-            for j in 0..=i {
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            for j in i..merging_count * 2 {
                 let id = Id::new(0, j);
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                if i != 0 {
-                    assert_eq!(cursor.next(), j != merging_count * 2 - 1, "{}/{}", i, j);
-                }
+                assert_eq!(cursor.next(), j != merging_count * 2 - 1, "{}/{}", i, j);
             }
         }
     }
