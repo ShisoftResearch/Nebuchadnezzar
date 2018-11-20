@@ -714,13 +714,13 @@ mod test {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
-            for j in 0..=i {
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            for j in i..merging_count * 2 {
                 let id = Id::new(0, j);
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                assert_eq!(cursor.next(), j != 199, "{}/{}", i, j);
+                assert_eq!(cursor.next(), j != merging_count * 2 - 1, "{}/{}", i, j);
             }
         }
 
@@ -738,13 +738,13 @@ mod test {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
-            for j in 0..=i {
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            for j in i..merging_count * 3 {
                 let id = Id::new(0, j);
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                assert_eq!(cursor.next(), j != 299, "{}/{}", i, j);
+                assert_eq!(cursor.next(), j != merging_count * 3 - 1, "{}/{}", i, j);
             }
         }
     }
