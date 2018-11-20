@@ -162,20 +162,36 @@ where
     fn seek(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
         let index = self.index.read();
         debug!("Seeking for {:?}, in index len {}", key, index.len());
-        let mut range = match ordering {
-            Ordering::Forward => index.range::<EntryKey, _>(key..),
-            Ordering::Backward => index.range::<EntryKey, _>(..=key),
-        };
-        let first = match ordering {
-            Ordering::Forward => range.next(),
-            Ordering::Backward => range.next_back(),
+        let first_page = {
+            if index.is_empty() {
+                None
+            } else {
+                match ordering {
+                    Ordering::Forward => {
+                        let first_entry = index.iter().next().unwrap();
+                        if key < first_entry.0 {
+                            Some(first_entry)
+                        } else {
+                            index.range::<EntryKey, _>(..=key).last()
+                        }
+                    }
+                    Ordering::Backward => {
+                        let last_entry = index.iter().last().unwrap();
+                        if key > last_entry.0 {
+                            Some(last_entry)
+                        } else {
+                            index.range::<EntryKey, _>(..=key).last()
+                        }
+                    }
+                }
+            }
         }
         .map(|(_, page_id)| {
             debug!("First page id is {:?}", page_id);
             self.pages.lock().get_or_fetch(page_id).unwrap().clone()
         });
 
-        let (pos, page_len) = if let Some(ref page) = first {
+        let (pos, page_len) = if let Some(ref page) = first_page {
             debug!("First page has {} elements", page.len);
             (
                 page.slice.as_slice_immute()[..page.len]
@@ -192,7 +208,7 @@ where
         let mut cursor = RTCursor {
             ordering,
             page_len,
-            current: first,
+            current: first_page,
             pos,
             cache: self.pages.clone(),
             index: self.index.clone(),
@@ -633,7 +649,7 @@ mod test {
     }
 
     #[test]
-    pub fn merging() {
+    pub fn overflowed_merging() {
         env_logger::init();
         let server_group = "sstable_index_init";
         let server_addr = String::from("127.0.0.1:5201");
@@ -652,8 +668,7 @@ mod test {
         );
         client.new_schema_with_id(super::get_schema()).wait();
 
-        let mut tree_1: LevelTree<L1Page> = LevelTree::new(&client);
-        let mut tree_2: LevelTree<L2Page> = LevelTree::new(&client);
+        let mut tree: LevelTree<L1Page> = LevelTree::new(&client);
         let mut tombstones = BTreeSet::new();
 
         let merging_count = 100;
@@ -668,19 +683,20 @@ mod test {
             key_with_id(&mut key, &id);
             initial_parts.push(key);
         }
-        tree_1.merge(initial_parts.as_mut_slice(), &mut tombstones);
+        tree.merge(initial_parts.as_mut_slice(), &mut tombstones);
         for i in 0..merging_count {
             let id = Id::new(0, initial_offset + i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
-            for j in 0..=i {
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            for j in i..merging_count {
                 let id = Id::new(0, initial_offset + j);
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                let has_next = cursor.next();
                 if i != 0 {
-                    assert_eq!(cursor.next(), j != merging_count - 1, "{}/{}", i, j);
+                    assert_eq!(has_next, j != merging_count - 1, "{}/{}", i, j);
                 }
             }
         }
@@ -693,12 +709,12 @@ mod test {
             key_with_id(&mut key, &id);
             left_parts.push(key);
         }
-        tree_1.merge(left_parts.as_mut_slice(), &mut tombstones);
+        tree.merge(left_parts.as_mut_slice(), &mut tombstones);
         for i in 0..merging_count * 2 {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
             for j in 0..=i {
                 let id = Id::new(0, j);
                 let mut key = key_prefix.clone();
@@ -717,18 +733,93 @@ mod test {
             key_with_id(&mut key, &id);
             right_parts.push(key);
         }
-        tree_1.merge(right_parts.as_mut_slice(), &mut tombstones);
+        tree.merge(right_parts.as_mut_slice(), &mut tombstones);
         for i in 0..merging_count * 3 {
             let id = Id::new(0, i);
             let mut key = key_prefix.clone();
             key_with_id(&mut key, &id);
-            let mut cursor = tree_1.seek(&smallvec!(0), Ordering::Forward);
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
             for j in 0..=i {
                 let id = Id::new(0, j);
                 let mut key = key_prefix.clone();
                 key_with_id(&mut key, &id);
                 assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                 assert_eq!(cursor.next(), j != 299, "{}/{}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    pub fn overlapping_merge() {
+        env_logger::init();
+        let server_group = "sstable_index_init";
+        let server_addr = String::from("127.0.0.1:5202");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::get_schema()).wait();
+
+        let mut tree: LevelTree<L1Page> = LevelTree::new(&client);
+        let mut tombstones = BTreeSet::new();
+
+        let merging_count = 100;
+        // merge to empty, even numbers
+        let mut initial_parts = vec![];
+        let key_prefix = smallvec![1, 2, 3, 4];
+        for i in 0..merging_count {
+            let id = Id::new(0, i * 2);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            initial_parts.push(key);
+        }
+        tree.merge(initial_parts.as_mut_slice(), &mut tombstones);
+        for i in 0..merging_count {
+            let id = Id::new(0, i * 2);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+            for j in 0..=i {
+                let id = Id::new(0, j * 2);
+                let mut key = key_prefix.clone();
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                if i != 0 {
+                    assert_eq!(cursor.next(), j != merging_count - 1, "{}/{}", i, j);
+                }
+            }
+        }
+
+        let mut overlapping_part = vec![];
+        for i in 0..merging_count {
+            let id = Id::new(0, i * 2 + 1);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            overlapping_part.push(key);
+        }
+        tree.merge(overlapping_part.as_mut_slice(), &mut tombstones);
+        for i in 0..merging_count * 2 {
+            let id = Id::new(0, i);
+            let mut key = key_prefix.clone();
+            key_with_id(&mut key, &id);
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+            for j in 0..=i {
+                let id = Id::new(0, j);
+                let mut key = key_prefix.clone();
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                if i != 0 {
+                    assert_eq!(cursor.next(), j != merging_count * 2 - 1, "{}/{}", i, j);
+                }
             }
         }
     }
