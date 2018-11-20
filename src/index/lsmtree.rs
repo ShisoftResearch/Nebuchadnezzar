@@ -240,3 +240,62 @@ impl Cursor for LSMTreeCursor {
         self.level_cursors.iter().filter_map(|c| c.current()).min()
     }
 }
+
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::io::{Cursor as StdCursor};
+    use futures::prelude::*;
+    use server::NebServer;
+    use server::ServerOptions;
+    use client;
+    use std::env;
+    use byteorder::BigEndian;
+    use byteorder::WriteBytesExt;
+
+    fn u64_to_slice(n: u64) -> [u8; 8] {
+        let mut key_slice = [0u8; 8];
+        {
+            let mut cursor = StdCursor::new(&mut key_slice[..]);
+            cursor.write_u64::<BigEndian>(n);
+        };
+        key_slice
+    }
+
+    #[test]
+    pub fn insertions() {
+        env_logger::init();
+        let server_group = "sstable_index_init";
+        let server_addr = String::from("127.0.0.1:5300");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::get_schema()).wait();
+        let tree = LSMTree::new(&client);
+        let num = env::var("LSM_TREE_TEST_ITEMS")
+            // this value cannot do anything useful to the test
+            // must arrange a long-term test to cover every levels
+            .unwrap_or("1000".to_string())
+            .parse::<u64>()
+            .unwrap();
+
+        for i in 0.. num {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let key = SmallVec::from_slice(&key_slice);
+            debug!("insert id: {}", i);
+            tree.insert(key, &id).unwrap();
+        }
+    }
+}
