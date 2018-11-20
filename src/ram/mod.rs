@@ -7,8 +7,8 @@ pub mod cleaner;
 pub mod entry;
 pub mod io;
 pub mod schema;
+pub mod segs;
 pub mod tombstone;
 pub mod types;
-pub mod segs;
 
 mod clock;
