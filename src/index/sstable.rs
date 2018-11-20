@@ -828,5 +828,20 @@ mod test {
                 assert_eq!(cursor.next(), j != merging_count * 2 - 1, "{}/{}", i, j);
             }
         }
+
+        let id = Id::new(0, 101);
+        let mut rm_key_1 = key_prefix.clone();
+        key_with_id(&mut rm_key_1, &id);
+        assert!(tree.mark_deleted(&rm_key_1));
+
+        let id = Id::new(0, 100);
+        let mut rm_key_2 = key_prefix.clone();
+        key_with_id(&mut rm_key_2, &id);
+        assert!(tree.mark_deleted(&rm_key_2));
+
+        tree.merge(&mut vec![rm_key_2.clone()], &mut tombstones);
+        assert_ne!(tree.seek(&rm_key_1, Ordering::Forward).current(), Some(&rm_key_1));
+        // key2 should not be removed for it exists in upper level
+        assert_eq!(tree.seek(&rm_key_2, Ordering::Forward).current(), Some(&rm_key_2));
     }
 }
