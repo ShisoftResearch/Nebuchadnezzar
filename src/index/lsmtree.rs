@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::{mem, ptr};
 
 const LEVEL_M_MAX_ELEMENTS_COUNT: usize = LEVEL_M * LEVEL_M * LEVEL_M;
-const LEVEL_PAGES_MULTIPLIER: usize = 100;
+const LEVEL_ELEMENTS_MULTIPLIER: usize = 100;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
 const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;
@@ -31,17 +31,17 @@ macro_rules! with_levels {
 
         fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> (LevelTrees, Vec<usize>, Vec<usize>) {
             let mut trees = LevelTrees::new();
-            let mut max_pages_list = Vec::new();
-            let mut max_pages = LEVEL_M_MAX_PAGES_COUNT;
+            let mut max_elements_list = Vec::new();
+            let mut max_elements = LEVEL_M_MAX_ELEMENTS_COUNT;
             let mut page_sizes = Vec::new();
             $(
-                max_pages *= LEVEL_PAGES_MULTIPLIER;
+                max_elements *= LEVEL_ELEMENTS_MULTIPLIER;
                 trees.push(box LevelTree::<$sym>::new(neb_client));
-                max_pages_list.push(max_pages * $level_size);
+                max_elements_list.push(max_elements);
                 page_sizes.push($level_size);
                 const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
             )*
-            return (trees, max_pages_list, page_sizes);
+            return (trees, max_elements_list, page_sizes);
         }
     };
 }
