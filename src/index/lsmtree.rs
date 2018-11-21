@@ -169,6 +169,12 @@ impl LSMTree {
             guard.remove_pages(pages.iter().map(|p| p.keys()).collect_vec().as_slice())
         }
     }
+
+    pub fn len(&self) -> usize {
+        let mem_len = self.level_m.len();
+        let levels_len_sum = self.trees.iter().map(|tree| tree.len()).sum::<usize>();
+        return mem_len + levels_len_sum;
+    }
 }
 
 pub struct LSMTreeCursor {
@@ -301,8 +307,10 @@ mod test {
             tree.insert(key, &id).unwrap();
         }
 
-        debug!("Sleep for level merge");
-        thread::sleep(Duration::from_millis(num));
+        if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
+            debug!("Sleep 5 minute for level merge");
+            thread::sleep(Duration::from_secs(5 * 60));
+        }
 
         debug!("Start validations");
         let mut rng = thread_rng();

@@ -568,14 +568,14 @@ where
 
     fn current(&self) -> Option<&EntryKey> {
         if self.pos < 0 || self.pos >= self.page_len {
-            debug!("out of flow, exit");
+            // debug!("out of flow, exit");
             return None;
         }
         if let Some(ref page) = self.current {
-            debug!("has current page, return {}", self.pos);
+            // debug!("has current page, return {}", self.pos);
             Some(&page.slice.as_slice_immute()[self.pos])
         } else {
-            debug!("have no current page, return none");
+           //  debug!("have no current page, return none");
             None
         }
     }
