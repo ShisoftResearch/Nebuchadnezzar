@@ -459,6 +459,7 @@ impl<'a> TreeTxn<'a> {
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
                 let result = {
                     let pivot_pos = acq_node.search(&pivot, &mut self.bz);
+                    debug!("will insert into current node at {}, node len {}", pivot_pos, acq_node.len(&mut self.bz));
                     let mut current_innode = acq_node.innode_mut();
                     current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
                 };
@@ -712,20 +713,19 @@ fn insert_into_split<T, S>(
     xlen: &mut usize,
     ylen: &mut usize,
     pos: usize,
-    pivot: usize,
 ) where
     S: Slice<Item = T> + BTreeSlice<T>,
     T: Default + Debug,
 {
     debug!(
-        "insert into split left len {}, right len {}, pos {}, pivot {}",
-        xlen, ylen, pos, pivot
+        "insert into split left len {}, right len {}, pos {}",
+        xlen, ylen, pos
     );
-    if pos < pivot {
+    if pos < *xlen {
         debug!("insert into left part, pos: {}", pos);
         x.insert_at(item, pos, xlen);
     } else {
-        let right_pos = pos - pivot;
+        let right_pos = pos - *xlen;
         debug!("insert into right part, pos: {}", right_pos);
         y.insert_at(item, right_pos, ylen);
     }

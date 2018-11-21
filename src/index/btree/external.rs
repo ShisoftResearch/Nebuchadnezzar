@@ -148,7 +148,6 @@ impl ExtNode {
                 &mut keys_1_len,
                 &mut keys_2_len,
                 pos,
-                pivot,
             );
             let extnode_2 = ExtNode {
                 id: new_page_id,
