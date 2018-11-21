@@ -279,7 +279,7 @@ mod test {
     pub fn insertions() {
         env_logger::init();
         let server_group = "sstable_index_init";
-        let server_addr = String::from("127.0.0.1:5300");
+        let server_addr = String::from("127.0.0.1:5600");
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,

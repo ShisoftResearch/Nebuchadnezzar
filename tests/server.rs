@@ -48,7 +48,7 @@ pub fn smoke_test() {
         .parse::<u64>()
         .unwrap();
     env_logger::init();
-    let server_addr = String::from("127.0.0.1:5300");
+    let server_addr = String::from("127.0.0.1:5500");
     let server_group = String::from("smoke_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {

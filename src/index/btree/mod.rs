@@ -1327,7 +1327,7 @@ mod test {
     pub fn alternative_insertion_pattern() {
         env_logger::init();
         let server_group = "b+ tree alternative insertion pattern";
-        let server_addr = String::from("127.0.0.1:5300");
+        let server_addr = String::from("127.0.0.1:5400");
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
