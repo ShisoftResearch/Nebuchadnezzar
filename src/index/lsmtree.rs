@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::{mem, ptr};
 
 const LEVEL_M_MAX_ELEMENTS_COUNT: usize = LEVEL_M * LEVEL_M * LEVEL_M;
-const LEVEL_ELEMENTS_MULTIPLIER: usize = 100;
+const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 const LEVEL_DIFF_MULTIPLIER: usize = 10;
 const LEVEL_M: usize = super::btree::NUM_KEYS;
 const LEVEL_1: usize = LEVEL_M * LEVEL_DIFF_MULTIPLIER;
@@ -283,7 +283,7 @@ mod test {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 8 * 1024 * 1024 * 1024,
+                memory_size: 4 * 1024 * 1024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
             },
