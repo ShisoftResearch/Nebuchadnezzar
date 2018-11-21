@@ -69,7 +69,10 @@ impl InNode {
                     // pivot moved, need to compensate
                     key_pos -= 1;
                 }
-                debug!("keys 1 len: {}, keys 2 len: {}, pos {}", keys_1_len, keys_2_len, key_pos);
+                debug!(
+                    "keys 1 len: {}, keys 2 len: {}, pos {}",
+                    keys_1_len, keys_2_len, key_pos
+                );
                 let pivot_key = keys_1[pivot].to_owned();
                 insert_into_split(
                     key,

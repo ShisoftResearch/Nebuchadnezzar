@@ -150,7 +150,10 @@ impl LSMTree {
     {
         let elements = upper_level.elements();
         if elements > max_elements {
-            debug!("upper level have elements {} exceeds {}, start level merging", elements, max_elements);
+            debug!(
+                "upper level have elements {} exceeds {}, start level merging",
+                elements, max_elements
+            );
             let entries_to_merge = upper_page_size;
             let guard = upper_level.prepare_level_merge();
             let mut pages = vec![guard.last_page()];
@@ -247,21 +250,20 @@ impl Cursor for LSMTreeCursor {
     }
 }
 
-
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::io::{Cursor as StdCursor};
-    use futures::prelude::*;
-    use server::NebServer;
-    use server::ServerOptions;
-    use client;
-    use std::env;
     use byteorder::BigEndian;
     use byteorder::WriteBytesExt;
-    use rand::thread_rng;
+    use client;
+    use futures::prelude::*;
     use rand::distributions::Uniform;
+    use rand::thread_rng;
     use rand::Rng;
+    use server::NebServer;
+    use server::ServerOptions;
+    use std::env;
+    use std::io::Cursor as StdCursor;
 
     fn u64_to_slice(n: u64) -> [u8; 8] {
         let mut key_slice = [0u8; 8];
@@ -299,7 +301,7 @@ mod test {
             .parse::<u64>()
             .unwrap();
 
-        for i in 0.. num {
+        for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
@@ -327,7 +329,7 @@ mod test {
             if roll_die.next().unwrap() != 6 {
                 continue;
             }
-            for j in i .. num {
+            for j in i..num {
                 let id = Id::new(0, j);
                 let key_slice = u64_to_slice(j);
                 let mut key = SmallVec::from_slice(&key_slice);

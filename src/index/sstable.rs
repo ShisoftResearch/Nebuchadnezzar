@@ -575,7 +575,7 @@ where
             // debug!("has current page, return {}", self.pos);
             Some(&page.slice.as_slice_immute()[self.pos])
         } else {
-           //  debug!("have no current page, return none");
+            //  debug!("have no current page, return none");
             None
         }
     }
@@ -840,8 +840,14 @@ mod test {
         assert!(tree.mark_deleted(&rm_key_2));
 
         tree.merge(&mut vec![rm_key_2.clone()], &mut tombstones);
-        assert_ne!(tree.seek(&rm_key_1, Ordering::Forward).current(), Some(&rm_key_1));
+        assert_ne!(
+            tree.seek(&rm_key_1, Ordering::Forward).current(),
+            Some(&rm_key_1)
+        );
         // key2 should not be removed for it exists in upper level
-        assert_eq!(tree.seek(&rm_key_2, Ordering::Forward).current(), Some(&rm_key_2));
+        assert_eq!(
+            tree.seek(&rm_key_2, Ordering::Forward).current(),
+            Some(&rm_key_2)
+        );
     }
 }

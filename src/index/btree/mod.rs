@@ -459,7 +459,11 @@ impl<'a> TreeTxn<'a> {
                 let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
                 let result = {
                     let pivot_pos = acq_node.search(&pivot, &mut self.bz);
-                    debug!("will insert into current node at {}, node len {}", pivot_pos, acq_node.len(&mut self.bz));
+                    debug!(
+                        "will insert into current node at {}, node len {}",
+                        pivot_pos,
+                        acq_node.len(&mut self.bz)
+                    );
                     let mut current_innode = acq_node.innode_mut();
                     current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
                 };
@@ -1346,7 +1350,7 @@ mod test {
             .parse::<u64>()
             .unwrap();
 
-        for i in 0.. num {
+        for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
