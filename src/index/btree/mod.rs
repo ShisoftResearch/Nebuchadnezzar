@@ -1359,12 +1359,19 @@ mod test {
             tree.insert(&key).unwrap();
         }
 
+
+        let mut rng = thread_rng();
+        let die_range = Uniform::new_inclusive(1, 6);
+        let mut roll_die = rng.sample_iter(&die_range);
         for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             debug!("checking {:?}", &key);
+            if roll_die.next().unwrap() != 6 {
+                continue;
+            }
             let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
             for j in i..num {
                 let id = Id::new(0, j);
