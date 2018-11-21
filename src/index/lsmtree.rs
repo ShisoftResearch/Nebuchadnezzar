@@ -253,6 +253,9 @@ mod test {
     use std::env;
     use byteorder::BigEndian;
     use byteorder::WriteBytesExt;
+    use rand::thread_rng;
+    use rand::distributions::Uniform;
+    use rand::Rng;
 
     fn u64_to_slice(n: u64) -> [u8; 8] {
         let mut key_slice = [0u8; 8];
@@ -298,12 +301,32 @@ mod test {
             tree.insert(key, &id).unwrap();
         }
 
-        for i in 0.. num {
+        debug!("Sleep for level merge");
+        thread::sleep(Duration::from_millis(num));
+
+        debug!("Start validations");
+        let mut rng = thread_rng();
+        let die_range = Uniform::new_inclusive(1, 6);
+        let mut roll_die = rng.sample_iter(&die_range);
+        for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            debug!("insert id: {}", i);
-            tree.insert(key, &id).unwrap();
+            let mut key = SmallVec::from_slice(&key_slice);
+            debug!("checking: {}", i);
+            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
+            key_with_id(&mut key, &id);
+            assert_eq!(cursor.current(), Some(&key), "{}", i);
+            if roll_die.next().unwrap() != 6 {
+                continue;
+            }
+            for j in i .. num {
+                let id = Id::new(0, j);
+                let key_slice = u64_to_slice(j);
+                let mut key = SmallVec::from_slice(&key_slice);
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
+            }
         }
     }
 }
