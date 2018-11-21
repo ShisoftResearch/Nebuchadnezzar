@@ -150,10 +150,7 @@ impl LSMTree {
     {
         let elements = upper_level.elements();
         if elements > max_elements {
-            debug!(
-                "upper level have elements {} exceeds {}, start level merging",
-                elements, max_elements
-            );
+            debug!("upper level have elements {} exceeds {}, start level merging", elements, max_elements);
             let entries_to_merge = upper_page_size;
             let guard = upper_level.prepare_level_merge();
             let mut pages = vec![guard.last_page()];
@@ -171,12 +168,6 @@ impl LSMTree {
             lower_level.merge(entries.as_mut_slice(), upper_tombstones);
             guard.remove_pages(pages.iter().map(|p| p.keys()).collect_vec().as_slice())
         }
-    }
-
-    pub fn len(&self) -> usize {
-        let mem_len = self.level_m.len();
-        let levels_len_sum = self.trees.iter().map(|tree| tree.len()).sum::<usize>();
-        return mem_len + levels_len_sum;
     }
 }
 
@@ -250,21 +241,18 @@ impl Cursor for LSMTreeCursor {
     }
 }
 
+
 #[cfg(test)]
 mod test {
     use super::*;
-    use byteorder::BigEndian;
-    use byteorder::WriteBytesExt;
-    use client;
+    use std::io::{Cursor as StdCursor};
     use futures::prelude::*;
-    use rand::distributions::Uniform;
-    use rand::thread_rng;
-    use rand::Rng;
-    use rayon::prelude::*;
     use server::NebServer;
     use server::ServerOptions;
+    use client;
     use std::env;
-    use std::io::Cursor as StdCursor;
+    use byteorder::BigEndian;
+    use byteorder::WriteBytesExt;
 
     fn u64_to_slice(n: u64) -> [u8; 8] {
         let mut key_slice = [0u8; 8];
@@ -277,7 +265,7 @@ mod test {
 
     #[test]
     pub fn insertions() {
-        env_logger::init();
+        env_logger::init();`
         let server_group = "sstable_index_init";
         let server_addr = String::from("127.0.0.1:5300");
         let server = NebServer::new_from_opts(
@@ -302,42 +290,12 @@ mod test {
             .parse::<u64>()
             .unwrap();
 
-        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
-            let i = *i;
+        for i in 0.. num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
+            debug!("insert id: {}", i);
             tree.insert(key, &id).unwrap();
-        });
-
-        if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
-            debug!("Sleep 5 minute for level merge");
-            thread::sleep(Duration::from_secs(5 * 60));
         }
-
-        debug!("Start validations");
-        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
-            let mut rng = rand::rngs::OsRng::new().unwrap();
-            let die_range = Uniform::new_inclusive(1, 6);
-            let mut roll_die = rng.sample_iter(&die_range);
-            let i = *i;
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let mut key = SmallVec::from_slice(&key_slice);
-            debug!("checking: {}", i);
-            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
-            key_with_id(&mut key, &id);
-            assert_eq!(cursor.current(), Some(&key), "{}", i);
-            if roll_die.next().unwrap() == 6 {
-                for j in i..num {
-                    let id = Id::new(0, j);
-                    let key_slice = u64_to_slice(j);
-                    let mut key = SmallVec::from_slice(&key_slice);
-                    key_with_id(&mut key, &id);
-                    assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
-                }
-            }
-        });
     }
 }
