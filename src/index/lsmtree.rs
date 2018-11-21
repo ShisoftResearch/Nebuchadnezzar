@@ -46,7 +46,7 @@ macro_rules! with_levels {
     };
 }
 
-with_levels!{
+with_levels! {
     L1, LEVEL_1;
     L2, LEVEL_2;
     L3, LEVEL_3;
@@ -301,6 +301,18 @@ mod test {
             .unwrap_or("1000".to_string())
             .parse::<u64>()
             .unwrap();
+
+        let tree_clone = tree.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(10));
+            let tree_len = tree_clone.len();
+            debug!(
+                "LSM-Tree now have {}/{} elements, total {:.2}%",
+                tree_len,
+                num,
+                tree_len as f32 / num as f32 * 100.0
+            );
+        });
 
         (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
             let i = *i;
