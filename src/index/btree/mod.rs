@@ -1318,4 +1318,58 @@ mod test {
             assert_eq!(client.count().wait().unwrap(), 1);
         }
     }
+
+    #[test]
+    pub fn alternative_insertion_pattern() {
+        env_logger::init();
+        let server_group = "b+ tree alternative insertion pattern";
+        let server_addr = String::from("127.0.0.1:5300");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 1024 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::page_schema()).wait();
+        let tree = BPlusTree::new(&client);
+        let num = env::var("BTREE_TEST_ITEMS")
+            // this value cannot do anything useful to the test
+            // must arrange a long-term test to cover every levels
+            .unwrap_or("1000".to_string())
+            .parse::<u64>()
+            .unwrap();
+
+        for i in 0.. num {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            debug!("insert {:?}", key);
+            tree.insert(&key).unwrap();
+        }
+
+        for i in 0..num {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            debug!("checking {:?}", &key);
+            let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
+            for j in i..num {
+                let id = Id::new(0, j);
+                let key_slice = u64_to_slice(j);
+                let mut key = SmallVec::from_slice(&key_slice);
+                key_with_id(&mut key, &id);
+                assert_eq!(cursor.current(), Some(&key));
+                assert_eq!(cursor.next(), j != num - 1);
+            }
+        }
+    }
 }

@@ -297,5 +297,13 @@ mod test {
             debug!("insert id: {}", i);
             tree.insert(key, &id).unwrap();
         }
+
+        for i in 0.. num {
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let key = SmallVec::from_slice(&key_slice);
+            debug!("insert id: {}", i);
+            tree.insert(key, &id).unwrap();
+        }
     }
 }
