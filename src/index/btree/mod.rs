@@ -100,7 +100,7 @@ impl BPlusTree {
         return tree;
     }
 
-    pub fn seek(&mut self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
         let root = self.tree.root;
         match ordering {
             Ordering::Forward => self.search(root, key, ordering),
@@ -127,7 +127,7 @@ impl BPlusTree {
     }
 
     fn search(
-        &mut self,
+        &self,
         node: &NodeCellRef,
         key: &EntryKey,
         ordering: Ordering,
@@ -145,7 +145,7 @@ impl BPlusTree {
         }
     }
 
-    pub fn insert(&mut self, key: &EntryKey) -> Result<(), TxnErr> {
+    pub fn insert(&self, key: &EntryKey) -> Result<(), TxnErr> {
         let root_ref = self.tree.root;
         if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
             debug!("split root with pivot key {:?}", pivotKey);
@@ -175,7 +175,7 @@ impl BPlusTree {
     }
 
     fn insert_to_node(
-        &mut self,
+        &self,
         node: &NodeCellRef,
         key: EntryKey,
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
@@ -248,7 +248,7 @@ impl BPlusTree {
         }
     }
 
-    pub fn remove(&mut self, key: &EntryKey) -> Result<bool, TxnErr> {
+    pub fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
         let root = self.tree.root;
         let removed = self.remove_from_node(root, key)?;
         let root_node = self.txn.read::<Node>(root)?.unwrap();
@@ -276,7 +276,7 @@ impl BPlusTree {
     }
 
     fn remove_from_node(
-        &mut self,
+        &self,
         node: TxnValRef,
         key: &EntryKey,
     ) -> Result<RemoveStatus, TxnErr> {
@@ -342,8 +342,6 @@ impl BPlusTree {
                         current_innode.merge_children(
                             left_ptr_pos,
                             right_ptr_pos,
-                            &mut self.txn,
-                            &mut self.bz,
                         );
                         status.removed = true;
                     }
@@ -381,19 +379,17 @@ impl BPlusTree {
     }
 
     pub fn flush_all(&self) {
-        for (_, value) in self.ext_node_cache.lock().iter() {
-            Self::flush_item(&self.storage, value)
-        }
+        unimplemented!()
     }
 
     pub fn len(&self) -> usize {
         self.len.load(Relaxed)
     }
 
-    fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
-        let cache = value.read();
+    unsafe fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
+        let value = &*value.get();
         if cache.dirty {
-            let cell = cache.to_cell();
+            let cell = value.extnode().to_cell();
             client.upsert_cell(cell).wait().unwrap();
         }
     }
@@ -436,10 +432,11 @@ impl Node {
         key: EntryKey,
         ptr: Option<NodeCellRef>,
         pos: usize,
-    ) -> Option<(Node, Option<EntryKey>)> {
+        self_ref: Option<&NodeCellRef>,
+    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
         if let &mut Node::External(ref id) = self {
             debug!("inserting to external node at: {:?}, key {:?}", pos, key);
-            self.extnode_mut().insert(key, pos, tree)
+            self.extnode_mut().insert(key, pos, tree, self_ref.unwrap().clone())
         } else {
             debug!("inserting to internal node at: {:?}, key {:?}", pos, key);
             self.innode_mut().insert(key, ptr, pos)
@@ -481,7 +478,7 @@ impl Node {
     }
     fn extnode_mut(&mut self) -> &mut ExtNode {
         match self {
-            &Node::External(ref mut node) => &mut *node,
+            &mut Node::External(ref mut node) => node,
             _ => unreachable!(),
         }
     }
@@ -497,11 +494,11 @@ impl Node {
             _ => unreachable!(),
         }
     }
-    fn ext_id(&self) -> &Id {
-        if let &Node::External(ref node) = self {
-            &node.id
-        } else {
-            panic!()
+    fn ext_id(&self) -> Id {
+        match self {
+            &Node::External(ref node) => node.id,
+            &Node::None => Id::unit_id(),
+            _ => unreachable!()
         }
     }
     fn innode(&self) -> &InNode {
@@ -513,41 +510,8 @@ impl Node {
 }
 
 impl RTCursor {
-    fn new(pos: usize, id: &Id, bz: &Rc<CacheBufferZone>, ordering: Ordering) -> RTCursor {
-        let node = bz.get(id);
-        let page = bz.get_guard(id).unwrap();
-        let next = page.next;
-        let prev = page.prev;
-        debug!("Cursor page len: {}, id {:?}", &node.len, node.id);
-        if pos < node.len {
-            debug!(
-                "Key at pos {} is {:?}, next: {:?}, prev: {:?}",
-                pos, &node.keys[pos], next, prev
-            );
-        } else {
-            debug!("Cursor creation without valid pos")
-        }
-        let mut cursor = RTCursor {
-            index: pos,
-            ordering,
-            page,
-            ended: false,
-            next_page: bz.get_guard(match ordering {
-                Ordering::Forward => &next,
-                Ordering::Backward => &prev,
-            }),
-        };
-
-        match ordering {
-            Ordering::Forward => {
-                if pos >= node.len {
-                    cursor.next();
-                }
-            }
-            Ordering::Backward => {}
-        }
-
-        return cursor;
+    fn new(pos: usize, id: &Id, ordering: Ordering) -> RTCursor {
+        unimplemented!()
     }
     fn boxed(self) -> Box<IndexCursor> {
         box self
@@ -556,58 +520,54 @@ impl RTCursor {
 
 impl IndexCursor for RTCursor {
     fn next(&mut self) -> bool {
-        debug!(
-            "Next id with index: {}, length: {}",
-            self.index + 1,
-            self.page.len
-        );
-        match self.ordering {
-            Ordering::Forward => {
-                if self.index + 1 >= self.page.len {
-                    // next page
-                    if let Some(next_page) = self.next_page.clone() {
-                        debug!("Shifting page forward");
-                        self.next_page = self.bz.get_guard(&next_page.next);
-                        self.index = 0;
-                        self.page = next_page;
-                    } else {
-                        debug!("iterated to end");
-                        self.ended = true;
-                        return false;
-                    }
-                } else {
-                    self.index += 1;
-                    debug!("Advancing cursor to index {}", self.index);
-                }
-            }
-            Ordering::Backward => {
-                if self.index == 0 {
-                    // next page
-                    if let Some(next_page) = self.next_page.clone() {
-                        debug!("Shifting page backward");
-                        self.next_page = self.bz.get_guard(&next_page.prev);
-                        self.index = next_page.len - 1;
-                        self.page = next_page;
-                    } else {
-                        debug!("iterated to end");
-                        self.ended = true;
-                        return false;
-                    }
-                } else {
-                    self.index -= 1;
-                    debug!("Advancing cursor to index {}", self.index);
-                }
-            }
-        }
+//        debug!(
+//            "Next id with index: {}, length: {}",
+//            self.index + 1,
+//            self.page.len
+//        );
+//        match self.ordering {
+//            Ordering::Forward => {
+//                if self.index + 1 >= self.page.len {
+//                    // next page
+//                    if let Some(next_page) = self.next_page.clone() {
+//                        debug!("Shifting page forward");
+//                        self.next_page = self.bz.get_guard(&next_page.next);
+//                        self.index = 0;
+//                        self.page = next_page;
+//                    } else {
+//                        debug!("iterated to end");
+//                        self.ended = true;
+//                        return false;
+//                    }
+//                } else {
+//                    self.index += 1;
+//                    debug!("Advancing cursor to index {}", self.index);
+//                }
+//            }
+//            Ordering::Backward => {
+//                if self.index == 0 {
+//                    // next page
+//                    if let Some(next_page) = self.next_page.clone() {
+//                        debug!("Shifting page backward");
+//                        self.next_page = self.bz.get_guard(&next_page.prev);
+//                        self.index = next_page.len - 1;
+//                        self.page = next_page;
+//                    } else {
+//                        debug!("iterated to end");
+//                        self.ended = true;
+//                        return false;
+//                    }
+//                } else {
+//                    self.index -= 1;
+//                    debug!("Advancing cursor to index {}", self.index);
+//                }
+//            }
+//        }
         return true;
     }
 
     fn current(&self) -> Option<&EntryKey> {
-        if !self.ended && self.index >= 0 && self.index < self.page.len {
-            Some(&self.page.keys[self.index])
-        } else {
-            None
-        }
+        unimplemented!()
     }
 }
 
@@ -620,7 +580,7 @@ fn insert_into_split<T, S>(
     pos: usize,
 ) where
     S: Slice<Item = T> + BTreeSlice<T>,
-    T: Default + Debug,
+    T: Default,
 {
     debug!(
         "insert into split left len {}, right len {}, pos {}",
@@ -644,16 +604,7 @@ pub struct BPlusTreeMergingPage {
 
 impl MergingPage for BPlusTreeMergingPage {
     fn next(&self) -> Box<MergingPage> {
-        let next_id = &self.page.prev;
-        debug_assert_ne!(next_id, &Id::unit_id());
-        self.pages.borrow_mut().push(*next_id);
-        let next_page = self.mapper.lock().get_or_fetch(next_id).unwrap().read();
-        next_page.merging.store(true, Relaxed);
-        box BPlusTreeMergingPage {
-            page: next_page,
-            mapper: self.mapper.clone(),
-            pages: self.pages.clone(),
-        }
+        unimplemented!()
     }
 
     fn keys(&self) -> &[EntryKey] {
@@ -663,28 +614,7 @@ impl MergingPage for BPlusTreeMergingPage {
 
 impl MergeableTree for BPlusTree {
     fn prepare_level_merge(&self) -> Box<MergingTreeGuard> {
-        let (txn, (last_node, last_node_ref)) = self
-            .stm
-            .transaction_optional_commit(
-                |txn| {
-                    let mut tree_txn = TreeTxn::new(self, txn);
-                    let last_node_ref = tree_txn.last_node(self.root)?.unwrap();
-                    let mut txn = tree_txn.txn;
-                    txn.exclusive(last_node_ref);
-                    let node = txn.read::<Node>(last_node_ref)?.unwrap();
-                    Ok((node, last_node_ref))
-                },
-                false,
-            )
-            .unwrap();
-        box BPlusTreeMergingTreeGuard {
-            cache: self.ext_node_cache.clone(),
-            txn: RefCell::new(txn),
-            storage: self.storage.clone(),
-            pages: Rc::new(RefCell::new(vec![])),
-            last_node,
-            last_node_ref,
-        }
+        unimplemented!()
     }
 
     fn elements(&self) -> usize {
@@ -703,34 +633,11 @@ pub struct BPlusTreeMergingTreeGuard {
 
 impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
     fn remove_pages(&self, pages: &[&[EntryKey]]) {
-        let mut last_node_owned = (&*self.last_node).clone();
-        {
-            let mut innode = last_node_owned.innode_mut();
-            innode.len -= pages.len();
-        }
-        for page_id in self.pages.borrow().iter() {
-            self.storage.remove_cell(*page_id).wait();
-        }
-        unsafe {
-            self.txn
-                .borrow_mut()
-                .force_update(self.last_node_ref, last_node_owned);
-        }
+        unimplemented!()
     }
 
     fn last_page(&self) -> Box<MergingPage> {
-        let innode = self.last_node.innode();
-        let last_ext_ref = innode.ptrs.last().unwrap();
-        let mut txn_mutable = self.txn.borrow_mut();
-        let last_node = txn_mutable.read::<Node>(*last_ext_ref).unwrap().unwrap();
-        let last_ext_id = last_node.ext_id();
-        let last_extnode = self.cache.lock().get_or_fetch(&last_ext_id).unwrap().read();
-        self.pages.borrow_mut().push(last_ext_id);
-        box BPlusTreeMergingPage {
-            page: last_extnode,
-            mapper: self.cache.clone(),
-            pages: self.pages.clone(),
-        }
+        unimplemented!()
     }
 }
 
@@ -748,7 +655,7 @@ macro_rules! impl_btree_slice {
 }
 
 impl_btree_slice!(EntryKeySlice, EntryKey, NUM_KEYS);
-impl_btree_slice!(NodePointerSlice, TxnValRef, NUM_PTRS);
+impl_btree_slice!(NodePtrCellSlice, NodeCellRef, NUM_PTRS);
 
 struct RemoveStatus {
     item_found: bool,
@@ -763,7 +670,7 @@ impl Default for Node {
 
 trait BTreeSlice<T>: Sized + Slice<Item = T>
 where
-    T: Default + Debug,
+    T: Default,
 {
     fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
         let mut right_slice = Self::init();
@@ -782,14 +689,13 @@ where
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
         debug_assert!(
             pos <= *len,
-            "pos {:?} larger or equals to len {:?}, item: {:?}",
+            "pos {} larger or equals to len {}",
             pos,
-            len,
-            item
+            len
         );
         debug!(
-            "insert into slice, pos: {}, len {}, item {:?}",
-            pos, len, item
+            "insert into slice, pos: {}, len {}",
+            pos, len
         );
         let mut slice = self.as_slice();
         if *len > 0 {
@@ -798,7 +704,7 @@ where
                 slice.swap(i, i + 1);
             }
         }
-        debug!("setting item {:?} at {} for insertion", item, pos);
+        debug!("setting item at {} for insertion", pos);
         *len += 1;
         slice[pos] = item;
     }

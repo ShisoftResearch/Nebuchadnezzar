@@ -31,7 +31,7 @@ pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
 }
 
 pub trait Slice: Sized {
-    type Item: Default + Debug;
+    type Item: Default;
 
     fn as_slice(&mut self) -> &mut [Self::Item];
     fn as_slice_immute(&self) -> &[Self::Item] {

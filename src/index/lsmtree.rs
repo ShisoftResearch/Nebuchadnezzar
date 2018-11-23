@@ -103,7 +103,7 @@ impl LSMTree {
             Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
             Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
         };
-        let mut cursors = vec![self.level_m.seek(&key, ordering).unwrap()];
+        let mut cursors: Vec<Box<Cursor>> = vec![box self.level_m.seek(&key, ordering).unwrap()];
         for tree in &self.trees {
             cursors.push(tree.seek(&key, ordering));
         }

@@ -24,6 +24,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::cell::UnsafeCell;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, Arc<RwLock<ExtNode>>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -41,7 +42,6 @@ lazy_static! {
     static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
 }
 
-#[derive(Clone)]
 pub struct ExtNode {
     pub id: Id,
     pub keys: EntryKeySlice,
@@ -60,7 +60,7 @@ pub struct ExtNodeSplit {
 impl ExtNode {
     pub fn new(id: Id) -> ExtNode {
         ExtNode {
-            id: *id,
+            id,
             keys: EntryKeySlice::init(),
             next: Node::none_ref(),
             prev: Node::none_ref(),
@@ -69,38 +69,14 @@ impl ExtNode {
             cc: AtomicUsize::new(0)
         }
     }
-    pub fn from_cell(cell: Cell) -> Self {
-        let cell_id = cell.id();
-        let cell_version = cell.header.version;
-        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
-        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
-        let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_len = keys.len().unwrap();
-        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
-            array
-        } else {
-            panic!()
-        };
-        let mut key_slice = EntryKeySlice::init();
-        let mut key_count = 0;
-        for (i, key_val) in keys_array.iter().enumerate() {
-            key_slice[i] = EntryKey::from(key_val.as_slice());
-            key_count += 1;
-        }
-        ExtNode {
-            id: cell_id,
-            keys: key_slice,
-            next: *next,
-            prev: *prev,
-            len: key_count,
-            dirty: false,
-            cc: AtomicUsize::new(0),
-        }
-    }
+
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        value[*NEXT_PAGE_KEY_HASH] = Value::Id(*self.next.get().ext_id());
-        value[*PREV_PAGE_KEY_HASH] = Value::Id(*self.prev.get().ext_id());
+        let (prev_id, next_id) = unsafe {
+            ((&*self.next.get()).ext_id(), (&*self.prev.get()).ext_id())
+        };
+        value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
+        value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
         value[*KEYS_KEY_HASH] = self.keys[..self.len]
             .iter()
             .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
@@ -120,7 +96,7 @@ impl ExtNode {
         pos: usize,
         tree: &BPlusTree,
         self_ref: NodeCellRef,
-    ) -> Option<(Node, Option<EntryKey>)> {
+    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
         let cached_len = cached.len;
         debug_assert!(cached_len <= NUM_KEYS);
         if cached_len == NUM_KEYS {
@@ -162,12 +138,11 @@ impl ExtNode {
             );
             cached.next = new_page_id;
             cached.len = keys_1_len;
-            let node_2 = Node::External(box new_page_id);
             debug!(
                 "Split to left len {}, right len {}",
                 cached.len, extnode_2.len
             );
-            bz.new_node(extnode_2);
+            let node_2 = Arc::new(UnsafeCell::new(Node::External(box extnode_2)));
             return Some((node_2, None));
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
@@ -196,10 +171,10 @@ impl ExtNode {
             debug!("{}\t- {:?}", i, self.keys[i]);
         }
     }
-    pub fn remove_node(&self) {
+    pub unsafe fn remove_node(&self) {
         let id = &self.id;
-        let mut prev = self.prev.get();
-        let mut next = self.next.get();
+        let mut prev = &mut *self.prev.get();
+        let mut next = &mut *self.next.get();
         debug_assert_ne!(id, &Id::unit_id());
         if !prev.is_none() {
             let mut prev_node = prev.extnode_mut();
@@ -212,9 +187,9 @@ impl ExtNode {
     }
 }
 
-pub fn rearrange_empty_extnode(node: &ExtNode) -> Id {
-    let mut prev = node.prev.get();
-    let mut next = node.next.get();
+pub unsafe fn rearrange_empty_extnode(node: &ExtNode) -> Id {
+    let mut prev = &mut *node.prev.get();
+    let mut next = &mut *node.next.get();
     if !prev.is_none() {
         let mut prev_node = prev.extnode_mut();
         prev_node.next = node.next.clone();
@@ -244,5 +219,59 @@ pub fn page_schema() -> Schema {
                 Field::new(KEYS_FIELD, type_id_of(Type::SmallBytes), false, true, None),
             ]),
         ),
+    }
+}
+
+pub struct NodeCache {
+    nodes: HashMap<Id, NodeCellRef>,
+    storage: Arc<AsyncClient>
+}
+
+impl NodeCache {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+        NodeCache {
+            nodes: HashMap::new(),
+            storage: neb_client.clone()
+        }
+    }
+
+    pub fn get(&mut self, id: &Id) -> NodeCellRef {
+        if id.is_unit_id() {
+            return Arc::new(UnsafeCell::new(Node::None));
+        }
+
+        self.nodes.entry(*id).or_insert_with(|| {
+            let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
+            Arc::new(UnsafeCell::new(Node::External(box self.extnode_from_cell(cell))))
+        }).clone()
+    }
+
+    fn extnode_from_cell(&mut self, cell: Cell) -> ExtNode {
+        let cell_id = cell.id();
+        let cell_version = cell.header.version;
+        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
+        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
+        let keys = &cell.data[*KEYS_KEY_HASH];
+        let keys_len = keys.len().unwrap();
+        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+            array
+        } else {
+            panic!()
+        };
+        let mut key_slice = EntryKeySlice::init();
+        let mut key_count = 0;
+        for (i, key_val) in keys_array.iter().enumerate() {
+            key_slice[i] = EntryKey::from(key_val.as_slice());
+            key_count += 1;
+        }
+        ExtNode {
+            id: cell_id,
+            keys: key_slice,
+            next: self.get(next),
+            prev: self.get(prev),
+            len: key_count,
+            dirty: false,
+            cc: AtomicUsize::new(0),
+        }
     }
 }

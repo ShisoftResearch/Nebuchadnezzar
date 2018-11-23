@@ -10,7 +10,6 @@ use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
 use std::cell::UnsafeCell;
 
-#[derive(Clone)]
 pub struct InNode {
     pub keys: EntryKeySlice,
     pub ptrs: NodePtrCellSlice,
@@ -153,14 +152,14 @@ impl InNode {
             Ok(pointer_pos + 1)
         }
     }
-    pub fn merge_children(
+    pub unsafe fn merge_children(
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
     ) -> Result<(), TxnErr> {
-        let mut left_node = self.ptrs[left_ptr_pos].get();
-        let mut right_node = self.ptrs[right_ptr_pos].get();
-        debug_assert_ne!(left_node, right_node);
+        let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
+        let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
+        debug_assert_ne!(left_node.ext_id(), right_node.ext_id());
         let left_len = left_node.len();
         let right_len = right_node.len();
         let mut merged_len = 0;
@@ -210,14 +209,14 @@ impl InNode {
         }
         self.len += right.len + 1;
     }
-    pub fn relocate_children(
+    pub unsafe fn relocate_children(
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-    ) -> Result<(), TxnErr> {
+    ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
-        let mut left_node = self.ptrs[left_ptr_pos].get();
-        let mut right_node = self.ptrs[right_ptr_pos].get();
+        let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
+        let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
         let mut new_right_node_key = Default::default();
         let half_full_pos = (left_node.len() + right_node.len()) / 2;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
@@ -346,7 +345,5 @@ impl InNode {
             right_key_pos, new_right_node_key
         );
         self.keys[right_key_pos] = new_right_node_key;
-
-        Ok(())
     }
 }
