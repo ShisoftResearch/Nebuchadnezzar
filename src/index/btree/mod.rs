@@ -37,6 +37,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::cell::UnsafeCell;
 
 mod external;
 mod internal;
@@ -46,7 +47,8 @@ const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
 type EntryKeySlice = [EntryKey; NUM_KEYS];
-type NodePointerSlice = [TxnValRef; NUM_PTRS];
+type NodeCellRef = Arc<UnsafeCell<Node>>;
+type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 
 // B-Tree is the memtable for the LSM-Tree
 // Items can be added and removed in real-time
@@ -54,17 +56,14 @@ type NodePointerSlice = [TxnValRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    root: TxnValRef,
-    ext_node_cache: Arc<ExtNodeCacheMap>,
-    stm: TxnManager,
+    root: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
-    merging: RwLock<Option<TxnValRef>>,
 }
 
 #[derive(Clone)]
 enum Node {
-    External(Box<Id>),
+    External(Box<ExtNode>),
     Internal(Box<InNode>),
     None,
 }
@@ -76,9 +75,8 @@ enum Node {
 pub struct RTCursor {
     index: usize,
     ordering: Ordering,
-    page: CacheGuardHolder,
-    next_page: Option<CacheGuardHolder>,
-    bz: Rc<CacheBufferZone>,
+    page: NodeCellRef,
+    next_page: Option<NodeCellRef>,
     ended: bool,
 }
 
@@ -88,223 +86,18 @@ impl Default for Ordering {
     }
 }
 
-pub struct TreeTxn<'a> {
-    tree: &'a BPlusTree,
-    bz: Rc<CacheBufferZone>,
-    len: Arc<AtomicUsize>,
-    txn: &'a mut Txn,
-}
-
 impl BPlusTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: Default::default(),
-            stm: TxnManager::new(),
+            root: Arc::new(UnsafeCell::new(Node::None)),
             storage: neb_client.clone(),
-            len: Arc::new(AtomicUsize::new(0)),
-            merging: RwLock::new(None),
-            ext_node_cache: Arc::new(Mutex::new(LRUCache::new(
-                CACHE_SIZE,
-                move |id| {
-                    debug!("Reading page to cache {:?}", id);
-                    neb_client_1
-                        .read_cell(*id)
-                        .wait()
-                        .unwrap()
-                        .map(|cell| Arc::new(RwLock::new(ExtNode::from_cell(cell))))
-                        .ok()
-                },
-                move |id, value| {
-                    debug!("Flush page to cache {:?}", &id);
-                    Self::flush_item(&neb_client_2, &value);
-                },
-            ))),
+            len: Arc::new(AtomicUsize::new(0))
         };
-        {
-            let actual_tree_root = tree.new_ext_cached_node();
-            let root_ref = tree.stm.with_value(actual_tree_root);
-            tree.root = root_ref;
-        }
+        let root_id = tree.new_page_id();
+        tree.root = Arc::new(UnsafeCell::new(Node::new_external(root_id)));
         return tree;
-    }
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Result<Box<IndexCursor>, TxnErr> {
-        debug!("searching for {:?}", key);
-        self.transaction(|txn| txn.seek(key, ordering))
-            .map(|c| c.boxed())
-    }
-
-    pub fn insert(&self, key: &EntryKey) -> Result<(), TxnErr> {
-        debug!("inserting {:?}", &key);
-        self.transaction(|txn| txn.insert(key))
-    }
-
-    pub fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
-        debug!("removing {:?}", &key);
-        self.transaction(|txn| txn.remove(key))
-    }
-
-    pub fn transaction<R, F>(&self, func: F) -> Result<R, TxnErr>
-    where
-        F: Fn(&mut TreeTxn) -> Result<R, TxnErr>,
-    {
-        self.stm
-            .transaction(|txn| {
-                let mut t_txn = TreeTxn::new(self, txn);
-                let res = func(&mut t_txn)?;
-                Ok((res, t_txn.bz))
-            })
-            .map(|(res, mut bz)| {
-                bz.flush();
-                res
-            })
-    }
-
-    pub fn flush_all(&self) {
-        for (_, value) in self.ext_node_cache.lock().iter() {
-            Self::flush_item(&self.storage, value)
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len.load(Relaxed)
-    }
-
-    fn flush_item(client: &Arc<AsyncClient>, value: &Arc<RwLock<ExtNode>>) {
-        let cache = value.read();
-        if cache.dirty {
-            let cell = cache.to_cell();
-            client.upsert_cell(cell).wait().unwrap();
-        }
-    }
-
-    fn new_page_id(&self) -> Id {
-        // TODO: achieve locality
-        Id::rand()
-    }
-    fn new_ext_cached_node(&self) -> Node {
-        let id = self.new_page_id();
-        let mut node = ExtNode::new(&id);
-        node.dirty = true;
-        self.ext_node_cache
-            .lock()
-            .insert(id, Arc::new(RwLock::new(node)));
-        debug!("New page id is: {:?}", id);
-        return Node::External(box id);
-    }
-}
-
-impl Node {
-    fn search(&self, key: &EntryKey, bz: &CacheBufferZone) -> usize {
-        let len = self.len(bz);
-        if self.is_ext() {
-            self.extnode(bz).keys[..len]
-                .binary_search(key)
-                .unwrap_or_else(|i| i)
-        } else {
-            self.innode().keys[..len]
-                .binary_search(key)
-                .map(|i| i + 1)
-                .unwrap_or_else(|i| i)
-        }
-    }
-    fn warm_cache_for_write_intention(&self, bz: &CacheBufferZone) {
-        if self.is_ext() {
-            self.extnode_mut(bz);
-        }
-    }
-    fn insert(
-        &mut self,
-        key: EntryKey,
-        ptr: Option<TxnValRef>,
-        pos: usize,
-        tree: &BPlusTree,
-        bz: &CacheBufferZone,
-    ) -> Option<(Node, Option<EntryKey>)> {
-        if let &mut Node::External(ref id) = self {
-            debug!("inserting to external node at: {:?}, key {:?}", pos, key);
-            self.extnode_mut(bz).insert(key, pos, tree, bz)
-        } else {
-            debug!("inserting to internal node at: {:?}, key {:?}", pos, key);
-            self.innode_mut().insert(key, ptr, pos)
-        }
-    }
-    fn remove(&mut self, pos: usize, bz: &CacheBufferZone) {
-        if let &mut Node::External(ref id) = self {
-            self.extnode_mut(bz).remove_at(pos)
-        } else {
-            self.innode_mut().remove_at(pos)
-        }
-    }
-    fn is_ext(&self) -> bool {
-        match self {
-            &Node::External(_) => true,
-            &Node::Internal(_) => false,
-            &Node::None => panic!(),
-        }
-    }
-    fn first_key(&self, bz: &CacheBufferZone) -> EntryKey {
-        if self.is_ext() {
-            self.extnode(bz).keys[0].to_owned()
-        } else {
-            self.innode().keys[0].to_owned()
-        }
-    }
-    fn len(&self, bz: &CacheBufferZone) -> usize {
-        if self.is_ext() {
-            self.extnode(bz).len
-        } else {
-            self.innode().len
-        }
-    }
-    fn is_half_full(&self, bz: &CacheBufferZone) -> bool {
-        self.len(bz) >= NUM_KEYS / 2
-    }
-    fn cannot_merge(&self, bz: &CacheBufferZone) -> bool {
-        self.len(bz) > NUM_KEYS / 2
-    }
-    fn extnode_mut<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRefMut<'a> {
-        match self {
-            &Node::External(ref id) => bz.get_for_mut(id),
-            _ => unreachable!(),
-        }
-    }
-    fn innode_mut(&mut self) -> &mut InNode {
-        match self {
-            &mut Node::Internal(ref mut n) => n,
-            _ => unreachable!(),
-        }
-    }
-    fn extnode<'a>(&self, bz: &'a CacheBufferZone) -> RcNodeRef<'a> {
-        match self {
-            &Node::External(ref id) => bz.get(id),
-            _ => unreachable!(),
-        }
-    }
-    fn ext_id(&self) -> Id {
-        if let &Node::External(ref id) = self {
-            **id
-        } else {
-            panic!()
-        }
-    }
-    fn innode(&self) -> &InNode {
-        match self {
-            &Node::Internal(ref n) => n,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl<'a> TreeTxn<'a> {
-    fn new(tree: &'a BPlusTree, txn: &'a mut Txn) -> TreeTxn<'a> {
-        TreeTxn {
-            bz: Rc::new(CacheBufferZone::new(&tree.ext_node_cache, &tree.storage)),
-            len: tree.len.clone(),
-            tree,
-            txn,
-        }
     }
 
     pub fn seek(&mut self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
@@ -335,43 +128,20 @@ impl<'a> TreeTxn<'a> {
 
     fn search(
         &mut self,
-        node: TxnValRef,
+        node: &NodeCellRef,
         key: &EntryKey,
         ordering: Ordering,
     ) -> Result<RTCursor, TxnErr> {
         debug!("searching for {:?} at {:?}", key, node);
-        let node = self.txn.read::<Node>(node)?.unwrap();
-        let pos = node.search(key, &mut self.bz);
+        let pos = node.search(key);
         if node.is_ext() {
             debug!("search in external for {:?}", key);
             Ok(RTCursor::new(pos, &node.ext_id(), &self.bz, ordering))
         } else if let Node::Internal(ref n) = *node {
-            let next_node_ref = n.pointers[pos];
+            let next_node_ref = n.ptrs[pos];
             self.search(next_node_ref, key, ordering)
         } else {
             unreachable!()
-        }
-    }
-    fn last_node(&mut self, node_ref: TxnValRef) -> Result<Option<TxnValRef>, TxnErr> {
-        let node = self.txn.read::<Node>(node_ref)?.unwrap();
-        if node.is_ext() {
-            return Ok(None);
-        } else if let Node::Internal(ref n) = *node {
-            let sub_level = self.last_node(*n.pointers.last().unwrap())?;
-            if sub_level.is_none() {
-                return Ok(Some(node_ref));
-            } else {
-                return Ok(sub_level);
-            }
-        } else {
-            unreachable!()
-        }
-    }
-
-    fn check_merging(&self, node: TxnValRef) -> Result<(), TxnErr> {
-        match &*self.tree.merging.read() {
-            &Some(r) if r == node => Err(TxnErr::NotRealizable),
-            _ => Ok(()),
         }
     }
 
@@ -379,19 +149,21 @@ impl<'a> TreeTxn<'a> {
         let root_ref = self.tree.root;
         if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
             debug!("split root with pivot key {:?}", pivotKey);
-            let first_key = new_node.first_key(&mut self.bz);
+            let first_key = new_node.first_key();
             let new_node_ref = self.txn.new_value(new_node);
             let pivot = pivotKey.unwrap_or_else(|| first_key);
             let mut new_in_root = InNode {
                 keys: make_array!(NUM_KEYS, Default::default()),
-                pointers: make_array!(NUM_PTRS, Default::default()),
+                ptrs: make_array!(NUM_PTRS, Default::default()),
+                right_ptr: Arc::new(UnsafeCell::new(Node::None)),
+                cc: AtomicUsize::new(0),
                 len: 1,
             };
             let old_root = self.txn.read_owned::<Node>(self.tree.root)?.unwrap();
             let old_root_ref = self.txn.new_value(old_root);
             new_in_root.keys[0] = pivot;
-            new_in_root.pointers[0] = old_root_ref;
-            new_in_root.pointers[1] = new_node_ref;
+            new_in_root.ptrs[0] = old_root_ref;
+            new_in_root.ptrs[1] = new_node_ref;
             let new_root = Node::Internal(box new_in_root);
             self.txn.update(self.tree.root, new_root);
         }
@@ -401,15 +173,14 @@ impl<'a> TreeTxn<'a> {
         });
         Ok(())
     }
+
     fn insert_to_node(
         &mut self,
-        node: TxnValRef,
+        node: &NodeCellRef,
         key: EntryKey,
     ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
         self.check_merging(node)?;
-        let ref_node = self.txn.read::<Node>(node)?.unwrap();
-        ref_node.warm_cache_for_write_intention(&mut self.bz);
-        let pos = ref_node.search(&key, &mut self.bz);
+        let pos = ref_node.search(&key);
         debug!(
             "insert to node: {:?}, len {}, pos: {}, external: {}",
             node,
@@ -430,7 +201,7 @@ impl<'a> TreeTxn<'a> {
                 return Ok(node.insert(key, pos, self.tree, &*self.bz));
             }
             &Node::Internal(ref n) => {
-                let next_node_ref = n.pointers[pos];
+                let next_node_ref = n.ptrs[pos];
                 debug!(
                     "insert into internal at {}, has keys {}, ref {:?}",
                     pos, n.len, next_node_ref
@@ -447,7 +218,7 @@ impl<'a> TreeTxn<'a> {
                 );
                 debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
                 let pivot = pivot_key.unwrap_or_else(|| {
-                    let first_key = new_node.first_key(&mut self.bz);
+                    let first_key = new_node.first_key();
                     debug_assert_ne!(first_key.len(), 0);
                     first_key
                 });
@@ -485,16 +256,16 @@ impl<'a> TreeTxn<'a> {
             && removed.removed
             && !root_node.is_ext()
             && root_node.len(&mut self.bz) == 0
-        {
-            // When root is external and have no keys but one pointer will take the only sub level
-            // pointer node as the new root node.
-            // It is not possible to change the root reference so the sub level node will be cloned
-            // and removed. Its clone will be used as the new root node.
-            let new_root_ref = root_node.innode().pointers[0];
-            let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
-            self.txn.update(root, new_root_cloned);
-            self.txn.delete(new_root_ref);
-        }
+            {
+                // When root is external and have no keys but one pointer will take the only sub level
+                // pointer node as the new root node.
+                // It is not possible to change the root reference so the sub level node will be cloned
+                // and removed. Its clone will be used as the new root node.
+                let new_root_ref = root_node.innode().ptrs[0];
+                let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
+                self.txn.update(root, new_root_cloned);
+                self.txn.delete(new_root_ref);
+            }
         if removed.item_found {
             let len_counter = self.len.clone();
             self.txn.defer(move || {
@@ -515,11 +286,11 @@ impl<'a> TreeTxn<'a> {
         node_ref.warm_cache_for_write_intention(&mut self.bz);
         let pos = node_ref.search(key, &mut self.bz);;
         if let Node::Internal(n) = &*node_ref {
-            let mut status = self.remove_from_node(n.pointers[pos], key)?;
+            let mut status = self.remove_from_node(n.ptrs[pos], key)?;
             if !status.removed {
                 return Ok(status);
             }
-            let sub_node_ref = n.pointers[pos];
+            let sub_node_ref = n.ptrs[pos];
             let sub_node = self.txn.read::<Node>(sub_node_ref)?.unwrap();
             let mut current_node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
             {
@@ -536,10 +307,10 @@ impl<'a> TreeTxn<'a> {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
                         let sub_innode = sub_node.innode();
-                        let sub_sub_node_ref = sub_innode.pointers[0];
+                        let sub_sub_node_ref = sub_innode.ptrs[0];
                         debug_assert!(sub_innode.len == 0);
                         debug_assert!(self.txn.read::<Node>(sub_sub_node_ref).unwrap().is_some());
-                        current_innode.pointers[pos] = sub_sub_node_ref;
+                        current_innode.ptrs[pos] = sub_sub_node_ref;
                         status.removed = false;
                     }
                 } else if !sub_node.is_half_full(&mut self.bz) && current_innode.len > 1 {
@@ -549,7 +320,7 @@ impl<'a> TreeTxn<'a> {
                         current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
-                    let cand_node = self.txn.read::<Node>(n.pointers[cand_ptr_pos])?.unwrap();
+                    let cand_node = self.txn.read::<Node>(n.ptrs[cand_ptr_pos])?.unwrap();
                     debug_assert_eq!(cand_node.is_ext(), sub_node.is_ext());
                     if cand_node.is_ext() {
                         cand_node.extnode_mut(&mut self.bz);
@@ -608,6 +379,137 @@ impl<'a> TreeTxn<'a> {
             unreachable!()
         }
     }
+
+    pub fn flush_all(&self) {
+        for (_, value) in self.ext_node_cache.lock().iter() {
+            Self::flush_item(&self.storage, value)
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len.load(Relaxed)
+    }
+
+    fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
+        let cache = value.read();
+        if cache.dirty {
+            let cell = cache.to_cell();
+            client.upsert_cell(cell).wait().unwrap();
+        }
+    }
+
+    fn new_page_id(&self) -> Id {
+        // TODO: achieve locality
+        Id::rand()
+    }
+}
+
+impl Node {
+    pub fn none_ref() -> NodeCellRef {
+        Arc::new(UnsafeCell::new(Node::None))
+    }
+    pub fn new_external(id: Id) -> Node {
+        Node::External(box ExtNode::new(id))
+    }
+    pub fn is_none(&self) -> bool {
+        match self {
+            &Node::None => true,
+            _ => false
+        }
+    }
+    fn search(&self, key: &EntryKey, bz: &CacheBufferZone) -> usize {
+        let len = self.len();
+        if self.is_ext() {
+            self.extnode().keys[..len]
+                .binary_search(key)
+                .unwrap_or_else(|i| i)
+        } else {
+            self.innode().keys[..len]
+                .binary_search(key)
+                .map(|i| i + 1)
+                .unwrap_or_else(|i| i)
+        }
+    }
+
+    fn insert(
+        &mut self,
+        key: EntryKey,
+        ptr: Option<NodeCellRef>,
+        pos: usize,
+    ) -> Option<(Node, Option<EntryKey>)> {
+        if let &mut Node::External(ref id) = self {
+            debug!("inserting to external node at: {:?}, key {:?}", pos, key);
+            self.extnode_mut().insert(key, pos, tree)
+        } else {
+            debug!("inserting to internal node at: {:?}, key {:?}", pos, key);
+            self.innode_mut().insert(key, ptr, pos)
+        }
+    }
+    fn remove(&mut self, pos: usize) {
+        if let &mut Node::External(ref id) = self {
+            self.extnode_mut().remove_at(pos)
+        } else {
+            self.innode_mut().remove_at(pos)
+        }
+    }
+    fn is_ext(&self) -> bool {
+        match self {
+            &Node::External(_) => true,
+            &Node::Internal(_) => false,
+            &Node::None => panic!(),
+        }
+    }
+    fn first_key(&self) -> EntryKey {
+        if self.is_ext() {
+            self.extnode().keys[0].to_owned()
+        } else {
+            self.innode().keys[0].to_owned()
+        }
+    }
+    fn len(&self) -> usize {
+        if self.is_ext() {
+            self.extnode().len
+        } else {
+            self.innode().len
+        }
+    }
+    fn is_half_full(&self) -> bool {
+        self.len() >= NUM_KEYS / 2
+    }
+    fn cannot_merge(&self) -> bool {
+        self.len() > NUM_KEYS / 2
+    }
+    fn extnode_mut(&mut self) -> &mut ExtNode {
+        match self {
+            &Node::External(ref mut node) => &mut *node,
+            _ => unreachable!(),
+        }
+    }
+    fn innode_mut(&mut self) -> &mut InNode {
+        match self {
+            &mut Node::Internal(ref mut n) => n,
+            _ => unreachable!(),
+        }
+    }
+    fn extnode(&self) -> &ExtNode {
+        match self {
+            &Node::External(ref node) => node,
+            _ => unreachable!(),
+        }
+    }
+    fn ext_id(&self) -> &Id {
+        if let &Node::External(ref node) = self {
+            &node.id
+        } else {
+            panic!()
+        }
+    }
+    fn innode(&self) -> &InNode {
+        match self {
+            &Node::Internal(ref n) => n,
+            _ => unreachable!(),
+        }
+    }
 }
 
 impl RTCursor {
@@ -629,7 +531,6 @@ impl RTCursor {
             index: pos,
             ordering,
             page,
-            bz: bz.clone(),
             ended: false,
             next_page: bz.get_guard(match ordering {
                 Ordering::Forward => &next,
@@ -819,7 +720,7 @@ impl MergingTreeGuard for BPlusTreeMergingTreeGuard {
 
     fn last_page(&self) -> Box<MergingPage> {
         let innode = self.last_node.innode();
-        let last_ext_ref = innode.pointers.last().unwrap();
+        let last_ext_ref = innode.ptrs.last().unwrap();
         let mut txn_mutable = self.txn.borrow_mut();
         let last_node = txn_mutable.read::<Node>(*last_ext_ref).unwrap().unwrap();
         let last_ext_id = last_node.ext_id();
@@ -1001,7 +902,7 @@ mod test {
             Node::Internal(innode) => {
                 let len = innode.len;
                 let nodes = innode
-                    .pointers
+                    .ptrs
                     .iter()
                     .take(len + 1)
                     .map(|node_ref| cascading_dump_node(tree, *node_ref, bz))

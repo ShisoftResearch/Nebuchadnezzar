@@ -6,11 +6,16 @@ use index::btree::Slice;
 use index::btree::*;
 use itertools::free::chain;
 use std::mem;
+use std::sync::atomic::AtomicPtr;
+use std::sync::Arc;
+use std::cell::UnsafeCell;
 
 #[derive(Clone)]
 pub struct InNode {
     pub keys: EntryKeySlice,
-    pub pointers: NodePointerSlice,
+    pub ptrs: NodePtrCellSlice,
+    pub right_ptr: NodeCellRef,
+    pub cc: AtomicUsize,
     pub len: usize,
 }
 
@@ -22,7 +27,7 @@ pub struct InNodeKeysSplit {
 }
 
 pub struct InNodePtrSplit {
-    pub ptrs_2: NodePointerSlice,
+    pub ptrs_2: NodePtrCellSlice,
 }
 
 impl InNode {
@@ -42,15 +47,15 @@ impl InNode {
             key_pos, n_key_len
         );
         self.keys.remove_at(key_pos, &mut n_key_len);
-        self.pointers.remove_at(ptr_pos, &mut n_ptr_len);
+        self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
         self.len = n_key_len;
     }
     pub fn insert(
         &mut self,
         key: EntryKey,
-        ptr: Option<TxnValRef>,
+        ptr: Option<NodeCellRef>,
         pos: usize,
-    ) -> Option<(Node, Option<EntryKey>)> {
+    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -91,7 +96,7 @@ impl InNode {
             };
             let ptr_split = {
                 debug!("insert into ptrs");
-                let mut ptrs_1 = &mut self.pointers;
+                let mut ptrs_1 = &mut self.ptrs;
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
@@ -111,16 +116,19 @@ impl InNode {
             let node_2 = InNode {
                 len: keys_split.keys_2_len,
                 keys: keys_split.keys_2,
-                pointers: ptr_split.ptrs_2,
+                ptrs: ptr_split.ptrs_2,
+                right_ptr: self.right_ptr.clone(),
+                cc: AtomicUsize::new(0)
             };
+            let node_2_ref = Arc::new(UnsafeCell::new(Node::Internal(box node_2)));
             self.len = keys_split.keys_1_len;
-            return Some((Node::Internal(box node_2), Some(keys_split.pivot_key)));
+            self.right_ptr = node_2_ref.clone();
+            return Some((node_2_ref, Some(keys_split.pivot_key)));
         } else {
             let mut new_node_len = node_len;
             let mut new_node_pointers = node_len + 1;
             self.keys.insert_at(key, pos, &mut new_node_len);
-            self.pointers
-                .insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
+            self.ptrs.insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
             self.len = new_node_len;
             return None;
         }
@@ -128,8 +136,6 @@ impl InNode {
     pub fn rebalance_candidate(
         &self,
         pointer_pos: usize,
-        txn: &mut Txn,
-        bz: &CacheBufferZone,
     ) -> Result<usize, TxnErr> {
         debug_assert!(pointer_pos <= self.len);
         debug!(
@@ -151,16 +157,12 @@ impl InNode {
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        txn: &mut Txn,
-        bz: &CacheBufferZone,
     ) -> Result<(), TxnErr> {
-        let left_ref = self.pointers[left_ptr_pos];
-        let right_ref = self.pointers[right_ptr_pos];
-        debug_assert_ne!(left_ref, right_ref);
-        let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
-        let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
-        let left_len = left_node.len(bz);
-        let right_len = right_node.len(bz);
+        let mut left_node = self.ptrs[left_ptr_pos].get();
+        let mut right_node = self.ptrs[right_ptr_pos].get();
+        debug_assert_ne!(left_node, right_node);
+        let left_len = left_node.len();
+        let right_len = right_node.len();
         let mut merged_len = 0;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
@@ -174,13 +176,13 @@ impl InNode {
             }
             txn.update(left_ref, left_node);
         } else {
-            let mut right_extnode = right_node.extnode_mut(bz);
+            let mut right_extnode = right_node.extnode_mut();
             {
-                let mut left_extnode = left_node.extnode_mut(bz);
+                let mut left_extnode = left_node.extnode_mut();
                 left_extnode.merge_with(&mut right_extnode);
                 merged_len = left_extnode.len;
             }
-            right_extnode.remove_node(bz);
+            right_extnode.remove_node();
         }
         self.remove_at(right_ptr_pos);
         debug!(
@@ -204,7 +206,7 @@ impl InNode {
             mem::swap(&mut self.keys[i], &mut right.keys[i - self_len - 1]);
         }
         for i in self_len + 1..new_len + 2 {
-            mem::swap(&mut self.pointers[i], &mut right.pointers[i - self_len - 1]);
+            mem::swap(&mut self.ptrs[i], &mut right.ptrs[i - self_len - 1]);
         }
         self.len += right.len + 1;
     }
@@ -212,16 +214,12 @@ impl InNode {
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        txn: &mut Txn,
-        bz: &CacheBufferZone,
     ) -> Result<(), TxnErr> {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
-        let left_ref = self.pointers[left_ptr_pos];
-        let right_ref = self.pointers[right_ptr_pos];
-        let mut left_node = txn.read_owned::<Node>(left_ref)?.unwrap();
-        let mut right_node = txn.read_owned::<Node>(right_ref)?.unwrap();
+        let mut left_node = self.ptrs[left_ptr_pos].get();
+        let mut right_node = self.ptrs[right_ptr_pos].get();
         let mut new_right_node_key = Default::default();
-        let half_full_pos = (left_node.len(bz) + right_node.len(bz)) / 2;
+        let half_full_pos = (left_node.len() + right_node.len()) / 2;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             // relocate internal sub nodes
@@ -236,10 +234,10 @@ impl InNode {
                 );
 
                 let mut new_left_keys = EntryKeySlice::init();
-                let mut new_left_ptrs = NodePointerSlice::init();
+                let mut new_left_ptrs = NodePtrCellSlice::init();
 
                 let mut new_right_keys = EntryKeySlice::init();
-                let mut new_right_ptrs = NodePointerSlice::init();
+                let mut new_right_ptrs = NodePtrCellSlice::init();
 
                 let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
                 let mut new_left_keys_len = 0;
@@ -267,8 +265,8 @@ impl InNode {
                 }
 
                 for (i, ptr) in chain(
-                    left_innode.pointers[..left_innode.len + 1].iter_mut(),
-                    right_innode.pointers[..right_innode.len + 1].iter_mut(),
+                    left_innode.ptrs[..left_innode.len + 1].iter_mut(),
+                    right_innode.ptrs[..right_innode.len + 1].iter_mut(),
                 )
                 .enumerate()
                 {
@@ -281,11 +279,11 @@ impl InNode {
                 }
 
                 left_innode.keys = new_left_keys;
-                left_innode.pointers = new_left_ptrs;
+                left_innode.ptrs = new_left_ptrs;
                 left_innode.len = new_left_keys_len;
 
                 right_innode.keys = new_right_keys;
-                right_innode.pointers = new_right_ptrs;
+                right_innode.ptrs = new_right_ptrs;
                 right_innode.len = new_right_keys_len;
 
                 debug!(
@@ -293,14 +291,11 @@ impl InNode {
                     left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
                 );
             }
-
-            txn.update(left_ref, left_node);
-            txn.update(right_ref, right_node);
         } else if left_node.is_ext() {
             // relocate external sub nodes
 
-            let mut left_extnode = left_node.extnode_mut(bz);
-            let mut right_extnode = right_node.extnode_mut(bz);
+            let mut left_extnode = left_node.extnode_mut();
+            let mut right_extnode = right_node.extnode_mut();
 
             debug!(
                 "Before relocation external children. left {}:{:?} right {}:{:?}",

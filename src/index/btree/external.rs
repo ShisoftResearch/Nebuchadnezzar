@@ -45,11 +45,11 @@ lazy_static! {
 pub struct ExtNode {
     pub id: Id,
     pub keys: EntryKeySlice,
-    pub next: Id,
-    pub prev: Id,
+    pub next: NodeCellRef,
+    pub prev: NodeCellRef,
     pub len: usize,
     pub dirty: bool,
-    pub merging: Arc<AtomicBool>,
+    pub cc: AtomicUsize
 }
 
 pub struct ExtNodeSplit {
@@ -58,15 +58,15 @@ pub struct ExtNodeSplit {
 }
 
 impl ExtNode {
-    pub fn new(id: &Id) -> ExtNode {
+    pub fn new(id: Id) -> ExtNode {
         ExtNode {
             id: *id,
             keys: EntryKeySlice::init(),
-            next: Id::unit_id(),
-            prev: Id::unit_id(),
+            next: Node::none_ref(),
+            prev: Node::none_ref(),
             len: 0,
             dirty: false,
-            merging: Arc::new(AtomicBool::new(false)),
+            cc: AtomicUsize::new(0)
         }
     }
     pub fn from_cell(cell: Cell) -> Self {
@@ -94,13 +94,13 @@ impl ExtNode {
             prev: *prev,
             len: key_count,
             dirty: false,
-            merging: Arc::new(AtomicBool::new(false)),
+            cc: AtomicUsize::new(0),
         }
     }
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        value[*NEXT_PAGE_KEY_HASH] = Value::Id(self.next);
-        value[*PREV_PAGE_KEY_HASH] = Value::Id(self.prev);
+        value[*NEXT_PAGE_KEY_HASH] = Value::Id(*self.next.get().ext_id());
+        value[*PREV_PAGE_KEY_HASH] = Value::Id(*self.prev.get().ext_id());
         value[*KEYS_KEY_HASH] = self.keys[..self.len]
             .iter()
             .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
@@ -119,9 +119,8 @@ impl ExtNode {
         key: EntryKey,
         pos: usize,
         tree: &BPlusTree,
-        bz: &CacheBufferZone,
+        self_ref: NodeCellRef,
     ) -> Option<(Node, Option<EntryKey>)> {
-        let mut cached = self;
         let cached_len = cached.len;
         debug_assert!(cached_len <= NUM_KEYS);
         if cached_len == NUM_KEYS {
@@ -129,8 +128,7 @@ impl ExtNode {
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             // cached.dump();
             let pivot = cached_len / 2;
-            let cached_next = *&cached.next;
-            let cached_id = *&cached.id;
+            let cached_next = &cached.next;
             let new_page_id = tree.new_page_id();
             let mut keys_1 = &mut cached.keys;
             let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
@@ -153,10 +151,10 @@ impl ExtNode {
                 id: new_page_id,
                 keys: keys_2,
                 next: cached_next,
-                prev: cached_id,
+                prev: self_ref,
                 len: keys_2_len,
                 dirty: true,
-                merging: Arc::new(AtomicBool::new(false)),
+                cc: AtomicUsize::new(0)
             };
             debug!(
                 "new node have next {:?} prev {:?}, current id {:?}",
@@ -198,240 +196,34 @@ impl ExtNode {
             debug!("{}\t- {:?}", i, self.keys[i]);
         }
     }
-    pub fn remove_node(&self, bz: &CacheBufferZone) {
+    pub fn remove_node(&self) {
         let id = &self.id;
-        let prev = &self.prev;
-        let next = &self.next;
+        let mut prev = self.prev.get();
+        let mut next = self.next.get();
         debug_assert_ne!(id, &Id::unit_id());
-        if !prev.is_unit_id() {
-            let mut prev_node = bz.get_for_mut(&prev);
-            prev_node.next = *next;
+        if !prev.is_none() {
+            let mut prev_node = prev.extnode_mut();
+            prev_node.next = self.next.clone();
         }
-        if !next.is_unit_id() {
-            let mut next_node = bz.get_for_mut(&next);
-            next_node.prev = *prev;
+        if !next.is_none() {
+            let mut next_node = next.extnode_mut();
+            next_node.prev = self.prev.clone();
         }
-        debug!("Removing node {:?}, len {}", id, self.len);
-        bz.delete(id);
     }
 }
 
-pub fn rearrange_empty_extnode(node: &ExtNode, bz: &CacheBufferZone) -> Id {
-    let prev = node.prev;
-    let next = node.next;
-    if !prev.is_unit_id() {
-        let mut prev_node = bz.get_for_mut(&prev);
-        prev_node.next = next;
+pub fn rearrange_empty_extnode(node: &ExtNode) -> Id {
+    let mut prev = node.prev.get();
+    let mut next = node.next.get();
+    if !prev.is_none() {
+        let mut prev_node = prev.extnode_mut();
+        prev_node.next = node.next.clone();
     }
-    if !next.is_unit_id() {
-        let mut next_node = bz.get_for_mut(&next);
-        next_node.prev = prev;
+    if !next.is_none() {
+        let mut next_node = next.extnode_mut();
+        next_node.prev = node.prev.clone();
     }
     return node.id;
-}
-
-#[derive(Clone)]
-pub enum CacheGuardHolder {
-    Read(ExtNodeCachedImmute),
-    Write(ExtNodeCachedMut),
-}
-
-type NodeRcRefCell = Rc<RefCell<ExtNode>>;
-
-pub type RcNodeRefData<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, Ref<'a, ExtNode>>;
-pub type RcNodeRefMut<'a> = OwningHandle<RcRef<RefCell<ExtNode>>, RefMut<'a, ExtNode>>;
-
-enum CachedData {
-    Some(NodeRcRefCell),
-    None,
-    Deleted,
-}
-
-pub enum RcNodeRef<'a> {
-    Data(RcNodeRefData<'a>),
-    Guard(CacheGuardHolder),
-}
-
-pub struct CacheBufferZone {
-    mapper: Arc<ExtNodeCacheMap>,
-    storage: Arc<AsyncClient>,
-    data: RefCell<HashMap<Id, (CacheGuardHolder, CachedData)>>,
-}
-
-impl Deref for CacheGuardHolder {
-    type Target = ExtNode;
-
-    fn deref(&self) -> &'_ <Self as Deref>::Target {
-        match self {
-            &CacheGuardHolder::Read(ref g) => &*g,
-            &CacheGuardHolder::Write(ref g) => &*g,
-        }
-    }
-}
-
-impl<'a> Deref for RcNodeRef<'a> {
-    type Target = ExtNode;
-
-    fn deref(&self) -> &'_ <Self as Deref>::Target {
-        match self {
-            &RcNodeRef::Guard(ref g) => &*g,
-            &RcNodeRef::Data(ref g) => &*g,
-        }
-    }
-}
-
-impl CacheBufferZone {
-    pub fn new(mapper: &Arc<ExtNodeCacheMap>, storage: &Arc<AsyncClient>) -> CacheBufferZone {
-        CacheBufferZone {
-            mapper: mapper.clone(),
-            storage: storage.clone(),
-            data: RefCell::new(HashMap::new()),
-        }
-    }
-
-    pub fn get(&self, id: &Id) -> RcNodeRef {
-        debug!("Getting cached fo readonly {:?}", id);
-        {
-            // read from data (from write)
-            let data = self.data.borrow();
-            match data.get(id) {
-                Some((guard, CachedData::Some(data))) => {
-                    let cell = data.clone();
-                    let cell_ref = RcRef::new(cell);
-                    let handle = OwningHandle::new(cell_ref);
-                    return RcNodeRef::Data(handle);
-                }
-                Some((guard, CachedData::None)) => {
-                    // read from guards
-                    return RcNodeRef::Guard(guard.clone());
-                }
-                _ => {}
-            }
-        }
-        {
-            debug!("Buffer zone inserting for readonly");
-            let guard = self.get_ext_node_cached(id);
-            let holder = CacheGuardHolder::Read(guard);
-            let mut data = self.data.borrow_mut();
-            // data placeholder for aliened flush. None will be ignored in both get and get mut
-            data.insert(*id, (holder, CachedData::None));
-        }
-        return self.get(id);
-    }
-
-    pub fn get_for_mut(&self, id: &Id) -> RcNodeRefMut {
-        debug!("Getting cached for mutation {:?}", id);
-        {
-            let data = self.data.borrow();
-            match data.get(id) {
-                Some((CacheGuardHolder::Write(_), CachedData::Some(ref extnode))) => {
-                    let cell = extnode.clone();
-                    let cell_ref = RcRef::new(cell);
-                    let handle = OwningHandle::new_mut(cell_ref);
-                    return handle;
-                }
-                Some((CacheGuardHolder::Read(_), _)) => panic!("mutating readonly buffered cache"),
-                Some((CacheGuardHolder::Write(_), _)) => panic!("item not available"),
-                _ => {}
-            }
-        }
-        {
-            debug!("Buffer zone inserting for mutation {:?}", id);
-            let mut guard = self.get_mut_ext_node_cached(id);
-            guard.dirty = true;
-            let mut data_map = self.data.borrow_mut();
-            let data = RefCell::new((&*guard).clone());
-            let holder = CacheGuardHolder::Write(guard);
-            data_map.insert(*id, (holder, CachedData::Some(Rc::new(data))));
-        }
-        self.get_for_mut(id)
-    }
-
-    pub fn delete(&self, id: &Id) {
-        let mut data_map = self.data.borrow_mut();
-        debug!(
-            "remove {:?} from data map with keys {:?}",
-            id,
-            data_map.keys()
-        );
-        debug_assert!(data_map.contains_key(id), "cannot found {:?}", id);
-        match data_map.get_mut(id) {
-            Some((CacheGuardHolder::Write(_), cache)) => *cache = CachedData::Deleted,
-            Some((CacheGuardHolder::Read(_), _)) => panic!("data readonly {:?}", id),
-            None => panic!("data not loaded {:?}", id),
-        }
-    }
-
-    pub fn new_node(&self, node: ExtNode) {
-        let mut mapper = self.mapper.lock();
-        if mapper.get(&node.id).is_some() {
-            panic!()
-        } else {
-            let node_id = node.id;
-            // a placeholder guard
-            let lock = RwLock::new(ExtNode::new(&node_id));
-            let guard = CacheGuardHolder::Write(lock.write());
-            let mut data = self.data.borrow_mut();
-            mapper.insert(node_id, Arc::new(lock));
-            data.insert(
-                node_id,
-                (guard, CachedData::Some(Rc::new(RefCell::new(node)))),
-            );
-        }
-    }
-
-    pub fn flush(&self) {
-        let mut data_map = self.data.borrow_mut();
-        for ((id, (holder, data))) in data_map.iter_mut() {
-            if let &mut CacheGuardHolder::Write(ref mut guard) = holder {
-                debug!("Flushing updating node: {:?}", id);
-                match data {
-                    CachedData::Some(ref node_rc) => {
-                        let mut ext_node = (*(*node_rc).borrow()).clone();
-                        debug!(
-                            "flushing {:?} to cache with {} keys",
-                            ext_node.id, ext_node.len
-                        );
-                        **guard = ext_node
-                    }
-                    CachedData::Deleted => {
-                        debug!("Flushing deleting node: {:?}", id);
-                        self.mapper.lock().remove(id);
-                        self.storage.remove_cell(*id).wait().unwrap();
-                    }
-                    _ => panic!(),
-                }
-            }
-        }
-    }
-
-    pub fn get_guard(&self, id: &Id) -> Option<CacheGuardHolder> {
-        if id.is_unit_id() {
-            return None;
-        }
-        let mut data_map = self.data.borrow_mut();
-        {
-            let res = data_map.get(id).map(|(holder, _)| holder.clone());
-            if res.is_some() {
-                return res;
-            }
-        }
-        let guard = self.get_ext_node_cached(id);
-        let holder = CacheGuardHolder::Read(guard);
-        data_map.insert(*id, (holder.clone(), CachedData::None)); // act as a read operation
-        return Some(holder);
-    }
-
-    fn get_ext_node_lock(&self, id: &Id) -> Arc<RwLock<ExtNode>> {
-        self.mapper.lock().get_or_fetch(id).unwrap().clone()
-    }
-
-    pub fn get_mut_ext_node_cached(&self, id: &Id) -> ExtNodeCachedMut {
-        self.get_ext_node_lock(id).write()
-    }
-    pub fn get_ext_node_cached(&self, id: &Id) -> ExtNodeCachedImmute {
-        self.get_ext_node_lock(id).read()
-    }
 }
 
 pub fn page_schema() -> Schema {
