@@ -136,7 +136,7 @@ impl BPlusTree {
         let pos = node.search(key);
         if node.is_ext() {
             debug!("search in external for {:?}", key);
-            Ok(RTCursor::new(pos, &node.ext_id(), &self.bz, ordering))
+            Ok(RTCursor::new(pos, &node.ext_id(), ordering))
         } else if let Node::Internal(ref n) = *node {
             let next_node_ref = n.ptrs[pos];
             self.search(next_node_ref, key, ordering)
@@ -184,17 +184,16 @@ impl BPlusTree {
         debug!(
             "insert to node: {:?}, len {}, pos: {}, external: {}",
             node,
-            ref_node.len(&mut self.bz),
+            ref_node.len(),
             pos,
             ref_node.is_ext()
         );
         let split_node = match &*ref_node {
-            &Node::External(ref id) => {
+            &Node::External(ref node) => {
                 debug!(
                     "insert into external at {}, key {:?}, id {:?}",
-                    pos, key, id
+                    pos, key, node.id
                 );
-                let mut node = self.bz.get_for_mut(id);
                 if node.merging.load(Relaxed) {
                     return Err(TxnErr::NotRealizable);
                 }
@@ -248,93 +247,77 @@ impl BPlusTree {
         }
     }
 
-    pub fn remove(&self, key: &EntryKey) -> Result<bool, TxnErr> {
-        let root = self.tree.root;
-        let removed = self.remove_from_node(root, key)?;
-        let root_node = self.txn.read::<Node>(root)?.unwrap();
+    pub fn remove(&self, key: &EntryKey) -> bool {
+        let root = &self.root;
+        let removed = unsafe { self.remove_from_node(root, key) };
+        let root_node = unsafe { &mut *self.root.get() };
         if removed.item_found
             && removed.removed
             && !root_node.is_ext()
-            && root_node.len(&mut self.bz) == 0
+            && root_node.len() == 0
             {
                 // When root is external and have no keys but one pointer will take the only sub level
                 // pointer node as the new root node.
-                // It is not possible to change the root reference so the sub level node will be cloned
-                // and removed. Its clone will be used as the new root node.
-                let new_root_ref = root_node.innode().ptrs[0];
-                let new_root_cloned = self.txn.read_owned::<Node>(new_root_ref)?.unwrap();
-                self.txn.update(root, new_root_cloned);
-                self.txn.delete(new_root_ref);
+                let new_root = unsafe { &mut *root_node.innode().ptrs[0].get() };
+                // TODO: check memory leak
+                mem::swap(root_node, new_root);
+
             }
         if removed.item_found {
-            let len_counter = self.len.clone();
-            self.txn.defer(move || {
-                len_counter.fetch_sub(1, Relaxed);
-            });
+            self.len.fetch_sub(1, Relaxed);
         }
-        Ok(removed.item_found)
+        removed.item_found
     }
 
-    fn remove_from_node(
+    unsafe fn remove_from_node(
         &self,
-        node: TxnValRef,
+        node: &NodeCellRef,
         key: &EntryKey,
-    ) -> Result<RemoveStatus, TxnErr> {
-        debug!("Removing {:?} from node {:?}", key, node);
-        self.check_merging(node)?;
-        let node_ref = self.txn.read::<Node>(node)?.unwrap();
-        node_ref.warm_cache_for_write_intention(&mut self.bz);
-        let pos = node_ref.search(key, &mut self.bz);;
-        if let Node::Internal(n) = &*node_ref {
-            let mut status = self.remove_from_node(n.ptrs[pos], key)?;
+    ) -> RemoveStatus {
+        debug!("Removing {:?} from node", key);
+        let mut node = &mut *node.get();
+        let pos = node.search(key);
+        if let Node::Internal(n) = node {
+            let mut status = self.remove_from_node(&n.ptrs[pos], key);
             if !status.removed {
-                return Ok(status);
+                return status;
             }
-            let sub_node_ref = n.ptrs[pos];
-            let sub_node = self.txn.read::<Node>(sub_node_ref)?.unwrap();
-            let mut current_node_owned = self.txn.read_owned::<Node>(node)?.unwrap();
+            let sub_node = &mut *n.ptrs[pos].get();
+            let mut current_node_owned = node;
             {
                 let mut current_innode = current_node_owned.innode_mut();
-                if sub_node.len(&mut self.bz) == 0 {
+                if sub_node.len() == 0 {
                     // need to remove empty child node
                     if sub_node.is_ext() {
                         debug!("Removing empty node");
                         current_innode.remove_at(pos);
-                        self.txn.delete(sub_node_ref);
-                        sub_node.extnode_mut(&self.bz).remove_node(&self.bz);
+                        sub_node.extnode_mut().remove_node();
                         status.removed = true;
                     } else {
                         // empty internal nodes should be replaced with it's only remaining child pointer
                         // there must be at least one child pointer exists
                         let sub_innode = sub_node.innode();
-                        let sub_sub_node_ref = sub_innode.ptrs[0];
+                        let sub_sub_node_ref = sub_innode.ptrs[0].clone();
                         debug_assert!(sub_innode.len == 0);
-                        debug_assert!(self.txn.read::<Node>(sub_sub_node_ref).unwrap().is_some());
                         current_innode.ptrs[pos] = sub_sub_node_ref;
                         status.removed = false;
                     }
-                } else if !sub_node.is_half_full(&mut self.bz) && current_innode.len > 1 {
+                } else if !sub_node.is_half_full() && current_innode.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
                     let cand_ptr_pos =
-                        current_innode.rebalance_candidate(pos, &mut self.txn, &mut self.bz)?;;
+                        current_innode.rebalance_candidate(pos);
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
-                    let cand_node = self.txn.read::<Node>(n.ptrs[cand_ptr_pos])?.unwrap();
+                    let cand_node = &mut *n.ptrs[cand_ptr_pos].get();
                     debug_assert_eq!(cand_node.is_ext(), sub_node.is_ext());
-                    if cand_node.is_ext() {
-                        cand_node.extnode_mut(&mut self.bz);
-                        sub_node.extnode_mut(&mut self.bz);
-                    }
-                    if sub_node.cannot_merge(&mut self.bz) || cand_node.cannot_merge(&mut self.bz) {
+                    if sub_node.cannot_merge() || cand_node.cannot_merge() {
                         // relocate
                         debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
                         current_innode.relocate_children(
                             left_ptr_pos,
                             right_ptr_pos,
-                            &mut self.txn,
-                            &mut self.bz,
-                        )?;
+                        );
                         status.removed = false;
                     } else {
                         // merge
@@ -347,31 +330,29 @@ impl BPlusTree {
                     }
                 }
             }
-            self.txn.update(node, current_node_owned);
-            return Ok(status);
-        } else if let &Node::External(ref id) = &*node_ref {
-            let mut cached_node = self.bz.get_for_mut(id);
-            if pos >= cached_node.len {
-                debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}, keys {:?}",
-                       pos, cached_node.len, key, &cached_node.keys);
-                return Ok(RemoveStatus {
+            return status;
+        } else if let &mut Node::External(ref mut node) = node {
+            if pos >= node.len {
+                debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
+                       pos, node.len, key);
+                return RemoveStatus {
                     item_found: false,
                     removed: false,
-                });
+                };
             }
-            if &cached_node.keys[pos] == key {
-                cached_node.remove_at(pos);
-                return Ok(RemoveStatus {
+            if &node.keys[pos] == key {
+                node.remove_at(pos);
+                return RemoveStatus {
                     item_found: true,
                     removed: true,
-                });
+                };
             } else {
-                debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}, keys {:?}",
-                       pos, key, &cached_node.keys[pos], &cached_node.keys);
-                return Ok(RemoveStatus {
+                debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
+                       pos, key, &node.keys[pos]);
+                return RemoveStatus {
                     item_found: false,
                     removed: false,
-                });
+                };
             }
         } else {
             unreachable!()
@@ -413,7 +394,7 @@ impl Node {
             _ => false
         }
     }
-    fn search(&self, key: &EntryKey, bz: &CacheBufferZone) -> usize {
+    fn search(&self, key: &EntryKey) -> usize {
         let len = self.len();
         if self.is_ext() {
             self.extnode().keys[..len]

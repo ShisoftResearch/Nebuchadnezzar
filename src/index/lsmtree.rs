@@ -85,9 +85,9 @@ impl LSMTree {
         self.level_m.insert(&key).map_err(|e| ())
     }
 
-    pub fn remove(&self, mut key: EntryKey, id: &Id) -> Result<bool, ()> {
+    pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
         key_with_id(&mut key, id);
-        let m_deleted = self.level_m.remove(&key).map_err(|e| ())?;
+        let m_deleted = self.level_m.remove(&key);
         let levels_deleted = self
             .trees
             .iter()
@@ -95,7 +95,7 @@ impl LSMTree {
             .collect_vec() // collect here to prevent short circuit
             .into_iter()
             .any(|d| d);
-        Ok(m_deleted || levels_deleted)
+        m_deleted || levels_deleted
     }
 
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {

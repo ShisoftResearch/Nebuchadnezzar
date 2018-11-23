@@ -135,21 +135,21 @@ impl InNode {
     pub fn rebalance_candidate(
         &self,
         pointer_pos: usize,
-    ) -> Result<usize, TxnErr> {
+    ) -> usize {
         debug_assert!(pointer_pos <= self.len);
         debug!(
             "Searching for rebalance candidate, pos {}, len {}",
             pointer_pos, self.len
         );
         if pointer_pos == 0 {
-            Ok(1)
+            1
         } else if pointer_pos + 1 >= self.len {
             // the last one, pick left
-            Ok(pointer_pos - 1)
+            pointer_pos - 1
         } else {
             // pick the right one
             // we should pick the one  with least pointers, but it cost for the check is too high
-            Ok(pointer_pos + 1)
+            pointer_pos + 1
         }
     }
     pub unsafe fn merge_children(
