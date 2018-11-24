@@ -80,9 +80,9 @@ impl LSMTree {
         lsm_tree
     }
 
-    pub fn insert(&self, mut key: EntryKey, id: &Id) -> Result<(), ()> {
+    pub fn insert(&self, mut key: EntryKey, id: &Id) {
         key_with_id(&mut key, id);
-        self.level_m.insert(&key).map_err(|e| ())
+        self.level_m.insert(&key)
     }
 
     pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
@@ -103,7 +103,7 @@ impl LSMTree {
             Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
             Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
         };
-        let mut cursors: Vec<Box<Cursor>> = vec![box self.level_m.seek(&key, ordering).unwrap()];
+        let mut cursors: Vec<Box<Cursor>> = vec![box self.level_m.seek(&key, ordering)];
         for tree in &self.trees {
             cursors.push(tree.seek(&key, ordering));
         }

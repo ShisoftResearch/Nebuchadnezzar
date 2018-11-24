@@ -90,31 +90,27 @@ impl ExtNode {
         self.keys.remove_at(pos, &mut cached_len);
         self.len = cached_len;
     }
-    pub fn insert(
+    pub unsafe fn insert(
         &mut self,
         key: EntryKey,
         pos: usize,
         tree: &BPlusTree,
-        self_ref: NodeCellRef,
+        self_ref: &NodeCellRef,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-        let cached_len = cached.len;
-        debug_assert!(cached_len <= NUM_KEYS);
-        if cached_len == NUM_KEYS {
+        let self_len = self.len;
+        debug_assert!(self_len <= NUM_KEYS);
+        if self_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             // cached.dump();
-            let pivot = cached_len / 2;
-            let cached_next = &cached.next;
+            let pivot = self_len / 2;
+            let self_next = &mut *self.next.get();
             let new_page_id = tree.new_page_id();
-            let mut keys_1 = &mut cached.keys;
-            let mut keys_2 = keys_1.split_at_pivot(pivot, cached_len);
+            let mut keys_1 = &mut self.keys;
+            let mut keys_2 = keys_1.split_at_pivot(pivot, self_len);
             let mut keys_1_len = pivot;
-            let mut keys_2_len = cached_len - pivot;
+            let mut keys_2_len = self_len - pivot;
             // modify next node point previous to new node
-            if !cached_next.is_unit_id() {
-                let mut prev_node = bz.get_for_mut(&cached_next);
-                prev_node.prev = new_page_id;
-            }
             insert_into_split(
                 key,
                 keys_1,
@@ -126,29 +122,28 @@ impl ExtNode {
             let extnode_2 = ExtNode {
                 id: new_page_id,
                 keys: keys_2,
-                next: cached_next,
-                prev: self_ref,
+                next: self.next.clone(),
+                prev: self_ref.clone(),
                 len: keys_2_len,
                 dirty: true,
                 cc: AtomicUsize::new(0)
             };
             debug!(
-                "new node have next {:?} prev {:?}, current id {:?}",
-                extnode_2.next, extnode_2.prev, cached.id
-            );
-            cached.next = new_page_id;
-            cached.len = keys_1_len;
-            debug!(
                 "Split to left len {}, right len {}",
-                cached.len, extnode_2.len
+                self.len, extnode_2.len
             );
             let node_2 = Arc::new(UnsafeCell::new(Node::External(box extnode_2)));
+            if !self_next.is_none() {
+                self_next.extnode_mut().prev = node_2.clone();
+            }
+            self.next = node_2.clone();
+            self.len = keys_1_len;
             return Some((node_2, None));
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
-            let mut new_cached_len = cached_len;
-            cached.keys.insert_at(key, pos, &mut new_cached_len);
-            cached.len = new_cached_len;
+            let mut new_cached_len = self_len;
+            self.keys.insert_at(key, pos, &mut new_cached_len);
+            self.len = new_cached_len;
             return None;
         }
     }
@@ -184,6 +179,9 @@ impl ExtNode {
             let mut next_node = next.extnode_mut();
             next_node.prev = self.prev.clone();
         }
+    }
+    pub fn is_dirty(&self) -> bool {
+        unimplemented!()
     }
 }
 
@@ -223,30 +221,30 @@ pub fn page_schema() -> Schema {
 }
 
 pub struct NodeCache {
-    nodes: HashMap<Id, NodeCellRef>,
+    nodes: RefCell<HashMap<Id, NodeCellRef>>,
     storage: Arc<AsyncClient>
 }
 
 impl NodeCache {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         NodeCache {
-            nodes: HashMap::new(),
+            nodes: RefCell::new(HashMap::new()),
             storage: neb_client.clone()
         }
     }
 
-    pub fn get(&mut self, id: &Id) -> NodeCellRef {
+    pub fn get(&self, id: &Id) -> NodeCellRef {
         if id.is_unit_id() {
             return Arc::new(UnsafeCell::new(Node::None));
         }
-
-        self.nodes.entry(*id).or_insert_with(|| {
+        let mut nodes = self.nodes.borrow_mut();
+        nodes.entry(*id).or_insert_with(|| {
             let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
             Arc::new(UnsafeCell::new(Node::External(box self.extnode_from_cell(cell))))
         }).clone()
     }
 
-    fn extnode_from_cell(&mut self, cell: Cell) -> ExtNode {
+    fn extnode_from_cell(&self, cell: Cell) -> ExtNode {
         let cell_id = cell.id();
         let cell_version = cell.header.version;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();

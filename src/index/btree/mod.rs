@@ -61,8 +61,7 @@ pub struct BPlusTree {
     len: Arc<AtomicUsize>,
 }
 
-#[derive(Clone)]
-enum Node {
+pub enum Node {
     External(Box<ExtNode>),
     Internal(Box<InNode>),
     None,
@@ -100,57 +99,53 @@ impl BPlusTree {
         return tree;
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> Result<RTCursor, TxnErr> {
-        let root = self.tree.root;
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
+        let mut cursor = unsafe { self.search(&self.root, key, ordering) };
         match ordering {
-            Ordering::Forward => self.search(root, key, ordering),
+            Ordering::Forward => {},
             Ordering::Backward => {
                 // fill highest bits to the end of the search key as the last possible id for backward search
-                debug!("seek backwards with precise key {:?}", key);
-                self.search(root, key, ordering).map(|mut cursor| {
-                    debug!(
-                        "found cursor pos {} for backwards, len {}, will be corrected",
-                        cursor.index, cursor.page.len
-                    );
-                    let cursor_index = cursor.index;
-                    if cursor_index > 0 {
-                        cursor.index -= 1;
-                    }
-                    debug!(
-                        "cursor pos have been corrected to {}, len {}, item {:?}",
-                        cursor.index, cursor.page.len, cursor.page.keys[cursor.index]
-                    );
-                    return cursor;
-                })
+                debug!(
+                    "found cursor pos {} for backwards, will be corrected",
+                    cursor.index
+                );
+                let cursor_index = cursor.index;
+                if cursor_index > 0 {
+                    cursor.index -= 1;
+                }
+                debug!(
+                    "cursor pos have been corrected to {}",
+                    cursor.index
+                );
             }
         }
+        cursor
     }
 
-    fn search(
+    unsafe fn search(
         &self,
         node: &NodeCellRef,
         key: &EntryKey,
         ordering: Ordering,
-    ) -> Result<RTCursor, TxnErr> {
-        debug!("searching for {:?} at {:?}", key, node);
+    ) -> RTCursor {
+        debug!("searching for {:?}", key);
+        let node = &*node.get();
         let pos = node.search(key);
         if node.is_ext() {
             debug!("search in external for {:?}", key);
-            Ok(RTCursor::new(pos, &node.ext_id(), ordering))
-        } else if let Node::Internal(ref n) = *node {
-            let next_node_ref = n.ptrs[pos];
+            RTCursor::new(pos, &node.ext_id(), ordering)
+        } else if let &Node::Internal(ref n) = node {
+            let next_node_ref = &n.ptrs[pos];
             self.search(next_node_ref, key, ordering)
         } else {
             unreachable!()
         }
     }
 
-    pub fn insert(&self, key: &EntryKey) -> Result<(), TxnErr> {
-        let root_ref = self.tree.root;
-        if let Some((new_node, pivotKey)) = self.insert_to_node(root_ref, key.clone())? {
+    pub fn insert(&self, key: &EntryKey) {
+        if let Some((new_node, pivotKey)) = unsafe {self.insert_to_node(&self.root, key.clone())} {
             debug!("split root with pivot key {:?}", pivotKey);
-            let first_key = new_node.first_key();
-            let new_node_ref = self.txn.new_value(new_node);
+            let first_key = unsafe { (&*new_node.get()).first_key() };
             let pivot = pivotKey.unwrap_or_else(|| first_key);
             let mut new_in_root = InNode {
                 keys: make_array!(NUM_KEYS, Default::default()),
@@ -159,98 +154,86 @@ impl BPlusTree {
                 cc: AtomicUsize::new(0),
                 len: 1,
             };
-            let old_root = self.txn.read_owned::<Node>(self.tree.root)?.unwrap();
-            let old_root_ref = self.txn.new_value(old_root);
-            new_in_root.keys[0] = pivot;
-            new_in_root.ptrs[0] = old_root_ref;
-            new_in_root.ptrs[1] = new_node_ref;
-            let new_root = Node::Internal(box new_in_root);
-            self.txn.update(self.tree.root, new_root);
+            // TODO: review swap root
+            unsafe {
+                let old_root = self.root.get();
+                new_in_root.keys[0] = pivot;
+                new_in_root.ptrs[0].get().swap(old_root);
+                new_in_root.ptrs[1] = new_node;
+                let new_root = Node::Internal(box new_in_root);
+                self.root.get().replace(new_root);
+            }
         }
-        let len_counter = self.len.clone();
-        self.txn.defer(move || {
-            len_counter.fetch_add(1, Relaxed);
-        });
-        Ok(())
+        self.len.fetch_add(1, Relaxed);
     }
 
-    fn insert_to_node(
+    unsafe fn insert_to_node(
         &self,
-        node: &NodeCellRef,
+        node_ref: &NodeCellRef,
         key: EntryKey,
-    ) -> Result<Option<(Node, Option<EntryKey>)>, TxnErr> {
-        self.check_merging(node)?;
-        let pos = ref_node.search(&key);
+    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
+        let node = &mut *node_ref.get();
+        let pos = node.search(&key);
         debug!(
-            "insert to node: {:?}, len {}, pos: {}, external: {}",
-            node,
-            ref_node.len(),
+            "insert to node, len {}, pos: {}, external: {}",
+            node.len(),
             pos,
-            ref_node.is_ext()
+            node.is_ext()
         );
-        let split_node = match &*ref_node {
-            &Node::External(ref node) => {
+        let split_node = match node {
+            &mut Node::External(ref mut node) => {
                 debug!(
                     "insert into external at {}, key {:?}, id {:?}",
                     pos, key, node.id
                 );
-                if node.merging.load(Relaxed) {
-                    return Err(TxnErr::NotRealizable);
-                }
-                return Ok(node.insert(key, pos, self.tree, &*self.bz));
+                return node.insert(key, pos, self, node_ref);
             }
-            &Node::Internal(ref n) => {
-                let next_node_ref = n.ptrs[pos];
+            &mut Node::Internal(ref mut n) => {
+                let next_node_ref = &n.ptrs[pos];
                 debug!(
-                    "insert into internal at {}, has keys {}, ref {:?}",
-                    pos, n.len, next_node_ref
+                    "insert into internal at {}, has keys {}",
+                    pos, n.len
                 );
-                self.insert_to_node(next_node_ref, key)?
+                self.insert_to_node(next_node_ref, key)
             }
-            &Node::None => unreachable!(),
+            &mut Node::None => unreachable!(),
         };
         match split_node {
-            Some((new_node, pivot_key)) => {
+            Some((new_node_ref, pivot_key)) => {
                 debug!(
                     "Sub level node split, shall insert new node to current level, pivot {:?}",
                     pivot_key
                 );
+                let new_node = &*new_node_ref.get();
                 debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
                 let pivot = pivot_key.unwrap_or_else(|| {
                     let first_key = new_node.first_key();
                     debug_assert_ne!(first_key.len(), 0);
                     first_key
                 });
-                let new_node_ref = self.txn.new_value(new_node);
-                debug!(
-                    "New node in transaction {:?}, pivot {:?}",
-                    new_node_ref, pivot
-                );
-                let mut acq_node = self.txn.read_owned::<Node>(node)?.unwrap();
+                debug!("New pivot {:?}", pivot);
                 let result = {
-                    let pivot_pos = acq_node.search(&pivot, &mut self.bz);
+                    let pivot_pos = node.search(&pivot);
                     debug!(
                         "will insert into current node at {}, node len {}",
-                        pivot_pos,
-                        acq_node.len(&mut self.bz)
+                        pivot_pos, node.len()
                     );
-                    let mut current_innode = acq_node.innode_mut();
+                    let mut current_innode = node.innode_mut();
                     current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
                 };
-                self.txn.update(node, acq_node);
                 if result.is_some() {
                     debug!("Sub level split caused current level split");
                 }
-                return Ok(result);
+                return result;
             }
-            None => return Ok(None),
+            None => None,
         }
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
         let root = &self.root;
         let removed = unsafe { self.remove_from_node(root, key) };
-        let root_node = unsafe { &mut *self.root.get() };
+        let root_node = unsafe { &mut *root.get() };
         if removed.item_found
             && removed.removed
             && !root_node.is_ext()
@@ -277,20 +260,18 @@ impl BPlusTree {
         debug!("Removing {:?} from node", key);
         let mut node = &mut *node.get();
         let pos = node.search(key);
-        if let Node::Internal(n) = node {
+        if let Node::Internal(ref mut n) = node {
             let mut status = self.remove_from_node(&n.ptrs[pos], key);
             if !status.removed {
                 return status;
             }
             let sub_node = &mut *n.ptrs[pos].get();
-            let mut current_node_owned = node;
             {
-                let mut current_innode = current_node_owned.innode_mut();
                 if sub_node.len() == 0 {
                     // need to remove empty child node
                     if sub_node.is_ext() {
                         debug!("Removing empty node");
-                        current_innode.remove_at(pos);
+                        n.remove_at(pos);
                         sub_node.extnode_mut().remove_node();
                         status.removed = true;
                     } else {
@@ -299,14 +280,14 @@ impl BPlusTree {
                         let sub_innode = sub_node.innode();
                         let sub_sub_node_ref = sub_innode.ptrs[0].clone();
                         debug_assert!(sub_innode.len == 0);
-                        current_innode.ptrs[pos] = sub_sub_node_ref;
+                        n.ptrs[pos] = sub_sub_node_ref;
                         status.removed = false;
                     }
-                } else if !sub_node.is_half_full() && current_innode.len > 1 {
+                } else if !sub_node.is_half_full() && n.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
                     let cand_ptr_pos =
-                        current_innode.rebalance_candidate(pos);
+                        n.rebalance_candidate(pos);
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
                     let cand_node = &mut *n.ptrs[cand_ptr_pos].get();
@@ -314,7 +295,7 @@ impl BPlusTree {
                     if sub_node.cannot_merge() || cand_node.cannot_merge() {
                         // relocate
                         debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
-                        current_innode.relocate_children(
+                        n.relocate_children(
                             left_ptr_pos,
                             right_ptr_pos,
                         );
@@ -322,7 +303,7 @@ impl BPlusTree {
                     } else {
                         // merge
                         debug!("Merge {} with {}", left_ptr_pos, right_ptr_pos);
-                        current_innode.merge_children(
+                        n.merge_children(
                             left_ptr_pos,
                             right_ptr_pos,
                         );
@@ -369,7 +350,8 @@ impl BPlusTree {
 
     unsafe fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
         let value = &*value.get();
-        if cache.dirty {
+        let extnode = value.extnode();
+        if extnode.is_dirty() {
             let cell = value.extnode().to_cell();
             client.upsert_cell(cell).wait().unwrap();
         }
@@ -408,26 +390,11 @@ impl Node {
         }
     }
 
-    fn insert(
-        &mut self,
-        key: EntryKey,
-        ptr: Option<NodeCellRef>,
-        pos: usize,
-        self_ref: Option<&NodeCellRef>,
-    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-        if let &mut Node::External(ref id) = self {
-            debug!("inserting to external node at: {:?}, key {:?}", pos, key);
-            self.extnode_mut().insert(key, pos, tree, self_ref.unwrap().clone())
-        } else {
-            debug!("inserting to internal node at: {:?}, key {:?}", pos, key);
-            self.innode_mut().insert(key, ptr, pos)
-        }
-    }
     fn remove(&mut self, pos: usize) {
-        if let &mut Node::External(ref id) = self {
-            self.extnode_mut().remove_at(pos)
-        } else {
-            self.innode_mut().remove_at(pos)
+        match self {
+            &mut Node::External(ref mut node) => node.remove_at(pos),
+            &mut Node::Internal(ref mut node) => node.remove_at(pos),
+            &mut Node::None => unreachable!()
         }
     }
     fn is_ext(&self) -> bool {

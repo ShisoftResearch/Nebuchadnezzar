@@ -1,7 +1,6 @@
 use hermes::stm::Txn;
 use hermes::stm::TxnErr;
 use hermes::stm::TxnValRef;
-use index::btree::external::CacheBufferZone;
 use index::btree::Slice;
 use index::btree::*;
 use itertools::free::chain;
@@ -173,7 +172,6 @@ impl InNode {
                 left_innode.merge_with(&mut right_innode, right_key);
                 merged_len = left_innode.len;
             }
-            txn.update(left_ref, left_node);
         } else {
             let mut right_extnode = right_node.extnode_mut();
             {
@@ -188,7 +186,6 @@ impl InNode {
             "Removing merged node, left {}, right {}, merged {}",
             left_len, right_len, merged_len
         );
-        txn.delete(right_ref);
         Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
