@@ -25,6 +25,7 @@ use std;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::cell::UnsafeCell;
 use std::cmp::{max, min};
 use std::fmt::Debug;
 use std::fmt::Error;
@@ -37,7 +38,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::cell::UnsafeCell;
 
 mod external;
 mod internal;
@@ -74,7 +74,7 @@ pub enum Node {
 pub struct RTCursor {
     index: usize,
     ordering: Ordering,
-    page: Option<NodeCellRef>
+    page: Option<NodeCellRef>,
 }
 
 impl Default for Ordering {
@@ -90,7 +90,7 @@ impl BPlusTree {
         let mut tree = BPlusTree {
             root: Arc::new(UnsafeCell::new(Node::None)),
             storage: neb_client.clone(),
-            len: Arc::new(AtomicUsize::new(0))
+            len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
         tree.root = Arc::new(UnsafeCell::new(Node::new_external(root_id)));
@@ -100,7 +100,7 @@ impl BPlusTree {
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
         let mut cursor = unsafe { self.search(&self.root, key, ordering) };
         match ordering {
-            Ordering::Forward => {},
+            Ordering::Forward => {}
             Ordering::Backward => {
                 // fill highest bits to the end of the search key as the last possible id for backward search
                 debug!(
@@ -111,21 +111,13 @@ impl BPlusTree {
                 if cursor_index > 0 {
                     cursor.index -= 1;
                 }
-                debug!(
-                    "cursor pos have been corrected to {}",
-                    cursor.index
-                );
+                debug!("cursor pos have been corrected to {}", cursor.index);
             }
         }
         cursor
     }
 
-    unsafe fn search(
-        &self,
-        node: &NodeCellRef,
-        key: &EntryKey,
-        ordering: Ordering,
-    ) -> RTCursor {
+    unsafe fn search(&self, node: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
         debug!("searching for {:?}", key);
         let node = &*node.get();
         let pos = node.search(key);
@@ -141,7 +133,8 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        if let Some((new_node, pivotKey)) = unsafe {self.insert_to_node(&self.root, key.clone())} {
+        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, key.clone()) }
+        {
             debug!("split root with pivot key {:?}", pivotKey);
             let first_key = unsafe { (&*new_node.get()).first_key() };
             let pivot = pivotKey.unwrap_or_else(|| first_key);
@@ -188,10 +181,7 @@ impl BPlusTree {
             }
             &mut Node::Internal(ref mut n) => {
                 let next_node_ref = &n.ptrs[pos];
-                debug!(
-                    "insert into internal at {}, has keys {}",
-                    pos, n.len
-                );
+                debug!("insert into internal at {}, has keys {}", pos, n.len);
                 self.insert_to_node(next_node_ref, key)
             }
             &mut Node::None => unreachable!(),
@@ -214,7 +204,8 @@ impl BPlusTree {
                     let pivot_pos = node.search(&pivot);
                     debug!(
                         "will insert into current node at {}, node len {}",
-                        pivot_pos, node.len()
+                        pivot_pos,
+                        node.len()
                     );
                     let mut current_innode = node.innode_mut();
                     current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
@@ -232,29 +223,20 @@ impl BPlusTree {
         let root = &self.root;
         let removed = unsafe { self.remove_from_node(root, key) };
         let root_node = unsafe { &mut *root.get() };
-        if removed.item_found
-            && removed.removed
-            && !root_node.is_ext()
-            && root_node.len() == 0
-            {
-                // When root is external and have no keys but one pointer will take the only sub level
-                // pointer node as the new root node.
-                let new_root = unsafe { &mut *root_node.innode().ptrs[0].get() };
-                // TODO: check memory leak
-                mem::swap(root_node, new_root);
-
-            }
+        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
+            // When root is external and have no keys but one pointer will take the only sub level
+            // pointer node as the new root node.
+            let new_root = unsafe { &mut *root_node.innode().ptrs[0].get() };
+            // TODO: check memory leak
+            mem::swap(root_node, new_root);
+        }
         if removed.item_found {
             self.len.fetch_sub(1, Relaxed);
         }
         removed.item_found
     }
 
-    unsafe fn remove_from_node(
-        &self,
-        node: &NodeCellRef,
-        key: &EntryKey,
-    ) -> RemoveStatus {
+    unsafe fn remove_from_node(&self, node: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
         debug!("Removing {:?} from node", key);
         let mut node = &mut *node.get();
         let pos = node.search(key);
@@ -284,8 +266,7 @@ impl BPlusTree {
                 } else if !sub_node.is_half_full() && n.len > 1 {
                     // need to rebalance
                     // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                    let cand_ptr_pos =
-                        n.rebalance_candidate(pos);
+                    let cand_ptr_pos = n.rebalance_candidate(pos);
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
                     let cand_node = &mut *n.ptrs[cand_ptr_pos].get();
@@ -293,18 +274,12 @@ impl BPlusTree {
                     if sub_node.cannot_merge() || cand_node.cannot_merge() {
                         // relocate
                         debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
-                        n.relocate_children(
-                            left_ptr_pos,
-                            right_ptr_pos,
-                        );
+                        n.relocate_children(left_ptr_pos, right_ptr_pos);
                         status.removed = false;
                     } else {
                         // merge
                         debug!("Merge {} with {}", left_ptr_pos, right_ptr_pos);
-                        n.merge_children(
-                            left_ptr_pos,
-                            right_ptr_pos,
-                        );
+                        n.merge_children(left_ptr_pos, right_ptr_pos);
                         status.removed = true;
                     }
                 }
@@ -312,8 +287,10 @@ impl BPlusTree {
             return status;
         } else if let &mut Node::External(ref mut node) = node {
             if pos >= node.len {
-                debug!("Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
-                       pos, node.len, key);
+                debug!(
+                    "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
+                    pos, node.len, key
+                );
                 return RemoveStatus {
                     item_found: false,
                     removed: false,
@@ -326,8 +303,10 @@ impl BPlusTree {
                     removed: true,
                 };
             } else {
-                debug!("Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
-                       pos, key, &node.keys[pos]);
+                debug!(
+                    "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
+                    pos, key, &node.keys[pos]
+                );
                 return RemoveStatus {
                     item_found: false,
                     removed: false,
@@ -371,7 +350,7 @@ impl Node {
     pub fn is_none(&self) -> bool {
         match self {
             &Node::None => true,
-            _ => false
+            _ => false,
         }
     }
     fn search(&self, key: &EntryKey) -> usize {
@@ -392,7 +371,7 @@ impl Node {
         match self {
             &mut Node::External(ref mut node) => node.remove_at(pos),
             &mut Node::Internal(ref mut node) => node.remove_at(pos),
-            &mut Node::None => unreachable!()
+            &mut Node::None => unreachable!(),
         }
     }
     fn is_ext(&self) -> bool {
@@ -444,7 +423,7 @@ impl Node {
         match self {
             &Node::External(ref node) => node.id,
             &Node::None => Id::unit_id(),
-            _ => unreachable!()
+            _ => unreachable!(),
         }
     }
     fn innode(&self) -> &InNode {
@@ -523,7 +502,7 @@ impl IndexCursor for RTCursor {
             let page = unsafe { &*page_ref.get() };
             Some(&page.extnode().keys[self.index])
         } else {
-            return None
+            return None;
         }
     }
 }
@@ -644,16 +623,8 @@ where
         return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
-        debug_assert!(
-            pos <= *len,
-            "pos {} larger or equals to len {}",
-            pos,
-            len
-        );
-        debug!(
-            "insert into slice, pos: {}, len {}",
-            pos, len
-        );
+        debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
+        debug!("insert into slice, pos: {}, len {}", pos, len);
         let mut slice = self.as_slice();
         if *len > 0 {
             slice[*len] = T::default();
@@ -690,6 +661,7 @@ mod test {
     use hermes::stm::TxnValRef;
     use index::btree::external::CacheBufferZone;
     use index::btree::NUM_KEYS;
+    use index::Cursor;
     use index::{id_from_key, key_with_id};
     use ram::types::RandValue;
     use rand::distributions::Uniform;
@@ -704,7 +676,6 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
-    use index::Cursor;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -830,8 +801,8 @@ mod test {
         info!("test insertion");
         let mut entry_key = key.clone();
         key_with_id(&mut entry_key, &id);
-        tree.insert(&entry_key).unwrap();
-        let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
+        tree.insert(&entry_key);
+        let mut cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(id_from_key(cursor.current().unwrap()), id);
     }
 
@@ -846,6 +817,7 @@ mod test {
 
     #[test]
     fn crd() {
+        use index::Cursor;
         env_logger::init();
         let server_group = "index_insertions";
         let server_addr = String::from("127.0.0.1:5101");
@@ -880,26 +852,15 @@ mod test {
                 debug!("insert id: {}", i);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
-                tree.insert(&entry_key).unwrap();
+                tree.insert(&entry_key);
             }
-            tree.transaction(|txn| {
-                let root = txn.txn.read::<Node>(tree.root)?.unwrap();
-                let root_innode = root.innode();
-                debug!("root have {} keys", root_innode.keys.len());
-                for i in 0..root_innode.len {
-                    debug!("{:?} | ", root_innode.keys[i]);
-                }
-                // debug!("{:?}", root_innode.keys);
-                Ok(())
-            })
-            .unwrap();
             assert_eq!(tree.len(), num as usize);
             dump_tree(&tree, "tree_dump.json");
         }
 
         {
             debug!("Scanning for sequence");
-            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
             for i in 0..num {
                 let id = id_from_key(cursor.current().unwrap());
                 let unmatched = i != id.lower;
@@ -919,7 +880,7 @@ mod test {
                 assert_eq!(cursor.next(), i + 1 < num);
             }
             debug!("Forward scanning for sequence verification");
-            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward).unwrap();
+            let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
             for i in 0..num {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
@@ -936,7 +897,7 @@ mod test {
             let mut entry_key = SmallVec::from_slice(&backward_start_key_slice);
             // search backward required max possible id
             key_with_id(&mut entry_key, &Id::new(::std::u64::MAX, ::std::u64::MAX));
-            let mut cursor = tree.seek(&entry_key, Ordering::Backward).unwrap();
+            let mut cursor = tree.seek(&entry_key, Ordering::Backward);
             for i in (0..num).rev() {
                 let expected = Id::new(0, i);
                 debug!("Expecting id {:?}", expected);
@@ -954,11 +915,7 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(
-                        tree.seek(&key, Ordering::default())
-                            .current()
-                            .unwrap()
-                    ),
+                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
                     id,
                     "{}",
                     i
@@ -976,7 +933,7 @@ mod test {
                 let key = SmallVec::from_slice(&key_slice);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
-                let remove_succeed = tree.remove(&entry_key).unwrap();
+                let remove_succeed = tree.remove(&entry_key);
                 if !remove_succeed {
                     dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 }
@@ -991,11 +948,7 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(
-                        tree.seek(&key, Ordering::default())
-                            .current()
-                            .unwrap()
-                    ),
+                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
                     Id::new(0, deletion_volume), // seek should reach deletion_volume
                     "{}",
                     i
@@ -1008,11 +961,7 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    id_from_key(
-                        tree.seek(&key, Ordering::default())
-                            .current()
-                            .unwrap()
-                    ),
+                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
                     id,
                     "{}",
                     i
@@ -1052,11 +1001,7 @@ mod test {
                     let key_slice = u64_to_slice(j);
                     let key = SmallVec::from_slice(&key_slice);
                     assert_eq!(
-                        id_from_key(
-                            tree.seek(&key, Ordering::default())
-                                .current()
-                                .unwrap()
-                        ),
+                        id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
                         id,
                         "{} / {}",
                         i,
@@ -1086,6 +1031,7 @@ mod test {
 
     #[test]
     pub fn alternative_insertion_pattern() {
+        use index::Cursor;
         env_logger::init();
         let server_group = "b+ tree alternative insertion pattern";
         let server_addr = String::from("127.0.0.1:5400");
@@ -1119,7 +1065,6 @@ mod test {
             debug!("insert {:?}", key);
             tree.insert(&key);
         }
-
 
         let mut rng = thread_rng();
         let die_range = Uniform::new_inclusive(1, 6);

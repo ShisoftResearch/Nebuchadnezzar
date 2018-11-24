@@ -16,6 +16,7 @@ use ram::types::*;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::mem;
 use std::ops::Deref;
@@ -24,7 +25,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::cell::UnsafeCell;
 
 pub type ExtNodeCacheMap = Mutex<LRUCache<Id, Arc<RwLock<ExtNode>>>>;
 pub type ExtNodeCachedMut = RwLockWriteGuard<ExtNode>;
@@ -49,7 +49,7 @@ pub struct ExtNode {
     pub prev: NodeCellRef,
     pub len: usize,
     pub dirty: bool,
-    pub cc: AtomicUsize
+    pub cc: AtomicUsize,
 }
 
 pub struct ExtNodeSplit {
@@ -66,15 +66,14 @@ impl ExtNode {
             prev: Node::none_ref(),
             len: 0,
             dirty: false,
-            cc: AtomicUsize::new(0)
+            cc: AtomicUsize::new(0),
         }
     }
 
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        let (prev_id, next_id) = unsafe {
-            ((&*self.next.get()).ext_id(), (&*self.prev.get()).ext_id())
-        };
+        let (prev_id, next_id) =
+            unsafe { ((&*self.next.get()).ext_id(), (&*self.prev.get()).ext_id()) };
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
         value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
         value[*KEYS_KEY_HASH] = self.keys[..self.len]
@@ -126,7 +125,7 @@ impl ExtNode {
                 prev: self_ref.clone(),
                 len: keys_2_len,
                 dirty: true,
-                cc: AtomicUsize::new(0)
+                cc: AtomicUsize::new(0),
             };
             debug!(
                 "Split to left len {}, right len {}",
@@ -222,14 +221,14 @@ pub fn page_schema() -> Schema {
 
 pub struct NodeCache {
     nodes: RefCell<HashMap<Id, NodeCellRef>>,
-    storage: Arc<AsyncClient>
+    storage: Arc<AsyncClient>,
 }
 
 impl NodeCache {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         NodeCache {
             nodes: RefCell::new(HashMap::new()),
-            storage: neb_client.clone()
+            storage: neb_client.clone(),
         }
     }
 
@@ -238,10 +237,15 @@ impl NodeCache {
             return Arc::new(UnsafeCell::new(Node::None));
         }
         let mut nodes = self.nodes.borrow_mut();
-        nodes.entry(*id).or_insert_with(|| {
-            let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
-            Arc::new(UnsafeCell::new(Node::External(box self.extnode_from_cell(cell))))
-        }).clone()
+        nodes
+            .entry(*id)
+            .or_insert_with(|| {
+                let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
+                Arc::new(UnsafeCell::new(Node::External(
+                    box self.extnode_from_cell(cell),
+                )))
+            })
+            .clone()
     }
 
     fn extnode_from_cell(&self, cell: Cell) -> ExtNode {

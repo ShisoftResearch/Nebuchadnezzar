@@ -4,10 +4,10 @@ use hermes::stm::TxnValRef;
 use index::btree::Slice;
 use index::btree::*;
 use itertools::free::chain;
+use std::cell::UnsafeCell;
 use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
-use std::cell::UnsafeCell;
 
 pub struct InNode {
     pub keys: EntryKeySlice,
@@ -116,7 +116,7 @@ impl InNode {
                 keys: keys_split.keys_2,
                 ptrs: ptr_split.ptrs_2,
                 right_ptr: self.right_ptr.clone(),
-                cc: AtomicUsize::new(0)
+                cc: AtomicUsize::new(0),
             };
             let node_2_ref = Arc::new(UnsafeCell::new(Node::Internal(box node_2)));
             self.len = keys_split.keys_1_len;
@@ -126,15 +126,13 @@ impl InNode {
             let mut new_node_len = node_len;
             let mut new_node_pointers = node_len + 1;
             self.keys.insert_at(key, pos, &mut new_node_len);
-            self.ptrs.insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
+            self.ptrs
+                .insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
             self.len = new_node_len;
             return None;
         }
     }
-    pub fn rebalance_candidate(
-        &self,
-        pointer_pos: usize,
-    ) -> usize {
+    pub fn rebalance_candidate(&self, pointer_pos: usize) -> usize {
         debug_assert!(pointer_pos <= self.len);
         debug!(
             "Searching for rebalance candidate, pos {}, len {}",
@@ -206,11 +204,7 @@ impl InNode {
         }
         self.len += right.len + 1;
     }
-    pub unsafe fn relocate_children(
-        &mut self,
-        left_ptr_pos: usize,
-        right_ptr_pos: usize,
-    ) {
+    pub unsafe fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
         let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
