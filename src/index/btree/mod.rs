@@ -117,13 +117,14 @@ impl BPlusTree {
         cursor
     }
 
-    unsafe fn search(&self, node: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
+    unsafe fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
         debug!("searching for {:?}", key);
-        let node = &*node.get();
+        let node = &*node_ref.get();
         let pos = node.search(key);
         if node.is_ext() {
-            debug!("search in external for {:?}", key);
-            RTCursor::new(pos, &node.ext_id(), ordering)
+            let extnode = node.extnode();
+            debug!("search in external for {:?}, len {}", key, extnode.len);
+            RTCursor::new(pos, node_ref, ordering)
         } else if let &Node::Internal(ref n) = node {
             let next_node_ref = &n.ptrs[pos];
             self.search(next_node_ref, key, ordering)
@@ -435,11 +436,11 @@ impl Node {
 }
 
 impl RTCursor {
-    fn new(pos: usize, id: &Id, ordering: Ordering) -> RTCursor {
+    fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> RTCursor {
         RTCursor {
             index: pos,
             ordering,
-            page: None
+            page: Some(page.clone())
         }
     }
     fn boxed(self) -> Box<IndexCursor> {
