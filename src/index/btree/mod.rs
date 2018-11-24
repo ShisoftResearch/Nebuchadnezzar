@@ -74,9 +74,7 @@ pub enum Node {
 pub struct RTCursor {
     index: usize,
     ordering: Ordering,
-    page: NodeCellRef,
-    next_page: Option<NodeCellRef>,
-    ended: bool,
+    page: Option<NodeCellRef>
 }
 
 impl Default for Ordering {
@@ -468,54 +466,65 @@ impl RTCursor {
 
 impl IndexCursor for RTCursor {
     fn next(&mut self) -> bool {
-//        debug!(
-//            "Next id with index: {}, length: {}",
-//            self.index + 1,
-//            self.page.len
-//        );
-//        match self.ordering {
-//            Ordering::Forward => {
-//                if self.index + 1 >= self.page.len {
-//                    // next page
-//                    if let Some(next_page) = self.next_page.clone() {
-//                        debug!("Shifting page forward");
-//                        self.next_page = self.bz.get_guard(&next_page.next);
-//                        self.index = 0;
-//                        self.page = next_page;
-//                    } else {
-//                        debug!("iterated to end");
-//                        self.ended = true;
-//                        return false;
-//                    }
-//                } else {
-//                    self.index += 1;
-//                    debug!("Advancing cursor to index {}", self.index);
-//                }
-//            }
-//            Ordering::Backward => {
-//                if self.index == 0 {
-//                    // next page
-//                    if let Some(next_page) = self.next_page.clone() {
-//                        debug!("Shifting page backward");
-//                        self.next_page = self.bz.get_guard(&next_page.prev);
-//                        self.index = next_page.len - 1;
-//                        self.page = next_page;
-//                    } else {
-//                        debug!("iterated to end");
-//                        self.ended = true;
-//                        return false;
-//                    }
-//                } else {
-//                    self.index -= 1;
-//                    debug!("Advancing cursor to index {}", self.index);
-//                }
-//            }
-//        }
-        return true;
+        if self.page.is_some() {
+            let current_page = self.page.clone().unwrap();
+            let page = unsafe { &*current_page.get() };
+            let ext_page = page.extnode();
+            debug!(
+                "Next id with index: {}, length: {}",
+                self.index + 1,
+                ext_page.len
+            );
+            match self.ordering {
+                Ordering::Forward => {
+                    if self.index + 1 >= page.len() {
+                        // next page
+                        if unsafe { &*ext_page.next.get() }.is_none() {
+                            debug!("Shifting page forward");
+                            self.index = 0;
+                            self.page = Some(ext_page.next.clone());
+                        } else {
+                            debug!("iterated to end");
+                            self.page = None;
+                            return false;
+                        }
+                    } else {
+                        self.index += 1;
+                        debug!("Advancing cursor to index {}", self.index);
+                    }
+                }
+                Ordering::Backward => {
+                    if self.index == 0 {
+                        // next page
+                        let prev_page = unsafe { &*ext_page.prev.get() };
+                        if !prev_page.is_none() {
+                            debug!("Shifting page backward");
+                            self.page = Some(ext_page.prev.clone());
+                            self.index = prev_page.len() - 1;
+                        } else {
+                            debug!("iterated to end");
+                            self.page = None;
+                            return false;
+                        }
+                    } else {
+                        self.index -= 1;
+                        debug!("Advancing cursor to index {}", self.index);
+                    }
+                }
+            }
+            true
+        } else {
+            false
+        }
     }
 
     fn current(&self) -> Option<&EntryKey> {
-        unimplemented!()
+        if let &Some(ref page_ref) = &self.page {
+            let page = unsafe { &*page_ref.get() };
+            Some(&page.extnode().keys[self.index])
+        } else {
+            return None
+        }
     }
 }
 
@@ -695,6 +704,7 @@ mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
+    use index::Cursor;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -946,7 +956,6 @@ mod test {
                 assert_eq!(
                     id_from_key(
                         tree.seek(&key, Ordering::default())
-                            .unwrap()
                             .current()
                             .unwrap()
                     ),
@@ -984,7 +993,6 @@ mod test {
                 assert_eq!(
                     id_from_key(
                         tree.seek(&key, Ordering::default())
-                            .unwrap()
                             .current()
                             .unwrap()
                     ),
@@ -1002,7 +1010,6 @@ mod test {
                 assert_eq!(
                     id_from_key(
                         tree.seek(&key, Ordering::default())
-                            .unwrap()
                             .current()
                             .unwrap()
                     ),
@@ -1027,7 +1034,7 @@ mod test {
                     let key = SmallVec::from_slice(&key_slice);
                     let mut entry_key = key.clone();
                     key_with_id(&mut entry_key, &id);
-                    let remove_succeed = tree.remove(&entry_key).unwrap();
+                    let remove_succeed = tree.remove(&entry_key);
                     if !remove_succeed {
                         dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
                     }
@@ -1047,7 +1054,6 @@ mod test {
                     assert_eq!(
                         id_from_key(
                             tree.seek(&key, Ordering::default())
-                                .unwrap()
                                 .current()
                                 .unwrap()
                         ),
@@ -1065,7 +1071,7 @@ mod test {
                 let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 assert_eq!(
-                    tree.seek(&key, Ordering::default()).unwrap().current(),
+                    tree.seek(&key, Ordering::default()).current(),
                     None, // should always be 'None' for empty tree
                     "{}",
                     i
@@ -1111,7 +1117,7 @@ mod test {
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             debug!("insert {:?}", key);
-            tree.insert(&key).unwrap();
+            tree.insert(&key);
         }
 
 
@@ -1127,7 +1133,7 @@ mod test {
             if roll_die.next().unwrap() != 6 {
                 continue;
             }
-            let mut cursor = tree.seek(&key, Ordering::Forward).unwrap();
+            let mut cursor = tree.seek(&key, Ordering::Forward);
             for j in i..num {
                 let id = Id::new(0, j);
                 let key_slice = u64_to_slice(j);

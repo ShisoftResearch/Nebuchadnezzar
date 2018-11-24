@@ -319,7 +319,7 @@ mod test {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let key = SmallVec::from_slice(&key_slice);
-            tree.insert(key, &id).unwrap();
+            tree.insert(key, &id);
         });
 
         if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
