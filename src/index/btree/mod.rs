@@ -46,8 +46,8 @@ pub const NUM_KEYS: usize = 24;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
+pub type NodeCellRef = Arc<UnsafeCell<Node>>;
 type EntryKeySlice = [EntryKey; NUM_KEYS];
-type NodeCellRef = Arc<UnsafeCell<Node>>;
 type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 
 // B-Tree is the memtable for the LSM-Tree
@@ -56,7 +56,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    root: NodeCellRef,
+    pub root: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
 }
@@ -413,7 +413,7 @@ impl Node {
             _ => unreachable!(),
         }
     }
-    fn extnode(&self) -> &ExtNode {
+    pub fn extnode(&self) -> &ExtNode {
         match self {
             &Node::External(ref node) => node,
             _ => unreachable!(),
@@ -426,7 +426,7 @@ impl Node {
             _ => unreachable!(),
         }
     }
-    fn innode(&self) -> &InNode {
+    pub fn innode(&self) -> &InNode {
         match self {
             &Node::Internal(ref n) => n,
             _ => unreachable!(),
@@ -436,7 +436,11 @@ impl Node {
 
 impl RTCursor {
     fn new(pos: usize, id: &Id, ordering: Ordering) -> RTCursor {
-        unimplemented!()
+        RTCursor {
+            index: pos,
+            ordering,
+            page: None
+        }
     }
     fn boxed(self) -> Box<IndexCursor> {
         box self
@@ -659,7 +663,7 @@ mod test {
     use dovahkiin::types::custom_types::id::Id;
     use futures::future::Future;
     use hermes::stm::TxnValRef;
-    use index::btree::external::CacheBufferZone;
+    use index::btree::NodeCellRef;
     use index::btree::NUM_KEYS;
     use index::Cursor;
     use index::{id_from_key, key_with_id};
@@ -672,7 +676,7 @@ mod test {
     use smallvec::SmallVec;
     use std::env;
     use std::fs::File;
-    use std::io::Cursor;
+    use std::io::Cursor as StdCursor;
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
@@ -693,80 +697,69 @@ mod test {
 
     fn dump_tree(tree: &BPlusTree, f: &str) {
         debug!("dumping {}", f);
-        let mut bz = CacheBufferZone::new(&tree.ext_node_cache, &tree.storage);
-        let debug_root = cascading_dump_node(tree, tree.root, &mut bz);
+        let debug_root = cascading_dump_node(&tree.root);
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
         let mut file = File::create(f).unwrap();
         file.write_all(json.as_bytes());
     }
 
-    fn cascading_dump_node(
-        tree: &BPlusTree,
-        node: TxnValRef,
-        bz: &mut CacheBufferZone,
-    ) -> DebugNode {
-        let node = tree
-            .stm
-            .transaction(|txn| {
-                txn.read_owned::<Node>(node)
-                    .map(|opt| opt.unwrap_or(Node::None))
-            })
-            .unwrap();
-        match node {
-            Node::External(id) => {
-                let node = bz.get(&*id);
-                let keys = node
-                    .keys
-                    .iter()
-                    .take(node.len)
-                    .map(|key| {
-                        let id = id_from_key(key);
-                        format!("{}\t{:?}", id.lower, key)
-                    })
-                    .collect();
-                return DebugNode {
-                    keys,
+    fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
+        unsafe {
+            match &*node.get() {
+                &Node::External(ref node) => {
+                    let keys = node
+                        .keys
+                        .iter()
+                        .take(node.len)
+                        .map(|key| {
+                            let id = id_from_key(key);
+                            format!("{}\t{:?}", id.lower, key)
+                        })
+                        .collect();
+                    return DebugNode {
+                        keys,
+                        nodes: vec![],
+                        id: Some(format!("{:?}", node.id)),
+                        next: Some(format!("{:?}", (&*node.next.get()).extnode().id)),
+                        prev: Some(format!("{:?}", (&*node.prev.get()).extnode().id)),
+                        len: node.len,
+                        is_external: true,
+                    };
+                }
+                &Node::Internal(ref innode) => {
+                    let len = innode.len;
+                    let nodes = innode
+                        .ptrs
+                        .iter()
+                        .take(len + 1)
+                        .map(|node_ref| cascading_dump_node(node_ref))
+                        .collect();
+                    let keys = innode
+                        .keys
+                        .iter()
+                        .take(len)
+                        .map(|key| format!("{:?}", key))
+                        .collect();
+                    return DebugNode {
+                        keys,
+                        nodes,
+                        id: None,
+                        next: None,
+                        prev: None,
+                        len,
+                        is_external: false,
+                    };
+                }
+                &Node::None => return DebugNode {
+                    keys: vec![String::from("<NOT FOUND>")],
                     nodes: vec![],
-                    id: Some(format!("{:?}", node.id)),
-                    next: Some(format!("{:?}", node.next)),
-                    prev: Some(format!("{:?}", node.prev)),
-                    len: node.len,
-                    is_external: true,
-                };
-            }
-            Node::Internal(innode) => {
-                let len = innode.len;
-                let nodes = innode
-                    .ptrs
-                    .iter()
-                    .take(len + 1)
-                    .map(|node_ref| cascading_dump_node(tree, *node_ref, bz))
-                    .collect();
-                let keys = innode
-                    .keys
-                    .iter()
-                    .take(len)
-                    .map(|key| format!("{:?}", key))
-                    .collect();
-                return DebugNode {
-                    keys,
-                    nodes,
                     id: None,
                     next: None,
                     prev: None,
-                    len,
+                    len: 0,
                     is_external: false,
-                };
+                },
             }
-            Node::None => DebugNode {
-                keys: vec![String::from("<NOT FOUND>")],
-                nodes: vec![],
-                id: None,
-                next: None,
-                prev: None,
-                len: 0,
-                is_external: false,
-            },
         }
     }
 
@@ -809,7 +802,7 @@ mod test {
     fn u64_to_slice(n: u64) -> [u8; 8] {
         let mut key_slice = [0u8; 8];
         {
-            let mut cursor = Cursor::new(&mut key_slice[..]);
+            let mut cursor = StdCursor::new(&mut key_slice[..]);
             cursor.write_u64::<BigEndian>(n);
         };
         key_slice
