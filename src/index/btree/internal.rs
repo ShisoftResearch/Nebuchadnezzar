@@ -156,7 +156,6 @@ impl InNode {
     ) -> Result<(), TxnErr> {
         let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
         let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
-        debug_assert_ne!(left_node.ext_id(), right_node.ext_id());
         let left_len = left_node.len();
         let right_len = right_node.len();
         let mut merged_len = 0;
