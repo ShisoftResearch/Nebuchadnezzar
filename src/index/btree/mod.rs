@@ -117,15 +117,24 @@ impl BPlusTree {
         cursor
     }
 
-    unsafe fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
+    unsafe fn search(
+        &self,
+        node_ref: &NodeCellRef,
+        key: &EntryKey,
+        ordering: Ordering,
+    ) -> RTCursor {
         debug!("searching for {:?}", key);
         let node = &*node_ref.get();
         let pos = node.search(key);
         if node.is_ext() {
             let extnode = node.extnode();
-            debug!("search in external for {:?}, len {}", key, extnode.len);
+            debug!(
+                "search in external for {:?}, len {}, content: {:?}",
+                key, extnode.len, extnode.keys
+            );
             RTCursor::new(pos, node_ref, ordering)
         } else if let &Node::Internal(ref n) = node {
+            debug!("search in internal node for {:?}, len {}", key, n.len);
             let next_node_ref = &n.ptrs[pos];
             self.search(next_node_ref, key, ordering)
         } else {
@@ -420,7 +429,7 @@ impl Node {
             _ => unreachable!(),
         }
     }
-    fn ext_id(&self) -> Id {
+    pub fn ext_id(&self) -> Id {
         match self {
             &Node::External(ref node) => node.id,
             &Node::None => Id::unit_id(),
@@ -437,11 +446,21 @@ impl Node {
 
 impl RTCursor {
     fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> RTCursor {
-        RTCursor {
+        let mut cursor = RTCursor {
             index: pos,
             ordering,
-            page: Some(page.clone())
+            page: Some(page.clone()),
+        };
+        match ordering {
+            Ordering::Forward => {
+                let node = unsafe { &*page.get() };
+                if pos >= node.innode().len {
+                    cursor.next();
+                }
+            }
+            Ordering::Backward => {}
         }
+        cursor
     }
     fn boxed(self) -> Box<IndexCursor> {
         box self
@@ -463,8 +482,9 @@ impl IndexCursor for RTCursor {
                 Ordering::Forward => {
                     if self.index + 1 >= page.len() {
                         // next page
-                        if unsafe { &*ext_page.next.get() }.is_none() {
-                            debug!("Shifting page forward");
+                        let next_page = unsafe { &*ext_page.next.get() };
+                        if !next_page.is_none() {
+                            debug!("Shifting page forward, next page len: {}", next_page.len());
                             self.index = 0;
                             self.page = Some(ext_page.next.clone());
                         } else {
@@ -505,6 +525,9 @@ impl IndexCursor for RTCursor {
     fn current(&self) -> Option<&EntryKey> {
         if let &Some(ref page_ref) = &self.page {
             let page = unsafe { &*page_ref.get() };
+            if self.index >= page.len() {
+                panic!("cursor position overflowed {}/{}", self.index, page.len())
+            }
             Some(&page.extnode().keys[self.index])
         } else {
             return None;
@@ -721,8 +744,8 @@ mod test {
                         keys,
                         nodes: vec![],
                         id: Some(format!("{:?}", node.id)),
-                        next: Some(format!("{:?}", (&*node.next.get()).extnode().id)),
-                        prev: Some(format!("{:?}", (&*node.prev.get()).extnode().id)),
+                        next: Some(format!("{:?}", (&*node.next.get()).ext_id())),
+                        prev: Some(format!("{:?}", (&*node.prev.get()).ext_id())),
                         len: node.len,
                         is_external: true,
                     };
@@ -751,15 +774,17 @@ mod test {
                         is_external: false,
                     };
                 }
-                &Node::None => return DebugNode {
-                    keys: vec![String::from("<NOT FOUND>")],
-                    nodes: vec![],
-                    id: None,
-                    next: None,
-                    prev: None,
-                    len: 0,
-                    is_external: false,
-                },
+                &Node::None => {
+                    return DebugNode {
+                        keys: vec![String::from("<NOT FOUND>")],
+                        nodes: vec![],
+                        id: None,
+                        next: None,
+                        prev: None,
+                        len: 0,
+                        is_external: false,
+                    }
+                }
             }
         }
     }
