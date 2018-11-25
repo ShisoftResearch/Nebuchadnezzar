@@ -157,12 +157,13 @@ impl BPlusTree {
             };
             // TODO: review swap root
             unsafe {
-                let old_root = self.root.get();
+                let old_root = &mut *self.root.get();
                 new_in_root.keys[0] = pivot;
-                new_in_root.ptrs[0].get().swap(old_root);
                 new_in_root.ptrs[1] = new_node;
+                let first_ptr = &mut *new_in_root.ptrs[0].get();
                 let new_root = Node::Internal(box new_in_root);
-                self.root.get().replace(new_root);
+                *first_ptr = new_root;
+                mem::swap(old_root, first_ptr);
             }
         }
         self.len.fetch_add(1, Relaxed);
