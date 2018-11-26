@@ -217,7 +217,7 @@ impl BPlusTree {
                         node.len()
                     );
                     let mut current_innode = node.innode_mut();
-                    current_innode.insert(pivot, ode_ref), pivot_pos)
+                    current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
                 };
                 if result.is_some() {
                     debug!("Sub level split caused current level split");
