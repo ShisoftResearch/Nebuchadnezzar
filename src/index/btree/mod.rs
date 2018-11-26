@@ -32,6 +32,8 @@ use std::fmt::Error;
 use std::fmt::Formatter;
 use std::io::Write;
 use std::mem;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
@@ -46,7 +48,7 @@ pub const NUM_KEYS: usize = 24;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
-pub type NodeCellRef = Arc<UnsafeCell<Node>>;
+pub type NodeCellRef = Arc<Node>;
 type EntryKeySlice = [EntryKey; NUM_KEYS];
 type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 
@@ -59,12 +61,6 @@ pub struct BPlusTree {
     pub root: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
-}
-
-pub enum Node {
-    External(Box<ExtNode>),
-    Internal(Box<InNode>),
-    None,
 }
 
 // This is the runtime cursor on iteration
@@ -88,12 +84,12 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: Arc::new(UnsafeCell::new(Node::None)),
+            root: Arc::new(Node::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
-        tree.root = Arc::new(UnsafeCell::new(Node::new_external(root_id)));
+        tree.root = Arc::new(Node::new_external(root_id));
         return tree;
     }
 
@@ -124,44 +120,44 @@ impl BPlusTree {
         ordering: Ordering,
     ) -> RTCursor {
         debug!("searching for {:?}", key);
-        let node = &*node_ref.get();
-        let pos = node.search(key);
-        if node.is_ext() {
-            let extnode = node.extnode();
-            debug!(
-                "search in external for {:?}, len {}, content: {:?}",
-                key, extnode.len, extnode.keys
-            );
-            RTCursor::new(pos, node_ref, ordering)
-        } else if let &Node::Internal(ref n) = node {
-            debug!("search in internal node for {:?}, len {}", key, n.len);
-            let next_node_ref = &n.ptrs[pos];
-            self.search(next_node_ref, key, ordering)
-        } else {
-            unreachable!()
-        }
+        return node_ref.read(|node| {
+            let pos = node.search(key);
+            if node.is_ext() {
+                let extnode = node.extnode();
+                debug!(
+                    "search in external for {:?}, len {}, content: {:?}",
+                    key, extnode.len, extnode.keys
+                );
+                RTCursor::new(pos, node_ref, ordering)
+            } else if let &NodeData::Internal(ref n) = node {
+                debug!("search in internal node for {:?}, len {}", key, n.len);
+                let next_node_ref = &n.ptrs[pos];
+                self.search(next_node_ref, key, ordering)
+            } else {
+                unreachable!()
+            }
+        })
     }
 
     pub fn insert(&self, key: &EntryKey) {
         if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, key.clone()) }
         {
             debug!("split root with pivot key {:?}", pivotKey);
-            let first_key = unsafe { (&*new_node.get()).first_key() };
+            let first_key = new_node.read_unchecked().first_key();
             let pivot = pivotKey.unwrap_or_else(|| first_key);
             let mut new_in_root = InNode {
                 keys: make_array!(NUM_KEYS, Default::default()),
                 ptrs: make_array!(NUM_PTRS, Default::default()),
-                right_ptr: Arc::new(UnsafeCell::new(Node::None)),
-                cc: AtomicUsize::new(0),
+                right: Arc::new(Node::none()),
                 len: 1,
             };
             // TODO: review swap root
             unsafe {
-                let old_root = &mut *self.root.get();
+                let old_root = &mut *self.root.write();
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[1] = new_node;
-                let first_ptr = &mut *new_in_root.ptrs[0].get();
-                let new_root = Node::Internal(box new_in_root);
+                let first_ptr = &mut *new_in_root.ptrs[0].write();
+                let new_root = NodeData::Internal(box new_in_root);
                 *first_ptr = new_root;
                 mem::swap(old_root, first_ptr);
             }
@@ -174,7 +170,7 @@ impl BPlusTree {
         node_ref: &NodeCellRef,
         key: EntryKey,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-        let node = &mut *node_ref.get();
+        let node = &mut *node_ref.write();
         let pos = node.search(&key);
         debug!(
             "insert to node, len {}, pos: {}, external: {}",
@@ -183,19 +179,19 @@ impl BPlusTree {
             node.is_ext()
         );
         let split_node = match node {
-            &mut Node::External(ref mut node) => {
+            &mut NodeData::External(ref mut node) => {
                 debug!(
                     "insert into external at {}, key {:?}, id {:?}",
                     pos, key, node.id
                 );
                 return node.insert(key, pos, self, node_ref);
             }
-            &mut Node::Internal(ref mut n) => {
+            &mut NodeData::Internal(ref mut n) => {
                 let next_node_ref = &n.ptrs[pos];
                 debug!("insert into internal at {}, has keys {}", pos, n.len);
                 self.insert_to_node(next_node_ref, key)
             }
-            &mut Node::None => unreachable!(),
+            &mut NodeData::None => unreachable!(),
         };
         match split_node {
             Some((new_node_ref, pivot_key)) => {
@@ -203,13 +199,15 @@ impl BPlusTree {
                     "Sub level node split, shall insert new node to current level, pivot {:?}",
                     pivot_key
                 );
-                let new_node = &*new_node_ref.get();
-                debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                let pivot = pivot_key.unwrap_or_else(|| {
-                    let first_key = new_node.first_key();
-                    debug_assert_ne!(first_key.len(), 0);
-                    first_key
-                });
+                let pivot = {
+                    let new_node = new_node_ref.read_unchecked();
+                    debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                    pivot_key.unwrap_or_else(|| {
+                        let first_key = new_node.first_key();
+                        debug_assert_ne!(first_key.len(), 0);
+                        first_key
+                    })
+                };
                 debug!("New pivot {:?}", pivot);
                 let result = {
                     let pivot_pos = node.search(&pivot);
@@ -219,7 +217,7 @@ impl BPlusTree {
                         node.len()
                     );
                     let mut current_innode = node.innode_mut();
-                    current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
+                    current_innode.insert(pivot, ode_ref), pivot_pos)
                 };
                 if result.is_some() {
                     debug!("Sub level split caused current level split");
@@ -233,11 +231,11 @@ impl BPlusTree {
     pub fn remove(&self, key: &EntryKey) -> bool {
         let root = &self.root;
         let removed = unsafe { self.remove_from_node(root, key) };
-        let root_node = unsafe { &mut *root.get() };
+        let root_node = &mut *root.write();
         if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
             // When root is external and have no keys but one pointer will take the only sub level
             // pointer node as the new root node.
-            let new_root = unsafe { &mut *root_node.innode().ptrs[0].get() };
+            let new_root = &mut *root_node.innode().ptrs[0].write();
             // TODO: check memory leak
             mem::swap(root_node, new_root);
         }
@@ -249,14 +247,14 @@ impl BPlusTree {
 
     unsafe fn remove_from_node(&self, node: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
         debug!("Removing {:?} from node", key);
-        let mut node = &mut *node.get();
+        let mut node = &mut *node.write();
         let pos = node.search(key);
-        if let Node::Internal(ref mut n) = node {
+        if let NodeData::Internal(ref mut n) = node {
             let mut status = self.remove_from_node(&n.ptrs[pos], key);
             if !status.removed {
                 return status;
             }
-            let sub_node = &mut *n.ptrs[pos].get();
+            let sub_node = &mut *n.ptrs[pos].write();
             {
                 if sub_node.len() == 0 {
                     // need to remove empty child node
@@ -280,7 +278,7 @@ impl BPlusTree {
                     let cand_ptr_pos = n.rebalance_candidate(pos);
                     let left_ptr_pos = min(pos, cand_ptr_pos);
                     let right_ptr_pos = max(pos, cand_ptr_pos);
-                    let cand_node = &mut *n.ptrs[cand_ptr_pos].get();
+                    let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
                     debug_assert_eq!(cand_node.is_ext(), sub_node.is_ext());
                     if sub_node.cannot_merge() || cand_node.cannot_merge() {
                         // relocate
@@ -296,7 +294,7 @@ impl BPlusTree {
                 }
             }
             return status;
-        } else if let &mut Node::External(ref mut node) = node {
+        } else if let &mut NodeData::External(ref mut node) = node {
             if pos >= node.len {
                 debug!(
                     "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
@@ -337,10 +335,15 @@ impl BPlusTree {
     }
 
     unsafe fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
-        let value = &*value.get();
-        let extnode = value.extnode();
-        if extnode.is_dirty() {
-            let cell = value.extnode().to_cell();
+        let cell = value.read(|node| {
+            let extnode = node.extnode();
+            if extnode.is_dirty() {
+                Some(extnode.to_cell())
+            } else {
+                None
+            }
+        });
+        if let Some(cell) = cell {
             client.upsert_cell(cell).wait().unwrap();
         }
     }
@@ -351,16 +354,16 @@ impl BPlusTree {
     }
 }
 
-impl Node {
-    pub fn none_ref() -> NodeCellRef {
-        Arc::new(UnsafeCell::new(Node::None))
-    }
-    pub fn new_external(id: Id) -> Node {
-        Node::External(box ExtNode::new(id))
-    }
+pub enum NodeData {
+    External(Box<ExtNode>),
+    Internal(Box<InNode>),
+    None,
+}
+
+impl NodeData {
     pub fn is_none(&self) -> bool {
         match self {
-            &Node::None => true,
+            &NodeData::None => true,
             _ => false,
         }
     }
@@ -380,16 +383,16 @@ impl Node {
 
     fn remove(&mut self, pos: usize) {
         match self {
-            &mut Node::External(ref mut node) => node.remove_at(pos),
-            &mut Node::Internal(ref mut node) => node.remove_at(pos),
-            &mut Node::None => unreachable!(),
+            &mut NodeData::External(ref mut node) => node.remove_at(pos),
+            &mut NodeData::Internal(ref mut node) => node.remove_at(pos),
+            &mut NodeData::None => unreachable!(),
         }
     }
     fn is_ext(&self) -> bool {
         match self {
-            &Node::External(_) => true,
-            &Node::Internal(_) => false,
-            &Node::None => panic!(),
+            &NodeData::External(_) => true,
+            &NodeData::Internal(_) => false,
+            &NodeData::None => panic!(),
         }
     }
     fn first_key(&self) -> EntryKey {
@@ -414,34 +417,101 @@ impl Node {
     }
     fn extnode_mut(&mut self) -> &mut ExtNode {
         match self {
-            &mut Node::External(ref mut node) => node,
+            &mut NodeData::External(ref mut node) => node,
             _ => unreachable!(),
         }
     }
     fn innode_mut(&mut self) -> &mut InNode {
         match self {
-            &mut Node::Internal(ref mut n) => n,
+            &mut NodeData::Internal(ref mut n) => n,
             _ => unreachable!(),
         }
     }
     pub fn extnode(&self) -> &ExtNode {
         match self {
-            &Node::External(ref node) => node,
+            &NodeData::External(ref node) => node,
             _ => unreachable!(),
         }
     }
     pub fn ext_id(&self) -> Id {
         match self {
-            &Node::External(ref node) => node.id,
-            &Node::None => Id::unit_id(),
+            &NodeData::External(ref node) => node.id,
+            &NodeData::None => Id::unit_id(),
             _ => unreachable!(),
         }
     }
     pub fn innode(&self) -> &InNode {
         match self {
-            &Node::Internal(ref n) => n,
+            &NodeData::Internal(ref n) => n,
             _ => unreachable!(),
         }
+    }
+}
+
+pub struct Node {
+    data: UnsafeCell<NodeData>,
+    cc: AtomicUsize,
+}
+
+impl Node {
+    fn new(data: NodeData) -> Self {
+        Node {
+            data: UnsafeCell::new(data),
+            cc: AtomicUsize::new(0),
+        }
+    }
+
+    fn internal(innode: InNode) -> Self {
+        Self::new(NodeData::Internal(box innode))
+    }
+
+    fn external(extnode: ExtNode) -> Self {
+        Self::new(NodeData::External(box extnode))
+    }
+
+    fn none() -> Self {
+        Self::new(NodeData::None)
+    }
+    pub fn none_ref() -> NodeCellRef {
+        Arc::new(Node::none())
+    }
+    pub fn new_external(id: Id) -> Self {
+        Self::external(ExtNode::new(id))
+    }
+
+    pub fn write<'a>(&self) -> NodeWriteGuard {
+        NodeWriteGuard {
+            data: self.data.get(),
+            cc: &self.cc as *const AtomicUsize,
+        }
+    }
+
+    pub fn read<F: FnMut(&NodeData) -> R, R>(&self, mut func: F) -> R {
+        let data = unsafe { &*self.data.get() };
+        func(data)
+    }
+
+    pub fn read_unchecked(&self) -> &NodeData {
+        unsafe { &*self.data.get() }
+    }
+}
+
+pub struct NodeWriteGuard {
+    data: *mut NodeData,
+    cc: *const AtomicUsize,
+}
+
+impl<'a> Deref for NodeWriteGuard {
+    type Target = NodeData;
+
+    fn deref(&self) -> &<Self as Deref>::Target {
+        unsafe { &*self.data }
+    }
+}
+
+impl<'a> DerefMut for NodeWriteGuard {
+    fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
+        unsafe { &mut*self.data }
     }
 }
 
@@ -454,8 +524,8 @@ impl RTCursor {
         };
         match ordering {
             Ordering::Forward => {
-                let node = unsafe { &*page.get() };
-                if pos >= node.extnode().len {
+                let len = page.read(|node| node.len());
+                if pos >= len {
                     cursor.next();
                 }
             }
@@ -472,64 +542,73 @@ impl IndexCursor for RTCursor {
     fn next(&mut self) -> bool {
         if self.page.is_some() {
             let current_page = self.page.clone().unwrap();
-            let page = unsafe { &*current_page.get() };
-            let ext_page = page.extnode();
-            debug!(
-                "Next id with index: {}, length: {}",
-                self.index + 1,
-                ext_page.len
-            );
-            match self.ordering {
-                Ordering::Forward => {
-                    if self.index + 1 >= page.len() {
-                        // next page
-                        let next_page = unsafe { &*ext_page.next.get() };
-                        if !next_page.is_none() {
-                            debug!("Shifting page forward, next page len: {}", next_page.len());
-                            self.index = 0;
-                            self.page = Some(ext_page.next.clone());
+            current_page.read(|page| {
+                let ext_page = page.extnode();
+                debug!(
+                    "Next id with index: {}, length: {}",
+                    self.index + 1,
+                    ext_page.len
+                );
+                match self.ordering {
+                    Ordering::Forward => {
+                        if self.index + 1 >= page.len() {
+                            // next page
+                            return ext_page.next.read(|next_page| {
+                                if !next_page.is_none() {
+                                    debug!(
+                                        "Shifting page forward, next page len: {}",
+                                        next_page.len()
+                                    );
+                                    self.index = 0;
+                                    self.page = Some(ext_page.next.clone());
+                                    return true;
+                                } else {
+                                    debug!("iterated to end");
+                                    self.page = None;
+                                    return false;
+                                }
+                            });
                         } else {
-                            debug!("iterated to end");
-                            self.page = None;
-                            return false;
+                            self.index += 1;
+                            debug!("Advancing cursor to index {}", self.index);
                         }
-                    } else {
-                        self.index += 1;
-                        debug!("Advancing cursor to index {}", self.index);
+                    }
+                    Ordering::Backward => {
+                        if self.index == 0 {
+                            // next page
+                            return ext_page.prev.read(|prev_page| {
+                                if !prev_page.is_none() {
+                                    debug!("Shifting page backward");
+                                    self.page = Some(ext_page.prev.clone());
+                                    self.index = prev_page.len() - 1;
+                                    return true;
+                                } else {
+                                    debug!("iterated to end");
+                                    self.page = None;
+                                    return false;
+                                }
+                            });
+                        } else {
+                            self.index -= 1;
+                            debug!("Advancing cursor to index {}", self.index);
+                        }
                     }
                 }
-                Ordering::Backward => {
-                    if self.index == 0 {
-                        // next page
-                        let prev_page = unsafe { &*ext_page.prev.get() };
-                        if !prev_page.is_none() {
-                            debug!("Shifting page backward");
-                            self.page = Some(ext_page.prev.clone());
-                            self.index = prev_page.len() - 1;
-                        } else {
-                            debug!("iterated to end");
-                            self.page = None;
-                            return false;
-                        }
-                    } else {
-                        self.index -= 1;
-                        debug!("Advancing cursor to index {}", self.index);
-                    }
-                }
-            }
-            true
+                true
+            })
         } else {
             false
         }
     }
 
-    fn current(&self) -> Option<&EntryKey> {
+    fn current(&self) -> Option<EntryKey> {
         if let &Some(ref page_ref) = &self.page {
-            let page = unsafe { &*page_ref.get() };
-            if self.index >= page.len() {
-                panic!("cursor position overflowed {}/{}", self.index, page.len())
-            }
-            Some(&page.extnode().keys[self.index])
+            page_ref.read(|page: &NodeData| {
+                if self.index >= page.len() {
+                    panic!("cursor position overflowed {}/{}", self.index, page.len())
+                }
+                Some(page.extnode().keys[self.index].clone())
+            })
         } else {
             return None;
         }
@@ -629,7 +708,7 @@ struct RemoveStatus {
 
 impl Default for Node {
     fn default() -> Self {
-        Node::None
+        Node::none()
     }
 }
 
@@ -689,6 +768,7 @@ mod test {
     use futures::future::Future;
     use hermes::stm::TxnValRef;
     use index::btree::NodeCellRef;
+    use index::btree::NodeData;
     use index::btree::NUM_KEYS;
     use index::Cursor;
     use index::{id_from_key, key_with_id};
@@ -730,8 +810,8 @@ mod test {
 
     fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
         unsafe {
-            match &*node.get() {
-                &Node::External(ref node) => {
+            match &(&*node.get()).data {
+                &NodeData::External(ref node) => {
                     let keys = node
                         .keys
                         .iter()
@@ -751,7 +831,7 @@ mod test {
                         is_external: true,
                     };
                 }
-                &Node::Internal(ref innode) => {
+                &NodeData::Internal(ref innode) => {
                     let len = innode.len;
                     let nodes = innode
                         .ptrs
@@ -775,7 +855,7 @@ mod test {
                         is_external: false,
                     };
                 }
-                &Node::None => {
+                &NodeData::None => {
                     return DebugNode {
                         keys: vec![String::from("<NOT FOUND>")],
                         nodes: vec![],

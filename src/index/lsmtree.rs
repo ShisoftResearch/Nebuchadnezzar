@@ -194,13 +194,14 @@ impl LSMTreeCursor {
     }
 
     fn next_candidate(&mut self) -> (bool, usize) {
+        // TODO: redo this part
         let min_tree = self
             .level_cursors
             .iter()
             .enumerate()
             .map(|(i, cursor)| (i, cursor.current()))
             .filter_map(|(i, current)| current.map(|current_val| (i, current_val)))
-            .min_by_key(|(i, val)| *val)
+            .min_by_key(|(i, val)| val.clone())
             .map(|(id, _)| id);
         if let Some(id) = min_tree {
             let min_has_next = self.level_cursors[id].next();
@@ -210,7 +211,7 @@ impl LSMTreeCursor {
                     .iter()
                     .enumerate()
                     .filter_map(|(level, cursor)| cursor.current().map(|key| (id, key)))
-                    .min_by_key(|(level, key)| *key);
+                    .min_by_key(|(level, key)| key.clone());
                 if let Some((id, _)) = next {
                     return (true, id);
                 }
@@ -235,7 +236,7 @@ impl Cursor for LSMTreeCursor {
             let candidate_key = self.level_cursors[candidate_level].current().unwrap();
             if self.tombstones[candidate_level + 1]
                 .read()
-                .contains(candidate_key)
+                .contains(&candidate_key)
             {
                 // marked in tombstone, skip
                 continue;
@@ -245,7 +246,7 @@ impl Cursor for LSMTreeCursor {
         return false;
     }
 
-    fn current(&self) -> Option<&EntryKey> {
+    fn current(&self) -> Option<EntryKey> {
         self.level_cursors.iter().filter_map(|c| c.current()).min()
     }
 }

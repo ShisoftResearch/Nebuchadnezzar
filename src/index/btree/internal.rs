@@ -12,9 +12,8 @@ use std::sync::Arc;
 pub struct InNode {
     pub keys: EntryKeySlice,
     pub ptrs: NodePtrCellSlice,
-    pub right_ptr: NodeCellRef,
-    pub cc: AtomicUsize,
     pub len: usize,
+    pub right: NodeCellRef,
 }
 
 pub struct InNodeKeysSplit {
@@ -115,12 +114,11 @@ impl InNode {
                 len: keys_split.keys_2_len,
                 keys: keys_split.keys_2,
                 ptrs: ptr_split.ptrs_2,
-                right_ptr: self.right_ptr.clone(),
-                cc: AtomicUsize::new(0),
+                right: self.right.clone(),
             };
-            let node_2_ref = Arc::new(UnsafeCell::new(Node::Internal(box node_2)));
+            let node_2_ref = Arc::new(Node::internal(node_2));
             self.len = keys_split.keys_1_len;
-            self.right_ptr = node_2_ref.clone();
+            self.right = node_2_ref.clone();
             return Some((node_2_ref, Some(keys_split.pivot_key)));
         } else {
             let mut new_node_len = node_len;
@@ -154,8 +152,8 @@ impl InNode {
         left_ptr_pos: usize,
         right_ptr_pos: usize,
     ) -> Result<(), TxnErr> {
-        let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
-        let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
+        let mut left_node = &mut *self.ptrs[left_ptr_pos].write();
+        let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
         let left_len = left_node.len();
         let right_len = right_node.len();
         let mut merged_len = 0;
@@ -205,8 +203,8 @@ impl InNode {
     }
     pub unsafe fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
-        let mut left_node = &mut *self.ptrs[left_ptr_pos].get();
-        let mut right_node = &mut *self.ptrs[right_ptr_pos].get();
+        let mut left_node = &mut *self.ptrs[left_ptr_pos].write();
+        let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
         let mut new_right_node_key = Default::default();
         let half_full_pos = (left_node.len() + right_node.len()) / 2;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());

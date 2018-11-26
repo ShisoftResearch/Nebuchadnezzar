@@ -49,7 +49,6 @@ pub struct ExtNode {
     pub prev: NodeCellRef,
     pub len: usize,
     pub dirty: bool,
-    pub cc: AtomicUsize,
 }
 
 pub struct ExtNodeSplit {
@@ -66,14 +65,14 @@ impl ExtNode {
             prev: Node::none_ref(),
             len: 0,
             dirty: false,
-            cc: AtomicUsize::new(0),
         }
     }
 
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        let (prev_id, next_id) =
-            unsafe { ((&*self.next.get()).ext_id(), (&*self.prev.get()).ext_id()) };
+        let prev_id = self.prev.read(|node| node.extnode().id);
+        let next_id = self.next.read(|node| node.extnode().id);
+
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
         value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
         value[*KEYS_KEY_HASH] = self.keys[..self.len]
@@ -103,7 +102,7 @@ impl ExtNode {
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             // cached.dump();
             let pivot = self_len / 2;
-            let self_next = &mut *self.next.get();
+            let self_next = &mut *self.next.write();
             let new_page_id = tree.new_page_id();
             let mut keys_1 = &mut self.keys;
             let mut keys_2 = keys_1.split_at_pivot(pivot, self_len);
@@ -125,13 +124,12 @@ impl ExtNode {
                 prev: self_ref.clone(),
                 len: keys_2_len,
                 dirty: true,
-                cc: AtomicUsize::new(0),
             };
             debug!(
                 "Split to left len {}, right len {}",
                 self.len, extnode_2.len
             );
-            let node_2 = Arc::new(UnsafeCell::new(Node::External(box extnode_2)));
+            let node_2 = Arc::new(Node::external(extnode_2));
             if !self_next.is_none() {
                 self_next.extnode_mut().prev = node_2.clone();
             }
@@ -167,8 +165,9 @@ impl ExtNode {
     }
     pub unsafe fn remove_node(&self) {
         let id = &self.id;
-        let mut prev = &mut *self.prev.get();
-        let mut next = &mut *self.next.get();
+        // TODO: adjust write latch ordering
+        let mut prev = &mut *self.prev.write();
+        let mut next = &mut *self.next.write();
         debug_assert_ne!(id, &Id::unit_id());
         if !prev.is_none() {
             let mut prev_node = prev.extnode_mut();
@@ -185,8 +184,9 @@ impl ExtNode {
 }
 
 pub unsafe fn rearrange_empty_extnode(node: &ExtNode) -> Id {
-    let mut prev = &mut *node.prev.get();
-    let mut next = &mut *node.next.get();
+    // TODO: adjust write latch ordering
+    let mut prev = &mut *node.prev.write();
+    let mut next = &mut *node.next.write();
     if !prev.is_none() {
         let mut prev_node = prev.extnode_mut();
         prev_node.next = node.next.clone();
@@ -234,16 +234,14 @@ impl NodeCache {
 
     pub fn get(&self, id: &Id) -> NodeCellRef {
         if id.is_unit_id() {
-            return Arc::new(UnsafeCell::new(Node::None));
+            return Arc::new(Node::none());
         }
         let mut nodes = self.nodes.borrow_mut();
         nodes
             .entry(*id)
             .or_insert_with(|| {
                 let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
-                Arc::new(UnsafeCell::new(Node::External(
-                    box self.extnode_from_cell(cell),
-                )))
+                Arc::new(Node::external(self.extnode_from_cell(cell)))
             })
             .clone()
     }
@@ -273,7 +271,6 @@ impl NodeCache {
             prev: self.get(prev),
             len: key_count,
             dirty: false,
-            cc: AtomicUsize::new(0),
         }
     }
 }

@@ -51,7 +51,7 @@ pub trait Slice: Sized {
 
 pub trait Cursor {
     fn next(&mut self) -> bool;
-    fn current(&self) -> Option<&EntryKey>;
+    fn current(&self) -> Option<EntryKey>;
 }
 
 pub trait MergingPage {
