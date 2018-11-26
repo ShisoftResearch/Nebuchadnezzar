@@ -120,7 +120,8 @@ impl BPlusTree {
         ordering: Ordering,
     ) -> RTCursor {
         debug!("searching for {:?}", key);
-        return node_ref.read(|node| {
+        return node_ref.read(|node_handler| {
+            let node = &**node_handler;
             let pos = node.search(key);
             if node.is_ext() {
                 let extnode = node.extnode();
@@ -486,9 +487,9 @@ impl Node {
         }
     }
 
-    pub fn read<F: FnMut(&NodeData) -> R, R>(&self, mut func: F) -> R {
-        let data = unsafe { &*self.data.get() };
-        func(data)
+    pub fn read<'a, F: FnMut(&NodeReadHandler) -> R + 'a, R: 'a>(&'a self, mut func: F) -> R {
+        let handler = NodeReadHandler { ptr: self.data.get() };
+        func(&handler)
     }
 
     pub fn read_unchecked(&self) -> &NodeData {
@@ -501,7 +502,7 @@ pub struct NodeWriteGuard {
     cc: *const AtomicUsize,
 }
 
-impl<'a> Deref for NodeWriteGuard {
+impl Deref for NodeWriteGuard {
     type Target = NodeData;
 
     fn deref(&self) -> &<Self as Deref>::Target {
@@ -509,9 +510,21 @@ impl<'a> Deref for NodeWriteGuard {
     }
 }
 
-impl<'a> DerefMut for NodeWriteGuard {
+impl DerefMut for NodeWriteGuard {
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
         unsafe { &mut*self.data }
+    }
+}
+
+pub struct NodeReadHandler {
+    ptr: *const NodeData
+}
+
+impl Deref for NodeReadHandler {
+    type Target = NodeData;
+
+    fn deref(&self) -> &<Self as Deref>::Target {
+        unsafe { &*self.ptr }
     }
 }
 
@@ -601,13 +614,14 @@ impl IndexCursor for RTCursor {
         }
     }
 
-    fn current(&self) -> Option<EntryKey> {
+    fn current(&self) -> Option<&EntryKey> {
         if let &Some(ref page_ref) = &self.page {
-            page_ref.read(|page: &NodeData| {
+            page_ref.read(|handler| {
+                let page = unsafe { &*handler.ptr };
                 if self.index >= page.len() {
                     panic!("cursor position overflowed {}/{}", self.index, page.len())
                 }
-                Some(page.extnode().keys[self.index].clone())
+                Some(&page.extnode().keys[self.index])
             })
         } else {
             return None;
@@ -810,7 +824,7 @@ mod test {
 
     fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
         unsafe {
-            match &(&*node.get()).data {
+            match &*node.write() {
                 &NodeData::External(ref node) => {
                     let keys = node
                         .keys
@@ -825,8 +839,8 @@ mod test {
                         keys,
                         nodes: vec![],
                         id: Some(format!("{:?}", node.id)),
-                        next: Some(format!("{:?}", (&*node.next.get()).ext_id())),
-                        prev: Some(format!("{:?}", (&*node.prev.get()).ext_id())),
+                        next: Some(format!("{:?}", node.next.write().ext_id())),
+                        prev: Some(format!("{:?}", node.prev.write().ext_id())),
                         len: node.len,
                         is_external: true,
                     };

@@ -365,9 +365,7 @@ where
     }
 
     fn mark_deleted(&self, key: &EntryKey) -> bool {
-        let search = self.seek(key, Ordering::Forward).current();
-        if search.is_none() { return false }
-        if &search.unwrap() == key {
+        if self.seek(key, Ordering::Forward).current() == Some(key) {
             let mut tombstones = self.tombstones.write();
             if tombstones.contains(key) {
                 return false;
@@ -568,14 +566,14 @@ where
         }
     }
 
-    fn current(&self) -> Option<EntryKey> {
+    fn current(&self) -> Option<&EntryKey> {
         if self.pos < 0 || self.pos >= self.page_len {
             // debug!("out of flow, exit");
             return None;
         }
         if let Some(ref page) = self.current {
             // debug!("has current page, return {}", self.pos);
-            Some(page.slice.as_slice_immute()[self.pos].clone())
+            Some(&page.slice.as_slice_immute()[self.pos])
         } else {
             //  debug!("have no current page, return none");
             None

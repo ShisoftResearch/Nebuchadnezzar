@@ -236,7 +236,7 @@ impl Cursor for LSMTreeCursor {
             let candidate_key = self.level_cursors[candidate_level].current().unwrap();
             if self.tombstones[candidate_level + 1]
                 .read()
-                .contains(&candidate_key)
+                .contains(candidate_key)
             {
                 // marked in tombstone, skip
                 continue;
@@ -246,7 +246,7 @@ impl Cursor for LSMTreeCursor {
         return false;
     }
 
-    fn current(&self) -> Option<EntryKey> {
+    fn current(&self) -> Option<&EntryKey> {
         self.level_cursors.iter().filter_map(|c| c.current()).min()
     }
 }
