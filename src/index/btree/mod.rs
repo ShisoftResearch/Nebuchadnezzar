@@ -137,7 +137,7 @@ impl BPlusTree {
             } else {
                 unreachable!()
             }
-        })
+        });
     }
 
     pub fn insert(&self, key: &EntryKey) {
@@ -488,7 +488,9 @@ impl Node {
     }
 
     pub fn read<'a, F: FnMut(&NodeReadHandler) -> R + 'a, R: 'a>(&'a self, mut func: F) -> R {
-        let handler = NodeReadHandler { ptr: self.data.get() };
+        let handler = NodeReadHandler {
+            ptr: self.data.get(),
+        };
         func(&handler)
     }
 
@@ -512,12 +514,12 @@ impl Deref for NodeWriteGuard {
 
 impl DerefMut for NodeWriteGuard {
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
-        unsafe { &mut*self.data }
+        unsafe { &mut *self.data }
     }
 }
 
 pub struct NodeReadHandler {
-    ptr: *const NodeData
+    ptr: *const NodeData,
 }
 
 impl Deref for NodeReadHandler {
