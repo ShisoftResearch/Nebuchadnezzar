@@ -888,8 +888,8 @@ mod test {
 
     #[test]
     fn node_size() {
-        // expecting the node size to be an on-heap pointer plus node type tag, aligned.
-        assert_eq!(size_of::<Node>(), size_of::<usize>() * 2);
+        // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
+        assert_eq!(size_of::<Node>(), size_of::<usize>() * 3);
     }
 
     #[test]
