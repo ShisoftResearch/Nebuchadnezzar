@@ -37,7 +37,7 @@ use std::ops::DerefMut;
 use std::ops::Range;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 
@@ -81,7 +81,20 @@ impl Default for Ordering {
 
 enum InsertSearchResult {
     External,
-    Internal(NodeCellRef)
+    Internal(NodeCellRef),
+}
+
+enum RemoveSearchResult {
+    External,
+    Internal(NodeCellRef, SubNodeStatus),
+}
+
+enum SubNodeStatus {
+    ExtNodeEmpty,
+    InNodeEmpty,
+    Relocate(usize, usize),
+    Merge(usize, usize),
+    Ok
 }
 
 impl BPlusTree {
@@ -146,8 +159,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, &key) }
-        {
+        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, &key) } {
             debug!("split root with pivot key {:?}", pivotKey);
             let first_key = new_node.read_unchecked().first_key();
             let pivot = pivotKey.unwrap_or_else(|| first_key);
@@ -177,21 +189,19 @@ impl BPlusTree {
         key: &EntryKey,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
         loop {
-            let node_ver = node_ref.version();
-            let search = node_ref.read(|node_handler| {
+            let mut node_ver = 0;
+            let mut search = node_ref.read(|node_handler| {
                 debug!(
-                    "insert to node, len {}, pos: {}, external: {}",
+                    "insert to node, len {}, external: {}",
                     node_handler.len(),
-                    pos,
                     node_handler.is_ext()
                 );
+                node_ver = node_handler.version;
                 match &**node_handler {
-                    &NodeData::External(ref node) => {
-                        InsertSearchResult::External
-                    }
-                    &NodeData::Internal(ref mun) => {
+                    &NodeData::External(ref node) => InsertSearchResult::External,
+                    &NodeData::Internal(ref node) => {
                         let pos = node_handler.search(&key);
-                        let next_node_ref = &n.ptrs[pos];
+                        let next_node_ref = &node.ptrs[pos];
                         InsertSearchResult::Internal(next_node_ref.clone())
                     }
                     &NodeData::None => unreachable!(),
@@ -201,19 +211,20 @@ impl BPlusTree {
                 InsertSearchResult::External => {
                     // latch nodes from left to right
                     let mut current_guard = node_ref.write();
-                    if node_ver != node_ref.version() { continue; }
-                    let mut next_guard = current_guard.extnode().next.write();
-                    let pos = current_guard.search(&key);
-                    return current_guard.extnode_mut().insert(&key, pos, self, node_ref, next_guard)
-                },
-                InsertSearchResult::Internal(node) => {
-                    self.insert_to_node(&node, &key)
+                    if node_ver != node_ref.version() {
+                        continue;
+                    }
+                    let pos = current_guard.search(key);
+                    return current_guard.extnode_mut().insert(key, pos, self, node_ref);
                 }
+                InsertSearchResult::Internal(node) => self.insert_to_node(&node, key),
             };
             match split_node {
                 Some((new_node_ref, pivot_key)) => {
                     let mut node = node_ref.write();
-                    if node_ver != node_ref.version() { continue; }
+                    if node_ver != node_ref.version() {
+                        continue;
+                    }
                     debug!(
                         "Sub level node split, shall insert new node to current level, pivot {:?}",
                         pivot_key
@@ -266,84 +277,139 @@ impl BPlusTree {
         removed.item_found
     }
 
-    unsafe fn remove_from_node(&self, node: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
+    unsafe fn remove_from_node(&self, node_ref: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
         debug!("Removing {:?} from node", key);
-        let mut node = &mut *node.write();
-        let pos = node.search(key);
-        if let NodeData::Internal(ref mut n) = node {
-            let mut status = self.remove_from_node(&n.ptrs[pos], key);
-            if !status.removed {
-                return status;
-            }
-            let sub_node = &mut *n.ptrs[pos].write();
-            {
-                if sub_node.len() == 0 {
-                    // need to remove empty child node
-                    if sub_node.is_ext() {
-                        debug!("Removing empty node");
-                        n.remove_at(pos);
-                        sub_node.extnode_mut().remove_node();
-                        status.removed = true;
+        loop {
+            let mut pos = 0;
+            let mut ver = 0;
+            let (mut remove_stat, search) = node_ref.read(|node| {
+                pos = node.search(key);
+                ver = node.version;
+                if let &NodeData::Internal(ref n) = &**node {
+                    let sub_node = n.ptrs[pos].clone();
+                    let mut sub_node_remove = self.remove_from_node(&sub_node, key);
+                    let sub_node_stat = sub_node.read(|sub_node_handler| {
+                        if sub_node_handler.len() == 0 {
+                            if sub_node_handler.is_ext() {
+                                SubNodeStatus::ExtNodeEmpty
+                            } else {
+                                SubNodeStatus::InNodeEmpty
+                            }
+                        } else if !sub_node_handler.is_half_full() && n.len > 1 {
+                            // need to rebalance
+                            // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
+                            let cand_ptr_pos = n.rebalance_candidate(pos);
+                            let left_ptr_pos = min(pos, cand_ptr_pos);
+                            let right_ptr_pos = max(pos, cand_ptr_pos);
+                            let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
+                            debug_assert_eq!(cand_node.is_ext(), sub_node_handler.is_ext());
+                            if sub_node_handler.cannot_merge() || cand_node.cannot_merge() {
+                                SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos)
+                            } else {
+                                SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos)
+                            }
+                        } else {
+                            SubNodeStatus::Ok
+                        }
+                    });
+                    (
+                        sub_node_remove,
+                        RemoveSearchResult::Internal(sub_node, sub_node_stat),
+                    )
+                } else if let &NodeData::External(ref node) = &**node {
+                    if pos >= node.len || &node.keys[pos] != key {
+                        (
+                            RemoveStatus {
+                                item_found: false,
+                                removed: false,
+                            },
+                            RemoveSearchResult::External,
+                        )
                     } else {
-                        // empty internal nodes should be replaced with it's only remaining child pointer
-                        // there must be at least one child pointer exists
-                        let sub_innode = sub_node.innode();
-                        let sub_sub_node_ref = sub_innode.ptrs[0].clone();
-                        debug_assert!(sub_innode.len == 0);
-                        n.ptrs[pos] = sub_sub_node_ref;
-                        status.removed = false;
+                        (
+                            RemoveStatus {
+                                item_found: true,
+                                removed: true,
+                            },
+                            RemoveSearchResult::External,
+                        )
                     }
-                } else if !sub_node.is_half_full() && n.len > 1 {
-                    // need to rebalance
-                    // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                    let cand_ptr_pos = n.rebalance_candidate(pos);
-                    let left_ptr_pos = min(pos, cand_ptr_pos);
-                    let right_ptr_pos = max(pos, cand_ptr_pos);
-                    let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
-                    debug_assert_eq!(cand_node.is_ext(), sub_node.is_ext());
-                    if sub_node.cannot_merge() || cand_node.cannot_merge() {
-                        // relocate
-                        debug!("Relocating {} to {}", left_ptr_pos, right_ptr_pos);
-                        n.relocate_children(left_ptr_pos, right_ptr_pos);
-                        status.removed = false;
+                } else {
+                    unreachable!()
+                }
+            });
+            match search {
+                RemoveSearchResult::Internal(sub_node, sub_node_stat) => {
+                    if !remove_stat.removed {
+                        return remove_stat;
+                    }
+                    let mut node_guard = node_ref.write();
+                    let mut n = node_guard.innode_mut();
+                    if node_ref.version() != ver {
+                        continue;
+                    }
+                    match sub_node_stat {
+                        SubNodeStatus::Ok => {},
+                        SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos) => {
+                            n.relocate_children(left_ptr_pos, right_ptr_pos);
+                            remove_stat.removed = false;
+                        }
+                        SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos) => {
+                            n.merge_children(left_ptr_pos, right_ptr_pos);
+                            remove_stat.removed = true;
+                        },
+                        SubNodeStatus::ExtNodeEmpty => {
+                            n.remove_at(pos);
+                            sub_node.write().extnode_mut().remove_node();
+                            remove_stat.removed = true;
+                        },
+                        SubNodeStatus::InNodeEmpty => {
+                            // empty internal nodes should be replaced with it's only remaining child pointer
+                            // there must be at least one child pointer exists
+                            let sub_node_guard = sub_node.write();
+                            let sub_innode = sub_node_guard.innode();
+                            let sub_sub_node_ref = sub_innode.ptrs[0].clone();
+                            debug_assert!(sub_innode.len == 0);
+                            n.ptrs[pos] = sub_sub_node_ref;
+                            remove_stat.removed = false;
+                        }
+                    }
+                    return remove_stat;
+                },
+                RemoveSearchResult::External => {
+                    let mut node_guard = node_ref.write();
+                    let mut node = node_guard.extnode_mut();
+                    if node_ref.version() != ver {
+                        continue;
+                    }
+                    if pos >= node.len {
+                        debug!(
+                            "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
+                            pos, node.len, key
+                        );
+                        return RemoveStatus {
+                            item_found: false,
+                            removed: false,
+                        };
+                    }
+                    if &node.keys[pos] == key {
+                        node.remove_at(pos);
+                        return RemoveStatus {
+                            item_found: true,
+                            removed: true,
+                        };
                     } else {
-                        // merge
-                        debug!("Merge {} with {}", left_ptr_pos, right_ptr_pos);
-                        n.merge_children(left_ptr_pos, right_ptr_pos);
-                        status.removed = true;
+                        debug!(
+                            "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
+                            pos, key, &node.keys[pos]
+                        );
+                        return RemoveStatus {
+                            item_found: false,
+                            removed: false,
+                        };
                     }
                 }
             }
-            return status;
-        } else if let &mut NodeData::External(ref mut node) = node {
-            if pos >= node.len {
-                debug!(
-                    "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
-                    pos, node.len, key
-                );
-                return RemoveStatus {
-                    item_found: false,
-                    removed: false,
-                };
-            }
-            if &node.keys[pos] == key {
-                node.remove_at(pos);
-                return RemoveStatus {
-                    item_found: true,
-                    removed: true,
-                };
-            } else {
-                debug!(
-                    "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
-                    pos, key, &node.keys[pos]
-                );
-                return RemoveStatus {
-                    item_found: false,
-                    removed: false,
-                };
-            }
-        } else {
-            unreachable!()
         }
     }
 
@@ -511,29 +577,31 @@ impl Node {
                 return NodeWriteGuard {
                     data: self.data.get(),
                     cc: &self.cc as *const AtomicUsize,
-                }
+                };
             }
             debug!("acquire latch failed, retry {:b}", cc_num);
         }
     }
 
     pub fn read<'a, F: FnMut(&NodeReadHandler) -> R + 'a, R: 'a>(&'a self, mut func: F) -> R {
-        let handler = NodeReadHandler {
+        let mut handler = NodeReadHandler {
             ptr: self.data.get(),
+            version: 0,
         };
         let cc = &self.cc;
         loop {
             let cc_num = cc.load(Relaxed);
-            if cc_num & LATCH_FLAG == LATCH_FLAG  {
+            if cc_num & LATCH_FLAG == LATCH_FLAG {
                 debug!("read have a latch, retry {:b}", cc_num);
                 continue;
             }
+            handler.version = cc_num & (!LATCH_FLAG);
             let res = func(&handler);
             let new_cc_num = cc.load(Relaxed);
             if new_cc_num == cc_num {
-                debug!("read version changed, retry {:b}", cc_num);
                 return res;
             }
+            debug!("read version changed, retry {:b}", cc_num);
         }
     }
 
@@ -555,12 +623,7 @@ impl Deref for NodeWriteGuard {
     type Target = NodeData;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        unsafe {
-            let cc = &*self.cc;
-            let cc_num = cc.load(Relaxed);
-            cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
-            &*self.data
-        }
+        unsafe { &*self.data }
     }
 }
 
@@ -570,8 +633,17 @@ impl DerefMut for NodeWriteGuard {
     }
 }
 
+impl Drop for NodeWriteGuard {
+    fn drop(&mut self) {
+        let cc = unsafe { &*self.cc };
+        let cc_num = cc.load(Relaxed);
+        cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
+    }
+}
+
 pub struct NodeReadHandler {
     ptr: *const NodeData,
+    version: usize,
 }
 
 impl Deref for NodeReadHandler {

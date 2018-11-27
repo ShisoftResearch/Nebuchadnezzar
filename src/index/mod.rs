@@ -16,7 +16,6 @@ const KEY_SIZE: usize = ID_SIZE + 16; // 16 is the estimate length of: schema id
 type EntryKey = SmallVec<[u8; KEY_SIZE]>;
 
 fn id_from_key(key: &EntryKey) -> Id {
-    debug!("Decoding key to id {:?}", key);
     let mut id_cursor = StdCursor::new(&key[key.len() - ID_SIZE..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
 }

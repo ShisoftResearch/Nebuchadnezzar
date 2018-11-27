@@ -152,7 +152,8 @@ impl InNode {
         left_ptr_pos: usize,
         right_ptr_pos: usize,
     ) -> Result<(), TxnErr> {
-        let mut left_node = &mut *self.ptrs[left_ptr_pos].write();
+        let left_node_ref = self.ptrs[left_ptr_pos].clone();
+        let mut left_node = &mut *left_node_ref.write();
         let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
         let left_len = left_node.len();
         let right_len = right_node.len();
@@ -169,12 +170,17 @@ impl InNode {
             }
         } else {
             let mut right_extnode = right_node.extnode_mut();
+            let mut left_extnode = left_node.extnode_mut();
             {
-                let mut left_extnode = left_node.extnode_mut();
                 left_extnode.merge_with(&mut right_extnode);
                 merged_len = left_extnode.len;
             }
-            right_extnode.remove_node();
+            let right_node_next_ref = right_extnode.next.clone();
+            let mut right_node_next = right_node_next_ref.write();
+            if !right_node_next.is_none() {
+                right_node_next.extnode_mut().prev = left_node_ref
+            }
+            left_extnode.next = right_node_next_ref;
         }
         self.remove_at(right_ptr_pos);
         debug!(
