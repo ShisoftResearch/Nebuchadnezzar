@@ -898,7 +898,7 @@ where
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use super::{BPlusTree, Node, Ordering};
     use bifrost::utils::fut_exec::wait;
     use byteorder::BigEndian;
@@ -940,7 +940,7 @@ mod test {
         is_external: bool,
     }
 
-    fn dump_tree(tree: &BPlusTree, f: &str) {
+    pub fn dump_tree(tree: &BPlusTree, f: &str) {
         debug!("dumping {}", f);
         let debug_root = cascading_dump_node(&tree.root);
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
