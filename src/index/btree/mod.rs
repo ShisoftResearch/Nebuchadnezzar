@@ -449,6 +449,8 @@ impl NodeData {
     }
 }
 
+const LATCH_FLAG: usize = !(!0 >> 1);
+
 pub struct Node {
     data: UnsafeCell<NodeData>,
     cc: AtomicUsize,
@@ -481,9 +483,16 @@ impl Node {
     }
 
     pub fn write<'a>(&self) -> NodeWriteGuard {
-        NodeWriteGuard {
-            data: self.data.get(),
-            cc: &self.cc as *const AtomicUsize,
+        let cc = &self.cc;
+        loop {
+            let cc_num = cc.load(Relaxed);
+            let expected = cc_num & (!LATCH_FLAG);
+            if cc.compare_and_swap(expected, cc_num | LATCH_FLAG, Relaxed) == expected {
+                return NodeWriteGuard {
+                    data: self.data.get(),
+                    cc: &self.cc as *const AtomicUsize,
+                }
+            }
         }
     }
 
@@ -491,7 +500,18 @@ impl Node {
         let handler = NodeReadHandler {
             ptr: self.data.get(),
         };
-        func(&handler)
+        let cc = &self.cc;
+        loop {
+            let cc_num = cc.load(Relaxed);
+            if cc_num & LATCH_FLAG == LATCH_FLAG  {
+                continue;
+            }
+            let res = func(&handler);
+            let new_cc_num = cc.load(Relaxed);
+            if new_cc_num == cc_num {
+                return res;
+            }
+        }
     }
 
     pub fn read_unchecked(&self) -> &NodeData {
@@ -508,7 +528,12 @@ impl Deref for NodeWriteGuard {
     type Target = NodeData;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        unsafe { &*self.data }
+        unsafe {
+            let cc = &*self.cc;
+            let cc_num = cc.load(Relaxed);
+            cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
+            &*self.data
+        }
     }
 }
 
