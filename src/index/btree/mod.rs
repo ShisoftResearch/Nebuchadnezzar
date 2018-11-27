@@ -146,7 +146,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, key.clone()) }
+        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, &key) }
         {
             debug!("split root with pivot key {:?}", pivotKey);
             let first_key = new_node.read_unchecked().first_key();
@@ -174,73 +174,79 @@ impl BPlusTree {
     unsafe fn insert_to_node(
         &self,
         node_ref: &NodeCellRef,
-        key: EntryKey,
+        key: &EntryKey,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-        let search = node_ref.read(|node_handler| {
-            debug!(
-                "insert to node, len {}, pos: {}, external: {}",
-                node_handler.len(),
-                pos,
-                node_handler.is_ext()
-            );
-            match &**node_handler {
-                &NodeData::External(ref node) => {
-                    InsertSearchResult::External
-                }
-                &NodeData::Internal(ref mun) => {
-                    let pos = node_handler.search(&key);
-                    let next_node_ref = &n.ptrs[pos];
-                    InsertSearchResult::Internal(next_node_ref.clone())
-                }
-                &NodeData::None => unreachable!(),
-            }
-        });
-        let split_node = match search {
-            InsertSearchResult::External => {
-                // latch nodes from left to right
-                let mut current_guard = node_ref.write();
-                let mut next_guard = current_guard.extnode().next.write();
-                let pos = current_guard.search(&key);
-                return current_guard.extnode_mut().insert(key, pos, self, node_ref, next_guard)
-            },
-            InsertSearchResult::Internal(node) => {
-                self.insert_to_node(&node, key)
-            }
-        };
-        match split_node {
-            Some((new_node_ref, pivot_key)) => {
-                let mut node = node_ref.write();
+        loop {
+            let node_ver = node_ref.version();
+            let search = node_ref.read(|node_handler| {
                 debug!(
-                    "Sub level node split, shall insert new node to current level, pivot {:?}",
-                    pivot_key
+                    "insert to node, len {}, pos: {}, external: {}",
+                    node_handler.len(),
+                    pos,
+                    node_handler.is_ext()
                 );
-                let pivot = {
-                    let new_node = new_node_ref.read_unchecked();
-                    debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                    pivot_key.unwrap_or_else(|| {
-                        let first_key = new_node.first_key();
-                        debug_assert_ne!(first_key.len(), 0);
-                        first_key
-                    })
-                };
-                debug!("New pivot {:?}", pivot);
-                let result = {
-                    let pivot_pos = node.search(&pivot);
-                    debug!(
-                        "will insert into current node at {}, node len {}",
-                        pivot_pos,
-                        node.len()
-                    );
-                    let mut current_innode = node.innode_mut();
-                    current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
-                };
-                if result.is_some() {
-                    debug!("Sub level split caused current level split");
+                match &**node_handler {
+                    &NodeData::External(ref node) => {
+                        InsertSearchResult::External
+                    }
+                    &NodeData::Internal(ref mun) => {
+                        let pos = node_handler.search(&key);
+                        let next_node_ref = &n.ptrs[pos];
+                        InsertSearchResult::Internal(next_node_ref.clone())
+                    }
+                    &NodeData::None => unreachable!(),
                 }
-                return result;
+            });
+            let split_node = match search {
+                InsertSearchResult::External => {
+                    // latch nodes from left to right
+                    let mut current_guard = node_ref.write();
+                    if node_ver != node_ref.version() { continue; }
+                    let mut next_guard = current_guard.extnode().next.write();
+                    let pos = current_guard.search(&key);
+                    return current_guard.extnode_mut().insert(&key, pos, self, node_ref, next_guard)
+                },
+                InsertSearchResult::Internal(node) => {
+                    self.insert_to_node(&node, &key)
+                }
+            };
+            match split_node {
+                Some((new_node_ref, pivot_key)) => {
+                    let mut node = node_ref.write();
+                    if node_ver != node_ref.version() { continue; }
+                    debug!(
+                        "Sub level node split, shall insert new node to current level, pivot {:?}",
+                        pivot_key
+                    );
+                    let pivot = {
+                        let new_node = new_node_ref.read_unchecked();
+                        debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                        pivot_key.unwrap_or_else(|| {
+                            let first_key = new_node.first_key();
+                            debug_assert_ne!(first_key.len(), 0);
+                            first_key
+                        })
+                    };
+                    debug!("New pivot {:?}", pivot);
+                    let result = {
+                        let pivot_pos = node.search(&pivot);
+                        debug!(
+                            "will insert into current node at {}, node len {}",
+                            pivot_pos,
+                            node.len()
+                        );
+                        let mut current_innode = node.innode_mut();
+                        current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
+                    };
+                    if result.is_some() {
+                        debug!("Sub level split caused current level split");
+                    }
+                    return result;
+                }
+                None => return None,
             }
-            None => None,
         }
+        unreachable!()
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
@@ -533,6 +539,10 @@ impl Node {
 
     pub fn read_unchecked(&self) -> &NodeData {
         unsafe { &*self.data.get() }
+    }
+
+    pub fn version(&self) -> usize {
+        self.cc.load(Relaxed) & (!LATCH_FLAG)
     }
 }
 
