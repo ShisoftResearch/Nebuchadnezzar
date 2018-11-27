@@ -94,6 +94,7 @@ impl ExtNode {
         pos: usize,
         tree: &BPlusTree,
         self_ref: &NodeCellRef,
+        next_guard: NodeWriteGuard,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
         let self_len = self.len;
         debug_assert!(self_len <= NUM_KEYS);
@@ -102,7 +103,7 @@ impl ExtNode {
             debug!("insert to external with split, key {:?}, pos {}", &key, pos);
             // cached.dump();
             let pivot = self_len / 2;
-            let self_next = &mut *self.next.write();
+            let self_next = &mut *next_guard;
             let new_page_id = tree.new_page_id();
             let mut keys_1 = &mut self.keys;
             let mut keys_2 = keys_1.split_at_pivot(pivot, self_len);

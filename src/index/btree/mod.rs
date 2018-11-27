@@ -79,6 +79,11 @@ impl Default for Ordering {
     }
 }
 
+enum InsertSearchResult {
+    External,
+    Internal(NodeCellRef)
+}
+
 impl BPlusTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
         let neb_client_1 = neb_client.clone();
@@ -171,31 +176,40 @@ impl BPlusTree {
         node_ref: &NodeCellRef,
         key: EntryKey,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-        let node = &mut *node_ref.write();
-        let pos = node.search(&key);
-        debug!(
-            "insert to node, len {}, pos: {}, external: {}",
-            node.len(),
-            pos,
-            node.is_ext()
-        );
-        let split_node = match node {
-            &mut NodeData::External(ref mut node) => {
-                debug!(
-                    "insert into external at {}, key {:?}, id {:?}",
-                    pos, key, node.id
-                );
-                return node.insert(key, pos, self, node_ref);
+        let search = node_ref.read(|node_handler| {
+            debug!(
+                "insert to node, len {}, pos: {}, external: {}",
+                node_handler.len(),
+                pos,
+                node_handler.is_ext()
+            );
+            match &**node_handler {
+                &NodeData::External(ref node) => {
+                    InsertSearchResult::External
+                }
+                &NodeData::Internal(ref mun) => {
+                    let pos = node_handler.search(&key);
+                    let next_node_ref = &n.ptrs[pos];
+                    InsertSearchResult::Internal(next_node_ref.clone())
+                }
+                &NodeData::None => unreachable!(),
             }
-            &mut NodeData::Internal(ref mut n) => {
-                let next_node_ref = &n.ptrs[pos];
-                debug!("insert into internal at {}, has keys {}", pos, n.len);
-                self.insert_to_node(next_node_ref, key)
+        });
+        let split_node = match search {
+            InsertSearchResult::External => {
+                // latch nodes from left to right
+                let mut current_guard = node_ref.write();
+                let mut next_guard = current_guard.extnode().next.write();
+                let pos = current_guard.search(&key);
+                return current_guard.extnode_mut().insert(key, pos, self, node_ref, next_guard)
+            },
+            InsertSearchResult::Internal(node) => {
+                self.insert_to_node(&node, key)
             }
-            &mut NodeData::None => unreachable!(),
         };
         match split_node {
             Some((new_node_ref, pivot_key)) => {
+                let mut node = node_ref.write();
                 debug!(
                     "Sub level node split, shall insert new node to current level, pivot {:?}",
                     pivot_key
@@ -482,7 +496,7 @@ impl Node {
         Self::external(ExtNode::new(id))
     }
 
-    pub fn write<'a>(&self) -> NodeWriteGuard {
+    pub fn write(&self) -> NodeWriteGuard {
         let cc = &self.cc;
         loop {
             let cc_num = cc.load(Relaxed);
