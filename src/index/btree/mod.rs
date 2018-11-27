@@ -159,7 +159,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        if let Some((new_node, pivotKey)) = unsafe { self.insert_to_node(&self.root, &key) } {
+        if let Some((new_node, pivotKey)) = self.insert_to_node(&self.root, &key) {
             debug!("split root with pivot key {:?}", pivotKey);
             let first_key = new_node.read_unchecked().first_key();
             let pivot = pivotKey.unwrap_or_else(|| first_key);
@@ -183,7 +183,7 @@ impl BPlusTree {
         self.len.fetch_add(1, Relaxed);
     }
 
-    unsafe fn insert_to_node(
+    fn insert_to_node(
         &self,
         node_ref: &NodeCellRef,
         key: &EntryKey,
@@ -262,7 +262,7 @@ impl BPlusTree {
 
     pub fn remove(&self, key: &EntryKey) -> bool {
         let root = &self.root;
-        let removed = unsafe { self.remove_from_node(root, key) };
+        let removed = self.remove_from_node(root, key);
         let root_node = &mut *root.write();
         if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
             // When root is external and have no keys but one pointer will take the only sub level
@@ -277,7 +277,7 @@ impl BPlusTree {
         removed.item_found
     }
 
-    unsafe fn remove_from_node(&self, node_ref: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
+    fn remove_from_node(&self, node_ref: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
         debug!("Removing {:?} from node", key);
         loop {
             let mut pos = 0;
@@ -421,7 +421,7 @@ impl BPlusTree {
         self.len.load(Relaxed)
     }
 
-    unsafe fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
+    fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
         let cell = value.read(|node| {
             let extnode = node.extnode();
             if extnode.is_dirty() {

@@ -88,7 +88,7 @@ impl ExtNode {
         self.keys.remove_at(pos, &mut cached_len);
         self.len = cached_len;
     }
-    pub unsafe fn insert(
+    pub fn insert(
         &mut self,
         key: &EntryKey,
         pos: usize,
@@ -164,7 +164,7 @@ impl ExtNode {
             debug!("{}\t- {:?}", i, self.keys[i]);
         }
     }
-    pub unsafe fn remove_node(&self) {
+    pub fn remove_node(&self) {
         let id = &self.id;
         // TODO: adjust write latch ordering
         let mut prev = &mut *self.prev.write();
@@ -184,7 +184,7 @@ impl ExtNode {
     }
 }
 
-pub unsafe fn rearrange_empty_extnode(node: &ExtNode) -> Id {
+pub fn rearrange_empty_extnode(node: &ExtNode) -> Id {
     // TODO: adjust write latch ordering
     let mut prev = &mut *node.prev.write();
     let mut next = &mut *node.next.write();

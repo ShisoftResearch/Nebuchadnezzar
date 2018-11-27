@@ -147,7 +147,7 @@ impl InNode {
             pointer_pos + 1
         }
     }
-    pub unsafe fn merge_children(
+    pub fn merge_children(
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
@@ -207,7 +207,7 @@ impl InNode {
         }
         self.len += right.len + 1;
     }
-    pub unsafe fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
+    pub fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut left_node = &mut *self.ptrs[left_ptr_pos].write();
         let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
