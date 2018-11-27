@@ -94,7 +94,7 @@ enum SubNodeStatus {
     InNodeEmpty,
     Relocate(usize, usize),
     Merge(usize, usize),
-    Ok
+    Ok,
 }
 
 impl BPlusTree {
@@ -349,7 +349,7 @@ impl BPlusTree {
                         continue;
                     }
                     match sub_node_stat {
-                        SubNodeStatus::Ok => {},
+                        SubNodeStatus::Ok => {}
                         SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos) => {
                             n.relocate_children(left_ptr_pos, right_ptr_pos);
                             remove_stat.removed = false;
@@ -357,12 +357,12 @@ impl BPlusTree {
                         SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos) => {
                             n.merge_children(left_ptr_pos, right_ptr_pos);
                             remove_stat.removed = true;
-                        },
+                        }
                         SubNodeStatus::ExtNodeEmpty => {
                             n.remove_at(pos);
                             sub_node.write().extnode_mut().remove_node();
                             remove_stat.removed = true;
-                        },
+                        }
                         SubNodeStatus::InNodeEmpty => {
                             // empty internal nodes should be replaced with it's only remaining child pointer
                             // there must be at least one child pointer exists
@@ -375,7 +375,7 @@ impl BPlusTree {
                         }
                     }
                     return remove_stat;
-                },
+                }
                 RemoveSearchResult::External => {
                     let mut node_guard = node_ref.write();
                     let mut node = node_guard.extnode_mut();
