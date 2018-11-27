@@ -493,6 +493,7 @@ impl Node {
                     cc: &self.cc as *const AtomicUsize,
                 }
             }
+            debug!("acquire latch failed, retry {:b}", cc_num);
         }
     }
 
@@ -504,11 +505,13 @@ impl Node {
         loop {
             let cc_num = cc.load(Relaxed);
             if cc_num & LATCH_FLAG == LATCH_FLAG  {
+                debug!("read have a latch, retry {:b}", cc_num);
                 continue;
             }
             let res = func(&handler);
             let new_cc_num = cc.load(Relaxed);
             if new_cc_num == cc_num {
+                debug!("read version changed, retry {:b}", cc_num);
                 return res;
             }
         }
