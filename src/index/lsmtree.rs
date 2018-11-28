@@ -277,6 +277,7 @@ mod test {
     }
 
     #[test]
+    #[ignore]
     pub fn insertions() {
         env_logger::init();
         let server_group = "sstable_index_init";
