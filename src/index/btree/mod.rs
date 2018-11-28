@@ -197,11 +197,11 @@ impl BPlusTree {
                     node_handler.len(),
                     node_handler.is_ext()
                 );
+                node_ver = node_handler.version;
                 if let Some(right_node) = node_handler.key_at_right_node(key) {
                     debug!("Moving to right node for insertion");
                     return InsertSearchResult::RightNode(right_node.clone());
                 }
-                node_ver = node_handler.version;
                 match &**node_handler {
                     &NodeData::External(ref node) => InsertSearchResult::External,
                     &NodeData::Internal(ref node) => {
@@ -220,8 +220,10 @@ impl BPlusTree {
                     // latch nodes from left to right
                     let mut current_guard = node_ref.write();
                     if node_ver != node_ref.version() {
+                        debug!("node version changed after external write lock, retry");
                         continue;
                     }
+                    debug_assert!(current_guard.key_at_right_node(key).is_none());
                     let pos = current_guard.search(key);
                     return current_guard.extnode_mut().insert(key, pos, self, node_ref);
                 }
@@ -231,6 +233,7 @@ impl BPlusTree {
                 Some((new_node_ref, pivot_key)) => {
                     let mut node = node_ref.write();
                     if node_ver != node_ref.version() {
+                        debug!("node version changed after internal write lock, retry");
                         continue;
                     }
                     debug!(
@@ -639,11 +642,11 @@ impl Node {
         let cc = &self.cc;
         loop {
             let cc_num = cc.load(Relaxed);
-            if cc_num & LATCH_FLAG == LATCH_FLAG {
+            handler.version = cc_num & (!LATCH_FLAG);
+            if handler.version != cc_num {
                 debug!("read have a latch, retry {:b}", cc_num);
                 continue;
             }
-            handler.version = cc_num & (!LATCH_FLAG);
             let res = func(&handler);
             let new_cc_num = cc.load(Relaxed);
             if new_cc_num == cc_num {
