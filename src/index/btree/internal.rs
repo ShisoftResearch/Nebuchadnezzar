@@ -166,6 +166,7 @@ impl InNode {
                 let mut right_innode = right_node.innode_mut();
                 let right_key = self.keys[right_key_pos].clone();
                 left_innode.merge_with(&mut right_innode, right_key);
+                left_innode.right = right_innode.right.clone();
                 merged_len = left_innode.len;
             }
         } else {

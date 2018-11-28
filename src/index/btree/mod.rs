@@ -82,10 +82,12 @@ impl Default for Ordering {
 enum InsertSearchResult {
     External,
     Internal(NodeCellRef),
+    RightNode(NodeCellRef),
 }
 
 enum RemoveSearchResult {
     External,
+    RightNode(NodeCellRef),
     Internal(NodeCellRef, SubNodeStatus),
 }
 
@@ -131,15 +133,14 @@ impl BPlusTree {
         cursor
     }
 
-    unsafe fn search(
-        &self,
-        node_ref: &NodeCellRef,
-        key: &EntryKey,
-        ordering: Ordering,
-    ) -> RTCursor {
+    fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
         debug!("searching for {:?}", key);
         return node_ref.read(|node_handler| {
             let node = &**node_handler;
+            if let Some(right_node) = node.key_at_right_node(key) {
+                debug!("Search found a node at the right side");
+                return self.search(right_node, key, ordering);
+            }
             let pos = node.search(key);
             if node.is_ext() {
                 let extnode = node.extnode();
@@ -196,6 +197,10 @@ impl BPlusTree {
                     node_handler.len(),
                     node_handler.is_ext()
                 );
+                if let Some(right_node) = node_handler.key_at_right_node(key) {
+                    debug!("Moving to right node for insertion");
+                    return InsertSearchResult::RightNode(right_node.clone());
+                }
                 node_ver = node_handler.version;
                 match &**node_handler {
                     &NodeData::External(ref node) => InsertSearchResult::External,
@@ -208,6 +213,9 @@ impl BPlusTree {
                 }
             });
             let split_node = match search {
+                InsertSearchResult::RightNode(node) => {
+                    return self.insert_to_node(&node, key);
+                }
                 InsertSearchResult::External => {
                     // latch nodes from left to right
                     let mut current_guard = node_ref.write();
@@ -283,8 +291,17 @@ impl BPlusTree {
             let mut pos = 0;
             let mut ver = 0;
             let (mut remove_stat, search) = node_ref.read(|node| {
-                pos = node.search(key);
+                if let Some(right_node) = node.key_at_right_node(key) {
+                    return (
+                        RemoveStatus {
+                            item_found: false,
+                            removed: false,
+                        },
+                        RemoveSearchResult::RightNode(right_node.clone()),
+                    );
+                }
                 ver = node.version;
+                pos = node.search(key);
                 if let &NodeData::Internal(ref n) = &**node {
                     let sub_node = n.ptrs[pos].clone();
                     let mut sub_node_remove = self.remove_from_node(&sub_node, key);
@@ -339,6 +356,7 @@ impl BPlusTree {
                 }
             });
             match search {
+                RemoveSearchResult::RightNode(node) => return self.remove_from_node(&node, key),
                 RemoveSearchResult::Internal(sub_node, sub_node_stat) => {
                     if !remove_stat.removed {
                         return remove_stat;
@@ -532,6 +550,36 @@ impl NodeData {
             &NodeData::Internal(ref n) => n,
             _ => unreachable!(),
         }
+    }
+    pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
+        if self.len() > 0 {
+            match self {
+                &NodeData::Internal(ref n) => {
+                    if &n.keys[n.len - 1] < key {
+                        let right_node = n.right.read_unchecked();
+                        if !right_node.is_none() {
+                            let right_innode = right_node.innode();
+                            if right_innode.keys.len() > 0 && &right_innode.keys[0] <= key {
+                                return Some(&n.right);
+                            }
+                        }
+                    }
+                }
+                &NodeData::External(ref n) => {
+                    if &n.keys[n.len - 1] < key {
+                        let right_node = n.next.read_unchecked();
+                        if !right_node.is_none() {
+                            let right_extnode = right_node.extnode();
+                            if right_extnode.keys.len() > 0 && &right_extnode.keys[0] <= key {
+                                return Some(&n.next);
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        return None;
     }
 }
 
