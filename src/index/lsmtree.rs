@@ -330,7 +330,7 @@ mod test {
             thread::sleep(Duration::from_secs(5 * 60));
         }
         debug!("Start validations");
-        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+        (0..num).collect::<Vec<_>>().iter().for_each(|i| {
             let mut rng = rand::rngs::OsRng::new().unwrap();
             let die_range = Uniform::new_inclusive(1, 6);
             let mut roll_die = rng.sample_iter(&die_range);
