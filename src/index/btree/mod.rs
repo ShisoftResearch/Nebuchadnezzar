@@ -202,12 +202,14 @@ impl BPlusTree {
         let mut split_node = None;
 
         loop {
+            let mut version = 0;
             let mut search = node_ref.read(|node_handler| {
                 debug!(
                     "insert to node, len {}, external: {}",
                     node_handler.len(),
                     node_handler.is_ext()
                 );
+                version = node_handler.version;
                 if let Some(right_node) = node_handler.key_at_right_node(key) {
                     debug!("Moving to right node for insertion");
                     return InsertSearchResult::RightNode(right_node.clone());
@@ -229,7 +231,9 @@ impl BPlusTree {
                 InsertSearchResult::External => {
                     // latch nodes from left to right
                     let node_guard = node_ref.write();
-                    debug_assert!(node_guard.is_ext());
+                    if node_ref.version() != version {
+                        continue;
+                    }
                     let mut searched_guard = write_key_page(node_guard, key);
                     let pos = searched_guard.search(key);
                     debug_assert!(searched_guard.is_ext(), "{:?}", searched_guard.innode().keys);
