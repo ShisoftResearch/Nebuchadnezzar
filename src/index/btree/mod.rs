@@ -85,6 +85,12 @@ enum InsertSearchResult {
     RightNode(NodeCellRef),
 }
 
+enum InsertToNodeResult {
+    NoSplit,
+    Split(NodeWriteGuard, NodeCellRef, Option<EntryKey>),
+    SplitParentChanged
+}
+
 enum RemoveSearchResult {
     External,
     RightNode(NodeCellRef),
@@ -189,6 +195,9 @@ impl BPlusTree {
         node_ref: &NodeCellRef,
         key: &EntryKey,
     ) -> Option<(NodeCellRef, Option<EntryKey>)> {
+
+        let mut split_node = None;
+
         loop {
             let mut node_ver = 0;
             let mut search = node_ref.read(|node_handler| {
@@ -197,11 +206,11 @@ impl BPlusTree {
                     node_handler.len(),
                     node_handler.is_ext()
                 );
+                node_ver = node_handler.version;
                 if let Some(right_node) = node_handler.key_at_right_node(key) {
                     debug!("Moving to right node for insertion");
                     return InsertSearchResult::RightNode(right_node.clone());
                 }
-                node_ver = node_handler.version;
                 match &**node_handler {
                     &NodeData::External(ref node) => InsertSearchResult::External,
                     &NodeData::Internal(ref node) => {
@@ -212,7 +221,7 @@ impl BPlusTree {
                     &NodeData::None => unreachable!(),
                 }
             });
-            let split_node = match search {
+            split_node = match search {
                 InsertSearchResult::RightNode(node) => {
                     return self.insert_to_node(&node, key);
                 }
@@ -222,49 +231,49 @@ impl BPlusTree {
                     if node_ver != node_ref.version() {
                         continue;
                     }
+                    debug_assert!(current_guard.key_at_right_node(key).is_none());
                     let pos = current_guard.search(key);
                     return current_guard.extnode_mut().insert(key, pos, self, node_ref);
                 }
                 InsertSearchResult::Internal(node) => self.insert_to_node(&node, key),
             };
-            match split_node {
-                Some((new_node_ref, pivot_key)) => {
-                    let mut node = node_ref.write();
-                    if node_ver != node_ref.version() {
-                        continue;
-                    }
-                    debug!(
-                        "Sub level node split, shall insert new node to current level, pivot {:?}",
-                        pivot_key
-                    );
-                    let pivot = {
-                        let new_node = new_node_ref.read_unchecked();
-                        debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                        pivot_key.unwrap_or_else(|| {
-                            let first_key = new_node.first_key();
-                            debug_assert_ne!(first_key.len(), 0);
-                            first_key
-                        })
-                    };
-                    debug!("New pivot {:?}", pivot);
-                    let result = {
-                        let pivot_pos = node.search(&pivot);
-                        debug!(
-                            "will insert into current node at {}, node len {}",
-                            pivot_pos,
-                            node.len()
-                        );
-                        let mut current_innode = node.innode_mut();
-                        current_innode.insert(pivot, Some(new_node_ref), pivot_pos)
-                    };
-                    if result.is_some() {
-                        debug!("Sub level split caused current level split");
-                    }
-                    return result;
-                }
-                None => return None,
-            }
+            break;
         }
+        match split_node {
+            Some((new_node_ref, pivot_key)) => {
+                debug!(
+                    "Sub level node split, shall insert new node to current level, pivot {:?}",
+                    pivot_key
+                );
+                let pivot = {
+                    let new_node = new_node_ref.read_unchecked();
+                    debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
+                    pivot_key.unwrap_or_else(|| {
+                        let first_key = new_node.first_key();
+                        debug_assert_ne!(first_key.len(), 0);
+                        first_key
+                    })
+                };
+                debug!("New pivot {:?}", pivot);
+                let mut new_node_parent = write_key_page(node_ref, &pivot);
+                let result = {
+                    let pivot_pos = new_node_parent.search(&pivot);
+                    debug!(
+                        "will insert into current node at {}, node len {}",
+                        pivot_pos,
+                        new_node_parent.len()
+                    );
+                    let mut new_node_parent_innode = new_node_parent.innode_mut();
+                    new_node_parent_innode.insert(pivot, Some(new_node_ref), pivot_pos)
+                };
+                if result.is_some() {
+                    debug!("Sub level split caused current level split");
+                }
+                return result;
+            }
+            None => return None,
+        }
+
         unreachable!()
     }
 
@@ -580,6 +589,44 @@ impl NodeData {
             }
         }
         return None;
+    }
+}
+
+pub fn write_key_page(search_page: &NodeCellRef, key: &EntryKey) -> NodeWriteGuard {
+    let mut node_guard = search_page.write();
+    loop {
+        if node_guard.len() > 0 {
+            match &*node_guard {
+                &NodeData::Internal(ref n) => {
+                    if &n.keys[n.len - 1] < key {
+                        let right_ref = &n.right;
+                        let right_node = right_ref.read_unchecked();
+                        if !right_node.is_none() {
+                            let right_innode = right_node.innode();
+                            if right_innode.keys.len() > 0 && &right_innode.keys[0] <= key {
+                                return write_key_page(right_ref, key);
+                            }
+                        }
+                    }
+                }
+                &NodeData::External(ref n) => {
+                    if &n.keys[n.len - 1] < key {
+                        let right_ref = &n.next;
+                        let right_node = right_ref.read_unchecked();
+                        if !right_node.is_none() {
+                            let right_extnode = right_node.extnode();
+                            if right_extnode.keys.len() > 0 && &right_extnode.keys[0] <= key {
+                                return write_key_page(right_ref, key);
+                            }
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            return node_guard;
+        } else {
+            return node_guard;
+        }
     }
 }
 
