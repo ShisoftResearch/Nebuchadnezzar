@@ -63,6 +63,9 @@ pub struct BPlusTree {
     len: Arc<AtomicUsize>,
 }
 
+unsafe impl Sync for BPlusTree {}
+unsafe impl Send for BPlusTree {}
+
 // This is the runtime cursor on iteration
 // It hold a copy of the containing page next page lock guard
 // These lock guards are preventing the node and their neighbourhoods been changed externally
@@ -1020,6 +1023,9 @@ pub mod test {
     use std::io::Write;
     use std::mem::size_of;
     use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+    use rayon::prelude::*;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1423,5 +1429,81 @@ pub mod test {
                 assert_eq!(cursor.next(), j != num - 1);
             }
         }
+    }
+
+    #[test]
+    fn parallel() {
+        env_logger::init();
+        let server_group = "sstable_index_init";
+        let server_addr = String::from("127.0.0.1:5600");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 4 * 1024 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        client.new_schema_with_id(super::page_schema()).wait();
+        let tree = Arc::new(BPlusTree::new(&client));
+        let num = env::var("BTREE_TEST_ITEMS")
+            // this value cannot do anything useful to the test
+            // must arrange a long-term test to cover every levels
+            .unwrap_or("1000".to_string())
+            .parse::<u64>()
+            .unwrap();
+
+        let tree_clone = tree.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(10));
+                let tree_len = tree_clone.len();
+                debug!(
+                    "LSM-Tree now have {}/{} elements, total {:.2}%",
+                    tree_len,
+                    num,
+                    tree_len as f32 / num as f32 * 100.0
+                );
+            }
+        });
+
+        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+            let i = *i;
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            tree.insert(&key);
+        });
+
+        debug!("Start validation on single thread");
+        (0..num).collect::<Vec<_>>().iter().for_each(|i| {
+            let mut rng = rand::rngs::OsRng::new().unwrap();
+            let die_range = Uniform::new_inclusive(1, 6);
+            let mut roll_die = rng.sample_iter(&die_range);
+            let i = *i;
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            debug!("checking: {}", i);
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            key_with_id(&mut key, &id);
+            assert_eq!(cursor.current(), Some(&key), "{}", i);
+            if roll_die.next().unwrap() == 6 {
+                for j in i..num {
+                    let id = Id::new(0, j);
+                    let key_slice = u64_to_slice(j);
+                    let mut key = SmallVec::from_slice(&key_slice);
+                    key_with_id(&mut key, &id);
+                    assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                    assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
+                }
+            }
+        });
     }
 }
