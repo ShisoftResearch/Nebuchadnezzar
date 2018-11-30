@@ -110,6 +110,7 @@ enum SubNodeStatus {
 
 pub struct NodeSplit {
     new_right_node: NodeCellRef,
+    left_node_latch: NodeWriteGuard,
     pivot: Option<EntryKey>,
     parent_latch: Option<NodeWriteGuard>,
 }
@@ -181,7 +182,7 @@ impl BPlusTree {
 
     pub fn insert(&self, key: &EntryKey) {
         match self.insert_to_node(&self.root, None, None, &key) {
-            Some(NodeSplitResult::Split(split)) => {
+            Some(NodeSplitResult::Split(mut split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let first_key = new_node.read_unchecked().first_key();
@@ -195,7 +196,7 @@ impl BPlusTree {
                 // TODO: review swap root
                 unsafe {
                     debug!("obtain latch for root split");
-                    let old_root = &mut *self.root.write();;
+                    let old_root = &mut *split.left_node_latch;
                     new_in_root.keys[0] = pivot;
                     new_in_root.ptrs[1] = new_node;
                     debug!("obtain latch for root new splited root");
@@ -259,7 +260,7 @@ impl BPlusTree {
                         "{:?}",
                         searched_guard.innode().keys
                     );
-                    return searched_guard.extnode_mut().insert(
+                    let mut split_result = searched_guard.extnode_mut().insert(
                         key,
                         pos,
                         self,
@@ -267,6 +268,10 @@ impl BPlusTree {
                         parent,
                         parent_version,
                     );
+                    if let &mut Some(NodeSplitResult::Split(ref mut split)) = &mut split_result {
+                        split.left_node_latch = searched_guard;
+                    }
+                    return split_result;
                 }
                 InsertSearchResult::Internal(node) => {
                     let split_res = self.insert_to_node(&node, Some(node_ref), Some(version), key);
@@ -296,14 +301,17 @@ impl BPlusTree {
                                 pivot_pos,
                                 target_guard.len()
                             );
-                            let mut target_innode = target_guard.innode_mut();
-                            return target_innode.insert(
+                            let mut split_result = target_guard.innode_mut().insert(
                                 pivot,
                                 split.new_right_node,
                                 parent,
                                 parent_version,
                                 pivot_pos,
                             );
+                            if let &mut Some(NodeSplitResult::Split(ref mut split)) = &mut split_result {
+                                split.left_node_latch = target_guard;
+                            }
+                            return split_result;
                         }
                     }
                 }
@@ -768,21 +776,36 @@ impl Deref for NodeWriteGuard {
     type Target = NodeData;
 
     fn deref(&self) -> &<Self as Deref>::Target {
+        debug_assert_ne!(self.data as usize, 0);
         unsafe { &*self.data }
     }
 }
 
 impl DerefMut for NodeWriteGuard {
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
+        debug_assert_ne!(self.data as usize, 0);
         unsafe { &mut *self.data }
     }
 }
 
 impl Drop for NodeWriteGuard {
     fn drop(&mut self) {
-        let cc = unsafe { &*self.cc };
-        let cc_num = cc.load(Relaxed);
-        cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
+        // cope with null pointer
+        if self.cc as usize != 0 {
+            let cc = unsafe { &*self.cc };
+            let cc_num = cc.load(Relaxed);
+            cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
+        }
+    }
+}
+
+impl Default for NodeWriteGuard {
+    fn default() -> Self {
+        NodeWriteGuard {
+            data: 0 as *mut NodeData,
+            cc: 0 as *const AtomicUsize,
+            version: 0
+        }
     }
 }
 

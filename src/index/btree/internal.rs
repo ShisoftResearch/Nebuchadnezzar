@@ -129,6 +129,7 @@ impl InNode {
             self.right = node_2_ref.clone();
             return Some(NodeSplitResult::Split(NodeSplit {
                 new_right_node: node_2_ref,
+                left_node_latch: NodeWriteGuard::default(),
                 pivot: Some(keys_split.pivot_key),
                 parent_latch: parent_guard,
             }));

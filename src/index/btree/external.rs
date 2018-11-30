@@ -150,6 +150,7 @@ impl ExtNode {
                 new_right_node: node_2,
                 pivot: None,
                 parent_latch,
+                left_node_latch: NodeWriteGuard::default()
             }));
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
