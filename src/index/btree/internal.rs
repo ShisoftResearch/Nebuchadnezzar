@@ -50,9 +50,11 @@ impl InNode {
     pub fn insert(
         &mut self,
         key: EntryKey,
-        ptr: Option<NodeCellRef>,
+        new_node: NodeCellRef,
+        parent: Option<&NodeCellRef>,
+        parent_version: Option<usize>,
         pos: usize,
-    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
+    ) -> Option<NodeSplitResult> {
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -60,6 +62,12 @@ impl InNode {
         if node_len == NUM_KEYS {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
+            let parent_guard = parent.map(|n| n.write());
+            if let &Some(ref pg) = &parent_guard {
+                if pg.version != parent_version.unwrap() {
+                    return Some(NodeSplitResult::Retry);
+                }
+            }
             let keys_split = {
                 debug!("insert into keys");
                 let mut keys_1 = &mut self.keys;
@@ -99,7 +107,7 @@ impl InNode {
                 let mut ptrs_2_len = ptr_len - pivot - 1;
                 let mut ptr_pos = pos + 1;
                 insert_into_split(
-                    ptr.unwrap(),
+                    new_node,
                     ptrs_1,
                     &mut ptrs_2,
                     &mut ptrs_1_len,
@@ -119,13 +127,17 @@ impl InNode {
             let node_2_ref = Arc::new(Node::internal(node_2));
             self.len = keys_split.keys_1_len;
             self.right = node_2_ref.clone();
-            return Some((node_2_ref, Some(keys_split.pivot_key)));
+            return Some(NodeSplitResult::Split(NodeSplit {
+                new_right_node: node_2_ref,
+                pivot: Some(keys_split.pivot_key),
+                parent_latch: parent_guard,
+            }));
         } else {
             let mut new_node_len = node_len;
             let mut new_node_pointers = node_len + 1;
             self.keys.insert_at(key, pos, &mut new_node_len);
             self.ptrs
-                .insert_at(ptr.unwrap(), pos + 1, &mut new_node_pointers);
+                .insert_at(new_node, pos + 1, &mut new_node_pointers);
             self.len = new_node_len;
             return None;
         }

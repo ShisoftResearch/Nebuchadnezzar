@@ -91,7 +91,7 @@ enum InsertSearchResult {
 enum InsertToNodeResult {
     NoSplit,
     Split(NodeWriteGuard, NodeCellRef, Option<EntryKey>),
-    SplitParentChanged
+    SplitParentChanged,
 }
 
 enum RemoveSearchResult {
@@ -106,6 +106,17 @@ enum SubNodeStatus {
     Relocate(usize, usize),
     Merge(usize, usize),
     Ok,
+}
+
+pub struct NodeSplit {
+    new_right_node: NodeCellRef,
+    pivot: Option<EntryKey>,
+    parent_latch: Option<NodeWriteGuard>,
+}
+
+pub enum NodeSplitResult {
+    Split(NodeSplit),
+    Retry,
 }
 
 impl BPlusTree {
@@ -169,26 +180,33 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        if let Some((new_node, pivotKey)) = self.insert_to_node(&self.root, &key) {
-            debug!("split root with pivot key {:?}", pivotKey);
-            let first_key = new_node.read_unchecked().first_key();
-            let pivot = pivotKey.unwrap_or_else(|| first_key);
-            let mut new_in_root = InNode {
-                keys: make_array!(NUM_KEYS, Default::default()),
-                ptrs: make_array!(NUM_PTRS, Default::default()),
-                right: Arc::new(Node::none()),
-                len: 1,
-            };
-            // TODO: review swap root
-            unsafe {
-                let old_root = &mut *self.root.write();
-                new_in_root.keys[0] = pivot;
-                new_in_root.ptrs[1] = new_node;
-                let first_ptr = &mut *new_in_root.ptrs[0].write();
-                let new_root = NodeData::Internal(box new_in_root);
-                *first_ptr = new_root;
-                mem::swap(old_root, first_ptr);
+        match self.insert_to_node(&self.root, None, None, &key) {
+            Some(NodeSplitResult::Split(split)) => {
+                debug!("split root with pivot key {:?}", split.pivot);
+                let new_node = split.new_right_node;
+                let first_key = new_node.read_unchecked().first_key();
+                let pivot = split.pivot.unwrap_or_else(|| first_key);
+                let mut new_in_root = InNode {
+                    keys: make_array!(NUM_KEYS, Default::default()),
+                    ptrs: make_array!(NUM_PTRS, Default::default()),
+                    right: Arc::new(Node::none()),
+                    len: 1,
+                };
+                // TODO: review swap root
+                unsafe {
+                    debug!("obtain latch for root split");
+                    let old_root = &mut *self.root.write();;
+                    new_in_root.keys[0] = pivot;
+                    new_in_root.ptrs[1] = new_node;
+                    debug!("obtain latch for root new splited root");
+                    let first_ptr = &mut *new_in_root.ptrs[0].write();
+                    let new_root = NodeData::Internal(box new_in_root);
+                    *first_ptr = new_root;
+                    mem::swap(old_root, first_ptr);
+                }
             }
+            Some(_) => unreachable!(),
+            None => {}
         }
         self.len.fetch_add(1, Relaxed);
     }
@@ -196,11 +214,10 @@ impl BPlusTree {
     fn insert_to_node(
         &self,
         node_ref: &NodeCellRef,
+        parent: Option<&NodeCellRef>,
+        parent_version: Option<usize>,
         key: &EntryKey,
-    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
-
-        let mut split_node = None;
-
+    ) -> Option<NodeSplitResult> {
         loop {
             let mut version = 0;
             let mut search = node_ref.read(|node_handler| {
@@ -224,61 +241,75 @@ impl BPlusTree {
                     &NodeData::None => unreachable!(),
                 }
             });
-            split_node = match search {
+            match search {
                 InsertSearchResult::RightNode(node) => {
-                    return self.insert_to_node(&node, key);
+                    return self.insert_to_node(&node, parent, parent_version, key);
                 }
                 InsertSearchResult::External => {
                     // latch nodes from left to right
+                    debug!("Obtain latch for external node");
                     let node_guard = node_ref.write();
                     if node_ref.version() != version {
                         continue;
                     }
                     let mut searched_guard = write_key_page(node_guard, key);
                     let pos = searched_guard.search(key);
-                    debug_assert!(searched_guard.is_ext(), "{:?}", searched_guard.innode().keys);
-                    return searched_guard.extnode_mut().insert(key, pos, self, node_ref);
+                    debug_assert!(
+                        searched_guard.is_ext(),
+                        "{:?}",
+                        searched_guard.innode().keys
+                    );
+                    return searched_guard.extnode_mut().insert(
+                        key,
+                        pos,
+                        self,
+                        node_ref,
+                        parent,
+                        parent_version,
+                    );
                 }
-                InsertSearchResult::Internal(node) => self.insert_to_node(&node, key),
+                InsertSearchResult::Internal(node) => {
+                    let split_res = self.insert_to_node(&node, Some(node_ref), Some(version), key);
+                    match split_res {
+                        Some(NodeSplitResult::Retry) => continue,
+                        None => return None,
+                        Some(NodeSplitResult::Split(split)) => {
+                            debug!(
+                                "Sub level node split, shall insert new node to current level, pivot {:?}",
+                                split.pivot
+                            );
+                            let pivot = {
+                                let new_node = split.new_right_node.read_unchecked();
+                                debug_assert!(!(!new_node.is_ext() && split.pivot.is_none()));
+                                split.pivot.unwrap_or_else(|| {
+                                    let first_key = new_node.first_key();
+                                    debug_assert_ne!(first_key.len(), 0);
+                                    first_key
+                                })
+                            };
+                            debug!("New pivot {:?}", pivot);
+                            debug!("obtain latch for internal node split");
+                            let mut target_guard = write_key_page(split.parent_latch.unwrap(), key);
+                            let pivot_pos = target_guard.search(&pivot);
+                            debug!(
+                                "will insert into current node at {}, node len {}",
+                                pivot_pos,
+                                target_guard.len()
+                            );
+                            let mut target_innode = target_guard.innode_mut();
+                            return target_innode.insert(
+                                pivot,
+                                split.new_right_node,
+                                parent,
+                                parent_version,
+                                pivot_pos,
+                            );
+                        }
+                    }
+                }
             };
             break;
         }
-        match split_node {
-            Some((new_node_ref, pivot_key)) => {
-                debug!(
-                    "Sub level node split, shall insert new node to current level, pivot {:?}",
-                    pivot_key
-                );
-                let pivot = {
-                    let new_node = new_node_ref.read_unchecked();
-                    debug_assert!(!(!new_node.is_ext() && pivot_key.is_none()));
-                    pivot_key.unwrap_or_else(|| {
-                        let first_key = new_node.first_key();
-                        debug_assert_ne!(first_key.len(), 0);
-                        first_key
-                    })
-                };
-                debug!("New pivot {:?}", pivot);
-                let node_guard = node_ref.write();
-                let mut new_node_parent = write_key_page(node_guard, &pivot);
-                let result = {
-                    let pivot_pos = new_node_parent.search(&pivot);
-                    debug!(
-                        "will insert into current node at {}, node len {}",
-                        pivot_pos,
-                        new_node_parent.len()
-                    );
-                    let mut new_node_parent_innode = new_node_parent.innode_mut();
-                    new_node_parent_innode.insert(pivot, Some(new_node_ref), pivot_pos)
-                };
-                if result.is_some() {
-                    debug!("Sub level split caused current level split");
-                }
-                return result;
-            }
-            None => return None,
-        }
-
         unreachable!()
     }
 
@@ -569,7 +600,7 @@ impl NodeData {
         match self {
             &NodeData::Internal(_) => "internal",
             &NodeData::External(_) => "external",
-            &NodeData::None => "none"
+            &NodeData::None => "none",
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
@@ -610,8 +641,12 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
             &NodeData::Internal(ref n) => {
                 if &n.keys[n.len - 1] < key {
                     let right_ref = &n.right;
+                    debug!("Obtain latch for internal write key page");
                     let right_node = right_ref.write();
-                    if !right_node.is_none() && right_node.len() > 0 && &right_node.innode().keys[0] <= key {
+                    if !right_node.is_none()
+                        && right_node.len() > 0
+                        && &right_node.innode().keys[0] <= key
+                    {
                         debug_assert!(!right_node.is_ext());
                         return write_key_page(right_node, key);
                     }
@@ -620,8 +655,12 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
             &NodeData::External(ref n) => {
                 if &n.keys[n.len - 1] < key {
                     let right_ref = &n.next;
+                    debug!("Obtain latch for external write key page");
                     let right_node = right_ref.write();
-                    if !right_node.is_none() && right_node.len() > 0 && &right_node.extnode().keys[0] <= key {
+                    if !right_node.is_none()
+                        && right_node.len() > 0
+                        && &right_node.extnode().keys[0] <= key
+                    {
                         debug_assert!(right_node.is_ext());
                         return write_key_page(right_node, key);
                     }
@@ -677,6 +716,7 @@ impl Node {
                 return NodeWriteGuard {
                     data: self.data.get(),
                     cc: &self.cc as *const AtomicUsize,
+                    version: node_version(cc_num),
                 };
             }
             debug!("acquire latch failed, retry {:b}", cc_num);
@@ -710,13 +750,18 @@ impl Node {
     }
 
     pub fn version(&self) -> usize {
-        self.cc.load(Relaxed) & (!LATCH_FLAG)
+        node_version(self.cc.load(Relaxed))
     }
+}
+
+pub fn node_version(cc_num: usize) -> usize {
+    cc_num & (!LATCH_FLAG)
 }
 
 pub struct NodeWriteGuard {
     data: *mut NodeData,
     cc: *const AtomicUsize,
+    version: usize,
 }
 
 impl Deref for NodeWriteGuard {
@@ -1015,6 +1060,7 @@ pub mod test {
     use ram::types::RandValue;
     use rand::distributions::Uniform;
     use rand::prelude::*;
+    use rayon::prelude::*;
     use server;
     use server::NebServer;
     use server::ServerOptions;
@@ -1027,7 +1073,6 @@ pub mod test {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use rayon::prelude::*;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1461,17 +1506,15 @@ pub mod test {
             .unwrap();
 
         let tree_clone = tree.clone();
-        thread::spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(10));
-                let tree_len = tree_clone.len();
-                debug!(
-                    "LSM-Tree now have {}/{} elements, total {:.2}%",
-                    tree_len,
-                    num,
-                    tree_len as f32 / num as f32 * 100.0
-                );
-            }
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(10));
+            let tree_len = tree_clone.len();
+            debug!(
+                "LSM-Tree now have {}/{} elements, total {:.2}%",
+                tree_len,
+                num,
+                tree_len as f32 / num as f32 * 100.0
+            );
         });
 
         (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {

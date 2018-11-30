@@ -94,16 +94,24 @@ impl ExtNode {
         pos: usize,
         tree: &BPlusTree,
         self_ref: &NodeCellRef,
-    ) -> Option<(NodeCellRef, Option<EntryKey>)> {
+        parent: Option<&NodeCellRef>,
+        parent_version: Option<usize>,
+    ) -> Option<NodeSplitResult> {
         let self_len = self.len;
         let key = key.clone();
         debug_assert!(self_len <= NUM_KEYS);
         if self_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
+            let self_next = &mut *self.next.write();
+            let parent_latch = parent.map(|node| node.write());
+            if let &Some(ref guard) = &parent_latch {
+                if guard.version != parent_version.unwrap() {
+                    return Some(NodeSplitResult::Retry);
+                }
+            }
             // cached.dump();
             let pivot = self_len / 2;
-            let self_next = &mut *self.next.write();
             let new_page_id = tree.new_page_id();
             let mut keys_1 = &mut self.keys;
             let mut keys_2 = keys_1.split_at_pivot(pivot, self_len);
@@ -131,12 +139,18 @@ impl ExtNode {
                 self.len, extnode_2.len
             );
             let node_2 = Arc::new(Node::external(extnode_2));
-            if !self_next.is_none() {
-                self_next.extnode_mut().prev = node_2.clone();
+            {
+                if !self_next.is_none() {
+                    self_next.extnode_mut().prev = node_2.clone();
+                }
             }
             self.next = node_2.clone();
             self.len = keys_1_len;
-            return Some((node_2, None));
+            return Some(NodeSplitResult::Split(NodeSplit {
+                new_right_node: node_2,
+                pivot: None,
+                parent_latch,
+            }));
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
             let mut new_cached_len = self_len;
