@@ -1096,6 +1096,7 @@ pub mod test {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+    use itertools::Itertools;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1256,9 +1257,12 @@ pub mod test {
             .unwrap();
         {
             info!("test insertion");
-            for i in (0..num).rev() {
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
+            let mut nums = (0..num).collect_vec();
+            let mut slice = nums.as_mut_slice();
+            thread_rng().shuffle(slice);
+            for i in slice {
+                let id = Id::new(0, *i);
+                let key_slice = u64_to_slice(*i);
                 let key = SmallVec::from_slice(&key_slice);
                 debug!("insert id: {}", i);
                 let mut entry_key = key.clone();
