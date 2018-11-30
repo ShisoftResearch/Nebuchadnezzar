@@ -259,7 +259,8 @@ impl BPlusTree {
                     })
                 };
                 debug!("New pivot {:?}", pivot);
-                let mut new_node_parent = write_key_page(node_ref.write(), &pivot);
+                let node_guard = node_ref.write();
+                let mut new_node_parent = write_key_page(node_guard, &pivot);
                 let result = {
                     let pivot_pos = new_node_parent.search(&pivot);
                     debug!(
