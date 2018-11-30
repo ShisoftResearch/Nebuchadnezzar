@@ -1341,7 +1341,9 @@ pub mod test {
         {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
-            for i in 0..deletion_volume {
+            let mut deletions = (0..deletion_volume).collect_vec();
+            thread_rng().shuffle(deletions.as_mut_slice());
+            for i in deletions {
                 debug!("delete: {}", i);
                 let id = Id::new(0, i);
                 let key_slice = u64_to_slice(i);
@@ -1352,7 +1354,7 @@ pub mod test {
                 if !remove_succeed {
                     dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 }
-                assert!(remove_succeed, "{}", i);
+                assert!(remove_succeed, "remove at {}", i);
             }
 
             assert_eq!(tree.len(), (num - deletion_volume) as usize);
@@ -1544,7 +1546,9 @@ pub mod test {
             );
         });
 
-        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+        let mut nums = (0..num).collect::<Vec<_>>();
+        thread_rng().shuffle(nums.as_mut_slice());
+        nums.par_iter().for_each(|i| {
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
