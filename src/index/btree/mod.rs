@@ -1101,6 +1101,7 @@ pub mod test {
     use std::thread;
     use std::time::Duration;
     use itertools::Itertools;
+    use index::EntryKey;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -1231,6 +1232,19 @@ pub mod test {
         key_slice
     }
 
+    fn check_ordering(tree: &BPlusTree, key: &EntryKey) {
+        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+        let mut last_key = cursor.current().unwrap().clone();
+        while cursor.next() {
+            let current = cursor.current().unwrap();
+            if &last_key > current {
+                dump_tree(tree, "error_insert_dump.json");
+                panic!("error on ordering check {:?} > {:?}, key {:?}", last_key, current, key);
+            }
+            last_key = current.clone();
+        }
+    }
+
     #[test]
     fn crd() {
         use index::Cursor;
@@ -1262,16 +1276,19 @@ pub mod test {
         {
             info!("test insertion");
             let mut nums = (0..num).collect_vec();
-            let mut slice = nums.as_mut_slice();
-            thread_rng().shuffle(slice);
-            for i in slice {
-                let id = Id::new(0, *i);
-                let key_slice = u64_to_slice(*i);
+            thread_rng().shuffle(nums.as_mut_slice());
+            let json = serde_json::to_string(&nums).unwrap();
+            let mut file = File::create("nums_dump.json").unwrap();
+            file.write_all(json.as_bytes());
+            for i in nums {
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
                 let key = SmallVec::from_slice(&key_slice);
                 debug!("insert id: {}", i);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 tree.insert(&entry_key);
+                check_ordering(&tree, &entry_key);
             }
             assert_eq!(tree.len(), num as usize);
             dump_tree(&tree, "tree_dump.json");
