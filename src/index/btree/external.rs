@@ -134,9 +134,11 @@ impl ExtNode {
                 len: keys_2_len,
                 dirty: true,
             };
+            debug_assert!(extnode_2.prev.read_unchecked().is_ext());
+            self.len = keys_1_len;
             debug!(
-                "Split to left len {}, right len {}",
-                self.len, extnode_2.len
+                "Split to left len {}, right len {}, right prev id: {:?}",
+                self.len, extnode_2.len, extnode_2.prev.read_unchecked().ext_id()
             );
             let node_2 = Arc::new(Node::external(extnode_2));
             {
@@ -145,7 +147,7 @@ impl ExtNode {
                 }
             }
             self.next = node_2.clone();
-            self.len = keys_1_len;
+
             return Some(NodeSplitResult::Split(NodeSplit {
                 new_right_node: node_2,
                 pivot: None,

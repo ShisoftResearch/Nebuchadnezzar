@@ -58,7 +58,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    pub root: NodeCellRef,
+    root: UnsafeCell<NodeCellRef>,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
 }
@@ -125,17 +125,23 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: Arc::new(Node::none()),
+            root: UnsafeCell::new(Arc::new(Node::none())),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
-        tree.root = Arc::new(Node::new_external(root_id));
+        unsafe {
+            *&mut*tree.root.get() = Arc::new(Node::new_external(root_id));
+        }
         return tree;
     }
 
+    pub fn get_root(&self) -> &mut NodeCellRef {
+        unsafe { &mut*self.root.get() }
+    }
+
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
-        let mut cursor = unsafe { self.search(&self.root, key, ordering) };
+        let mut cursor = unsafe { self.search(self.get_root(), key, ordering) };
         match ordering {
             Ordering::Forward => {}
             Ordering::Backward => {
@@ -181,8 +187,9 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match self.insert_to_node(&self.root, None, None, &key) {
+        match self.insert_to_node(self.get_root(), None, None, &key) {
             Some(NodeSplitResult::Split(mut split)) => {
+                debug!("split root with pivot key {:?}", split.pivot);
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let first_key = new_node.read_unchecked().first_key();
@@ -193,18 +200,11 @@ impl BPlusTree {
                     right: Arc::new(Node::none()),
                     len: 1,
                 };
-                // TODO: review swap root
-                unsafe {
-                    debug!("obtain latch for root split");
-                    let old_root = &mut *split.left_node_latch;
-                    new_in_root.keys[0] = pivot;
-                    new_in_root.ptrs[1] = new_node;
-                    debug!("obtain latch for root new splited root");
-                    let first_ptr = &mut *new_in_root.ptrs[0].write();
-                    let new_root = NodeData::Internal(box new_in_root);
-                    *first_ptr = new_root;
-                    mem::swap(old_root, first_ptr);
-                }
+                let mut old_root = self.get_root();
+                new_in_root.keys[0] = pivot;
+                new_in_root.ptrs[0] = old_root.clone();
+                new_in_root.ptrs[1] = new_node;
+                *old_root = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             Some(_) => unreachable!(),
             None => {}
@@ -283,18 +283,11 @@ impl BPlusTree {
                                 "Sub level node split, shall insert new node to current level, pivot {:?}",
                                 split.pivot
                             );
-                            let pivot = {
-                                let new_node = split.new_right_node.read_unchecked();
-                                debug_assert!(!(!new_node.is_ext() && split.pivot.is_none()));
-                                split.pivot.unwrap_or_else(|| {
-                                    let first_key = new_node.first_key();
-                                    debug_assert_ne!(first_key.len(), 0);
-                                    first_key
-                                })
-                            };
+                            let pivot_candidate = split.new_right_node.read_unchecked().first_key();
+                            let pivot = split.pivot.unwrap_or(pivot_candidate);
                             debug!("New pivot {:?}", pivot);
                             debug!("obtain latch for internal node split");
-                            let mut target_guard = write_key_page(split.parent_latch.unwrap(), key);
+                            let mut target_guard = split.parent_latch.unwrap();
                             let pivot_pos = target_guard.search(&pivot);
                             debug!(
                                 "will insert into current node at {}, node len {}",
@@ -322,7 +315,7 @@ impl BPlusTree {
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
-        let root = &self.root;
+        let root = self.get_root();
         let removed = self.remove_from_node(root, key);
         let root_node = &mut *root.write();
         if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
@@ -595,7 +588,7 @@ impl NodeData {
         match self {
             &NodeData::External(ref node) => node.id,
             &NodeData::None => Id::unit_id(),
-            _ => unreachable!(self.type_name()),
+            &NodeData::Internal(ref node) =>  unreachable!(self.type_name()),
         }
     }
     pub fn innode(&self) -> &InNode {
@@ -612,6 +605,7 @@ impl NodeData {
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
+        return None;
         if self.len() > 0 {
             match self {
                 &NodeData::Internal(ref n) => {
@@ -646,6 +640,7 @@ impl NodeData {
 }
 
 pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteGuard {
+    return search_page;
     if search_page.len() > 0 {
         match &*search_page {
             &NodeData::Internal(ref n) => {
@@ -855,33 +850,26 @@ impl IndexCursor for RTCursor {
             let current_page = self.page.clone().unwrap();
             current_page.read(|page| {
                 let ext_page = page.extnode();
-                debug!(
-                    "Next id with index: {}, length: {}",
-                    self.index + 1,
-                    ext_page.len
-                );
+                // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                 match self.ordering {
                     Ordering::Forward => {
                         if self.index + 1 >= page.len() {
                             // next page
                             return ext_page.next.read(|next_page| {
                                 if !next_page.is_none() {
-                                    debug!(
-                                        "Shifting page forward, next page len: {}",
-                                        next_page.len()
-                                    );
+                                    // debug!("Shifting page forward, next page len: {}", next_page.len());
                                     self.index = 0;
                                     self.page = Some(ext_page.next.clone());
                                     return true;
                                 } else {
-                                    debug!("iterated to end");
+                                    // debug!("iterated to end");
                                     self.page = None;
                                     return false;
                                 }
                             });
                         } else {
                             self.index += 1;
-                            debug!("Advancing cursor to index {}", self.index);
+                            // debug!("Advancing cursor to index {}", self.index);
                         }
                     }
                     Ordering::Backward => {
@@ -901,7 +889,7 @@ impl IndexCursor for RTCursor {
                             });
                         } else {
                             self.index -= 1;
-                            debug!("Advancing cursor to index {}", self.index);
+                            // debug!("Advancing cursor to index {}", self.index);
                         }
                     }
                 }
@@ -1119,7 +1107,7 @@ pub mod test {
 
     pub fn dump_tree(tree: &BPlusTree, f: &str) {
         debug!("dumping {}", f);
-        let debug_root = cascading_dump_node(&tree.root);
+        let debug_root = cascading_dump_node(tree.get_root());
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
         let mut file = File::create(f).unwrap();
         file.write_all(json.as_bytes());
@@ -1127,7 +1115,7 @@ pub mod test {
 
     fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
         unsafe {
-            match &*node.write() {
+            match &*node.read_unchecked() {
                 &NodeData::External(ref node) => {
                     let keys = node
                         .keys
@@ -1142,8 +1130,8 @@ pub mod test {
                         keys,
                         nodes: vec![],
                         id: Some(format!("{:?}", node.id)),
-                        next: Some(format!("{:?}", node.next.write().ext_id())),
-                        prev: Some(format!("{:?}", node.prev.write().ext_id())),
+                        next: Some(format!("{:?}", node.next.read_unchecked().ext_id())),
+                        prev: Some(format!("{:?}", node.prev.read_unchecked().ext_id())),
                         len: node.len,
                         is_external: true,
                     };
@@ -1269,6 +1257,8 @@ pub mod test {
             .wait()
             .unwrap();
         let tree = BPlusTree::new(&client);
+        ::std::fs::remove_dir_all("dumps");
+        ::std::fs::create_dir_all("dumps");
         let num = env::var("BTREE_TEST_ITEMS")
             .unwrap_or("1000".to_string())
             .parse::<u64>()
@@ -1280,15 +1270,18 @@ pub mod test {
             let json = serde_json::to_string(&nums).unwrap();
             let mut file = File::create("nums_dump.json").unwrap();
             file.write_all(json.as_bytes());
-            for i in nums {
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
+            let mut i = 0;
+            for n in nums {
+                let id = Id::new(0, n);
+                let key_slice = u64_to_slice(n);
                 let key = SmallVec::from_slice(&key_slice);
-                debug!("insert id: {}", i);
+                debug!("insert id: {}", n);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 tree.insert(&entry_key);
+                dump_tree(&tree, &format!("dumps/insertion_{}_{}_dump.json", i, n));
                 check_ordering(&tree, &entry_key);
+                i += 1;
             }
             assert_eq!(tree.len(), num as usize);
             dump_tree(&tree, "tree_dump.json");
