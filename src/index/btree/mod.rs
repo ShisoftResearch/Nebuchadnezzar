@@ -619,7 +619,8 @@ impl NodeData {
                         let right_node = n.right.read_unchecked();
                         if !right_node.is_none() {
                             let right_innode = right_node.innode();
-                            if right_innode.keys.len() > 0 && &right_innode.keys[0] <= key {
+                            if right_innode.keys.len() > 0 && &right_innode.keys[0] < key {
+                                debug!("found key to put to right internal page {:?}/{:?}", key, &right_innode.keys[0]);
                                 return Some(&n.right);
                             }
                         }
@@ -630,7 +631,8 @@ impl NodeData {
                         let right_node = n.next.read_unchecked();
                         if !right_node.is_none() {
                             let right_extnode = right_node.extnode();
-                            if right_extnode.keys.len() > 0 && &right_extnode.keys[0] <= key {
+                            if right_extnode.keys.len() > 0 && &right_extnode.keys[0] < key {
+                                debug!("found key to put to right external page {:?}/{:?}", key, &right_extnode.keys[0]);
                                 return Some(&n.next);
                             }
                         }
@@ -653,9 +655,10 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
                     let right_node = right_ref.write();
                     if !right_node.is_none()
                         && right_node.len() > 0
-                        && &right_node.innode().keys[0] <= key
+                        && &right_node.innode().keys[0] < key
                     {
                         debug_assert!(!right_node.is_ext());
+                        debug!("will write to right internal page");
                         return write_key_page(right_node, key);
                     }
                 }
@@ -667,9 +670,10 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
                     let right_node = right_ref.write();
                     if !right_node.is_none()
                         && right_node.len() > 0
-                        && &right_node.extnode().keys[0] <= key
+                        && &right_node.extnode().keys[0] < key
                     {
                         debug_assert!(right_node.is_ext());
+                        debug!("will write to right external page");
                         return write_key_page(right_node, key);
                     }
                 }
@@ -1338,6 +1342,8 @@ pub mod test {
             }
         }
 
+
+        return;
         {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
