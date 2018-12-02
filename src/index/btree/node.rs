@@ -138,7 +138,7 @@ impl NodeData {
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
-        return None;
+        // return None;
         if self.len() > 0 {
             match self {
                 &NodeData::Internal(ref n) => {
@@ -179,7 +179,7 @@ impl NodeData {
 }
 
 pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteGuard {
-    return search_page;
+    // return search_page;
     if search_page.len() > 0 {
         match &*search_page {
             &NodeData::Internal(ref n) => {

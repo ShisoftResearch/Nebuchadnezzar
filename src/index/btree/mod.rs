@@ -50,7 +50,7 @@ mod internal;
 mod merge;
 mod node;
 
-pub const NUM_KEYS: usize = 24;
+pub const NUM_KEYS: usize = 4;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -753,7 +753,7 @@ pub mod test {
                 let id = Id::new(0, n);
                 let key_slice = u64_to_slice(n);
                 let key = SmallVec::from_slice(&key_slice);
-                debug!("insert id: {}", n);
+                debug!("{}. insert id: {}", i, n);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 tree.insert(&entry_key);
