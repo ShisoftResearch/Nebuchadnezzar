@@ -757,7 +757,6 @@ pub mod test {
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 tree.insert(&entry_key);
-                dump_tree(&tree, &format!("dumps/insertion_{}_{}_dump.json", i, n));
                 check_ordering(&tree, &entry_key);
                 i += 1;
             }
