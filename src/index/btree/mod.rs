@@ -231,7 +231,8 @@ impl BPlusTree {
                     return split_result;
                 }
                 InsertSearchResult::Internal(sub_node) => {
-                    let split_res = self.insert_to_node(&sub_node, Some(node_ref), Some(version), key);
+                    let split_res =
+                        self.insert_to_node(&sub_node, Some(node_ref), Some(version), key);
                     match split_res {
                         Some(NodeSplitResult::Retry) => continue,
                         None => return None,
@@ -245,8 +246,15 @@ impl BPlusTree {
                             debug!("obtain latch for internal node split");
                             let mut self_guard = split.parent_latch.unwrap();
                             let pivot_pos = self_guard.search(&pivot);
-                            debug_assert!(self_guard.innode().ptrs[pivot_pos].read_unchecked().first_key() < pivot);
-                            debug_assert!(split.new_right_node.read_unchecked().first_key() >= pivot);
+                            debug_assert!(
+                                self_guard.innode().ptrs[pivot_pos]
+                                    .read_unchecked()
+                                    .first_key()
+                                    < pivot
+                            );
+                            debug_assert!(
+                                split.new_right_node.read_unchecked().first_key() >= pivot
+                            );
                             debug!(
                                 "will insert into current node at {}, node len {}",
                                 pivot_pos,
@@ -259,7 +267,10 @@ impl BPlusTree {
                                 parent_version,
                                 pivot_pos,
                             );
-                            debug_assert!(self_guard.first_key() > self_guard.innode().ptrs[0].read_unchecked().first_key());
+                            debug_assert!(
+                                self_guard.first_key()
+                                    > self_guard.innode().ptrs[0].read_unchecked().first_key()
+                            );
                             if let &mut Some(NodeSplitResult::Split(ref mut split)) =
                                 &mut split_result
                             {

@@ -81,7 +81,7 @@ impl InNode {
                         keys_2,
                         keys_1_len,
                         keys_2_len,
-                        pivot_key
+                        pivot_key,
                     }
                 } else {
                     let mut keys_1 = &mut self.keys;
