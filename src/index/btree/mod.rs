@@ -50,7 +50,7 @@ mod internal;
 mod merge;
 mod node;
 
-pub const NUM_KEYS: usize = 4;
+pub const NUM_KEYS: usize = 24;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
