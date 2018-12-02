@@ -141,7 +141,9 @@ impl ExtNode {
             self.len = keys_1_len;
             debug!(
                 "Split to left len {}, right len {}, right prev id: {:?}",
-                self.len, extnode_2.len, extnode_2.prev.read_unchecked().ext_id()
+                self.len,
+                extnode_2.len,
+                extnode_2.prev.read_unchecked().ext_id()
             );
             let node_2 = Arc::new(Node::external(extnode_2));
             {
@@ -155,7 +157,7 @@ impl ExtNode {
                 new_right_node: node_2,
                 pivot: pivot_key,
                 parent_latch,
-                left_node_latch: NodeWriteGuard::default()
+                left_node_latch: NodeWriteGuard::default(),
             }));
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);

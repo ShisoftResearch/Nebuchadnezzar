@@ -9,8 +9,11 @@ use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::{key_hash, Map, PrimitiveArray, ToValue, Value};
 use futures::Future;
 use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
+pub use index::btree::cursor::*;
 use index::btree::external::*;
 use index::btree::internal::*;
+pub use index::btree::merge::*;
+pub use index::btree::node::*;
 use index::EntryKey;
 use index::MergeableTree;
 use index::MergingPage;
@@ -40,16 +43,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-pub use index::btree::node::*;
-pub use index::btree::cursor::*;
-pub use index::btree::merge::*;
 
-
+mod cursor;
 mod external;
 mod internal;
-mod node;
-mod cursor;
 mod merge;
+mod node;
 
 pub const NUM_KEYS: usize = 4;
 const NUM_PTRS: usize = NUM_KEYS + 1;
@@ -90,13 +89,13 @@ impl BPlusTree {
         };
         let root_id = tree.new_page_id();
         unsafe {
-            *&mut*tree.root.get() = Arc::new(Node::new_external(root_id));
+            *&mut *tree.root.get() = Arc::new(Node::new_external(root_id));
         }
         return tree;
     }
 
     pub fn get_root(&self) -> &mut NodeCellRef {
-        unsafe { &mut*self.root.get() }
+        unsafe { &mut *self.root.get() }
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
@@ -258,7 +257,9 @@ impl BPlusTree {
                                 parent_version,
                                 pivot_pos,
                             );
-                            if let &mut Some(NodeSplitResult::Split(ref mut split)) = &mut split_result {
+                            if let &mut Some(NodeSplitResult::Split(ref mut split)) =
+                                &mut split_result
+                            {
                                 split.left_node_latch = target_guard;
                             }
                             return split_result;
@@ -527,11 +528,14 @@ pub mod test {
     use dovahkiin::types::custom_types::id::Id;
     use futures::future::Future;
     use hermes::stm::TxnValRef;
+    use index::btree::node::*;
     use index::btree::NodeCellRef;
     use index::btree::NodeData;
     use index::btree::NUM_KEYS;
     use index::Cursor;
+    use index::EntryKey;
     use index::{id_from_key, key_with_id};
+    use itertools::Itertools;
     use ram::types::RandValue;
     use rand::distributions::Uniform;
     use rand::prelude::*;
@@ -548,9 +552,6 @@ pub mod test {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use itertools::Itertools;
-    use index::EntryKey;
-    use index::btree::node::*;
 
     extern crate env_logger;
     extern crate serde_json;
@@ -688,7 +689,10 @@ pub mod test {
             let current = cursor.current().unwrap();
             if &last_key > current {
                 dump_tree(tree, "error_insert_dump.json");
-                panic!("error on ordering check {:?} > {:?}, key {:?}", last_key, current, key);
+                panic!(
+                    "error on ordering check {:?} > {:?}, key {:?}",
+                    last_key, current, key
+                );
             }
             last_key = current.clone();
         }
