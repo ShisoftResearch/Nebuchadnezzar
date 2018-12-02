@@ -193,8 +193,8 @@ impl BPlusTree {
                     &NodeData::External(ref node) => InsertSearchResult::External,
                     &NodeData::Internal(ref node) => {
                         let pos = node_handler.search(&key);
-                        let next_node_ref = &node.ptrs[pos];
-                        InsertSearchResult::Internal(next_node_ref.clone())
+                        let sub_node_ref = &node.ptrs[pos];
+                        InsertSearchResult::Internal(sub_node_ref.clone())
                     }
                     &NodeData::None => unreachable!(),
                 }
@@ -230,8 +230,8 @@ impl BPlusTree {
                     }
                     return split_result;
                 }
-                InsertSearchResult::Internal(node) => {
-                    let split_res = self.insert_to_node(&node, Some(node_ref), Some(version), key);
+                InsertSearchResult::Internal(sub_node) => {
+                    let split_res = self.insert_to_node(&sub_node, Some(node_ref), Some(version), key);
                     match split_res {
                         Some(NodeSplitResult::Retry) => continue,
                         None => return None,
@@ -243,24 +243,27 @@ impl BPlusTree {
                             let pivot = split.pivot;
                             debug!("New pivot {:?}", pivot);
                             debug!("obtain latch for internal node split");
-                            let mut target_guard = split.parent_latch.unwrap();
-                            let pivot_pos = target_guard.search(&pivot);
+                            let mut self_guard = split.parent_latch.unwrap();
+                            let pivot_pos = self_guard.search(&pivot);
+                            debug_assert!(self_guard.innode().ptrs[pivot_pos].read_unchecked().first_key() < pivot);
+                            debug_assert!(split.new_right_node.read_unchecked().first_key() >= pivot);
                             debug!(
                                 "will insert into current node at {}, node len {}",
                                 pivot_pos,
-                                target_guard.len()
+                                self_guard.len()
                             );
-                            let mut split_result = target_guard.innode_mut().insert(
+                            let mut split_result = self_guard.innode_mut().insert(
                                 pivot,
                                 split.new_right_node,
                                 parent,
                                 parent_version,
                                 pivot_pos,
                             );
+                            debug_assert!(self_guard.first_key() > self_guard.innode().ptrs[0].read_unchecked().first_key());
                             if let &mut Some(NodeSplitResult::Split(ref mut split)) =
                                 &mut split_result
                             {
-                                split.left_node_latch = target_guard;
+                                split.left_node_latch = self_guard;
                             }
                             return split_result;
                         }
@@ -485,8 +488,7 @@ where
             for i in pivot..len {
                 // leave pivot to the right slice
                 let right_pos = i - pivot;
-                let item = mem::replace(&mut slice1[i], T::default());
-                slice2[right_pos] = item;
+                mem::swap(&mut slice1[i], &mut slice2[right_pos]);
             }
         }
         return right_slice;

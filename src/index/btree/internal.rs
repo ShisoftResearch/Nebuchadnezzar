@@ -70,53 +70,81 @@ impl InNode {
             }
             let keys_split = {
                 debug!("insert into keys");
-                let mut keys_1 = &mut self.keys;
-                let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
-                let mut keys_1_len = pivot; // will not count the pivot
-                let mut keys_2_len = node_len - pivot - 1;
-                let mut key_pos = pos;
-                if pos > pivot {
-                    // pivot moved, need to compensate
-                    key_pos -= 1;
-                }
-                debug!(
-                    "keys 1 len: {}, keys 2 len: {}, pos {}",
-                    keys_1_len, keys_2_len, key_pos
-                );
-                let pivot_key = keys_1[pivot].to_owned();
-                insert_into_split(
-                    key,
-                    keys_1,
-                    &mut keys_2,
-                    &mut keys_1_len,
-                    &mut keys_2_len,
-                    key_pos,
-                );
-                InNodeKeysSplit {
-                    keys_2,
-                    keys_1_len,
-                    keys_2_len,
-                    pivot_key,
+                if pivot == pos {
+                    debug!("special key treatment when pivot == pos");
+                    let mut keys_1 = &mut self.keys;
+                    let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
+                    let mut keys_1_len = pivot;
+                    let mut keys_2_len = node_len - pivot;
+                    let pivot_key = key;
+                    InNodeKeysSplit {
+                        keys_2,
+                        keys_1_len,
+                        keys_2_len,
+                        pivot_key
+                    }
+                } else {
+                    let mut keys_1 = &mut self.keys;
+                    let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
+                    let mut keys_1_len = pivot; // will not count the pivot
+                    let mut keys_2_len = node_len - pivot - 1;
+                    let mut key_pos = pos;
+                    if pos > pivot {
+                        // pivot moved, need to compensate
+                        key_pos -= 1;
+                    }
+                    debug!(
+                        "keys 1 len: {}, keys 2 len: {}, pos {}",
+                        keys_1_len, keys_2_len, key_pos
+                    );
+                    debug_assert_ne!(pivot, pos);
+                    let pivot_key = keys_1[pivot].to_owned();
+                    insert_into_split(
+                        key,
+                        keys_1,
+                        &mut keys_2,
+                        &mut keys_1_len,
+                        &mut keys_2_len,
+                        key_pos,
+                    );
+                    InNodeKeysSplit {
+                        keys_2,
+                        keys_1_len,
+                        keys_2_len,
+                        pivot_key,
+                    }
                 }
             };
             let ptr_split = {
-                debug!("insert into ptrs");
-                let mut ptrs_1 = &mut self.ptrs;
-                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
-                let mut ptrs_1_len = pivot + 1;
-                let mut ptrs_2_len = ptr_len - pivot - 1;
-                let mut ptr_pos = pos + 1;
-                insert_into_split(
-                    new_node,
-                    ptrs_1,
-                    &mut ptrs_2,
-                    &mut ptrs_1_len,
-                    &mut ptrs_2_len,
-                    ptr_pos,
-                );
-                debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
-                debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
-                InNodePtrSplit { ptrs_2 }
+                if pivot == pos {
+                    debug!("special ptr treatment when pivot == pos");
+                    let mut ptrs_1 = &mut self.ptrs;
+                    let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                    let mut ptrs_1_len = pivot + 1;
+                    let mut ptrs_2_len = ptr_len - pivot - 1;
+                    ptrs_2.insert_at(new_node, 0, &mut ptrs_2_len);
+                    debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                    debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                    InNodePtrSplit { ptrs_2 }
+                } else {
+                    debug!("insert into ptrs");
+                    let mut ptrs_1 = &mut self.ptrs;
+                    let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                    let mut ptrs_1_len = pivot + 1;
+                    let mut ptrs_2_len = ptr_len - pivot - 1;
+                    let mut ptr_pos = pos + 1;
+                    insert_into_split(
+                        new_node,
+                        ptrs_1,
+                        &mut ptrs_2,
+                        &mut ptrs_1_len,
+                        &mut ptrs_2_len,
+                        ptr_pos,
+                    );
+                    debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                    debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                    InNodePtrSplit { ptrs_2 }
+                }
             };
             let node_2 = InNode {
                 len: keys_split.keys_2_len,

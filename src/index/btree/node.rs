@@ -76,7 +76,8 @@ impl NodeData {
         match self {
             &NodeData::External(_) => true,
             &NodeData::Internal(_) => false,
-            &NodeData::None => panic!(),
+            &NodeData
+            ::None => panic!(),
         }
     }
     pub fn first_key(&self) -> EntryKey {
