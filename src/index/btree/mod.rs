@@ -148,7 +148,6 @@ impl BPlusTree {
         match self.insert_to_node(self.get_root(), None, None, &key) {
             Some(NodeSplitResult::Split(mut split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
-                debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
                 let mut new_in_root = InNode {
@@ -158,6 +157,8 @@ impl BPlusTree {
                     len: 1,
                 };
                 let mut old_root = self.get_root();
+                // should be the same node
+                debug_assert_eq!(old_root.read_unchecked().first_key(), split.left_node_latch.first_key());
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root.clone();
                 new_in_root.ptrs[1] = new_node;
