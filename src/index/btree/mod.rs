@@ -44,7 +44,7 @@ use utils::lru_cache::LRUCache;
 mod external;
 mod internal;
 
-pub const NUM_KEYS: usize = 24;
+pub const NUM_KEYS: usize = 4;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -111,7 +111,7 @@ enum SubNodeStatus {
 pub struct NodeSplit {
     new_right_node: NodeCellRef,
     left_node_latch: NodeWriteGuard,
-    pivot: Option<EntryKey>,
+    pivot: EntryKey,
     parent_latch: Option<NodeWriteGuard>,
 }
 
@@ -192,8 +192,7 @@ impl BPlusTree {
                 debug!("split root with pivot key {:?}", split.pivot);
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
-                let first_key = new_node.read_unchecked().first_key();
-                let pivot = split.pivot.unwrap_or_else(|| first_key);
+                let pivot = split.pivot;
                 let mut new_in_root = InNode {
                     keys: make_array!(NUM_KEYS, Default::default()),
                     ptrs: make_array!(NUM_PTRS, Default::default()),
@@ -283,8 +282,7 @@ impl BPlusTree {
                                 "Sub level node split, shall insert new node to current level, pivot {:?}",
                                 split.pivot
                             );
-                            let pivot_candidate = split.new_right_node.read_unchecked().first_key();
-                            let pivot = split.pivot.unwrap_or(pivot_candidate);
+                            let pivot = split.pivot;
                             debug!("New pivot {:?}", pivot);
                             debug!("obtain latch for internal node split");
                             let mut target_guard = split.parent_latch.unwrap();
@@ -605,6 +603,7 @@ impl NodeData {
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
+        return None;
         if self.len() > 0 {
             match self {
                 &NodeData::Internal(ref n) => {
@@ -639,6 +638,7 @@ impl NodeData {
 }
 
 pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteGuard {
+    return search_page;
     if search_page.len() > 0 {
         match &*search_page {
             &NodeData::Internal(ref n) => {

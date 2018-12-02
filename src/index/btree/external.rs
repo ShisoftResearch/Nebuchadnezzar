@@ -126,6 +126,7 @@ impl ExtNode {
                 &mut keys_2_len,
                 pos,
             );
+            let pivot_key = keys_2[0].clone();
             let extnode_2 = ExtNode {
                 id: new_page_id,
                 keys: keys_2,
@@ -134,6 +135,8 @@ impl ExtNode {
                 len: keys_2_len,
                 dirty: true,
             };
+            debug_assert!(pivot_key > smallvec!(0));
+            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1]);
             debug_assert!(extnode_2.prev.read_unchecked().is_ext());
             self.len = keys_1_len;
             debug!(
@@ -150,7 +153,7 @@ impl ExtNode {
 
             return Some(NodeSplitResult::Split(NodeSplit {
                 new_right_node: node_2,
-                pivot: None,
+                pivot: pivot_key,
                 parent_latch,
                 left_node_latch: NodeWriteGuard::default()
             }));
