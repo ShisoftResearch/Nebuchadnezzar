@@ -137,7 +137,7 @@ impl ExtNode {
                 dirty: true,
             };
             debug_assert!(pivot_key > smallvec!(0));
-            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1], "{:?} / {:?}", pivot_key, &keys_1[keys_1_len - 1]);
+            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1], "{:?} / {:?} @ {}", pivot_key, &keys_1[keys_1_len - 1], pos);
             debug_assert!(extnode_2.prev.read_unchecked().is_ext());
             self.len = keys_1_len;
             debug!(

@@ -1104,12 +1104,13 @@ pub mod test {
         let num = 10000;
         let mut nums = (0..num).collect_vec();
         thread_rng().shuffle(nums.as_mut_slice());
-        nums.iter().for_each(|num| {
-            let mut guard = node.write();
-            let mut ext_node = guard.extnode_mut();
+        nums.par_iter().for_each(|num| {
             let key_slice = u64_to_slice(*num);
             let mut key = SmallVec::from_slice(&key_slice);
-            ext_node.insert(&key,0 , &tree, &node, None, None);
+            let mut guard = node.write();
+            let pos: usize = guard.search(&key);
+            let mut ext_node = guard.extnode_mut();
+            ext_node.insert(&key, pos, &tree, &node, None, None);
         });
         assert_eq!(node.version(), num as usize);
     }
