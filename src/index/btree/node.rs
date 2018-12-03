@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::atomic::fence;
+use std::sync::atomic::Ordering::AcqRel;
+use std::sync::atomic::Ordering::Acquire;
+use std::sync::atomic::Ordering::Release;
 
 pub enum InsertSearchResult {
     External,
@@ -258,13 +262,16 @@ impl Node {
         loop {
             let cc_num = cc.load(Relaxed);
             let expected = cc_num & (!LATCH_FLAG);
-            if cc.compare_and_swap(expected, cc_num | LATCH_FLAG, Relaxed) == expected {
-                return NodeWriteGuard {
+
+            match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
+                Ok(num) if num == expected => return NodeWriteGuard {
                     data: self.data.get(),
                     cc: &self.cc as *const AtomicUsize,
                     version: node_version(cc_num),
-                };
+                },
+                _ => {}
             }
+
             debug!("acquire latch failed, retry {:b}", cc_num);
         }
     }
@@ -276,14 +283,14 @@ impl Node {
         };
         let cc = &self.cc;
         loop {
-            let cc_num = cc.load(Relaxed);
+            let cc_num = cc.load(SeqCst);
             if cc_num & LATCH_FLAG == LATCH_FLAG {
                 debug!("read have a latch, retry {:b}", cc_num);
                 continue;
             }
             handler.version = cc_num & (!LATCH_FLAG);
             let res = func(&handler);
-            let new_cc_num = cc.load(Relaxed);
+            let new_cc_num = cc.load(SeqCst);
             if new_cc_num == cc_num {
                 return res;
             }
@@ -296,7 +303,7 @@ impl Node {
     }
 
     pub fn version(&self) -> usize {
-        node_version(self.cc.load(Relaxed))
+        node_version(self.cc.load(SeqCst))
     }
 }
 
@@ -331,8 +338,8 @@ impl Drop for NodeWriteGuard {
         // cope with null pointer
         if self.cc as usize != 0 {
             let cc = unsafe { &*self.cc };
-            let cc_num = cc.load(Relaxed);
-            cc.store((cc_num & (!LATCH_FLAG)) + 1, Relaxed);
+            let cc_num = cc.load(SeqCst);
+            cc.store((cc_num & (!LATCH_FLAG)) + 1, Release);
         }
     }
 }
