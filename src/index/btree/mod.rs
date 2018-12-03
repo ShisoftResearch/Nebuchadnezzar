@@ -1101,7 +1101,7 @@ pub mod test {
         );
         let tree = BPlusTree::new(&client);
         let node = Arc::new(Node::new(NodeData::External(box ExtNode::new(Id::new(1, 2)))));
-        let num = 10000;
+        let num = 100000;
         let mut nums = (0..num).collect_vec();
         thread_rng().shuffle(nums.as_mut_slice());
         nums.par_iter().for_each(|num| {
@@ -1112,6 +1112,11 @@ pub mod test {
             let mut ext_node = guard.extnode_mut();
             ext_node.insert(&key, pos, &tree, &node, None, None);
         });
+        let read = node.read_unchecked();
+        let extnode = read.extnode();
+        for i in 0..read.len() - 1 {
+            assert!(extnode.keys[i] < extnode.keys[i + 1]);
+        }
         assert_eq!(node.version(), num as usize);
     }
 }
