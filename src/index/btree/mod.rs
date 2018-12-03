@@ -158,7 +158,10 @@ impl BPlusTree {
                 };
                 let mut old_root = self.get_root();
                 // should be the same node
-                debug_assert_eq!(old_root.read_unchecked().first_key(), split.left_node_latch.first_key());
+                debug_assert_eq!(
+                    old_root.read_unchecked().first_key(),
+                    split.left_node_latch.first_key()
+                );
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root.clone();
                 new_in_root.ptrs[1] = new_node;
