@@ -50,7 +50,7 @@ mod internal;
 mod merge;
 mod node;
 
-pub const NUM_KEYS: usize = 24;
+pub const NUM_KEYS: usize = 4;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -1079,5 +1079,38 @@ pub mod test {
                 }
             }
         });
+    }
+
+    #[test]
+    fn node_lock() {
+        env_logger::init();
+        let server_group = "node_lock_test";
+        let server_addr = String::from("127.0.0.1:5610");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 4 * 1024 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+            },
+            &server_addr,
+            &server_group,
+        );
+        let client = Arc::new(
+            AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
+        );
+        let tree = BPlusTree::new(&client);
+        let node = Arc::new(Node::new(NodeData::External(box ExtNode::new(Id::new(1, 2)))));
+        let num = 10000;
+        let mut nums = (0..num).collect_vec();
+        thread_rng().shuffle(nums.as_mut_slice());
+        nums.iter().for_each(|num| {
+            let mut guard = node.write();
+            let mut ext_node = guard.extnode_mut();
+            let key_slice = u64_to_slice(*num);
+            let mut key = SmallVec::from_slice(&key_slice);
+            ext_node.insert(&key,0 , &tree, &node, None, None);
+        });
+        assert_eq!(node.version(), num as usize);
     }
 }

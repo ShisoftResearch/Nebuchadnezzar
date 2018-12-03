@@ -100,6 +100,7 @@ impl ExtNode {
         let self_len = self.len;
         let key = key.clone();
         debug_assert!(self_len <= NUM_KEYS);
+        debug_assert!(pos <= self_len);
         if self_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
@@ -136,7 +137,7 @@ impl ExtNode {
                 dirty: true,
             };
             debug_assert!(pivot_key > smallvec!(0));
-            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1]);
+            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1], "{:?} / {:?}", pivot_key, &keys_1[keys_1_len - 1]);
             debug_assert!(extnode_2.prev.read_unchecked().is_ext());
             self.len = keys_1_len;
             debug!(

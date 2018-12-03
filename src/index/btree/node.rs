@@ -258,11 +258,12 @@ impl Node {
     }
 
     pub fn write(&self) -> NodeWriteGuard {
+        debug!("acquiring node write lock");
         let cc = &self.cc;
         loop {
             let cc_num = cc.load(Relaxed);
             let expected = cc_num & (!LATCH_FLAG);
-
+            debug_assert_eq!(expected & LATCH_FLAG, 0);
             match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
                 Ok(num) if num == expected => return NodeWriteGuard {
                     data: self.data.get(),
@@ -271,8 +272,6 @@ impl Node {
                 },
                 _ => {}
             }
-
-            debug!("acquire latch failed, retry {:b}", cc_num);
         }
     }
 
@@ -339,6 +338,7 @@ impl Drop for NodeWriteGuard {
         if self.cc as usize != 0 {
             let cc = unsafe { &*self.cc };
             let cc_num = cc.load(SeqCst);
+            debug_assert_eq!(cc_num & LATCH_FLAG, LATCH_FLAG);
             cc.store((cc_num & (!LATCH_FLAG)) + 1, Release);
         }
     }
@@ -353,6 +353,8 @@ impl Default for NodeWriteGuard {
         }
     }
 }
+
+unsafe impl Sync for Node {}
 
 pub struct NodeReadHandler {
     pub ptr: *const NodeData,
