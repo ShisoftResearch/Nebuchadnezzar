@@ -82,6 +82,11 @@ impl ExtNode {
             .value();
         Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
+    pub fn search(&self, key: &EntryKey) -> usize {
+        self.keys[..self.len]
+            .binary_search(key)
+            .unwrap_or_else(|i| i)
+    }
     pub fn remove_at(&mut self, pos: usize) {
         let mut cached_len = self.len;
         debug!("Removing from external pos {}, len {}", pos, cached_len);
@@ -91,25 +96,23 @@ impl ExtNode {
     pub fn insert(
         &mut self,
         key: &EntryKey,
-        pos: usize,
         tree: &BPlusTree,
         self_ref: &NodeCellRef,
-        parent: Option<&NodeCellRef>,
-        parent_version: Option<usize>,
+        parent: &NodeCellRef,
+        parent_version: usize,
     ) -> Option<NodeSplitResult> {
         let self_len = self.len;
         let key = key.clone();
+        let pos = self.search(&key);
         debug_assert!(self_len <= NUM_KEYS);
         debug_assert!(pos <= self_len);
         if self_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let self_next = &mut *self.next.write();
-            let parent_latch = parent.map(|node| node.write());
-            if let &Some(ref guard) = &parent_latch {
-                if guard.version != parent_version.unwrap() {
-                    return Some(NodeSplitResult::Retry);
-                }
+            let parent_latch = parent.write();
+            if parent_latch.version != parent_version {
+                return Some(NodeSplitResult::Retry);
             }
             // cached.dump();
             let pivot = self_len / 2;
@@ -137,7 +140,13 @@ impl ExtNode {
                 dirty: true,
             };
             debug_assert!(pivot_key > smallvec!(0));
-            debug_assert!(&pivot_key > &keys_1[keys_1_len - 1], "{:?} / {:?} @ {}", pivot_key, &keys_1[keys_1_len - 1], pos);
+            debug_assert!(
+                &pivot_key > &keys_1[keys_1_len - 1],
+                "{:?} / {:?} @ {}",
+                pivot_key,
+                &keys_1[keys_1_len - 1],
+                pos
+            );
             debug_assert!(extnode_2.prev.read_unchecked().is_ext());
             self.len = keys_1_len;
             debug!(

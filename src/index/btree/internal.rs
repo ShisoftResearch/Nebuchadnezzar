@@ -35,6 +35,12 @@ impl InNode {
             ptr_pos - 1
         }
     }
+    pub fn search(&self, key: &EntryKey) -> usize {
+        self.keys[..self.len]
+            .binary_search(key)
+            .map(|i| i + 1)
+            .unwrap_or_else(|i| i)
+    }
     pub fn remove_at(&mut self, ptr_pos: usize) {
         let mut n_key_len = self.len;
         let mut n_ptr_len = n_key_len + 1;
@@ -51,22 +57,20 @@ impl InNode {
         &mut self,
         key: EntryKey,
         new_node: NodeCellRef,
-        parent: Option<&NodeCellRef>,
-        parent_version: Option<usize>,
-        pos: usize,
+        parent: &NodeCellRef,
+        parent_version: usize,
     ) -> Option<NodeSplitResult> {
-        debug!("Insert into internal node at {}, key: {:?}", pos, key);
         let node_len = self.len;
         let ptr_len = self.len + 1;
+        let pos = self.search(&key);
+        debug!("Insert into internal node at {}, key: {:?}", pos, key);
         debug_assert!(node_len <= NUM_KEYS);
         if node_len == NUM_KEYS {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
-            let parent_guard = parent.map(|n| n.write());
-            if let &Some(ref pg) = &parent_guard {
-                if pg.version != parent_version.unwrap() {
-                    return Some(NodeSplitResult::Retry);
-                }
+            let parent_guard = parent.write();
+            if parent_guard.version != parent_version {
+                return Some(NodeSplitResult::Retry);
             }
             let keys_split = {
                 debug!("insert into keys");

@@ -34,7 +34,7 @@ pub struct NodeSplit {
     pub new_right_node: NodeCellRef,
     pub left_node_latch: NodeWriteGuard,
     pub pivot: EntryKey,
-    pub parent_latch: Option<NodeWriteGuard>,
+    pub parent_latch: NodeWriteGuard,
 }
 
 pub enum NodeSplitResult {
@@ -58,14 +58,9 @@ impl NodeData {
     pub fn search(&self, key: &EntryKey) -> usize {
         let len = self.len();
         if self.is_ext() {
-            self.extnode().keys[..len]
-                .binary_search(key)
-                .unwrap_or_else(|i| i)
+            self.extnode().search(key)
         } else {
-            self.innode().keys[..len]
-                .binary_search(key)
-                .map(|i| i + 1)
-                .unwrap_or_else(|i| i)
+            self.innode().search(key)
         }
     }
 
@@ -265,11 +260,13 @@ impl Node {
             let expected = cc_num & (!LATCH_FLAG);
             debug_assert_eq!(expected & LATCH_FLAG, 0);
             match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
-                Ok(num) if num == expected => return NodeWriteGuard {
-                    data: self.data.get(),
-                    cc: &self.cc as *const AtomicUsize,
-                    version: node_version(cc_num),
-                },
+                Ok(num) if num == expected => {
+                    return NodeWriteGuard {
+                        data: self.data.get(),
+                        cc: &self.cc as *const AtomicUsize,
+                        version: node_version(cc_num),
+                    }
+                }
                 _ => {}
             }
         }

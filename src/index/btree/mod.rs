@@ -65,6 +65,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
     root: UnsafeCell<NodeCellRef>,
+    root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
 }
@@ -84,6 +85,7 @@ impl BPlusTree {
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
             root: UnsafeCell::new(Arc::new(Node::none())),
+            root_versioning: NodeCellRef::new(Node::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
@@ -145,7 +147,8 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match self.insert_to_node(self.get_root(), None, None, &key) {
+        let root_version = self.root_versioning.version();
+        match self.insert_to_node(self.get_root(), &self.root_versioning, root_version, &key) {
             Some(NodeSplitResult::Split(mut split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
@@ -176,8 +179,8 @@ impl BPlusTree {
     fn insert_to_node(
         &self,
         node_ref: &NodeCellRef,
-        parent: Option<&NodeCellRef>,
-        parent_version: Option<usize>,
+        parent: &NodeCellRef,
+        parent_version: usize,
         key: &EntryKey,
     ) -> Option<NodeSplitResult> {
         loop {
@@ -196,7 +199,7 @@ impl BPlusTree {
                 match &**node_handler {
                     &NodeData::External(ref node) => InsertSearchResult::External,
                     &NodeData::Internal(ref node) => {
-                        let pos = node_handler.search(&key);
+                        let pos = node.search(key);
                         let sub_node_ref = &node.ptrs[pos];
                         InsertSearchResult::Internal(sub_node_ref.clone())
                     }
@@ -215,7 +218,6 @@ impl BPlusTree {
                         continue;
                     }
                     let mut searched_guard = write_key_page(node_guard, key);
-                    let pos = searched_guard.search(key);
                     debug_assert!(
                         searched_guard.is_ext(),
                         "{:?}",
@@ -223,7 +225,6 @@ impl BPlusTree {
                     );
                     let mut split_result = searched_guard.extnode_mut().insert(
                         key,
-                        pos,
                         self,
                         node_ref,
                         parent,
@@ -236,7 +237,7 @@ impl BPlusTree {
                 }
                 InsertSearchResult::Internal(sub_node) => {
                     let split_res =
-                        self.insert_to_node(&sub_node, Some(node_ref), Some(version), key);
+                        self.insert_to_node(&sub_node, node_ref, version, key);
                     match split_res {
                         Some(NodeSplitResult::Retry) => continue,
                         None => return None,
@@ -248,28 +249,15 @@ impl BPlusTree {
                             let pivot = split.pivot;
                             debug!("New pivot {:?}", pivot);
                             debug!("obtain latch for internal node split");
-                            let mut self_guard = split.parent_latch.unwrap();
-                            let pivot_pos = self_guard.search(&pivot);
-                            debug_assert!(
-                                self_guard.innode().ptrs[pivot_pos]
-                                    .read_unchecked()
-                                    .first_key()
-                                    < pivot
-                            );
+                            let mut self_guard = split.parent_latch;
                             debug_assert!(
                                 split.new_right_node.read_unchecked().first_key() >= pivot
-                            );
-                            debug!(
-                                "will insert into current node at {}, node len {}",
-                                pivot_pos,
-                                self_guard.len()
                             );
                             let mut split_result = self_guard.innode_mut().insert(
                                 pivot,
                                 split.new_right_node,
                                 parent,
                                 parent_version,
-                                pivot_pos,
                             );
                             debug_assert!(
                                 self_guard.first_key()
@@ -1096,21 +1084,28 @@ pub mod test {
             &server_addr,
             &server_group,
         );
-        let client = Arc::new(
-            AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-        );
+        let client =
+            Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
         let tree = BPlusTree::new(&client);
-        let node = Arc::new(Node::new(NodeData::External(box ExtNode::new(Id::new(1, 2)))));
+        let node = Arc::new(Node::new(NodeData::External(box ExtNode::new(Id::new(
+            1, 2,
+        )))));
         let num = 100000;
         let mut nums = (0..num).collect_vec();
+        let dummy_node = NodeCellRef::new(Node::none());
         thread_rng().shuffle(nums.as_mut_slice());
         nums.par_iter().for_each(|num| {
             let key_slice = u64_to_slice(*num);
             let mut key = SmallVec::from_slice(&key_slice);
             let mut guard = node.write();
-            let pos: usize = guard.search(&key);
             let mut ext_node = guard.extnode_mut();
-            ext_node.insert(&key, pos, &tree, &node, None, None);
+            loop {
+                let dummy_version = dummy_node.version();
+                match ext_node.insert(&key, &tree, &node, &dummy_node, dummy_version) {
+                    Some(NodeSplitResult::Retry) => continue,
+                    _ => break
+                }
+            }
         });
         let read = node.read_unchecked();
         let extnode = read.extnode();
