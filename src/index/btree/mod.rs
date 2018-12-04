@@ -1041,6 +1041,7 @@ pub mod test {
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
             if roll_die.next().unwrap() == 6 {
+                debug!("Scanning test for {} to {}", i, num);
                 for j in i..num {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
