@@ -979,7 +979,7 @@ pub mod test {
     #[test]
     fn parallel() {
         env_logger::init();
-        let server_group = "sstable_index_init";
+        let server_group = "b_plus_index_init";
         let server_addr = String::from("127.0.0.1:5600");
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1008,7 +1008,7 @@ pub mod test {
             thread::sleep(Duration::from_secs(10));
             let tree_len = tree_clone.len();
             debug!(
-                "LSM-Tree now have {}/{} elements, total {:.2}%",
+                "B+ Tree now have {}/{} elements, total {:.2}%",
                 tree_len,
                 num,
                 tree_len as f32 / num as f32 * 100.0
