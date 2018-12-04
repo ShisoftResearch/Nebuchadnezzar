@@ -170,7 +170,7 @@ impl BPlusTree {
                 new_in_root.ptrs[1] = new_node;
                 *old_root = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
-            Some(_) => unreachable!(),
+            Some(NodeSplitResult::Retry) => unreachable!("root should not retry"),
             None => {}
         }
         self.len.fetch_add(1, Relaxed);
