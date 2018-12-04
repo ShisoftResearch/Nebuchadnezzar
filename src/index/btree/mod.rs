@@ -1028,10 +1028,11 @@ pub mod test {
 
         dump_tree(&*tree, "btree_parallel_insertion_dump.json");
         debug!("Start validation");
+
+        let mut rng = rand::rngs::OsRng::new().unwrap();
+        let die_range = Uniform::new_inclusive(1, 6);
+        let roll_die = RwLock::new(rng.sample_iter(&die_range));
         (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
-            let mut rng = rand::rngs::OsRng::new().unwrap();
-            let die_range = Uniform::new_inclusive(1, 6);
-            let mut roll_die = rng.sample_iter(&die_range);
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
@@ -1040,7 +1041,8 @@ pub mod test {
             let mut cursor = tree.seek(&key, Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
-            if roll_die.next().unwrap() == 6 {
+            if roll_die.write().next().unwrap() == 6 {
+                debug!("Scanning {}", num);
                 for j in i..num {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
