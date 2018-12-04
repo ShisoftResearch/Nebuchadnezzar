@@ -261,169 +261,172 @@ impl BPlusTree {
         };
     }
 
-
     pub fn remove(&self, key: &EntryKey) -> bool {
-        let root = self.get_root();
-        let removed = self.remove_from_node(root, key);
-        let root_node = &mut *root.write();
-        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
-            // When root is external and have no keys but one pointer will take the only sub level
-            // pointer node as the new root node.
-            let new_root = &mut *root_node.innode().ptrs[0].write();
-            // TODO: check memory leak
-            mem::swap(root_node, new_root);
-        }
-        if removed.item_found {
-            self.len.fetch_sub(1, Relaxed);
-        }
-        removed.item_found
+        unimplemented!();
     }
 
-    fn remove_from_node(&self, node_ref: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
-        debug!("Removing {:?} from node", key);
-        loop {
-            let mut pos = 0;
-            let mut ver = 0;
-            let (mut remove_stat, search) = node_ref.read(|node| {
-                if let Some(right_node) = node.key_at_right_node(key) {
-                    return (
-                        RemoveStatus {
-                            item_found: false,
-                            removed: false,
-                        },
-                        RemoveSearchResult::RightNode(right_node.clone()),
-                    );
-                }
-                ver = node.version;
-                pos = node.search(key);
-                if let &NodeData::Internal(ref n) = &**node {
-                    let sub_node = n.ptrs[pos].clone();
-                    let mut sub_node_remove = self.remove_from_node(&sub_node, key);
-                    let sub_node_stat = sub_node.read(|sub_node_handler| {
-                        if sub_node_handler.len() == 0 {
-                            if sub_node_handler.is_ext() {
-                                SubNodeStatus::ExtNodeEmpty
-                            } else {
-                                SubNodeStatus::InNodeEmpty
-                            }
-                        } else if !sub_node_handler.is_half_full() && n.len > 1 {
-                            // need to rebalance
-                            // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-                            let cand_ptr_pos = n.rebalance_candidate(pos);
-                            let left_ptr_pos = min(pos, cand_ptr_pos);
-                            let right_ptr_pos = max(pos, cand_ptr_pos);
-                            let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
-                            debug_assert_eq!(cand_node.is_ext(), sub_node_handler.is_ext());
-                            if sub_node_handler.cannot_merge() || cand_node.cannot_merge() {
-                                SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos)
-                            } else {
-                                SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos)
-                            }
-                        } else {
-                            SubNodeStatus::Ok
-                        }
-                    });
-                    (
-                        sub_node_remove,
-                        RemoveSearchResult::Internal(sub_node, sub_node_stat),
-                    )
-                } else if let &NodeData::External(ref node) = &**node {
-                    if pos >= node.len || &node.keys[pos] != key {
-                        (
-                            RemoveStatus {
-                                item_found: false,
-                                removed: false,
-                            },
-                            RemoveSearchResult::External,
-                        )
-                    } else {
-                        (
-                            RemoveStatus {
-                                item_found: true,
-                                removed: true,
-                            },
-                            RemoveSearchResult::External,
-                        )
-                    }
-                } else {
-                    unreachable!()
-                }
-            });
-            match search {
-                RemoveSearchResult::RightNode(node) => return self.remove_from_node(&node, key),
-                RemoveSearchResult::Internal(sub_node, sub_node_stat) => {
-                    if !remove_stat.removed {
-                        return remove_stat;
-                    }
-                    let mut node_guard = node_ref.write();
-                    let mut n = node_guard.innode_mut();
-                    if node_ref.version() != ver {
-                        continue;
-                    }
-                    match sub_node_stat {
-                        SubNodeStatus::Ok => {}
-                        SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos) => {
-                            n.relocate_children(left_ptr_pos, right_ptr_pos);
-                            remove_stat.removed = false;
-                        }
-                        SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos) => {
-                            n.merge_children(left_ptr_pos, right_ptr_pos);
-                            remove_stat.removed = true;
-                        }
-                        SubNodeStatus::ExtNodeEmpty => {
-                            n.remove_at(pos);
-                            sub_node.write().extnode_mut().remove_node();
-                            remove_stat.removed = true;
-                        }
-                        SubNodeStatus::InNodeEmpty => {
-                            // empty internal nodes should be replaced with it's only remaining child pointer
-                            // there must be at least one child pointer exists
-                            let sub_node_guard = sub_node.write();
-                            let sub_innode = sub_node_guard.innode();
-                            let sub_sub_node_ref = sub_innode.ptrs[0].clone();
-                            debug_assert!(sub_innode.len == 0);
-                            n.ptrs[pos] = sub_sub_node_ref;
-                            remove_stat.removed = false;
-                        }
-                    }
-                    return remove_stat;
-                }
-                RemoveSearchResult::External => {
-                    let mut node_guard = node_ref.write();
-                    let mut node = node_guard.extnode_mut();
-                    if node_ref.version() != ver {
-                        continue;
-                    }
-                    if pos >= node.len {
-                        debug!(
-                            "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
-                            pos, node.len, key
-                        );
-                        return RemoveStatus {
-                            item_found: false,
-                            removed: false,
-                        };
-                    }
-                    if &node.keys[pos] == key {
-                        node.remove_at(pos);
-                        return RemoveStatus {
-                            item_found: true,
-                            removed: true,
-                        };
-                    } else {
-                        debug!(
-                            "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
-                            pos, key, &node.keys[pos]
-                        );
-                        return RemoveStatus {
-                            item_found: false,
-                            removed: false,
-                        };
-                    }
-                }
-            }
-        }
-    }
+//    pub fn remove(&self, key: &EntryKey) -> bool {
+//        let root = self.get_root();
+//        let removed = self.remove_from_node(root, key);
+//        let root_node = &mut *root.write();
+//        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
+//            // When root is external and have no keys but one pointer will take the only sub level
+//            // pointer node as the new root node.
+//            let new_root = &mut *root_node.innode().ptrs[0].write();
+//            // TODO: check memory leak
+//            mem::swap(root_node, new_root);
+//        }
+//        if removed.item_found {
+//            self.len.fetch_sub(1, Relaxed);
+//        }
+//        removed.item_found
+//    }
+//
+//    fn remove_from_node(&self, node_ref: &NodeCellRef, key: &EntryKey) -> RemoveStatus {
+//        debug!("Removing {:?} from node", key);
+//        loop {
+//            let mut pos = 0;
+//            let mut ver = 0;
+//            let (mut remove_stat, search) = node_ref.read(|node| {
+//                if let Some(right_node) = node.key_at_right_node(key) {
+//                    return (
+//                        RemoveStatus {
+//                            item_found: false,
+//                            removed: false,
+//                        },
+//                        RemoveSearchResult::RightNode(right_node.clone()),
+//                    );
+//                }
+//                ver = node.version;
+//                pos = node.search(key);
+//                if let &NodeData::Internal(ref n) = &**node {
+//                    let sub_node = n.ptrs[pos].clone();
+//                    let mut sub_node_remove = self.remove_from_node(&sub_node, key);
+//                    let sub_node_stat = sub_node.read(|sub_node_handler| {
+//                        if sub_node_handler.len() == 0 {
+//                            if sub_node_handler.is_ext() {
+//                                SubNodeStatus::ExtNodeEmpty
+//                            } else {
+//                                SubNodeStatus::InNodeEmpty
+//                            }
+//                        } else if !sub_node_handler.is_half_full() && n.len > 1 {
+//                            // need to rebalance
+//                            // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
+//                            let cand_ptr_pos = n.rebalance_candidate(pos);
+//                            let left_ptr_pos = min(pos, cand_ptr_pos);
+//                            let right_ptr_pos = max(pos, cand_ptr_pos);
+//                            let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
+//                            debug_assert_eq!(cand_node.is_ext(), sub_node_handler.is_ext());
+//                            if sub_node_handler.cannot_merge() || cand_node.cannot_merge() {
+//                                SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos)
+//                            } else {
+//                                SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos)
+//                            }
+//                        } else {
+//                            SubNodeStatus::Ok
+//                        }
+//                    });
+//                    (
+//                        sub_node_remove,
+//                        RemoveSearchResult::Internal(sub_node, sub_node_stat),
+//                    )
+//                } else if let &NodeData::External(ref node) = &**node {
+//                    if pos >= node.len || &node.keys[pos] != key {
+//                        (
+//                            RemoveStatus {
+//                                item_found: false,
+//                                removed: false,
+//                            },
+//                            RemoveSearchResult::External,
+//                        )
+//                    } else {
+//                        (
+//                            RemoveStatus {
+//                                item_found: true,
+//                                removed: true,
+//                            },
+//                            RemoveSearchResult::External,
+//                        )
+//                    }
+//                } else {
+//                    unreachable!()
+//                }
+//            });
+//            match search {
+//                RemoveSearchResult::RightNode(node) => return self.remove_from_node(&node, key),
+//                RemoveSearchResult::Internal(sub_node, sub_node_stat) => {
+//                    if !remove_stat.removed {
+//                        return remove_stat;
+//                    }
+//                    let mut node_guard = node_ref.write();
+//                    let mut n = node_guard.innode_mut();
+//                    if node_ref.version() != ver {
+//                        continue;
+//                    }
+//                    match sub_node_stat {
+//                        SubNodeStatus::Ok => {}
+//                        SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos) => {
+//                            n.relocate_children(left_ptr_pos, right_ptr_pos);
+//                            remove_stat.removed = false;
+//                        }
+//                        SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos) => {
+//                            n.merge_children(left_ptr_pos, right_ptr_pos);
+//                            remove_stat.removed = true;
+//                        }
+//                        SubNodeStatus::ExtNodeEmpty => {
+//                            n.remove_at(pos);
+//                            sub_node.write().extnode_mut().remove_node();
+//                            remove_stat.removed = true;
+//                        }
+//                        SubNodeStatus::InNodeEmpty => {
+//                            // empty internal nodes should be replaced with it's only remaining child pointer
+//                            // there must be at least one child pointer exists
+//                            let sub_node_guard = sub_node.write();
+//                            let sub_innode = sub_node_guard.innode();
+//                            let sub_sub_node_ref = sub_innode.ptrs[0].clone();
+//                            debug_assert!(sub_innode.len == 0);
+//                            n.ptrs[pos] = sub_sub_node_ref;
+//                            remove_stat.removed = false;
+//                        }
+//                    }
+//                    return remove_stat;
+//                }
+//                RemoveSearchResult::External => {
+//                    let mut node_guard = node_ref.write();
+//                    let mut node = node_guard.extnode_mut();
+//                    if node_ref.version() != ver {
+//                        continue;
+//                    }
+//                    if pos >= node.len {
+//                        debug!(
+//                            "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
+//                            pos, node.len, key
+//                        );
+//                        return RemoveStatus {
+//                            item_found: false,
+//                            removed: false,
+//                        };
+//                    }
+//                    if &node.keys[pos] == key {
+//                        node.remove_at(pos);
+//                        return RemoveStatus {
+//                            item_found: true,
+//                            removed: true,
+//                        };
+//                    } else {
+//                        debug!(
+//                            "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
+//                            pos, key, &node.keys[pos]
+//                        );
+//                        return RemoveStatus {
+//                            item_found: false,
+//                            removed: false,
+//                        };
+//                    }
+//                }
+//            }
+//        }
+//    }
 
     pub fn flush_all(&self) {
         // unimplemented!()
@@ -807,112 +810,112 @@ pub mod test {
 
         // TODO: fix remove before removing this line
         return;
-        {
-            debug!("Testing deletion");
-            let deletion_volume = num / 2;
-            let mut deletions = (0..deletion_volume).collect_vec();
-            thread_rng().shuffle(deletions.as_mut_slice());
-            for i in deletions {
-                debug!("delete: {}", i);
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                let mut entry_key = key.clone();
-                key_with_id(&mut entry_key, &id);
-                let remove_succeed = tree.remove(&entry_key);
-                if !remove_succeed {
-                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
-                }
-                assert!(remove_succeed, "remove at {}", i);
-            }
-
-            assert_eq!(tree.len(), (num - deletion_volume) as usize);
-            dump_tree(&tree, "remove_completed_dump.json");
-
-            debug!("check for removed items");
-            for i in 0..deletion_volume {
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                    Id::new(0, deletion_volume), // seek should reach deletion_volume
-                    "{}",
-                    i
-                );
-            }
-
-            debug!("check for remaining items");
-            for i in deletion_volume..num {
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                    id,
-                    "{}",
-                    i
-                );
-            }
-
-            tree.flush_all();
-
-            debug!("remove remaining items, with extensive point search");
-            // die-rolling
-            let mut rng = thread_rng();
-            let die_range = Uniform::new_inclusive(1, 6);
-            let mut roll_die = rng.sample_iter(&die_range);
-            for i in (deletion_volume..num).rev() {
-                {
-                    debug!("delete and sampling: {}", i);
-                    let id = Id::new(0, i);
-                    let key_slice = u64_to_slice(i);
-                    let key = SmallVec::from_slice(&key_slice);
-                    let mut entry_key = key.clone();
-                    key_with_id(&mut entry_key, &id);
-                    let remove_succeed = tree.remove(&entry_key);
-                    if !remove_succeed {
-                        dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
-                    }
-                    assert!(remove_succeed, "{}", i);
-                }
-                if roll_die.next().unwrap() != 6 {
-                    continue;
-                }
-                debug!("sampling for remaining integrity for {}", i);
-                for j in deletion_volume..i {
-                    if roll_die.next().unwrap() != 6 {
-                        continue;
-                    }
-                    let id = Id::new(0, j);
-                    let key_slice = u64_to_slice(j);
-                    let key = SmallVec::from_slice(&key_slice);
-                    assert_eq!(
-                        id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                        id,
-                        "{} / {}",
-                        i,
-                        j
-                    );
-                }
-            }
-            dump_tree(&tree, "remove_remains_dump.json");
-
-            debug!("check for removed items");
-            for i in 0..num {
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(
-                    tree.seek(&key, Ordering::default()).current(),
-                    None, // should always be 'None' for empty tree
-                    "{}",
-                    i
-                );
-            }
-
-            tree.flush_all();
-            assert_eq!(tree.len(), 0);
-            // assert_eq!(client.count().wait().unwrap(), 1);
-        }
+//        {
+//            debug!("Testing deletion");
+//            let deletion_volume = num / 2;
+//            let mut deletions = (0..deletion_volume).collect_vec();
+//            thread_rng().shuffle(deletions.as_mut_slice());
+//            for i in deletions {
+//                debug!("delete: {}", i);
+//                let id = Id::new(0, i);
+//                let key_slice = u64_to_slice(i);
+//                let key = SmallVec::from_slice(&key_slice);
+//                let mut entry_key = key.clone();
+//                key_with_id(&mut entry_key, &id);
+//                let remove_succeed = tree.remove(&entry_key);
+//                if !remove_succeed {
+//                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
+//                }
+//                assert!(remove_succeed, "remove at {}", i);
+//            }
+//
+//            assert_eq!(tree.len(), (num - deletion_volume) as usize);
+//            dump_tree(&tree, "remove_completed_dump.json");
+//
+//            debug!("check for removed items");
+//            for i in 0..deletion_volume {
+//                let key_slice = u64_to_slice(i);
+//                let key = SmallVec::from_slice(&key_slice);
+//                assert_eq!(
+//                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                    Id::new(0, deletion_volume), // seek should reach deletion_volume
+//                    "{}",
+//                    i
+//                );
+//            }
+//
+//            debug!("check for remaining items");
+//            for i in deletion_volume..num {
+//                let id = Id::new(0, i);
+//                let key_slice = u64_to_slice(i);
+//                let key = SmallVec::from_slice(&key_slice);
+//                assert_eq!(
+//                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                    id,
+//                    "{}",
+//                    i
+//                );
+//            }
+//
+//            tree.flush_all();
+//
+//            debug!("remove remaining items, with extensive point search");
+//            // die-rolling
+//            let mut rng = thread_rng();
+//            let die_range = Uniform::new_inclusive(1, 6);
+//            let mut roll_die = rng.sample_iter(&die_range);
+//            for i in (deletion_volume..num).rev() {
+//                {
+//                    debug!("delete and sampling: {}", i);
+//                    let id = Id::new(0, i);
+//                    let key_slice = u64_to_slice(i);
+//                    let key = SmallVec::from_slice(&key_slice);
+//                    let mut entry_key = key.clone();
+//                    key_with_id(&mut entry_key, &id);
+//                    let remove_succeed = tree.remove(&entry_key);
+//                    if !remove_succeed {
+//                        dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+//                    }
+//                    assert!(remove_succeed, "{}", i);
+//                }
+//                if roll_die.next().unwrap() != 6 {
+//                    continue;
+//                }
+//                debug!("sampling for remaining integrity for {}", i);
+//                for j in deletion_volume..i {
+//                    if roll_die.next().unwrap() != 6 {
+//                        continue;
+//                    }
+//                    let id = Id::new(0, j);
+//                    let key_slice = u64_to_slice(j);
+//                    let key = SmallVec::from_slice(&key_slice);
+//                    assert_eq!(
+//                        id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                        id,
+//                        "{} / {}",
+//                        i,
+//                        j
+//                    );
+//                }
+//            }
+//            dump_tree(&tree, "remove_remains_dump.json");
+//
+//            debug!("check for removed items");
+//            for i in 0..num {
+//                let key_slice = u64_to_slice(i);
+//                let key = SmallVec::from_slice(&key_slice);
+//                assert_eq!(
+//                    tree.seek(&key, Ordering::default()).current(),
+//                    None, // should always be 'None' for empty tree
+//                    "{}",
+//                    i
+//                );
+//            }
+//
+//            tree.flush_all();
+//            assert_eq!(tree.len(), 0);
+//            // assert_eq!(client.count().wait().unwrap(), 1);
+//        }
     }
 
     #[test]
