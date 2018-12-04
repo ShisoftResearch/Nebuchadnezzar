@@ -99,8 +99,7 @@ impl ExtNode {
         tree: &BPlusTree,
         self_ref: &NodeCellRef,
         parent: &NodeCellRef,
-        parent_version: usize,
-    ) -> Option<NodeSplitResult> {
+    ) -> Option<NodeSplit> {
         let self_len = self.len;
         let key = key.clone();
         let pos = self.search(&key);
@@ -111,9 +110,6 @@ impl ExtNode {
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let self_next = &mut *self.next.write();
             let parent_latch = parent.write();
-            if parent_latch.version != parent_version {
-                return Some(NodeSplitResult::Retry);
-            }
             // cached.dump();
             let pivot = self_len / 2;
             let new_page_id = tree.new_page_id();
@@ -163,12 +159,12 @@ impl ExtNode {
             }
             self.next = node_2.clone();
 
-            return Some(NodeSplitResult::Split(NodeSplit {
+            return Some(NodeSplit {
                 new_right_node: node_2,
                 pivot: pivot_key,
                 parent_latch,
                 left_node_latch: NodeWriteGuard::default(),
-            }));
+            });
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
             let mut new_cached_len = self_len;

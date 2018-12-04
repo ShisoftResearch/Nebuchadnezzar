@@ -57,9 +57,8 @@ impl InNode {
         &mut self,
         key: EntryKey,
         new_node: NodeCellRef,
-        parent: &NodeCellRef,
-        parent_version: usize,
-    ) -> Option<NodeSplitResult> {
+        parent: &NodeCellRef
+    ) -> Option<NodeSplit> {
         let node_len = self.len;
         let ptr_len = self.len + 1;
         let pos = self.search(&key);
@@ -69,9 +68,6 @@ impl InNode {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
             let parent_guard = parent.write();
-            if parent_guard.version != parent_version {
-                return Some(NodeSplitResult::Retry);
-            }
             let keys_split = {
                 debug!("insert into keys");
                 if pivot == pos {
@@ -159,12 +155,12 @@ impl InNode {
             let node_2_ref = Arc::new(Node::internal(node_2));
             self.len = keys_split.keys_1_len;
             self.right = node_2_ref.clone();
-            return Some(NodeSplitResult::Split(NodeSplit {
+            return Some(NodeSplit {
                 new_right_node: node_2_ref,
                 left_node_latch: NodeWriteGuard::default(),
                 pivot: keys_split.pivot_key,
                 parent_latch: parent_guard,
-            }));
+            });
         } else {
             let mut new_node_len = node_len;
             let mut new_node_pointers = node_len + 1;

@@ -37,11 +37,6 @@ pub struct NodeSplit {
     pub parent_latch: NodeWriteGuard,
 }
 
-pub enum NodeSplitResult {
-    Split(NodeSplit),
-    Retry,
-}
-
 pub enum NodeData {
     External(Box<ExtNode>),
     Internal(Box<InNode>),
