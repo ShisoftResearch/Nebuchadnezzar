@@ -63,7 +63,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    root: UnsafeCell<NodeCellRef>,
+    root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
@@ -83,18 +83,18 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: UnsafeCell::new(Arc::new(Node::none())),
+            root: RwLock::new(Arc::new(Node::none())),
             root_versioning: NodeCellRef::new(Node::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
-        *unsafe { &mut *tree.root.get() } = Arc::new(Node::new_external(root_id));
+        *tree.root.write() = Arc::new(Node::new_external(root_id));
         return tree;
     }
 
     pub fn get_root(&self) -> NodeCellRef {
-        unsafe{ &*self.root.get() }.clone()
+        self.root.read().clone()
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
@@ -164,7 +164,7 @@ impl BPlusTree {
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root;
                 new_in_root.ptrs[1] = new_node;
-                *unsafe {&mut *self.root.get()} = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
+                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             None => {}
         }
@@ -979,7 +979,7 @@ pub mod test {
     #[test]
     fn parallel() {
         env_logger::init();
-        let server_group = "b_plus_tree_parallel";
+        let server_group = "sstable_index_init";
         let server_addr = String::from("127.0.0.1:5600");
         let server = NebServer::new_from_opts(
             &ServerOptions {
@@ -1008,7 +1008,7 @@ pub mod test {
             thread::sleep(Duration::from_secs(10));
             let tree_len = tree_clone.len();
             debug!(
-                "B+ Tree now have {}/{} elements, total {:.2}%",
+                "LSM-Tree now have {}/{} elements, total {:.2}%",
                 tree_len,
                 num,
                 tree_len as f32 / num as f32 * 100.0
@@ -1041,7 +1041,6 @@ pub mod test {
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
             if roll_die.next().unwrap() == 6 {
-                debug!("Scanning test for {} to {}", i, num);
                 for j in i..num {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
