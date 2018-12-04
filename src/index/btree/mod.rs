@@ -50,7 +50,7 @@ mod internal;
 mod merge;
 mod node;
 
-pub const NUM_KEYS: usize = 4;
+pub const NUM_KEYS: usize = 24;
 const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
 
@@ -167,7 +167,7 @@ impl BPlusTree {
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root.clone();
                 new_in_root.ptrs[1] = new_node;
-                *old_root = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
+                unsafe { *self.root.get() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root))) };
             }
             None => {}
         }
@@ -239,20 +239,21 @@ impl BPlusTree {
                         debug!("New pivot {:?}", pivot);
                         debug!("obtain latch for internal node split");
                         let mut self_guard = split.parent_latch;
+                        let mut target_guard = write_key_page(self_guard, &pivot);
                         debug_assert!(
                             split.new_right_node.read_unchecked().first_key() >= pivot
                         );
-                        let mut split_result = self_guard.innode_mut().insert(
+                        let mut split_result = target_guard.innode_mut().insert(
                             pivot,
                             split.new_right_node,
                             parent
                         );
                         debug_assert!(
-                            self_guard.first_key()
-                                > self_guard.innode().ptrs[0].read_unchecked().first_key()
+                            target_guard.first_key()
+                                > target_guard.innode().ptrs[0].read_unchecked().first_key()
                         );
                         if let &mut Some(ref mut split) = &mut split_result {
-                            split.left_node_latch = self_guard;
+                            split.left_node_latch = target_guard;
                         }
                         return split_result;
                     }
