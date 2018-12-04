@@ -1,5 +1,3 @@
-use bifrost::utils::async_locks::Mutex;
-use bifrost::utils::async_locks::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use bifrost::utils::fut_exec::wait;
 use bifrost_hasher::hash_bytes;
 use byteorder::{LittleEndian, WriteBytesExt};
@@ -43,6 +41,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use parking_lot::RwLock;
 
 mod cursor;
 mod external;
@@ -64,7 +63,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    root: UnsafeCell<NodeCellRef>,
+    root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
@@ -84,24 +83,22 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: UnsafeCell::new(Arc::new(Node::none())),
+            root: RwLock::new(Arc::new(Node::none())),
             root_versioning: NodeCellRef::new(Node::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
-        unsafe {
-            *&mut *tree.root.get() = Arc::new(Node::new_external(root_id));
-        }
+        *tree.root.write() = Arc::new(Node::new_external(root_id));
         return tree;
     }
 
-    pub fn get_root(&self) -> &mut NodeCellRef {
-        unsafe { &mut *self.root.get() }
+    pub fn get_root(&self) -> NodeCellRef {
+        self.root.read().clone()
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
-        let mut cursor = unsafe { self.search(self.get_root(), key, ordering) };
+        let mut cursor = unsafe { self.search(&self.get_root(), key, ordering) };
         match ordering {
             Ordering::Forward => {}
             Ordering::Backward => {
@@ -147,7 +144,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match self.insert_to_node(self.get_root(), &self.root_versioning, &key) {
+        match self.insert_to_node(&self.get_root(), &self.root_versioning, &key) {
             Some(split) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
@@ -158,22 +155,21 @@ impl BPlusTree {
                     right: Arc::new(Node::none()),
                     len: 1,
                 };
-                let mut old_root = self.get_root();
+                let mut old_root = self.get_root().clone();
                 // should be the same node
                 debug_assert_eq!(
                     old_root.read_unchecked().first_key(),
                     split.left_node_latch.first_key()
                 );
                 new_in_root.keys[0] = pivot;
-                new_in_root.ptrs[0] = old_root.clone();
+                new_in_root.ptrs[0] = old_root;
                 new_in_root.ptrs[1] = new_node;
-                unsafe { *self.root.get() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root))) };
+                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             None => {}
         }
         self.len.fetch_add(1, Relaxed);
     }
-
     fn insert_to_node(
         &self,
         node_ref: &NodeCellRef,
@@ -562,7 +558,7 @@ pub mod test {
 
     pub fn dump_tree(tree: &BPlusTree, f: &str) {
         debug!("dumping {}", f);
-        let debug_root = cascading_dump_node(tree.get_root());
+        let debug_root = cascading_dump_node(&tree.get_root());
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
         let mut file = File::create(f).unwrap();
         file.write_all(json.as_bytes());
