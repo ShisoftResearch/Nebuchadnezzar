@@ -63,7 +63,7 @@ type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree {
-    root: RwLock<NodeCellRef>,
+    root: UnsafeCell<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
@@ -83,18 +83,18 @@ impl BPlusTree {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: RwLock::new(Arc::new(Node::none())),
+            root: UnsafeCell::new(Arc::new(Node::none())),
             root_versioning: NodeCellRef::new(Node::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
         };
         let root_id = tree.new_page_id();
-        *tree.root.write() = Arc::new(Node::new_external(root_id));
+        *unsafe { &mut *tree.root.get() } = Arc::new(Node::new_external(root_id));
         return tree;
     }
 
     pub fn get_root(&self) -> NodeCellRef {
-        self.root.read().clone()
+        unsafe{ &*self.root.get() }.clone()
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
@@ -164,7 +164,7 @@ impl BPlusTree {
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root;
                 new_in_root.ptrs[1] = new_node;
-                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
+                *unsafe {&mut *self.root.get()} = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             None => {}
         }
