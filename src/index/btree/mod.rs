@@ -121,6 +121,14 @@ impl BPlusTree {
         debug!("searching for {:?}", key);
         return node_ref.read(|node_handler| {
             let node = &**node_handler;
+            if node.len() == 0 {
+                // empty node. return empty cursor
+                return RTCursor {
+                    index: 0,
+                    ordering,
+                    page: None
+                };
+            }
             if let Some(right_node) = node.key_at_right_node(key) {
                 debug!("Search found a node at the right side");
                 return self.search(right_node, key, ordering);
@@ -193,6 +201,7 @@ impl BPlusTree {
                     let sub_node_ref = &node.ptrs[pos];
                     InsertSearchResult::Internal(sub_node_ref.clone())
                 }
+                &NodeData::Empty(ref node) => InsertSearchResult::RightNode(node.right.clone()),
                 &NodeData::None => unreachable!(),
             }
         });
@@ -259,8 +268,8 @@ impl BPlusTree {
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
-        let root = self.get_root();
-        let removed = self.remove_from_node(&root, key, &self.root_versioning);
+        let mut root = self.get_root();
+        let removed = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning);
 //        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
 //            // When root is external and have no keys but one pointer will take the only sub level
 //            // pointer node as the new root node.
@@ -276,12 +285,12 @@ impl BPlusTree {
 
     fn remove_from_node(
         &self,
-        node_ref: &NodeCellRef,
-        key: &EntryKey,
+        node_ref: &mut NodeCellRef,
+        key: &mut EntryKey,
         parent: &NodeCellRef) -> RemoveResult
     {
         debug!("Removing {:?} from node", key);
-        let search = node_ref.read(|node| {
+        let mut search = node_ref.read(|node| {
             if let Some(right_node) = node.key_at_right_node(key) {
                 return RemoveSearchResult::RightNode(right_node.clone());
             }
@@ -289,11 +298,10 @@ impl BPlusTree {
                 &NodeData::Internal(ref n) => {
                     let pos = n.search(key);
                     let sub_node = n.ptrs[pos].clone();
-                    return RemoveSearchResult::Internal(sub_node);
+                    RemoveSearchResult::Internal(sub_node)
                 }
-                &NodeData::External(_) => {
-                    return RemoveSearchResult::External;
-                },
+                &NodeData::External(_) => RemoveSearchResult::External,
+                &NodeData::Empty(ref n) => RemoveSearchResult::RightNode(n.right.clone()),
                 &NodeData::None => unreachable!()
             }
         });
@@ -351,15 +359,15 @@ impl BPlusTree {
 //            unreachable!()
 //        }
         match search {
-            RemoveSearchResult::RightNode(node) => return self.remove_from_node(&node, key, parent),
-            RemoveSearchResult::Internal(sub_node) => {
-                let mut node_remove_res = self.remove_from_node(&sub_node, key, node_ref);
+            RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent),
+            RemoveSearchResult::Internal(mut sub_node) => {
+                let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref);
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
+                    let mut left_node = &mut*rebalancing.left_guard;
+                    let mut right_node = &mut*rebalancing.right_guard;
                     if node_remove_res.empty {
                         // swap the content of left and right, then delete right
                         // this procedure will prevent locking left node for changing right reference
-                        let mut left_node = &mut*rebalancing.left_guard;
-                        let mut right_node = &mut*rebalancing.right_guard;
                         let left_left_ref = left_node.left_ref().map(|r| r.clone());
                         let right_right_ref = right_node.right_ref().map(|r| r.clone());
                         let left_ref = rebalancing.left_ref.clone();
@@ -374,7 +382,10 @@ impl BPlusTree {
                         let (mut substitute_parent_guard, substitute_parent_ref) = write_key_page(empty_parent, &empty_parent_ref, &rebalancing.right_key);
                         let substitute_pos = substitute_parent_guard.search(&rebalancing.right_key);
                         substitute_parent_guard.innode_mut().ptrs[substitute_pos] = sub_node.clone();
-                    } else {
+                        *node_ref = substitute_parent_ref;
+                        *key = rebalancing.right_key;
+                    } else if left_node.cannot_merge() || right_node.cannot_merge() {
+                        // Relocate
 
                     }
                 }
@@ -423,30 +434,41 @@ impl BPlusTree {
                 {
                     let is_half_full = target_guard.is_half_full();
                     let mut node = target_guard.extnode_mut();
+                    let pos = node.search(key);
                     if !is_half_full {
                         let right_guard = node.next.write();
-                        let right_key = right_guard.extnode().keys[0].clone();
-                        let right_right_guard = if node.len <= 1 {
-                            let right_right = right_guard.extnode().next.write();
-                            if right_right.is_none() {
-                                None
+                        let parent_guard = parent.write();
+                        let parent_pos = parent_guard.search(key);
+                        // Check if the right node is innode and its parent is the same as the left one
+                        // because we have to lock from left to right, there is no way to lock backwards
+                        // if the empty non half-full node is at the right most of its parent
+                        // So left over imbalanced such nodes will be expected and they can be eliminate
+                        // by their left node remove operations.
+                        if !right_guard.is_none() && parent_pos < parent_guard.len() - 1 {
+                            debug_assert!(right_guard.is_ext());
+                            let right_key = right_guard.extnode().keys[0].clone();
+                            let right_right_guard = if node.len <= 1 {
+                                let right_right = right_guard.extnode().next.write();
+                                if right_right.is_none() {
+                                    None
+                                } else {
+                                    Some(right_right)
+                                }
                             } else {
-                                Some(right_right)
-                            }
-                        } else {
-                            None
-                        };
-                        let rebalacing = RebalancingNodes {
-                            left_guard: NodeWriteGuard::default(),
-                            left_ref: target_ref.clone(),
-                            parent: parent.write(),
-                            right_right_guard,
-                            right_key,
-                            right_guard
-                        };
-                        remove_result.rebalancing = Some(rebalacing);
+                                None
+                            };
+                            let rebalacing = RebalancingNodes {
+                                left_guard: NodeWriteGuard::default(),
+                                left_ref: target_ref.clone(),
+                                parent: parent_guard,
+                                parent_pos,
+                                right_right_guard,
+                                right_key,
+                                right_guard
+                            };
+                            remove_result.rebalancing = Some(rebalacing);
+                        }
                     }
-                    let pos = node.search(key);
                     if pos >= node.len {
                         debug!(
                             "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
