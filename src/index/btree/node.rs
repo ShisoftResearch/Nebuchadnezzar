@@ -19,7 +19,7 @@ pub enum InsertToNodeResult {
 pub enum RemoveSearchResult {
     External,
     RightNode(NodeCellRef),
-    Internal(NodeCellRef, SubNodeStatus),
+    Internal(NodeCellRef),
 }
 
 pub enum SubNodeStatus {
@@ -35,6 +35,21 @@ pub struct NodeSplit {
     pub left_node_latch: NodeWriteGuard,
     pub pivot: EntryKey,
     pub parent_latch: NodeWriteGuard,
+}
+
+pub struct RebalancingNodes {
+    pub left_guard: NodeWriteGuard,
+    pub left_ref: NodeCellRef,
+    pub right_guard: NodeWriteGuard,
+    pub right_right_guard: Option<NodeWriteGuard>, // for external pointer modification
+    pub parent: NodeWriteGuard,
+    pub right_key: EntryKey,
+}
+
+pub struct RemoveResult {
+    pub rebalancing: Option<RebalancingNodes>,
+    pub empty: bool,
+    pub removed: bool
 }
 
 pub enum NodeData {
@@ -88,7 +103,7 @@ impl NodeData {
         }
     }
     pub fn is_half_full(&self) -> bool {
-        self.len() >= NUM_KEYS / 2
+        self.len() >= NUM_KEYS / 2 && self.len() > 1
     }
     pub fn cannot_merge(&self) -> bool {
         self.len() > NUM_KEYS / 2
@@ -170,9 +185,24 @@ impl NodeData {
         }
         return None;
     }
+
+    pub fn left_ref(&mut self) -> Option<&mut NodeCellRef> {
+        match self {
+            &mut NodeData::External(ref mut n) => Some(&mut n.prev),
+            _ => None
+        }
+    }
+
+    pub fn right_ref(&mut self) -> Option<&mut NodeCellRef> {
+        match self {
+            &mut NodeData::External(ref mut n) => Some(&mut n.next),
+            &mut NodeData::Internal(ref mut n) => Some(&mut n.right),
+            &mut NodeData::None => None
+        }
+    }
 }
 
-pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteGuard {
+pub fn write_key_page(search_page: NodeWriteGuard, search_ref: &NodeCellRef, key: &EntryKey) -> (NodeWriteGuard, NodeCellRef) {
     // return search_page;
     if search_page.len() > 0 {
         match &*search_page {
@@ -187,7 +217,7 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
                     {
                         debug_assert!(!right_node.is_ext());
                         debug!("will write to right internal page");
-                        return write_key_page(right_node, key);
+                        return write_key_page(right_node, right_ref, key);
                     }
                 }
             }
@@ -202,15 +232,15 @@ pub fn write_key_page(search_page: NodeWriteGuard, key: &EntryKey) -> NodeWriteG
                     {
                         debug_assert!(right_node.is_ext());
                         debug!("will write to right external page");
-                        return write_key_page(right_node, key);
+                        return write_key_page(right_node, right_ref, key);
                     }
                 }
             }
             _ => unreachable!(),
         }
-        return search_page;
+        return (search_page, search_ref.clone());
     } else {
-        return search_page;
+        return (search_page, search_ref.clone());
     }
 }
 

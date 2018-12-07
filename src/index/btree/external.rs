@@ -192,21 +192,6 @@ impl ExtNode {
             debug!("{}\t- {:?}", i, self.keys[i]);
         }
     }
-    pub fn remove_node(&self) {
-        let id = &self.id;
-        // TODO: adjust write latch ordering
-        let mut prev = &mut *self.prev.write();
-        let mut next = &mut *self.next.write();
-        debug_assert_ne!(id, &Id::unit_id());
-        if !prev.is_none() {
-            let mut prev_node = prev.extnode_mut();
-            prev_node.next = self.next.clone();
-        }
-        if !next.is_none() {
-            let mut next_node = next.extnode_mut();
-            next_node.prev = self.prev.clone();
-        }
-    }
     pub fn is_dirty(&self) -> bool {
         unimplemented!()
     }
