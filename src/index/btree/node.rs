@@ -72,6 +72,14 @@ impl NodeData {
             _ => false,
         }
     }
+    pub fn is_empty(&self) -> bool {
+        match self {
+            &NodeData::Empty(ref n) => true,
+            &NodeData::External(ref n) => n.len == 0,
+            &NodeData::Internal(ref n) => n.len == 0,
+            &NodeData::None => unreachable!()
+        }
+    }
     pub fn search(&self, key: &EntryKey) -> usize {
         let len = self.len();
         if self.is_ext() {

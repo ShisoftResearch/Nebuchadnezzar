@@ -42,6 +42,19 @@ impl IndexCursor for RTCursor {
                 // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                 match self.ordering {
                     Ordering::Forward => {
+                        if page.is_empty() {
+                            let next_node = ext_page.next.read_unchecked();
+                            self.index = 0;
+                            self.page = Some(ext_page.next.clone());
+                            if next_node.is_empty() {
+                                return self.next();
+                            } else if next_node.is_ext() {
+                                return true;
+                            } else {
+                                self.page = None;
+                                return false;
+                            }
+                        }
                         if self.index + 1 >= page.len() {
                             // next page
                             return ext_page.next.read(|next_page| {
@@ -62,6 +75,19 @@ impl IndexCursor for RTCursor {
                         }
                     }
                     Ordering::Backward => {
+                        if page.is_empty() {
+                            let prev_node = ext_page.prev.read_unchecked();
+                            self.index = 0;
+                            self.page = Some(ext_page.next.clone());
+                            if prev_node.is_empty() {
+                                return self.next();
+                            } else if prev_node.is_ext() {
+                                return true;
+                            } else {
+                                self.page = None;
+                                return false;
+                            }
+                        }
                         if self.index == 0 {
                             // next page
                             return ext_page.prev.read(|prev_page| {

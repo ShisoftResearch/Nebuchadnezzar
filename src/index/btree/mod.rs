@@ -121,32 +121,34 @@ impl BPlusTree {
         debug!("searching for {:?}", key);
         return node_ref.read(|node_handler| {
             let node = &**node_handler;
-            if node.len() == 0 {
-                // empty node. return empty cursor
-                return RTCursor {
-                    index: 0,
-                    ordering,
-                    page: None
-                };
-            }
             if let Some(right_node) = node.key_at_right_node(key) {
                 debug!("Search found a node at the right side");
                 return self.search(right_node, key, ordering);
             }
             let pos = node.search(key);
-            if node.is_ext() {
-                let extnode = node.extnode();
-                debug!(
-                    "search in external for {:?}, len {}, content: {:?}",
-                    key, extnode.len, extnode.keys
-                );
-                RTCursor::new(pos, node_ref, ordering)
-            } else if let &NodeData::Internal(ref n) = node {
-                debug!("search in internal node for {:?}, len {}", key, n.len);
-                let next_node_ref = &n.ptrs[pos];
-                self.search(next_node_ref, key, ordering)
-            } else {
-                unreachable!()
+            match node {
+                &NodeData::External(ref n) => {
+                    debug!(
+                        "search in external for {:?}, len {}, content: {:?}",
+                        key, n.len, n.keys
+                    );
+                    RTCursor::new(pos, node_ref, ordering)
+                },
+                &NodeData::Internal(ref n) => {
+                    debug!("search in internal node for {:?}, len {}", key, n.len);
+                    let next_node_ref = &n.ptrs[pos];
+                    self.search(next_node_ref, key, ordering)
+                },
+                &NodeData::Empty(ref n) => {
+                    self.search(&n.right, key, ordering)
+                },
+                &NodeData::None => {
+                    RTCursor{
+                        index: 0,
+                        ordering,
+                        page: None
+                    }
+                }
             }
         });
     }
@@ -685,6 +687,17 @@ pub mod test {
                 &NodeData::None => {
                     return DebugNode {
                         keys: vec![String::from("<NOT FOUND>")],
+                        nodes: vec![],
+                        id: None,
+                        next: None,
+                        prev: None,
+                        len: 0,
+                        is_external: false,
+                    }
+                }
+                &NodeData::Empty(ref n) => {
+                    return DebugNode {
+                        keys: vec![String::from("<EMPTY>")],
                         nodes: vec![],
                         id: None,
                         next: None,
