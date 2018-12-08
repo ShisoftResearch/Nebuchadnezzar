@@ -209,20 +209,40 @@ impl NodeData {
         return None;
     }
 
-    pub fn left_ref(&mut self) -> Option<&mut NodeCellRef> {
+    pub fn left_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.prev),
             _ => None
         }
     }
 
-    pub fn right_ref(&mut self) -> Option<&mut NodeCellRef> {
+    pub fn left_ref(&self) -> Option<&NodeCellRef> {
+        match self {
+            &NodeData::External(ref n) => Some(&n.prev),
+            _ => None
+        }
+    }
+
+    pub fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.next),
             &mut NodeData::Internal(ref mut n) => Some(&mut n.right),
             &mut NodeData::Empty(ref mut n) => Some(&mut n.right),
             &mut NodeData::None => None
         }
+    }
+
+    pub fn right_ref(&self) -> Option<&NodeCellRef> {
+        match self {
+            &NodeData::External(ref n) => Some(&n.next),
+            &NodeData::Internal(ref n) => Some(&n.right),
+            &NodeData::Empty(ref n) => Some(&n.right),
+            &NodeData::None => None
+        }
+    }
+
+    pub fn has_vaild_right_node(&self) -> bool {
+        self.right_ref().is_some()
     }
 }
 

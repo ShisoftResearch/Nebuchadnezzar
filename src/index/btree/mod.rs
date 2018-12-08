@@ -154,7 +154,7 @@ impl BPlusTree {
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match self.insert_to_node(&self.get_root(), &self.root_versioning, &key) {
+        match self.insert_to_node(&self.get_root(), &self.root_versioning, &key, 0) {
             Some(split) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
@@ -166,10 +166,12 @@ impl BPlusTree {
                     len: 1,
                 };
                 let mut old_root = self.get_root().clone();
-                // should be the same node
+                // check latched root and old same node
                 debug_assert_eq!(
                     old_root.read_unchecked().first_key(),
-                    split.left_node_latch.first_key()
+                    split.left_node_latch.first_key(),
+                    "root verification failed, left node right node type: {}",
+                    split.left_node_latch.innode().right.read_unchecked().type_name()
                 );
                 new_in_root.keys[0] = pivot;
                 new_in_root.ptrs[0] = old_root;
@@ -185,6 +187,7 @@ impl BPlusTree {
         node_ref: &NodeCellRef,
         parent: &NodeCellRef,
         key: &EntryKey,
+        level: usize,
     ) -> Option<NodeSplit> {
         let mut search = node_ref.read(|node_handler| {
             debug!(
@@ -207,9 +210,9 @@ impl BPlusTree {
                 &NodeData::None => unreachable!(),
             }
         });
-        match search {
+        let modification = match search {
             InsertSearchResult::RightNode(node) => {
-                return self.insert_to_node(&node, parent, key);
+                self.insert_to_node(&node, parent, key, level)
             }
             InsertSearchResult::External => {
                 // latch nodes from left to right
@@ -230,13 +233,13 @@ impl BPlusTree {
                 if let &mut Some(ref mut split) = &mut split_result {
                     split.left_node_latch = searched_guard;
                 }
-                return split_result;
+                split_result
             }
             InsertSearchResult::Internal(sub_node) => {
                 let split_res =
-                    self.insert_to_node(&sub_node, node_ref, key);
+                    self.insert_to_node(&sub_node, node_ref, key, level + 1);
                 match split_res {
-                    None => return None,
+                    None => None,
                     Some(split) => {
                         debug!(
                             "Sub level node split, shall insert new node to current level, pivot {:?}",
@@ -262,11 +265,29 @@ impl BPlusTree {
                         if let &mut Some(ref mut split) = &mut split_result {
                             split.left_node_latch = target_guard;
                         }
-                        return split_result;
+                        split_result
                     }
                 }
             }
         };
+        if level == 0 {
+            if let &Some(ref split) = &modification {
+                let current_root = self.get_root().clone();
+                if  current_root.read_unchecked().first_key() != split.left_node_latch.first_key() &&
+                    split.left_node_latch.has_vaild_right_node() {
+                    // at this point, root split occurred when waiting for the latch
+                    // the new right node should be inserted to any right node of the old root
+                    // hopefully that node won't split again
+                    let current_root_guard = current_root.write();
+                    // at this point, the root may have split again, we need to search for the exact one
+                    let (mut root_level_target, target_ref) = write_key_page(current_root_guard, &current_root, &split.pivot);
+                    // assert this even in production
+                    assert!(!root_level_target.is_ext());
+                    return root_level_target.innode_mut().insert(split.pivot.clone(), split.new_right_node.clone(), parent);
+                }
+            }
+        }
+        modification
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
@@ -370,16 +391,16 @@ impl BPlusTree {
                         let mut right_node = &mut*rebalancing.right_guard;
                         // swap the content of left and right, then delete right
                         // this procedure will prevent locking left node for changing right reference
-                        let left_left_ref = left_node.left_ref().map(|r| r.clone());
-                        let right_right_ref = right_node.right_ref().map(|r| r.clone());
+                        let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
+                        let right_right_ref = right_node.right_ref_mut().map(|r| r.clone());
                         let left_ref = rebalancing.left_ref.clone();
-                        right_node.right_ref().map(|mut r| *r = left_ref.clone());
+                        right_node.right_ref_mut().map(|mut r| *r = left_ref.clone());
                         // swap the empty node with the right node. In this case left node holds
                         // content of the right node but pointers need to be corrected.
                         mem::swap(left_node, right_node);
-                        left_node.left_ref().map(|r| *r = left_left_ref.unwrap());
-                        left_node.right_ref().map(|r| *r = right_right_ref.unwrap());
-                        rebalancing.right_right_guard.map(|mut rg| rg.left_ref().map(|r| *r = left_ref));
+                        left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
+                        left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
+                        rebalancing.right_right_guard.map(|mut rg| rg.left_ref_mut().map(|r| *r = left_ref));
                         // remove the left ptr
                         rebalancing.parent.remove(rebalancing.parent_pos);
                         // point the right ptr to the replaced sub node
@@ -388,8 +409,8 @@ impl BPlusTree {
                         // right empty node that can be deleted directly without hassle
                         let mut node_to_remove = &mut rebalancing.right_guard;
                         let owned_left_ref = rebalancing.left_ref.clone();
-                        rebalancing.left_guard.right_ref().map(|r| *r = node_to_remove.right_ref().unwrap().clone());
-                        rebalancing.right_right_guard.map(|ref mut rg| rg.left_ref().map(|r| *r = owned_left_ref));
+                        rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
+                        rebalancing.right_right_guard.map(|ref mut rg| rg.left_ref_mut().map(|r| *r = owned_left_ref));
                         rebalancing.parent.remove(rebalancing.parent_pos + 1);
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
                         // Relocate
