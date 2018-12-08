@@ -111,14 +111,20 @@ impl NodeData {
         }
     }
     pub fn len(&self) -> usize {
-        if self.is_ext() {
-            self.extnode().len
-        } else {
-            self.innode().len
+        match self {
+            &NodeData::Internal(ref node) => node.len,
+            &NodeData::External(ref node) => node.len,
+            &NodeData::Empty(_) => 0,
+            &NodeData::None => unreachable!()
         }
     }
     pub fn is_half_full(&self) -> bool {
-        self.len() >= NUM_KEYS / 2 && self.len() > 1
+        if self.is_none() {
+            true
+        } else {
+            let len = self.len();
+            len >= NUM_KEYS / 2 && len > 1
+        }
     }
     pub fn cannot_merge(&self) -> bool {
         self.len() > NUM_KEYS / 2
