@@ -192,10 +192,10 @@ impl InNode {
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
+        left_node: &mut NodeData,
+        right_node: &mut NodeData
     ) -> Result<(), TxnErr> {
         let left_node_ref = self.ptrs[left_ptr_pos].clone();
-        let mut left_node = &mut *left_node_ref.write();
-        let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
         let left_len = left_node.len();
         let right_len = right_node.len();
         let mut merged_len = 0;
@@ -249,10 +249,14 @@ impl InNode {
         }
         self.len += right.len + 1;
     }
-    pub fn relocate_children(&mut self, left_ptr_pos: usize, right_ptr_pos: usize) {
+    pub fn relocate_children(
+        &mut self,
+        left_ptr_pos: usize,
+        right_ptr_pos: usize,
+        left_node: &mut NodeData,
+        right_node: &mut NodeData
+    ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
-        let mut left_node = &mut *self.ptrs[left_ptr_pos].write();
-        let mut right_node = &mut *self.ptrs[right_ptr_pos].write();
         let mut new_right_node_key = Default::default();
         let half_full_pos = (left_node.len() + right_node.len()) / 2;
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());

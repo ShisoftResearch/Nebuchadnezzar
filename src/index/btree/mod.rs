@@ -166,7 +166,7 @@ impl BPlusTree {
                     len: 1,
                 };
                 let mut old_root = self.get_root().clone();
-                // check latched root and old same node
+                // check latched root and current root are the same node
                 debug_assert_eq!(
                     old_root.read_unchecked().first_key(),
                     split.left_node_latch.first_key(),
@@ -328,65 +328,16 @@ impl BPlusTree {
                 &NodeData::None => unreachable!()
             }
         });
-//        if let &NodeData::Internal(ref n) = &**node {
-//            let pos = n.search(key);
-//            let sub_node = n.ptrs[pos].clone();
-//            let mut sub_node_remove = self.remove_from_node(&sub_node, key);
-//            let sub_node_stat = sub_node.read(|sub_node_handler| {
-//                if sub_node_handler.len() == 0 {
-//                    if sub_node_handler.is_ext() {
-//                        SubNodeStatus::ExtNodeEmpty
-//                    } else {
-//                        SubNodeStatus::InNodeEmpty
-//                    }
-//                } else if !sub_node_handler.is_half_full() && n.len > 1 {
-//                    // need to rebalance
-//                    // pick up a subnode for rebalance, it can be at the left or the right of the node that is not half full
-//                    let cand_ptr_pos = n.rebalance_candidate(pos);
-//                    let left_ptr_pos = min(pos, cand_ptr_pos);
-//                    let right_ptr_pos = max(pos, cand_ptr_pos);
-//                    let cand_node = &mut *n.ptrs[cand_ptr_pos].write();
-//                    debug_assert_eq!(cand_node.is_ext(), sub_node_handler.is_ext());
-//                    if sub_node_handler.cannot_merge() || cand_node.cannot_merge() {
-//                        SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos)
-//                    } else {
-//                        SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos)
-//                    }
-//                } else {
-//                    SubNodeStatus::Ok
-//                }
-//            });
-//            (
-//                sub_node_remove,
-//                RemoveSearchResult::Internal(sub_node, sub_node_stat),
-//            )
-//        } else if let &NodeData::External(ref node) = &**node {
-//            if pos >= node.len || &node.keys[pos] != key {
-//                (
-//                    RemoveStatus {
-//                        item_found: false,
-//                        removed: false,
-//                    },
-//                    RemoveSearchResult::External,
-//                )
-//            } else {
-//                (
-//                    RemoveStatus {
-//                        item_found: true,
-//                        removed: true,
-//                    },
-//                    RemoveSearchResult::External,
-//                )
-//            }
-//        } else {
-//            unreachable!()
-//        }
         match search {
             RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent),
             RemoveSearchResult::Internal(mut sub_node) => {
                 let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref);
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
+                        // Remove the empty node that have a right node with the same parent
+                        // Because we cannot lock from left to right, we have to move the content
+                        // of the right node to the left and remove the right node instead so the
+                        // left right pointers can be modified
                         let mut left_node = &mut*rebalancing.left_guard;
                         let mut right_node = &mut*rebalancing.right_guard;
                         // swap the content of left and right, then delete right
@@ -406,50 +357,29 @@ impl BPlusTree {
                         // point the right ptr to the replaced sub node
                         rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
                     } else if rebalancing.right_guard.is_empty() {
-                        // right empty node that can be deleted directly without hassle
+                        // There is a right empty node that can be deleted directly without hassle
                         let mut node_to_remove = &mut rebalancing.right_guard;
                         let owned_left_ref = rebalancing.left_ref.clone();
                         rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
                         rebalancing.right_right_guard.map(|ref mut rg| rg.left_ref_mut().map(|r| *r = owned_left_ref));
                         rebalancing.parent.remove(rebalancing.parent_pos + 1);
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        // Relocate
-
+                        // Relocate the nodes with the same parent for balance.
+                        let mut left_node = &mut*rebalancing.left_guard;
+                        let mut right_node = &mut*rebalancing.right_guard;
+                        let left_pos = rebalancing.parent_pos;
+                        let right_pos = left_pos + 1;
+                        rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+                    } else {
+                        // Nodes with the same parent can merge
+                        let mut left_node = &mut*rebalancing.left_guard;
+                        let mut right_node = &mut*rebalancing.right_guard;
+                        let left_pos = rebalancing.parent_pos;
+                        let right_pos = left_pos + 1;
+                        rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node);
                     }
                 }
-
                 unimplemented!();
-
-//                let node_guard = sub_node.write();
-//                let mut target_node = write_key_page(node_guard, key);
-//                let mut n = target_node.innode_mut();
-//                match sub_node_stat {
-//                    SubNodeStatus::Ok => {}
-//                    SubNodeStatus::Relocate(left_ptr_pos, right_ptr_pos) => {
-//                        n.relocate_children(left_ptr_pos, right_ptr_pos);
-//                        remove_stat.removed = false;
-//                    }
-//                    SubNodeStatus::Merge(left_ptr_pos, right_ptr_pos) => {
-//                        n.merge_children(left_ptr_pos, right_ptr_pos);
-//                        remove_stat.removed = true;
-//                    }
-//                    SubNodeStatus::ExtNodeEmpty => {
-//                        n.remove_at(pos);
-//                        sub_node.write().extnode_mut().remove_node();
-//                        remove_stat.removed = true;
-//                    }
-//                    SubNodeStatus::InNodeEmpty => {
-//                        // empty internal nodes should be replaced with it's only remaining child pointer
-//                        // there must be at least one child pointer exists
-//                        let sub_node_guard = sub_node.write();
-//                        let sub_innode = sub_node_guard.innode();
-//                        let sub_sub_node_ref = sub_innode.ptrs[0].clone();
-//                        debug_assert!(sub_innode.len == 0);
-//                        n.ptrs[pos] = sub_sub_node_ref;
-//                        remove_stat.removed = false;
-//                    }
-//                }
-//                return remove_stat;
             }
             RemoveSearchResult::External => {
                 let node_guard = node_ref.write();
