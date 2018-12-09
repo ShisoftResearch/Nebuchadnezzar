@@ -41,7 +41,7 @@ pub struct RebalancingNodes {
     pub left_guard: NodeWriteGuard,
     pub left_ref: NodeCellRef,
     pub right_guard: NodeWriteGuard,
-    pub right_right_guard: Option<NodeWriteGuard>, // for external pointer modification
+    pub right_right_guard: NodeWriteGuard, // for external pointer modification
     pub parent: NodeWriteGuard,
     pub parent_pos: usize,
     pub right_key: EntryKey,
@@ -118,11 +118,11 @@ impl NodeData {
             &NodeData::None => unreachable!()
         }
     }
-    pub fn is_half_full(&self) -> bool {
+    pub fn will_half_full(&self) -> bool {
         if self.is_none() {
             true
         } else {
-            let len = self.len();
+            let len = self.len() - 1;
             len >= NUM_KEYS / 2 && len > 1
         }
     }

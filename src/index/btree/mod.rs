@@ -306,6 +306,21 @@ impl BPlusTree {
         removed.removed
     }
 
+    fn with_innode_removing<F>(
+        &self,
+        mut rebalancing: RebalancingNodes,
+        parent: &NodeCellRef,
+        func: F) -> RemoveResult
+        where F: Fn()
+    {
+        let parent_half_full = rebalancing.parent.will_half_full();
+        let mut parent_node = rebalancing.parent.innode_mut();
+        let mut parent_right_guard = parent_node.right.write();
+        let mut left_node = &mut*rebalancing.left_guard;
+        let mut right_node = &mut*rebalancing.right_guard;
+        unimplemented!();
+    }
+
     fn remove_from_node(
         &self,
         node_ref: &mut NodeCellRef,
@@ -332,6 +347,7 @@ impl BPlusTree {
             RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent),
             RemoveSearchResult::Internal(mut sub_node) => {
                 let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref);
+
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
                         // Remove the empty node that have a right node with the same parent
@@ -351,17 +367,18 @@ impl BPlusTree {
                         mem::swap(left_node, right_node);
                         left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
                         left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
-                        rebalancing.right_right_guard.map(|mut rg| rg.left_ref_mut().map(|r| *r = left_ref));
+                        rebalancing.right_right_guard.left_ref_mut().map(|r| *r = left_ref);
                         // remove the left ptr
                         rebalancing.parent.remove(rebalancing.parent_pos);
                         // point the right ptr to the replaced sub node
                         rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
+
                     } else if rebalancing.right_guard.is_empty() {
                         // There is a right empty node that can be deleted directly without hassle
                         let mut node_to_remove = &mut rebalancing.right_guard;
                         let owned_left_ref = rebalancing.left_ref.clone();
                         rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
-                        rebalancing.right_right_guard.map(|ref mut rg| rg.left_ref_mut().map(|r| *r = owned_left_ref));
+                        rebalancing.right_right_guard.left_ref_mut().map(|r| *r = owned_left_ref);
                         rebalancing.parent.remove(rebalancing.parent_pos + 1);
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
                         // Relocate the nodes with the same parent for balance.
@@ -370,13 +387,15 @@ impl BPlusTree {
                         let left_pos = rebalancing.parent_pos;
                         let right_pos = left_pos + 1;
                         rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+                        // current_rebalance = None;
                     } else {
                         // Nodes with the same parent can merge
                         let mut left_node = &mut*rebalancing.left_guard;
                         let mut right_node = &mut*rebalancing.right_guard;
+                        let mut right_node_next = &mut *rebalancing.right_right_guard;
                         let left_pos = rebalancing.parent_pos;
                         let right_pos = left_pos + 1;
-                        rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node);
+                        rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
                     }
                 }
                 unimplemented!();
@@ -390,11 +409,11 @@ impl BPlusTree {
                     empty: false
                 };
                 {
-                    let is_left_half_full = target_guard.is_half_full();
+                    let is_left_half_full = target_guard.will_half_full();
                     let mut node = target_guard.extnode_mut();
                     let pos = node.search(key);
                     let right_guard = node.next.write();
-                    let is_right_half_full = right_guard.is_half_full();
+                    let is_right_half_full = right_guard.will_half_full();
                     if !is_left_half_full || !is_right_half_full {
                         let (parent_guard, _) = write_key_page(parent.write(), parent, key);
                         let parent_pos = parent_guard.search(key);
@@ -406,14 +425,7 @@ impl BPlusTree {
                         if !right_guard.is_none() && parent_pos < parent_guard.len() - 1 {
                             debug_assert!(right_guard.is_ext());
                             let right_key = right_guard.extnode().keys[0].clone();
-                            let right_right_guard = {
-                                let right_right = right_guard.extnode().next.write();
-                                if right_right.is_none() {
-                                    None
-                                } else {
-                                    Some(right_right)
-                                }
-                            };
+                            let right_right_guard = right_guard.extnode().next.write();
                             let rebalacing = RebalancingNodes {
                                 left_guard: NodeWriteGuard::default(),
                                 left_ref: target_ref.clone(),
