@@ -308,17 +308,43 @@ impl BPlusTree {
 
     fn with_innode_removing<F>(
         &self,
+        key: &EntryKey,
         mut rebalancing: RebalancingNodes,
         parent: &NodeCellRef,
+        parent_parent: &NodeCellRef,
+        removed: bool,
         func: F) -> RemoveResult
-        where F: Fn()
+        where F: Fn(&mut RebalancingNodes)
     {
         let parent_half_full = rebalancing.parent.will_half_full();
-        let mut parent_node = rebalancing.parent.innode_mut();
-        let mut parent_right_guard = parent_node.right.write();
-        let mut left_node = &mut*rebalancing.left_guard;
-        let mut right_node = &mut*rebalancing.right_guard;
-        unimplemented!();
+        let mut parent_right_guard = rebalancing.parent.innode_mut().right.write();
+        let mut parent_remove_result = RemoveResult {
+            rebalancing: None,
+            removed,
+            empty: false
+        };
+        let (parent_parent_guard, parent_parent_ref) = write_key_page(parent_parent.write(), parent_parent, key);
+        let parent_parent_remove_pos = parent_parent_guard.search(key);
+        let parent_right_half_full = parent_right_guard.will_half_full();
+        let parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
+            // indicates whether the upper parent level need to relocated
+            Some(parent_right_guard.innode().right.write())
+        } else { None };
+        func(&mut rebalancing);
+        if rebalancing.parent.innode().len == 0 {
+            parent_remove_result.empty = true;
+        }
+        parent_remove_result.rebalancing = parent_right_right_guard.map(|parent_right_right_guard| {
+            RebalancingNodes {
+                left_guard: rebalancing.parent,
+                left_ref: parent.clone(),
+                right_right_guard: parent_right_guard.innode().right.write(),
+                right_guard: parent_right_guard,
+                parent: parent_parent_guard,
+                parent_pos: parent_parent_remove_pos,
+            }
+        });
+        parent_remove_result
     }
 
     fn remove_from_node(
@@ -424,7 +450,6 @@ impl BPlusTree {
                         // by their left node remove operations.
                         if !right_guard.is_none() && parent_pos < parent_guard.len() - 1 {
                             debug_assert!(right_guard.is_ext());
-                            let right_key = right_guard.extnode().keys[0].clone();
                             let right_right_guard = right_guard.extnode().next.write();
                             let rebalacing = RebalancingNodes {
                                 left_guard: NodeWriteGuard::default(),
@@ -432,7 +457,6 @@ impl BPlusTree {
                                 parent: parent_guard,
                                 parent_pos,
                                 right_right_guard,
-                                right_key,
                                 right_guard
                             };
                             remove_result.rebalancing = Some(rebalacing);

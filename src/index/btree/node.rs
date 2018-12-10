@@ -43,8 +43,7 @@ pub struct RebalancingNodes {
     pub right_guard: NodeWriteGuard,
     pub right_right_guard: NodeWriteGuard, // for external pointer modification
     pub parent: NodeWriteGuard,
-    pub parent_pos: usize,
-    pub right_key: EntryKey,
+    pub parent_pos: usize
 }
 
 pub struct RemoveResult {
@@ -118,6 +117,8 @@ impl NodeData {
             &NodeData::None => unreachable!()
         }
     }
+
+    // check if the node will be half full after an item have been removed
     pub fn will_half_full(&self) -> bool {
         if self.is_none() {
             true
