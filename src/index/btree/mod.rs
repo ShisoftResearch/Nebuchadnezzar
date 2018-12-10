@@ -341,7 +341,7 @@ impl BPlusTree {
             RebalancingNodes {
                 left_guard: rebalancing.parent,
                 left_ref: parent.clone(),
-                right_right_guard: parent_right_guard.innode().right.write(),
+                right_right_guard: parent_right_right_guard,
                 right_guard: parent_right_guard,
                 parent: parent_parent_guard,
                 parent_pos: parent_parent_remove_pos,
@@ -914,7 +914,6 @@ pub mod test {
         }
 
         // TODO: fix remove before removing this line
-        return;
         {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
