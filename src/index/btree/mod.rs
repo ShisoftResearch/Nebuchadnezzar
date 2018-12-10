@@ -292,18 +292,21 @@ impl BPlusTree {
 
     pub fn remove(&self, key: &EntryKey) -> bool {
         let mut root = self.get_root();
-        let removed = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning);
-//        if removed.item_found && removed.removed && !root_node.is_ext() && root_node.len() == 0 {
-//            // When root is external and have no keys but one pointer will take the only sub level
-//            // pointer node as the new root node.
-//            let new_root = &mut *root_node.innode().ptrs[0].write();
-//            // TODO: check memory leak
-//            mem::swap(root_node, new_root);
-//        }
-//        if removed.item_found {
-//            self.len.fetch_sub(1, Relaxed);
-//        }
-        removed.removed
+        let result = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning);
+        if let Some(rebalance) = result.rebalancing {
+            let root_node = rebalance.parent;
+            if self.root.read().read_unchecked().innode().keys[0] == root_node.innode().keys[0] {
+                // Make sure root node does not changed during the process. If it did changed, ignore it
+                // When root is external and have no keys but one pointer will take the only sub level
+                // pointer node as the new root node.
+                let new_root = root_node.innode().ptrs[0].clone();
+                *self.root.write() = new_root;
+            }
+        }
+        if result.removed {
+            self.len.fetch_sub(1, Relaxed);
+        }
+        result.removed
     }
 
     fn with_innode_removing<F>(
@@ -514,7 +517,7 @@ impl BPlusTree {
                 if let &mut Some(ref mut rebalancing) = &mut remove_result.rebalancing {
                     rebalancing.left_guard = target_guard;
                 }
-                return remove_result;
+                remove_result
             }
         }
     }
