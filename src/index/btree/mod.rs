@@ -376,7 +376,7 @@ impl BPlusTree {
                 let removed = node_remove_res.removed;
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
-                        self.with_innode_removing(
+                        Some(self.with_innode_removing(
                             key,
                             rebalancing,
                             &sub_node,
@@ -405,9 +405,9 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos);
                                 // point the right ptr to the replaced sub node
                                 rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
-                            });
+                            }))
                     } else if rebalancing.right_guard.is_empty() {
-                        self.with_innode_removing(
+                        Some(self.with_innode_removing(
                             key,
                             rebalancing,
                             &sub_node,
@@ -420,7 +420,7 @@ impl BPlusTree {
                                 rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
                                 rebalancing.right_right_guard.left_ref_mut().map(|r| *r = owned_left_ref);
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
-                            });
+                            }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
                         // Relocate the nodes with the same parent for balance.
                         let mut left_node = &mut*rebalancing.left_guard;
@@ -428,10 +428,10 @@ impl BPlusTree {
                         let left_pos = rebalancing.parent_pos;
                         let right_pos = left_pos + 1;
                         rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
-                        // current_rebalance = None;
+                        None
                     } else {
                         // Nodes with the same parent can merge
-                        self.with_innode_removing(
+                        Some(self.with_innode_removing(
                             key,
                             rebalancing,
                             &sub_node,
@@ -444,10 +444,17 @@ impl BPlusTree {
                                 let left_pos = rebalancing.parent_pos;
                                 let right_pos = left_pos + 1;
                                 rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
-                            });
+                            }))
                     }
-                }
-                unimplemented!();
+                } else {
+                    None
+                }.unwrap_or_else(|| {
+                    RemoveResult {
+                        rebalancing: None,
+                        empty: false,
+                        removed
+                    }
+                })
             }
             RemoveSearchResult::External => {
                 let node_guard = node_ref.write();
