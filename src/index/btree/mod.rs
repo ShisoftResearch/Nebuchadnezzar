@@ -373,39 +373,54 @@ impl BPlusTree {
             RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent),
             RemoveSearchResult::Internal(mut sub_node) => {
                 let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref);
-
+                let removed = node_remove_res.removed;
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
-                        // Remove the empty node that have a right node with the same parent
-                        // Because we cannot lock from left to right, we have to move the content
-                        // of the right node to the left and remove the right node instead so the
-                        // left right pointers can be modified
-                        let mut left_node = &mut*rebalancing.left_guard;
-                        let mut right_node = &mut*rebalancing.right_guard;
-                        // swap the content of left and right, then delete right
-                        // this procedure will prevent locking left node for changing right reference
-                        let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
-                        let right_right_ref = right_node.right_ref_mut().map(|r| r.clone());
-                        let left_ref = rebalancing.left_ref.clone();
-                        right_node.right_ref_mut().map(|mut r| *r = left_ref.clone());
-                        // swap the empty node with the right node. In this case left node holds
-                        // content of the right node but pointers need to be corrected.
-                        mem::swap(left_node, right_node);
-                        left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
-                        left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
-                        rebalancing.right_right_guard.left_ref_mut().map(|r| *r = left_ref);
-                        // remove the left ptr
-                        rebalancing.parent.remove(rebalancing.parent_pos);
-                        // point the right ptr to the replaced sub node
-                        rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
-
+                        self.with_innode_removing(
+                            key,
+                            rebalancing,
+                            &sub_node,
+                            parent,
+                            removed,
+                            |rebalancing| {
+                                // Remove the empty node that have a right node with the same parent
+                                // Because we cannot lock from left to right, we have to move the content
+                                // of the right node to the left and remove the right node instead so the
+                                // left right pointers can be modified
+                                let mut left_node = &mut*rebalancing.left_guard;
+                                let mut right_node = &mut*rebalancing.right_guard;
+                                // swap the content of left and right, then delete right
+                                // this procedure will prevent locking left node for changing right reference
+                                let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
+                                let right_right_ref = right_node.right_ref_mut().map(|r| r.clone());
+                                let left_ref = rebalancing.left_ref.clone();
+                                right_node.right_ref_mut().map(|mut r| *r = left_ref.clone());
+                                // swap the empty node with the right node. In this case left node holds
+                                // content of the right node but pointers need to be corrected.
+                                mem::swap(left_node, right_node);
+                                left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
+                                left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
+                                rebalancing.right_right_guard.left_ref_mut().map(|r| *r = left_ref);
+                                // remove the left ptr
+                                rebalancing.parent.remove(rebalancing.parent_pos);
+                                // point the right ptr to the replaced sub node
+                                rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
+                            });
                     } else if rebalancing.right_guard.is_empty() {
-                        // There is a right empty node that can be deleted directly without hassle
-                        let mut node_to_remove = &mut rebalancing.right_guard;
-                        let owned_left_ref = rebalancing.left_ref.clone();
-                        rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
-                        rebalancing.right_right_guard.left_ref_mut().map(|r| *r = owned_left_ref);
-                        rebalancing.parent.remove(rebalancing.parent_pos + 1);
+                        self.with_innode_removing(
+                            key,
+                            rebalancing,
+                            &sub_node,
+                            parent,
+                            removed,
+                            |rebalancing| {
+                                // There is a right empty node that can be deleted directly without hassle
+                                let mut node_to_remove = &mut rebalancing.right_guard;
+                                let owned_left_ref = rebalancing.left_ref.clone();
+                                rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
+                                rebalancing.right_right_guard.left_ref_mut().map(|r| *r = owned_left_ref);
+                                rebalancing.parent.remove(rebalancing.parent_pos + 1);
+                            });
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
                         // Relocate the nodes with the same parent for balance.
                         let mut left_node = &mut*rebalancing.left_guard;
@@ -416,12 +431,20 @@ impl BPlusTree {
                         // current_rebalance = None;
                     } else {
                         // Nodes with the same parent can merge
-                        let mut left_node = &mut*rebalancing.left_guard;
-                        let mut right_node = &mut*rebalancing.right_guard;
-                        let mut right_node_next = &mut *rebalancing.right_right_guard;
-                        let left_pos = rebalancing.parent_pos;
-                        let right_pos = left_pos + 1;
-                        rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
+                        self.with_innode_removing(
+                            key,
+                            rebalancing,
+                            &sub_node,
+                            parent,
+                            removed,
+                            |rebalancing| {
+                                let mut left_node = &mut *rebalancing.left_guard;
+                                let mut right_node = &mut *rebalancing.right_guard;
+                                let mut right_node_next = &mut *rebalancing.right_right_guard;
+                                let left_pos = rebalancing.parent_pos;
+                                let right_pos = left_pos + 1;
+                                rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
+                            });
                     }
                 }
                 unimplemented!();

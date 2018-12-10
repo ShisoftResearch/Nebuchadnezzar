@@ -57,7 +57,7 @@ impl InNode {
         &mut self,
         key: EntryKey,
         new_node: NodeCellRef,
-        parent: &NodeCellRef
+        parent: &NodeCellRef,
     ) -> Option<NodeSplit> {
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -194,7 +194,7 @@ impl InNode {
         right_ptr_pos: usize,
         left_node: &mut NodeData,
         right_node: &mut NodeData,
-        right_node_next: &mut NodeData
+        right_node_next: &mut NodeData,
     ) -> Result<(), TxnErr> {
         let left_node_ref = self.ptrs[left_ptr_pos].clone();
         let left_len = left_node.len();
@@ -253,7 +253,7 @@ impl InNode {
         left_ptr_pos: usize,
         right_ptr_pos: usize,
         left_node: &mut NodeData,
-        right_node: &mut NodeData
+        right_node: &mut NodeData,
     ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut new_right_node_key = Default::default();

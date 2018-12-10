@@ -43,13 +43,13 @@ pub struct RebalancingNodes {
     pub right_guard: NodeWriteGuard,
     pub right_right_guard: NodeWriteGuard, // for external pointer modification
     pub parent: NodeWriteGuard,
-    pub parent_pos: usize
+    pub parent_pos: usize,
 }
 
 pub struct RemoveResult {
     pub rebalancing: Option<RebalancingNodes>,
     pub empty: bool,
-    pub removed: bool
+    pub removed: bool,
 }
 
 pub enum NodeData {
@@ -61,7 +61,7 @@ pub enum NodeData {
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
-    pub right: NodeCellRef
+    pub right: NodeCellRef,
 }
 
 impl NodeData {
@@ -76,7 +76,7 @@ impl NodeData {
             &NodeData::Empty(ref n) => true,
             &NodeData::External(ref n) => n.len == 0,
             &NodeData::Internal(ref n) => n.len == 0,
-            &NodeData::None => unreachable!()
+            &NodeData::None => unreachable!(),
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
@@ -114,7 +114,7 @@ impl NodeData {
             &NodeData::Internal(ref node) => node.len,
             &NodeData::External(ref node) => node.len,
             &NodeData::Empty(_) => 0,
-            &NodeData::None => unreachable!()
+            &NodeData::None => unreachable!(),
         }
     }
 
@@ -166,7 +166,7 @@ impl NodeData {
             &NodeData::Internal(_) => "internal",
             &NodeData::External(_) => "external",
             &NodeData::None => "none",
-            &NodeData::Empty(_) => "empty"
+            &NodeData::Empty(_) => "empty",
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
@@ -202,7 +202,7 @@ impl NodeData {
                             }
                         }
                     }
-                },
+                }
                 &NodeData::Empty(ref n) => return Some(&n.right),
                 _ => unreachable!(),
             }
@@ -213,14 +213,14 @@ impl NodeData {
     pub fn left_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.prev),
-            _ => None
+            _ => None,
         }
     }
 
     pub fn left_ref(&self) -> Option<&NodeCellRef> {
         match self {
             &NodeData::External(ref n) => Some(&n.prev),
-            _ => None
+            _ => None,
         }
     }
 
@@ -229,7 +229,7 @@ impl NodeData {
             &mut NodeData::External(ref mut n) => Some(&mut n.next),
             &mut NodeData::Internal(ref mut n) => Some(&mut n.right),
             &mut NodeData::Empty(ref mut n) => Some(&mut n.right),
-            &mut NodeData::None => None
+            &mut NodeData::None => None,
         }
     }
 
@@ -238,7 +238,7 @@ impl NodeData {
             &NodeData::External(ref n) => Some(&n.next),
             &NodeData::Internal(ref n) => Some(&n.right),
             &NodeData::Empty(ref n) => Some(&n.right),
-            &NodeData::None => None
+            &NodeData::None => None,
         }
     }
 
@@ -247,7 +247,11 @@ impl NodeData {
     }
 }
 
-pub fn write_key_page(search_page: NodeWriteGuard, search_ref: &NodeCellRef, key: &EntryKey) -> (NodeWriteGuard, NodeCellRef) {
+pub fn write_key_page(
+    search_page: NodeWriteGuard,
+    search_ref: &NodeCellRef,
+    key: &EntryKey,
+) -> (NodeWriteGuard, NodeCellRef) {
     // return search_page;
     if search_page.len() > 0 {
         match &*search_page {
@@ -280,7 +284,7 @@ pub fn write_key_page(search_page: NodeWriteGuard, search_ref: &NodeCellRef, key
                         return write_key_page(right_node, right_ref, key);
                     }
                 }
-            },
+            }
             &NodeData::Empty(ref n) => return write_key_page(n.right.write(), &n.right, key),
             _ => unreachable!(),
         }
