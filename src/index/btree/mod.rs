@@ -98,7 +98,7 @@ impl BPlusTree {
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
-        let mut cursor = unsafe { self.search(&self.get_root(), key, ordering) };
+        let mut cursor = self.search(&self.get_root(), key, ordering);
         match ordering {
             Ordering::Forward => {}
             Ordering::Backward => {
@@ -292,7 +292,7 @@ impl BPlusTree {
 
     pub fn remove(&self, key: &EntryKey) -> bool {
         let mut root = self.get_root();
-        let result = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning);
+        let result = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning, 0);
         if let Some(rebalance) = result.rebalancing {
             let root_node = rebalance.parent;
             if self.root.read().read_unchecked().innode().keys[0] == root_node.innode().keys[0] {
@@ -316,6 +316,7 @@ impl BPlusTree {
         parent: &NodeCellRef,
         parent_parent: &NodeCellRef,
         removed: bool,
+        level: usize,
         func: F) -> RemoveResult
         where F: Fn(&mut RebalancingNodes)
     {
@@ -326,13 +327,28 @@ impl BPlusTree {
             removed,
             empty: false
         };
-        let (parent_parent_guard, parent_parent_ref) = write_key_page(parent_parent.write(), parent_parent, key);
-        let parent_parent_remove_pos = parent_parent_guard.search(key);
-        let parent_right_half_full = parent_right_guard.will_half_full();
-        let parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
-            // indicates whether the upper parent level need to relocated
-            Some(parent_right_guard.innode().right.write())
-        } else { None };
+
+        let parent_parent_guard;
+        let parent_parent_ref;
+        let parent_parent_remove_pos;
+        let parent_right_right_guard;
+        if level == 0 {
+            parent_parent_guard = parent_parent.write();
+            parent_parent_ref = parent_parent.clone();
+            parent_parent_remove_pos = 0;
+            parent_right_right_guard = None;
+        } else {
+            let (pp_guard, pp_ref) = write_key_page(parent_parent.write(), parent_parent, key);
+            parent_parent_guard = pp_guard;
+            parent_parent_ref = pp_ref;
+            parent_parent_remove_pos = parent_parent_guard.search(key);
+            let parent_right_half_full = parent_right_guard.will_half_full();
+            parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
+                // indicates whether the upper parent level need to relocated
+                Some(parent_right_guard.innode().right.write())
+            } else { None };
+        }
+
         func(&mut rebalancing);
         if rebalancing.parent.innode().len == 0 {
             parent_remove_result.empty = true;
@@ -354,7 +370,8 @@ impl BPlusTree {
         &self,
         node_ref: &mut NodeCellRef,
         key: &mut EntryKey,
-        parent: &NodeCellRef) -> RemoveResult
+        parent: &NodeCellRef,
+        level: usize) -> RemoveResult
     {
         debug!("Removing {:?} from node", key);
         let mut search = node_ref.read(|node| {
@@ -373,9 +390,9 @@ impl BPlusTree {
             }
         });
         match search {
-            RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent),
+            RemoveSearchResult::RightNode(mut node) => return self.remove_from_node(&mut node, key, parent, level),
             RemoveSearchResult::Internal(mut sub_node) => {
-                let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref);
+                let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref, level + 1);
                 let removed = node_remove_res.removed;
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
@@ -385,6 +402,7 @@ impl BPlusTree {
                             &sub_node,
                             parent,
                             removed,
+                            level,
                             |rebalancing| {
                                 // Remove the empty node that have a right node with the same parent
                                 // Because we cannot lock from left to right, we have to move the content
@@ -416,6 +434,7 @@ impl BPlusTree {
                             &sub_node,
                             parent,
                             removed,
+                            level,
                             |rebalancing| {
                                 // There is a right empty node that can be deleted directly without hassle
                                 let mut node_to_remove = &mut rebalancing.right_guard;
@@ -440,6 +459,7 @@ impl BPlusTree {
                             &sub_node,
                             parent,
                             removed,
+                            level,
                             |rebalancing| {
                                 let mut left_node = &mut *rebalancing.left_guard;
                                 let mut right_node = &mut *rebalancing.right_guard;
@@ -918,7 +938,7 @@ pub mod test {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
             let mut deletions = (0..deletion_volume).collect_vec();
-            thread_rng().shuffle(deletions.as_mut_slice());
+            // thread_rng().shuffle(deletions.as_mut_slice());
             for i in deletions {
                 debug!("delete: {}", i);
                 let id = Id::new(0, i);
@@ -928,8 +948,9 @@ pub mod test {
                 key_with_id(&mut entry_key, &id);
                 let remove_succeed = tree.remove(&entry_key);
                 if !remove_succeed {
-                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                    // dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 }
+                dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 assert!(remove_succeed, "remove at {}", i);
             }
 

@@ -46,13 +46,16 @@ impl IndexCursor for RTCursor {
                             let next_node = ext_page.next.read_unchecked();
                             self.index = 0;
                             self.page = Some(ext_page.next.clone());
-                            if next_node.is_empty() {
+                            if next_node.is_none() {
+                                self.page = None;
+                                return false;
+                            }
+                            else if next_node.is_empty() {
                                 return self.next();
                             } else if next_node.is_ext() {
                                 return true;
                             } else {
-                                self.page = None;
-                                return false;
+                                unreachable!()
                             }
                         }
                         if self.index + 1 >= page.len() {
@@ -79,13 +82,15 @@ impl IndexCursor for RTCursor {
                             let prev_node = ext_page.prev.read_unchecked();
                             self.index = 0;
                             self.page = Some(ext_page.next.clone());
-                            if prev_node.is_empty() {
+                            if prev_node.is_none() {
+                                self.page = None;
+                                return false;
+                            } else if prev_node.is_empty() {
                                 return self.next();
                             } else if prev_node.is_ext() {
                                 return true;
                             } else {
-                                self.page = None;
-                                return false;
+                                unreachable!()
                             }
                         }
                         if self.index == 0 {

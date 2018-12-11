@@ -123,7 +123,11 @@ impl NodeData {
         if self.is_none() {
             true
         } else {
-            let len = self.len() - 1;
+            let mut len = self.len();
+            if len == 0 {
+                return false;
+            }
+            len -= 1;
             len >= NUM_KEYS / 2 && len > 1
         }
     }
