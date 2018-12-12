@@ -944,7 +944,7 @@ pub mod test {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
             let mut deletions = (0..deletion_volume).collect_vec();
-            // thread_rng().shuffle(deletions.as_mut_slice());
+            thread_rng().shuffle(deletions.as_mut_slice());
             for i in deletions {
                 debug!("delete: {}", i);
                 let id = Id::new(0, i);

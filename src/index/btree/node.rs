@@ -134,7 +134,7 @@ impl NodeData {
         }
     }
     pub fn cannot_merge(&self) -> bool {
-        self.len() > NUM_KEYS / 2
+        self.len() >= NUM_KEYS / 2
     }
     pub fn extnode_mut(&mut self) -> &mut ExtNode {
         match self {
