@@ -251,7 +251,7 @@ impl BPlusTree {
                         let mut self_guard = split.parent_latch;
                         let (mut target_guard, _) = write_key_page(self_guard, node_ref, &pivot);
                         debug_assert!(
-                            split.new_right_node.read_unchecked().first_key() >= pivot
+                            split.new_right_node.read_unchecked().first_key() >= &pivot
                         );
                         let mut split_result = target_guard.innode_mut().insert(
                             pivot,
@@ -373,7 +373,7 @@ impl BPlusTree {
         parent: &NodeCellRef,
         level: usize) -> RemoveResult
     {
-        debug!("Removing {:?} from node", key);
+        debug!("Removing {:?} from node, level {}", key, level);
         let mut search = node_ref.read(|node| {
             if let Some(right_node) = node.key_at_right_node(key) {
                 return RemoveSearchResult::RightNode(right_node.clone());
@@ -396,6 +396,7 @@ impl BPlusTree {
                 let removed = node_remove_res.removed;
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
                     if node_remove_res.empty {
+                        debug!("Remove {:?} sub level is empty, level {}", key, level);
                         Some(self.with_innode_removing(
                             key,
                             rebalancing,
@@ -428,6 +429,7 @@ impl BPlusTree {
                                 rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
                             }))
                     } else if rebalancing.right_guard.is_empty() {
+                        debug!("Remove {:?} sub level right node is empty, level {}", key, level);
                         Some(self.with_innode_removing(
                             key,
                             rebalancing,
@@ -444,15 +446,19 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        // Relocate the nodes with the same parent for balance.
-                        let mut left_node = &mut*rebalancing.left_guard;
-                        let mut right_node = &mut*rebalancing.right_guard;
-                        let left_pos = rebalancing.parent_pos;
-                        let right_pos = left_pos + 1;
-                        rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+                        if rebalancing.left_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 || rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 {
+                            // Relocate the nodes with the same parent for balance.
+                            debug!("Remove {:?} sub level need relocation, level {}", key, level);
+                            let mut left_node = &mut*rebalancing.left_guard;
+                            let mut right_node = &mut*rebalancing.right_guard;
+                            let left_pos = rebalancing.parent_pos;
+                            let right_pos = left_pos + 1;
+                            rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+                        }
                         None
                     } else {
                         // Nodes with the same parent can merge
+                        debug!("Remove {:?} sub level need to be merged, level {}", key, level);
                         Some(self.with_innode_removing(
                             key,
                             rebalancing,

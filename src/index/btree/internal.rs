@@ -199,11 +199,13 @@ impl InNode {
         let left_node_ref = self.ptrs[left_ptr_pos].clone();
         let left_len = left_node.len();
         let right_len = right_node.len();
+        let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
         let mut merged_len = 0;
+        debug!("Merge children, left len {}, right len {}, left_ptr_pos {}, right_ptr_pos {}, right_key_pos {}",
+                left_len, right_len, left_ptr_pos, right_ptr_pos, right_key_pos);
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             {
-                let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
                 let mut left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
                 let right_key = self.keys[right_key_pos].clone();
@@ -225,9 +227,11 @@ impl InNode {
         }
         self.remove_at(right_ptr_pos);
         debug!(
-            "Removing merged node, left {}, right {}, merged {}",
-            left_len, right_len, merged_len
+            "Removing merged node at {}, left {}, right {}, merged {}",
+            right_ptr_pos,left_len, right_len, merged_len
         );
+        debug!("Merged parent level keys: {:?}", self.keys);
+        debug!("Merged level keys {:?}", left_node.keys());
         Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
@@ -310,9 +314,9 @@ impl InNode {
                 {
                     let ptr_owned = mem::replace(ptr, Default::default());
                     if i < half_full_pos + 1 {
-                        new_right_ptrs[i] = ptr_owned;
+                        new_left_ptrs[i] = ptr_owned;
                     } else {
-                        new_left_ptrs[i - half_full_pos - 1] = ptr_owned;
+                        new_right_ptrs[i - half_full_pos - 1] = ptr_owned;
                     }
                 }
 

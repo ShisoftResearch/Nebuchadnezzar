@@ -102,12 +102,15 @@ impl NodeData {
             &NodeData::None | &NodeData::Empty(_) => panic!(),
         }
     }
-    pub fn first_key(&self) -> EntryKey {
+    pub fn keys(&self) -> &[EntryKey] {
         if self.is_ext() {
-            self.extnode().keys[0].to_owned()
+            &self.extnode().keys
         } else {
-            self.innode().keys[0].to_owned()
+            &self.innode().keys
         }
+    }
+    pub fn first_key(&self) -> &EntryKey {
+        &self.keys()[0]
     }
     pub fn len(&self) -> usize {
         match self {
