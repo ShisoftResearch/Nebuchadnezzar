@@ -939,7 +939,6 @@ pub mod test {
             }
         }
 
-        // TODO: fix remove before removing this line
         {
             debug!("Testing deletion");
             let deletion_volume = num / 2;
