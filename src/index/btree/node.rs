@@ -130,7 +130,6 @@ impl NodeData {
             if len == 0 {
                 return false;
             }
-            len -= 1;
             len >= NUM_KEYS / 2 && len > 1
         }
     }

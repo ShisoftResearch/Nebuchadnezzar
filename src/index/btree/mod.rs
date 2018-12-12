@@ -345,7 +345,7 @@ impl BPlusTree {
             let parent_right_half_full = parent_right_guard.will_half_full();
             parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
                 // indicates whether the upper parent level need to relocated
-                Some(parent_right_guard.innode().right.write())
+                parent_right_guard.right_ref().map(|r| r.write())
             } else { None };
         }
 
@@ -954,9 +954,9 @@ pub mod test {
                 key_with_id(&mut entry_key, &id);
                 let remove_succeed = tree.remove(&entry_key);
                 if !remove_succeed {
-                    // dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 }
-                dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                // dump_tree(&tree, &format!("removing_{}_dump.json", i));
                 assert!(remove_succeed, "remove at {}", i);
             }
 
