@@ -456,7 +456,7 @@ impl BPlusTree {
                             rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
                         }
                         None
-                    } else {
+                    } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1 <= NUM_KEYS {
                         // Nodes with the same parent can merge
                         debug!("Remove {:?} sub level need to be merged, level {}", key, level);
                         Some(self.with_innode_removing(
@@ -474,6 +474,8 @@ impl BPlusTree {
                                 let right_pos = left_pos + 1;
                                 rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
                             }))
+                    } else {
+                        None
                     }
                 } else {
                     None
