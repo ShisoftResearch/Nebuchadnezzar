@@ -247,7 +247,7 @@ impl InNode {
         for i in self_len + 1..new_len {
             mem::swap(&mut self.keys[i], &mut right.keys[i - self_len - 1]);
         }
-        for i in self_len + 1..new_len + 2 {
+        for i in self_len + 1..new_len + 1 {
             mem::swap(&mut self.ptrs[i], &mut right.ptrs[i - self_len - 1]);
         }
         self.len += right.len + 1;
