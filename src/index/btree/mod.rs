@@ -320,7 +320,7 @@ impl BPlusTree {
         func: F) -> RemoveResult
         where F: Fn(&mut RebalancingNodes)
     {
-        let parent_half_full = rebalancing.parent.will_half_full();
+        let parent_half_full = rebalancing.parent.is_half_full();
         let mut parent_right_guard = rebalancing.parent.innode_mut().right.write();
         let mut parent_remove_result = RemoveResult {
             rebalancing: None,
@@ -342,7 +342,7 @@ impl BPlusTree {
             parent_parent_guard = pp_guard;
             parent_parent_ref = pp_ref;
             parent_parent_remove_pos = parent_parent_guard.search(key);
-            let parent_right_half_full = parent_right_guard.will_half_full();
+            let parent_right_half_full = parent_right_guard.is_half_full();
             parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
                 // indicates whether the upper parent level need to relocated
                 parent_right_guard.right_ref().map(|r| r.write())
@@ -494,11 +494,11 @@ impl BPlusTree {
                     empty: false
                 };
                 {
-                    let is_left_half_full = target_guard.will_half_full();
+                    let is_left_half_full = target_guard.is_half_full();
                     let mut node = target_guard.extnode_mut();
                     let pos = node.search(key);
                     let right_guard = node.next.write();
-                    let is_right_half_full = right_guard.will_half_full();
+                    let is_right_half_full = right_guard.is_half_full();
                     if !is_left_half_full || !is_right_half_full {
                         let (parent_guard, _) = write_key_page(parent.write(), parent, key);
                         let parent_pos = parent_guard.search(key);

@@ -122,20 +122,22 @@ impl NodeData {
     }
 
     // check if the node will be half full after an item have been removed
-    pub fn will_half_full(&self) -> bool {
+    pub fn is_half_full(&self) -> bool {
         if self.is_none() {
             true
         } else {
-            let mut len = self.len();
+            let len = self.len();
             if len == 0 {
                 return false;
             }
             len >= NUM_KEYS / 2 && len > 1
         }
     }
+
     pub fn cannot_merge(&self) -> bool {
-        self.len() >= NUM_KEYS / 2
+        self.len() > NUM_KEYS / 2
     }
+
     pub fn extnode_mut(&mut self) -> &mut ExtNode {
         match self {
             &mut NodeData::External(ref mut node) => node,
