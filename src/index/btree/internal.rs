@@ -283,6 +283,7 @@ impl InNode {
 
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
+                debug_assert!(!self.ptrs[right_ptr_pos].read_unchecked().is_none());
                 let pivot_key_pos = right_ptr_pos - 1;
                 let pivot_key = self.keys[pivot_key_pos].to_owned();
                 debug_assert!(pivot_key > smallvec!(0),
