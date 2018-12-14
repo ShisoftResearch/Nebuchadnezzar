@@ -501,7 +501,7 @@ impl BPlusTree {
                     let pos = node.search(key);
                     let right_guard = node.next.write();
                     let is_right_half_full = right_guard.is_half_full();
-                    if !is_left_half_full || !is_right_half_full {
+                    if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
                         let right_right_guard = right_guard.extnode().next.write();
                         let (parent_guard, _) = write_key_page(parent.write(), parent, key);
                         let parent_pos = parent_guard.search(key);
@@ -510,7 +510,7 @@ impl BPlusTree {
                         // if the empty non half-full node is at the right most of its parent
                         // So left over imbalanced such nodes will be expected and they can be eliminate
                         // by their left node remove operations.
-                        if !right_guard.is_none() && parent_pos < parent_guard.len() - 1 {
+                        if parent_pos < parent_guard.len() - 1 {
                             debug_assert!(right_guard.is_ext());
                             let rebalacing = RebalancingNodes {
                                 left_guard: NodeWriteGuard::default(),
