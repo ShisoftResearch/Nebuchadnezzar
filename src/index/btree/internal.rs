@@ -284,6 +284,7 @@ impl InNode {
                 let pivot_key = self.keys[right_ptr_pos - 1].to_owned();
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
+                debug_assert!(pivot_key > smallvec!(0));
                 for (i, key) in chain(
                     chain(
                         left_innode.keys[..left_innode.len].iter_mut(),
