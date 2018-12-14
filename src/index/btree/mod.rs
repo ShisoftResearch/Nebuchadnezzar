@@ -853,6 +853,10 @@ pub mod test {
             .unwrap_or("1000".to_string())
             .parse::<u64>()
             .unwrap();
+        // die-rolling
+        let mut rng = thread_rng();
+        let die_range = Uniform::new_inclusive(1, 6);
+        let mut roll_die = rng.sample_iter(&die_range);
         {
             info!("test insertion");
             let mut nums = (0..num).collect_vec();
@@ -869,7 +873,9 @@ pub mod test {
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 tree.insert(&entry_key);
-                check_ordering(&tree, &entry_key);
+                if roll_die.next().unwrap() == 6 {
+                    check_ordering(&tree, &entry_key);
+                }
                 i += 1;
             }
             assert_eq!(tree.len(), num as usize);
@@ -992,10 +998,6 @@ pub mod test {
             tree.flush_all();
 
             debug!("remove remaining items, with extensive point search");
-            // die-rolling
-            let mut rng = thread_rng();
-            let die_range = Uniform::new_inclusive(1, 6);
-            let mut roll_die = rng.sample_iter(&die_range);
             for i in (deletion_volume..num).rev() {
                 {
                     debug!("delete and sampling: {}", i);
