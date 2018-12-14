@@ -363,13 +363,12 @@ impl InNode {
                     new_left_keys[i] = key_owned;
                     new_left_keys_len += 1;
                 } else {
-                    if i == half_full_pos {
-                        new_right_node_key = key_owned.clone()
-                    }
                     new_right_keys[i - half_full_pos] = key_owned;
                     new_right_keys_len += 1;
                 }
             }
+
+            new_right_node_key = new_right_keys[0].clone();
 
             left_extnode.keys = new_left_keys;
             left_extnode.len = new_left_keys_len;
