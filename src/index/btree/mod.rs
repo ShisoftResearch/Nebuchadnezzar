@@ -1097,10 +1097,10 @@ pub mod test {
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
-            debug!("checking {:?}", &key);
             if roll_die.next().unwrap() != 6 {
                 continue;
             }
+            debug!("checking {:?}", &key);
             let mut cursor = tree.seek(&key, Ordering::Forward);
             for j in i..num {
                 let id = Id::new(0, j);
