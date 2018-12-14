@@ -294,15 +294,14 @@ impl InNode {
                 )
                 .enumerate()
                 {
-                    let key_owned = mem::replace(key, Default::default());
                     if i < half_full_pos {
-                        new_left_keys[i] = key_owned;
+                        mem::swap(key, &mut new_left_keys[i]);
                         new_left_keys_len += 1;
                     } else if i == half_full_pos {
-                        new_right_node_key = key_owned
+                        mem::swap(key, &mut new_right_node_key);
                     } else {
                         let nk_index = i - half_full_pos - 1;
-                        new_right_keys[nk_index] = key_owned;
+                        mem::swap(key, &mut new_right_keys[nk_index]);
                         new_right_keys_len += 1;
                     }
                 }
@@ -313,11 +312,10 @@ impl InNode {
                 )
                 .enumerate()
                 {
-                    let ptr_owned = mem::replace(ptr, Default::default());
                     if i < half_full_pos + 1 {
-                        new_left_ptrs[i] = ptr_owned;
+                        mem::swap(ptr, &mut new_left_ptrs[i]);
                     } else {
-                        new_right_ptrs[i - half_full_pos - 1] = ptr_owned;
+                        mem::swap(ptr, &mut new_right_ptrs[i - half_full_pos - 1]);
                     }
                 }
 
@@ -358,12 +356,11 @@ impl InNode {
             )
             .enumerate()
             {
-                let key_owned = mem::replace(key, Default::default());
                 if i < half_full_pos {
-                    new_left_keys[i] = key_owned;
+                    mem::swap(key, &mut new_left_keys[i]);
                     new_left_keys_len += 1;
                 } else {
-                    new_right_keys[i - half_full_pos] = key_owned;
+                    mem::swap(key, &mut new_right_keys[i - half_full_pos]);
                     new_right_keys_len += 1;
                 }
             }
