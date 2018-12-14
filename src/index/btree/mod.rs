@@ -946,19 +946,19 @@ pub mod test {
             let deletion_volume = num / 2;
             let mut deletions = (0..deletion_volume).collect_vec();
             thread_rng().shuffle(deletions.as_mut_slice());
-            for i in deletions {
-                debug!("delete: {}", i);
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
+            for (i, num) in deletions.iter().enumerate() {
+                debug!("delete: {}: {}", i, num);
+                let id = Id::new(0, *num);
+                let key_slice = u64_to_slice(*num);
                 let key = SmallVec::from_slice(&key_slice);
                 let mut entry_key = key.clone();
                 key_with_id(&mut entry_key, &id);
                 let remove_succeed = tree.remove(&entry_key);
                 if !remove_succeed {
-                    dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                    dump_tree(&tree, &format!("removing_{}_{}_dump.json", i, num));
                 }
                 // dump_tree(&tree, &format!("removing_{}_dump.json", i));
-                assert!(remove_succeed, "remove at {}", i);
+                assert!(remove_succeed, "remove at {}: {}", i, num);
             }
 
             assert_eq!(tree.len(), (num - deletion_volume) as usize);
