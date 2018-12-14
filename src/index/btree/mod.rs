@@ -343,7 +343,7 @@ impl BPlusTree {
             parent_parent_ref = pp_ref;
             parent_parent_remove_pos = parent_parent_guard.search(key);
             let parent_right_half_full = parent_right_guard.is_half_full();
-            parent_right_right_guard = if !parent_half_full || !parent_right_half_full {
+            parent_right_right_guard = if parent_parent_guard.len() > parent_parent_remove_pos + 1 && (!parent_half_full || !parent_right_half_full) {
                 // indicates whether the upper parent level need to relocated
                 parent_right_guard.right_ref().map(|r| r.write())
             } else { None };
@@ -416,10 +416,10 @@ impl BPlusTree {
                                 let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
                                 let right_right_ref = right_node.right_ref_mut().map(|r| r.clone());
                                 let left_ref = rebalancing.left_ref.clone();
-                                right_node.right_ref_mut().map(|mut r| *r = left_ref.clone());
                                 // swap the empty node with the right node. In this case left node holds
                                 // content of the right node but pointers need to be corrected.
                                 mem::swap(left_node, right_node);
+                                *right_node = NodeData::Empty(box EmptyNode { left: Some(left_ref.clone()), right: left_ref.clone() });
                                 left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
                                 left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
                                 rebalancing.right_right_guard.left_ref_mut().map(|r| *r = left_ref);
@@ -502,6 +502,7 @@ impl BPlusTree {
                     let right_guard = node.next.write();
                     let is_right_half_full = right_guard.is_half_full();
                     if !is_left_half_full || !is_right_half_full {
+                        let right_right_guard = right_guard.extnode().next.write();
                         let (parent_guard, _) = write_key_page(parent.write(), parent, key);
                         let parent_pos = parent_guard.search(key);
                         // Check if the right node is innode and its parent is the same as the left one
@@ -511,7 +512,6 @@ impl BPlusTree {
                         // by their left node remove operations.
                         if !right_guard.is_none() && parent_pos < parent_guard.len() - 1 {
                             debug_assert!(right_guard.is_ext());
-                            let right_right_guard = right_guard.extnode().next.write();
                             let rebalacing = RebalancingNodes {
                                 left_guard: NodeWriteGuard::default(),
                                 left_ref: target_ref.clone(),
