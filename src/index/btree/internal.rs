@@ -281,13 +281,13 @@ impl InNode {
                 let mut new_right_keys = EntryKeySlice::init();
                 let mut new_right_ptrs = NodePtrCellSlice::init();
 
-                let pivot_key_pos = right_ptr_pos - 1;
-                let pivot_key = self.keys[pivot_key_pos].to_owned();
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
+                let pivot_key_pos = right_ptr_pos - 1;
+                let pivot_key = self.keys[pivot_key_pos].to_owned();
                 debug_assert!(pivot_key > smallvec!(0),
-                              "Current pivot key at {} is empty, left ptr {}, right ptr {}, now keys are {:?}",
-                              pivot_key_pos, left_ptr_pos, right_ptr_pos, self.keys);
+                              "Current pivot key {:?} at {} is empty, left ptr {}, right ptr {}, now keys are {:?}",
+                              pivot_key, pivot_key_pos, left_ptr_pos, right_ptr_pos, self.keys);
                 for (i, key) in chain(
                     chain(
                         left_innode.keys[..left_innode.len].iter_mut(),
