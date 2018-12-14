@@ -388,6 +388,7 @@ impl InNode {
             "Setting key at pos {} to new key {:?}",
             right_key_pos, new_right_node_key
         );
+        debug_assert!(new_right_node_key > smallvec!(0));
         self.keys[right_key_pos] = new_right_node_key;
     }
 }
