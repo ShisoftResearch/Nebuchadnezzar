@@ -109,9 +109,15 @@ impl NodeData {
             &self.innode().keys
         }
     }
+
     pub fn first_key(&self) -> &EntryKey {
         &self.keys()[0]
     }
+
+    pub fn last_key(&self) -> &EntryKey {
+        &self.keys()[self.len() - 1]
+    }
+
     pub fn len(&self) -> usize {
         match self {
             &NodeData::Internal(ref node) => node.len,
@@ -261,45 +267,15 @@ pub fn write_key_page(
     key: &EntryKey,
 ) -> (NodeWriteGuard, NodeCellRef) {
     // return search_page;
-    if search_page.len() > 0 {
-        match &*search_page {
-            &NodeData::Internal(ref n) => {
-                if &n.keys[n.len - 1] < key {
-                    let right_ref = &n.right;
-                    debug!("Obtain latch for internal write key page");
-                    let right_node = right_ref.write();
-                    if !right_node.is_none()
-                        && right_node.len() > 0
-                        && &right_node.innode().keys[0] < key
-                    {
-                        debug_assert!(!right_node.is_ext());
-                        debug!("will write to right internal page");
-                        return write_key_page(right_node, right_ref, key);
-                    }
-                }
-            }
-            &NodeData::External(ref n) => {
-                if &n.keys[n.len - 1] < key {
-                    let right_ref = &n.next;
-                    debug!("Obtain latch for external write key page");
-                    let right_node = right_ref.write();
-                    if !right_node.is_none()
-                        && right_node.len() > 0
-                        && &right_node.extnode().keys[0] < key
-                    {
-                        debug_assert!(right_node.is_ext());
-                        debug!("will write to right external page");
-                        return write_key_page(right_node, right_ref, key);
-                    }
-                }
-            }
-            &NodeData::Empty(ref n) => return write_key_page(n.right.write(), &n.right, key),
-            _ => unreachable!(),
+    if search_page.len() > 0 && search_page.last_key() < key {
+        let right_ref = search_page.right_ref().unwrap();
+        let right_node = right_ref.write();
+        if !right_node.is_none() && right_node.len() > 0 && right_node.first_key() < key {
+            debug!("will write {:?} to right page, start with {:?}", key, right_node.first_key());
+            return write_key_page(right_node, right_ref, key);
         }
-        return (search_page, search_ref.clone());
-    } else {
-        return (search_page, search_ref.clone());
     }
+    return (search_page, search_ref.clone());
 }
 
 const LATCH_FLAG: usize = !(!0 >> 1);
