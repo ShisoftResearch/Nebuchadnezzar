@@ -184,41 +184,14 @@ impl NodeData {
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
-        // return None;
-        if self.len() > 0 {
-            match self {
-                &NodeData::Internal(ref n) => {
-                    if &n.keys[n.len - 1] < key {
-                        let right_node = n.right.read_unchecked();
-                        if !right_node.is_none() {
-                            let right_innode = right_node.innode();
-                            if right_innode.keys.len() > 0 && &right_innode.keys[0] < key {
-                                debug!(
-                                    "found key to put to right internal page {:?}/{:?}",
-                                    key, &right_innode.keys[0]
-                                );
-                                return Some(&n.right);
-                            }
-                        }
-                    }
-                }
-                &NodeData::External(ref n) => {
-                    if &n.keys[n.len - 1] < key {
-                        let right_node = n.next.read_unchecked();
-                        if !right_node.is_none() {
-                            let right_extnode = right_node.extnode();
-                            if right_extnode.keys.len() > 0 && &right_extnode.keys[0] < key {
-                                debug!(
-                                    "found key to put to right external page {:?}/{:?}",
-                                    key, &right_extnode.keys[0]
-                                );
-                                return Some(&n.next);
-                            }
-                        }
-                    }
-                }
-                &NodeData::Empty(ref n) => return Some(&n.right),
-                _ => unreachable!(),
+        if self.len() > 0 && self.last_key() < key {
+            let right_node = self.right_ref().unwrap().read_unchecked();
+            if !right_node.is_none() && right_node.len() > 0 && right_node.first_key() < key {
+                debug!(
+                    "found key to put to right page {:?}/{:?}",
+                    key, right_node.first_key()
+                );
+                return Some(self.right_ref().unwrap())
             }
         }
         return None;
@@ -266,7 +239,6 @@ pub fn write_key_page(
     search_ref: &NodeCellRef,
     key: &EntryKey,
 ) -> (NodeWriteGuard, NodeCellRef) {
-    // return search_page;
     if search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref().unwrap();
         let right_node = right_ref.write();
@@ -312,7 +284,7 @@ impl Node {
     }
 
     pub fn write(&self) -> NodeWriteGuard {
-        debug!("acquiring node write lock");
+        // debug!("acquiring node write lock");
         let cc = &self.cc;
         loop {
             let cc_num = cc.load(Relaxed);
@@ -340,7 +312,7 @@ impl Node {
         loop {
             let cc_num = cc.load(SeqCst);
             if cc_num & LATCH_FLAG == LATCH_FLAG {
-                debug!("read have a latch, retry {:b}", cc_num);
+                // debug!("read have a latch, retry {:b}", cc_num);
                 continue;
             }
             handler.version = cc_num & (!LATCH_FLAG);
@@ -349,7 +321,7 @@ impl Node {
             if new_cc_num == cc_num {
                 return res;
             }
-            debug!("read version changed, retry {:b}", cc_num);
+            // debug!("read version changed, retry {:b}", cc_num);
         }
     }
 
