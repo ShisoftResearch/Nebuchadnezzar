@@ -490,6 +490,7 @@ impl BPlusTree {
                     let pos = node.search(key);
                     let right_guard = node.next.write();
                     let is_right_half_full = right_guard.is_half_full();
+                    let is_right_none = right_guard.is_none();
                     if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
                         let right_right_guard = right_guard.extnode().next.write();
                         let (parent_guard, _) = write_key_page(parent.write(), parent, key);
@@ -513,10 +514,12 @@ impl BPlusTree {
                         }
                     }
                     if pos >= node.len {
-                        debug!(
-                            "Removing pos overflows external node, pos {}, len {}, expecting key {:?}",
-                            pos, node.len, key
-                        );
+                        if !is_right_none {
+                            panic!(
+                                "Removing pos overflows external node, pos {}, len {}, expecting key {:?}, current keys {:?}, right keys {:?}",
+                                pos, node.len, key, node.keys, node.next.read_unchecked().keys()
+                            );
+                        }
                         remove_result.removed = false;
                     }
                     if &node.keys[pos] == key {
