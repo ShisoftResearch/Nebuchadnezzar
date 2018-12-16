@@ -1141,7 +1141,7 @@ pub mod test {
             );
         });
 
-        let mut nums = (0..num).collect::<Vec<_>>();
+        let mut nums = (0..num).collect_vec();
         thread_rng().shuffle(nums.as_mut_slice());
         nums.par_iter().for_each(|i| {
             let i = *i;
@@ -1179,6 +1179,8 @@ pub mod test {
                 }
             }
         });
+
+
     }
 
     #[test]
