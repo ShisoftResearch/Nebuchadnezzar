@@ -8,6 +8,7 @@ use std::cell::UnsafeCell;
 use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
+use index::btree::node::EmptyNode;
 
 pub struct InNode {
     pub keys: EntryKeySlice,
@@ -195,7 +196,7 @@ impl InNode {
         left_node: &mut NodeData,
         right_node: &mut NodeData,
         right_node_next: &mut NodeData,
-    ) -> Result<(), TxnErr> {
+    ) {
         let left_node_ref = self.ptrs[left_ptr_pos].clone();
         let left_len = left_node.len();
         let right_len = right_node.len();
@@ -221,10 +222,11 @@ impl InNode {
                 merged_len = left_extnode.len;
             }
             if !right_node_next.is_none() {
-                right_node_next.extnode_mut().prev = left_node_ref
+                right_node_next.extnode_mut().prev = left_node_ref.clone()
             }
             left_extnode.next = right_extnode.next.clone();
         }
+        *right_node = NodeData::Empty(box EmptyNode { left: Some(left_node_ref.clone()), right: left_node_ref.clone() });
         self.remove_at(right_ptr_pos);
         debug!(
             "Removing merged node at {}, left {}, right {}, merged {}",
@@ -232,7 +234,6 @@ impl InNode {
         );
         debug!("Merged parent level keys: {:?}", self.keys);
         debug!("Merged level keys {:?}", left_node.keys());
-        Ok(())
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         debug!(

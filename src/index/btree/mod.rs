@@ -415,6 +415,7 @@ impl BPlusTree {
                                 // remove the left ptr
                                 rebalancing.parent.remove(rebalancing.parent_pos);
                                 // point the right ptr to the replaced sub node
+                                debug!("Removed sub level empty node, living node len {}, have {:?}", left_node.len(), left_node.keys());
                                 rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
                             }))
                     } else if rebalancing.right_guard.is_empty() {
