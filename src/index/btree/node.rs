@@ -249,7 +249,8 @@ pub fn write_key_page(
         let right_ref = search_page.right_ref().unwrap();
         let right_node = write_node(right_ref);
         if !right_node.is_none() && (search_page.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
-            debug!("will write {:?} to right page, start with {:?}", key, right_node.first_key());
+            debug!("Will write {:?} from left {} node to right page, start with {:?}, keys {:?}",
+                   key, search_page.type_name(), right_node.first_key(), right_node.keys());
             return write_key_page(right_node, right_ref, key);
         }
     }

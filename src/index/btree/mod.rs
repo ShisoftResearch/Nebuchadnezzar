@@ -1195,7 +1195,7 @@ pub mod test {
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
-            assert!(tree.remove(&key));
+            assert!(tree.remove(&key), "Cannot find item to remove {}, {:?}", i, &key);
         });
     }
 
