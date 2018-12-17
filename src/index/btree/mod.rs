@@ -436,8 +436,9 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        if rebalancing.left_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 || rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 {
+                        if rebalancing.left_guard.len() > NUM_KEYS  / 2 && rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 {
                             // Relocate the nodes with the same parent for balance.
+                            // For OLFIT, items can only be located from left to right.
                             debug!("Remove {:?} sub level need relocation, level {}", key, level);
                             let mut left_node = &mut*rebalancing.left_guard;
                             let mut right_node = &mut*rebalancing.right_guard;
@@ -526,8 +527,8 @@ impl BPlusTree {
                         remove_result.removed = true;
                     } else {
                         debug!(
-                            "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
-                            pos, key, &node.keys[pos]
+                            "Search check failed for remove at pos {}, expecting {:?}, actual {:?}, have {:?}",
+                            pos, key, &node.keys[pos], &node.keys
                         );
                         remove_result.removed = false;
                     }
