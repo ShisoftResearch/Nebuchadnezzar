@@ -330,6 +330,7 @@ impl BPlusTree {
             parent_parent_remove_pos = 0;
             parent_right_right_guard = None;
         } else {
+            let pre_locked_parent_right_right_guard = parent_right_guard.right_ref().map(|r| r.write());
             let (pp_guard, pp_ref) = write_key_page(parent_parent.write(), parent_parent, key);
             parent_parent_guard = pp_guard;
             parent_parent_ref = pp_ref;
@@ -337,7 +338,7 @@ impl BPlusTree {
             let parent_right_half_full = parent_right_guard.is_half_full();
             parent_right_right_guard = if parent_parent_guard.len() > parent_parent_remove_pos + 1 && (!parent_half_full || !parent_right_half_full) {
                 // indicates whether the upper parent level need to relocated
-                parent_right_guard.right_ref().map(|r| r.write())
+                pre_locked_parent_right_right_guard
             } else { None };
         }
 
