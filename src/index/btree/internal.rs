@@ -68,7 +68,7 @@ impl InNode {
         if node_len == NUM_KEYS {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
-            let parent_guard = parent.write();
+            let parent_guard = write_node(parent);
             let keys_split = {
                 debug!("insert into keys");
                 if pivot == pos {

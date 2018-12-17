@@ -70,8 +70,8 @@ impl ExtNode {
 
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        let prev_id = self.prev.read(|node| node.extnode().id);
-        let next_id = self.next.read(|node| node.extnode().id);
+        let prev_id = read_node(&self.prev, |node| node.extnode().id);
+        let next_id = read_node(&self.next, |node| node.extnode().id);
 
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
         value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
@@ -108,8 +108,8 @@ impl ExtNode {
         if self_len == NUM_KEYS {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
-            let self_next = &mut *self.next.write();
-            let parent_latch = parent.write();
+            let self_next = &mut *write_node(&self.next);
+            let parent_latch = write_node(parent);
             // cached.dump();
             let pivot = self_len / 2;
             let new_page_id = tree.new_page_id();
@@ -195,21 +195,6 @@ impl ExtNode {
     pub fn is_dirty(&self) -> bool {
         unimplemented!()
     }
-}
-
-pub fn rearrange_empty_extnode(node: &ExtNode) -> Id {
-    // TODO: adjust write latch ordering
-    let mut prev = &mut *node.prev.write();
-    let mut next = &mut *node.next.write();
-    if !prev.is_none() {
-        let mut prev_node = prev.extnode_mut();
-        prev_node.next = node.next.clone();
-    }
-    if !next.is_none() {
-        let mut next_node = next.extnode_mut();
-        next_node.prev = node.prev.clone();
-    }
-    return node.id;
 }
 
 pub fn page_schema() -> Schema {

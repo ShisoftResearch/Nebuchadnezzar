@@ -119,7 +119,7 @@ impl BPlusTree {
 
     fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
         debug!("searching for {:?}", key);
-        return node_ref.read(|node_handler| {
+        read_node(node_ref, |node_handler| {
             let node = &**node_handler;
             if let Some(right_node) = node.key_at_right_node(key) {
                 debug!("Search found a node at the right side");
@@ -150,7 +150,7 @@ impl BPlusTree {
                     }
                 }
             }
-        });
+        })
     }
 
     pub fn insert(&self, key: &EntryKey) {
@@ -189,7 +189,7 @@ impl BPlusTree {
         key: &EntryKey,
         level: usize,
     ) -> Option<NodeSplit> {
-        let mut search = node_ref.read(|node_handler| {
+        let mut search = read_node(node_ref, |node_handler| {
             debug!(
                 "insert to node, len {}, external: {}",
                 node_handler.len(),
@@ -213,7 +213,7 @@ impl BPlusTree {
             InsertSearchResult::External => {
                 // latch nodes from left to right
                 debug!("Obtain latch for external node");
-                let node_guard = node_ref.write();
+                let node_guard = write_node(node_ref);
                 let (mut searched_guard, _) = write_key_page(node_guard, node_ref, key);
                 debug_assert!(
                     searched_guard.is_ext(),
@@ -264,13 +264,13 @@ impl BPlusTree {
         };
         if level == 0 {
             if let &Some(ref split) = &modification {
-                let current_root = self.get_root().clone();
+                let current_root = self.get_root();
                 if  current_root.read_unchecked().first_key() != split.left_node_latch.first_key() &&
                     split.left_node_latch.has_vaild_right_node() {
                     // at this point, root split occurred when waiting for the latch
                     // the new right node should be inserted to any right node of the old root
                     // hopefully that node won't split again
-                    let current_root_guard = current_root.write();
+                    let current_root_guard = write_node(&current_root);
                     // at this point, the root may have split again, we need to search for the exact one
                     let (mut root_level_target, target_ref) = write_key_page(current_root_guard, &current_root, &split.pivot);
                     // assert this even in production
@@ -313,7 +313,7 @@ impl BPlusTree {
         where F: Fn(&mut RebalancingNodes)
     {
         let parent_half_full = rebalancing.parent.is_half_full();
-        let mut parent_right_guard = rebalancing.parent.innode_mut().right.write();
+        let mut parent_right_guard = write_node(&rebalancing.parent.innode_mut().right);
         let mut parent_remove_result = RemoveResult {
             rebalancing: None,
             removed,
@@ -325,13 +325,13 @@ impl BPlusTree {
         let parent_parent_remove_pos;
         let parent_right_right_guard;
         if level == 0 {
-            parent_parent_guard = parent_parent.write();
+            parent_parent_guard = write_node(parent_parent);
             parent_parent_ref = parent_parent.clone();
             parent_parent_remove_pos = 0;
             parent_right_right_guard = None;
         } else {
-            let pre_locked_parent_right_right_guard = parent_right_guard.right_ref().map(|r| r.write());
-            let (pp_guard, pp_ref) = write_key_page(parent_parent.write(), parent_parent, key);
+            let pre_locked_parent_right_right_guard = parent_right_guard.right_ref().map(|r| write_node(r));
+            let (pp_guard, pp_ref) = write_key_page(write_node(parent_parent), parent_parent, key);
             parent_parent_guard = pp_guard;
             parent_parent_ref = pp_ref;
             parent_parent_remove_pos = parent_parent_guard.search(key);
@@ -367,7 +367,7 @@ impl BPlusTree {
         level: usize) -> RemoveResult
     {
         debug!("Removing {:?} from node, level {}", key, level);
-        let mut search = node_ref.read(|node| {
+        let mut search = read_node(node_ref, |node| {
             match &**node {
                 &NodeData::Internal(ref n) => {
                     let pos = n.search(key);
@@ -437,7 +437,7 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        if rebalancing.left_guard.len() > NUM_KEYS  / 2 && rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 {
+                        if rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 && rebalancing.right_guard.len() < rebalancing.left_guard.len() {
                             // Relocate the nodes with the same parent for balance.
                             // For OLFIT, items can only be located from left to right.
                             debug!("Remove {:?} sub level need relocation, level {}", key, level);
@@ -480,7 +480,7 @@ impl BPlusTree {
                 })
             }
             RemoveSearchResult::External => {
-                let node_guard = node_ref.write();
+                let node_guard = write_node(node_ref);
                 let (mut target_guard, target_ref) = write_key_page(node_guard, node_ref, key);
                 let mut remove_result = RemoveResult {
                     rebalancing: None,
@@ -491,24 +491,25 @@ impl BPlusTree {
                     let is_left_half_full = target_guard.is_half_full();
                     let mut node = target_guard.extnode_mut();
                     let pos = node.search(key);
-                    let right_guard = node.next.write();
+                    let right_guard = write_node(&node.next);
                     let is_right_half_full = right_guard.is_half_full();
                     let is_right_none = right_guard.is_none();
                     if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
-                        let right_right_guard = right_guard.extnode().next.write();
-                        let (parent_guard, _) = write_key_page(parent.write(), parent, key);
-                        let parent_pos = parent_guard.search(key);
+                        let right_right_guard = write_node(&right_guard.extnode().next);
+                        let parent_guard = write_node(parent);
+                        let (parent_target_guard, _) = write_key_page(parent_guard, parent, key);
+                        let parent_pos = parent_target_guard.search(key);
                         // Check if the right node is innode and its parent is the same as the left one
                         // because we have to lock from left to right, there is no way to lock backwards
                         // if the empty non half-full node is at the right most of its parent
                         // So left over imbalanced such nodes will be expected and they can be eliminate
                         // by their left node remove operations.
-                        if parent_pos < parent_guard.len() - 1 {
+                        if parent_pos < parent_target_guard.len() - 1 {
                             debug_assert!(right_guard.is_ext());
                             let rebalacing = RebalancingNodes {
                                 left_guard: NodeWriteGuard::default(),
                                 left_ref: target_ref.clone(),
-                                parent: parent_guard,
+                                parent: parent_target_guard,
                                 parent_pos,
                                 right_right_guard,
                                 right_guard
@@ -552,7 +553,7 @@ impl BPlusTree {
     }
 
     fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
-        let cell = value.read(|node| {
+        let cell = read_node(value, |node| {
             let extnode = node.extnode();
             if extnode.is_dirty() {
                 Some(extnode.to_cell())
@@ -1226,7 +1227,7 @@ pub mod test {
         nums.par_iter().for_each(|num| {
             let key_slice = u64_to_slice(*num);
             let mut key = SmallVec::from_slice(&key_slice);
-            let mut guard = node.write();
+            let mut guard = write_node(&node);
             let mut ext_node = guard.extnode_mut();
             ext_node.insert(&key, &tree, &node, &dummy_node);
         });

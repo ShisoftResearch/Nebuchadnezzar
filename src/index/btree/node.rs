@@ -247,7 +247,7 @@ pub fn write_key_page(
 ) -> (NodeWriteGuard, NodeCellRef) {
     if search_page.is_empty_node() || search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref().unwrap();
-        let right_node = right_ref.write();
+        let right_node = write_node(right_ref);
         if !right_node.is_none() && (search_page.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
             debug!("will write {:?} to right page, start with {:?}", key, right_node.first_key());
             return write_key_page(right_node, right_ref, key);
@@ -289,48 +289,6 @@ impl Node {
         Self::external(ExtNode::new(id))
     }
 
-    pub fn write(&self) -> NodeWriteGuard {
-        // debug!("acquiring node write lock");
-        let cc = &self.cc;
-        loop {
-            let cc_num = cc.load(Relaxed);
-            let expected = cc_num & (!LATCH_FLAG);
-            debug_assert_eq!(expected & LATCH_FLAG, 0);
-            match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
-                Ok(num) if num == expected => {
-                    return NodeWriteGuard {
-                        data: self.data.get(),
-                        cc: &self.cc as *const AtomicUsize,
-                        version: node_version(cc_num),
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    pub fn read<'a, F: FnMut(&NodeReadHandler) -> R + 'a, R: 'a>(&'a self, mut func: F) -> R {
-        let mut handler = NodeReadHandler {
-            ptr: self.data.get(),
-            version: 0,
-        };
-        let cc = &self.cc;
-        loop {
-            let cc_num = cc.load(SeqCst);
-            if cc_num & LATCH_FLAG == LATCH_FLAG {
-                // debug!("read have a latch, retry {:b}", cc_num);
-                continue;
-            }
-            handler.version = cc_num & (!LATCH_FLAG);
-            let res = func(&handler);
-            let new_cc_num = cc.load(SeqCst);
-            if new_cc_num == cc_num {
-                return res;
-            }
-            // debug!("read version changed, retry {:b}", cc_num);
-        }
-    }
-
     pub fn read_unchecked(&self) -> &NodeData {
         unsafe { &*self.data.get() }
     }
@@ -344,10 +302,55 @@ pub fn node_version(cc_num: usize) -> usize {
     cc_num & (!LATCH_FLAG)
 }
 
+pub fn write_node(node: &NodeCellRef) -> NodeWriteGuard {
+    // debug!("acquiring node write lock");
+    let cc = &node.cc;
+    loop {
+        let cc_num = cc.load(Relaxed);
+        let expected = cc_num & (!LATCH_FLAG);
+        debug_assert_eq!(expected & LATCH_FLAG, 0);
+        match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
+            Ok(num) if num == expected => {
+                return NodeWriteGuard {
+                    data: node.data.get(),
+                    cc: &node.cc as *const AtomicUsize,
+                    version: node_version(cc_num),
+                    node_ref: node.clone()
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn read_node<'a, F: FnMut(&NodeReadHandler) -> R + 'a, R: 'a>(node: &NodeCellRef, mut func: F) -> R {
+    let mut handler = NodeReadHandler {
+        ptr: node.data.get(),
+        version: 0,
+        node_ref: node.clone()
+    };
+    let cc = &node.cc;
+    loop {
+        let cc_num = cc.load(SeqCst);
+        if cc_num & LATCH_FLAG == LATCH_FLAG {
+            // debug!("read have a latch, retry {:b}", cc_num);
+            continue;
+        }
+        handler.version = cc_num & (!LATCH_FLAG);
+        let res = func(&handler);
+        let new_cc_num = cc.load(SeqCst);
+        if new_cc_num == cc_num {
+            return res;
+        }
+        // debug!("read version changed, retry {:b}", cc_num);
+    }
+}
+
 pub struct NodeWriteGuard {
     pub data: *mut NodeData,
     pub cc: *const AtomicUsize,
     pub version: usize,
+    node_ref: NodeCellRef
 }
 
 impl Deref for NodeWriteGuard {
@@ -384,6 +387,7 @@ impl Default for NodeWriteGuard {
             data: 0 as *mut NodeData,
             cc: 0 as *const AtomicUsize,
             version: 0,
+            node_ref: Node::none_ref()
         }
     }
 }
@@ -393,6 +397,7 @@ unsafe impl Sync for Node {}
 pub struct NodeReadHandler {
     pub ptr: *const NodeData,
     pub version: usize,
+    node_ref: NodeCellRef,
 }
 
 impl Deref for NodeReadHandler {

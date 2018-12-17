@@ -19,7 +19,7 @@ impl RTCursor {
         };
         match ordering {
             Ordering::Forward => {
-                let len = page.read(|node| node.len());
+                let len = read_node(page, |node| node.len());
                 if pos >= len {
                     cursor.next();
                 }
@@ -37,7 +37,7 @@ impl IndexCursor for RTCursor {
     fn next(&mut self) -> bool {
         if self.page.is_some() {
             let current_page = self.page.clone().unwrap();
-            current_page.read(|page| {
+            read_node(&current_page, |page| {
                 let ext_page = page.extnode();
                 // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                 match self.ordering {
@@ -60,7 +60,7 @@ impl IndexCursor for RTCursor {
                         }
                         if self.index + 1 >= page.len() {
                             // next page
-                            return ext_page.next.read(|next_page| {
+                            return read_node(&ext_page.next, |next_page| {
                                 if !next_page.is_none() {
                                     // debug!("Shifting page forward, next page len: {}", next_page.len());
                                     self.index = 0;
@@ -95,7 +95,7 @@ impl IndexCursor for RTCursor {
                         }
                         if self.index == 0 {
                             // next page
-                            return ext_page.prev.read(|prev_page| {
+                            return read_node(&ext_page.prev, |prev_page| {
                                 if !prev_page.is_none() {
                                     debug!("Shifting page backward");
                                     self.page = Some(ext_page.prev.clone());
@@ -122,7 +122,7 @@ impl IndexCursor for RTCursor {
 
     fn current(&self) -> Option<&EntryKey> {
         if let &Some(ref page_ref) = &self.page {
-            page_ref.read(|handler| {
+            read_node(page_ref, |handler| {
                 let page = unsafe { &*handler.ptr };
                 if self.index >= page.len() {
                     panic!("cursor position overflowed {}/{}", self.index, page.len())
