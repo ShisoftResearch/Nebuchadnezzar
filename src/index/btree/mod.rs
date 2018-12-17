@@ -515,12 +515,10 @@ impl BPlusTree {
                         }
                     }
                     if pos >= node.len {
-                        if !is_right_none {
-                            panic!(
-                                "Removing pos overflows external node, pos {}, len {}, expecting key {:?}, current keys {:?}, right keys {:?}",
-                                pos, node.len, key, node.keys, node.next.read_unchecked().keys()
-                            );
-                        }
+                        debug!(
+                            "Removing pos overflows external node, pos {}, len {}, expecting key {:?}, current keys {:?}, right keys {:?}",
+                            pos, node.len, key, node.keys, node.next.read_unchecked().keys()
+                        );
                         remove_result.removed = false;
                     }
                     if &node.keys[pos] == key {
@@ -531,7 +529,7 @@ impl BPlusTree {
                             "Search check failed for remove at pos {}, expecting {:?}, actual {:?}",
                             pos, key, &node.keys[pos]
                         );
-                        remove_result.removed = false;;
+                        remove_result.removed = false;
                     }
                     remove_result.empty = node.len == 0;
                 }

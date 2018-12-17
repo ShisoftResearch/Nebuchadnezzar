@@ -192,7 +192,7 @@ impl NodeData {
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
         if self.is_empty_node() || self.len() > 0 && self.last_key() < key {
             let right_node = self.right_ref().unwrap().read_unchecked();
-            if !right_node.is_none() && (right_node.is_empty_node() || right_node.len() > 0 && right_node.first_key() < key) {
+            if !right_node.is_none() && (self.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
                 debug!(
                     "found key to put to right page {:?}/{:?}",
                     key, right_node.first_key()
@@ -248,7 +248,7 @@ pub fn write_key_page(
     if search_page.is_empty_node() || search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref().unwrap();
         let right_node = right_ref.write();
-        if !right_node.is_none() && (search_page.is_empty_node() || right_node.len() > 0 && right_node.first_key() < key) {
+        if !right_node.is_none() && (search_page.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
             debug!("will write {:?} to right page, start with {:?}", key, right_node.first_key());
             return write_key_page(right_node, right_ref, key);
         }
