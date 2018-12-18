@@ -252,7 +252,7 @@ pub fn write_key_page(
             debug!("Will write {:?} from left {} node to right page, start with {:?}, keys {:?}",
                    key, search_page.type_name(),
                    if right_node.is_empty_node() { smallvec!(0) } else { right_node.first_key().clone() },
-                   right_node.keys());
+                   if right_node.is_empty_node() { &[] } else { right_node.keys() });
             return write_key_page(right_node, right_ref, key);
         }
     }
