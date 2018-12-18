@@ -245,7 +245,7 @@ pub fn write_key_page(
     search_page: NodeWriteGuard,
     search_ref: &NodeCellRef,
     key: &EntryKey,
-) -> (NodeWriteGuard, NodeCellRef) {
+) -> NodeWriteGuard {
     if search_page.is_empty_node() || search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref().unwrap();
         let right_node = write_node(right_ref);
@@ -257,7 +257,7 @@ pub fn write_key_page(
             return write_key_page(right_node, right_ref, key);
         }
     }
-    return (search_page, search_ref.clone());
+    return search_page;
 }
 
 const LATCH_FLAG: usize = !(!0 >> 1);
@@ -393,6 +393,12 @@ impl Default for NodeWriteGuard {
             version: 0,
             node_ref: Node::none_ref()
         }
+    }
+}
+
+impl NodeWriteGuard {
+    pub fn node_ref(&self) -> &NodeCellRef {
+        &self.node_ref
     }
 }
 
