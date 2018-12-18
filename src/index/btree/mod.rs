@@ -399,7 +399,7 @@ impl BPlusTree {
                                 // Because we cannot lock from left to right, we have to move the content
                                 // of the right node to the left and remove the right node instead so the
                                 // left right pointers can be modified
-                                if !rebalancing.left_guard.is_empty() || self.root.read().read_unchecked().first_key() != rebalancing.left_guard.first_key() {
+                                if !rebalancing.left_guard.is_empty() || (level == 0 && self.root.read().read_unchecked().first_key() != rebalancing.left_guard.first_key()) {
                                     return;
                                 }
 
