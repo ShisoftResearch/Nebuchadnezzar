@@ -467,6 +467,7 @@ impl BPlusTree {
                                 let mut right_node_next = &mut *rebalancing.right_right_guard;
                                 let left_pos = rebalancing.parent_pos;
                                 let right_pos = left_pos + 1;
+                                if left_node.is_empty() || right_node.is_empty() { return; }
                                 rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
                             }))
                         // None
@@ -529,6 +530,7 @@ impl BPlusTree {
                         remove_result.removed = false;
                     }
                     if &node.keys[pos] == key {
+                        debug!("Removing key {:?} at {}, keys {:?}", key, pos, &node.keys);
                         node.remove_at(pos);
                         remove_result.removed = true;
                     } else {

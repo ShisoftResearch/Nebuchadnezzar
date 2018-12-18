@@ -47,8 +47,8 @@ impl InNode {
         let mut n_ptr_len = n_key_len + 1;
         let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
         debug!(
-            "Removing from internal node pos {}, len {}",
-            key_pos, n_key_len
+            "Removing from internal node pos {}, len {}, key {:?}",
+            key_pos, n_key_len, &self.keys[key_pos]
         );
         self.keys.remove_at(key_pos, &mut n_key_len);
         self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);

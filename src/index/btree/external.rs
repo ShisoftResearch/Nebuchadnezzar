@@ -89,7 +89,8 @@ impl ExtNode {
     }
     pub fn remove_at(&mut self, pos: usize) {
         let mut cached_len = self.len;
-        debug!("Removing from external pos {}, len {}", pos, cached_len);
+        debug!("Removing from external pos {}, len {}, key {:?}",
+               pos, cached_len, self.keys[pos]);
         self.keys.remove_at(pos, &mut cached_len);
         self.len = cached_len;
     }
@@ -175,8 +176,8 @@ impl ExtNode {
     }
     pub fn merge_with(&mut self, right: &mut Self) {
         debug!(
-            "Merge external node, left len {}, right len {}",
-            self.len, right.len
+            "Merge external node, left len {}:{:?}, right len {}:{:?}",
+            self.len, self.keys, right.len, right.keys
         );
         let self_len = self.len;
         let new_len = self.len + right.len;
