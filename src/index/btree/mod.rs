@@ -399,6 +399,10 @@ impl BPlusTree {
                                 // Because we cannot lock from left to right, we have to move the content
                                 // of the right node to the left and remove the right node instead so the
                                 // left right pointers can be modified
+                                if !rebalancing.left_guard.is_empty() || self.root.read().read_unchecked().first_key() != rebalancing.left_guard.first_key() {
+                                    return;
+                                }
+
                                 let mut left_node = &mut*rebalancing.left_guard;
                                 let mut right_node = &mut*rebalancing.right_guard;
                                 // swap the content of left and right, then delete right
@@ -437,36 +441,36 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-//                        if rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 && rebalancing.right_guard.len() < rebalancing.left_guard.len() {
-//                            // Relocate the nodes with the same parent for balance.
-//                            // For OLFIT, items can only be located from left to right.
-//                            debug!("Remove {:?} sub level need relocation, level {}", key, level);
-//                            let mut left_node = &mut*rebalancing.left_guard;
-//                            let mut right_node = &mut*rebalancing.right_guard;
-//                            let left_pos = rebalancing.parent_pos;
-//                            let right_pos = left_pos + 1;
-//                            rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
-//                        }
+                        if rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 && rebalancing.right_guard.len() < rebalancing.left_guard.len() {
+                            // Relocate the nodes with the same parent for balance.
+                            // For OLFIT, items can only be located from left to right.
+                            debug!("Remove {:?} sub level need relocation, level {}", key, level);
+                            let mut left_node = &mut*rebalancing.left_guard;
+                            let mut right_node = &mut*rebalancing.right_guard;
+                            let left_pos = rebalancing.parent_pos;
+                            let right_pos = left_pos + 1;
+                            rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+                        }
                         None
                     } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1 <= NUM_KEYS {
                         // Nodes with the same parent can merge
-//                        debug!("Remove {:?} sub level need to be merged, level {}", key, level);
-//                        Some(self.with_innode_removing(
-//                            key,
-//                            rebalancing,
-//                            &sub_node,
-//                            parent,
-//                            removed,
-//                            level,
-//                            |rebalancing| {
-//                                let mut left_node = &mut *rebalancing.left_guard;
-//                                let mut right_node = &mut *rebalancing.right_guard;
-//                                let mut right_node_next = &mut *rebalancing.right_right_guard;
-//                                let left_pos = rebalancing.parent_pos;
-//                                let right_pos = left_pos + 1;
-//                                rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
-//                            }))
-                        None
+                        debug!("Remove {:?} sub level need to be merged, level {}", key, level);
+                        Some(self.with_innode_removing(
+                            key,
+                            rebalancing,
+                            &sub_node,
+                            parent,
+                            removed,
+                            level,
+                            |rebalancing| {
+                                let mut left_node = &mut *rebalancing.left_guard;
+                                let mut right_node = &mut *rebalancing.right_guard;
+                                let mut right_node_next = &mut *rebalancing.right_right_guard;
+                                let left_pos = rebalancing.parent_pos;
+                                let right_pos = left_pos + 1;
+                                rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
+                            }))
+                        // None
                     } else {
                         None
                     }
