@@ -438,7 +438,7 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        if  rebalancing.right_guard.len() < NUM_KEYS / 2 &&
+                        if  rebalancing.right_guard.len() < NUM_KEYS / 3 &&
                             rebalancing.right_guard.len() < rebalancing.left_guard.len() &&
                             rebalancing.left_guard.len() > NUM_KEYS / 2 {
                             // Relocate the nodes with the same parent for balance.
@@ -499,7 +499,6 @@ impl BPlusTree {
                     let right_guard = write_node(&node.next);
                     let is_right_half_full = right_guard.is_half_full();
                     let is_right_none = right_guard.is_none();
-                    debug_assert!(right_guard.is_ext());
                     if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
                         let right_right_guard = write_node(&right_guard.extnode().next);
                         let parent_guard = write_node(parent);
