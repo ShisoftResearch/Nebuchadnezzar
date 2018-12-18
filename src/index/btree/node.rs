@@ -195,7 +195,8 @@ impl NodeData {
             if !right_node.is_none() && (self.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
                 debug!(
                     "found key to put to right page {:?}/{:?}",
-                    key, right_node.first_key()
+                    key,
+                    if right_node.is_empty() { smallvec!(0) } else { right_node.first_key().clone() }
                 );
                 return Some(self.right_ref().unwrap())
             }
