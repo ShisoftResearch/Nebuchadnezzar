@@ -214,7 +214,7 @@ impl BPlusTree {
                 // latch nodes from left to right
                 debug!("Obtain latch for external node");
                 let node_guard = write_node(node_ref);
-                let mut searched_guard = write_key_page(node_guard, node_ref, key);
+                let mut searched_guard = write_key_page(node_guard, key);
                 debug_assert!(
                     searched_guard.is_ext(),
                     "{:?}",
@@ -245,7 +245,7 @@ impl BPlusTree {
                         debug!("New pivot {:?}", pivot);
                         debug!("obtain latch for internal node split");
                         let mut self_guard = split.parent_latch;
-                        let mut target_guard = write_key_page(self_guard, node_ref, &pivot);
+                        let mut target_guard = write_key_page(self_guard, &pivot);
                         debug_assert!(
                             split.new_right_node.read_unchecked().first_key() >= &pivot
                         );
@@ -272,7 +272,7 @@ impl BPlusTree {
                     // hopefully that node won't split again
                     let current_root_guard = write_node(&current_root);
                     // at this point, the root may have split again, we need to search for the exact one
-                    let mut root_level_target = write_key_page(current_root_guard, &current_root, &split.pivot);
+                    let mut root_level_target = write_key_page(current_root_guard, &split.pivot);
                     // assert this even in production
                     assert!(!root_level_target.is_ext());
                     return root_level_target.innode_mut().insert(split.pivot.clone(), split.new_right_node.clone(), parent);
@@ -329,7 +329,7 @@ impl BPlusTree {
             parent_parent_remove_pos = 0;
         } else {
             let pre_locked_parent_right_right_guard = parent_right_guard.right_ref().map(|r| write_node(r));
-            let pp_guard = write_key_page(write_node(parent_parent), parent_parent, key);
+            let pp_guard = write_key_page(write_node(parent_parent), key);
             parent_parent_guard = pp_guard;
             parent_parent_remove_pos = parent_parent_guard.search(key);
             let parent_right_half_full = parent_right_guard.is_half_full();
@@ -486,7 +486,7 @@ impl BPlusTree {
             }
             RemoveSearchResult::External => {
                 let node_guard = write_node(node_ref);
-                let mut target_guard = write_key_page(node_guard, node_ref, key);
+                let mut target_guard = write_key_page(node_guard, key);
                 let target_guard_ref = target_guard.node_ref().clone();
                 let mut remove_result = RemoveResult {
                     rebalancing: None,
@@ -503,7 +503,7 @@ impl BPlusTree {
                     if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
                         let right_right_guard = write_node(&right_guard.extnode().next);
                         let parent_guard = write_node(parent);
-                        let parent_target_guard = write_key_page(parent_guard, parent, key);
+                        let parent_target_guard = write_key_page(parent_guard, key);
                         let parent_pos = parent_target_guard.search(key);
                         // Check if the right node is innode and its parent is the same as the left one
                         // because we have to lock from left to right, there is no way to lock backwards

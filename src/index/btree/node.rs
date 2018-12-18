@@ -190,9 +190,9 @@ impl NodeData {
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
-        if self.is_empty_node() || self.len() > 0 && self.last_key() < key {
+        if self.is_empty() || self.len() > 0 && self.last_key() < key {
             let right_node = self.right_ref().unwrap().read_unchecked();
-            if !right_node.is_none() && (self.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
+            if !right_node.is_none() && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key) {
                 debug!(
                     "found key to put to right page {:?}/{:?}",
                     key,
@@ -241,20 +241,26 @@ impl NodeData {
     }
 }
 
+pub fn write_non_empty(search_page: NodeWriteGuard) -> NodeWriteGuard {
+    if !search_page.is_none() && search_page.is_empty() {
+        return write_non_empty(write_node(search_page.right_ref().unwrap()))
+    }
+    return search_page;
+}
+
 pub fn write_key_page(
     search_page: NodeWriteGuard,
-    search_ref: &NodeCellRef,
     key: &EntryKey,
 ) -> NodeWriteGuard {
-    if search_page.is_empty_node() || search_page.len() > 0 && search_page.last_key() < key {
+    if search_page.is_empty() || search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref().unwrap();
-        let right_node = write_node(right_ref);
-        if !right_node.is_none() && (search_page.is_empty_node() || right_node.len() > 0 && right_node.first_key() <= key) {
+        let right_node = write_non_empty(write_node(right_ref));
+        if !right_node.is_none() && (search_page.is_empty() || right_node.len() > 0 && right_node.first_key() <= key) {
             debug!("Will write {:?} from left {} node to right page, start with {:?}, keys {:?}",
                    key, search_page.type_name(),
-                   if right_node.is_empty_node() { smallvec!(0) } else { right_node.first_key().clone() },
-                   if right_node.is_empty_node() { &[] } else { right_node.keys() });
-            return write_key_page(right_node, right_ref, key);
+                   if right_node.is_empty() { smallvec!(0) } else { right_node.first_key().clone() },
+                   if right_node.is_empty() { &[] } else { right_node.keys() });
+            return write_key_page(right_node, key);
         }
     }
     return search_page;
