@@ -441,16 +441,16 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        if rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 && rebalancing.right_guard.len() < rebalancing.left_guard.len() {
-                            // Relocate the nodes with the same parent for balance.
-                            // For OLFIT, items can only be located from left to right.
-                            debug!("Remove {:?} sub level need relocation, level {}", key, level);
-                            let mut left_node = &mut*rebalancing.left_guard;
-                            let mut right_node = &mut*rebalancing.right_guard;
-                            let left_pos = rebalancing.parent_pos;
-                            let right_pos = left_pos + 1;
-                            rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
-                        }
+//                        if rebalancing.right_guard.len() as f32 <= NUM_KEYS as f32 / 1.5 && rebalancing.right_guard.len() < rebalancing.left_guard.len() {
+//                            // Relocate the nodes with the same parent for balance.
+//                            // For OLFIT, items can only be located from left to right.
+//                            debug!("Remove {:?} sub level need relocation, level {}", key, level);
+//                            let mut left_node = &mut*rebalancing.left_guard;
+//                            let mut right_node = &mut*rebalancing.right_guard;
+//                            let left_pos = rebalancing.parent_pos;
+//                            let right_pos = left_pos + 1;
+//                            rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
+//                        }
                         None
                     } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1 <= NUM_KEYS {
                         // Nodes with the same parent can merge
