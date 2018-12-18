@@ -499,8 +499,8 @@ impl BPlusTree {
                     let pos = node.search(key);
                     let right_guard = write_node(&node.next);
                     let is_right_half_full = right_guard.is_half_full();
-                    let is_right_none = right_guard.is_none();
-                    if !right_guard.is_none() && (!is_left_half_full || !is_right_half_full) {
+                    let right_node_cannot_rebalance = right_guard.is_none() || !right_guard.is_empty_node();
+                    if !right_node_cannot_rebalance && (!is_left_half_full || !is_right_half_full) {
                         let right_right_guard = write_node(&right_guard.extnode().next);
                         let parent_guard = write_node(parent);
                         let parent_target_guard = write_key_page(parent_guard, key);
