@@ -172,7 +172,8 @@ impl NodeData {
         match self {
             &NodeData::External(ref node) => node.id,
             &NodeData::None => Id::unit_id(),
-            &NodeData::Internal(_) | &NodeData::Empty(_) => unreachable!(self.type_name()),
+            &NodeData::Empty(_) => Id::unit_id(),
+            &NodeData::Internal(_) => unreachable!(self.type_name()),
         }
     }
     pub fn innode(&self) -> &InNode {
