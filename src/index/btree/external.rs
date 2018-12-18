@@ -88,11 +88,10 @@ impl ExtNode {
             .unwrap_or_else(|i| i)
     }
     pub fn remove_at(&mut self, pos: usize) {
-        let mut cached_len = self.len;
+        let mut cached_len = &mut self.len;
         debug!("Removing from external pos {}, len {}, key {:?}",
                pos, cached_len, self.keys[pos]);
-        self.keys.remove_at(pos, &mut cached_len);
-        self.len = cached_len;
+        self.keys.remove_at(pos, cached_len);
     }
     pub fn insert(
         &mut self,

@@ -43,16 +43,15 @@ impl InNode {
             .unwrap_or_else(|i| i)
     }
     pub fn remove_at(&mut self, ptr_pos: usize) {
-        let mut n_key_len = self.len;
-        let mut n_ptr_len = n_key_len + 1;
         let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
+        let mut n_key_len = &mut self.len;
+        let mut n_ptr_len = *n_key_len + 1;
         debug!(
             "Removing from internal node pos {}, len {}, key {:?}",
             key_pos, n_key_len, &self.keys[key_pos]
         );
-        self.keys.remove_at(key_pos, &mut n_key_len);
+        self.keys.remove_at(key_pos, n_key_len);
         self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
-        self.len = n_key_len;
     }
     pub fn insert(
         &mut self,

@@ -622,12 +622,14 @@ where
     fn remove_at(&mut self, pos: usize, len: &mut usize) {
         debug!("remove at {} len {}", pos, len);
         debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
-        if pos < *len - 1 {
-            let slice = self.as_slice();
-            for i in pos..*len - 1 {
+        let slice = self.as_slice();
+        let bound = *len - 1;
+        if pos < bound {
+            for i in pos..bound {
                 slice.swap(i, i + 1);
             }
         }
+        slice[bound] = T::default();
         *len -= 1;
     }
 }
