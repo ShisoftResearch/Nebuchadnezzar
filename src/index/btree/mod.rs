@@ -590,14 +590,17 @@ impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
 macro_rules! impl_btree_level {
     ($items: expr) => {
-        impl_slice_ops!([EntryKey; $expr], EntryKey, $expr);
-        impl_slice_ops!([NodeCellRef; $expr + 1], NodeCellRef, $expr + 1);
+        impl_slice_ops!([EntryKey; $items], EntryKey, $items);
+        impl_slice_ops!([NodeCellRef; $items + 1], NodeCellRef, $items + 1);
     };
 }
 
 pub struct NodeCellRef {
     inner: Arc<Any>
 }
+
+unsafe impl Send for NodeCellRef {}
+unsafe impl Sync for NodeCellRef {}
 
 impl NodeCellRef {
     pub fn new<KS, PS>(node: Node<KS, PS>) -> Self
@@ -651,7 +654,6 @@ pub mod test {
     use index::btree::node::*;
     use index::btree::NodeCellRef;
     use index::btree::NodeData;
-    use index::btree::NUM_KEYS;
     use index::Cursor;
     use index::EntryKey;
     use index::{id_from_key, key_with_id};
@@ -687,7 +689,13 @@ pub mod test {
         is_external: bool,
     }
 
-    pub fn dump_tree(tree: &BPlusTree, f: &str) {
+    const PAGE_SIZE: usize = 24;
+    impl_btree_level!(PAGE_SIZE);
+    type KeySlice = [EntryKey; PAGE_SIZE];
+    type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
+    type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
+
+    pub fn dump_tree(tree: &LevelBPlusTree, f: &str) {
         debug!("dumping {}", f);
         let debug_root = cascading_dump_node(&tree.get_root());
         let json = serde_json::to_string_pretty(&debug_root).unwrap();
@@ -697,10 +705,12 @@ pub mod test {
 
     fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
         unsafe {
-            match &*node.read_unchecked() {
+            match &*node.deref().read_unchecked() {
                 &NodeData::External(ref node) => {
+                    let node: &ExtNode<KeySlice, PtrSlice> = node;
                     let keys = node
                         .keys
+                        .as_slice_immute()
                         .iter()
                         .take(node.len)
                         .map(|key| {
@@ -712,8 +722,8 @@ pub mod test {
                         keys,
                         nodes: vec![],
                         id: Some(format!("{:?}", node.id)),
-                        next: Some(format!("{:?}", node.next.read_unchecked().ext_id())),
-                        prev: Some(format!("{:?}", node.prev.read_unchecked().ext_id())),
+                        next: Some(format!("{:?}", node.next.deref::<KeySlice, PtrSlice>().read_unchecked().ext_id())),
+                        prev: Some(format!("{:?}", node.prev.deref::<KeySlice, PtrSlice>().read_unchecked().ext_id())),
                         len: node.len,
                         is_external: true,
                     };
@@ -771,7 +781,7 @@ pub mod test {
     #[test]
     fn node_size() {
         // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
-        assert_eq!(size_of::<Node>(), size_of::<usize>() * 3);
+        assert_eq!(size_of::<Node<KeySlice, PtrSlice>>(), size_of::<usize>() * 3);
     }
 
     #[test]
@@ -793,7 +803,7 @@ pub mod test {
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
         client.new_schema_with_id(super::external::page_schema());
-        let tree = BPlusTree::new(&client);
+        let tree = LevelBPlusTree::new(&client);
         let id = Id::unit_id();
         let key = smallvec![1, 2, 3, 4, 5, 6];
         info!("test insertion");
@@ -813,7 +823,7 @@ pub mod test {
         key_slice
     }
 
-    fn check_ordering(tree: &BPlusTree, key: &EntryKey) {
+    fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
         let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
         let mut last_key = cursor.current().unwrap().clone();
         while cursor.next() {
@@ -852,7 +862,7 @@ pub mod test {
             .new_schema_with_id(super::external::page_schema())
             .wait()
             .unwrap();
-        let tree = BPlusTree::new(&client);
+        let tree = LevelBPlusTree::new(&client);
         ::std::fs::remove_dir_all("dumps");
         ::std::fs::create_dir_all("dumps");
         let num = env::var("BTREE_TEST_ITEMS")
@@ -1078,7 +1088,7 @@ pub mod test {
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
         client.new_schema_with_id(super::page_schema()).wait();
-        let tree = BPlusTree::new(&client);
+        let tree = LevelBPlusTree::new(&client);
         let num = env::var("BTREE_TEST_ITEMS")
             // this value cannot do anything useful to the test
             // must arrange a long-term test to cover every levels
@@ -1138,7 +1148,7 @@ pub mod test {
             client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
         );
         client.new_schema_with_id(super::page_schema()).wait();
-        let tree = Arc::new(BPlusTree::new(&client));
+        let tree = Arc::new(LevelBPlusTree::new(&client));
         let num = env::var("BTREE_TEST_ITEMS")
             // this value cannot do anything useful to the test
             // must arrange a long-term test to cover every levels
@@ -1215,26 +1225,28 @@ pub mod test {
         );
         let client =
             Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-        let tree = BPlusTree::new(&client);
-        let node = Arc::new(Node::new(NodeData::External(box ExtNode::new(Id::new(
+        let tree = LevelBPlusTree::new(&client);
+        let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(
             1, 2,
-        )))));
+        ));
+        let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(box inner_ext_node)));
         let num = 100000;
         let mut nums = (0..num).collect_vec();
-        let dummy_node = NodeCellRef::new(Node::none());
+        let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::none();
+        let dummy_node = NodeCellRef::new(inner_dummy_node);
         thread_rng().shuffle(nums.as_mut_slice());
         nums.par_iter().for_each(|num| {
             let key_slice = u64_to_slice(*num);
             let mut key = SmallVec::from_slice(&key_slice);
-            let mut guard = write_node(&node);
+            let mut guard = write_node::<KeySlice, PtrSlice>(&node);
             let mut ext_node = guard.extnode_mut();
             ext_node.insert(&key, &tree, &node, &dummy_node);
         });
-        let read = node.read_unchecked();
+        let read: &NodeData<KeySlice, PtrSlice> = node.deref().read_unchecked();
         let extnode = read.extnode();
         for i in 0..read.len() - 1 {
             assert!(extnode.keys[i] < extnode.keys[i + 1]);
         }
-        assert_eq!(node.version(), num as usize);
+        assert_eq!(node.deref::<KeySlice, PtrSlice>().version(), num as usize);
     }
 }
