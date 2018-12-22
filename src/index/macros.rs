@@ -12,14 +12,15 @@ macro_rules! make_array {
 
 macro_rules! impl_slice_ops {
     ($t: ty, $et: ty, $n: expr) => {
-        impl Slice for $t {
-            type Item = $et;
-
+        impl Slice<$et> for $t {
             fn as_slice(&mut self) -> &mut [$et] {
                 self
             }
             fn init() -> Self {
                 make_array!($n, Self::item_default())
+            }
+            fn slice_len() -> usize {
+                $n
             }
         }
     };

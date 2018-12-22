@@ -9,26 +9,37 @@ use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
 use index::btree::node::EmptyNode;
+use index::EntryKey;
 
-pub struct InNode {
-    pub keys: EntryKeySlice,
-    pub ptrs: NodePtrCellSlice,
+pub struct InNode<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    pub keys: KS,
+    pub ptrs: PS,
     pub len: usize,
     pub right: NodeCellRef,
 }
 
-pub struct InNodeKeysSplit {
-    pub keys_2: EntryKeySlice,
+pub struct InNodeKeysSplit<KS>
+    where KS: Slice<EntryKey> + Debug + 'static
+{
+    pub keys_2: KS,
     pub keys_1_len: usize,
     pub keys_2_len: usize,
     pub pivot_key: EntryKey,
 }
 
-pub struct InNodePtrSplit {
-    pub ptrs_2: NodePtrCellSlice,
+pub struct InNodePtrSplit<PS>
+    where PS: Slice<NodeCellRef> + 'static
+{
+    pub ptrs_2: PS,
 }
 
-impl InNode {
+impl <KS, PS>InNode<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
     pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
         if ptr_pos == 0 {
             0
@@ -37,7 +48,7 @@ impl InNode {
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
-        self.keys[..self.len]
+        self.keys.as_slice_immute()[..self.len]
             .binary_search(key)
             .map(|i| i + 1)
             .unwrap_or_else(|i| i)
@@ -48,7 +59,7 @@ impl InNode {
         let mut n_ptr_len = *n_key_len + 1;
         debug!(
             "Removing from internal node pos {}, len {}, key {:?}",
-            key_pos, n_key_len, &self.keys[key_pos]
+            key_pos, n_key_len, &self.keys.as_slice()[key_pos]
         );
         self.keys.remove_at(key_pos, n_key_len);
         self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
@@ -58,13 +69,13 @@ impl InNode {
         key: EntryKey,
         new_node: NodeCellRef,
         parent: &NodeCellRef,
-    ) -> Option<NodeSplit> {
+    ) -> Option<NodeSplit<KS, PS>> {
         let node_len = self.len;
         let ptr_len = self.len + 1;
         let pos = self.search(&key);
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
-        debug_assert!(node_len <= NUM_KEYS);
-        if node_len == NUM_KEYS {
+        debug_assert!(node_len <= KS::slice_len());
+        if node_len == KS::slice_len() {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
             let parent_guard = write_node(parent);
@@ -98,7 +109,7 @@ impl InNode {
                         keys_1_len, keys_2_len, key_pos
                     );
                     debug_assert_ne!(pivot, pos);
-                    let pivot_key = keys_1[pivot].to_owned();
+                    let pivot_key = keys_1.as_slice()[pivot].to_owned();
                     insert_into_split(
                         key,
                         keys_1,
@@ -152,7 +163,7 @@ impl InNode {
                 ptrs: ptr_split.ptrs_2,
                 right: self.right.clone(),
             };
-            let node_2_ref = Arc::new(Node::internal(node_2));
+            let node_2_ref = NodeCellRef::new(Node::internal(node_2));
             self.len = keys_split.keys_1_len;
             self.right = node_2_ref.clone();
             return Some(NodeSplit {
@@ -192,11 +203,11 @@ impl InNode {
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        left_node: &mut NodeData,
-        right_node: &mut NodeData,
-        right_node_next: &mut NodeData,
+        left_node: &mut NodeData<KS, PS>,
+        right_node: &mut NodeData<KS, PS>,
+        right_node_next: &mut NodeData<KS, PS>,
     ) {
-        let left_node_ref = self.ptrs[left_ptr_pos].clone();
+        let left_node_ref = self.ptrs.as_slice()[left_ptr_pos].clone();
         let left_len = left_node.len();
         let right_len = right_node.len();
         let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
@@ -208,7 +219,7 @@ impl InNode {
             {
                 let mut left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
-                let right_key = self.keys[right_key_pos].clone();
+                let right_key = self.keys.as_slice()[right_key_pos].clone();
                 left_innode.merge_with(&mut right_innode, right_key);
                 left_innode.right = right_innode.right.clone();
                 merged_len = left_innode.len;
@@ -241,14 +252,14 @@ impl InNode {
         );
         let mut self_len = self.len;
         let new_len = self_len + right.len + 1;
-        debug_assert!(new_len <= self.keys.len());
+        debug_assert!(new_len <= KS::slice_len());
         // moving keys
-        self.keys[self_len] = right_key;
+        self.keys.as_slice()[self_len] = right_key;
         for i in self_len + 1..new_len {
-            mem::swap(&mut self.keys[i], &mut right.keys[i - self_len - 1]);
+            mem::swap(&mut self.keys.as_slice()[i], &mut right.keys.as_slice()[i - self_len - 1]);
         }
         for i in self_len + 1..new_len + 1 {
-            mem::swap(&mut self.ptrs[i], &mut right.ptrs[i - self_len - 1]);
+            mem::swap(&mut self.ptrs.as_slice()[i], &mut right.ptrs.as_slice()[i - self_len - 1]);
         }
         self.len += right.len + 1;
     }
@@ -256,8 +267,8 @@ impl InNode {
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        left_node: &mut NodeData,
-        right_node: &mut NodeData,
+        left_node: &mut NodeData<KS, PS>,
+        right_node: &mut NodeData<KS, PS>,
     ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut new_right_node_key = Default::default();
@@ -275,52 +286,52 @@ impl InNode {
                     left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
                 );
 
-                let mut new_left_keys = EntryKeySlice::init();
-                let mut new_left_ptrs = NodePtrCellSlice::init();
+                let mut new_left_keys = KS::init();
+                let mut new_left_ptrs = PS::init();
 
-                let mut new_right_keys = EntryKeySlice::init();
-                let mut new_right_ptrs = NodePtrCellSlice::init();
+                let mut new_right_keys = KS::init();
+                let mut new_right_ptrs = PS::init();
 
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
                 debug_assert!(self.len >= right_ptr_pos);
-                debug_assert!(!self.ptrs[right_ptr_pos].read_unchecked().is_none());
+                debug_assert!(!self.ptrs.as_slice()[right_ptr_pos].deref::<KS, PS>().read_unchecked().is_none());
                 let pivot_key_pos = right_ptr_pos - 1;
-                let pivot_key = self.keys[pivot_key_pos].to_owned();
+                let pivot_key = self.keys.as_slice()[pivot_key_pos].to_owned();
                 debug_assert!(pivot_key > smallvec!(0),
                               "Current pivot key {:?} at {} is empty, left ptr {}, right ptr {}, now keys are {:?}",
                               pivot_key, pivot_key_pos, left_ptr_pos, right_ptr_pos, self.keys);
                 for (i, key) in chain(
                     chain(
-                        left_innode.keys[..left_innode.len].iter_mut(),
+                        left_innode.keys.as_slice()[..left_innode.len].iter_mut(),
                         [pivot_key].iter_mut(),
                     ),
-                    right_innode.keys[..right_innode.len].iter_mut(),
+                    right_innode.keys.as_slice()[..right_innode.len].iter_mut(),
                 )
                 .enumerate()
                 {
                     if i < half_full_pos {
-                        mem::swap(key, &mut new_left_keys[i]);
+                        mem::swap(key, &mut new_left_keys.as_slice()[i]);
                         new_left_keys_len += 1;
                     } else if i == half_full_pos {
                         mem::swap(key, &mut new_right_node_key);
                     } else {
                         let nk_index = i - half_full_pos - 1;
-                        mem::swap(key, &mut new_right_keys[nk_index]);
+                        mem::swap(key, &mut new_right_keys.as_slice()[nk_index]);
                         new_right_keys_len += 1;
                     }
                 }
 
                 for (i, ptr) in chain(
-                    left_innode.ptrs[..left_innode.len + 1].iter_mut(),
-                    right_innode.ptrs[..right_innode.len + 1].iter_mut(),
+                    left_innode.ptrs.as_slice()[..left_innode.len + 1].iter_mut(),
+                    right_innode.ptrs.as_slice()[..right_innode.len + 1].iter_mut(),
                 )
                 .enumerate()
                 {
                     if i < half_full_pos + 1 {
-                        mem::swap(ptr, &mut new_left_ptrs[i]);
+                        mem::swap(ptr, &mut new_left_ptrs.as_slice()[i]);
                     } else {
-                        mem::swap(ptr, &mut new_right_ptrs[i - half_full_pos - 1]);
+                        mem::swap(ptr, &mut new_right_ptrs.as_slice()[i - half_full_pos - 1]);
                     }
                 }
 
@@ -348,29 +359,29 @@ impl InNode {
                 left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
             );
 
-            let mut new_left_keys = EntryKeySlice::init();
-            let mut new_right_keys = EntryKeySlice::init();
+            let mut new_left_keys = KS::init();
+            let mut new_right_keys = KS::init();
 
             let left_len = left_extnode.len;
             let right_len = right_extnode.len;
             let mut new_left_keys_len = 0;
             let mut new_right_keys_len = 0;
             for (i, key) in chain(
-                left_extnode.keys[..left_len].iter_mut(),
-                right_extnode.keys[..right_len].iter_mut(),
+                left_extnode.keys.as_slice()[..left_len].iter_mut(),
+                right_extnode.keys.as_slice()[..right_len].iter_mut(),
             )
             .enumerate()
             {
                 if i < half_full_pos {
-                    mem::swap(key, &mut new_left_keys[i]);
+                    mem::swap(key, &mut new_left_keys.as_slice()[i]);
                     new_left_keys_len += 1;
                 } else {
-                    mem::swap(key, &mut new_right_keys[i - half_full_pos]);
+                    mem::swap(key, &mut new_right_keys.as_slice()[i - half_full_pos]);
                     new_right_keys_len += 1;
                 }
             }
 
-            new_right_node_key = new_right_keys[0].clone();
+            new_right_node_key = new_right_keys.as_slice()[0].clone();
 
             left_extnode.keys = new_left_keys;
             left_extnode.len = new_left_keys_len;
@@ -390,6 +401,6 @@ impl InNode {
             right_key_pos, new_right_node_key
         );
         debug_assert!(new_right_node_key > smallvec!(0));
-        self.keys[right_key_pos] = new_right_node_key;
+        self.keys.as_slice()[right_key_pos] = new_right_node_key;
     }
 }

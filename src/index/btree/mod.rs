@@ -10,7 +10,6 @@ use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 pub use index::btree::cursor::*;
 use index::btree::external::*;
 use index::btree::internal::*;
-pub use index::btree::merge::*;
 pub use index::btree::node::*;
 use index::EntryKey;
 use index::MergeableTree;
@@ -42,35 +41,39 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 use parking_lot::RwLock;
+use std::any::Any;
+use std::marker::PhantomData;
 
 mod cursor;
 mod external;
 mod internal;
-mod merge;
 mod node;
 
-pub const NUM_KEYS: usize = 24;
-const NUM_PTRS: usize = NUM_KEYS + 1;
 const CACHE_SIZE: usize = 2048;
-
-pub type NodeCellRef = Arc<Node>;
-type EntryKeySlice = [EntryKey; NUM_KEYS];
-type NodePtrCellSlice = [NodeCellRef; NUM_PTRS];
 
 // B-Tree is the memtable for the LSM-Tree
 // Items can be added and removed in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
-pub struct BPlusTree {
+pub struct BPlusTree<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
+    marker: PhantomData<(KS, PS)>
 }
 
-unsafe impl Sync for BPlusTree {}
-unsafe impl Send for BPlusTree {}
+unsafe impl <KS, PS> Sync for BPlusTree<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static {}
+
+unsafe impl <KS, PS> Send for BPlusTree<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static {}
 
 impl Default for Ordering {
     fn default() -> Self {
@@ -78,18 +81,22 @@ impl Default for Ordering {
     }
 }
 
-impl BPlusTree {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree {
+impl <KS, PS> BPlusTree<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree<KS, PS> {
         let neb_client_1 = neb_client.clone();
         let neb_client_2 = neb_client.clone();
         let mut tree = BPlusTree {
-            root: RwLock::new(Arc::new(Node::none())),
-            root_versioning: NodeCellRef::new(Node::none()),
+            root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::none())),
+            root_versioning: NodeCellRef::new(Node::<KS, PS>::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
+            marker: PhantomData
         };
         let root_id = tree.new_page_id();
-        *tree.root.write() = Arc::new(Node::new_external(root_id));
+        *tree.root.write() = NodeCellRef::new(Node::<KS, PS>::new_external(root_id));
         return tree;
     }
 
@@ -97,7 +104,7 @@ impl BPlusTree {
         self.root.read().clone()
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
         let mut cursor = self.search(&self.get_root(), key, ordering);
         match ordering {
             Ordering::Forward => {}
@@ -117,9 +124,9 @@ impl BPlusTree {
         cursor
     }
 
-    fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor {
+    fn search(&self, node_ref: &NodeCellRef, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
         debug!("searching for {:?}", key);
-        read_node(node_ref, |node_handler| {
+        read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
             let node = &**node_handler;
             if let Some(right_node) = node.key_at_right_node(key) {
                 debug!("Search found a node at the right side");
@@ -136,7 +143,7 @@ impl BPlusTree {
                 },
                 &NodeData::Internal(ref n) => {
                     debug!("search in internal node for {:?}, len {}", key, n.len);
-                    let next_node_ref = &n.ptrs[pos];
+                    let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                     self.search(next_node_ref, key, ordering)
                 },
                 &NodeData::Empty(ref n) => {
@@ -146,7 +153,8 @@ impl BPlusTree {
                     RTCursor{
                         index: 0,
                         ordering,
-                        page: None
+                        page: None,
+                        marker: PhantomData
                     }
                 }
             }
@@ -160,22 +168,22 @@ impl BPlusTree {
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
                 let mut new_in_root = InNode {
-                    keys: make_array!(NUM_KEYS, Default::default()),
-                    ptrs: make_array!(NUM_PTRS, Default::default()),
-                    right: Arc::new(Node::none()),
+                    keys: KS::init(),
+                    ptrs: PS::init(),
+                    right: NodeCellRef::new(Node::<KS, PS>::none()),
                     len: 1,
                 };
                 let mut old_root = self.get_root().clone();
                 // check latched root and current root are the same node
                 debug_assert_eq!(
-                    old_root.read_unchecked().first_key(),
+                    old_root.deref::<KS, PS>().read_unchecked().first_key(),
                     split.left_node_latch.first_key(),
                     "root verification failed, left node right node type: {}",
-                    split.left_node_latch.innode().right.read_unchecked().type_name()
+                    split.left_node_latch.innode().right.deref::<KS, PS>().read_unchecked().type_name()
                 );
-                new_in_root.keys[0] = pivot;
-                new_in_root.ptrs[0] = old_root;
-                new_in_root.ptrs[1] = new_node;
+                new_in_root.keys.as_slice()[0] = pivot;
+                new_in_root.ptrs.as_slice()[0] = old_root;
+                new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             None => {}
@@ -188,8 +196,8 @@ impl BPlusTree {
         parent: &NodeCellRef,
         key: &EntryKey,
         level: usize,
-    ) -> Option<NodeSplit> {
-        let mut search = read_node(node_ref, |node_handler| {
+    ) -> Option<NodeSplit<KS, PS>> {
+        let mut search = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
             debug!(
                 "insert to node, len {}, external: {}",
                 node_handler.len(),
@@ -199,7 +207,7 @@ impl BPlusTree {
                 &NodeData::External(ref node) => InsertSearchResult::External,
                 &NodeData::Internal(ref node) => {
                     let pos = node.search(key);
-                    let sub_node_ref = &node.ptrs[pos];
+                    let sub_node_ref = &node.ptrs.as_slice_immute()[pos];
                     InsertSearchResult::Internal(sub_node_ref.clone())
                 }
                 &NodeData::Empty(ref node) => InsertSearchResult::RightNode(node.right.clone()),
@@ -247,7 +255,7 @@ impl BPlusTree {
                         let mut self_guard = split.parent_latch;
                         let mut target_guard = write_key_page(self_guard, &pivot);
                         debug_assert!(
-                            split.new_right_node.read_unchecked().first_key() >= &pivot
+                            split.new_right_node.deref::<KS, PS>().read_unchecked().first_key() >= &pivot
                         );
                         let mut split_result = target_guard.innode_mut().insert(
                             pivot,
@@ -265,7 +273,7 @@ impl BPlusTree {
         if level == 0 {
             if let &Some(ref split) = &modification {
                 let current_root = self.get_root();
-                if  current_root.read_unchecked().first_key() != split.left_node_latch.first_key() &&
+                if  current_root.deref::<KS, PS>().read_unchecked().first_key() != split.left_node_latch.first_key() &&
                     split.left_node_latch.has_vaild_right_node() {
                     // at this point, root split occurred when waiting for the latch
                     // the new right node should be inserted to any right node of the old root
@@ -287,11 +295,11 @@ impl BPlusTree {
         let result = self.remove_from_node(&mut root, &mut key.clone(), &self.root_versioning, 0);
         if let Some(rebalance) = result.rebalancing {
             let root_node = rebalance.parent;
-            if self.root.read().read_unchecked().innode().keys[0] == root_node.innode().keys[0] {
+            if (*self.root.read()).deref::<KS, PS>().read_unchecked().innode().keys.as_slice_immute()[0] == root_node.innode().keys.as_slice_immute()[0] {
                 // Make sure root node does not changed during the process. If it did changed, ignore it
                 // When root is external and have no keys but one pointer will take the only sub level
                 // pointer node as the new root node.
-                let new_root = root_node.innode().ptrs[0].clone();
+                let new_root = root_node.innode().ptrs.as_slice_immute()[0].clone();
                 *self.root.write() = new_root;
             }
         }
@@ -304,13 +312,13 @@ impl BPlusTree {
     fn with_innode_removing<F>(
         &self,
         key: &EntryKey,
-        mut rebalancing: RebalancingNodes,
+        mut rebalancing: RebalancingNodes<KS, PS>,
         parent: &NodeCellRef,
         parent_parent: &NodeCellRef,
         removed: bool,
         level: usize,
-        func: F) -> RemoveResult
-        where F: Fn(&mut RebalancingNodes)
+        func: F) -> RemoveResult<KS, PS>
+        where F: Fn(&mut RebalancingNodes<KS, PS>)
     {
         let parent_half_full = rebalancing.parent.is_half_full();
         let mut parent_right_guard = write_node(&rebalancing.parent.innode_mut().right);
@@ -361,14 +369,14 @@ impl BPlusTree {
         node_ref: &mut NodeCellRef,
         key: &mut EntryKey,
         parent: &NodeCellRef,
-        level: usize) -> RemoveResult
+        level: usize) -> RemoveResult<KS, PS>
     {
         debug!("Removing {:?} from node, level {}", key, level);
-        let mut search = read_node(node_ref, |node| {
+        let mut search = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| {
             match &**node {
                 &NodeData::Internal(ref n) => {
                     let pos = n.search(key);
-                    let sub_node = n.ptrs[pos].clone();
+                    let sub_node = n.ptrs.as_slice_immute()[pos].clone();
                     RemoveSearchResult::Internal(sub_node)
                 }
                 &NodeData::External(_) => RemoveSearchResult::External,
@@ -396,7 +404,7 @@ impl BPlusTree {
                                 // Because we cannot lock from left to right, we have to move the content
                                 // of the right node to the left and remove the right node instead so the
                                 // left right pointers can be modified
-                                if !rebalancing.left_guard.is_empty() || (level == 0 && self.root.read().read_unchecked().first_key() != rebalancing.left_guard.first_key()) {
+                                if !rebalancing.left_guard.is_empty() || (level == 0 && (*self.root.read()).deref::<KS, PS>().read_unchecked().first_key() != rebalancing.left_guard.first_key()) {
                                     return;
                                 }
 
@@ -418,7 +426,7 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos);
                                 // point the right ptr to the replaced sub node
                                 debug!("Removed sub level empty node, living node len {}, have {:?}", left_node.len(), left_node.keys());
-                                rebalancing.parent.innode_mut().ptrs[rebalancing.parent_pos + 1] = sub_node.clone();
+                                rebalancing.parent.innode_mut().ptrs.as_slice()[rebalancing.parent_pos + 1] = sub_node.clone();
                             }))
                     } else if rebalancing.right_guard.is_empty() {
                         debug!("Remove {:?} sub level right node is empty, level {}", key, level);
@@ -438,9 +446,9 @@ impl BPlusTree {
                                 rebalancing.parent.remove(rebalancing.parent_pos + 1);
                             }))
                     } else if rebalancing.left_guard.cannot_merge() || rebalancing.right_guard.cannot_merge() {
-                        if  rebalancing.right_guard.len() < NUM_KEYS / 3 &&
+                        if  rebalancing.right_guard.len() < KS::slice_len() / 3 &&
                             rebalancing.right_guard.len() < rebalancing.left_guard.len() &&
-                            rebalancing.left_guard.len() > NUM_KEYS / 2 {
+                            rebalancing.left_guard.len() > KS::slice_len() / 2 {
                             // Relocate the nodes with the same parent for balance.
                             // For OLFIT, items can only be located from left to right.
                             debug!("Remove {:?} sub level need relocation, level {}", key, level);
@@ -451,7 +459,7 @@ impl BPlusTree {
                             rebalancing.parent.innode_mut().relocate_children(left_pos, right_pos, left_node, right_node);
                         }
                         None
-                    } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1 <= NUM_KEYS {
+                    } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1 <= KS::slice_len() {
                         // Nodes with the same parent can merge
                         debug!("Remove {:?} sub level need to be merged, level {}", key, level);
                         Some(self.with_innode_removing(
@@ -485,7 +493,7 @@ impl BPlusTree {
                 })
             }
             RemoveSearchResult::External => {
-                let node_guard = write_node(node_ref);
+                let node_guard: NodeWriteGuard<KS, PS> = write_node(node_ref);
                 let mut target_guard = write_key_page(node_guard, key);
                 let target_guard_ref = target_guard.node_ref().clone();
                 let mut remove_result = RemoveResult {
@@ -524,18 +532,18 @@ impl BPlusTree {
                     if pos >= node.len {
                         debug!(
                             "Removing pos overflows external node, pos {}, len {}, expecting key {:?}, current keys {:?}, right keys {:?}",
-                            pos, node.len, key, node.keys, node.next.read_unchecked().keys()
+                            pos, node.len, key, node.keys, node.next.deref::<KS, PS>().read_unchecked().keys()
                         );
                         remove_result.removed = false;
                     }
-                    if &node.keys[pos] == key {
+                    if &node.keys.as_slice()[pos] == key {
                         debug!("Removing key {:?} at {}, keys {:?}", key, pos, &node.keys);
                         node.remove_at(pos);
                         remove_result.removed = true;
                     } else {
                         debug!(
                             "Search check failed for remove at pos {}, expecting {:?}, actual {:?}, have {:?}",
-                            pos, key, &node.keys[pos], &node.keys
+                            pos, key, &node.keys.as_slice_immute()[pos], &node.keys
                         );
                         remove_result.removed = false;
                     }
@@ -558,7 +566,7 @@ impl BPlusTree {
     }
 
     fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
-        let cell = read_node(value, |node| {
+        let cell = read_node(value, |node: &NodeReadHandler<KS, PS>| {
             let extnode = node.extnode();
             if extnode.is_dirty() {
                 Some(extnode.to_cell())
@@ -577,59 +585,56 @@ impl BPlusTree {
     }
 }
 
-macro_rules! impl_btree_slice {
-    ($t: ty, $et: ty, $n: expr) => {
-        impl_slice_ops!($t, $et, $n);
-        impl BTreeSlice<$et> for $t {}
+impl_slice_ops!([EntryKey; 0], EntryKey, 0);
+impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
+
+macro_rules! impl_btree_level {
+    ($items: expr) => {
+        impl_slice_ops!([EntryKey; $expr], EntryKey, $expr);
+        impl_slice_ops!([NodeCellRef; $expr + 1], NodeCellRef, $expr + 1);
     };
 }
 
-impl_btree_slice!(EntryKeySlice, EntryKey, NUM_KEYS);
-impl_btree_slice!(NodePtrCellSlice, NodeCellRef, NUM_PTRS);
+pub struct NodeCellRef {
+    inner: Arc<Any>
+}
 
-pub trait BTreeSlice<T>: Sized + Slice<Item = T>
-where
-    T: Default,
-{
-    fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self {
-        let mut right_slice = Self::init();
-        {
-            let mut slice1: &mut [T] = self.as_slice();
-            let mut slice2: &mut [T] = right_slice.as_slice();
-            for i in pivot..len {
-                // leave pivot to the right slice
-                let right_pos = i - pivot;
-                mem::swap(&mut slice1[i], &mut slice2[right_pos]);
-            }
+impl NodeCellRef {
+    pub fn new<KS, PS>(node: Node<KS, PS>) -> Self
+        where KS: Slice<EntryKey> + Debug + 'static,
+              PS: Slice<NodeCellRef> + 'static
+    {
+        NodeCellRef {
+            inner: Arc::new(node)
         }
-        return right_slice;
     }
-    fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
-        debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
-        debug!("insert into slice, pos: {}, len {}", pos, len);
-        let mut slice = self.as_slice();
-        if *len > 0 {
-            slice[*len] = T::default();
-            for i in (pos..=*len - 1).rev() {
-                slice.swap(i, i + 1);
-            }
+
+    #[inline]
+    fn deref<KS, PS>(&self) -> &Node<KS, PS>
+        where KS: Slice<EntryKey> + Debug + 'static,
+              PS: Slice<NodeCellRef> + 'static
+    {
+        // The only unmatched scenario is the NodeCellRef was constructed by default function
+        // Because the size of different type of NodeData are the same, we can still cast them safely
+        // for NodeData have a fixed size for all the time
+        unsafe {
+            &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>)
         }
-        debug!("setting item at {} for insertion", pos);
-        *len += 1;
-        slice[pos] = item;
     }
-    fn remove_at(&mut self, pos: usize, len: &mut usize) {
-        debug!("remove at {} len {}", pos, len);
-        debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
-        let slice = self.as_slice();
-        let bound = *len - 1;
-        if pos < bound {
-            for i in pos..bound {
-                slice.swap(i, i + 1);
-            }
+}
+
+impl Clone for NodeCellRef {
+    fn clone(&self) -> Self {
+        NodeCellRef {
+            inner: self.inner.clone()
         }
-        slice[bound] = T::default();
-        *len -= 1;
+    }
+}
+
+impl Default for NodeCellRef {
+    fn default() -> Self {
+        let data: NodeData<[EntryKey; 0], [NodeCellRef; 0]> = NodeData::None;
+        Self::new(Node::new(data))
     }
 }
 
