@@ -476,6 +476,19 @@ impl <KS, PS> BPlusTree<KS, PS>
                                 rebalancing.parent.innode_mut().merge_children(left_pos, right_pos, left_node, right_node, right_node_next);
                             }))
                         // None
+                    } else if rebalancing.parent.len() == 1 && rebalancing.left_guard.is_empty() && rebalancing.right_guard.is_empty() {
+                        // this node and its children is empty, should be removed
+                        debug!("Cleaning up empty level nodes, level {}", level);
+                        Some(self.with_innode_removing(
+                            key,
+                            rebalancing,
+                            &sub_node,
+                            parent,
+                            removed,
+                            level, |rebalancing| {
+                                rebalancing.parent.remove(0);
+                                rebalancing.parent.innode_mut().ptrs.as_slice()[0] = Default::default();
+                            }))
                     } else {
                         None
                     }
