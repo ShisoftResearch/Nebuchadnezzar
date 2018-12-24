@@ -1227,6 +1227,7 @@ pub mod test {
             key_with_id(&mut key, &id);
             assert!(tree.remove(&key), "Cannot find item to remove {}, {:?}", i, &key);
         });
+        dump_tree(&*tree, "btree_parallel_deletion_dump.json");
     }
 
     #[test]
