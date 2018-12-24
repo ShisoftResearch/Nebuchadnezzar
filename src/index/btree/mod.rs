@@ -1190,7 +1190,6 @@ pub mod test {
 
         dump_tree(&*tree, "btree_parallel_insertion_dump.json");
         debug!("Start validation");
-
         let mut rng = rand::rngs::OsRng::new().unwrap();
         let die_range = Uniform::new_inclusive(1, 6);
         let roll_die = RwLock::new(rng.sample_iter(&die_range));
@@ -1214,6 +1213,19 @@ pub mod test {
                     assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
                 }
             }
+        });
+
+        debug!("Start parallel deleting");
+        let mut nums = (num / 2..num).collect_vec();
+        thread_rng().shuffle(nums.as_mut_slice());
+        nums.par_iter().for_each(|i| {
+            debug!("Deleting {}", i);
+            let i = *i;
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            assert!(tree.remove(&key), "Cannot find item to remove {}, {:?}", i, &key);
         });
     }
 
