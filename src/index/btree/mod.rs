@@ -324,8 +324,7 @@ impl <KS, PS> BPlusTree<KS, PS>
         let mut parent_right_guard = write_node(&rebalancing.parent.innode_mut().right);
         let mut parent_remove_result = RemoveResult {
             rebalancing: None,
-            removed,
-            empty: false
+            removed
         };
 
         let parent_parent_guard;
@@ -348,9 +347,6 @@ impl <KS, PS> BPlusTree<KS, PS>
         }
 
         func(&mut rebalancing);
-        if rebalancing.parent.innode().len == 0 {
-            parent_remove_result.empty = true;
-        }
         parent_remove_result.rebalancing = parent_right_right_guard.map(|parent_right_right_guard_stripped| {
             RebalancingNodes {
                 left_guard: rebalancing.parent,
@@ -390,8 +386,9 @@ impl <KS, PS> BPlusTree<KS, PS>
                 let mut node_remove_res = self.remove_from_node(&mut sub_node, key, node_ref, level + 1);
                 let removed = node_remove_res.removed;
                 if let Some(mut rebalancing) = node_remove_res.rebalancing {
-                    if node_remove_res.empty {
-                        debug!("Remove {:?} sub level is empty, level {}", key, level);
+                    debug!("Need to rebalance sub nodes, key {:?}, level {}", key, level);
+                    if rebalancing.left_guard.is_empty() && !rebalancing.right_guard.is_empty() {
+                        debug!("Remove {:?} sub level left node is empty, level {}", key, level);
                         Some(self.with_innode_removing(
                             key,
                             rebalancing,
@@ -487,7 +484,6 @@ impl <KS, PS> BPlusTree<KS, PS>
                 }.unwrap_or_else(|| {
                     RemoveResult {
                         rebalancing: None,
-                        empty: false,
                         removed
                     }
                 })
@@ -498,8 +494,7 @@ impl <KS, PS> BPlusTree<KS, PS>
                 let target_guard_ref = target_guard.node_ref().clone();
                 let mut remove_result = RemoveResult {
                     rebalancing: None,
-                    removed: false,
-                    empty: false
+                    removed: false
                 };
                 {
                     let is_left_half_full = target_guard.is_half_full();
@@ -507,8 +502,8 @@ impl <KS, PS> BPlusTree<KS, PS>
                     let pos = node.search(key);
                     let right_guard = write_node(&node.next);
                     let right_node_cannot_rebalance = right_guard.is_none() || !right_guard.is_empty_node();
-                    if !right_node_cannot_rebalance && (!is_left_half_full || !right_guard.is_half_full()) {
-                        let right_right_guard = write_node(&right_guard.extnode().next);
+                    if !right_guard.is_none() && !is_left_half_full || !right_guard.is_half_full(){
+                        let right_right_guard = write_node(&right_guard.right_ref().unwrap());
                         let parent_guard = write_node(parent);
                         let parent_target_guard = write_key_page(parent_guard, key);
                         let parent_pos = parent_target_guard.search(key);
@@ -518,15 +513,17 @@ impl <KS, PS> BPlusTree<KS, PS>
                         // So left over imbalanced such nodes will be expected and they can be eliminate
                         // by their left node remove operations.
                         if parent_pos < parent_target_guard.len() - 1 {
-                            let rebalacing = RebalancingNodes {
+                            debug!("removing innode have a rebalance requirement");
+                            remove_result.rebalancing = Some(RebalancingNodes {
                                 left_ref: target_guard_ref,
                                 left_guard: Default::default(),
                                 parent: parent_target_guard,
                                 parent_pos,
                                 right_right_guard,
                                 right_guard
-                            };
-                            remove_result.rebalancing = Some(rebalacing);
+                            });
+                        } else {
+                            debug!("removing innode have a rebalance requirement but left-right node does not with the same parent");
                         }
                     }
                     if pos >= node.len {
@@ -547,10 +544,9 @@ impl <KS, PS> BPlusTree<KS, PS>
                         );
                         remove_result.removed = false;
                     }
-                    remove_result.empty = node.len == 0;
                 }
-                if let &mut Some(ref mut rebalancing) = &mut remove_result.rebalancing {
-                    rebalancing.left_guard = target_guard;
+                if let Some(ref mut rebalance) = &mut remove_result.rebalancing {
+                    rebalance.left_guard = target_guard;
                 }
                 remove_result
             }
@@ -963,6 +959,109 @@ pub mod test {
             }
         }
 
+        {
+            debug!("Testing deletion");
+            let deletion_volume = num / 2;
+            let mut deletions = (0..deletion_volume).collect_vec();
+            thread_rng().shuffle(deletions.as_mut_slice());
+            for (i, num) in deletions.iter().enumerate() {
+                debug!("delete: {}: {}", i, num);
+                let id = Id::new(0, *num);
+                let key_slice = u64_to_slice(*num);
+                let key = SmallVec::from_slice(&key_slice);
+                let mut entry_key = key.clone();
+                key_with_id(&mut entry_key, &id);
+                let remove_succeed = tree.remove(&entry_key);
+                if !remove_succeed {
+                    dump_tree(&tree, &format!("removing_{}_{}_dump.json", i, num));
+                }
+                // dump_tree(&tree, &format!("removing_{}_dump.json", i));
+                assert!(remove_succeed, "remove at {}: {}", i, num);
+            }
+
+            assert_eq!(tree.len(), (num - deletion_volume) as usize);
+            dump_tree(&tree, "remove_completed_dump.json");
+
+            debug!("check for removed items");
+            for i in 0..deletion_volume {
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(
+                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+                    Id::new(0, deletion_volume), // seek should reach deletion_volume
+                    "{}",
+                    i
+                );
+            }
+
+            debug!("check for remaining items");
+            for i in deletion_volume..num {
+                let id = Id::new(0, i);
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(
+                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+                    id,
+                    "{}",
+                    i
+                );
+            }
+
+            tree.flush_all();
+
+            debug!("remove remaining items, with extensive point search");
+            for i in (deletion_volume..num).rev() {
+                {
+                    debug!("delete and sampling: {}", i);
+                    let id = Id::new(0, i);
+                    let key_slice = u64_to_slice(i);
+                    let key = SmallVec::from_slice(&key_slice);
+                    let mut entry_key = key.clone();
+                    key_with_id(&mut entry_key, &id);
+                    let remove_succeed = tree.remove(&entry_key);
+                    if !remove_succeed {
+                        dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+                    }
+                    assert!(remove_succeed, "{}", i);
+                }
+                if roll_die.next().unwrap() != 6 {
+                    continue;
+                }
+                debug!("sampling for remaining integrity for {}", i);
+                for j in deletion_volume..i {
+                    if roll_die.next().unwrap() != 6 {
+                        continue;
+                    }
+                    let id = Id::new(0, j);
+                    let key_slice = u64_to_slice(j);
+                    let key = SmallVec::from_slice(&key_slice);
+                    assert_eq!(
+                        id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+                        id,
+                        "{} / {}",
+                        i,
+                        j
+                    );
+                }
+            }
+            dump_tree(&tree, "remove_remains_dump.json");
+
+            debug!("check for removed items");
+            for i in 0..num {
+                let key_slice = u64_to_slice(i);
+                let key = SmallVec::from_slice(&key_slice);
+                assert_eq!(
+                    tree.seek(&key, Ordering::default()).current(),
+                    None, // should always be 'None' for empty tree
+                    "{}",
+                    i
+                );
+            }
+
+            tree.flush_all();
+            assert_eq!(tree.len(), 0);
+            // assert_eq!(client.count().wait().unwrap(), 1);
+        }
     }
 
     #[test]

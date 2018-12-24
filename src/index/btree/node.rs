@@ -60,7 +60,6 @@ pub struct RemoveResult<KS, PS>
           PS: Slice<NodeCellRef> + 'static
 {
     pub rebalancing: Option<RebalancingNodes<KS, PS>>,
-    pub empty: bool,
     pub removed: bool,
 }
 
