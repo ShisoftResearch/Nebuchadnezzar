@@ -4,40 +4,6 @@ use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
 
-pub enum RemoveSearchResult {
-    External,
-    RightNode(NodeCellRef),
-    Internal(NodeCellRef),
-}
-
-pub enum SubNodeStatus {
-    ExtNodeEmpty,
-    InNodeEmpty,
-    Relocate(usize, usize),
-    Merge(usize, usize),
-    Ok,
-}
-
-pub struct RebalancingNodes<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
-{
-    pub left_guard: NodeWriteGuard<KS, PS>,
-    pub left_ref: NodeCellRef,
-    pub right_guard: NodeWriteGuard<KS, PS>,
-    pub right_right_guard: NodeWriteGuard<KS, PS>, // for external pointer modification
-    pub parent: NodeWriteGuard<KS, PS>,
-    pub parent_pos: usize,
-}
-
-pub struct RemoveResult<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
-{
-    pub rebalancing: Option<RebalancingNodes<KS, PS>>,
-    pub removed: bool,
-}
-
 pub enum NodeData<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
