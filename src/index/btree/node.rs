@@ -4,21 +4,6 @@ use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
 
-pub enum InsertSearchResult {
-    External,
-    Internal(NodeCellRef),
-    RightNode(NodeCellRef),
-}
-
-pub enum InsertToNodeResult<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static + Debug,
-          PS: Slice<NodeCellRef> + 'static
-{
-    NoSplit,
-    Split(NodeWriteGuard<KS, PS>, NodeCellRef, Option<EntryKey>),
-    SplitParentChanged,
-}
-
 pub enum RemoveSearchResult {
     External,
     RightNode(NodeCellRef),
@@ -31,16 +16,6 @@ pub enum SubNodeStatus {
     Relocate(usize, usize),
     Merge(usize, usize),
     Ok,
-}
-
-pub struct NodeSplit<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
-{
-    pub new_right_node: NodeCellRef,
-    pub left_node_latch: NodeWriteGuard<KS, PS>,
-    pub pivot: EntryKey,
-    pub parent_latch: NodeWriteGuard<KS, PS>,
 }
 
 pub struct RebalancingNodes<KS, PS>

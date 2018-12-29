@@ -43,11 +43,13 @@ use utils::lru_cache::LRUCache;
 use parking_lot::RwLock;
 use std::any::Any;
 use std::marker::PhantomData;
+use index::btree::insert::*;
 
 mod cursor;
 mod external;
 mod internal;
 mod node;
+mod insert;
 
 const CACHE_SIZE: usize = 2048;
 
@@ -162,7 +164,7 @@ impl <KS, PS> BPlusTree<KS, PS>
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match self.insert_to_node(&self.get_root(), &self.root_versioning, &key, 0) {
+        match insert_to_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(split) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
@@ -189,105 +191,6 @@ impl <KS, PS> BPlusTree<KS, PS>
             None => {}
         }
         self.len.fetch_add(1, Relaxed);
-    }
-    fn insert_to_node(
-        &self,
-        node_ref: &NodeCellRef,
-        parent: &NodeCellRef,
-        key: &EntryKey,
-        level: usize,
-    ) -> Option<NodeSplit<KS, PS>> {
-        let mut search = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
-            debug!(
-                "insert to node, len {}, external: {}",
-                node_handler.len(),
-                node_handler.is_ext()
-            );
-            match &**node_handler {
-                &NodeData::External(ref node) => InsertSearchResult::External,
-                &NodeData::Internal(ref node) => {
-                    let pos = node.search(key);
-                    let sub_node_ref = &node.ptrs.as_slice_immute()[pos];
-                    InsertSearchResult::Internal(sub_node_ref.clone())
-                }
-                &NodeData::Empty(ref node) => InsertSearchResult::RightNode(node.right.clone()),
-                &NodeData::None => unreachable!(),
-            }
-        });
-        let modification = match search {
-            InsertSearchResult::RightNode(node) => {
-                self.insert_to_node(&node, parent, key, level)
-            }
-            InsertSearchResult::External => {
-                // latch nodes from left to right
-                debug!("Obtain latch for external node");
-                let node_guard = write_node(node_ref);
-                let mut searched_guard = write_key_page(node_guard, key);
-                debug_assert!(
-                    searched_guard.is_ext(),
-                    "{:?}",
-                    searched_guard.innode().keys
-                );
-                let mut split_result = searched_guard.extnode_mut().insert(
-                    key,
-                    self,
-                    node_ref,
-                    parent
-                );
-                if let &mut Some(ref mut split) = &mut split_result {
-                    split.left_node_latch = searched_guard;
-                }
-                split_result
-            }
-            InsertSearchResult::Internal(sub_node) => {
-                let split_res =
-                    self.insert_to_node(&sub_node, node_ref, key, level + 1);
-                match split_res {
-                    None => None,
-                    Some(split) => {
-                        debug!(
-                            "Sub level node split, shall insert new node to current level, pivot {:?}",
-                            split.pivot
-                        );
-                        let pivot = split.pivot;
-                        debug!("New pivot {:?}", pivot);
-                        debug!("obtain latch for internal node split");
-                        let mut self_guard = split.parent_latch;
-                        let mut target_guard = write_key_page(self_guard, &pivot);
-                        debug_assert!(
-                            split.new_right_node.deref::<KS, PS>().read_unchecked().first_key() >= &pivot
-                        );
-                        let mut split_result = target_guard.innode_mut().insert(
-                            pivot,
-                            split.new_right_node,
-                            parent
-                        );
-                        if let &mut Some(ref mut split) = &mut split_result {
-                            split.left_node_latch = target_guard;
-                        }
-                        split_result
-                    }
-                }
-            }
-        };
-        if level == 0 {
-            if let &Some(ref split) = &modification {
-                let current_root = self.get_root();
-                if  current_root.deref::<KS, PS>().read_unchecked().first_key() != split.left_node_latch.first_key() &&
-                    split.left_node_latch.has_vaild_right_node() {
-                    // at this point, root split occurred when waiting for the latch
-                    // the new right node should be inserted to any right node of the old root
-                    // hopefully that node won't split again
-                    let current_root_guard = write_node(&current_root);
-                    // at this point, the root may have split again, we need to search for the exact one
-                    let mut root_level_target = write_key_page(current_root_guard, &split.pivot);
-                    // assert this even in production
-                    assert!(!root_level_target.is_ext());
-                    return root_level_target.innode_mut().insert(split.pivot.clone(), split.new_right_node.clone(), parent);
-                }
-            }
-        }
-        modification
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
@@ -564,6 +467,12 @@ impl <KS, PS> BPlusTree<KS, PS>
                 remove_result
             }
         }
+    }
+
+
+    pub fn merge_pages(&self, pages: Vec<EntryKey>) {
+        let first_key = &pages[0];
+
     }
 
     pub fn flush_all(&self) {
