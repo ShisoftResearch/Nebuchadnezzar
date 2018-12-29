@@ -629,6 +629,7 @@ impl NodeCellRef {
         // The only unmatched scenario is the NodeCellRef was constructed by default function
         // Because the size of different type of NodeData are the same, we can still cast them safely
         // for NodeData have a fixed size for all the time
+        debug_assert!(self.inner.is::<Node<KS, PS>>(), "Node ref type unmatched");
         unsafe {
             &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>)
         }
