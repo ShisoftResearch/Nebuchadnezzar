@@ -117,7 +117,7 @@ pub fn check_root_modification<KS, PS>(
             // at this point, root split occurred when waiting for the latch
             // the new right node should be inserted to any right node of the old root
             // hopefully that node won't split again
-            let current_root_guard = write_node(&current_root);
+            let current_root_guard = write_node::<KS, PS>(&current_root);
             // at this point, the root may have split again, we need to search for the exact one
             let mut root_level_target = write_key_page(current_root_guard, &split.pivot);
             // assert this even in production
