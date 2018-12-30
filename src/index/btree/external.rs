@@ -108,7 +108,7 @@ impl <KS, PS>ExtNode<KS, PS>
         key: &EntryKey,
         tree: &BPlusTree<KS, PS>,
         self_ref: &NodeCellRef,
-        parent: &NodeCellRef,
+        parent: NodeRefOrGuard<KS, PS>,
     ) -> Option<NodeSplit<KS, PS>> {
         let self_len = self.len;
         let key = key.clone();
@@ -119,7 +119,7 @@ impl <KS, PS>ExtNode<KS, PS>
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
-            let mut parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
+            let mut parent_latch: NodeWriteGuard<KS, PS> = parent.into_guard();
             // cached.dump();
             let pivot = self_len / 2;
             let new_page_id = tree.new_page_id();

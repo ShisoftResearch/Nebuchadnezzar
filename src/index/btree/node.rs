@@ -4,6 +4,32 @@ use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
 
+pub enum NodeRefOrGuard<'a, KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    Reference(&'a NodeCellRef),
+    Guard(NodeWriteGuard<KS, PS>)
+}
+
+impl <'a, KS, PS> NodeRefOrGuard<'a, KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    #[inline]
+    pub fn into_guard(self) -> NodeWriteGuard<KS, PS> {
+        match self {
+            NodeRefOrGuard::Guard(g) => g,
+            NodeRefOrGuard::Reference(r) => write_node(r)
+        }
+    }
+}
+
+pub struct EmptyNode {
+    pub left: Option<NodeCellRef>,
+    pub right: NodeCellRef,
+}
+
 pub enum NodeData<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
@@ -12,11 +38,6 @@ pub enum NodeData<KS, PS>
     Internal(Box<InNode<KS, PS>>),
     Empty(Box<EmptyNode>),
     None,
-}
-
-pub struct EmptyNode {
-    pub left: Option<NodeCellRef>,
-    pub right: NodeCellRef,
 }
 
 impl <KS, PS>NodeData<KS, PS>

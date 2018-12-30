@@ -68,7 +68,7 @@ impl <KS, PS>InNode<KS, PS>
         &mut self,
         key: EntryKey,
         new_node: NodeCellRef,
-        parent: &NodeCellRef,
+        parent: NodeRefOrGuard<KS, PS>,
     ) -> Option<NodeSplit<KS, PS>> {
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -78,7 +78,7 @@ impl <KS, PS>InNode<KS, PS>
         if node_len == KS::slice_len() {
             let pivot = node_len / 2; // pivot key will be removed
             debug!("Going to split at pivot {}", pivot);
-            let parent_guard = write_node(parent);
+            let parent_guard = parent.into_guard();
             let keys_split = {
                 debug!("insert into keys");
                 if pivot == pos {
