@@ -9,6 +9,7 @@ use std::fmt::Debug;
 use index::btree::node::NodeWriteGuard;
 use index::btree::node::write_node;
 use index::btree::node::write_key_page;
+use index::btree::node::read_unchecked;
 
 pub enum InsertSearchResult {
     External,
@@ -35,7 +36,7 @@ pub struct NodeSplit<KS, PS>
     pub parent_latch: NodeWriteGuard<KS, PS>,
 }
 
-pub fn insert_internal<KS, PS>(
+pub fn insert_internal_tree_node<KS, PS>(
     split_res: Option<NodeSplit<KS, PS>>,
     parent: &NodeCellRef
 ) -> Option<NodeSplit<KS, PS>>
@@ -55,7 +56,7 @@ pub fn insert_internal<KS, PS>(
             let mut self_guard = split.parent_latch;
             let mut target_guard = write_key_page(self_guard, &pivot);
             debug_assert!(
-                split.new_right_node.deref::<KS, PS>().read_unchecked().first_key() >= &pivot
+                read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= &pivot
             );
             let mut split_result = target_guard.innode_mut().insert(
                 pivot,
@@ -70,7 +71,7 @@ pub fn insert_internal<KS, PS>(
     }
 }
 
-pub fn insert_external<KS, PS>(
+pub fn insert_external_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     parent: &NodeCellRef,
@@ -100,7 +101,33 @@ pub fn insert_external<KS, PS>(
     split_result
 }
 
-pub fn insert_to_node<KS, PS>(
+pub fn check_root_modification<KS, PS>(
+    tree: &BPlusTree<KS, PS>,
+    modification: &Option<NodeSplit<KS, PS>>,
+    parent: &NodeCellRef
+) -> Option<NodeSplit<KS, PS>>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    if let &Some(ref split) = modification {
+        let current_root = tree.get_root();
+        if  read_unchecked::<KS, PS>(&current_root).first_key() != split.left_node_latch.first_key() &&
+            split.left_node_latch.has_vaild_right_node() {
+            // at this point, root split occurred when waiting for the latch
+            // the new right node should be inserted to any right node of the old root
+            // hopefully that node won't split again
+            let current_root_guard = write_node(&current_root);
+            // at this point, the root may have split again, we need to search for the exact one
+            let mut root_level_target = write_key_page(current_root_guard, &split.pivot);
+            // assert this even in production
+            assert!(!root_level_target.is_ext());
+            return root_level_target.innode_mut().insert(split.pivot.clone(), split.new_right_node.clone(), parent);
+        }
+    }
+    None
+}
+
+pub fn insert_to_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     parent: &NodeCellRef,
@@ -129,32 +156,21 @@ pub fn insert_to_node<KS, PS>(
     });
     let modification = match search {
         InsertSearchResult::RightNode(node) => {
-            insert_to_node(tree,&node, parent, key, level)
+            insert_to_tree_node(tree, &node, parent, key, level)
         }
         InsertSearchResult::External => {
-            insert_external(tree, node_ref, parent, key)
+            insert_external_tree_node(tree, node_ref, parent, key)
         }
         InsertSearchResult::Internal(sub_node) => {
             let split_res =
-                insert_to_node(tree, &sub_node, node_ref, key, level + 1);
-            insert_internal(split_res, parent)
+                insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1);
+            insert_internal_tree_node(split_res, parent)
         }
     };
     if level == 0 {
-        if let &Some(ref split) = &modification {
-            let current_root = tree.get_root();
-            if  current_root.deref::<KS, PS>().read_unchecked().first_key() != split.left_node_latch.first_key() &&
-                split.left_node_latch.has_vaild_right_node() {
-                // at this point, root split occurred when waiting for the latch
-                // the new right node should be inserted to any right node of the old root
-                // hopefully that node won't split again
-                let current_root_guard = write_node(&current_root);
-                // at this point, the root may have split again, we need to search for the exact one
-                let mut root_level_target = write_key_page(current_root_guard, &split.pivot);
-                // assert this even in production
-                assert!(!root_level_target.is_ext());
-                return root_level_target.innode_mut().insert(split.pivot.clone(), split.new_right_node.clone(), parent);
-            }
+        let root_modified = check_root_modification(tree, &modification, parent);
+        if root_modified.is_some() {
+            return root_modified;
         }
     }
     modification

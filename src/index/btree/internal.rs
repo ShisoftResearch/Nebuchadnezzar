@@ -295,7 +295,7 @@ impl <KS, PS>InNode<KS, PS>
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
                 debug_assert!(self.len >= right_ptr_pos);
-                debug_assert!(!self.ptrs.as_slice()[right_ptr_pos].deref::<KS, PS>().read_unchecked().is_none());
+                debug_assert!(!read_unchecked::<KS, PS>(&self.ptrs.as_slice()[right_ptr_pos]).is_none());
                 let pivot_key_pos = right_ptr_pos - 1;
                 let pivot_key = self.keys.as_slice()[pivot_key_pos].to_owned();
                 debug_assert!(pivot_key > smallvec!(0),

@@ -150,7 +150,7 @@ impl <KS, PS>NodeData<KS, PS>
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
         if self.is_empty() || self.len() > 0 && self.last_key() < key {
-            let right_node: &Self = self.right_ref().unwrap().deref().read_unchecked();
+            let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
             if !right_node.is_none() && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key) {
                 debug!(
                     "found key to put to right page {:?}/{:?}",
@@ -269,11 +269,6 @@ impl <KS, PS>Node<KS, PS>
     pub fn new_external(id: Id) -> Self {
         Self::external(ExtNode::new(id))
     }
-
-    pub fn read_unchecked(&self) -> &NodeData<KS, PS> {
-        unsafe { &*self.data.get() }
-    }
-
     pub fn version(&self) -> usize {
         node_version(self.cc.load(SeqCst))
     }
@@ -312,11 +307,7 @@ pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
-    let mut handler = NodeReadHandler {
-        ptr: node.deref().data.get(),
-        version: 0,
-        node_ref: node.clone()
-    };
+    let mut handler = read_unchecked(node);
     let cc = &node.deref::<KS, PS>().cc;
     loop {
         let cc_num = cc.load(SeqCst);
@@ -331,6 +322,17 @@ pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a
             return res;
         }
         // debug!("read version changed, retry {:b}", cc_num);
+    }
+}
+
+pub fn read_unchecked<KS, PS>(node: &NodeCellRef) -> NodeReadHandler<KS, PS>
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    NodeReadHandler {
+        ptr: node.deref().data.get(),
+        version: 0,
+        node_ref: node.clone()
     }
 }
 

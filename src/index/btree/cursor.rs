@@ -54,7 +54,7 @@ impl <KS, PS>IndexCursor for RTCursor<KS, PS>
                 match self.ordering {
                     Ordering::Forward => {
                         if page.is_empty() {
-                            let next_node = ext_page.next.deref::<KS, PS>().read_unchecked();
+                            let next_node = read_unchecked::<KS, PS>(&ext_page.next);
                             self.index = 0;
                             self.page = Some(ext_page.next.clone());
                             if next_node.is_none() {
@@ -90,7 +90,7 @@ impl <KS, PS>IndexCursor for RTCursor<KS, PS>
                     }
                     Ordering::Backward => {
                         if page.is_empty() {
-                            let prev_node = ext_page.prev.deref::<KS, PS>().read_unchecked();
+                            let prev_node = read_unchecked::<KS, PS>(&ext_page.prev);
                             self.index = 0;
                             self.page = Some(ext_page.next.clone());
                             if prev_node.is_none() {

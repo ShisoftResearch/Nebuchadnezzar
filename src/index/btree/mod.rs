@@ -131,7 +131,7 @@ impl <KS, PS> BPlusTree<KS, PS>
     }
 
     pub fn insert(&self, key: &EntryKey) {
-        match insert_to_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
+        match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(split) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
@@ -145,10 +145,10 @@ impl <KS, PS> BPlusTree<KS, PS>
                 let mut old_root = self.get_root().clone();
                 // check latched root and current root are the same node
                 debug_assert_eq!(
-                    old_root.deref::<KS, PS>().read_unchecked().first_key(),
+                    read_unchecked::<KS, PS>(&old_root).first_key(),
                     split.left_node_latch.first_key(),
                     "root verification failed, left node right node type: {}",
-                    split.left_node_latch.innode().right.deref::<KS, PS>().read_unchecked().type_name()
+                    read_unchecked::<KS, PS>(&split.left_node_latch.innode().right).type_name()
                 );
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
@@ -165,7 +165,7 @@ impl <KS, PS> BPlusTree<KS, PS>
         let result = remove_from_node(self, &mut root, &mut key.clone(), &self.root_versioning, 0);
         if let Some(rebalance) = result.rebalancing {
             let root_node = rebalance.parent;
-            if (*self.root.read()).deref::<KS, PS>().read_unchecked().innode().keys.as_slice_immute()[0] == root_node.innode().keys.as_slice_immute()[0] {
+            if read_unchecked::<KS, PS>(&(*self.root.read())).innode().keys.as_slice_immute()[0] == root_node.innode().keys.as_slice_immute()[0] {
                 // Make sure root node does not changed during the process. If it did changed, ignore it
                 // When root is external and have no keys but one pointer will take the only sub level
                 // pointer node as the new root node.
@@ -333,7 +333,8 @@ pub mod test {
 
     fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
         unsafe {
-            match &*node.deref().read_unchecked() {
+            let node = read_unchecked(&*node);
+            match &*node {
                 &NodeData::External(ref node) => {
                     let node: &ExtNode<KeySlice, PtrSlice> = node;
                     let keys = node
@@ -350,8 +351,8 @@ pub mod test {
                         keys,
                         nodes: vec![],
                         id: Some(format!("{:?}", node.id)),
-                        next: Some(format!("{:?}", node.next.deref::<KeySlice, PtrSlice>().read_unchecked().ext_id())),
-                        prev: Some(format!("{:?}", node.prev.deref::<KeySlice, PtrSlice>().read_unchecked().ext_id())),
+                        next: Some(format!("{:?}", read_unchecked::<KeySlice, PtrSlice>(&node.next).ext_id())),
+                        prev: Some(format!("{:?}", read_unchecked::<KeySlice, PtrSlice>(&node.prev).ext_id())),
                         len: node.len,
                         is_external: true,
                     };
@@ -883,7 +884,7 @@ pub mod test {
             let mut ext_node = guard.extnode_mut();
             ext_node.insert(&key, &tree, &node, &dummy_node);
         });
-        let read: &NodeData<KeySlice, PtrSlice> = node.deref().read_unchecked();
+        let read = read_unchecked::<KeySlice, PtrSlice>(&node);
         let extnode = read.extnode();
         for i in 0..read.len() - 1 {
             assert!(extnode.keys[i] < extnode.keys[i + 1]);

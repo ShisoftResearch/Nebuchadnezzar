@@ -154,13 +154,13 @@ impl <KS, PS>ExtNode<KS, PS>
                 &keys_1.as_slice()[keys_1_len - 1],
                 pos
             );
-            debug_assert!(extnode_2.prev.deref::<KS, PS>().read_unchecked().is_ext());
+            debug_assert!(read_unchecked::<KS, PS>(&extnode_2.prev).is_ext());
             self.len = keys_1_len;
             debug!(
                 "Split to left len {}, right len {}, right prev id: {:?}",
                 self.len,
                 extnode_2.len,
-                extnode_2.prev.deref::<KS, PS>().read_unchecked().ext_id()
+                read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
             );
             let node_2 = NodeCellRef::new(Node::external(extnode_2));
             {

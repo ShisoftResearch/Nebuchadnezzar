@@ -11,6 +11,7 @@ use index::btree::node::EmptyNode;
 use index::btree::node::write_key_page;
 use index::btree::node::NodeReadHandler;
 use index::btree::BPlusTree;
+use index::btree::node::read_unchecked;
 
 pub enum RemoveSearchResult {
     External,
@@ -143,7 +144,7 @@ pub fn remove_from_node<KS, PS>(
                             // Because we cannot lock from left to right, we have to move the content
                             // of the right node to the left and remove the right node instead so the
                             // left right pointers can be modified
-                            if !rebalancing.left_guard.is_empty() || (level == 0 && (*tree.root.read()).deref::<KS, PS>().read_unchecked().first_key() != rebalancing.left_guard.first_key()) {
+                            if !rebalancing.left_guard.is_empty() || (level == 0 && read_unchecked::<KS, PS>(&(*tree.root.read())).first_key() != rebalancing.left_guard.first_key()) {
                                 return;
                             }
 
@@ -284,7 +285,7 @@ pub fn remove_from_node<KS, PS>(
                 if pos >= node.len {
                     debug!(
                         "Removing pos overflows external node, pos {}, len {}, expecting key {:?}, current keys {:?}, right keys {:?}",
-                        pos, node.len, key, node.keys, node.next.deref::<KS, PS>().read_unchecked().keys()
+                        pos, node.len, key, node.keys, read_unchecked::<KS, PS>(&node.next).keys()
                     );
                     remove_result.removed = false;
                 }
