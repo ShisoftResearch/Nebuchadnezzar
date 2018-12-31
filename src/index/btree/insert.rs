@@ -10,7 +10,6 @@ use index::btree::node::NodeWriteGuard;
 use index::btree::node::write_node;
 use index::btree::node::write_key_page;
 use index::btree::node::read_unchecked;
-use index::btree::node::NodeRefOrGuard;
 
 pub enum InsertSearchResult {
     External,
@@ -62,7 +61,7 @@ pub fn insert_internal_tree_node<KS, PS>(
             let mut split_result = target_guard.innode_mut().insert(
                 pivot,
                 split.new_right_node,
-                NodeRefOrGuard::Reference(parent)
+                parent
             );
             if let &mut Some(ref mut split) = &mut split_result {
                 split.left_node_latch = target_guard;
@@ -94,7 +93,7 @@ pub fn insert_external_tree_node<KS, PS>(
         key,
         tree,
         node_ref,
-        NodeRefOrGuard::Reference(parent)
+        parent
     );
     if let &mut Some(ref mut split) = &mut split_result {
         split.left_node_latch = searched_guard;
@@ -125,7 +124,7 @@ pub fn check_root_modification<KS, PS>(
             root_level_target.innode_mut().insert(
                 split.pivot.clone(),
                 split.new_right_node.clone(),
-                NodeRefOrGuard::Reference(parent));
+                parent);
         }
     }
     None

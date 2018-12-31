@@ -609,7 +609,7 @@ fn node_lock() {
         let mut key = SmallVec::from_slice(&key_slice);
         let mut guard = write_node::<KeySlice, PtrSlice>(&node);
         let mut ext_node = guard.extnode_mut();
-        ext_node.insert(&key, &tree, &node, NodeRefOrGuard::Reference(&dummy_node));
+        ext_node.insert(&key, &tree, &node, &dummy_node);
     });
     let read = read_unchecked::<KeySlice, PtrSlice>(&node);
     let extnode = read.extnode();
