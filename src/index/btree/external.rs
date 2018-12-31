@@ -103,6 +103,68 @@ impl <KS, PS>ExtNode<KS, PS>
                pos, cached_len, self.keys.as_slice()[pos]);
         self.keys.remove_at(pos, cached_len);
     }
+
+    pub fn split_insert(
+        &mut self,
+        key: EntryKey,
+        pos: usize,
+        self_ref: &NodeCellRef,
+        self_next: &mut NodeWriteGuard<KS, PS>,
+        tree: &BPlusTree<KS, PS>
+    ) -> (NodeCellRef, EntryKey) {
+        // cached.dump();
+        let pivot = self.len / 2;
+        let new_page_id = tree.new_page_id();
+        let mut keys_1 = &mut self.keys;
+        let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
+        let mut keys_1_len = pivot;
+        let mut keys_2_len = self.len - pivot;
+        // modify next node point previous to new node
+        insert_into_split(
+            key,
+            keys_1,
+            &mut keys_2,
+            &mut keys_1_len,
+            &mut keys_2_len,
+            pos,
+        );
+        let pivot_key = keys_2.as_slice()[0].clone();
+        let extnode_2: ExtNode<KS, PS> = ExtNode {
+            id: new_page_id,
+            keys: keys_2,
+            next: self.next.clone(),
+            prev: self_ref.clone(),
+            len: keys_2_len,
+            dirty: true,
+            mark: PhantomData
+        };
+        debug_assert!(pivot_key > smallvec!(0));
+        debug_assert!(
+            &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
+            "{:?} / {:?} @ {}",
+            pivot_key,
+            &keys_1.as_slice()[keys_1_len - 1],
+            pos
+        );
+        debug_assert!(read_unchecked::<KS, PS>(&extnode_2.prev).is_ext());
+        self.len = keys_1_len;
+        debug!(
+            "Split to left len {}, right len {}, right prev id: {:?}",
+            self.len,
+            extnode_2.len,
+            read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
+        );
+        let node_2 = NodeCellRef::new(Node::external(extnode_2));
+        {
+            if !self_next.is_none() {
+                self_next.extnode_mut().prev = node_2.clone();
+            }
+        }
+        self.next = node_2.clone();
+
+        (node_2, pivot_key)
+    }
+
     pub fn insert(
         &mut self,
         key: &EntryKey,
@@ -110,78 +172,26 @@ impl <KS, PS>ExtNode<KS, PS>
         self_ref: &NodeCellRef,
         parent: &NodeCellRef,
     ) -> Option<NodeSplit<KS, PS>> {
-        let self_len = self.len;
         let key = key.clone();
         let pos = self.search(&key);
-        debug_assert!(self_len <= KS::slice_len());
-        debug_assert!(pos <= self_len);
-        if self_len == KS::slice_len() {
+        debug_assert!(self.len <= KS::slice_len());
+        debug_assert!(pos <= self.len);
+        if self.len == KS::slice_len() {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
             let mut parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
-            // cached.dump();
-            let pivot = self_len / 2;
-            let new_page_id = tree.new_page_id();
-            let mut keys_1 = &mut self.keys;
-            let mut keys_2 = keys_1.split_at_pivot(pivot, self_len);
-            let mut keys_1_len = pivot;
-            let mut keys_2_len = self_len - pivot;
-            // modify next node point previous to new node
-            insert_into_split(
-                key,
-                keys_1,
-                &mut keys_2,
-                &mut keys_1_len,
-                &mut keys_2_len,
-                pos,
-            );
-            let pivot_key = keys_2.as_slice()[0].clone();
-            let extnode_2: ExtNode<KS, PS> = ExtNode {
-                id: new_page_id,
-                keys: keys_2,
-                next: self.next.clone(),
-                prev: self_ref.clone(),
-                len: keys_2_len,
-                dirty: true,
-                mark: PhantomData
-            };
-            debug_assert!(pivot_key > smallvec!(0));
-            debug_assert!(
-                &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
-                "{:?} / {:?} @ {}",
-                pivot_key,
-                &keys_1.as_slice()[keys_1_len - 1],
-                pos
-            );
-            debug_assert!(read_unchecked::<KS, PS>(&extnode_2.prev).is_ext());
-            self.len = keys_1_len;
-            debug!(
-                "Split to left len {}, right len {}, right prev id: {:?}",
-                self.len,
-                extnode_2.len,
-                read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
-            );
-            let node_2 = NodeCellRef::new(Node::external(extnode_2));
-            {
-                if !self_next.is_none() {
-                    self_next.extnode_mut().prev = node_2.clone();
-                }
-            }
-            self.next = node_2.clone();
-
-            return Some(NodeSplit {
+            let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
+            Some(NodeSplit {
                 new_right_node: node_2,
                 pivot: pivot_key,
                 parent_latch,
                 left_node_latch: NodeWriteGuard::default(),
-            });
+            })
         } else {
             debug!("insert to external without split at {}, key {:?}", pos, key);
-            let mut new_cached_len = self_len;
-            self.keys.insert_at(key, pos, &mut new_cached_len);
-            self.len = new_cached_len;
-            return None;
+            self.keys.insert_at(key, pos, &mut self.len);
+            None
         }
     }
     pub fn merge_with(&mut self, right: &mut Self) {
