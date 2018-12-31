@@ -64,6 +64,107 @@ impl <KS, PS>InNode<KS, PS>
         self.keys.remove_at(key_pos, n_key_len);
         self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
     }
+
+    pub fn split_insert(
+        &mut self,
+        key: EntryKey,
+        new_node: NodeCellRef,
+        pos: usize,
+    ) -> (NodeCellRef, EntryKey) {
+        let node_len = self.len;
+        let ptr_len = self.len + 1;
+        let pivot = node_len / 2; // pivot key will be removed
+        debug!("Going to split at pivot {}", pivot);
+        let keys_split = {
+            debug!("insert into keys");
+            if pivot == pos {
+                debug!("special key treatment when pivot == pos");
+                let mut keys_1 = &mut self.keys;
+                let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
+                let mut keys_1_len = pivot;
+                let mut keys_2_len = node_len - pivot;
+                let pivot_key = key;
+                InNodeKeysSplit {
+                    keys_2,
+                    keys_1_len,
+                    keys_2_len,
+                    pivot_key,
+                }
+            } else {
+                let mut keys_1 = &mut self.keys;
+                let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
+                let mut keys_1_len = pivot; // will not count the pivot
+                let mut keys_2_len = node_len - pivot - 1;
+                let mut key_pos = pos;
+                if pos > pivot {
+                    // pivot moved, need to compensate
+                    key_pos -= 1;
+                }
+                debug!(
+                    "keys 1 len: {}, keys 2 len: {}, pos {}",
+                    keys_1_len, keys_2_len, key_pos
+                );
+                debug_assert_ne!(pivot, pos);
+                let pivot_key = keys_1.as_slice()[pivot].to_owned();
+                insert_into_split(
+                    key,
+                    keys_1,
+                    &mut keys_2,
+                    &mut keys_1_len,
+                    &mut keys_2_len,
+                    key_pos,
+                );
+                InNodeKeysSplit {
+                    keys_2,
+                    keys_1_len,
+                    keys_2_len,
+                    pivot_key,
+                }
+            }
+        };
+        let ptr_split = {
+            if pivot == pos {
+                debug!("special ptr treatment when pivot == pos");
+                let mut ptrs_1 = &mut self.ptrs;
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                let mut ptrs_1_len = pivot + 1;
+                let mut ptrs_2_len = ptr_len - pivot - 1;
+                ptrs_2.insert_at(new_node, 0, &mut ptrs_2_len);
+                debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                InNodePtrSplit { ptrs_2 }
+            } else {
+                debug!("insert into ptrs");
+                let mut ptrs_1 = &mut self.ptrs;
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                let mut ptrs_1_len = pivot + 1;
+                let mut ptrs_2_len = ptr_len - pivot - 1;
+                let mut ptr_pos = pos + 1;
+                insert_into_split(
+                    new_node,
+                    ptrs_1,
+                    &mut ptrs_2,
+                    &mut ptrs_1_len,
+                    &mut ptrs_2_len,
+                    ptr_pos,
+                );
+                debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
+                debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
+                InNodePtrSplit { ptrs_2 }
+            }
+        };
+        let node_2 = InNode {
+            len: keys_split.keys_2_len,
+            keys: keys_split.keys_2,
+            ptrs: ptr_split.ptrs_2,
+            right: self.right.clone(),
+        };
+        let node_2_ref = NodeCellRef::new(Node::internal(node_2));
+        self.len = keys_split.keys_1_len;
+        self.right = node_2_ref.clone();
+        (node_2_ref, keys_split.pivot_key)
+    }
+
     pub fn insert(
         &mut self,
         key: EntryKey,
@@ -76,100 +177,12 @@ impl <KS, PS>InNode<KS, PS>
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         debug_assert!(node_len <= KS::slice_len());
         if node_len == KS::slice_len() {
-            let pivot = node_len / 2; // pivot key will be removed
-            debug!("Going to split at pivot {}", pivot);
             let parent_guard = write_node(parent);
-            let keys_split = {
-                debug!("insert into keys");
-                if pivot == pos {
-                    debug!("special key treatment when pivot == pos");
-                    let mut keys_1 = &mut self.keys;
-                    let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
-                    let mut keys_1_len = pivot;
-                    let mut keys_2_len = node_len - pivot;
-                    let pivot_key = key;
-                    InNodeKeysSplit {
-                        keys_2,
-                        keys_1_len,
-                        keys_2_len,
-                        pivot_key,
-                    }
-                } else {
-                    let mut keys_1 = &mut self.keys;
-                    let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
-                    let mut keys_1_len = pivot; // will not count the pivot
-                    let mut keys_2_len = node_len - pivot - 1;
-                    let mut key_pos = pos;
-                    if pos > pivot {
-                        // pivot moved, need to compensate
-                        key_pos -= 1;
-                    }
-                    debug!(
-                        "keys 1 len: {}, keys 2 len: {}, pos {}",
-                        keys_1_len, keys_2_len, key_pos
-                    );
-                    debug_assert_ne!(pivot, pos);
-                    let pivot_key = keys_1.as_slice()[pivot].to_owned();
-                    insert_into_split(
-                        key,
-                        keys_1,
-                        &mut keys_2,
-                        &mut keys_1_len,
-                        &mut keys_2_len,
-                        key_pos,
-                    );
-                    InNodeKeysSplit {
-                        keys_2,
-                        keys_1_len,
-                        keys_2_len,
-                        pivot_key,
-                    }
-                }
-            };
-            let ptr_split = {
-                if pivot == pos {
-                    debug!("special ptr treatment when pivot == pos");
-                    let mut ptrs_1 = &mut self.ptrs;
-                    let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
-                    let mut ptrs_1_len = pivot + 1;
-                    let mut ptrs_2_len = ptr_len - pivot - 1;
-                    ptrs_2.insert_at(new_node, 0, &mut ptrs_2_len);
-                    debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
-                    debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
-                    InNodePtrSplit { ptrs_2 }
-                } else {
-                    debug!("insert into ptrs");
-                    let mut ptrs_1 = &mut self.ptrs;
-                    let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
-                    let mut ptrs_1_len = pivot + 1;
-                    let mut ptrs_2_len = ptr_len - pivot - 1;
-                    let mut ptr_pos = pos + 1;
-                    insert_into_split(
-                        new_node,
-                        ptrs_1,
-                        &mut ptrs_2,
-                        &mut ptrs_1_len,
-                        &mut ptrs_2_len,
-                        ptr_pos,
-                    );
-                    debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
-                    debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
-                    InNodePtrSplit { ptrs_2 }
-                }
-            };
-            let node_2 = InNode {
-                len: keys_split.keys_2_len,
-                keys: keys_split.keys_2,
-                ptrs: ptr_split.ptrs_2,
-                right: self.right.clone(),
-            };
-            let node_2_ref = NodeCellRef::new(Node::internal(node_2));
-            self.len = keys_split.keys_1_len;
-            self.right = node_2_ref.clone();
+            let (node_2, pivot_key) = self.split_insert(key, new_node, pos);
             return Some(NodeSplit {
-                new_right_node: node_2_ref,
+                new_right_node: node_2,
                 left_node_latch: NodeWriteGuard::default(),
-                pivot: keys_split.pivot_key,
+                pivot: pivot_key,
                 parent_latch: parent_guard,
             });
         } else {
