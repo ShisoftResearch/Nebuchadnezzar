@@ -12,6 +12,8 @@ use index::btree::node::write_key_page;
 use index::btree::node::NodeReadHandler;
 use index::btree::BPlusTree;
 use index::btree::node::read_unchecked;
+use index::btree::search::mut_search;
+use index::btree::search::MutSearchResult;
 
 pub enum RemoveSearchResult {
     External,
@@ -111,21 +113,10 @@ pub fn remove_from_node<KS, PS>(
           PS: Slice<NodeCellRef> + 'static
 {
     debug!("Removing {:?} from node, level {}", key, level);
-    let mut search = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| {
-        match &**node {
-            &NodeData::Internal(ref n) => {
-                let pos = n.search(key);
-                let sub_node = n.ptrs.as_slice_immute()[pos].clone();
-                RemoveSearchResult::Internal(sub_node)
-            }
-            &NodeData::External(_) => RemoveSearchResult::External,
-            &NodeData::Empty(ref n) => RemoveSearchResult::RightNode(n.right.clone()),
-            &NodeData::None => unreachable!()
-        }
-    });
+    let mut search = mut_search::<KS, PS>(node_ref, key);
     match search {
-        RemoveSearchResult::RightNode(mut node) => return remove_from_node(tree,&mut node, key, parent, level),
-        RemoveSearchResult::Internal(mut sub_node) => {
+        MutSearchResult::RightNode(mut node) => return remove_from_node(tree,&mut node, key, parent, level),
+        MutSearchResult::Internal(mut sub_node) => {
             let mut node_remove_res = remove_from_node(tree,&mut sub_node, key, node_ref, level + 1);
             let removed = node_remove_res.removed;
             if let Some(mut rebalancing) = node_remove_res.rebalancing {
@@ -244,7 +235,7 @@ pub fn remove_from_node<KS, PS>(
                 }
             })
         }
-        RemoveSearchResult::External => {
+        MutSearchResult::External => {
             let node_guard: NodeWriteGuard<KS, PS> = write_node(node_ref);
             let mut target_guard = write_key_page(node_guard, key);
             let target_guard_ref = target_guard.node_ref().clone();

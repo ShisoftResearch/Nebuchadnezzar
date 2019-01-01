@@ -10,6 +10,8 @@ use index::btree::node::NodeWriteGuard;
 use index::btree::node::write_node;
 use index::btree::node::write_key_page;
 use index::btree::node::read_unchecked;
+use index::btree::search::mut_search;
+use index::btree::search::MutSearchResult;
 
 pub enum InsertSearchResult {
     External,
@@ -140,31 +142,15 @@ pub fn insert_to_tree_node<KS, PS>(
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
-    let mut search = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
-        debug!(
-            "insert to node, len {}, external: {}",
-            node_handler.len(),
-            node_handler.is_ext()
-        );
-        match &**node_handler {
-            &NodeData::External(ref node) => InsertSearchResult::External,
-            &NodeData::Internal(ref node) => {
-                let pos = node.search(key);
-                let sub_node_ref = &node.ptrs.as_slice_immute()[pos];
-                InsertSearchResult::Internal(sub_node_ref.clone())
-            }
-            &NodeData::Empty(ref node) => InsertSearchResult::RightNode(node.right.clone()),
-            &NodeData::None => unreachable!(),
-        }
-    });
+    let mut search = mut_search::<KS, PS>(node_ref, key);
     let modification = match search {
-        InsertSearchResult::RightNode(node) => {
+        MutSearchResult::RightNode(node) => {
             insert_to_tree_node(tree, &node, parent, key, level)
         }
-        InsertSearchResult::External => {
+        MutSearchResult::External => {
             insert_external_tree_node(tree, node_ref, parent, key)
         }
-        InsertSearchResult::Internal(sub_node) => {
+        MutSearchResult::Internal(sub_node) => {
             let split_res =
                 insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1);
             insert_internal_tree_node(split_res, parent)

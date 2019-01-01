@@ -48,3 +48,27 @@ pub fn search_node<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey, ordering: Ord
         }
     })
 }
+
+pub enum MutSearchResult {
+    External,
+    RightNode(NodeCellRef),
+    Internal(NodeCellRef),
+}
+
+pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> MutSearchResult
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    read_node(node_ref, |node: &NodeReadHandler<KS, PS>| {
+        match &**node {
+            &NodeData::Internal(ref n) => {
+                let pos = n.search(key);
+                let sub_node = n.ptrs.as_slice_immute()[pos].clone();
+                MutSearchResult::Internal(sub_node)
+            }
+            &NodeData::External(_) => MutSearchResult::External,
+            &NodeData::Empty(ref n) => MutSearchResult::RightNode(n.right.clone()),
+            &NodeData::None => unreachable!()
+        }
+    })
+}

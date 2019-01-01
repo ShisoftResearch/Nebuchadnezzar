@@ -54,6 +54,7 @@ mod node;
 mod insert;
 mod search;
 mod remove;
+mod merge;
 
 const CACHE_SIZE: usize = 2048;
 
