@@ -212,7 +212,7 @@ impl <KS, PS>ExtNode<KS, PS>
     pub fn merge_sort(&mut self, right: &[&EntryKey]) {
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
-        let mut new_slice = Self::new(self.id);
+        let mut new_node = Self::new(self.id);
         let mut pos = self.len;
         let mut left_pos = 0;
         let mut right_pos = 0;
@@ -220,25 +220,29 @@ impl <KS, PS>ExtNode<KS, PS>
             let left_key = &self.keys.as_slice_immute()[left_pos];
             let right_key = &self.keys.as_slice_immute()[right_pos];
             if left_key < right_key {
-                new_slice.keys.as_slice()[pos] = left_key.clone();
+                new_node.keys.as_slice()[pos] = left_key.clone();
                 left_pos += 1;
             } else {
-                new_slice.keys.as_slice()[pos] = right_key.clone();
+                new_node.keys.as_slice()[pos] = right_key.clone();
                 right_pos += 1;
             }
             pos += 1;
         }
         for key in &self.keys.as_slice()[left_pos..] {
-            new_slice.keys.as_slice()[pos] = key.clone();
+            new_node.keys.as_slice()[pos] = key.clone();
             pos += 1;
             left_pos += 1;
         }
         for key in &right[right_pos..] {
-            new_slice.keys.as_slice()[pos] = (*key).clone();
+            new_node.keys.as_slice()[pos] = (*key).clone();
             pos += 1;
             right_pos += 1;
         }
-        self.len = pos;
+        new_node.len = pos;
+        new_node.dirty = self.dirty;
+        new_node.next = self.next.clone();
+        new_node.prev = self.prev.clone();
+        *self = new_node;
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
