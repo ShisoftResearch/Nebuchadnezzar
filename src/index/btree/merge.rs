@@ -10,7 +10,9 @@ use index::btree::search::MutSearchResult;
 use index::btree::node::write_key_page;
 use index::btree::node::write_node;
 use index::btree::node::write_non_empty;
+use index::btree::node::read_unchecked;
 use itertools::Itertools;
+use index::btree::insert::check_root_modification;
 
 enum MergeSearch {
     External,
@@ -25,22 +27,51 @@ pub fn merge<KS, PS>(
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
+    let root = tree.get_root();
+    merge_into_tree_node(tree, &root, &tree.root_versioning, keys, 0);
+}
 
+fn merge_into_internal<KS, PS>(
+    node: &NodeCellRef,
+    lower_level_new_pages: Vec<(EntryKey, NodeCellRef)>,
+    new_pages: &mut Vec<(EntryKey, NodeCellRef)>
+)
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    let mut node_guard = write_node::<KS, PS>(node);
+    for (pivot, node) in lower_level_new_pages {
+        let mut target_guard = write_non_empty(write_key_page(node_guard, &pivot));
+        {
+            debug_assert!(!target_guard.is_none());
+            let innode = target_guard.innode_mut();
+            let pos = innode.search(&pivot);
+            if innode.len == KS::slice_len() - 1 {
+                // full node, going to split
+                let (node_ref, key) = innode.split_insert(pivot, node, pos);
+                new_pages.push((key, node_ref));
+            } else {
+                innode.insert_in_place(pivot, node, pos);
+            }
+        }
+        node_guard = target_guard;
+    }
 }
 
 pub fn merge_into_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node: &NodeCellRef,
     parent: &NodeCellRef,
-    keys: Vec<EntryKey>
+    keys: Vec<EntryKey>,
+    level: usize
 ) -> Vec<(EntryKey, NodeCellRef)>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
     let search = mut_search::<KS, PS>(node, &keys[0]);
-    match search {
+    let mut new_pages = match search {
         MutSearchResult::RightNode(node) => {
-            merge_into_tree_node(tree, &node, parent, keys)
+            merge_into_tree_node(tree, &node, parent, keys, level)
         }
         MutSearchResult::External => {
             // merge keys into internal pages
@@ -88,31 +119,20 @@ pub fn merge_into_tree_node<KS, PS>(
                     current_guard = right_guard;
                 }
             }
-            return new_pages;
+            new_pages
         }
         MutSearchResult::Internal(sub_node) => {
-            let lower_level_new_pages = merge_into_tree_node(tree, &sub_node, node, keys);
+            let lower_level_new_pages = merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
             let mut new_pages = vec![];
             if lower_level_new_pages.len() > 0 {
-                let mut node_guard = write_node::<KS, PS>(node);
-                for (pivot, node) in lower_level_new_pages {
-                    let mut target_guard = write_non_empty(write_key_page(node_guard, &pivot));
-                    {
-                        debug_assert!(!target_guard.is_none());
-                        let innode = target_guard.innode_mut();
-                        let pos = innode.search(&pivot);
-                        if innode.len == KS::slice_len() - 1 {
-                            // full node, going to split
-                            let (node_ref, key) = innode.split_insert(pivot, node, pos);
-                            new_pages.push((key, node_ref));
-                        } else {
-                            innode.insert_in_place(pivot, node, pos);
-                        }
-                    }
-                    node_guard = target_guard;
-                }
+                merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
             }
-            return new_pages;
+            new_pages
         }
+    };
+    if level == 0 && new_pages.len() > 0 {
+        // it is impossible to have a node been changed during merge for merges are performed in serial
+        debug_assert_eq!(read_unchecked::<KS, PS>(&tree.get_root()).first_key(), read_unchecked::<KS, PS>(&node).first_key())
     }
+    return new_pages;
 }
