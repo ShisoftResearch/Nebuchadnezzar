@@ -55,8 +55,7 @@ pub fn insert_internal_tree_node<KS, PS>(
             let pivot = split.pivot;
             debug!("New pivot {:?}", pivot);
             debug!("obtain latch for internal node split");
-            let mut self_guard = split.parent_latch;
-            let mut target_guard = write_key_page(self_guard, &pivot);
+            let mut target_guard = write_key_page(split.parent_latch, &pivot);
             debug_assert!(
                 read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= &pivot
             );
@@ -84,8 +83,7 @@ pub fn insert_external_tree_node<KS, PS>(
 {
     // latch nodes from left to right
     debug!("Obtain latch for external node");
-    let node_guard = write_node(node_ref);
-    let mut searched_guard = write_key_page(node_guard, key);
+    let mut searched_guard = write_key_page(write_node(node_ref), key);
     debug_assert!(
         searched_guard.is_ext(),
         "{:?}",

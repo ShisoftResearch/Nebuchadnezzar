@@ -33,7 +33,7 @@ pub fn merge_into_tree_node<KS, PS>(
     node: &NodeCellRef,
     parent: &NodeCellRef,
     keys: Vec<EntryKey>
-)
+) -> Vec<(EntryKey, NodeCellRef)>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
@@ -43,14 +43,11 @@ pub fn merge_into_tree_node<KS, PS>(
             merge_into_tree_node(tree, &node, parent, keys)
         }
         MutSearchResult::External => {
-            unimplemented!()
-        }
-        MutSearchResult::Internal(sub_node) => {
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
             let mut merging_pos = 0;
-            let mut current_guard = write_node::<KS, PS>(&sub_node);
+            let mut current_guard = write_node::<KS, PS>(&node);
             let mut new_pages = vec![];
             // merge by pages
             while merging_pos < keys.len() {
@@ -71,7 +68,7 @@ pub fn merge_into_tree_node<KS, PS>(
                     break;
                 }
                 let next_insert_key = &keys[merging_pos];
-                if key_upper_bound.is_some() && next_insert_key < key_upper_bound.as_ref().unwrap() {
+                if key_upper_bound.is_none() || next_insert_key < key_upper_bound.as_ref().unwrap() {
                     // trigger a split and put the split node into a cache
                     let insert_pos = target_page_guard.search(&keys[merging_pos]);
                     let target_node_ref = target_page_guard.node_ref().clone();
@@ -91,7 +88,31 @@ pub fn merge_into_tree_node<KS, PS>(
                     current_guard = right_guard;
                 }
             }
-            unimplemented!()
+            return new_pages;
+        }
+        MutSearchResult::Internal(sub_node) => {
+            let lower_level_new_pages = merge_into_tree_node(tree, &sub_node, node, keys);
+            let mut new_pages = vec![];
+            if lower_level_new_pages.len() > 0 {
+                let mut node_guard = write_node::<KS, PS>(node);
+                for (pivot, node) in lower_level_new_pages {
+                    let mut target_guard = write_non_empty(write_key_page(node_guard, &pivot));
+                    {
+                        debug_assert!(!target_guard.is_none());
+                        let innode = target_guard.innode_mut();
+                        let pos = innode.search(&pivot);
+                        if innode.len == KS::slice_len() - 1 {
+                            // full node, going to split
+                            let (node_ref, key) = innode.split_insert(pivot, node, pos);
+                            new_pages.push((key, node_ref));
+                        } else {
+                            innode.insert_in_place(pivot, node, pos);
+                        }
+                    }
+                    node_guard = target_guard;
+                }
+            }
+            return new_pages;
         }
     }
 }

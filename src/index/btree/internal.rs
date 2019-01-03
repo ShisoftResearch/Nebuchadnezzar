@@ -165,6 +165,16 @@ impl <KS, PS>InNode<KS, PS>
         (node_2_ref, keys_split.pivot_key)
     }
 
+    pub fn insert_in_place(&mut self, key: EntryKey, new_node: NodeCellRef, pos: usize) {
+        let node_len = self.len;
+        let mut new_node_len = node_len;
+        let mut new_node_pointers = node_len + 1;
+        self.keys.insert_at(key, pos, &mut new_node_len);
+        self.ptrs
+            .insert_at(new_node, pos + 1, &mut new_node_pointers);
+        self.len = new_node_len;
+    }
+
     pub fn insert(
         &mut self,
         key: EntryKey,
@@ -186,12 +196,7 @@ impl <KS, PS>InNode<KS, PS>
                 parent_latch: parent_guard,
             });
         } else {
-            let mut new_node_len = node_len;
-            let mut new_node_pointers = node_len + 1;
-            self.keys.insert_at(key, pos, &mut new_node_len);
-            self.ptrs
-                .insert_at(new_node, pos + 1, &mut new_node_pointers);
-            self.len = new_node_len;
+            self.insert_in_place(key, new_node, pos);
             return None;
         }
     }
