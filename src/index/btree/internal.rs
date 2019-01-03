@@ -40,6 +40,15 @@ impl <KS, PS>InNode<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
+    pub fn new(len: usize) -> Self {
+        InNode {
+            keys: KS::init(),
+            ptrs: PS::init(),
+            right: NodeCellRef::new(Node::<KS, PS>::none()),
+            len,
+        }
+    }
+
     pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
         if ptr_pos == 0 {
             0

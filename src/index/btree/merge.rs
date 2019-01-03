@@ -13,22 +13,14 @@ use index::btree::node::write_non_empty;
 use index::btree::node::read_unchecked;
 use itertools::Itertools;
 use index::btree::insert::check_root_modification;
+use index::btree::internal::InNode;
+use index::btree::node::Node;
+use index::btree::node::NodeData;
 
 enum MergeSearch {
     External,
     Internal(NodeCellRef),
     RightNode(NodeCellRef)
-}
-
-pub fn merge<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
-    keys: Vec<EntryKey>
-)
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
-{
-    let root = tree.get_root();
-    merge_into_tree_node(tree, &root, &tree.root_versioning, keys, 0);
 }
 
 fn merge_into_internal<KS, PS>(

@@ -46,6 +46,7 @@ use std::marker::PhantomData;
 use index::btree::insert::*;
 use index::btree::search::*;
 use index::btree::remove::*;
+use index::btree::merge::merge_into_tree_node;
 
 mod cursor;
 mod external;
@@ -137,12 +138,7 @@ impl <KS, PS> BPlusTree<KS, PS>
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
-                let mut new_in_root = InNode {
-                    keys: KS::init(),
-                    ptrs: PS::init(),
-                    right: NodeCellRef::new(Node::<KS, PS>::none()),
-                    len: 1,
-                };
+                let mut new_in_root: InNode<KS, PS> = InNode::new(1);
                 let mut old_root = self.get_root().clone();
                 // check latched root and current root are the same node
                 debug_assert_eq!(
@@ -180,9 +176,21 @@ impl <KS, PS> BPlusTree<KS, PS>
         result.removed
     }
 
-    pub fn merge_pages(&self, pages: Vec<EntryKey>) {
-        let first_key = &pages[0];
-
+    pub fn merge_page (&self, keys: Vec<EntryKey>) {
+        let root = self.get_root();
+        let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
+        if root_new_pages.len() > 0 {
+            let root_guard = write_node::<KS, PS>(&root);
+            let new_root_len = root_new_pages.len() + 1;
+            debug_assert!(new_root_len < KS::slice_len());
+            let mut new_in_root: InNode<KS, PS> = InNode::new(new_root_len);
+            new_in_root.ptrs.as_slice()[0] = root.clone();
+            for (i, (key, node)) in root_new_pages.into_iter().enumerate() {
+                new_in_root.keys.as_slice()[i] = key;
+                new_in_root.ptrs.as_slice()[i + 1] = node;
+            }
+            *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
+        }
     }
 
     pub fn flush_all(&self) {
