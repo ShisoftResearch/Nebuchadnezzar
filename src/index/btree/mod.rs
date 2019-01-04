@@ -178,6 +178,7 @@ impl <KS, PS> BPlusTree<KS, PS>
     }
 
     pub fn merge_page (&self, keys: Vec<EntryKey>) {
+        let keys_len = keys.len();
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
         if root_new_pages.len() > 0 {
@@ -192,7 +193,7 @@ impl <KS, PS> BPlusTree<KS, PS>
             }
             *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
         }
-        self.len.fetch_add(keys.len(), Relaxed);
+        self.len.fetch_add(keys_len, Relaxed);
     }
 
     pub fn flush_all(&self) {
