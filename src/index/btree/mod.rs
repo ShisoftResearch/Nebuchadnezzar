@@ -56,6 +56,7 @@ mod insert;
 mod search;
 mod remove;
 mod merge;
+mod prune;
 
 const CACHE_SIZE: usize = 2048;
 
@@ -191,6 +192,7 @@ impl <KS, PS> BPlusTree<KS, PS>
             }
             *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
         }
+        self.len.fetch_add(keys.len(), Relaxed);
     }
 
     pub fn flush_all(&self) {
