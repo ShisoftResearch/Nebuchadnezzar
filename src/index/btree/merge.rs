@@ -62,9 +62,6 @@ pub fn merge_into_tree_node<KS, PS>(
 {
     let search = mut_search::<KS, PS>(node, &keys[0]);
     let mut new_pages = match search {
-        MutSearchResult::RightNode(node) => {
-            merge_into_tree_node(tree, &node, parent, keys, level)
-        }
         MutSearchResult::External => {
             // merge keys into internal pages
             // this is a oneshot action.

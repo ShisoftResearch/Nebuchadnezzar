@@ -115,7 +115,6 @@ pub fn remove_from_node<KS, PS>(
     debug!("Removing {:?} from node, level {}", key, level);
     let mut search = mut_search::<KS, PS>(node_ref, key);
     match search {
-        MutSearchResult::RightNode(mut node) => return remove_from_node(tree,&mut node, key, parent, level),
         MutSearchResult::Internal(mut sub_node) => {
             let mut node_remove_res = remove_from_node(tree,&mut sub_node, key, node_ref, level + 1);
             let removed = node_remove_res.removed;

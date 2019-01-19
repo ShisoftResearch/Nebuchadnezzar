@@ -51,7 +51,6 @@ pub fn search_node<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey, ordering: Ord
 
 pub enum MutSearchResult {
     External,
-    RightNode(NodeCellRef),
     Internal(NodeCellRef),
 }
 
@@ -67,7 +66,7 @@ pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> MutSearchRe
                 MutSearchResult::Internal(sub_node)
             }
             &NodeData::External(_) => MutSearchResult::External,
-            &NodeData::Empty(ref n) => MutSearchResult::RightNode(n.right.clone()),
+            &NodeData::Empty(ref n) => mut_search::<KS, PS>(&n.right, key),
             &NodeData::None => unreachable!()
         }
     })

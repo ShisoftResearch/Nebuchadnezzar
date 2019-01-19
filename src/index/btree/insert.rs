@@ -142,9 +142,6 @@ pub fn insert_to_tree_node<KS, PS>(
 {
     let mut search = mut_search::<KS, PS>(node_ref, key);
     let modification = match search {
-        MutSearchResult::RightNode(node) => {
-            insert_to_tree_node(tree, &node, parent, key, level)
-        }
         MutSearchResult::External => {
             insert_external_tree_node(tree, node_ref, parent, key)
         }
