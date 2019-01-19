@@ -404,6 +404,27 @@ impl <KS, PS>NodeWriteGuard<KS, PS>
     pub fn node_ref(&self) -> &NodeCellRef {
         &self.node_ref
     }
+
+    // make an empty node as empty node, right node pointer covered
+    pub fn make_empty_node(&mut self) {
+        if self.is_empty_node() {
+            return;
+        }
+        debug_assert!(self.is_empty());
+        let data = &mut (**self);
+        let left_node = data.left_ref().cloned();
+        let right_node = data.right_ref().cloned().unwrap();
+        // check if have left node, if so then update the right node left pointer
+        if left_node.is_some() {
+            let mut right_guard = write_node::<KS, PS>(&right_node);
+            *right_guard.left_ref_mut().unwrap() = left_node.clone().unwrap();
+        }
+        let empty = EmptyNode {
+            left: left_node,
+            right: right_node
+        };
+        *data = NodeData::Empty(box empty)
+    }
 }
 
 unsafe impl <KS, PS> Sync for Node<KS, PS>
