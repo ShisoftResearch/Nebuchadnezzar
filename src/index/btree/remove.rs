@@ -1,3 +1,5 @@
+// This function is unstable yet, tests ignored
+
 use index::EntryKey;
 use index::btree::NodeCellRef;
 use index::Slice;
