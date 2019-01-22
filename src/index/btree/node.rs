@@ -197,8 +197,9 @@ impl <KS, PS>NodeData<KS, PS>
 
     pub fn right_ref_mut_no_empty(&mut self) -> Option<&mut NodeCellRef> {
         self.right_ref_mut().map(|right_ref| {
-            if read_unchecked::<KS, PS>(right_ref).is_empty_node() {
-                *right_ref = Self::get_non_empty_node(right_ref)
+            let right_node_handler = read_unchecked::<KS, PS>(right_ref);
+            if right_node_handler.is_empty_node() {
+                *right_ref = Self::get_non_empty_node(right_node_handler.right_ref().unwrap())
             };
             right_ref
         })
