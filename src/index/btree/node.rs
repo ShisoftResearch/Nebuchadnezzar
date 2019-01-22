@@ -177,13 +177,31 @@ impl <KS, PS>NodeData<KS, PS>
         }
     }
 
-    pub fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
+    fn get_non_empty_node(node_ref: &NodeCellRef) -> NodeCellRef {
+        let node = read_unchecked::<KS, PS>(node_ref);
+        if node.is_empty_node() {
+            Self::get_non_empty_node(node.right_ref().unwrap())
+        } else {
+            node_ref.clone()
+        }
+    }
+
+    fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.next),
             &mut NodeData::Internal(ref mut n) => Some(&mut n.right),
             &mut NodeData::Empty(ref mut n) => Some(&mut n.right),
             &mut NodeData::None => None,
         }
+    }
+
+    pub fn right_ref_mut_no_empty(&mut self) -> Option<&mut NodeCellRef> {
+        self.right_ref_mut().map(|right_ref| {
+            if read_unchecked::<KS, PS>(right_ref).is_empty_node() {
+                *right_ref = Self::get_non_empty_node(right_ref)
+            };
+            right_ref
+        })
     }
 
     pub fn right_ref(&self) -> Option<&NodeCellRef> {

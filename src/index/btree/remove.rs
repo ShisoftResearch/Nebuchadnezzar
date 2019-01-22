@@ -143,14 +143,14 @@ pub fn remove_from_node<KS, PS>(
                             // swap the content of left and right, then delete right
                             // this procedure will prevent locking left node for changing right reference
                             let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
-                            let right_right_ref = right_node.right_ref_mut().map(|r| r.clone());
+                            let right_right_ref = right_node.right_ref_mut_no_empty().map(|r| r.clone());
                             let left_ref = rebalancing.left_ref.clone();
                             // swap the empty node with the right node. In this case left node holds
                             // content of the right node but pointers need to be corrected.
                             mem::swap(left_node, right_node);
                             *right_node = NodeData::Empty(box EmptyNode { left: Some(left_ref.clone()), right: left_ref.clone() });
                             left_node.left_ref_mut().map(|r| *r = left_left_ref.unwrap());
-                            left_node.right_ref_mut().map(|r| *r = right_right_ref.unwrap());
+                            left_node.right_ref_mut_no_empty().map(|r| *r = right_right_ref.unwrap());
                             rebalancing.right_right_guard.left_ref_mut().map(|r| *r = left_ref);
                             // remove the left ptr
                             rebalancing.parent.remove(rebalancing.parent_pos);
@@ -171,7 +171,7 @@ pub fn remove_from_node<KS, PS>(
                             // There is a right empty node that can be deleted directly without hassle
                             let mut node_to_remove = &mut rebalancing.right_guard;
                             let owned_left_ref = rebalancing.left_ref.clone();
-                            rebalancing.left_guard.right_ref_mut().map(|r| *r = node_to_remove.right_ref_mut().unwrap().clone());
+                            rebalancing.left_guard.right_ref_mut_no_empty().map(|r| *r = node_to_remove.right_ref_mut_no_empty().unwrap().clone());
                             rebalancing.right_right_guard.left_ref_mut().map(|r| *r = owned_left_ref);
                             rebalancing.parent.remove(rebalancing.parent_pos + 1);
                         }))
