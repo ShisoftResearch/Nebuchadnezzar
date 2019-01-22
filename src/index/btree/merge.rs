@@ -73,7 +73,7 @@ pub fn merge_into_tree_node<KS, PS>(
             while merging_pos < keys.len() {
                 let start_key = &keys[merging_pos];
                 let mut target_page_guard = write_key_page(current_guard, start_key);
-                let mut right_guard = write_non_empty(write_node::<KS, PS>(target_page_guard.right_ref().unwrap()));
+                let mut right_guard = write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
                 let key_upper_bound = if right_guard.is_none() { None } else { Some(right_guard.first_key().clone()) };
                 let selection = keys[merging_pos..].iter()
                     .filter(|k| match &key_upper_bound {

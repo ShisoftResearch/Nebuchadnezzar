@@ -218,29 +218,29 @@ impl <KS, PS>NodeData<KS, PS>
     }
 }
 
-pub fn write_non_empty<KS, PS>(search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>
+pub fn write_non_empty<KS, PS>(mut search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
     if !search_page.is_none() && search_page.is_empty() {
-        return write_non_empty(write_node(search_page.right_ref().unwrap()))
+        return write_node(search_page.right_ref_mut_no_empty().unwrap())
     }
     return search_page;
 }
 
 pub fn write_key_page<KS, PS>(
-    search_page: NodeWriteGuard<KS, PS>,
+    mut search_page: NodeWriteGuard<KS, PS>,
     key: &EntryKey,
 ) -> NodeWriteGuard<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
     if search_page.is_empty() || search_page.len() > 0 && search_page.last_key() < key {
-        let right_ref = search_page.right_ref().unwrap();
-        let right_node = write_non_empty(write_node(right_ref));
-        if !right_node.is_none() && (search_page.is_empty() || right_node.len() > 0 && right_node.first_key() <= key) {
-            debug!("Will write {:?} from left {} node to right page, start with {:?}, keys {:?}",
-                   key, search_page.type_name(),
+        let right_ref = search_page.right_ref_mut_no_empty().unwrap();
+        let right_node = write_node(right_ref);
+        if !right_node.is_none() && (right_node.len() > 0 && right_node.first_key() <= key) {
+            debug!("Will write {:?} from left node to right page, start with {:?}, keys {:?}",
+                   key,
                    if right_node.is_empty() { smallvec!(0) } else { right_node.first_key().clone() },
                    if right_node.is_empty() { &[] } else { right_node.keys() });
             return write_key_page(right_node, key);
@@ -431,7 +431,7 @@ impl <KS, PS>NodeWriteGuard<KS, PS>
         debug_assert!(self.is_empty());
         let data = &mut (**self);
         let left_node = data.left_ref().cloned();
-        let right_node = data.right_ref().cloned().unwrap();
+        let right_node = data.right_ref_mut_no_empty().cloned().unwrap();
         // check if have left node, if so then update the right node left pointer
         if left_node.is_some() {
             let mut right_guard = write_node::<KS, PS>(&right_node);

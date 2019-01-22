@@ -77,7 +77,7 @@ pub fn with_innode_removing<F, KS, PS>(
         parent_right_right_guard = None;
         parent_parent_remove_pos = 0;
     } else {
-        let pre_locked_parent_right_right_guard = parent_right_guard.right_ref().map(|r| write_node(r));
+        let pre_locked_parent_right_right_guard = parent_right_guard.right_ref_mut_no_empty().map(|r| write_node(r));
         let pp_guard = write_key_page(write_node(parent_parent), key);
         parent_parent_guard = pp_guard;
         parent_parent_remove_pos = parent_parent_guard.search(key);
@@ -246,10 +246,10 @@ pub fn remove_from_node<KS, PS>(
                 let is_left_half_full = target_guard.is_half_full();
                 let mut node = target_guard.extnode_mut();
                 let pos = node.search(key);
-                let right_guard = write_node(&node.next);
+                let mut right_guard = write_node(&node.next);
                 let right_node_cannot_rebalance = right_guard.is_none() || !right_guard.is_empty_node();
                 if !right_guard.is_none() && !is_left_half_full || !right_guard.is_half_full(){
-                    let right_right_guard = write_node(&right_guard.right_ref().unwrap());
+                    let right_right_guard = write_node(&right_guard.right_ref_mut_no_empty().unwrap());
                     let parent_guard = write_node(parent);
                     let parent_target_guard = write_key_page(parent_guard, key);
                     let parent_pos = parent_target_guard.search(key);
