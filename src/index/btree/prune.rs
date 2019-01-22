@@ -21,7 +21,7 @@ enum Selection<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
-    Selected(Vec<(EntryKey, NodeWriteGuard<KS, PS>)>),
+    Selected(Vec<NodeWriteGuard<KS, PS>>),
     Innode(NodeCellRef)
 }
 
@@ -30,7 +30,7 @@ enum PruningSearch {
     Innode(NodeCellRef),
 }
 
-fn select<KS, PS>(node: &NodeCellRef) -> Vec<(EntryKey, NodeWriteGuard<KS, PS>)>
+fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
@@ -39,14 +39,11 @@ fn select<KS, PS>(node: &NodeCellRef) -> Vec<(EntryKey, NodeWriteGuard<KS, PS>)>
         let innode: &InNode<KS, PS> = node_handler.innode();
         let first_node = innode.ptrs.as_slice_immute().first().unwrap();
         if read_unchecked::<KS, PS>(first_node).is_ext() {
-            let mut keys = innode.keys.as_slice_immute().iter();
-            keys.next(); // skip the first
             Selection::Selected(innode.ptrs
                 .as_slice_immute()
                 .iter()
-                .zip(keys)
                 .take(LEVEL_PAGE_DIFF_MULTIPLIER)
-                .map(|(r, k)| (k.clone(), write_node::<KS, PS>(r)))
+                .map(|r| write_node::<KS, PS>(r))
                 .collect())
         } else {
             Selection::Innode(first_node.clone())
@@ -106,7 +103,7 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(src_tree: &BPlusTree<KSA, PSA>, dest_tree
     // merge to dest_tree
     {
         let keys: Vec<EntryKey> = left_most_leaf_guards.iter()
-            .map(|(_, g)| g.keys())
+            .map(|g| g.keys())
             .flatten()
             .cloned()
             .collect_vec();
@@ -116,15 +113,16 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(src_tree: &BPlusTree<KSA, PSA>, dest_tree
     // cleanup upper level references
     {
         let page_keys = left_most_leaf_guards.iter()
-            .map(|(k, _)| k)
+            .filter(|g| !g.is_empty())
+            .map(|g| g.first_key())
             .collect_vec();
         prune_selected::<KSA, PSA>(&src_tree.get_root(), page_keys);
     }
 
     // adjust leaf left, right references
-    let right_right_most = left_most_leaf_guards.last().unwrap().1.right_ref().unwrap().clone();
-    let left_left_most = left_most_leaf_guards.first().unwrap().1.left_ref().unwrap().clone();
-    for (_, mut g) in left_most_leaf_guards {
+    let right_right_most = left_most_leaf_guards.last().unwrap().right_ref().unwrap().clone();
+    let left_left_most = left_most_leaf_guards.first().unwrap().left_ref().unwrap().clone();
+    for mut g in left_most_leaf_guards {
         *g = NodeData::Empty(box EmptyNode {
             left: Some(left_left_most.clone()),
             right: right_right_most.clone()
