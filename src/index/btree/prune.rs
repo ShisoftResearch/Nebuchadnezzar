@@ -7,6 +7,7 @@ use index::Slice;
 use index::btree::internal::InNode;
 use index::btree::node::read_unchecked;
 use std::fmt::Debug;
+use std::collections::BTreeSet;
 use index::btree::node::write_node;
 use index::btree::BPlusTree;
 use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
@@ -16,6 +17,7 @@ use index::btree::search::MutSearchResult;
 use index::btree::node::write_key_page;
 use index::btree::node::NodeData;
 use index::btree::node::EmptyNode;
+use std::mem;
 
 enum Selection<KS, PS>
     where KS: Slice<EntryKey> + Debug + 'static,
@@ -55,10 +57,56 @@ fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
     }
 }
 
+fn apply_removal<'a, KS, PS> (
+    cursor_guard: &mut NodeWriteGuard<KS, PS>,
+    poses: &mut BTreeSet<usize>,
+    key_to_del: &'a EntryKey,
+    empty_pages: &mut Vec<&'a EntryKey>
+)
+    where KS: Slice<EntryKey> + Debug + 'static,
+          PS: Slice<NodeCellRef> + 'static
+{
+    {
+        let innode = cursor_guard.innode_mut();
+        let mut new_keys = KS::init();
+        let mut new_ptrs = PS::init();
+        {
+            let keys: Vec<_> = innode.keys.as_slice()
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !poses.contains(i))
+                .map(|(_, k)| k)
+                .collect();
+            let ptrs: Vec<_> = innode.ptrs.as_slice()
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !poses.contains(i))
+                .map(|(_, p)| p)
+                .collect();
+            innode.len = keys.len();
+            for (i, key) in keys.into_iter().enumerate() {
+                mem::swap(&mut new_keys.as_slice()[i], key);
+            }
+            for (i, ptr) in ptrs.into_iter().enumerate() {
+                mem::swap(&mut new_ptrs.as_slice()[i], ptr);
+            }
+        }
+        innode.keys = new_keys;
+        innode.ptrs = new_ptrs;
+    }
+
+    if cursor_guard.is_empty() {
+        cursor_guard.make_empty_node();
+        empty_pages.push(key_to_del);
+    }
+    *poses = BTreeSet::new();
+}
+
 fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -> Vec<&'a EntryKey>
     where KS: Slice<EntryKey> + Debug + 'static,
           PS: Slice<NodeCellRef> + 'static
 {
+    let key_len = keys.len();
     let first_search = mut_search::<KS, PS>(node, keys.first().unwrap());
     let pruning = match first_search {
         MutSearchResult::Internal(sub_node) => {
@@ -80,13 +128,22 @@ fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -
     }
     // start delete
     let mut cursor_guard = write_node::<KS, PS>(node);
-    for keys_to_del in keys {
-        cursor_guard = write_key_page(cursor_guard, keys_to_del);
-        let pos = cursor_guard.search(keys_to_del);
-        cursor_guard.remove(pos);
-        if cursor_guard.is_empty() {
-            cursor_guard.make_empty_node();
-            empty_pages.push(keys_to_del);
+    let mut guard_removing_poses = BTreeSet::new();
+    for (i, key_to_del) in keys.into_iter().enumerate() {
+        if cursor_guard.last_key() < key_to_del {
+            apply_removal(
+                &mut cursor_guard,
+                &mut guard_removing_poses, key_to_del,
+                &mut empty_pages);
+            cursor_guard = write_key_page(cursor_guard, key_to_del);
+        }
+        let pos = cursor_guard.search(key_to_del);
+        guard_removing_poses.insert(pos);
+        if i == key_len - 1 {
+            apply_removal(
+                &mut cursor_guard,
+                &mut guard_removing_poses, key_to_del,
+                &mut empty_pages);
         }
     }
     empty_pages
