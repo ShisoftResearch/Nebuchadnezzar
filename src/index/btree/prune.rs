@@ -1,30 +1,31 @@
-use index::btree::NodeCellRef;
-use index::EntryKey;
-use smallvec::SmallVec;
-use index::btree::search::mut_search;
-use index::btree::node::read_node;
-use index::Slice;
 use index::btree::internal::InNode;
+use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
-use std::fmt::Debug;
-use std::collections::BTreeSet;
-use index::btree::node::write_node;
-use index::btree::BPlusTree;
-use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
-use index::btree::node::NodeWriteGuard;
-use itertools::Itertools;
-use index::btree::search::MutSearchResult;
 use index::btree::node::write_key_page;
-use index::btree::node::NodeData;
+use index::btree::node::write_node;
 use index::btree::node::EmptyNode;
+use index::btree::node::NodeData;
+use index::btree::node::NodeWriteGuard;
+use index::btree::search::mut_search;
+use index::btree::search::MutSearchResult;
+use index::btree::BPlusTree;
+use index::btree::NodeCellRef;
+use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
+use index::EntryKey;
+use index::Slice;
+use itertools::Itertools;
+use smallvec::SmallVec;
+use std::collections::BTreeSet;
+use std::fmt::Debug;
 use std::mem;
 
 enum Selection<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     Selected(Vec<NodeWriteGuard<KS, PS>>),
-    Innode(NodeCellRef)
+    Innode(NodeCellRef),
 }
 
 enum PruningSearch {
@@ -33,51 +34,59 @@ enum PruningSearch {
 }
 
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let selection = read_node(node, |node_handler| {
         debug_assert!(!node_handler.is_ext());
         let innode: &InNode<KS, PS> = node_handler.innode();
         let first_node = innode.ptrs.as_slice_immute().first().unwrap();
         if read_unchecked::<KS, PS>(first_node).is_ext() {
-            Selection::Selected(innode.ptrs
-                .as_slice_immute()
-                .iter()
-                .take(LEVEL_PAGE_DIFF_MULTIPLIER)
-                .map(|r| write_node::<KS, PS>(r))
-                .collect())
+            Selection::Selected(
+                innode
+                    .ptrs
+                    .as_slice_immute()
+                    .iter()
+                    .take(LEVEL_PAGE_DIFF_MULTIPLIER)
+                    .map(|r| write_node::<KS, PS>(r))
+                    .collect(),
+            )
         } else {
             Selection::Innode(first_node.clone())
         }
     });
     match selection {
         Selection::Selected(res) => res,
-        Selection::Innode(node) => select::<KS, PS>(&node)
+        Selection::Innode(node) => select::<KS, PS>(&node),
     }
 }
 
-fn apply_removal<'a, KS, PS> (
+fn apply_removal<'a, KS, PS>(
     cursor_guard: &mut NodeWriteGuard<KS, PS>,
     poses: &mut BTreeSet<usize>,
     key_to_del: &'a EntryKey,
-    empty_pages: &mut Vec<&'a EntryKey>
-)
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+    empty_pages: &mut Vec<&'a EntryKey>,
+) where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     {
         let innode = cursor_guard.innode_mut();
         let mut new_keys = KS::init();
         let mut new_ptrs = PS::init();
         {
-            let keys: Vec<_> = innode.keys.as_slice()
+            let keys: Vec<_> = innode
+                .keys
+                .as_slice()
                 .into_iter()
                 .enumerate()
                 .filter(|(i, _)| !poses.contains(i))
                 .map(|(_, k)| k)
                 .collect();
-            let ptrs: Vec<_> = innode.ptrs.as_slice()
+            let ptrs: Vec<_> = innode
+                .ptrs
+                .as_slice()
                 .into_iter()
                 .enumerate()
                 .filter(|(i, _)| !poses.contains(i))
@@ -103,8 +112,9 @@ fn apply_removal<'a, KS, PS> (
 }
 
 fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -> Vec<&'a EntryKey>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let key_len = keys.len();
     let first_search = mut_search::<KS, PS>(node, keys.first().unwrap());
@@ -115,13 +125,13 @@ fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -
             } else {
                 PruningSearch::Innode(sub_node)
             }
-        },
-        MutSearchResult::External => unreachable!()
+        }
+        MutSearchResult::External => unreachable!(),
     };
     // empty page references that will dealt with by upper level
     let mut empty_pages = vec![];
     match pruning {
-        PruningSearch::DeepestInnode => {},
+        PruningSearch::DeepestInnode => {}
         PruningSearch::Innode(sub_node) => {
             keys = prune_selected::<KS, PS>(&sub_node, keys);
         }
@@ -133,8 +143,10 @@ fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -
         if cursor_guard.last_key() < key_to_del {
             apply_removal(
                 &mut cursor_guard,
-                &mut guard_removing_poses, key_to_del,
-                &mut empty_pages);
+                &mut guard_removing_poses,
+                key_to_del,
+                &mut empty_pages,
+            );
             cursor_guard = write_key_page(cursor_guard, key_to_del);
         }
         let pos = cursor_guard.search(key_to_del);
@@ -142,24 +154,30 @@ fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -
         if i == key_len - 1 {
             apply_removal(
                 &mut cursor_guard,
-                &mut guard_removing_poses, key_to_del,
-                &mut empty_pages);
+                &mut guard_removing_poses,
+                key_to_del,
+                &mut empty_pages,
+            );
         }
     }
     empty_pages
 }
 
-pub fn level_merge<KSA, PSA, KSB, PSB>(src_tree: &BPlusTree<KSA, PSA>, dest_tree: &BPlusTree<KSB, PSB>)
-    where KSA: Slice<EntryKey> + Debug + 'static,
-          PSA: Slice<NodeCellRef> + 'static,
-          KSB: Slice<EntryKey> + Debug + 'static,
-          PSB: Slice<NodeCellRef> + 'static
+pub fn level_merge<KSA, PSA, KSB, PSB>(
+    src_tree: &BPlusTree<KSA, PSA>,
+    dest_tree: &BPlusTree<KSB, PSB>,
+) where
+    KSA: Slice<EntryKey> + Debug + 'static,
+    PSA: Slice<NodeCellRef> + 'static,
+    KSB: Slice<EntryKey> + Debug + 'static,
+    PSB: Slice<NodeCellRef> + 'static,
 {
     let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
 
     // merge to dest_tree
     {
-        let keys: Vec<EntryKey> = left_most_leaf_guards.iter()
+        let keys: Vec<EntryKey> = left_most_leaf_guards
+            .iter()
             .map(|g| g.keys())
             .flatten()
             .cloned()
@@ -169,7 +187,8 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(src_tree: &BPlusTree<KSA, PSA>, dest_tree
 
     // cleanup upper level references
     {
-        let page_keys = left_most_leaf_guards.iter()
+        let page_keys = left_most_leaf_guards
+            .iter()
             .filter(|g| !g.is_empty())
             .map(|g| g.first_key())
             .collect_vec();
@@ -177,12 +196,22 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(src_tree: &BPlusTree<KSA, PSA>, dest_tree
     }
 
     // adjust leaf left, right references
-    let right_right_most = left_most_leaf_guards.last().unwrap().right_ref().unwrap().clone();
-    let left_left_most = left_most_leaf_guards.first().unwrap().left_ref().unwrap().clone();
+    let right_right_most = left_most_leaf_guards
+        .last()
+        .unwrap()
+        .right_ref()
+        .unwrap()
+        .clone();
+    let left_left_most = left_most_leaf_guards
+        .first()
+        .unwrap()
+        .left_ref()
+        .unwrap()
+        .clone();
     for mut g in left_most_leaf_guards {
         *g = NodeData::Empty(box EmptyNode {
             left: Some(left_left_most.clone()),
-            right: right_right_most.clone()
+            right: right_right_most.clone(),
         })
     }
 }

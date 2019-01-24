@@ -9,8 +9,12 @@ use futures::Future;
 use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 pub use index::btree::cursor::*;
 use index::btree::external::*;
+use index::btree::insert::*;
 use index::btree::internal::*;
+use index::btree::merge::merge_into_tree_node;
 pub use index::btree::node::*;
+use index::btree::remove::*;
+use index::btree::search::*;
 use index::EntryKey;
 use index::MergeableTree;
 use index::MergingPage;
@@ -18,10 +22,12 @@ use index::MergingTreeGuard;
 use index::Slice;
 use index::{Cursor as IndexCursor, Ordering};
 use itertools::{chain, Itertools};
+use parking_lot::RwLock;
 use ram::cell::Cell;
 use ram::types::RandValue;
 use smallvec::SmallVec;
 use std;
+use std::any::Any;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
@@ -31,6 +37,7 @@ use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -40,23 +47,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use parking_lot::RwLock;
-use std::any::Any;
-use std::marker::PhantomData;
-use index::btree::insert::*;
-use index::btree::search::*;
-use index::btree::remove::*;
-use index::btree::merge::merge_into_tree_node;
 
 mod cursor;
 mod external;
-mod internal;
-mod node;
 mod insert;
-mod search;
-mod remove;
+mod internal;
 mod merge;
+mod node;
 mod prune;
+mod remove;
+mod search;
 
 const CACHE_SIZE: usize = 2048;
 
@@ -66,23 +66,30 @@ const CACHE_SIZE: usize = 2048;
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
 pub struct BPlusTree<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
-    marker: PhantomData<(KS, PS)>
+    marker: PhantomData<(KS, PS)>,
 }
 
-unsafe impl <KS, PS> Sync for BPlusTree<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static {}
+unsafe impl<KS, PS> Sync for BPlusTree<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
 
-unsafe impl <KS, PS> Send for BPlusTree<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static {}
+unsafe impl<KS, PS> Send for BPlusTree<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
 
 impl Default for Ordering {
     fn default() -> Self {
@@ -90,9 +97,10 @@ impl Default for Ordering {
     }
 }
 
-impl <KS, PS> BPlusTree<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> BPlusTree<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree<KS, PS> {
         let neb_client_1 = neb_client.clone();
@@ -102,7 +110,7 @@ impl <KS, PS> BPlusTree<KS, PS>
             root_versioning: NodeCellRef::new(Node::<KS, PS>::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
-            marker: PhantomData
+            marker: PhantomData,
         };
         let root_id = tree.new_page_id();
         *tree.root.write() = NodeCellRef::new(Node::<KS, PS>::new_external(root_id));
@@ -151,7 +159,8 @@ impl <KS, PS> BPlusTree<KS, PS>
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
-                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
+                *self.root.write() =
+                    NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
             }
             None => {}
         }
@@ -163,7 +172,12 @@ impl <KS, PS> BPlusTree<KS, PS>
         let result = remove_from_node(self, &mut root, &mut key.clone(), &self.root_versioning, 0);
         if let Some(rebalance) = result.rebalancing {
             let root_node = rebalance.parent;
-            if read_unchecked::<KS, PS>(&(*self.root.read())).innode().keys.as_slice_immute()[0] == root_node.innode().keys.as_slice_immute()[0] {
+            if read_unchecked::<KS, PS>(&(*self.root.read()))
+                .innode()
+                .keys
+                .as_slice_immute()[0]
+                == root_node.innode().keys.as_slice_immute()[0]
+            {
                 // Make sure root node does not changed during the process. If it did changed, ignore it
                 // When root is external and have no keys but one pointer will take the only sub level
                 // pointer node as the new root node.
@@ -177,7 +191,7 @@ impl <KS, PS> BPlusTree<KS, PS>
         result.removed
     }
 
-    pub fn merge_page (&self, keys: Vec<EntryKey>) {
+    pub fn merge_page(&self, keys: Vec<EntryKey>) {
         let keys_len = keys.len();
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
@@ -235,7 +249,7 @@ macro_rules! impl_btree_level {
 }
 
 pub struct NodeCellRef {
-    inner: Arc<Any>
+    inner: Arc<Any>,
 }
 
 unsafe impl Send for NodeCellRef {}
@@ -243,33 +257,33 @@ unsafe impl Sync for NodeCellRef {}
 
 impl NodeCellRef {
     pub fn new<KS, PS>(node: Node<KS, PS>) -> Self
-        where KS: Slice<EntryKey> + Debug + 'static,
-              PS: Slice<NodeCellRef> + 'static
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
     {
         NodeCellRef {
-            inner: Arc::new(node)
+            inner: Arc::new(node),
         }
     }
 
     #[inline]
     fn deref<KS, PS>(&self) -> &Node<KS, PS>
-        where KS: Slice<EntryKey> + Debug + 'static,
-              PS: Slice<NodeCellRef> + 'static
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
     {
         // The only unmatched scenario is the NodeCellRef was constructed by default function
         // Because the size of different type of NodeData are the same, we can still cast them safely
         // for NodeData have a fixed size for all the time
         debug_assert!(self.inner.is::<Node<KS, PS>>(), "Node ref type unmatched");
-        unsafe {
-            &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>)
-        }
+        unsafe { &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>) }
     }
 }
 
 impl Clone for NodeCellRef {
     fn clone(&self) -> Self {
         NodeCellRef {
-            inner: self.inner.clone()
+            inner: self.inner.clone(),
         }
     }
 }

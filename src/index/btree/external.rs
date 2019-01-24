@@ -8,6 +8,8 @@ use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
 use futures::Future;
 use index::btree::*;
+use index::EntryKey;
+use index::Slice;
 use itertools::Itertools;
 use owning_ref::{OwningHandle, OwningRef, RcRef};
 use ram::cell::Cell;
@@ -18,6 +20,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -25,9 +28,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::Slice;
-use index::EntryKey;
-use std::marker::PhantomData;
 
 const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 const KEYS_FIELD: &'static str = "keys";
@@ -42,8 +42,9 @@ lazy_static! {
 }
 
 pub struct ExtNode<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub id: Id,
     pub keys: KS,
@@ -51,20 +52,22 @@ pub struct ExtNode<KS, PS>
     pub prev: NodeCellRef,
     pub len: usize,
     pub dirty: bool,
-    mark: PhantomData<PS>
+    mark: PhantomData<PS>,
 }
 
 pub struct ExtNodeSplit<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub node_2: ExtNode<KS, PS>,
     pub keys_1_len: usize,
 }
 
-impl <KS, PS>ExtNode<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> ExtNode<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(id: Id) -> ExtNode<KS, PS> {
         ExtNode {
@@ -74,14 +77,18 @@ impl <KS, PS>ExtNode<KS, PS>
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
             dirty: false,
-            mark: PhantomData
+            mark: PhantomData,
         }
     }
 
     pub fn to_cell(&self) -> Cell {
         let mut value = Value::Map(Map::new());
-        let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| node.extnode().id);
-        let next_id = read_node(&self.next, |node: &NodeReadHandler<KS, PS>| node.extnode().id);
+        let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| {
+            node.extnode().id
+        });
+        let next_id = read_node(&self.next, |node: &NodeReadHandler<KS, PS>| {
+            node.extnode().id
+        });
 
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
         value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
@@ -99,8 +106,12 @@ impl <KS, PS>ExtNode<KS, PS>
     }
     pub fn remove_at(&mut self, pos: usize) {
         let mut cached_len = &mut self.len;
-        debug!("Removing from external pos {}, len {}, key {:?}",
-               pos, cached_len, self.keys.as_slice()[pos]);
+        debug!(
+            "Removing from external pos {}, len {}, key {:?}",
+            pos,
+            cached_len,
+            self.keys.as_slice()[pos]
+        );
         self.keys.remove_at(pos, cached_len);
     }
 
@@ -110,7 +121,7 @@ impl <KS, PS>ExtNode<KS, PS>
         pos: usize,
         self_ref: &NodeCellRef,
         self_next: &mut NodeWriteGuard<KS, PS>,
-        tree: &BPlusTree<KS, PS>
+        tree: &BPlusTree<KS, PS>,
     ) -> (NodeCellRef, EntryKey) {
         // cached.dump();
         let pivot = self.len / 2;
@@ -136,7 +147,7 @@ impl <KS, PS>ExtNode<KS, PS>
             prev: self_ref.clone(),
             len: keys_2_len,
             dirty: true,
-            mark: PhantomData
+            mark: PhantomData,
         };
         debug_assert!(pivot_key > smallvec!(0));
         debug_assert!(
@@ -204,7 +215,10 @@ impl <KS, PS>ExtNode<KS, PS>
         let new_len = self.len + right.len;
         debug_assert!(new_len <= KS::slice_len());
         for i in self.len..new_len {
-            mem::swap(&mut self.keys.as_slice()[i], &mut right.keys.as_slice()[i - self_len]);
+            mem::swap(
+                &mut self.keys.as_slice()[i],
+                &mut right.keys.as_slice()[i - self_len],
+            );
         }
         self.len = new_len;
     }
@@ -281,23 +295,25 @@ pub fn page_schema() -> Schema {
 }
 
 pub struct NodeCache<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     nodes: RefCell<HashMap<Id, NodeCellRef>>,
     storage: Arc<AsyncClient>,
-    marker: PhantomData<(KS, PS)>
+    marker: PhantomData<(KS, PS)>,
 }
 
-impl <KS, PS>NodeCache<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> NodeCache<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         NodeCache {
             nodes: RefCell::new(HashMap::new()),
             storage: neb_client.clone(),
-            marker: PhantomData
+            marker: PhantomData,
         }
     }
 
@@ -340,7 +356,7 @@ impl <KS, PS>NodeCache<KS, PS>
             prev: self.get(prev),
             len: key_count,
             dirty: false,
-            mark: PhantomData
+            mark: PhantomData,
         }
     }
 }

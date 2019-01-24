@@ -78,8 +78,14 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
                     keys,
                     nodes: vec![],
                     id: Some(format!("{:?}", node.id)),
-                    next: Some(format!("{:?}", read_unchecked::<KeySlice, PtrSlice>(&node.next).ext_id())),
-                    prev: Some(format!("{:?}", read_unchecked::<KeySlice, PtrSlice>(&node.prev).ext_id())),
+                    next: Some(format!(
+                        "{:?}",
+                        read_unchecked::<KeySlice, PtrSlice>(&node.next).ext_id()
+                    )),
+                    prev: Some(format!(
+                        "{:?}",
+                        read_unchecked::<KeySlice, PtrSlice>(&node.prev).ext_id()
+                    )),
                     len: node.len,
                     is_external: true,
                 };
@@ -117,7 +123,7 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
                     prev: None,
                     len: 0,
                     is_external: false,
-                }
+                };
             }
             &NodeData::Empty(ref n) => {
                 return DebugNode {
@@ -128,7 +134,7 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
                     prev: None,
                     len: 0,
                     is_external: false,
-                }
+                };
             }
         }
     }
@@ -137,7 +143,10 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
 #[test]
 fn node_size() {
     // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
-    assert_eq!(size_of::<Node<KeySlice, PtrSlice>>(), size_of::<usize>() * 3);
+    assert_eq!(
+        size_of::<Node<KeySlice, PtrSlice>>(),
+        size_of::<usize>() * 3
+    );
 }
 
 #[test]
@@ -155,9 +164,8 @@ fn init() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(super::external::page_schema());
     let tree = LevelBPlusTree::new(&client);
     let id = Id::unit_id();
@@ -211,9 +219,8 @@ fn crd() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client
         .new_schema_with_id(super::external::page_schema())
         .wait()
@@ -440,9 +447,8 @@ pub fn alternative_insertion_pattern() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(super::page_schema()).wait();
     let tree = LevelBPlusTree::new(&client);
     let num = env::var("BTREE_TEST_ITEMS")
@@ -500,9 +506,8 @@ fn parallel() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(super::page_schema()).wait();
     let tree = Arc::new(LevelBPlusTree::new(&client));
     let num = env::var("BTREE_TEST_ITEMS")
@@ -562,19 +567,19 @@ fn parallel() {
         }
     });
 
-//    debug!("Start parallel deleting");
-//    let mut nums = (num / 2..num).collect_vec();
-//    thread_rng().shuffle(nums.as_mut_slice());
-//    nums.par_iter().for_each(|i| {
-//        debug!("Deleting {}", i);
-//        let i = *i;
-//        let id = Id::new(0, i);
-//        let key_slice = u64_to_slice(i);
-//        let mut key = SmallVec::from_slice(&key_slice);
-//        key_with_id(&mut key, &id);
-//        assert!(tree.remove(&key), "Cannot find item to remove {}, {:?}", i, &key);
-//    });
-//    dump_tree(&*tree, "btree_parallel_deletion_dump.json");
+    //    debug!("Start parallel deleting");
+    //    let mut nums = (num / 2..num).collect_vec();
+    //    thread_rng().shuffle(nums.as_mut_slice());
+    //    nums.par_iter().for_each(|i| {
+    //        debug!("Deleting {}", i);
+    //        let i = *i;
+    //        let id = Id::new(0, i);
+    //        let key_slice = u64_to_slice(i);
+    //        let mut key = SmallVec::from_slice(&key_slice);
+    //        key_with_id(&mut key, &id);
+    //        assert!(tree.remove(&key), "Cannot find item to remove {}, {:?}", i, &key);
+    //    });
+    //    dump_tree(&*tree, "btree_parallel_deletion_dump.json");
 }
 
 #[test]
@@ -592,12 +597,9 @@ fn node_lock() {
         &server_addr,
         &server_group,
     );
-    let client =
-        Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
+    let client = Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     let tree = LevelBPlusTree::new(&client);
-    let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(
-        1, 2,
-    ));
+    let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(1, 2));
     let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(box inner_ext_node)));
     let num = 100000;
     let mut nums = (0..num).collect_vec();

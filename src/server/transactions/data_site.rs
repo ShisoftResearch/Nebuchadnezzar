@@ -496,13 +496,13 @@ impl DataManagerInner {
         // check state
         match txn.state {
             TxnState::Started => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted))
+                return this.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted));
             }
             TxnState::Aborted => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted))
+                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
             }
             TxnState::Committed => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted))
+                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
             TxnState::Prepared => {}
         }

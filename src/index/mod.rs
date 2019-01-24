@@ -5,15 +5,15 @@ use std::io::Cursor as StdCursor;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ops::IndexMut;
 use std::ops::Index;
+use std::ops::IndexMut;
 use std::slice::SliceIndex;
 
 #[macro_use]
 mod macros;
 pub mod btree;
-pub mod placement;
 mod lsmtree;
+pub mod placement;
 
 const ID_SIZE: usize = 16;
 const KEY_SIZE: usize = ID_SIZE + 16; // 16 is the estimate length of: schema id u32 (4) + field id u32(4) and value u64(8)+
@@ -53,7 +53,8 @@ pub trait Slice<T: Default> {
     }
 
     fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self
-        where Self: Sized
+    where
+        Self: Sized,
     {
         let mut right_slice = Self::init();
         {
@@ -95,8 +96,6 @@ pub trait Slice<T: Default> {
         *len -= 1;
     }
 }
-
-
 
 pub trait Cursor {
     fn next(&mut self) -> bool;

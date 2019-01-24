@@ -1,19 +1,20 @@
 use hermes::stm::Txn;
 use hermes::stm::TxnErr;
 use hermes::stm::TxnValRef;
+use index::btree::node::EmptyNode;
 use index::btree::Slice;
 use index::btree::*;
+use index::EntryKey;
 use itertools::free::chain;
 use std::cell::UnsafeCell;
 use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
-use index::btree::node::EmptyNode;
-use index::EntryKey;
 
 pub struct InNode<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub keys: KS,
     pub ptrs: PS,
@@ -22,7 +23,8 @@ pub struct InNode<KS, PS>
 }
 
 pub struct InNodeKeysSplit<KS>
-    where KS: Slice<EntryKey> + Debug + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
 {
     pub keys_2: KS,
     pub keys_1_len: usize,
@@ -31,14 +33,16 @@ pub struct InNodeKeysSplit<KS>
 }
 
 pub struct InNodePtrSplit<PS>
-    where PS: Slice<NodeCellRef> + 'static
+where
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub ptrs_2: PS,
 }
 
-impl <KS, PS>InNode<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> InNode<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(len: usize) -> Self {
         InNode {
@@ -68,7 +72,9 @@ impl <KS, PS>InNode<KS, PS>
         let mut n_ptr_len = *n_key_len + 1;
         debug!(
             "Removing from internal node pos {}, len {}, key {:?}",
-            key_pos, n_key_len, &self.keys.as_slice()[key_pos]
+            key_pos,
+            n_key_len,
+            &self.keys.as_slice()[key_pos]
         );
         self.keys.remove_at(key_pos, n_key_len);
         self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
@@ -263,11 +269,14 @@ impl <KS, PS>InNode<KS, PS>
             }
             left_extnode.next = right_extnode.next.clone();
         }
-        *right_node = NodeData::Empty(box EmptyNode { left: Some(left_node_ref.clone()), right: left_node_ref.clone() });
+        *right_node = NodeData::Empty(box EmptyNode {
+            left: Some(left_node_ref.clone()),
+            right: left_node_ref.clone(),
+        });
         self.remove_at(right_ptr_pos);
         debug!(
             "Removing merged node at {}, left {}, right {}, merged {}",
-            right_ptr_pos,left_len, right_len, merged_len
+            right_ptr_pos, left_len, right_len, merged_len
         );
         debug!("Merged parent level keys: {:?}", self.keys);
         debug!("Merged level keys {:?}", left_node.keys());
@@ -283,10 +292,16 @@ impl <KS, PS>InNode<KS, PS>
         // moving keys
         self.keys.as_slice()[self_len] = right_key;
         for i in self_len + 1..new_len {
-            mem::swap(&mut self.keys.as_slice()[i], &mut right.keys.as_slice()[i - self_len - 1]);
+            mem::swap(
+                &mut self.keys.as_slice()[i],
+                &mut right.keys.as_slice()[i - self_len - 1],
+            );
         }
         for i in self_len + 1..new_len + 1 {
-            mem::swap(&mut self.ptrs.as_slice()[i], &mut right.ptrs.as_slice()[i - self_len - 1]);
+            mem::swap(
+                &mut self.ptrs.as_slice()[i],
+                &mut right.ptrs.as_slice()[i - self_len - 1],
+            );
         }
         self.len += right.len + 1;
     }
@@ -322,7 +337,9 @@ impl <KS, PS>InNode<KS, PS>
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
                 debug_assert!(self.len >= right_ptr_pos);
-                debug_assert!(!read_unchecked::<KS, PS>(&self.ptrs.as_slice()[right_ptr_pos]).is_none());
+                debug_assert!(
+                    !read_unchecked::<KS, PS>(&self.ptrs.as_slice()[right_ptr_pos]).is_none()
+                );
                 let pivot_key_pos = right_ptr_pos - 1;
                 let pivot_key = self.keys.as_slice()[pivot_key_pos].to_owned();
                 debug_assert!(pivot_key > smallvec!(0),

@@ -1,35 +1,35 @@
-use index::EntryKey;
-use index::btree::BPlusTree;
-use index::btree::NodeCellRef;
+use index::btree::insert::check_root_modification;
+use index::btree::internal::InNode;
 use index::btree::node::read_node;
-use index::btree::node::NodeReadHandler;
-use std::fmt::Debug;
-use index::Slice;
-use index::btree::search::mut_search;
-use index::btree::search::MutSearchResult;
+use index::btree::node::read_unchecked;
 use index::btree::node::write_key_page;
 use index::btree::node::write_node;
 use index::btree::node::write_non_empty;
-use index::btree::node::read_unchecked;
-use itertools::Itertools;
-use index::btree::insert::check_root_modification;
-use index::btree::internal::InNode;
 use index::btree::node::Node;
 use index::btree::node::NodeData;
+use index::btree::node::NodeReadHandler;
+use index::btree::search::mut_search;
+use index::btree::search::MutSearchResult;
+use index::btree::BPlusTree;
+use index::btree::NodeCellRef;
+use index::EntryKey;
+use index::Slice;
+use itertools::Itertools;
+use std::fmt::Debug;
 
 enum MergeSearch {
     External,
     Internal(NodeCellRef),
-    RightNode(NodeCellRef)
+    RightNode(NodeCellRef),
 }
 
 fn merge_into_internal<KS, PS>(
     node: &NodeCellRef,
     lower_level_new_pages: Vec<(EntryKey, NodeCellRef)>,
-    new_pages: &mut Vec<(EntryKey, NodeCellRef)>
-)
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+    new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
+) where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let mut node_guard = write_node::<KS, PS>(node);
     for (pivot, node) in lower_level_new_pages {
@@ -55,10 +55,11 @@ pub fn merge_into_tree_node<KS, PS>(
     node: &NodeCellRef,
     parent: &NodeCellRef,
     keys: Vec<EntryKey>,
-    level: usize
+    level: usize,
 ) -> Vec<(EntryKey, NodeCellRef)>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let search = mut_search::<KS, PS>(node, &keys[0]);
     let mut new_pages = match search {
@@ -73,33 +74,41 @@ pub fn merge_into_tree_node<KS, PS>(
             while merging_pos < keys.len() {
                 let start_key = &keys[merging_pos];
                 let mut target_page_guard = write_key_page(current_guard, start_key);
-                let mut right_guard = write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
-                let key_upper_bound = if right_guard.is_none() { None } else { Some(right_guard.first_key().clone()) };
-                let selection = keys[merging_pos..].iter()
+                let mut right_guard =
+                    write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
+                let key_upper_bound = if right_guard.is_none() {
+                    None
+                } else {
+                    Some(right_guard.first_key().clone())
+                };
+                let selection = keys[merging_pos..]
+                    .iter()
                     .filter(|k| match &key_upper_bound {
                         &Some(ref upper) => k < &upper,
-                        &None => true
+                        &None => true,
                     })
                     .take(KS::slice_len() - target_page_guard.len())
                     .collect_vec();
-                target_page_guard.extnode_mut().merge_sort(selection.as_slice());
+                target_page_guard
+                    .extnode_mut()
+                    .merge_sort(selection.as_slice());
                 merging_pos += selection.len();
                 if merging_pos >= keys.len() {
                     break;
                 }
                 let next_insert_key = &keys[merging_pos];
-                if key_upper_bound.is_none() || next_insert_key < key_upper_bound.as_ref().unwrap() {
+                if key_upper_bound.is_none() || next_insert_key < key_upper_bound.as_ref().unwrap()
+                {
                     // trigger a split and put the split node into a cache
                     let insert_pos = target_page_guard.search(&keys[merging_pos]);
                     let target_node_ref = target_page_guard.node_ref().clone();
-                    let (new_node, pivot) = target_page_guard
-                        .extnode_mut()
-                        .split_insert(
-                            next_insert_key.clone(),
-                            insert_pos,
-                            &target_node_ref,
-                            &mut right_guard,
-                            tree);
+                    let (new_node, pivot) = target_page_guard.extnode_mut().split_insert(
+                        next_insert_key.clone(),
+                        insert_pos,
+                        &target_node_ref,
+                        &mut right_guard,
+                        tree,
+                    );
                     merging_pos += 1;
                     current_guard = write_node(&new_node);
                     new_pages.push((pivot, new_node));
@@ -111,7 +120,8 @@ pub fn merge_into_tree_node<KS, PS>(
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {
-            let lower_level_new_pages = merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
+            let lower_level_new_pages =
+                merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
             let mut new_pages = vec![];
             if lower_level_new_pages.len() > 0 {
                 merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
@@ -121,7 +131,10 @@ pub fn merge_into_tree_node<KS, PS>(
     };
     if level == 0 && new_pages.len() > 0 {
         // it is impossible to have a node been changed during merge for merges are performed in serial
-        debug_assert_eq!(read_unchecked::<KS, PS>(&tree.get_root()).first_key(), read_unchecked::<KS, PS>(&node).first_key())
+        debug_assert_eq!(
+            read_unchecked::<KS, PS>(&tree.get_root()).first_key(),
+            read_unchecked::<KS, PS>(&node).first_key()
+        )
     }
     return new_pages;
 }

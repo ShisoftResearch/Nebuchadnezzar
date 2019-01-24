@@ -10,8 +10,9 @@ pub struct EmptyNode {
 }
 
 pub enum NodeData<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     External(Box<ExtNode<KS, PS>>),
     Internal(Box<InNode<KS, PS>>),
@@ -19,9 +20,10 @@ pub enum NodeData<KS, PS>
     None,
 }
 
-impl <KS, PS>NodeData<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> NodeData<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn is_none(&self) -> bool {
         match self {
@@ -40,7 +42,7 @@ impl <KS, PS>NodeData<KS, PS>
     pub fn is_empty_node(&self) -> bool {
         match self {
             &NodeData::Empty(ref n) => true,
-            _ => false
+            _ => false,
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
@@ -151,13 +153,19 @@ impl <KS, PS>NodeData<KS, PS>
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
         if self.is_empty() || self.len() > 0 && self.last_key() < key {
             let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
-            if !right_node.is_none() && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key) {
+            if !right_node.is_none()
+                && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key)
+            {
                 debug!(
                     "found key to put to right page {:?}/{:?}",
                     key,
-                    if right_node.is_empty() { smallvec!(0) } else { right_node.first_key().clone() }
+                    if right_node.is_empty() {
+                        smallvec!(0)
+                    } else {
+                        right_node.first_key().clone()
+                    }
                 );
-                return Some(self.right_ref().unwrap())
+                return Some(self.right_ref().unwrap());
             }
         }
         return None;
@@ -220,11 +228,12 @@ impl <KS, PS>NodeData<KS, PS>
 }
 
 pub fn write_non_empty<KS, PS>(mut search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     if !search_page.is_none() && search_page.is_empty() {
-        return write_node(search_page.right_ref_mut_no_empty().unwrap())
+        return write_node(search_page.right_ref_mut_no_empty().unwrap());
     }
     return search_page;
 }
@@ -233,17 +242,28 @@ pub fn write_key_page<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,
     key: &EntryKey,
 ) -> NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     if search_page.is_empty() || search_page.len() > 0 && search_page.last_key() < key {
         let right_ref = search_page.right_ref_mut_no_empty().unwrap();
         let right_node = write_node(right_ref);
         if !right_node.is_none() && (right_node.len() > 0 && right_node.first_key() <= key) {
-            debug!("Will write {:?} from left node to right page, start with {:?}, keys {:?}",
-                   key,
-                   if right_node.is_empty() { smallvec!(0) } else { right_node.first_key().clone() },
-                   if right_node.is_empty() { &[] } else { right_node.keys() });
+            debug!(
+                "Will write {:?} from left node to right page, start with {:?}, keys {:?}",
+                key,
+                if right_node.is_empty() {
+                    smallvec!(0)
+                } else {
+                    right_node.first_key().clone()
+                },
+                if right_node.is_empty() {
+                    &[]
+                } else {
+                    right_node.keys()
+                }
+            );
             return write_key_page(right_node, key);
         }
     }
@@ -253,16 +273,18 @@ pub fn write_key_page<KS, PS>(
 const LATCH_FLAG: usize = !(!0 >> 1);
 
 pub struct Node<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     data: UnsafeCell<NodeData<KS, PS>>,
     cc: AtomicUsize,
 }
 
-impl <KS, PS>Node<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(data: NodeData<KS, PS>) -> Self {
         Node {
@@ -298,8 +320,9 @@ pub fn node_version(cc_num: usize) -> usize {
 }
 
 pub fn write_node<KS, PS>(node: &NodeCellRef) -> NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     // debug!("acquiring node write lock");
     let node_deref = node.deref();
@@ -314,17 +337,21 @@ pub fn write_node<KS, PS>(node: &NodeCellRef) -> NodeWriteGuard<KS, PS>
                     data: node_deref.data.get(),
                     cc: &node_deref.cc as *const AtomicUsize,
                     version: node_version(cc_num),
-                    node_ref: node.clone()
-                }
+                    node_ref: node.clone(),
+                };
             }
             _ => {}
         }
     }
 }
 
-pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(node: &NodeCellRef, mut func: F) -> R
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
+    node: &NodeCellRef,
+    mut func: F,
+) -> R
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let mut handler = read_unchecked(node);
     let cc = &node.deref::<KS, PS>().cc;
@@ -345,29 +372,32 @@ pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a
 }
 
 pub fn read_unchecked<KS, PS>(node: &NodeCellRef) -> NodeReadHandler<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     NodeReadHandler {
         ptr: node.deref().data.get(),
         version: 0,
-        node_ref: node.clone()
+        node_ref: node.clone(),
     }
 }
 
 pub struct NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub data: *mut NodeData<KS, PS>,
     pub cc: *const AtomicUsize,
     pub version: usize,
-    node_ref: NodeCellRef
+    node_ref: NodeCellRef,
 }
 
-impl <KS, PS> Deref for NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Deref for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     type Target = NodeData<KS, PS>;
 
@@ -377,9 +407,10 @@ impl <KS, PS> Deref for NodeWriteGuard<KS, PS>
     }
 }
 
-impl <KS, PS> DerefMut for NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> DerefMut for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
         debug_assert_ne!(self.data as usize, 0);
@@ -387,9 +418,10 @@ impl <KS, PS> DerefMut for NodeWriteGuard<KS, PS>
     }
 }
 
-impl <KS, PS> Drop for NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Drop for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn drop(&mut self) {
         // cope with null pointer
@@ -402,23 +434,25 @@ impl <KS, PS> Drop for NodeWriteGuard<KS, PS>
     }
 }
 
-impl <KS, PS> Default for NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Default for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn default() -> Self {
         NodeWriteGuard {
             data: 0 as *mut NodeData<KS, PS>,
             cc: 0 as *const AtomicUsize,
             version: 0,
-            node_ref: Node::<KS, PS>::none_ref()
+            node_ref: Node::<KS, PS>::none_ref(),
         }
     }
 }
 
-impl <KS, PS>NodeWriteGuard<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn node_ref(&self) -> &NodeCellRef {
         &self.node_ref
@@ -440,28 +474,33 @@ impl <KS, PS>NodeWriteGuard<KS, PS>
         }
         let empty = EmptyNode {
             left: left_node,
-            right: right_node
+            right: right_node,
         };
         *data = NodeData::Empty(box empty)
     }
 }
 
-unsafe impl <KS, PS> Sync for Node<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static {}
+unsafe impl<KS, PS> Sync for Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
 
 pub struct NodeReadHandler<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub ptr: *const NodeData<KS, PS>,
     pub version: usize,
     node_ref: NodeCellRef,
 }
 
-impl <KS, PS> Deref for NodeReadHandler<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Deref for NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     type Target = NodeData<KS, PS>;
 
@@ -475,9 +514,10 @@ pub struct RemoveStatus {
     pub removed: bool,
 }
 
-impl <KS, PS> Default for Node<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> Default for Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn default() -> Self {
         Node::none()

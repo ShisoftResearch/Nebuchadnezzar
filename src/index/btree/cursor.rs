@@ -5,25 +5,27 @@ use super::*;
 // These lock guards are preventing the node and their neighbourhoods been changed externally
 // Ordering are specified that can also change lock pattern
 pub struct RTCursor<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub index: usize,
     pub ordering: Ordering,
     pub page: Option<NodeCellRef>,
-    pub marker: PhantomData<(KS, PS)>
+    pub marker: PhantomData<(KS, PS)>,
 }
 
-impl <KS, PS>RTCursor<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> RTCursor<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> Self {
         let mut cursor = RTCursor {
             index: pos,
             ordering,
             page: Some(page.clone()),
-            marker: PhantomData
+            marker: PhantomData,
         };
         match ordering {
             Ordering::Forward => {
@@ -41,9 +43,10 @@ impl <KS, PS>RTCursor<KS, PS>
     }
 }
 
-impl <KS, PS>IndexCursor for RTCursor<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+impl<KS, PS> IndexCursor for RTCursor<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn next(&mut self) -> bool {
         if self.page.is_some() {
@@ -60,8 +63,7 @@ impl <KS, PS>IndexCursor for RTCursor<KS, PS>
                             if next_node.is_none() {
                                 self.page = None;
                                 return false;
-                            }
-                            else if next_node.is_empty() {
+                            } else if next_node.is_empty() {
                                 return self.next();
                             } else if next_node.is_ext() {
                                 return true;
@@ -71,18 +73,21 @@ impl <KS, PS>IndexCursor for RTCursor<KS, PS>
                         }
                         if self.index + 1 >= page.len() {
                             // next page
-                            return read_node(&ext_page.next, |next_page: &NodeReadHandler<KS, PS>| {
-                                if !next_page.is_none() {
-                                    // debug!("Shifting page forward, next page len: {}", next_page.len());
-                                    self.index = 0;
-                                    self.page = Some(ext_page.next.clone());
-                                    return true;
-                                } else {
-                                    // debug!("iterated to end");
-                                    self.page = None;
-                                    return false;
-                                }
-                            });
+                            return read_node(
+                                &ext_page.next,
+                                |next_page: &NodeReadHandler<KS, PS>| {
+                                    if !next_page.is_none() {
+                                        // debug!("Shifting page forward, next page len: {}", next_page.len());
+                                        self.index = 0;
+                                        self.page = Some(ext_page.next.clone());
+                                        return true;
+                                    } else {
+                                        // debug!("iterated to end");
+                                        self.page = None;
+                                        return false;
+                                    }
+                                },
+                            );
                         } else {
                             self.index += 1;
                             // debug!("Advancing cursor to index {}", self.index);
@@ -106,18 +111,21 @@ impl <KS, PS>IndexCursor for RTCursor<KS, PS>
                         }
                         if self.index == 0 {
                             // next page
-                            return read_node(&ext_page.prev, |prev_page: &NodeReadHandler<KS, PS>| {
-                                if !prev_page.is_none() {
-                                    debug!("Shifting page backward");
-                                    self.page = Some(ext_page.prev.clone());
-                                    self.index = prev_page.len() - 1;
-                                    return true;
-                                } else {
-                                    debug!("iterated to end");
-                                    self.page = None;
-                                    return false;
-                                }
-                            });
+                            return read_node(
+                                &ext_page.prev,
+                                |prev_page: &NodeReadHandler<KS, PS>| {
+                                    if !prev_page.is_none() {
+                                        debug!("Shifting page backward");
+                                        self.page = Some(ext_page.prev.clone());
+                                        self.index = prev_page.len() - 1;
+                                        return true;
+                                    } else {
+                                        debug!("iterated to end");
+                                        self.page = None;
+                                        return false;
+                                    }
+                                },
+                            );
                         } else {
                             self.index -= 1;
                             // debug!("Advancing cursor to index {}", self.index);
