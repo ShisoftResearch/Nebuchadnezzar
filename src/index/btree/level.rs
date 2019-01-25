@@ -182,7 +182,7 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(
             .flatten()
             .cloned()
             .collect_vec();
-        dest_tree.merge_page(keys);
+        dest_tree.merge_with_keys(keys);
     }
 
     // cleanup upper level references

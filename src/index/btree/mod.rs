@@ -54,7 +54,7 @@ mod insert;
 mod internal;
 mod merge;
 mod node;
-mod prune;
+mod level;
 mod remove;
 mod search;
 
@@ -191,7 +191,7 @@ where
         result.removed
     }
 
-    pub fn merge_page(&self, keys: Vec<EntryKey>) {
+    pub fn merge_with_keys(&self, keys: Vec<EntryKey>) {
         let keys_len = keys.len();
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
@@ -208,6 +208,14 @@ where
             *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
         }
         self.len.fetch_add(keys_len, Relaxed);
+    }
+
+    pub fn merge_tree<KSB, PSB>(&self, lower_tree: &BPlusTree<KSB, PSB>)
+        where
+            KSB: Slice<EntryKey> + Debug + 'static,
+            PSB: Slice<NodeCellRef> + 'static,
+    {
+        level::level_merge(self, lower_tree);
     }
 
     pub fn flush_all(&self) {
