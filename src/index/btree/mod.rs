@@ -52,9 +52,9 @@ mod cursor;
 mod external;
 mod insert;
 mod internal;
+mod level;
 mod merge;
 mod node;
-mod level;
 mod remove;
 mod search;
 
@@ -210,12 +210,12 @@ where
         self.len.fetch_add(keys_len, Relaxed);
     }
 
-    pub fn merge_tree<KSB, PSB>(&self, lower_tree: &BPlusTree<KSB, PSB>)
-        where
-            KSB: Slice<EntryKey> + Debug + 'static,
-            PSB: Slice<NodeCellRef> + 'static,
+    pub fn merge_tree<KSB, PSB>(&self, lower_tree: &BPlusTree<KSB, PSB>) -> usize
+    where
+        KSB: Slice<EntryKey> + Debug + 'static,
+        PSB: Slice<NodeCellRef> + 'static,
     {
-        level::level_merge(self, lower_tree);
+        level::level_merge(lower_tree, self)
     }
 
     pub fn flush_all(&self) {
@@ -283,7 +283,12 @@ impl NodeCellRef {
         // The only unmatched scenario is the NodeCellRef was constructed by default function
         // Because the size of different type of NodeData are the same, we can still cast them safely
         // for NodeData have a fixed size for all the time
-        debug_assert!(self.inner.is::<Node<KS, PS>>(), "Node ref type unmatched");
+        debug_assert!(
+            self.inner.is::<Node<KS, PS>>(),
+            "Node ref type unmatched, is default: {}",
+            self.inner
+                .is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
+        );
         unsafe { &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>) }
     }
 }
@@ -296,9 +301,13 @@ impl Clone for NodeCellRef {
     }
 }
 
+type DefaultKeySliceType = [EntryKey; 0];
+type DefaultPtrSliceType = [NodeCellRef; 0];
+type DefaultNodeDataType = NodeData<DefaultKeySliceType, DefaultPtrSliceType>;
+
 impl Default for NodeCellRef {
     fn default() -> Self {
-        let data: NodeData<[EntryKey; 0], [NodeCellRef; 0]> = NodeData::None;
+        let data: DefaultNodeDataType = NodeData::None;
         Self::new(Node::new(data))
     }
 }

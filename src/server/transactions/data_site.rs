@@ -502,7 +502,8 @@ impl DataManagerInner {
                 return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
             }
             TxnState::Committed => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
+                return this
+                    .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
             TxnState::Prepared => {}
         }

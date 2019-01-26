@@ -38,27 +38,27 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let selection = read_node(node, |node_handler| {
-        debug_assert!(!node_handler.is_ext());
-        let innode: &InNode<KS, PS> = node_handler.innode();
-        let first_node = innode.ptrs.as_slice_immute().first().unwrap();
-        if read_unchecked::<KS, PS>(first_node).is_ext() {
-            Selection::Selected(
-                innode
-                    .ptrs
-                    .as_slice_immute()
-                    .iter()
-                    .take(LEVEL_PAGE_DIFF_MULTIPLIER)
-                    .map(|r| write_node::<KS, PS>(r))
-                    .collect(),
-            )
-        } else {
-            Selection::Innode(first_node.clone())
+    let search = mut_search::<KS, PS>(node, &smallvec!());
+    match search {
+        MutSearchResult::External => {
+            let mut collected = vec![write_node(node)];
+            while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
+                let right = write_node(
+                    collected
+                        .last_mut()
+                        .unwrap()
+                        .right_ref_mut_no_empty()
+                        .unwrap(),
+                );
+                if right.is_none() {
+                    break;
+                } else {
+                    collected.push(right);
+                }
+            }
+            return collected;
         }
-    });
-    match selection {
-        Selection::Selected(res) => res,
-        Selection::Innode(node) => select::<KS, PS>(&node),
+        MutSearchResult::Internal(node) => select::<KS, PS>(&node),
     }
 }
 
@@ -166,22 +166,25 @@ where
 pub fn level_merge<KSA, PSA, KSB, PSB>(
     src_tree: &BPlusTree<KSA, PSA>,
     dest_tree: &BPlusTree<KSB, PSB>,
-) where
+) -> usize where
     KSA: Slice<EntryKey> + Debug + 'static,
     PSA: Slice<NodeCellRef> + 'static,
     KSB: Slice<EntryKey> + Debug + 'static,
     PSB: Slice<NodeCellRef> + 'static,
 {
     let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
+    let merge_page_len = left_most_leaf_guards.len();
+    debug!("Merge selected {} pages", left_most_leaf_guards.len());
 
     // merge to dest_tree
     {
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
-            .map(|g| g.keys())
+            .map(|g| &g.keys()[..g.len()])
             .flatten()
             .cloned()
             .collect_vec();
+        debug!("Merge selected keys are {:?}", &keys);
         dest_tree.merge_with_keys(keys);
     }
 
@@ -214,4 +217,5 @@ pub fn level_merge<KSA, PSA, KSB, PSB>(
             right: right_right_most.clone(),
         })
     }
+    merge_page_len
 }

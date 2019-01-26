@@ -21,10 +21,17 @@ where
     debug!("searching for {:?}", key);
     read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
         let node = &**node_handler;
+        let gen_empty_cursor = || RTCursor {
+            index: 0,
+            ordering,
+            page: None,
+            marker: PhantomData,
+        };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");
             return search_node(right_node, key, ordering);
         }
+        debug!("search node have keys {:?}", node.keys());
         let pos = node.search(key);
         match node {
             &NodeData::External(ref n) => {
@@ -35,17 +42,15 @@ where
                 RTCursor::new(pos, node_ref, ordering)
             }
             &NodeData::Internal(ref n) => {
-                debug!("search in internal node for {:?}, len {}", key, n.len);
+                debug!(
+                    "search in internal node for {:?}, len {}, pos {}",
+                    key, n.len, pos
+                );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                 search_node(next_node_ref, key, ordering)
             }
             &NodeData::Empty(ref n) => search_node(&n.right, key, ordering),
-            &NodeData::None => RTCursor {
-                index: 0,
-                ordering,
-                page: None,
-                marker: PhantomData,
-            },
+            &NodeData::None => gen_empty_cursor(),
         }
     })
 }

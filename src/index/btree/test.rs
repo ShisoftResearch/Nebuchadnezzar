@@ -620,3 +620,77 @@ fn node_lock() {
     }
     assert_eq!(node.deref::<KeySlice, PtrSlice>().version(), num as usize);
 }
+
+const TINY_PAGE_SIZE: usize = 5;
+impl_btree_level!(TINY_PAGE_SIZE);
+type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
+type TinyPtrSlice = [NodeCellRef; TINY_PAGE_SIZE + 1];
+type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
+
+#[test]
+fn level_merge() {
+    env_logger::init();
+    let server_group = "b_plus_index_init";
+    let server_addr = String::from("127.0.0.1:5800");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 1,
+            memory_size: 4 * 1024 * 1024 * 1024,
+            backup_storage: None,
+            wal_storage: None,
+        },
+        &server_addr,
+        &server_group,
+    );
+    let range = 1000;
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
+    client.new_schema_with_id(super::page_schema()).wait();
+    let tree_1 = Arc::new(TinyLevelBPlusTree::new(&client));
+    let tree_2 = Arc::new(LevelBPlusTree::new(&client));
+    for i in 0..range {
+        let n = i * 2;
+        let id = Id::new(0, n);
+        let key_slice = u64_to_slice(n);
+        let key = SmallVec::from_slice(&key_slice);
+        debug!("insert id: {}", n);
+        let mut entry_key = key.clone();
+        key_with_id(&mut entry_key, &id);
+        tree_1.insert(&entry_key);
+    }
+    for i in 0..range {
+        let n = i * 2 + 1;
+        let id = Id::new(0, n);
+        let key_slice = u64_to_slice(n);
+        let key = SmallVec::from_slice(&key_slice);
+        debug!("insert id: {}", n);
+        let mut entry_key = key.clone();
+        key_with_id(&mut entry_key, &id);
+        tree_2.insert(&entry_key);
+    }
+
+    debug!("MERGING...");
+    let merged = tree_2.merge_tree(&tree_1);
+    assert!(merged > 0);
+
+    for i in 0..range {
+        let n2 = i * 2 + 1;
+        let id2 = Id::new(0, n2);
+        let mut key2 = SmallVec::from_slice(&u64_to_slice(n2));
+        let key2_cur = tree_2.seek(&key2, Ordering::Forward);
+
+        key_with_id(&mut key2, &id2);
+
+        if (i as usize) < merged {
+            let n1 = i * 2;
+            let id1 = Id::new(0, n1);
+            let mut key1 = SmallVec::from_slice(&u64_to_slice(n1));
+            let key1_cur = tree_2.seek(&key1, Ordering::Forward);
+            key_with_id(&mut key1, &id1);
+            assert_eq!(key1_cur.current().unwrap(), &key1);
+        }
+        assert_eq!(key2_cur.current().unwrap(), &key2);
+
+        tree_2.seek(&key2, Default::default());
+    }
+}

@@ -224,15 +224,16 @@ where
     }
 
     pub fn merge_sort(&mut self, right: &[&EntryKey]) {
+        debug!("Merge sort have right nodes {:?}", right);
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
         let mut new_node = Self::new(self.id);
-        let mut pos = self.len;
+        let mut pos = 0;
         let mut left_pos = 0;
         let mut right_pos = 0;
         while left_pos < self.len && right_pos < right.len() {
             let left_key = &self.keys.as_slice_immute()[left_pos];
-            let right_key = &self.keys.as_slice_immute()[right_pos];
+            let right_key = right[right_pos];
             if left_key < right_key {
                 new_node.keys.as_slice()[pos] = left_key.clone();
                 left_pos += 1;
@@ -242,7 +243,7 @@ where
             }
             pos += 1;
         }
-        for key in &self.keys.as_slice()[left_pos..] {
+        for key in &self.keys.as_slice()[left_pos..self.len] {
             new_node.keys.as_slice()[pos] = key.clone();
             pos += 1;
             left_pos += 1;
@@ -252,14 +253,19 @@ where
             pos += 1;
             right_pos += 1;
         }
+        debug!("Merge sorted have keys {:?}", &new_node.keys.as_slice_immute()[..pos]);
         new_node.len = pos;
-        new_node.dirty = self.dirty;
+        new_node.dirty = true;
         new_node.next = self.next.clone();
         new_node.prev = self.prev.clone();
         *self = new_node;
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
+        debug!(
+            "Merge sorted page have keys: {:?}",
+            &self.keys.as_slice_immute()[..self.len]
+        )
     }
 
     pub fn dump(&self) {

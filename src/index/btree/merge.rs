@@ -67,12 +67,15 @@ where
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
+            debug!("Merge into internal with keys {:?}", &keys);
+            let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
             let mut new_pages = vec![];
             // merge by pages
-            while merging_pos < keys.len() {
+            while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
+                debug!("Start merging with page at {:?}", start_key);
                 let mut target_page_guard = write_key_page(current_guard, start_key);
                 let mut right_guard =
                     write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
@@ -81,7 +84,7 @@ where
                 } else {
                     Some(right_guard.first_key().clone())
                 };
-                let selection = keys[merging_pos..]
+                let selection = keys[merging_pos..keys_len]
                     .iter()
                     .filter(|k| match &key_upper_bound {
                         &Some(ref upper) => k < &upper,
@@ -93,10 +96,16 @@ where
                     .extnode_mut()
                     .merge_sort(selection.as_slice());
                 merging_pos += selection.len();
-                if merging_pos >= keys.len() {
+                if merging_pos >= keys_len {
                     break;
                 }
                 let next_insert_key = &keys[merging_pos];
+                debug_assert!(
+                    next_insert_key > &smallvec!(0),
+                    "empty key at {}, keys {:?}",
+                    merging_pos,
+                    keys
+                );
                 if key_upper_bound.is_none() || next_insert_key < key_upper_bound.as_ref().unwrap()
                 {
                     // trigger a split and put the split node into a cache
