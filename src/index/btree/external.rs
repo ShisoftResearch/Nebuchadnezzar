@@ -253,7 +253,10 @@ where
             pos += 1;
             right_pos += 1;
         }
-        debug!("Merge sorted have keys {:?}", &new_node.keys.as_slice_immute()[..pos]);
+        debug!(
+            "Merge sorted have keys {:?}",
+            &new_node.keys.as_slice_immute()[..pos]
+        );
         new_node.len = pos;
         new_node.dirty = true;
         new_node.next = self.next.clone();

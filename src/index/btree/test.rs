@@ -685,9 +685,12 @@ fn level_merge() {
             let n1 = i * 2;
             let id1 = Id::new(0, n1);
             let mut key1 = SmallVec::from_slice(&u64_to_slice(n1));
-            let key1_cur = tree_2.seek(&key1, Ordering::Forward);
+            let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
             key_with_id(&mut key1, &id1);
             assert_eq!(key1_cur.current().unwrap(), &key1);
+            assert_eq!(key1_cur.next(), i as usize != merged);
+            assert_eq!(key1_cur.current().unwrap(), &key2);
+            assert_ne!(tree_1.seek(&key1, Ordering::Forward).current(), Some(&key1));
         }
         assert_eq!(key2_cur.current().unwrap(), &key2);
 

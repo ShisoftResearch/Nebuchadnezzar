@@ -166,7 +166,8 @@ where
 pub fn level_merge<KSA, PSA, KSB, PSB>(
     src_tree: &BPlusTree<KSA, PSA>,
     dest_tree: &BPlusTree<KSB, PSB>,
-) -> usize where
+) -> usize
+where
     KSA: Slice<EntryKey> + Debug + 'static,
     PSA: Slice<NodeCellRef> + 'static,
     KSB: Slice<EntryKey> + Debug + 'static,
