@@ -47,6 +47,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::iter;
+use index::KEY_SIZE;
 
 mod cursor;
 mod external;
@@ -112,7 +114,7 @@ where
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
-        *tree.root.write() = NodeCellRef::new(Node::<KS, PS>::new_external(root_id));
+        *tree.root.write() = NodeCellRef::new(Node::<KS, PS>::new_external(root_id, max_entry_key()));
         return tree;
     }
 
@@ -146,7 +148,7 @@ where
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
-                let mut new_in_root: InNode<KS, PS> = InNode::new(1);
+                let mut new_in_root: InNode<KS, PS> = InNode::new(1, max_entry_key());
                 let mut old_root = self.get_root().clone();
                 // check latched root and current root are the same node
                 debug_assert_eq!(
@@ -198,7 +200,7 @@ where
             let root_guard = write_node::<KS, PS>(&root);
             let new_root_len = root_new_pages.len() + 1;
             debug_assert!(new_root_len < KS::slice_len());
-            let mut new_in_root: InNode<KS, PS> = InNode::new(new_root_len);
+            let mut new_in_root: InNode<KS, PS> = InNode::new(new_root_len, max_entry_key());
             new_in_root.ptrs.as_slice()[0] = root.clone();
             for (i, (key, node)) in root_new_pages.into_iter().enumerate() {
                 new_in_root.keys.as_slice()[i] = key;
@@ -293,6 +295,25 @@ impl NodeCellRef {
     pub fn is_default(&self) -> bool {
         self.inner.is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
     }
+
+    pub fn to_string<KS, PS>(&self) -> String
+        where
+            KS: Slice<EntryKey> + Debug + 'static,
+            PS: Slice<NodeCellRef> + 'static,
+    {
+        if self.is_default() {
+            String::from("<<DEFAULT>>")
+        } else {
+            let node = read_unchecked::<KS, PS>(self);
+            if node.is_none() {
+                String::from("<NONE>")
+            } else if node.is_empty_node() {
+                String::from("<EMPTY>")
+            } else {
+                format!("{:?}", node.first_key())
+            }
+        }
+    }
 }
 
 impl Clone for NodeCellRef {
@@ -301,6 +322,15 @@ impl Clone for NodeCellRef {
             inner: self.inner.clone(),
         }
     }
+}
+
+lazy_static!{
+    pub static ref MAX_ENTRY_KEY: EntryKey = max_entry_key();
+    pub static ref MIN_ENTRY_KEY: EntryKey = smallvec!(0);
+}
+
+fn max_entry_key() -> EntryKey {
+    EntryKey::from(iter::repeat(255u8).take(KEY_SIZE).collect_vec())
 }
 
 type DefaultKeySliceType = [EntryKey; 0];

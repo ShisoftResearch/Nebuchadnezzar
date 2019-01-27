@@ -3,7 +3,7 @@
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
-use index::btree::node::write_targeted_extnode;
+use index::btree::node::write_targeted;
 use index::btree::node::EmptyNode;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
@@ -85,7 +85,7 @@ where
         let pre_locked_parent_right_right_guard = parent_right_guard
             .right_ref_mut_no_empty()
             .map(|r| write_node(r));
-        let pp_guard = write_targeted_extnode(write_node(parent_parent), key);
+        let pp_guard = write_targeted(write_node(parent_parent), key);
         parent_parent_guard = pp_guard;
         parent_parent_remove_pos = parent_parent_guard.search(key);
         let parent_right_half_full = parent_right_guard.is_half_full();
@@ -311,7 +311,7 @@ where
         }
         MutSearchResult::External => {
             let node_guard: NodeWriteGuard<KS, PS> = write_node(node_ref);
-            let mut target_guard = write_targeted_extnode(node_guard, key);
+            let mut target_guard = write_targeted(node_guard, key);
             let target_guard_ref = target_guard.node_ref().clone();
             let mut remove_result = RemoveResult {
                 rebalancing: None,
@@ -328,7 +328,7 @@ where
                     let right_right_guard =
                         write_node(&right_guard.right_ref_mut_no_empty().unwrap());
                     let parent_guard = write_node(parent);
-                    let parent_target_guard = write_targeted_extnode(parent_guard, key);
+                    let parent_target_guard = write_targeted(parent_guard, key);
                     let parent_pos = parent_target_guard.search(key);
                     // Check if the right node is innode and its parent is the same as the left one
                     // because we have to lock from left to right, there is no way to lock backwards

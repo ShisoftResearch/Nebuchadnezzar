@@ -2,7 +2,7 @@ use index::btree::internal::InNode;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
-use index::btree::node::write_targeted_extnode;
+use index::btree::node::write_targeted;
 use index::btree::node::EmptyNode;
 use index::btree::node::NodeData;
 use index::btree::node::NodeWriteGuard;
@@ -65,8 +65,8 @@ where
 fn apply_removal<'a, KS, PS>(
     cursor_guard: &mut NodeWriteGuard<KS, PS>,
     poses: &mut BTreeSet<usize>,
-    key_to_del: &'a EntryKey,
     empty_pages: &mut Vec<&'a EntryKey>,
+    prev_key: &Option<&'a EntryKey>
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -115,69 +115,13 @@ fn apply_removal<'a, KS, PS>(
     }
 
     if cursor_guard.is_empty() {
-        debug!("Pruned page is empty: {:?}", key_to_del);
+        debug!("Pruned page is empty: {:?}", prev_key);
         cursor_guard.make_empty_node();
-        empty_pages.push(key_to_del);
-    }
-    poses.clear();
-}
-
-fn upper_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    let right_most_child = &node.innode().ptrs.as_slice_immute()[node.len()];
-    let right_node = read_unchecked::<KS, PS>(right_most_child);
-    if right_node.is_empty() {
-        &*node
-    } else {
-        &*right_node
-    }
-    .keys()
-    .last()
-    .unwrap()
-    .clone()
-}
-
-fn lower_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    let left_most_child = &node.innode().ptrs.as_slice_immute()[0];
-    let left_node = read_unchecked::<KS, PS>(left_most_child);
-    if left_node.is_empty() {
-        &*node
-    } else {
-        &*left_node
-    }
-    .keys()
-    .first()
-    .unwrap()
-    .clone()
-}
-
-fn shift_to_right_innode<KS, PS>(
-    mut search_node: NodeWriteGuard<KS, PS>,
-    key: &EntryKey,
-    node_upper_bound: &mut EntryKey,
-) -> NodeWriteGuard<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    if search_node.is_empty() || (search_node.len() > 0 && &*node_upper_bound < key) {
-        debug!("Shifting to right node for {:?}", key);
-        let right_ref = search_node.right_ref_mut_no_empty().unwrap();
-        let right_node = write_node(right_ref);
-        let right_upper_bound = upper_bound(&right_node);
-        if !right_node.is_none() && (right_node.len() > 0 && &lower_bound(&right_node) <= key) {
-            *node_upper_bound = right_upper_bound;
-            return shift_to_right_innode(right_node, key, node_upper_bound);
+        if let &Some(k) = prev_key {
+            empty_pages.push(k);
         }
     }
-    search_node
+    poses.clear();
 }
 
 fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -> Vec<&'a EntryKey>
@@ -212,34 +156,34 @@ where
         // start delete
         let mut cursor_guard = write_node::<KS, PS>(node);
         let mut guard_removing_poses = BTreeSet::new();
-        let mut cursor_upper_bound = upper_bound(&cursor_guard);
+        let mut prev_key = None;
         debug!(
             "Prune deepest node starting key: {:?}",
             cursor_guard.first_key()
         );
         for (i, key_to_del) in keys.into_iter().enumerate() {
-            if key_to_del > &cursor_upper_bound {
+            if key_to_del >= cursor_guard.right_bound() {
                 debug!(
-                    "Applying removal for overflow current page ({}/{}) {:?} < {:?}. {:?}",
+                    "Applying removal for overflow current page ({}/{}) key: {:?} >= bound: {:?}. guard keys: {:?}",
                     guard_removing_poses.len(),
                     cursor_guard.len() + 1,
-                    cursor_upper_bound,
                     key_to_del,
+                    cursor_guard.right_bound(),
                     &cursor_guard.keys()[..cursor_guard.len()]
                 );
                 apply_removal(
                     &mut cursor_guard,
                     &mut guard_removing_poses,
-                    key_to_del,
                     &mut empty_pages,
+                    &prev_key
                 );
+                cursor_guard =
+                    write_targeted(cursor_guard, key_to_del);
+                debug_assert!(!cursor_guard.is_empty_node());
                 debug!(
                     "Applied removal for overflow current page ({})",
                     cursor_guard.len()
                 );
-                cursor_guard =
-                    shift_to_right_innode(cursor_guard, key_to_del, &mut cursor_upper_bound);
-                debug_assert!(!cursor_guard.is_empty_node());
             }
             let pos = cursor_guard.search(key_to_del);
             debug!("Key to delete have position {}, key: {:?}", pos, key_to_del);
@@ -249,10 +193,11 @@ where
                 apply_removal(
                     &mut cursor_guard,
                     &mut guard_removing_poses,
-                    key_to_del,
                     &mut empty_pages,
+                    &prev_key
                 );
             }
+            prev_key = Some(key_to_del)
         }
     }
     empty_pages

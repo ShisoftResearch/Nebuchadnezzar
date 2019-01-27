@@ -20,6 +20,7 @@ where
     pub ptrs: PS,
     pub len: usize,
     pub right: NodeCellRef,
+    pub right_bound: EntryKey
 }
 
 pub struct InNodeKeysSplit<KS>
@@ -44,11 +45,12 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(len: usize) -> Self {
+    pub fn new(len: usize, right_bound: EntryKey) -> Self {
         InNode {
             keys: KS::init(),
             ptrs: PS::init(),
             right: NodeCellRef::new(Node::<KS, PS>::none()),
+            right_bound,
             len,
         }
     }
@@ -89,6 +91,7 @@ where
         let node_len = self.len;
         let ptr_len = self.len + 1;
         let pivot = node_len / 2; // pivot key will be removed
+        let pivot_key = self.keys.as_slice()[pivot].clone();
         debug!("Going to split at pivot {}", pivot);
         let keys_split = {
             debug!("insert into keys");
@@ -168,11 +171,13 @@ where
                 InNodePtrSplit { ptrs_2 }
             }
         };
+        let right_bound = mem::replace(&mut self.right_bound, pivot_key);
         let node_2 = InNode {
             len: keys_split.keys_2_len,
             keys: keys_split.keys_2,
             ptrs: ptr_split.ptrs_2,
             right: self.right.clone(),
+            right_bound
         };
         let node_2_ref = NodeCellRef::new(Node::internal(node_2));
         self.len = keys_split.keys_1_len;

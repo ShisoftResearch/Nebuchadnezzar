@@ -52,6 +52,7 @@ where
     pub prev: NodeCellRef,
     pub len: usize,
     pub dirty: bool,
+    pub right_bound: EntryKey,
     mark: PhantomData<PS>,
 }
 
@@ -69,7 +70,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(id: Id) -> ExtNode<KS, PS> {
+    pub fn new(id: Id, right_bound: EntryKey) -> ExtNode<KS, PS> {
         ExtNode {
             id,
             keys: KS::init(),
@@ -77,6 +78,7 @@ where
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
             dirty: false,
+            right_bound,
             mark: PhantomData,
         }
     }
@@ -147,6 +149,7 @@ where
             prev: self_ref.clone(),
             len: keys_2_len,
             dirty: true,
+            right_bound: mem::replace(&mut self.right_bound, pivot_key.clone()),
             mark: PhantomData,
         };
         debug_assert!(pivot_key > smallvec!(0));
@@ -227,41 +230,39 @@ where
         debug!("Merge sort have right nodes {:?}", right);
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
-        let mut new_node = Self::new(self.id);
         let mut pos = 0;
         let mut left_pos = 0;
         let mut right_pos = 0;
+        let mut left_keys = mem::replace(&mut self.keys, KS::init());
+        let mut left = left_keys.as_slice();
         while left_pos < self.len && right_pos < right.len() {
-            let left_key = &self.keys.as_slice_immute()[left_pos];
+            let left_key = &left[left_pos];
             let right_key = right[right_pos];
             if left_key < right_key {
-                new_node.keys.as_slice()[pos] = left_key.clone();
+                self.keys.as_slice()[pos] = left_key.clone();
                 left_pos += 1;
             } else {
-                new_node.keys.as_slice()[pos] = right_key.clone();
+                self.keys.as_slice()[pos] = right_key.clone();
                 right_pos += 1;
             }
             pos += 1;
         }
-        for key in &self.keys.as_slice()[left_pos..self.len] {
-            new_node.keys.as_slice()[pos] = key.clone();
+        for key in &left[left_pos..self.len] {
+            self.keys.as_slice()[pos] = key.clone();
             pos += 1;
             left_pos += 1;
         }
         for key in &right[right_pos..] {
-            new_node.keys.as_slice()[pos] = (*key).clone();
+            self.keys.as_slice()[pos] = (*key).clone();
             pos += 1;
             right_pos += 1;
         }
         debug!(
             "Merge sorted have keys {:?}",
-            &new_node.keys.as_slice_immute()[..pos]
+            &self.keys.as_slice_immute()[..pos]
         );
-        new_node.len = pos;
-        new_node.dirty = true;
-        new_node.next = self.next.clone();
-        new_node.prev = self.prev.clone();
-        *self = new_node;
+        self.len = pos;
+        self.dirty = true;
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
@@ -365,6 +366,7 @@ where
             prev: self.get(prev),
             len: key_count,
             dirty: false,
+            right_bound: max_entry_key(), // TODO: assign a real one on reconstructing
             mark: PhantomData,
         }
     }

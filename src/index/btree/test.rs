@@ -119,7 +119,7 @@ where
                 keys,
                 nodes,
                 id: None,
-                next: None,
+                next: Some(innode.right.to_string::<KS, PS>()),
                 prev: None,
                 len,
                 is_external: false,
@@ -336,109 +336,109 @@ fn crd() {
         }
     }
 
-    {
-        debug!("Testing deletion");
-        let deletion_volume = num / 2;
-        let mut deletions = (0..deletion_volume).collect_vec();
-        thread_rng().shuffle(deletions.as_mut_slice());
-        for (i, num) in deletions.iter().enumerate() {
-            debug!("delete: {}: {}", i, num);
-            let id = Id::new(0, *num);
-            let key_slice = u64_to_slice(*num);
-            let key = SmallVec::from_slice(&key_slice);
-            let mut entry_key = key.clone();
-            key_with_id(&mut entry_key, &id);
-            let remove_succeed = tree.remove(&entry_key);
-            if !remove_succeed {
-                dump_tree(&tree, &format!("removing_{}_{}_dump.json", i, num));
-            }
-            // dump_tree(&tree, &format!("removing_{}_dump.json", i));
-            assert!(remove_succeed, "remove at {}: {}", i, num);
-        }
-
-        assert_eq!(tree.len(), (num - deletion_volume) as usize);
-        dump_tree(&tree, "remove_completed_dump.json");
-
-        debug!("check for removed items");
-        for i in 0..deletion_volume {
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            assert_eq!(
-                id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                Id::new(0, deletion_volume), // seek should reach deletion_volume
-                "{}",
-                i
-            );
-        }
-
-        debug!("check for remaining items");
-        for i in deletion_volume..num {
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            assert_eq!(
-                id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                id,
-                "{}",
-                i
-            );
-        }
-
-        tree.flush_all();
-
-        debug!("remove remaining items, with extensive point search");
-        for i in (deletion_volume..num).rev() {
-            {
-                debug!("delete and sampling: {}", i);
-                let id = Id::new(0, i);
-                let key_slice = u64_to_slice(i);
-                let key = SmallVec::from_slice(&key_slice);
-                let mut entry_key = key.clone();
-                key_with_id(&mut entry_key, &id);
-                let remove_succeed = tree.remove(&entry_key);
-                if !remove_succeed {
-                    dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
-                }
-                assert!(remove_succeed, "{}", i);
-            }
-            if roll_die.next().unwrap() != 6 {
-                continue;
-            }
-            debug!("sampling for remaining integrity for {}", i);
-            for j in deletion_volume..i {
-                if roll_die.next().unwrap() != 6 {
-                    continue;
-                }
-                let id = Id::new(0, j);
-                let key_slice = u64_to_slice(j);
-                let key = SmallVec::from_slice(&key_slice);
-                assert_eq!(
-                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
-                    id,
-                    "{} / {}",
-                    i,
-                    j
-                );
-            }
-        }
-        dump_tree(&tree, "remove_remains_dump.json");
-
-        debug!("check for removed items");
-        for i in 0..num {
-            let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
-            assert_eq!(
-                tree.seek(&key, Ordering::default()).current(),
-                None, // should always be 'None' for empty tree
-                "{}",
-                i
-            );
-        }
-
-        tree.flush_all();
-        assert_eq!(tree.len(), 0);
+//    {
+//        debug!("Testing deletion");
+//        let deletion_volume = num / 2;
+//        let mut deletions = (0..deletion_volume).collect_vec();
+//        thread_rng().shuffle(deletions.as_mut_slice());
+//        for (i, num) in deletions.iter().enumerate() {
+//            debug!("delete: {}: {}", i, num);
+//            let id = Id::new(0, *num);
+//            let key_slice = u64_to_slice(*num);
+//            let key = SmallVec::from_slice(&key_slice);
+//            let mut entry_key = key.clone();
+//            key_with_id(&mut entry_key, &id);
+//            let remove_succeed = tree.remove(&entry_key);
+//            if !remove_succeed {
+//                dump_tree(&tree, &format!("removing_{}_{}_dump.json", i, num));
+//            }
+//            // dump_tree(&tree, &format!("removing_{}_dump.json", i));
+//            assert!(remove_succeed, "remove at {}: {}", i, num);
+//        }
+//
+//        assert_eq!(tree.len(), (num - deletion_volume) as usize);
+//        dump_tree(&tree, "remove_completed_dump.json");
+//
+//        debug!("check for removed items");
+//        for i in 0..deletion_volume {
+//            let key_slice = u64_to_slice(i);
+//            let key = SmallVec::from_slice(&key_slice);
+//            assert_eq!(
+//                id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                Id::new(0, deletion_volume), // seek should reach deletion_volume
+//                "{}",
+//                i
+//            );
+//        }
+//
+//        debug!("check for remaining items");
+//        for i in deletion_volume..num {
+//            let id = Id::new(0, i);
+//            let key_slice = u64_to_slice(i);
+//            let key = SmallVec::from_slice(&key_slice);
+//            assert_eq!(
+//                id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                id,
+//                "{}",
+//                i
+//            );
+//        }
+//
+//        tree.flush_all();
+//
+//        debug!("remove remaining items, with extensive point search");
+//        for i in (deletion_volume..num).rev() {
+//            {
+//                debug!("delete and sampling: {}", i);
+//                let id = Id::new(0, i);
+//                let key_slice = u64_to_slice(i);
+//                let key = SmallVec::from_slice(&key_slice);
+//                let mut entry_key = key.clone();
+//                key_with_id(&mut entry_key, &id);
+//                let remove_succeed = tree.remove(&entry_key);
+//                if !remove_succeed {
+//                    dump_tree(&tree, &format!("removing_{}_remaining_dump.json", i));
+//                }
+//                assert!(remove_succeed, "{}", i);
+//            }
+//            if roll_die.next().unwrap() != 6 {
+//                continue;
+//            }
+//            debug!("sampling for remaining integrity for {}", i);
+//            for j in deletion_volume..i {
+//                if roll_die.next().unwrap() != 6 {
+//                    continue;
+//                }
+//                let id = Id::new(0, j);
+//                let key_slice = u64_to_slice(j);
+//                let key = SmallVec::from_slice(&key_slice);
+//                assert_eq!(
+//                    id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+//                    id,
+//                    "{} / {}",
+//                    i,
+//                    j
+//                );
+//            }
+//        }
+//        dump_tree(&tree, "remove_remains_dump.json");
+//
+//        debug!("check for removed items");
+//        for i in 0..num {
+//            let key_slice = u64_to_slice(i);
+//            let key = SmallVec::from_slice(&key_slice);
+//            assert_eq!(
+//                tree.seek(&key, Ordering::default()).current(),
+//                None, // should always be 'None' for empty tree
+//                "{}",
+//                i
+//            );
+//        }
+//
+//        tree.flush_all();
+//        assert_eq!(tree.len(), 0);
         // assert_eq!(client.count().wait().unwrap(), 1);
-    }
+//    }
 }
 
 #[test]
@@ -609,7 +609,7 @@ fn node_lock() {
     );
     let client = Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     let tree = LevelBPlusTree::new(&client);
-    let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(1, 2));
+    let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(1, 2), max_entry_key());
     let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(box inner_ext_node)));
     let num = 100000;
     let mut nums = (0..num).collect_vec();

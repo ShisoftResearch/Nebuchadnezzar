@@ -1,7 +1,7 @@
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
-use index::btree::node::write_targeted_extnode;
+use index::btree::node::write_targeted;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
 use index::btree::node::NodeWriteGuard;
@@ -58,7 +58,7 @@ where
             let pivot = split.pivot;
             debug!("New pivot {:?}", pivot);
             debug!("obtain latch for internal node split");
-            let mut target_guard = write_targeted_extnode(split.parent_latch, &pivot);
+            let mut target_guard = write_targeted(split.parent_latch, &pivot);
             debug_assert!(read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= &pivot);
             let mut split_result =
                 target_guard
@@ -84,7 +84,7 @@ where
 {
     // latch nodes from left to right
     debug!("Obtain latch for external node");
-    let mut searched_guard = write_targeted_extnode(write_node(node_ref), key);
+    let mut searched_guard = write_targeted(write_node(node_ref), key);
     debug_assert!(
         searched_guard.is_ext(),
         "{:?}",
@@ -118,7 +118,7 @@ where
             // hopefully that node won't split again
             let current_root_guard = write_node::<KS, PS>(&current_root);
             // at this point, the root may have split again, we need to search for the exact one
-            let mut root_level_target = write_targeted_extnode(current_root_guard, &split.pivot);
+            let mut root_level_target = write_targeted(current_root_guard, &split.pivot);
             // assert this even in production
             assert!(!root_level_target.is_ext());
             root_level_target.innode_mut().insert(

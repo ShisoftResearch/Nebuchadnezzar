@@ -77,11 +77,19 @@ where
     }
 
     pub fn first_key(&self) -> &EntryKey {
-        &self.keys()[0]
+        if self.is_empty() && !self.is_empty_node() {
+            &*MIN_ENTRY_KEY
+        } else {
+            &self.keys()[0]
+        }
     }
 
     pub fn last_key(&self) -> &EntryKey {
-        &self.keys()[self.len() - 1]
+        if self.is_empty() && !self.is_empty_node() {
+            &*MIN_ENTRY_KEY
+        } else {
+            &self.keys()[self.len() - 1]
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -151,7 +159,7 @@ where
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
-        if self.is_empty() || self.len() > 0 && self.last_key() < key {
+        if self.is_empty() || self.len() > 0 && self.right_bound() <= key {
             let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
             if !right_node.is_none()
                 && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key)
@@ -225,6 +233,20 @@ where
     pub fn has_vaild_right_node(&self) -> bool {
         self.right_ref().is_some()
     }
+
+    pub fn right_bound(&self) -> &EntryKey {
+        match self {
+            &NodeData::External(ref n) => {
+                debug_assert!(&n.right_bound > self.first_key(), "{:?} lge {:?}", &n.right_bound, self.first_key());
+                &n.right_bound
+            },
+            &NodeData::Internal(ref n) => {
+                debug_assert!(&n.right_bound > self.first_key(), "{:?} lge {:?}", &n.right_bound, self.first_key());
+                &n.right_bound
+            },
+            _ => panic!(self.type_name())
+        }
+    }
 }
 
 pub fn write_non_empty<KS, PS>(mut search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>
@@ -238,7 +260,7 @@ where
     return search_page;
 }
 
-pub fn write_targeted_extnode<KS, PS>(
+pub fn write_targeted<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,
     key: &EntryKey,
 ) -> NodeWriteGuard<KS, PS>
@@ -246,20 +268,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    if search_page.is_empty() || (search_page.len() > 0 && search_page.last_key() < key) {
-        debug!(
-            "Shifting from {:?}~{:?}",
-            if search_page.is_empty() {
-                smallvec!(0)
-            } else {
-                search_page.first_key().clone()
-            },
-            if search_page.is_empty() {
-                smallvec!(0)
-            } else {
-                search_page.last_key().clone()
-            }
-        );
+    if search_page.is_empty() || (search_page.len() > 0 && search_page.right_bound() < key) {
         let right_ref = search_page.right_ref_mut_no_empty().unwrap();
         let right_node = write_node(right_ref);
         debug_assert!(!right_node.is_empty_node());
@@ -273,22 +282,8 @@ where
                 None
             }
         );
-        if !right_node.is_none() && (right_node.len() > 0 && right_node.first_key() <= key) {
-            debug!(
-                "Will write {:?} from left node to right page, start with {:?}, keys {:?}",
-                key,
-                if right_node.is_empty() {
-                    smallvec!(0)
-                } else {
-                    right_node.first_key().clone()
-                },
-                if right_node.is_empty() {
-                    &[]
-                } else {
-                    right_node.keys()
-                }
-            );
-            return write_targeted_extnode(right_node, key);
+        if !right_node.is_none() {
+            return write_targeted(right_node, key);
         }
     }
     search_page
@@ -331,8 +326,8 @@ where
     pub fn none_ref() -> NodeCellRef {
         NodeCellRef::new(Node::<KS, PS>::none())
     }
-    pub fn new_external(id: Id) -> Self {
-        Self::external(ExtNode::new(id))
+    pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
+        Self::external(ExtNode::new(id, right_bound))
     }
     pub fn version(&self) -> usize {
         node_version(self.cc.load(SeqCst))
