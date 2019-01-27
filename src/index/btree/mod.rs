@@ -285,10 +285,13 @@ impl NodeCellRef {
         debug_assert!(
             self.inner.is::<Node<KS, PS>>(),
             "Node ref type unmatched, is default: {}",
-            self.inner
-                .is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
+            self.is_default()
         );
         unsafe { &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>) }
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.inner.is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
     }
 }
 

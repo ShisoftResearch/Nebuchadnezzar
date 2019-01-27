@@ -67,76 +67,85 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    unsafe {
-        let node = read_unchecked(&*node);
-        match &*node {
-            &NodeData::External(ref node) => {
-                let node: &ExtNode<KS, PS> = node;
-                let keys = node.keys.as_slice_immute()[..node.len]
-                    .iter()
-                    .map(|key| {
-                        let id = id_from_key(key);
-                        format!("{}\t{:?}", id.lower, key)
-                    })
-                    .collect();
-                return DebugNode {
-                    keys,
-                    nodes: vec![],
-                    id: Some(format!("{:?}", node.id)),
-                    next: Some(format!(
-                        "{:?}",
-                        read_unchecked::<KS, PS>(&node.next).ext_id()
-                    )),
-                    prev: Some(format!(
-                        "{:?}",
-                        read_unchecked::<KS, PS>(&node.prev).ext_id()
-                    )),
-                    len: node.len,
-                    is_external: true,
-                };
-            }
-            &NodeData::Internal(ref innode) => {
-                let len = innode.len;
-                let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
-                    .iter()
-                    .map(|node_ref| cascading_dump_node::<KS, PS>(node_ref))
-                    .collect();
-                let keys = innode.keys.as_slice_immute()[..node.len()]
-                    .iter()
-                    .map(|key| format!("{:?}", key))
-                    .collect();
-                return DebugNode {
-                    keys,
-                    nodes,
-                    id: None,
-                    next: None,
-                    prev: None,
-                    len,
-                    is_external: false,
-                };
-            }
-            &NodeData::None => {
-                return DebugNode {
-                    keys: vec![String::from("<NOT FOUND>")],
-                    nodes: vec![],
-                    id: None,
-                    next: None,
-                    prev: None,
-                    len: 0,
-                    is_external: false,
-                };
-            }
-            &NodeData::Empty(ref n) => {
-                return DebugNode {
-                    keys: vec![String::from("<EMPTY>")],
-                    nodes: vec![],
-                    id: None,
-                    next: None,
-                    prev: None,
-                    len: 0,
-                    is_external: false,
-                };
-            }
+    if node.is_default() {
+        return DebugNode {
+            keys: vec![String::from("<ERROR!!! DEFAULT NODE!!!>")],
+            nodes: vec![],
+            id: None,
+            next: None,
+            prev: None,
+            len: 0,
+            is_external: false
+        }
+    }
+    let node = read_unchecked(&*node);
+    match &*node {
+        &NodeData::External(ref node) => {
+            let node: &ExtNode<KS, PS> = node;
+            let keys = node.keys.as_slice_immute()[..node.len]
+                .iter()
+                .map(|key| {
+                    let id = id_from_key(key);
+                    format!("{}\t{:?}", id.lower, key)
+                })
+                .collect();
+            return DebugNode {
+                keys,
+                nodes: vec![],
+                id: Some(format!("{:?}", node.id)),
+                next: Some(format!(
+                    "{:?}",
+                    read_unchecked::<KS, PS>(&node.next).ext_id()
+                )),
+                prev: Some(format!(
+                    "{:?}",
+                    read_unchecked::<KS, PS>(&node.prev).ext_id()
+                )),
+                len: node.len,
+                is_external: true,
+            };
+        }
+        &NodeData::Internal(ref innode) => {
+            let len = innode.len;
+            let keys = innode.keys.as_slice_immute()[..node.len()]
+                .iter()
+                .map(|key| format!("{:?}", key))
+                .collect();
+            let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
+                .iter()
+                .map(|node_ref| cascading_dump_node::<KS, PS>(node_ref))
+                .collect();
+            return DebugNode {
+                keys,
+                nodes,
+                id: None,
+                next: None,
+                prev: None,
+                len,
+                is_external: false,
+            };
+        }
+        &NodeData::None => {
+            return DebugNode {
+                keys: vec![String::from("<NOT FOUND>")],
+                nodes: vec![],
+                id: None,
+                next: None,
+                prev: None,
+                len: 0,
+                is_external: false,
+            };
+        }
+        &NodeData::Empty(ref n) => {
+            return DebugNode {
+                keys: vec![String::from("<EMPTY>")],
+                nodes: vec![],
+                id: None,
+                next: None,
+                prev: None,
+                len: 0,
+                is_external: false,
+            };
         }
     }
 }
