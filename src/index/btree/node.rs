@@ -196,13 +196,17 @@ where
     fn get_non_empty_node(node_ref: &NodeCellRef) -> NodeCellRef {
         let node = read_unchecked::<KS, PS>(node_ref);
         if node.is_empty_node() {
-            Self::get_non_empty_node(node.right_ref().unwrap())
+            let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
+            let mut guard = write_node::<KS, PS>(node_ref);
+            guard.left_ref_mut().map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
+            guard.right_ref_mut().map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
+            return non_empty
         } else {
             node_ref.clone()
         }
     }
 
-    fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
+    pub fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.next),
             &mut NodeData::Internal(ref mut n) => Some(&mut n.right),
@@ -374,6 +378,18 @@ where
     }
 }
 
+pub fn is_node_locked<KS, PS>(node: &NodeCellRef) -> bool
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    let node_deref = node.deref::<KS, PS>();
+    let cc = &node_deref.cc;
+    let cc_num = cc.load(Relaxed);
+    let expected = cc_num & (!LATCH_FLAG);
+    cc_num == expected
+}
+
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
     node: &NodeCellRef,
     mut func: F,
@@ -411,6 +427,18 @@ where
         node_ref: node.clone(),
     }
 }
+
+pub fn write_unchecked<KS, PS>(node: &NodeCellRef) -> &mut NodeData<KS, PS>
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    let node_deref = node.deref();
+    unsafe {
+        &mut*node_deref.data.get()
+    }
+}
+
 
 pub struct NodeWriteGuard<KS, PS>
 where

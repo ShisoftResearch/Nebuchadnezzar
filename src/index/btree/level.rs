@@ -11,6 +11,7 @@ use index::btree::search::MutSearchResult;
 use index::btree::BPlusTree;
 use index::btree::NodeCellRef;
 use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
+use index::btree::node::write_unchecked;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
@@ -18,6 +19,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
+use index::btree::node::is_node_locked;
 
 enum Selection<KS, PS>
 where
@@ -67,6 +69,7 @@ fn apply_removal<'a, KS, PS>(
     poses: &mut BTreeSet<usize>,
     empty_pages: &mut Vec<&'a EntryKey>,
     prev_key: &Option<&'a EntryKey>,
+    remove_children_right_nodes: bool
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -84,6 +87,18 @@ fn apply_removal<'a, KS, PS>(
         let mut new_keys = KS::init();
         let mut new_ptrs = PS::init();
         {
+            if remove_children_right_nodes {
+                // A node will be reclaimed if and only if it have zero references
+                // If there is any sequential empty nodes, they have to be unlinked each other
+                // The upper level will do the rest to unlink it from the tree
+                innode.ptrs.as_slice()[..innode.len + 1]
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| poses.contains(i))
+                    .for_each(|(_, r)| {
+                        write_node::<KS, PS>(r).right_ref_mut_no_empty();
+                    });
+            }
             let mut keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
                 .iter_mut()
                 .enumerate()
@@ -145,12 +160,14 @@ where
         }
         MutSearchResult::External => unreachable!(),
     };
+    let mut deepest = false;
     match pruning {
         PruningSearch::DeepestInnode => {
             debug!(
                 "Removing in deepest nodes keys {:?}, level {}",
                 &keys, level
             );
+            deepest = true;
         }
         PruningSearch::Innode(sub_node) => {
             keys = prune_selected::<KS, PS>(&sub_node, keys, level + 1);
@@ -185,6 +202,7 @@ where
                     &mut guard_removing_poses,
                     &mut empty_pages,
                     &prev_key,
+                    !deepest
                 );
                 cursor_guard = write_targeted(cursor_guard, key_to_del);
                 debug_assert!(!cursor_guard.is_empty_node());
@@ -212,6 +230,7 @@ where
                 &mut guard_removing_poses,
                 &mut empty_pages,
                 &prev_key,
+                !deepest
             );
         }
     }
