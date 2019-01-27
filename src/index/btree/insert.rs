@@ -1,7 +1,7 @@
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
-use index::btree::node::write_targeted_extnode;
 use index::btree::node::write_node;
+use index::btree::node::write_targeted_extnode;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
 use index::btree::node::NodeWriteGuard;

@@ -123,9 +123,9 @@ fn apply_removal<'a, KS, PS>(
 }
 
 fn upper_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let right_most_child = &node.innode().ptrs.as_slice_immute()[node.len()];
     let right_node = read_unchecked::<KS, PS>(right_most_child);
@@ -133,13 +133,17 @@ fn upper_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
         &*node
     } else {
         &*right_node
-    }.keys().last().unwrap().clone()
+    }
+    .keys()
+    .last()
+    .unwrap()
+    .clone()
 }
 
 fn lower_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let left_most_child = &node.innode().ptrs.as_slice_immute()[0];
     let left_node = read_unchecked::<KS, PS>(left_most_child);
@@ -147,7 +151,11 @@ fn lower_bound<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> EntryKey
         &*node
     } else {
         &*left_node
-    }.keys().first().unwrap().clone()
+    }
+    .keys()
+    .first()
+    .unwrap()
+    .clone()
 }
 
 fn shift_to_right_innode<KS, PS>(

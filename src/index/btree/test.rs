@@ -51,9 +51,9 @@ type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
 type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
 
 pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     debug!("dumping {}", f);
     let debug_root = cascading_dump_node::<KS, PS>(&tree.get_root());
@@ -63,18 +63,16 @@ pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
 }
 
 fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     unsafe {
         let node = read_unchecked(&*node);
         match &*node {
             &NodeData::External(ref node) => {
                 let node: &ExtNode<KS, PS> = node;
-                let keys = node
-                    .keys
-                    .as_slice_immute()[..node.len]
+                let keys = node.keys.as_slice_immute()[..node.len]
                     .iter()
                     .map(|key| {
                         let id = id_from_key(key);
@@ -99,15 +97,11 @@ fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode
             }
             &NodeData::Internal(ref innode) => {
                 let len = innode.len;
-                let nodes = innode
-                    .ptrs
-                    .as_slice_immute()[..node.len() + 1]
+                let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
                     .iter()
                     .map(|node_ref| cascading_dump_node::<KS, PS>(node_ref))
                     .collect();
-                let keys = innode
-                    .keys
-                    .as_slice_immute()[..node.len()]
+                let keys = innode.keys.as_slice_immute()[..node.len()]
                     .iter()
                     .map(|key| format!("{:?}", key))
                     .collect();
