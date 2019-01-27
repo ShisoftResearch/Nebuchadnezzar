@@ -50,25 +50,32 @@ type KeySlice = [EntryKey; PAGE_SIZE];
 type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
 type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
 
-pub fn dump_tree(tree: &LevelBPlusTree, f: &str) {
+pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
     debug!("dumping {}", f);
-    let debug_root = cascading_dump_node(&tree.get_root());
+    let debug_root = cascading_dump_node::<KS, PS>(&tree.get_root());
     let json = serde_json::to_string_pretty(&debug_root).unwrap();
     let mut file = File::create(f).unwrap();
     file.write_all(json.as_bytes());
 }
 
-fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
+fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
     unsafe {
         let node = read_unchecked(&*node);
         match &*node {
             &NodeData::External(ref node) => {
-                let node: &ExtNode<KeySlice, PtrSlice> = node;
+                let node: &ExtNode<KS, PS> = node;
                 let keys = node
                     .keys
-                    .as_slice_immute()
+                    .as_slice_immute()[..node.len]
                     .iter()
-                    .take(node.len)
                     .map(|key| {
                         let id = id_from_key(key);
                         format!("{}\t{:?}", id.lower, key)
@@ -80,11 +87,11 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
                     id: Some(format!("{:?}", node.id)),
                     next: Some(format!(
                         "{:?}",
-                        read_unchecked::<KeySlice, PtrSlice>(&node.next).ext_id()
+                        read_unchecked::<KS, PS>(&node.next).ext_id()
                     )),
                     prev: Some(format!(
                         "{:?}",
-                        read_unchecked::<KeySlice, PtrSlice>(&node.prev).ext_id()
+                        read_unchecked::<KS, PS>(&node.prev).ext_id()
                     )),
                     len: node.len,
                     is_external: true,
@@ -94,14 +101,14 @@ fn cascading_dump_node(node: &NodeCellRef) -> DebugNode {
                 let len = innode.len;
                 let nodes = innode
                     .ptrs
+                    .as_slice_immute()[..node.len() + 1]
                     .iter()
-                    .take(len + 1)
-                    .map(|node_ref| cascading_dump_node(node_ref))
+                    .map(|node_ref| cascading_dump_node::<KS, PS>(node_ref))
                     .collect();
                 let keys = innode
                     .keys
+                    .as_slice_immute()[..node.len()]
                     .iter()
-                    .take(len)
                     .map(|key| format!("{:?}", key))
                     .collect();
                 return DebugNode {
@@ -630,7 +637,7 @@ type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 #[test]
 fn level_merge() {
     env_logger::init();
-    let server_group = "b_plus_index_init";
+    let server_group = "b_plus_level_merge";
     let server_addr = String::from("127.0.0.1:5800");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -658,6 +665,7 @@ fn level_merge() {
         key_with_id(&mut entry_key, &id);
         tree_1.insert(&entry_key);
     }
+
     for i in 0..range {
         let n = i * 2 + 1;
         let id = Id::new(0, n);
@@ -669,9 +677,15 @@ fn level_merge() {
         tree_2.insert(&entry_key);
     }
 
+    dump_tree(&tree_1, "lsm-tree_level_merge_1_before_dump.json");
+    dump_tree(&tree_2, "lsm-tree_level_merge_2_before_dump.json");
+
     debug!("MERGING...");
     let merged = tree_2.merge_tree(&tree_1);
     assert!(merged > 0);
+
+    dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
+    dump_tree(&tree_2, "lsm-tree_level_merge_2_after_dump.json");
 
     for i in 0..range {
         let n2 = i * 2 + 1;

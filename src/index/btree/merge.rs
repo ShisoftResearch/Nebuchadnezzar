@@ -2,7 +2,7 @@ use index::btree::insert::check_root_modification;
 use index::btree::internal::InNode;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
-use index::btree::node::write_key_page;
+use index::btree::node::write_targeted_extnode;
 use index::btree::node::write_node;
 use index::btree::node::write_non_empty;
 use index::btree::node::Node;
@@ -33,7 +33,7 @@ fn merge_into_internal<KS, PS>(
 {
     let mut node_guard = write_node::<KS, PS>(node);
     for (pivot, node) in lower_level_new_pages {
-        let mut target_guard = write_non_empty(write_key_page(node_guard, &pivot));
+        let mut target_guard = write_non_empty(write_targeted_extnode(node_guard, &pivot));
         {
             debug_assert!(!target_guard.is_none());
             let innode = target_guard.innode_mut();
@@ -76,7 +76,7 @@ where
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
                 debug!("Start merging with page at {:?}", start_key);
-                let mut target_page_guard = write_key_page(current_guard, start_key);
+                let mut target_page_guard = write_targeted_extnode(current_guard, start_key);
                 let mut right_guard =
                     write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
                 let key_upper_bound = if right_guard.is_none() {

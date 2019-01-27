@@ -58,21 +58,21 @@ where
         match self {
             &mut NodeData::External(ref mut node) => node.remove_at(pos),
             &mut NodeData::Internal(ref mut node) => node.remove_at(pos),
-            &mut NodeData::None | &mut NodeData::Empty(_) => unreachable!(),
+            &mut NodeData::None | &mut NodeData::Empty(_) => unreachable!(self.type_name()),
         }
     }
     pub fn is_ext(&self) -> bool {
         match self {
             &NodeData::External(_) => true,
             &NodeData::Internal(_) => false,
-            &NodeData::None | &NodeData::Empty(_) => panic!(),
+            &NodeData::None | &NodeData::Empty(_) => panic!(self.type_name()),
         }
     }
     pub fn keys(&self) -> &[EntryKey] {
         if self.is_ext() {
-            &self.extnode().keys.as_slice_immute()
+            &self.extnode().keys.as_slice_immute()[..self.len()]
         } else {
-            &self.innode().keys.as_slice_immute()
+            &self.innode().keys.as_slice_immute()[..self.len()]
         }
     }
 
@@ -238,7 +238,7 @@ where
     return search_page;
 }
 
-pub fn write_key_page<KS, PS>(
+pub fn write_targeted_extnode<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,
     key: &EntryKey,
 ) -> NodeWriteGuard<KS, PS>
@@ -246,9 +246,33 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    if search_page.is_empty() || search_page.len() > 0 && search_page.last_key() < key {
+    if search_page.is_empty() || (search_page.len() > 0 && search_page.last_key() < key) {
+        debug!(
+            "Shifting from {:?}~{:?}",
+            if search_page.is_empty() {
+                smallvec!(0)
+            } else {
+                search_page.first_key().clone()
+            },
+            if search_page.is_empty() {
+                smallvec!(0)
+            } else {
+                search_page.last_key().clone()
+            }
+        );
         let right_ref = search_page.right_ref_mut_no_empty().unwrap();
         let right_node = write_node(right_ref);
+        debug_assert!(!right_node.is_empty_node());
+        debug!(
+            "Shifting to right {} node for {:?}, first key {:?}",
+            right_node.type_name(),
+            key,
+            if !right_node.is_none() && right_node.len() > 0 {
+                Some(right_node.first_key())
+            } else {
+                None
+            }
+        );
         if !right_node.is_none() && (right_node.len() > 0 && right_node.first_key() <= key) {
             debug!(
                 "Will write {:?} from left node to right page, start with {:?}, keys {:?}",
@@ -264,10 +288,10 @@ where
                     right_node.keys()
                 }
             );
-            return write_key_page(right_node, key);
+            return write_targeted_extnode(right_node, key);
         }
     }
-    return search_page;
+    search_page
 }
 
 const LATCH_FLAG: usize = !(!0 >> 1);
@@ -466,7 +490,7 @@ where
         debug_assert!(self.is_empty());
         let data = &mut (**self);
         let left_node = data.left_ref().cloned();
-        let right_node = data.right_ref_mut_no_empty().cloned().unwrap();
+        let right_node = data.right_ref().cloned().unwrap();
         // check if have left node, if so then update the right node left pointer
         if left_node.is_some() {
             let mut right_guard = write_node::<KS, PS>(&right_node);

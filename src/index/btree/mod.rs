@@ -60,8 +60,7 @@ mod search;
 
 const CACHE_SIZE: usize = 2048;
 
-// B-Tree is the memtable for the LSM-Tree
-// Items can be added and removed in real-time
+// Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
