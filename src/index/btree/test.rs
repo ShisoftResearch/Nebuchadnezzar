@@ -141,7 +141,7 @@ where
                 keys: vec![String::from("<EMPTY>")],
                 nodes: vec![],
                 id: None,
-                next: None,
+                next: Some(n.right.to_string::<KS, PS>()),
                 prev: None,
                 len: 0,
                 is_external: false,

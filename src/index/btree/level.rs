@@ -124,7 +124,7 @@ fn apply_removal<'a, KS, PS>(
     poses.clear();
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>) -> Vec<&'a EntryKey>
+fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>, level: usize) -> Vec<&'a EntryKey>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -143,33 +143,34 @@ where
     };
     match pruning {
         PruningSearch::DeepestInnode => {
-            debug!("Removing in deepest nodes keys {:?}", &keys);
+            debug!("Removing in deepest nodes keys {:?}, level {}", &keys, level);
         }
         PruningSearch::Innode(sub_node) => {
-            keys = prune_selected::<KS, PS>(&sub_node, keys);
+            keys = prune_selected::<KS, PS>(&sub_node, keys, level + 1);
         }
     }
     // empty page references that will dealt with by upper level
     let mut empty_pages = vec![];
     if !keys.is_empty() {
-        debug!("Pruning page containing keys {:?}", &keys);
+        debug!("Pruning page containing keys {:?}, level {}", &keys, level);
         // start delete
         let mut cursor_guard = write_node::<KS, PS>(node);
         let mut guard_removing_poses = BTreeSet::new();
         let mut prev_key = None;
         debug!(
-            "Prune deepest node starting key: {:?}",
-            cursor_guard.first_key()
+            "Prune deepest node starting key: {:?}, level {}",
+            cursor_guard.first_key(), level
         );
         for (i, key_to_del) in keys.into_iter().enumerate() {
             if key_to_del >= cursor_guard.right_bound() {
                 debug!(
-                    "Applying removal for overflow current page ({}/{}) key: {:?} >= bound: {:?}. guard keys: {:?}",
+                    "Applying removal for overflow current page ({}/{}) key: {:?} >= bound: {:?}. guard keys: {:?}, level {}",
                     guard_removing_poses.len(),
                     cursor_guard.len() + 1,
                     key_to_del,
                     cursor_guard.right_bound(),
-                    &cursor_guard.keys()[..cursor_guard.len()]
+                    &cursor_guard.keys()[..cursor_guard.len()],
+                    level
                 );
                 apply_removal(
                     &mut cursor_guard,
@@ -180,25 +181,26 @@ where
                 cursor_guard = write_targeted(cursor_guard, key_to_del);
                 debug_assert!(!cursor_guard.is_empty_node());
                 debug!(
-                    "Applied removal for overflow current page ({})",
-                    cursor_guard.len()
+                    "Applied removal for overflow current page ({}), level {}",
+                    cursor_guard.len(), level
                 );
             }
             let pos = cursor_guard.search(key_to_del);
-            debug!("Key to delete have position {}, key: {:?}", pos, key_to_del);
+            debug!("Key to delete have position {}, key: {:?}, level {}", pos, key_to_del, level);
             guard_removing_poses.insert(pos);
-            if i == key_len - 1 {
-                debug!("Applying removal for last key");
-                apply_removal(
-                    &mut cursor_guard,
-                    &mut guard_removing_poses,
-                    &mut empty_pages,
-                    &prev_key,
-                );
-            }
             prev_key = Some(key_to_del)
         }
+        if !guard_removing_poses.is_empty() {
+            debug!("Applying removal for last keys {:?}, level {}", &guard_removing_poses, level);
+            apply_removal(
+                &mut cursor_guard,
+                &mut guard_removing_poses,
+                &mut empty_pages,
+                &prev_key,
+            );
+        }
     }
+    debug!("Have empty nodes {:?}, level {:?}", &empty_pages, level);
     empty_pages
 }
 
@@ -235,7 +237,7 @@ where
             .filter(|g| !g.is_empty())
             .map(|g| g.first_key())
             .collect_vec();
-        prune_selected::<KSA, PSA>(&src_tree.get_root(), page_keys);
+        prune_selected::<KSA, PSA>(&src_tree.get_root(), page_keys, 0);
     }
 
     // adjust leaf left, right references
