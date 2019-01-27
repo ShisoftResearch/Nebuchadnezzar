@@ -17,6 +17,7 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
+use bifrost_plugins::hash_ident;
 
 pub mod cell_rpc;
 pub mod transactions;

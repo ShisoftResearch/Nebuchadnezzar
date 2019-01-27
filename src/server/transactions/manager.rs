@@ -12,6 +12,7 @@ use server::NebServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use utils::chashmap::{CHashMap, WriteGuard};
 use utils::stream::PollableStream;
+use bifrost_plugins::hash_ident;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
