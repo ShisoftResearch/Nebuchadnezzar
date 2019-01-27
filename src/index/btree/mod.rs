@@ -20,6 +20,7 @@ use index::MergeableTree;
 use index::MergingPage;
 use index::MergingTreeGuard;
 use index::Slice;
+use index::KEY_SIZE;
 use index::{Cursor as IndexCursor, Ordering};
 use itertools::{chain, Itertools};
 use parking_lot::RwLock;
@@ -37,6 +38,7 @@ use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
 use std::io::Write;
+use std::iter;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
@@ -47,8 +49,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::iter;
-use index::KEY_SIZE;
 
 mod cursor;
 mod external;
@@ -114,7 +114,8 @@ where
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
-        *tree.root.write() = NodeCellRef::new(Node::<KS, PS>::new_external(root_id, max_entry_key()));
+        *tree.root.write() =
+            NodeCellRef::new(Node::<KS, PS>::new_external(root_id, max_entry_key()));
         return tree;
     }
 
@@ -293,13 +294,14 @@ impl NodeCellRef {
     }
 
     pub fn is_default(&self) -> bool {
-        self.inner.is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
+        self.inner
+            .is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
     }
 
     pub fn to_string<KS, PS>(&self) -> String
-        where
-            KS: Slice<EntryKey> + Debug + 'static,
-            PS: Slice<NodeCellRef> + 'static,
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
     {
         if self.is_default() {
             String::from("<<DEFAULT>>")
@@ -324,7 +326,7 @@ impl Clone for NodeCellRef {
     }
 }
 
-lazy_static!{
+lazy_static! {
     pub static ref MAX_ENTRY_KEY: EntryKey = max_entry_key();
     pub static ref MIN_ENTRY_KEY: EntryKey = smallvec!(0);
 }

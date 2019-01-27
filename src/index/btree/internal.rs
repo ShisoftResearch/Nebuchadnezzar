@@ -20,7 +20,7 @@ where
     pub ptrs: PS,
     pub len: usize,
     pub right: NodeCellRef,
-    pub right_bound: EntryKey
+    pub right_bound: EntryKey,
 }
 
 pub struct InNodeKeysSplit<KS>
@@ -177,7 +177,7 @@ where
             keys: keys_split.keys_2,
             ptrs: ptr_split.ptrs_2,
             right: self.right.clone(),
-            right_bound
+            right_bound,
         };
         let node_2_ref = NodeCellRef::new(Node::internal(node_2));
         self.len = keys_split.keys_1_len;

@@ -237,14 +237,24 @@ where
     pub fn right_bound(&self) -> &EntryKey {
         match self {
             &NodeData::External(ref n) => {
-                debug_assert!(&n.right_bound > self.first_key(), "{:?} lge {:?}", &n.right_bound, self.first_key());
+                debug_assert!(
+                    &n.right_bound > self.first_key(),
+                    "{:?} lge {:?}",
+                    &n.right_bound,
+                    self.first_key()
+                );
                 &n.right_bound
-            },
+            }
             &NodeData::Internal(ref n) => {
-                debug_assert!(&n.right_bound > self.first_key(), "{:?} lge {:?}", &n.right_bound, self.first_key());
+                debug_assert!(
+                    &n.right_bound > self.first_key(),
+                    "{:?} lge {:?}",
+                    &n.right_bound,
+                    self.first_key()
+                );
                 &n.right_bound
-            },
-            _ => panic!(self.type_name())
+            }
+            _ => panic!(self.type_name()),
         }
     }
 }

@@ -66,7 +66,7 @@ fn apply_removal<'a, KS, PS>(
     cursor_guard: &mut NodeWriteGuard<KS, PS>,
     poses: &mut BTreeSet<usize>,
     empty_pages: &mut Vec<&'a EntryKey>,
-    prev_key: &Option<&'a EntryKey>
+    prev_key: &Option<&'a EntryKey>,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -175,10 +175,9 @@ where
                     &mut cursor_guard,
                     &mut guard_removing_poses,
                     &mut empty_pages,
-                    &prev_key
+                    &prev_key,
                 );
-                cursor_guard =
-                    write_targeted(cursor_guard, key_to_del);
+                cursor_guard = write_targeted(cursor_guard, key_to_del);
                 debug_assert!(!cursor_guard.is_empty_node());
                 debug!(
                     "Applied removal for overflow current page ({})",
@@ -194,7 +193,7 @@ where
                     &mut cursor_guard,
                     &mut guard_removing_poses,
                     &mut empty_pages,
-                    &prev_key
+                    &prev_key,
                 );
             }
             prev_key = Some(key_to_del)
