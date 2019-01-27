@@ -1,8 +1,10 @@
 use index::btree::internal::InNode;
+use index::btree::node::is_node_locked;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
 use index::btree::node::write_targeted;
+use index::btree::node::write_unchecked;
 use index::btree::node::EmptyNode;
 use index::btree::node::NodeData;
 use index::btree::node::NodeWriteGuard;
@@ -11,7 +13,6 @@ use index::btree::search::MutSearchResult;
 use index::btree::BPlusTree;
 use index::btree::NodeCellRef;
 use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
-use index::btree::node::write_unchecked;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
@@ -19,7 +20,6 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
-use index::btree::node::is_node_locked;
 
 enum Selection<KS, PS>
 where
@@ -69,7 +69,7 @@ fn apply_removal<'a, KS, PS>(
     poses: &mut BTreeSet<usize>,
     empty_pages: &mut Vec<&'a EntryKey>,
     prev_key: &Option<&'a EntryKey>,
-    remove_children_right_nodes: bool
+    remove_children_right_nodes: bool,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -202,7 +202,7 @@ where
                     &mut guard_removing_poses,
                     &mut empty_pages,
                     &prev_key,
-                    !deepest
+                    !deepest,
                 );
                 cursor_guard = write_targeted(cursor_guard, key_to_del);
                 debug_assert!(!cursor_guard.is_empty_node());
@@ -230,7 +230,7 @@ where
                 &mut guard_removing_poses,
                 &mut empty_pages,
                 &prev_key,
-                !deepest
+                !deepest,
             );
         }
     }

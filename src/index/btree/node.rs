@@ -198,9 +198,13 @@ where
         if node.is_empty_node() {
             let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
             let mut guard = write_node::<KS, PS>(node_ref);
-            guard.left_ref_mut().map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
-            guard.right_ref_mut().map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
-            return non_empty
+            guard
+                .left_ref_mut()
+                .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
+            guard
+                .right_ref_mut()
+                .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
+            return non_empty;
         } else {
             node_ref.clone()
         }
@@ -379,9 +383,9 @@ where
 }
 
 pub fn is_node_locked<KS, PS>(node: &NodeCellRef) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let node_deref = node.deref::<KS, PS>();
     let cc = &node_deref.cc;
@@ -429,16 +433,13 @@ where
 }
 
 pub fn write_unchecked<KS, PS>(node: &NodeCellRef) -> &mut NodeData<KS, PS>
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let node_deref = node.deref();
-    unsafe {
-        &mut*node_deref.data.get()
-    }
+    unsafe { &mut *node_deref.data.get() }
 }
-
 
 pub struct NodeWriteGuard<KS, PS>
 where
