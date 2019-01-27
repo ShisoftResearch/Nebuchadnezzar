@@ -124,7 +124,11 @@ fn apply_removal<'a, KS, PS>(
     poses.clear();
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, mut keys: Vec<&'a EntryKey>, level: usize) -> Vec<&'a EntryKey>
+fn prune_selected<'a, KS, PS>(
+    node: &NodeCellRef,
+    mut keys: Vec<&'a EntryKey>,
+    level: usize,
+) -> Vec<&'a EntryKey>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -143,7 +147,10 @@ where
     };
     match pruning {
         PruningSearch::DeepestInnode => {
-            debug!("Removing in deepest nodes keys {:?}, level {}", &keys, level);
+            debug!(
+                "Removing in deepest nodes keys {:?}, level {}",
+                &keys, level
+            );
         }
         PruningSearch::Innode(sub_node) => {
             keys = prune_selected::<KS, PS>(&sub_node, keys, level + 1);
@@ -159,7 +166,8 @@ where
         let mut prev_key = None;
         debug!(
             "Prune deepest node starting key: {:?}, level {}",
-            cursor_guard.first_key(), level
+            cursor_guard.first_key(),
+            level
         );
         for (i, key_to_del) in keys.into_iter().enumerate() {
             if key_to_del >= cursor_guard.right_bound() {
@@ -182,16 +190,23 @@ where
                 debug_assert!(!cursor_guard.is_empty_node());
                 debug!(
                     "Applied removal for overflow current page ({}), level {}",
-                    cursor_guard.len(), level
+                    cursor_guard.len(),
+                    level
                 );
             }
             let pos = cursor_guard.search(key_to_del);
-            debug!("Key to delete have position {}, key: {:?}, level {}", pos, key_to_del, level);
+            debug!(
+                "Key to delete have position {}, key: {:?}, level {}",
+                pos, key_to_del, level
+            );
             guard_removing_poses.insert(pos);
             prev_key = Some(key_to_del)
         }
         if !guard_removing_poses.is_empty() {
-            debug!("Applying removal for last keys {:?}, level {}", &guard_removing_poses, level);
+            debug!(
+                "Applying removal for last keys {:?}, level {}",
+                &guard_removing_poses, level
+            );
             apply_removal(
                 &mut cursor_guard,
                 &mut guard_removing_poses,
