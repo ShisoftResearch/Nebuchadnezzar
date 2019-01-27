@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use utils::chashmap::{CHashMap, WriteGuard};
+use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -496,13 +497,14 @@ impl DataManagerInner {
         // check state
         match txn.state {
             TxnState::Started => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted))
+                return this.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted));
             }
             TxnState::Aborted => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted))
+                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
             }
             TxnState::Committed => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted))
+                return this
+                    .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
             TxnState::Prepared => {}
         }

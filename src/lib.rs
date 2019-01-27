@@ -1,14 +1,13 @@
 #![crate_type = "lib"]
 #![feature(proc_macro)]
-#![feature(plugin)]
 #![feature(asm)]
-#![plugin(bifrost_plugins)]
 #![feature(exact_size_is_empty)]
 #![feature(use_extern_macros)]
 #![feature(integer_atomics)]
 #![feature(generators)]
 #![feature(box_syntax)]
 #![feature(test)]
+#![feature(proc_macro_hygiene)]
 
 #[macro_use]
 extern crate static_assertions;
@@ -19,6 +18,7 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bifrost;
 extern crate bifrost_hasher;
+extern crate bifrost_plugins;
 #[macro_use]
 pub extern crate dovahkiin;
 #[macro_use]

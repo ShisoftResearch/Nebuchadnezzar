@@ -5,6 +5,7 @@ use server::NebServer;
 
 use futures::prelude::*;
 use num_cpus;
+use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
