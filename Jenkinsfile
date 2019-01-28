@@ -1,6 +1,9 @@
 pipeline {
   agent {
-      docker { image 'shisoft-rustup' }
+    docker {
+      image 'shisoft-rustup'
+    }
+
   }
   stages {
     stage('Rust') {
