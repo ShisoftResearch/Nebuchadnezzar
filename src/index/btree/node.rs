@@ -201,9 +201,7 @@ where
             guard
                 .left_ref_mut()
                 .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
-            guard
-                .right_ref_mut()
-                .map(|r| *r = non_empty.clone());
+            guard.right_ref_mut().map(|r| *r = non_empty.clone());
             return non_empty;
         } else {
             node_ref.clone()

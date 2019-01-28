@@ -2,6 +2,7 @@ use super::*;
 use bifrost::utils::async_locks::{AsyncMutexGuard, Mutex, MutexGuard, RwLock};
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
+use bifrost_plugins::hash_ident;
 use futures::prelude::{async, await};
 use futures::sync::mpsc::{channel, Receiver, SendError, Sender};
 use futures::Sink;
@@ -12,7 +13,6 @@ use server::NebServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use utils::chashmap::{CHashMap, WriteGuard};
 use utils::stream::PollableStream;
-use bifrost_plugins::hash_ident;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;

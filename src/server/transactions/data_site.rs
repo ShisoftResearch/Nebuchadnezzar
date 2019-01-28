@@ -1,6 +1,7 @@
 use super::*;
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
+use bifrost_plugins::hash_ident;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::{Mutex, MutexGuard};
 use ram::cell::{Cell, CellHeader, ReadError, WriteError};
@@ -10,7 +11,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use utils::chashmap::{CHashMap, WriteGuard};
-use bifrost_plugins::hash_ident;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
