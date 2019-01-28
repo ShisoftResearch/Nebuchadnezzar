@@ -1,0 +1,41 @@
+[package]
+name = "neb"
+version = "0.1.0"
+authors = ["Hao Shi <shisoftgenius@gmail.com>"]
+
+[lib]
+name = "neb"
+
+[[test]]
+name = "tests"
+
+[dependencies]
+libc = "*"
+log = "0.3"
+lazy_static = "*"
+chashmap = "*"
+bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
+#bifrost = { path = "../bifrost" }
+bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
+#bifrost_plugins = { path = "../bifrost/src/plugins" }
+bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
+#bifrost_hasher = { path = "../bifrost/src/hasher" }
+dovahkiin = { git = "https://github.com/ShisoftResearch/Dovahkiin", branch = "develop" }
+serde = "*"
+serde_derive = "*"
+bincode = "*"
+byteorder = "1"
+parking_lot = {version = "0.4", features = ["nightly"]}
+rand = "0.3"
+linked-hash-map = "0.4"
+bitflags = "1.0"
+crc32c = "*"
+
+futures-cpupool = "0.1"
+futures-await = "0.1"
+
+num_cpus = "1.0"
+
+[dev-dependencies]
+rand = "0.3"
+env_logger = "0.4"
