@@ -20,6 +20,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
+use index::btree::SSLevelTree;
 
 enum Selection<KS, PS>
 where
@@ -238,15 +239,13 @@ where
     empty_pages
 }
 
-pub fn level_merge<KSA, PSA, KSB, PSB>(
+pub fn level_merge<KSA, PSA>(
     src_tree: &BPlusTree<KSA, PSA>,
-    dest_tree: &BPlusTree<KSB, PSB>,
+    dest_tree: &SSLevelTree
 ) -> usize
 where
     KSA: Slice<EntryKey> + Debug + 'static,
-    PSA: Slice<NodeCellRef> + 'static,
-    KSB: Slice<EntryKey> + Debug + 'static,
-    PSB: Slice<NodeCellRef> + 'static,
+    PSA: Slice<NodeCellRef> + 'static
 {
     let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();

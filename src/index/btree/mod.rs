@@ -193,7 +193,7 @@ where
         result.removed
     }
 
-    pub fn merge_with_keys(&self, keys: Vec<EntryKey>) {
+    pub fn merge_with_keys_(&self, keys: Vec<EntryKey>) {
         let keys_len = keys.len();
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
@@ -210,14 +210,6 @@ where
             *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(box new_in_root)));
         }
         self.len.fetch_add(keys_len, Relaxed);
-    }
-
-    pub fn merge_tree<KSB, PSB>(&self, lower_tree: &BPlusTree<KSB, PSB>) -> usize
-    where
-        KSB: Slice<EntryKey> + Debug + 'static,
-        PSB: Slice<NodeCellRef> + 'static,
-    {
-        level::level_merge(lower_tree, self)
     }
 
     pub fn flush_all(&self) {
@@ -245,6 +237,34 @@ where
     fn new_page_id(&self) -> Id {
         // TODO: achieve locality
         Id::rand()
+    }
+}
+
+pub trait SSLevelTree {
+    fn size(&self) -> usize;
+    fn count(&self) -> usize;
+    fn merge_to(&self, upper_level: &SSLevelTree) -> usize;
+    fn merge_with_keys(&self, keys: Vec<EntryKey>);
+}
+
+impl <KS, PS> SSLevelTree for BPlusTree<KS, PS> where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn size(&self) -> usize {
+        KS::slice_len()
+    }
+
+    fn count(&self) -> usize {
+        self.len()
+    }
+
+    fn merge_to(&self, upper_level: &SSLevelTree) -> usize {
+        level::level_merge(self, upper_level)
+    }
+
+    fn merge_with_keys(&self, keys: Vec<SmallVec<[u8; 32]>>) {
+        self.merge_with_keys_(keys)
     }
 }
 
