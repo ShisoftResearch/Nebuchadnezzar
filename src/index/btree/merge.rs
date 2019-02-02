@@ -84,18 +84,20 @@ where
                 } else {
                     Some(right_guard.first_key().clone())
                 };
-                let selection = keys[merging_pos..keys_len]
-                    .iter()
-                    .filter(|k| match &key_upper_bound {
-                        &Some(ref upper) => k < &upper,
-                        &None => true,
-                    })
-                    .take(KS::slice_len() - target_page_guard.len())
-                    .collect_vec();
-                target_page_guard
-                    .extnode_mut()
-                    .merge_sort(selection.as_slice());
-                merging_pos += selection.len();
+                {
+                    let mut ext_node = target_page_guard.extnode_mut();
+                    ext_node.remove_contains(&mut *tree.deleted.write());
+                    let selection = keys[merging_pos..keys_len]
+                        .iter()
+                        .filter(|k| match &key_upper_bound {
+                            &Some(ref upper) => k < &upper,
+                            &None => true,
+                        })
+                        .take(KS::slice_len() - ext_node.len)
+                        .collect_vec();
+                    ext_node.merge_sort(selection.as_slice());
+                    merging_pos += selection.len();
+                }
                 if merging_pos >= keys_len {
                     break;
                 }

@@ -253,10 +253,12 @@ where
 
     // merge to dest_tree
     {
+        let mut deleted_keys = src_tree.deleted.write();
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
             .map(|g| &g.keys()[..g.len()])
             .flatten()
+            .filter(|&k| !deleted_keys.remove(k))
             .cloned()
             .collect_vec();
         debug!("Merge selected keys are {:?}", &keys);

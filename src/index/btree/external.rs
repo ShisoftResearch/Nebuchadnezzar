@@ -19,6 +19,7 @@ use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
@@ -224,6 +225,26 @@ where
             );
         }
         self.len = new_len;
+    }
+
+    pub fn remove_contains(&mut self, set: &mut BTreeSet<EntryKey>) {
+        let remaining_keys = {
+            let remaining = self
+                .keys
+                .as_slice()
+                .iter()
+                .filter(|&k| set.remove(k))
+                .collect_vec();
+            if remaining.len() == self.len {
+                return;
+            }
+            remaining.into_iter().cloned().collect_vec()
+        };
+        let mut self_key_slice = self.keys.as_slice();
+        self.len = remaining_keys.len();
+        for (i, k_ref) in remaining_keys.into_iter().enumerate() {
+            self_key_slice[i] = k_ref;
+        }
     }
 
     pub fn merge_sort(&mut self, right: &[&EntryKey]) {
