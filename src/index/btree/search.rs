@@ -8,11 +8,13 @@ use index::Ordering;
 use index::Slice;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use index::btree::DeletionSet;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
     key: &EntryKey,
     ordering: Ordering,
+    deleted: &DeletionSet,
 ) -> RTCursor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -26,10 +28,11 @@ where
             ordering,
             page: None,
             marker: PhantomData,
+            deleted: deleted.clone()
         };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");
-            return search_node(right_node, key, ordering);
+            return search_node(right_node, key, ordering, deleted);
         }
         debug!("search node have keys {:?}", node.keys());
         let pos = node.search(key);
@@ -39,7 +42,7 @@ where
                     "search in external for {:?}, len {}, content: {:?}",
                     key, n.len, n.keys
                 );
-                RTCursor::new(pos, node_ref, ordering)
+                RTCursor::new(pos, node_ref, ordering, deleted)
             }
             &NodeData::Internal(ref n) => {
                 debug!(
@@ -47,9 +50,9 @@ where
                     key, n.len, pos
                 );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
-                search_node(next_node_ref, key, ordering)
+                search_node(next_node_ref, key, ordering, deleted)
             }
-            &NodeData::Empty(ref n) => search_node(&n.right, key, ordering),
+            &NodeData::Empty(ref n) => search_node(&n.right, key, ordering, deleted),
             &NodeData::None => gen_empty_cursor(),
         }
     })

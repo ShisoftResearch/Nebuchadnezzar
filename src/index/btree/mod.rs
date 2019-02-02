@@ -60,6 +60,7 @@ mod remove;
 mod search;
 
 const CACHE_SIZE: usize = 2048;
+pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
 
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
@@ -73,8 +74,8 @@ where
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
-    len: Arc<AtomicUsize>,
-    deleted: RwLock<BTreeSet<EntryKey>>,
+    len: AtomicUsize,
+    deleted: DeletionSet,
     marker: PhantomData<(KS, PS)>,
 }
 
@@ -110,8 +111,8 @@ where
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::none())),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::none()),
             storage: neb_client.clone(),
-            len: Arc::new(AtomicUsize::new(0)),
-            deleted: RwLock::new(BTreeSet::new()),
+            len: AtomicUsize::new(0),
+            deleted: Arc::new(RwLock::new(BTreeSet::new())),
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
@@ -125,7 +126,7 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
-        let mut cursor = search_node(&self.get_root(), key, ordering);
+        let mut cursor = search_node(&self.get_root(), key, ordering, &self.deleted);
         match ordering {
             Ordering::Forward => {}
             Ordering::Backward => {
@@ -283,8 +284,7 @@ where
     fn mark_key_deleted(&self, key: &SmallVec<[u8; 32]>) -> bool {
         if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
             if seek_key == key {
-                self.deleted.write().insert(key.clone());
-                return true;
+                return self.deleted.write().insert(key.clone());
             }
         }
         false

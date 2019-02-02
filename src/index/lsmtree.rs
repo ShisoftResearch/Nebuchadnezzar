@@ -61,14 +61,12 @@ impl LSMTree {
 
     pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
         key_with_id(&mut key, id);
-        let levels_deleted = self
-            .trees
+        self.trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
             .collect_vec() // collect here to prevent short circuit
             .into_iter()
-            .any(|d| d);
-        levels_deleted
+            .any(|d| d)
     }
 
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
@@ -85,19 +83,13 @@ impl LSMTree {
 
     fn sentinel(&self) {
         for i in 0..self.trees.len() - 1 {
-            let upper = &*self.trees[i];
-            let lower = &*self.trees[i + 1];
-            self.check_and_merge(self.max_sizes[i], upper, lower);
+            let lower = &*self.trees[i];
+            let upper = &*self.trees[i + 1];
+            if lower.count() > self.max_sizes[i] {
+                lower.merge_to(upper);
+            }
         }
         thread::sleep(Duration::from_millis(100));
-    }
-
-    fn check_and_merge<U, L>(&self, max_elements: usize, upper_level: &U, lower_level: &L)
-    where
-        U: LevelTree + ?Sized,
-        L: LevelTree + ?Sized,
-    {
-        unimplemented!()
     }
 
     pub fn len(&self) -> usize {

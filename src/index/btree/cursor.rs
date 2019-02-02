@@ -12,6 +12,7 @@ where
     pub index: usize,
     pub ordering: Ordering,
     pub page: Option<NodeCellRef>,
+    pub deleted: DeletionSet,
     pub marker: PhantomData<(KS, PS)>,
 }
 
@@ -20,11 +21,12 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> Self {
+    pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering, deleted: &DeletionSet) -> Self {
         let mut cursor = RTCursor {
             index: pos,
             ordering,
             page: Some(page.clone()),
+            deleted: deleted.clone(),
             marker: PhantomData,
         };
         match ordering {
@@ -41,14 +43,8 @@ where
     fn boxed(self) -> Box<IndexCursor> {
         box self
     }
-}
 
-impl<KS, PS> IndexCursor for RTCursor<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    fn next(&mut self) -> bool {
+    fn next_candidate(&mut self) -> bool {
         if self.page.is_some() {
             let current_page = self.page.clone().unwrap();
             read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
@@ -136,6 +132,26 @@ where
             })
         } else {
             false
+        }
+    }
+}
+
+impl<KS, PS> IndexCursor for RTCursor<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn next(&mut self) -> bool {
+        loop {
+            let has_candidate = self.next_candidate();
+            if has_candidate {
+                // search in deleted set and skip if exists
+                if !self.deleted.read().contains(self.current().unwrap()) {
+                    return true;
+                }
+            } else {
+                return false;
+            }
         }
     }
 
