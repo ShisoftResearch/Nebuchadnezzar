@@ -2,13 +2,13 @@ use index::btree::cursor::RTCursor;
 use index::btree::node::read_node;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
+use index::btree::DeletionSet;
 use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Ordering;
 use index::Slice;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use index::btree::DeletionSet;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
@@ -28,7 +28,7 @@ where
             ordering,
             page: None,
             marker: PhantomData,
-            deleted: deleted.clone()
+            deleted: deleted.clone(),
         };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");

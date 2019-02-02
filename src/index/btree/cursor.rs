@@ -160,7 +160,11 @@ where
             read_node(page_ref, |handler: &NodeReadHandler<KS, PS>| {
                 let page = unsafe { &*handler.ptr };
                 if self.index >= page.len() {
-                    panic!("cursor position overflowed {}/{}", self.index, page.len())
+                    panic!(
+                        "FIXME: cursor position overflowed {}/{}",
+                        self.index,
+                        page.len()
+                    )
                 }
                 Some(&page.extnode().keys.as_slice_immute()[self.index])
             })
