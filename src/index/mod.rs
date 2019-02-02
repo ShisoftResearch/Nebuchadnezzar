@@ -103,21 +103,6 @@ pub trait Cursor {
     fn current(&self) -> Option<&EntryKey>;
 }
 
-pub trait MergingPage {
-    fn next(&self) -> Box<MergingPage>;
-    fn keys(&self) -> &[EntryKey];
-}
-
-pub trait MergeableTree {
-    fn prepare_level_merge(&self) -> Box<MergingTreeGuard>;
-    fn elements(&self) -> usize;
-}
-
-pub trait MergingTreeGuard {
-    fn remove_pages(&self, pages: &[&[EntryKey]]);
-    fn last_page(&self) -> Box<MergingPage>;
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum Ordering {
     Forward,

@@ -33,205 +33,117 @@ with_levels! {
     L3, LEVEL_3;
     L4, LEVEL_4;
 }
-//
-//pub struct LSMTree {
-//    pub level_m: BPlusTree,
-//    trees: LevelTrees,
-//    // use Vec here for convenience
-//    max_sizes: Vec<usize>,
-//    page_sizes: Vec<usize>,
-//}
-//
-//unsafe impl Send for LSMTree {}
-//unsafe impl Sync for LSMTree {}
-//
-//impl LSMTree {
-//    pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
-//        let (trees, max_sizes, page_sizes) = init_lsm_level_trees(neb_client);
-//        let lsm_tree = Arc::new(LSMTree {
-//            level_m: BPlusTree::new(neb_client),
-//            trees,
-//            max_sizes,
-//            page_sizes,
-//        });
-//        let tree_clone = lsm_tree.clone();
-//        thread::spawn(move || {
-//            tree_clone.sentinel();
-//        });
-//        lsm_tree
-//    }
-//
-//    pub fn insert(&self, mut key: EntryKey, id: &Id) {
-//        key_with_id(&mut key, id);
-//        self.level_m.insert(&key)
-//    }
-//
-//    pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
-//        key_with_id(&mut key, id);
-//        let m_deleted = self.level_m.remove(&key);
-//        let levels_deleted = self
-//            .trees
-//            .iter()
-//            .map(|tree| tree.mark_deleted(&key))
-//            .collect_vec() // collect here to prevent short circuit
-//            .into_iter()
-//            .any(|d| d);
-//        m_deleted || levels_deleted
-//    }
-//
-//    pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
-//        match ordering {
-//            Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
-//            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
-//        };
-//        let mut cursors: Vec<Box<Cursor>> = vec![box self.level_m.seek(&key, ordering)];
-//        for tree in &self.trees {
-//            cursors.push(tree.seek(&key, ordering));
-//        }
-//        return LSMTreeCursor::new(
-//            cursors,
-//            self.trees.iter().map(|t| t.tombstones()).collect_vec(),
-//        );
-//    }
-//
-//    fn sentinel(&self) {
-//        self.check_and_merge(
-//            LEVEL_M_MAX_ELEMENTS_COUNT,
-//            self.page_sizes[0],
-//            &mut BTreeSet::new(),
-//            &self.level_m,
-//            &*self.trees[0],
-//        );
-//        for i in 0..self.trees.len() - 1 {
-//            let upper = &*self.trees[i];
-//            let lower = &*self.trees[i + 1];
-//            let upper_tombstons_ref = upper.tombstones();
-//            let mut upper_tombstones = upper_tombstons_ref.write();
-//            self.check_and_merge(
-//                self.max_sizes[i],
-//                self.page_sizes[i + 1],
-//                &mut *upper_tombstones,
-//                upper,
-//                lower,
-//            );
-//        }
-//        thread::sleep(Duration::from_millis(100));
-//    }
-//
-//    fn check_and_merge<U, L>(
-//        &self,
-//        max_elements: usize,
-//        upper_page_size: usize,
-//        upper_tombstones: &mut TombstonesInner,
-//        upper_level: &U,
-//        lower_level: &L,
-//    ) where
-//        U: MergeableTree + ?Sized,
-//        L: SSLevelTree + ?Sized,
-//    {
-//        let elements = upper_level.elements();
-//        if elements > max_elements {
-//            debug!(
-//                "upper level have elements {} exceeds {}, start level merging",
-//                elements, max_elements
-//            );
-//            let entries_to_merge = upper_page_size;
-//            let guard = upper_level.prepare_level_merge();
-//            let mut pages = vec![guard.last_page()];
-//            let mut collected_entries = pages.last().unwrap().keys().len();
-//            while collected_entries < entries_to_merge {
-//                let next_page = pages.last().unwrap().next();
-//                collected_entries += next_page.keys().len();
-//                pages.push(next_page);
-//            }
-//            let mut entries = vec![];
-//            for page in &pages {
-//                entries.append(&mut Vec::from(page.keys()));
-//            }
-//            debug!("going to merge {} entries", entries.len());
-//            lower_level.merge(entries.as_mut_slice(), upper_tombstones);
-//            guard.remove_pages(pages.iter().map(|p| p.keys()).collect_vec().as_slice())
-//        }
-//    }
-//
-//    pub fn len(&self) -> usize {
-//        let mem_len = self.level_m.len();
-//        let levels_len_sum = self.trees.iter().map(|tree| tree.len()).sum::<usize>();
-//        return mem_len + levels_len_sum;
-//    }
-//}
-//
-//pub struct LSMTreeCursor {
-//    level_cursors: Vec<Box<Cursor>>,
-//    tombstones: Vec<Arc<Tombstones>>,
-//}
-//
-//impl LSMTreeCursor {
-//    fn new(cursors: Vec<Box<Cursor>>, tombstones: Vec<Arc<Tombstones>>) -> Self {
-//        LSMTreeCursor {
-//            tombstones,
-//            level_cursors: cursors,
-//        }
-//    }
-//
-//    fn next_candidate(&mut self) -> (bool, usize) {
-//        // TODO: redo this part
-//        let min_tree = self
-//            .level_cursors
-//            .iter()
-//            .enumerate()
-//            .map(|(i, cursor)| (i, cursor.current()))
-//            .filter_map(|(i, current)| current.map(|current_val| (i, current_val)))
-//            .min_by_key(|(i, val)| val.clone())
-//            .map(|(id, _)| id);
-//        if let Some(id) = min_tree {
-//            let min_has_next = self.level_cursors[id].next();
-//            if !min_has_next {
-//                let next = self
-//                    .level_cursors
-//                    .iter()
-//                    .enumerate()
-//                    .filter_map(|(level, cursor)| cursor.current().map(|key| (id, key)))
-//                    .min_by_key(|(level, key)| key.clone());
-//                if let Some((id, _)) = next {
-//                    return (true, id);
-//                }
-//            } else {
-//                return (true, id);
-//            }
-//        }
-//        return (false, 0);
-//    }
-//}
-//
-//impl Cursor for LSMTreeCursor {
-//    fn next(&mut self) -> bool {
-//        loop {
-//            let (has_next, candidate_level) = self.next_candidate();
-//            if !has_next {
-//                break;
-//            }
-//            if candidate_level == 0 {
-//                return has_next;
-//            }
-//            let candidate_key = self.level_cursors[candidate_level].current().unwrap();
-//            if self.tombstones[candidate_level + 1]
-//                .read()
-//                .contains(candidate_key)
-//            {
-//                // marked in tombstone, skip
-//                continue;
-//            }
-//            return true;
-//        }
-//        return false;
-//    }
-//
-//    fn current(&self) -> Option<&EntryKey> {
-//        self.level_cursors.iter().filter_map(|c| c.current()).min()
-//    }
-//}
-//
+
+pub struct LSMTree {
+    trees: LevelTrees,
+    // use Vec here for convenience
+    max_sizes: Vec<usize>,
+}
+
+unsafe impl Send for LSMTree {}
+unsafe impl Sync for LSMTree {}
+
+impl LSMTree {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
+        let (trees, max_sizes) = init_lsm_level_trees(neb_client);
+        let lsm_tree = Arc::new(LSMTree {
+            trees,
+            max_sizes,
+        });
+        let tree_clone = lsm_tree.clone();
+        thread::spawn(move || {
+            tree_clone.sentinel();
+        });
+        lsm_tree
+    }
+
+    pub fn insert(&self, mut key: EntryKey, id: &Id) {
+        key_with_id(&mut key, id);
+        self.trees[0].insert_into(&key)
+    }
+
+    pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
+        key_with_id(&mut key, id);
+        let levels_deleted = self
+            .trees
+            .iter()
+            .map(|tree| tree.mark_key_deleted(&key))
+            .collect_vec() // collect here to prevent short circuit
+            .into_iter()
+            .any(|d| d);
+        levels_deleted
+    }
+
+    pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
+        match ordering {
+            Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
+            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
+        };
+        let mut cursors: Vec<Box<Cursor>> = vec![];
+        for tree in &self.trees {
+            cursors.push(tree.seek_for(&key, ordering));
+        }
+        return LSMTreeCursor::new(
+            cursors,
+        );
+    }
+
+    fn sentinel(&self) {
+        for i in 0..self.trees.len() - 1 {
+            let upper = &*self.trees[i];
+            let lower = &*self.trees[i + 1];
+            self.check_and_merge(
+                self.max_sizes[i],
+                upper,
+                lower,
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    fn check_and_merge<U, L>(
+        &self,
+        max_elements: usize,
+        upper_level: &U,
+        lower_level: &L,
+    ) where
+        U: LevelTree + ?Sized,
+        L: LevelTree + ?Sized,
+    {
+        unimplemented!()
+    }
+
+    pub fn len(&self) -> usize {
+        self.trees.iter().map(|tree| tree.count()).sum::<usize>()
+    }
+}
+
+pub struct LSMTreeCursor {
+    level_cursors: Vec<Box<Cursor>>,
+}
+
+impl LSMTreeCursor {
+    fn new(cursors: Vec<Box<Cursor>>) -> Self {
+        LSMTreeCursor {
+            level_cursors: cursors,
+        }
+    }
+
+    fn next_candidate(&mut self) -> (bool, usize) {
+        unimplemented!()
+    }
+}
+
+impl Cursor for LSMTreeCursor {
+    fn next(&mut self) -> bool {
+        unimplemented!()
+    }
+
+    fn current(&self) -> Option<&EntryKey> {
+        self.level_cursors.iter().filter_map(|c| c.current()).min()
+    }
+}
+
 //#[cfg(test)]
 //mod test {
 //    use super::*;

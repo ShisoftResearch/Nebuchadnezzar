@@ -16,9 +16,6 @@ pub use index::btree::node::*;
 use index::btree::remove::*;
 use index::btree::search::*;
 use index::EntryKey;
-use index::MergeableTree;
-use index::MergingPage;
-use index::MergingTreeGuard;
 use index::Slice;
 use index::KEY_SIZE;
 use index::{Cursor as IndexCursor, Ordering};
@@ -49,6 +46,8 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::Cursor;
+use std::collections::BTreeSet;
 
 mod cursor;
 mod external;
@@ -75,6 +74,7 @@ where
     root_versioning: NodeCellRef,
     storage: Arc<AsyncClient>,
     len: Arc<AtomicUsize>,
+    deleted: RwLock<BTreeSet<EntryKey>>,
     marker: PhantomData<(KS, PS)>,
 }
 
@@ -111,6 +111,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::none()),
             storage: neb_client.clone(),
             len: Arc::new(AtomicUsize::new(0)),
+            deleted: RwLock::new(BTreeSet::new()),
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
@@ -245,6 +246,9 @@ pub trait LevelTree {
     fn count(&self) -> usize;
     fn merge_to(&self, upper_level: &LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Vec<EntryKey>);
+    fn insert_into(&self, key: &EntryKey);
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
+    fn mark_key_deleted(&self, key: &EntryKey) -> bool;
 }
 
 impl <KS, PS> LevelTree for BPlusTree<KS, PS> where
@@ -265,6 +269,24 @@ impl <KS, PS> LevelTree for BPlusTree<KS, PS> where
 
     fn merge_with_keys(&self, keys: Vec<SmallVec<[u8; 32]>>) {
         self.merge_with_keys_(keys)
+    }
+
+    fn insert_into(&self, key: &SmallVec<[u8; 32]>) {
+        self.insert(key)
+    }
+
+    fn seek_for(&self, key: &SmallVec<[u8; 32]>, ordering: Ordering) -> Box<Cursor> {
+        box self.seek(key, ordering)
+    }
+
+    fn mark_key_deleted(&self, key: &SmallVec<[u8; 32]>) -> bool {
+        if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
+            if seek_key == key {
+                self.deleted.write().insert(key.clone());
+                return true;
+            }
+        }
+        false
     }
 }
 
