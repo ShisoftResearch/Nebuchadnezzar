@@ -231,9 +231,9 @@ where
         let remaining_keys = {
             let remaining = self
                 .keys
-                .as_slice()
+                .as_slice()[..self.len]
                 .iter()
-                .filter(|&k| set.remove(k))
+                .filter(|&k| !set.remove(k))
                 .collect_vec();
             if remaining.len() == self.len {
                 return;

@@ -684,7 +684,7 @@ fn level_merge() {
     dump_tree(&tree_2, "lsm-tree_level_merge_2_before_dump.json");
 
     debug!("MERGING...");
-    let merged = tree_2.merge_tree(&tree_1);
+    let merged = tree_1.merge_to(&*tree_2);
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
