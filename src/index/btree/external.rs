@@ -229,9 +229,7 @@ where
 
     pub fn remove_contains(&mut self, set: &mut BTreeSet<EntryKey>) {
         let remaining_keys = {
-            let remaining = self
-                .keys
-                .as_slice()[..self.len]
+            let remaining = self.keys.as_slice()[..self.len]
                 .iter()
                 .filter(|&k| !set.remove(k))
                 .collect_vec();

@@ -1,6 +1,8 @@
 use super::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use super::*;
 use client::AsyncClient;
+use index::btree::LevelTree;
+use index::btree::NodeCellRef;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::segs::MAX_SEGMENT_SIZE;
@@ -9,8 +11,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use index::btree::LevelTree;
-use index::btree::NodeCellRef;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -46,10 +46,7 @@ unsafe impl Sync for LSMTree {}
 impl LSMTree {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
         let (trees, max_sizes) = init_lsm_level_trees(neb_client);
-        let lsm_tree = Arc::new(LSMTree {
-            trees,
-            max_sizes,
-        });
+        let lsm_tree = Arc::new(LSMTree { trees, max_sizes });
         let tree_clone = lsm_tree.clone();
         thread::spawn(move || {
             tree_clone.sentinel();
@@ -83,30 +80,20 @@ impl LSMTree {
         for tree in &self.trees {
             cursors.push(tree.seek_for(&key, ordering));
         }
-        return LSMTreeCursor::new(
-            cursors,
-        );
+        return LSMTreeCursor::new(cursors);
     }
 
     fn sentinel(&self) {
         for i in 0..self.trees.len() - 1 {
             let upper = &*self.trees[i];
             let lower = &*self.trees[i + 1];
-            self.check_and_merge(
-                self.max_sizes[i],
-                upper,
-                lower,
-            );
+            self.check_and_merge(self.max_sizes[i], upper, lower);
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    fn check_and_merge<U, L>(
-        &self,
-        max_elements: usize,
-        upper_level: &U,
-        lower_level: &L,
-    ) where
+    fn check_and_merge<U, L>(&self, max_elements: usize, upper_level: &U, lower_level: &L)
+    where
         U: LevelTree + ?Sized,
         L: LevelTree + ?Sized,
     {

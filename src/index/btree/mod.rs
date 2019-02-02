@@ -15,6 +15,7 @@ use index::btree::merge::merge_into_tree_node;
 pub use index::btree::node::*;
 use index::btree::remove::*;
 use index::btree::search::*;
+use index::Cursor;
 use index::EntryKey;
 use index::Slice;
 use index::KEY_SIZE;
@@ -31,6 +32,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
 use std::cmp::{max, min};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
@@ -46,8 +48,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::Cursor;
-use std::collections::BTreeSet;
 
 mod cursor;
 mod external;
@@ -251,7 +251,8 @@ pub trait LevelTree {
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
 }
 
-impl <KS, PS> LevelTree for BPlusTree<KS, PS> where
+impl<KS, PS> LevelTree for BPlusTree<KS, PS>
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {

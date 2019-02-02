@@ -11,6 +11,7 @@ use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::BPlusTree;
+use index::btree::LevelTree;
 use index::btree::NodeCellRef;
 use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
 use index::EntryKey;
@@ -20,7 +21,6 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
-use index::btree::LevelTree;
 
 enum Selection<KS, PS>
 where
@@ -239,13 +239,10 @@ where
     empty_pages
 }
 
-pub fn level_merge<KSA, PSA>(
-    src_tree: &BPlusTree<KSA, PSA>,
-    dest_tree: &LevelTree
-) -> usize
+pub fn level_merge<KSA, PSA>(src_tree: &BPlusTree<KSA, PSA>, dest_tree: &LevelTree) -> usize
 where
     KSA: Slice<EntryKey> + Debug + 'static,
-    PSA: Slice<NodeCellRef> + 'static
+    PSA: Slice<NodeCellRef> + 'static,
 {
     let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
