@@ -107,15 +107,16 @@ impl LSMTreeCursor {
             level_cursors: cursors,
         }
     }
-
-    fn next_candidate(&mut self) -> (bool, usize) {
-        unimplemented!()
-    }
 }
 
 impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
-        unimplemented!()
+        self.level_cursors
+            .iter_mut()
+            .filter_map(|c| if c.current().is_some() { Some(c) } else { None })
+            .min_by(|a, b| { a.current().unwrap().cmp(b.current().unwrap()) })
+            .map(|c| c.next())
+            .unwrap_or(false)
     }
 
     fn current(&self) -> Option<&EntryKey> {
