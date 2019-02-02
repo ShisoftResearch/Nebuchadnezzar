@@ -240,14 +240,14 @@ where
     }
 }
 
-pub trait SSLevelTree {
+pub trait LevelTree {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to(&self, upper_level: &SSLevelTree) -> usize;
+    fn merge_to(&self, upper_level: &LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Vec<EntryKey>);
 }
 
-impl <KS, PS> SSLevelTree for BPlusTree<KS, PS> where
+impl <KS, PS> LevelTree for BPlusTree<KS, PS> where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
@@ -259,7 +259,7 @@ impl <KS, PS> SSLevelTree for BPlusTree<KS, PS> where
         self.len()
     }
 
-    fn merge_to(&self, upper_level: &SSLevelTree) -> usize {
+    fn merge_to(&self, upper_level: &LevelTree) -> usize {
         level::level_merge(self, upper_level)
     }
 

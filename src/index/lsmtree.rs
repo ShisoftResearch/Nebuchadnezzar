@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use index::btree::SSLevelTree;
+use index::btree::LevelTree;
+use index::btree::NodeCellRef;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -21,38 +22,17 @@ const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
 const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-type LevelTrees = Vec<Box<SSLevelTree>>;
-//
-//macro_rules! with_levels {
-//    ($($sym:ident, $level_size:ident;)*) => {
-//        $(
-//            type $sym = [EntryKey; $level_size];
-//            impl_sspage_slice!($sym, EntryKey, $level_size);
-//        )*
-//
-//        fn init_lsm_level_trees(neb_client: &Arc<AsyncClient>) -> (LevelTrees, Vec<usize>, Vec<usize>) {
-//            let mut trees = LevelTrees::new();
-//            let mut max_elements_list = Vec::new();
-//            let mut max_elements = LEVEL_M_MAX_ELEMENTS_COUNT;
-//            let mut page_sizes = Vec::new();
-//            $(
-//                max_elements *= LEVEL_ELEMENTS_MULTIPLIER;
-//                trees.push(box LevelTree::<$sym>::new(neb_client));
-//                max_elements_list.push(max_elements);
-//                page_sizes.push($level_size);
-//                const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
-//            )*
-//            return (trees, max_elements_list, page_sizes);
-//        }
-//    };
-//}
-//
-//with_levels! {
-//    L1, LEVEL_1;
-//    L2, LEVEL_2;
-//    L3, LEVEL_3;
-//    L4, LEVEL_4;
-//}
+type LevelTrees = Vec<Box<LevelTree>>;
+pub type Ptr = NodeCellRef;
+pub type Key = EntryKey;
+
+with_levels! {
+    LM, LEVEL_M;
+    L1, LEVEL_1;
+    L2, LEVEL_2;
+    L3, LEVEL_3;
+    L4, LEVEL_4;
+}
 //
 //pub struct LSMTree {
 //    pub level_m: BPlusTree,

@@ -20,7 +20,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
-use index::btree::SSLevelTree;
+use index::btree::LevelTree;
 
 enum Selection<KS, PS>
 where
@@ -241,7 +241,7 @@ where
 
 pub fn level_merge<KSA, PSA>(
     src_tree: &BPlusTree<KSA, PSA>,
-    dest_tree: &SSLevelTree
+    dest_tree: &LevelTree
 ) -> usize
 where
     KSA: Slice<EntryKey> + Debug + 'static,

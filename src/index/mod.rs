@@ -11,6 +11,7 @@ use std::slice::SliceIndex;
 
 #[macro_use]
 mod macros;
+#[macro_use]
 pub mod btree;
 mod lsmtree;
 pub mod placement;
