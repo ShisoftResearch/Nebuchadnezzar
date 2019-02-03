@@ -52,39 +52,21 @@ where
                 // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                 match self.ordering {
                     Ordering::Forward => {
-                        if page.is_empty() {
+                        if page.is_empty() || self.index + 1 >= page.len() {
                             return read_node(
                                 &ext_page.next,
                                 |next_node: &NodeReadHandler<KS, PS>| {
-                                    self.index = 0;
-                                    self.page = Some(ext_page.next.clone());
                                     if next_node.is_none() {
                                         self.page = None;
                                         return false;
                                     } else if next_node.is_empty() {
                                         return self.next();
                                     } else if next_node.is_ext() {
-                                        return true;
-                                    } else {
-                                        unreachable!()
-                                    }
-                                },
-                            );
-                        }
-                        if self.index + 1 >= page.len() {
-                            // next page
-                            return read_node(
-                                &ext_page.next,
-                                |next_page: &NodeReadHandler<KS, PS>| {
-                                    if !next_page.is_none() {
-                                        // debug!("Shifting page forward, next page len: {}", next_page.len());
                                         self.index = 0;
                                         self.page = Some(ext_page.next.clone());
                                         return true;
                                     } else {
-                                        // debug!("iterated to end");
-                                        self.page = None;
-                                        return false;
+                                        unreachable!()
                                     }
                                 },
                             );
@@ -94,39 +76,21 @@ where
                         }
                     }
                     Ordering::Backward => {
-                        if page.is_empty() {
+                        if page.is_empty() || self.index == 0 {
                             return read_node(
                                 &ext_page.prev,
                                 |prev_node: &NodeReadHandler<KS, PS>| {
-                                    self.index = prev_node.len() - 1;
-                                    self.page = Some(ext_page.prev.clone());
                                     if prev_node.is_none() {
                                         self.page = None;
                                         return false;
                                     } else if prev_node.is_empty() {
                                         return self.next();
                                     } else if prev_node.is_ext() {
+                                        self.index = prev_node.len() - 1;
+                                        self.page = Some(ext_page.prev.clone());
                                         return true;
                                     } else {
                                         unreachable!()
-                                    }
-                                },
-                            );
-                        }
-                        if self.index == 0 {
-                            // next page
-                            return read_node(
-                                &ext_page.prev,
-                                |prev_page: &NodeReadHandler<KS, PS>| {
-                                    if !prev_page.is_none() {
-                                        debug!("Shifting page backward");
-                                        self.page = Some(ext_page.prev.clone());
-                                        self.index = prev_page.len() - 1;
-                                        return true;
-                                    } else {
-                                        debug!("iterated to end");
-                                        self.page = None;
-                                        return false;
                                     }
                                 },
                             );
