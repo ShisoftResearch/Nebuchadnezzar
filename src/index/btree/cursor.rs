@@ -14,7 +14,7 @@ where
     pub page: Option<NodeCellRef>,
     pub deleted: DeletionSet,
     pub marker: PhantomData<(KS, PS)>,
-    pub current: Option<EntryKey>
+    pub current: Option<EntryKey>,
 }
 
 impl<KS, PS> RTCursor<KS, PS>
@@ -29,17 +29,22 @@ where
             page: Some(page.clone()),
             deleted: deleted.clone(),
             marker: PhantomData,
-            current: None
+            current: None,
         };
         match ordering {
-            Ordering::Forward if pos >= read_node(page, |node: &NodeReadHandler<KS, PS>| node.len()) => {
+            Ordering::Forward
+                if pos >= read_node(page, |node: &NodeReadHandler<KS, PS>| node.len()) =>
+            {
                 cursor.next();
-            },
+            }
             _ => {
                 cursor.current = Some(Self::read_current(page, pos));
             }
         }
-        debug!("Created cursor with pos {}, current {:?}, ordering: {:?}", cursor.index, cursor.current, cursor.ordering);
+        debug!(
+            "Created cursor with pos {}, current {:?}, ordering: {:?}",
+            cursor.index, cursor.current, cursor.ordering
+        );
         cursor
     }
     fn boxed(self) -> Box<IndexCursor> {
@@ -74,7 +79,8 @@ where
                                     } else if next_node.is_ext() {
                                         self.index = 0;
                                         self.page = Some(next_node_ref.clone());
-                                        self.current = Some(Self::read_current(next_node_ref, self.index));
+                                        self.current =
+                                            Some(Self::read_current(next_node_ref, self.index));
                                         return true;
                                     } else {
                                         unreachable!()
@@ -101,7 +107,8 @@ where
                                     } else if prev_node.is_ext() {
                                         self.index = prev_node.len() - 1;
                                         self.page = Some(prev_node_ref.clone());
-                                        self.current = Some(Self::read_current(prev_node_ref, self.index));
+                                        self.current =
+                                            Some(Self::read_current(prev_node_ref, self.index));
                                         return true;
                                     } else {
                                         unreachable!()

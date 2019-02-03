@@ -29,7 +29,7 @@ where
             page: None,
             marker: PhantomData,
             deleted: deleted.clone(),
-            current: None
+            current: None,
         };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");
@@ -41,13 +41,13 @@ where
             &NodeData::External(ref n) => {
                 debug!(
                     "search in external for {:?}, len {}, ordering {:?}, content: {:?}",
-                    key, n.len, ordering, &n.keys.as_slice_immute()[..n.len]
+                    key,
+                    n.len,
+                    ordering,
+                    &n.keys.as_slice_immute()[..n.len]
                 );
                 if ordering == Ordering::Backward {
-                    debug!(
-                        "found cursor pos {} for backwards, will be corrected",
-                        pos
-                    );
+                    debug!("found cursor pos {} for backwards, will be corrected", pos);
                     if pos > 0 {
                         pos -= 1;
                     }
