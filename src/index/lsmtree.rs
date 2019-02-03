@@ -113,13 +113,9 @@ impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
         self.level_cursors
             .iter_mut()
-            .filter_map(|c| {
-                c.current()
-                    .map(|k| unsafe { &*(k as *const EntryKey) })
-                    .map(|k| (k, c))
-            })
-            .min_by(|a, b| a.0.cmp(b.0))
-            .map(|x| x.1.next())
+            .filter_map(|c| if c.current().is_some() { Some(c) } else { None })
+            .min_by(|a, b| a.current().unwrap().cmp(b.current().unwrap()))
+            .map(|c| c.next())
             .unwrap_or(false)
     }
 
