@@ -14,6 +14,7 @@ where
     pub page: Option<NodeCellRef>,
     pub deleted: DeletionSet,
     pub marker: PhantomData<(KS, PS)>,
+    pub current: Option<EntryKey>
 }
 
 impl<KS, PS> RTCursor<KS, PS>
@@ -28,20 +29,27 @@ where
             page: Some(page.clone()),
             deleted: deleted.clone(),
             marker: PhantomData,
+            current: None
         };
         match ordering {
-            Ordering::Forward => {
-                let len = read_node(page, |node: &NodeReadHandler<KS, PS>| node.len());
-                if pos >= len {
-                    cursor.next();
-                }
+            Ordering::Forward if pos >= read_node(page, |node: &NodeReadHandler<KS, PS>| node.len()) => {
+                cursor.next();
+            },
+            _ => {
+                cursor.current = Some(Self::read_current(page, pos));
             }
-            Ordering::Backward => {}
         }
+        debug!("Created cursor with pos {}, current {:?}, ordering: {:?}", cursor.index, cursor.current, cursor.ordering);
         cursor
     }
     fn boxed(self) -> Box<IndexCursor> {
         box self
+    }
+
+    fn read_current(node: &NodeCellRef, pos: usize) -> EntryKey {
+        read_node(node, |node: &NodeReadHandler<KS, PS>| {
+            node.extnode().keys.as_slice_immute()[pos].clone()
+        })
     }
 
     fn next_candidate(&mut self) -> bool {
@@ -53,17 +61,20 @@ where
                 match self.ordering {
                     Ordering::Forward => {
                         if page.is_empty() || self.index + 1 >= page.len() {
+                            let next_node_ref = &ext_page.next;
                             return read_node(
-                                &ext_page.next,
+                                next_node_ref,
                                 |next_node: &NodeReadHandler<KS, PS>| {
                                     if next_node.is_none() {
                                         self.page = None;
+                                        self.current = None;
                                         return false;
                                     } else if next_node.is_empty() {
                                         return self.next();
                                     } else if next_node.is_ext() {
                                         self.index = 0;
-                                        self.page = Some(ext_page.next.clone());
+                                        self.page = Some(next_node_ref.clone());
+                                        self.current = Some(Self::read_current(next_node_ref, self.index));
                                         return true;
                                     } else {
                                         unreachable!()
@@ -77,17 +88,20 @@ where
                     }
                     Ordering::Backward => {
                         if page.is_empty() || self.index == 0 {
+                            let prev_node_ref = &ext_page.prev;
                             return read_node(
-                                &ext_page.prev,
+                                prev_node_ref,
                                 |prev_node: &NodeReadHandler<KS, PS>| {
                                     if prev_node.is_none() {
                                         self.page = None;
+                                        self.current = None;
                                         return false;
                                     } else if prev_node.is_empty() {
                                         return self.next();
                                     } else if prev_node.is_ext() {
                                         self.index = prev_node.len() - 1;
-                                        self.page = Some(ext_page.prev.clone());
+                                        self.page = Some(prev_node_ref.clone());
+                                        self.current = Some(Self::read_current(prev_node_ref, self.index));
                                         return true;
                                     } else {
                                         unreachable!()
@@ -100,6 +114,7 @@ where
                         }
                     }
                 }
+                self.current = Some(page.extnode().keys.as_slice_immute()[self.index].clone());
                 true
             })
         } else {
@@ -130,20 +145,6 @@ where
 
     // TODO: Use copied key reference
     fn current(&self) -> Option<&EntryKey> {
-        if let &Some(ref page_ref) = &self.page {
-            read_node(page_ref, |handler: &NodeReadHandler<KS, PS>| {
-                let page = unsafe { &*handler.ptr };
-                if self.index >= page.len() {
-                    panic!(
-                        "FIXME: cursor position overflowed {}/{}",
-                        self.index,
-                        page.len()
-                    )
-                }
-                Some(&page.extnode().keys.as_slice_immute()[self.index])
-            })
-        } else {
-            return None;
-        }
+        self.current.as_ref()
     }
 }

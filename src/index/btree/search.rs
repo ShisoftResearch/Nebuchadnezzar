@@ -29,19 +29,30 @@ where
             page: None,
             marker: PhantomData,
             deleted: deleted.clone(),
+            current: None
         };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");
             return search_node(right_node, key, ordering, deleted);
         }
         debug!("search node have keys {:?}", node.keys());
-        let pos = node.search(key);
+        let mut pos = node.search(key);
         match node {
             &NodeData::External(ref n) => {
                 debug!(
-                    "search in external for {:?}, len {}, content: {:?}",
-                    key, n.len, n.keys
+                    "search in external for {:?}, len {}, ordering {:?}, content: {:?}",
+                    key, n.len, ordering, &n.keys.as_slice_immute()[..n.len]
                 );
+                if ordering == Ordering::Backward {
+                    debug!(
+                        "found cursor pos {} for backwards, will be corrected",
+                        pos
+                    );
+                    if pos > 0 {
+                        pos -= 1;
+                    }
+                    debug!("cursor pos have been corrected to {}", pos);
+                }
                 RTCursor::new(pos, node_ref, ordering, deleted)
             }
             &NodeData::Internal(ref n) => {

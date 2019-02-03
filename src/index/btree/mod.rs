@@ -126,23 +126,7 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
-        let mut cursor = search_node(&self.get_root(), key, ordering, &self.deleted);
-        match ordering {
-            Ordering::Forward => {}
-            Ordering::Backward => {
-                // fill highest bits to the end of the search key as the last possible id for backward search
-                debug!(
-                    "found cursor pos {} for backwards, will be corrected",
-                    cursor.index
-                );
-                let cursor_index = cursor.index;
-                if cursor_index > 0 {
-                    cursor.index -= 1;
-                }
-                debug!("cursor pos have been corrected to {}", cursor.index);
-            }
-        }
-        cursor
+        search_node(&self.get_root(), key, ordering, &self.deleted)
     }
 
     pub fn insert(&self, key: &EntryKey) {
