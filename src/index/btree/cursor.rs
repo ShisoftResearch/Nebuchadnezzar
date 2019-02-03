@@ -53,19 +53,23 @@ where
                 match self.ordering {
                     Ordering::Forward => {
                         if page.is_empty() {
-                            let next_node = read_unchecked::<KS, PS>(&ext_page.next);
-                            self.index = 0;
-                            self.page = Some(ext_page.next.clone());
-                            if next_node.is_none() {
-                                self.page = None;
-                                return false;
-                            } else if next_node.is_empty() {
-                                return self.next();
-                            } else if next_node.is_ext() {
-                                return true;
-                            } else {
-                                unreachable!()
-                            }
+                            return read_node(
+                                &ext_page.next,
+                                |next_node: &NodeReadHandler<KS, PS>| {
+                                    self.index = 0;
+                                    self.page = Some(ext_page.next.clone());
+                                    if next_node.is_none() {
+                                        self.page = None;
+                                        return false;
+                                    } else if next_node.is_empty() {
+                                        return self.next();
+                                    } else if next_node.is_ext() {
+                                        return true;
+                                    } else {
+                                        unreachable!()
+                                    }
+                                },
+                            );
                         }
                         if self.index + 1 >= page.len() {
                             // next page
@@ -91,19 +95,23 @@ where
                     }
                     Ordering::Backward => {
                         if page.is_empty() {
-                            let prev_node = read_unchecked::<KS, PS>(&ext_page.prev);
-                            self.index = 0;
-                            self.page = Some(ext_page.next.clone());
-                            if prev_node.is_none() {
-                                self.page = None;
-                                return false;
-                            } else if prev_node.is_empty() {
-                                return self.next();
-                            } else if prev_node.is_ext() {
-                                return true;
-                            } else {
-                                unreachable!()
-                            }
+                            return read_node(
+                                &ext_page.prev,
+                                |prev_node: &NodeReadHandler<KS, PS>| {
+                                    self.index = prev_node.len() - 1;
+                                    self.page = Some(ext_page.prev.clone());
+                                    if prev_node.is_none() {
+                                        self.page = None;
+                                        return false;
+                                    } else if prev_node.is_empty() {
+                                        return self.next();
+                                    } else if prev_node.is_ext() {
+                                        return true;
+                                    } else {
+                                        unreachable!()
+                                    }
+                                },
+                            );
                         }
                         if self.index == 0 {
                             // next page
@@ -141,6 +149,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    // TODO: Copy current after next
     fn next(&mut self) -> bool {
         loop {
             let has_candidate = self.next_candidate();
@@ -155,6 +164,7 @@ where
         }
     }
 
+    // TODO: Use copied key reference
     fn current(&self) -> Option<&EntryKey> {
         if let &Some(ref page_ref) = &self.page {
             read_node(page_ref, |handler: &NodeReadHandler<KS, PS>| {
