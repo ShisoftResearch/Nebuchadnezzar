@@ -200,7 +200,7 @@ where
             let mut guard = write_node::<KS, PS>(node_ref);
             guard
                 .left_ref_mut()
-                .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::none()));
+                .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::with_none()));
             guard.right_ref_mut().map(|r| *r = non_empty.clone());
             return non_empty;
         } else {
@@ -328,22 +328,24 @@ where
         }
     }
 
-    pub fn internal(innode: InNode<KS, PS>) -> Self {
+    pub fn with_internal(innode: InNode<KS, PS>) -> Self {
         Self::new(NodeData::Internal(box innode))
     }
 
-    pub fn external(extnode: ExtNode<KS, PS>) -> Self {
+    pub fn with_external(extnode: ExtNode<KS, PS>) -> Self {
+        debug!("New External L3");
         Self::new(NodeData::External(box extnode))
     }
 
-    pub fn none() -> Self {
+    pub fn with_none() -> Self {
         Self::new(NodeData::None)
     }
     pub fn none_ref() -> NodeCellRef {
-        NodeCellRef::new(Node::<KS, PS>::none())
+        NodeCellRef::new(Node::<KS, PS>::with_none())
     }
     pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
-        Self::external(ExtNode::new(id, right_bound))
+        debug!("New External L2");
+        Self::with_external(ExtNode::new(id, right_bound))
     }
     pub fn version(&self) -> usize {
         node_version(self.cc.load(SeqCst))
@@ -576,7 +578,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     fn default() -> Self {
-        Node::none()
+        Node::with_none()
     }
 }
 

@@ -97,12 +97,16 @@ macro_rules! with_levels {
             let mut trees = LevelTrees::new();
             let mut max_elements_list = Vec::new();
             let mut max_elements = LEVEL_M_MAX_ELEMENTS_COUNT;
+            debug!("Initialize level trees...");
             $(
-                max_elements *= LEVEL_ELEMENTS_MULTIPLIER;
+                debug!("Initialize tree {}...", stringify!($sym));
                 trees.push(box $sym::Tree::new(neb_client));
-                max_elements_list.push(max_elements);
+                debug!("Tree {} initialized...", stringify!($sym));
                 const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
+                max_elements *= LEVEL_ELEMENTS_MULTIPLIER;
+                max_elements_list.push(max_elements);
             )*
+            debug!("Level trees initialized...");
             return (trees, max_elements_list);
         }
     };

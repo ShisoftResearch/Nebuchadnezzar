@@ -48,6 +48,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+pub use index::btree::external::page_schema;
 
 mod cursor;
 mod external;
@@ -105,19 +106,21 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree<KS, PS> {
-        let neb_client_1 = neb_client.clone();
-        let neb_client_2 = neb_client.clone();
+        debug!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let mut tree = BPlusTree {
-            root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::none())),
-            root_versioning: NodeCellRef::new(Node::<KS, PS>::none()),
+            root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::with_none())),
+            root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             storage: neb_client.clone(),
             len: AtomicUsize::new(0),
             deleted: Arc::new(RwLock::new(BTreeSet::new())),
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
-        *tree.root.write() =
-            NodeCellRef::new(Node::<KS, PS>::new_external(root_id, max_entry_key()));
+        let max_key = max_entry_key();
+        debug!("New External L1");
+        let root_inner = Node::<KS, PS>::new_external(root_id, max_key);
+        debug!("B+ Tree created");
+        *tree.root.write() = NodeCellRef::new(root_inner);
         return tree;
     }
 

@@ -169,7 +169,7 @@ where
             extnode_2.len,
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
-        let node_2 = NodeCellRef::new(Node::external(extnode_2));
+        let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         {
             if !self_next.is_none() {
                 self_next.extnode_mut().prev = node_2.clone();
@@ -348,14 +348,14 @@ where
 
     pub fn get(&self, id: &Id) -> NodeCellRef {
         if id.is_unit_id() {
-            return NodeCellRef::new(Node::<KS, PS>::none());
+            return NodeCellRef::new(Node::<KS, PS>::with_none());
         }
         let mut nodes = self.nodes.borrow_mut();
         nodes
             .entry(*id)
             .or_insert_with(|| {
                 let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
-                NodeCellRef::new(Node::external(self.extnode_from_cell(cell)))
+                NodeCellRef::new(Node::with_external(self.extnode_from_cell(cell)))
             })
             .clone()
     }

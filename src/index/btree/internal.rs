@@ -49,7 +49,7 @@ where
         InNode {
             keys: KS::init(),
             ptrs: PS::init(),
-            right: NodeCellRef::new(Node::<KS, PS>::none()),
+            right: NodeCellRef::new(Node::<KS, PS>::with_none()),
             right_bound,
             len,
         }
@@ -179,7 +179,7 @@ where
             right: self.right.clone(),
             right_bound,
         };
-        let node_2_ref = NodeCellRef::new(Node::internal(node_2));
+        let node_2_ref = NodeCellRef::new(Node::with_internal(node_2));
         self.len = keys_split.keys_1_len;
         self.right = node_2_ref.clone();
         (node_2_ref, keys_split.pivot_key)

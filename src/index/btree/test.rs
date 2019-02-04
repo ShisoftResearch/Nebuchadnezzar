@@ -613,7 +613,7 @@ fn node_lock() {
     let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(box inner_ext_node)));
     let num = 100000;
     let mut nums = (0..num).collect_vec();
-    let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::none();
+    let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::with_none();
     let dummy_node = NodeCellRef::new(inner_dummy_node);
     thread_rng().shuffle(nums.as_mut_slice());
     nums.par_iter().for_each(|num| {
