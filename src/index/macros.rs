@@ -72,19 +72,6 @@ macro_rules! with_levels {
 
                 pub type Tree = BPlusTree<KeySlice, PtrSlice>;
 
-                unsafe impl Array for KeySlice {
-                    type Item = Key;
-                    fn size() -> usize { $level_size }
-                    fn ptr(&self) -> *const Key { self.inner.as_ptr() }
-                    fn ptr_mut(&mut self) -> *mut Key { self.inner.as_mut_ptr() }
-                }
-                unsafe impl Array for PtrSlice {
-                    type Item = Ptr;
-                    fn size() -> usize { $level_size + 1 }
-                    fn ptr(&self) -> *const Ptr { self.inner.as_ptr() }
-                    fn ptr_mut(&mut self) -> *mut Ptr { self.inner.as_mut_ptr() }
-                }
-
                 impl fmt::Debug for KeySlice {
                     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
                         f.debug_list().entries(self.inner.iter()).finish()

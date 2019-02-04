@@ -288,6 +288,7 @@ macro_rules! impl_btree_level {
     };
 }
 
+#[derive(Clone)]
 pub struct NodeCellRef {
     inner: Arc<Any>,
 }
@@ -344,14 +345,6 @@ impl NodeCellRef {
             } else {
                 format!("{:?}", node.first_key())
             }
-        }
-    }
-}
-
-impl Clone for NodeCellRef {
-    fn clone(&self) -> Self {
-        NodeCellRef {
-            inner: self.inner.clone(),
         }
     }
 }

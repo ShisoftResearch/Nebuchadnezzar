@@ -341,7 +341,7 @@ where
         Self::new(NodeData::None)
     }
     pub fn none_ref() -> NodeCellRef {
-        NodeCellRef::new(Node::<KS, PS>::with_none())
+        NodeCellRef::new(Self::with_none())
     }
     pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
         debug!("New External L2");
