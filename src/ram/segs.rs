@@ -1,5 +1,4 @@
 use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
-use crc32c::crc32c;
 use libc;
 use parking_lot;
 use ram::cell;

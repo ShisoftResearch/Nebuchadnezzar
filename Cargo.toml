@@ -27,7 +27,6 @@ parking_lot = {version = "0.6", features = ["nightly", "deadlock_detection"]}
 rand = "0.5"
 linked-hash-map = "0.4"
 bitflags = "1.0"
-crc32c = "*"
 itertools = "*"
 smallvec = "*"
 owning_ref = "0.3"

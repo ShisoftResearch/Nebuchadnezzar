@@ -29,7 +29,6 @@ extern crate bitflags;
 extern crate bincode;
 extern crate byteorder;
 extern crate core;
-extern crate crc32c;
 extern crate futures_await as futures;
 extern crate libc;
 extern crate linked_hash_map;
