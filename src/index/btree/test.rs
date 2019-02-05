@@ -726,7 +726,7 @@ type LargeLevelBPlusTree = BPlusTree<LargeKeySlice, LargePtrSlice>;
 #[test]
 #[should_panic]
 fn large_page() {
-    // this test should panic but not stack overflow
+    // this test should panic not stack overflow
     env_logger::init();
     debug!("testing");
     ExtNode::<LargeKeySlice, LargePtrSlice>::new(Id::rand(), smallvec!(0));

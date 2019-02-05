@@ -159,7 +159,7 @@ mod test {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 4 * 1024 * 1024 * 1024,
+                memory_size: 3 * 1024 * 1024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
             },
