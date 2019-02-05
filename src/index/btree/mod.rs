@@ -182,7 +182,7 @@ where
         result.removed
     }
 
-    pub fn merge_with_keys_(&self, keys: Vec<EntryKey>) {
+    pub fn merge_with_keys_(&self, keys: Box<Vec<EntryKey>>) {
         let keys_len = keys.len();
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
@@ -233,7 +233,7 @@ pub trait LevelTree {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
     fn merge_to(&self, upper_level: &LevelTree) -> usize;
-    fn merge_with_keys(&self, keys: Vec<EntryKey>);
+    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey);
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
@@ -256,7 +256,7 @@ where
         level::level_merge(self, upper_level)
     }
 
-    fn merge_with_keys(&self, keys: Vec<SmallVec<[u8; 32]>>) {
+    fn merge_with_keys(&self, keys: Box<Vec<SmallVec<[u8; 32]>>>) {
         self.merge_with_keys_(keys)
     }
 
@@ -288,7 +288,6 @@ macro_rules! impl_btree_level {
     };
 }
 
-#[derive(Clone)]
 pub struct NodeCellRef {
     inner: Arc<Any>,
 }
@@ -345,6 +344,14 @@ impl NodeCellRef {
             } else {
                 format!("{:?}", node.first_key())
             }
+        }
+    }
+}
+
+impl Clone for NodeCellRef {
+    fn clone(&self) -> Self {
+        NodeCellRef {
+            inner: self.inner.clone(),
         }
     }
 }

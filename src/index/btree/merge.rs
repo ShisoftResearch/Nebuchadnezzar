@@ -25,14 +25,14 @@ enum MergeSearch {
 
 fn merge_into_internal<KS, PS>(
     node: &NodeCellRef,
-    lower_level_new_pages: Vec<(EntryKey, NodeCellRef)>,
+    lower_level_new_pages: Box<Vec<(EntryKey, NodeCellRef)>>,
     new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut node_guard = write_node::<KS, PS>(node);
-    for (pivot, node) in lower_level_new_pages {
+    for (pivot, node) in lower_level_new_pages.into_iter() {
         let mut target_guard = write_non_empty(write_targeted(node_guard, &pivot));
         {
             debug_assert!(!target_guard.is_none());
@@ -54,9 +54,9 @@ pub fn merge_into_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node: &NodeCellRef,
     parent: &NodeCellRef,
-    keys: Vec<EntryKey>,
+    keys: Box<Vec<EntryKey>>,
     level: usize,
-) -> Vec<(EntryKey, NodeCellRef)>
+) -> Box<Vec<(EntryKey, NodeCellRef)>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -147,5 +147,5 @@ where
             read_unchecked::<KS, PS>(&node).first_key()
         )
     }
-    return new_pages;
+    return box new_pages;
 }

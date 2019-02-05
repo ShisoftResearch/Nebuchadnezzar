@@ -29,7 +29,6 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::fmt;
 
 extern crate env_logger;
 extern crate serde_json;
@@ -713,52 +712,5 @@ fn level_merge() {
         assert_eq!(key2_cur.current().unwrap(), &key2);
 
         tree_2.seek(&key2, Default::default());
-    }
-}
-
-const LARGE_PAGE_SIZE: usize = 240000;
-struct LargeKeySlice {
-    inner: [EntryKey; LARGE_PAGE_SIZE]
-}
-type LargePtrSlice = [NodeCellRef; LARGE_PAGE_SIZE + 1];
-type LargeLevelBPlusTree = BPlusTree<LargeKeySlice, LargePtrSlice>;
-
-#[test]
-#[should_panic]
-fn large_page() {
-    // this test should panic not stack overflow
-    env_logger::init();
-    debug!("testing");
-    ExtNode::<LargeKeySlice, LargePtrSlice>::new(Id::rand(), smallvec!(0));
-}
-
-impl Slice<EntryKey> for LargeKeySlice {
-    fn as_slice(&mut self) -> &mut [EntryKey] {
-        &mut self.inner
-    }
-    fn slice_len() -> usize {
-        LARGE_PAGE_SIZE
-    }
-    fn init() -> Self {
-        panic!()
-    }
-}
-
-impl Slice<NodeCellRef> for LargePtrSlice {
-    fn as_slice(&mut self) -> &mut [NodeCellRef] {
-        self
-    }
-    fn slice_len() -> usize {
-        LARGE_PAGE_SIZE + 1
-    }
-    fn init() -> Self {
-        panic!()
-    }
-}
-
-impl Debug for LargeKeySlice {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        Ok(())
-        // f.debug_list().entries(self.inner.iter()).finish()
     }
 }

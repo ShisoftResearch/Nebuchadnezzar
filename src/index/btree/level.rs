@@ -142,9 +142,9 @@ fn apply_removal<'a, KS, PS>(
 
 fn prune_selected<'a, KS, PS>(
     node: &NodeCellRef,
-    mut keys: Vec<&'a EntryKey>,
+    mut keys: Box<Vec<&'a EntryKey>>,
     level: usize,
-) -> Vec<&'a EntryKey>
+) -> Box<Vec<&'a EntryKey>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -236,7 +236,7 @@ where
         }
     }
     debug!("Have empty nodes {:?}, level {:?}", &empty_pages, level);
-    empty_pages
+    box empty_pages
 }
 
 pub fn level_merge<KSA, PSA>(src_tree: &BPlusTree<KSA, PSA>, dest_tree: &LevelTree) -> usize
@@ -259,7 +259,7 @@ where
             .cloned()
             .collect_vec();
         debug!("Merge selected keys are {:?}", &keys);
-        dest_tree.merge_with_keys(keys);
+        dest_tree.merge_with_keys(box keys);
     }
 
     // cleanup upper level references
@@ -269,7 +269,7 @@ where
             .filter(|g| !g.is_empty())
             .map(|g| g.first_key())
             .collect_vec();
-        prune_selected::<KSA, PSA>(&src_tree.get_root(), page_keys, 0);
+        prune_selected::<KSA, PSA>(&src_tree.get_root(), box page_keys, 0);
     }
 
     // adjust leaf left, right references

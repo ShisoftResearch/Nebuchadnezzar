@@ -199,3 +199,4 @@ callgrind.out.*
 /dumps
 *.log
 /test-data/
+core

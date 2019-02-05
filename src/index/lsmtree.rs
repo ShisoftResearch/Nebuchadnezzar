@@ -31,7 +31,7 @@ with_levels! {
     L1, LEVEL_1;
     L2, LEVEL_2;
     L3, LEVEL_3;
-    L4, LEVEL_4;
+    // L4, LEVEL_4; // See https://github.com/rust-lang/rust/issues/58164
 }
 
 pub struct LSMTree {
@@ -84,14 +84,21 @@ impl LSMTree {
     }
 
     fn sentinel(&self) {
-        for i in 0..self.trees.len() - 1 {
-            let lower = &*self.trees[i];
-            let upper = &*self.trees[i + 1];
-            if lower.count() > self.max_sizes[i] {
-                lower.merge_to(upper);
+        loop {
+            for i in 0..self.trees.len() - 1 {
+                debug!("Checking tree merge {}", i);
+                let lower = &*self.trees[i];
+                let upper = &*self.trees[i + 1];
+                if lower.count() > self.max_sizes[i] {
+                    lower.merge_to(upper);
+                }
             }
+            thread::sleep(Duration::from_millis(1000));
         }
-        thread::sleep(Duration::from_millis(100));
+    }
+
+    pub fn level_sizes(&self) -> Vec<usize> {
+        self.trees.iter().map(|t| t.count()).collect()
     }
 
     pub fn len(&self) -> usize {
@@ -200,8 +207,9 @@ mod test {
         });
 
         if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
-            debug!("Sleep 5 minute for level merge");
-            thread::sleep(Duration::from_secs(5 * 60));
+            debug!("Level trees sizes are {:?}, wait for continuous merge", tree.level_sizes());
+            thread::sleep(Duration::from_secs(5));
+            debug!("Level trees sizes are {:?}", tree.level_sizes());
         }
         debug!("Start validations");
         (0..num).collect::<Vec<_>>().iter().for_each(|i| {
