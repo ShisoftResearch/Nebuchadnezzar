@@ -50,7 +50,7 @@ impl LSMTree {
         debug!("Initialized LSM-tree");
         let lsm_tree = Arc::new(LSMTree { trees, max_sizes });
         let tree_clone = lsm_tree.clone();
-        thread::spawn(move || {
+        thread::Builder::new().name("LSM-Tree Sentinel".to_string()).spawn(move || {
             tree_clone.sentinel();
         });
         lsm_tree

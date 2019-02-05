@@ -79,7 +79,6 @@ pub trait Slice<T: Default> {
                 slice.swap(i, i + 1);
             }
         }
-        debug!("setting item at {} for insertion", pos);
         *len += 1;
         slice[pos] = item;
     }

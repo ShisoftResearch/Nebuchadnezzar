@@ -131,6 +131,7 @@ where
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {
+            debug_assert!(!sub_node.is_default());
             let lower_level_new_pages =
                 merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
             let mut new_pages = vec![];

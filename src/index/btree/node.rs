@@ -333,7 +333,6 @@ where
     }
 
     pub fn with_external(extnode: ExtNode<KS, PS>) -> Self {
-        debug!("New External L3");
         Self::new(NodeData::External(box extnode))
     }
 
@@ -344,7 +343,6 @@ where
         NodeCellRef::new(Node::<KS, PS>::with_none())
     }
     pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
-        debug!("New External L2");
         Self::with_external(ExtNode::new(id, right_bound))
     }
     pub fn version(&self) -> usize {
@@ -416,7 +414,6 @@ where
         if new_cc_num == cc_num {
             return res;
         }
-        // debug!("read version changed, retry {:b}", cc_num);
     }
 }
 
