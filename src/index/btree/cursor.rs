@@ -61,12 +61,12 @@ where
         if self.page.is_some() {
             let current_page = self.page.clone().unwrap();
             read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
-                let ext_page = page.extnode();
+                // let ext_page = page.extnode();
                 // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                 match self.ordering {
                     Ordering::Forward => {
                         if page.is_empty() || self.index + 1 >= page.len() {
-                            let next_node_ref = &ext_page.next;
+                            let next_node_ref = page.right_ref().unwrap();
                             return read_node(
                                 next_node_ref,
                                 |next_node: &NodeReadHandler<KS, PS>| {
@@ -94,7 +94,7 @@ where
                     }
                     Ordering::Backward => {
                         if page.is_empty() || self.index == 0 {
-                            let prev_node_ref = &ext_page.prev;
+                            let prev_node_ref = page.left_ref().unwrap();
                             return read_node(
                                 prev_node_ref,
                                 |prev_node: &NodeReadHandler<KS, PS>| {
@@ -121,7 +121,7 @@ where
                         }
                     }
                 }
-                self.current = Some(page.extnode().keys.as_slice_immute()[self.index].clone());
+                self.current = Some(Self::read_current(&current_page, self.index));
                 true
             })
         } else {
