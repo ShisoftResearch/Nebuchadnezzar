@@ -47,8 +47,8 @@ where
 {
     pub fn new(len: usize, right_bound: EntryKey) -> Box<Self> {
         box InNode {
-            keys: *KS::init(),
-            ptrs: *PS::init(),
+            keys: KS::init(),
+            ptrs: PS::init(),
             right: NodeCellRef::new(Node::<KS, PS>::with_none()),
             right_bound,
             len,
@@ -98,7 +98,7 @@ where
             if pivot == pos {
                 debug!("special key treatment when pivot == pos");
                 let mut keys_1 = &mut self.keys;
-                let mut keys_2 = *keys_1.split_at_pivot(pivot, node_len);
+                let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
                 let mut keys_1_len = pivot;
                 let mut keys_2_len = node_len - pivot;
                 let pivot_key = key;
@@ -110,7 +110,7 @@ where
                 }
             } else {
                 let mut keys_1 = &mut self.keys;
-                let mut keys_2 = *keys_1.split_at_pivot(pivot + 1, node_len);
+                let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
                 let mut keys_1_len = pivot; // will not count the pivot
                 let mut keys_2_len = node_len - pivot - 1;
                 let mut key_pos = pos;
@@ -144,7 +144,7 @@ where
             if pivot == pos {
                 debug!("special ptr treatment when pivot == pos");
                 let mut ptrs_1 = &mut self.ptrs;
-                let mut ptrs_2 = *ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
                 ptrs_2.insert_at(new_node, 0, &mut ptrs_2_len);
@@ -154,7 +154,7 @@ where
             } else {
                 debug!("insert into ptrs");
                 let mut ptrs_1 = &mut self.ptrs;
-                let mut ptrs_2 = *ptrs_1.split_at_pivot(pivot + 1, ptr_len);
+                let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
                 let mut ptr_pos = pos + 1;
@@ -333,11 +333,11 @@ where
                     left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
                 );
 
-                let mut new_left_keys = *KS::init();
-                let mut new_left_ptrs = *PS::init();
+                let mut new_left_keys = KS::init();
+                let mut new_left_ptrs = PS::init();
 
-                let mut new_right_keys = *KS::init();
-                let mut new_right_ptrs = *PS::init();
+                let mut new_right_keys = KS::init();
+                let mut new_right_ptrs = PS::init();
 
                 let mut new_left_keys_len = 0;
                 let mut new_right_keys_len = 0;
@@ -408,8 +408,8 @@ where
                 left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
             );
 
-            let mut new_left_keys = *KS::init();
-            let mut new_right_keys = *KS::init();
+            let mut new_left_keys = KS::init();
+            let mut new_right_keys = KS::init();
 
             let left_len = left_extnode.len;
             let right_len = right_extnode.len;

@@ -85,8 +85,8 @@ fn apply_removal<'a, KS, PS>(
     );
     {
         let mut innode = cursor_guard.innode_mut();
-        let mut new_keys = *KS::init();
-        let mut new_ptrs = *PS::init();
+        let mut new_keys = KS::init();
+        let mut new_ptrs = PS::init();
         {
             if remove_children_right_nodes {
                 // A node will be reclaimed if and only if it have zero references

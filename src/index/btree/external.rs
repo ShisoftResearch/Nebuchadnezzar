@@ -74,7 +74,7 @@ where
     pub fn new(id: Id, right_bound: EntryKey) -> Box<Self> {
         box ExtNode {
             id,
-            keys: *KS::init(),
+            keys: KS::init(),
             next: Node::<KS, PS>::none_ref(),
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
@@ -130,7 +130,7 @@ where
         let pivot = self.len / 2;
         let new_page_id = tree.new_page_id();
         let mut keys_1 = &mut self.keys;
-        let mut keys_2 = *keys_1.split_at_pivot(pivot, self.len);
+        let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;
         // modify next node point previous to new node
@@ -252,7 +252,7 @@ where
         let mut pos = 0;
         let mut left_pos = 0;
         let mut right_pos = 0;
-        let mut left_keys = mem::replace(&mut self.keys, *KS::init());
+        let mut left_keys = mem::replace(&mut self.keys, KS::init());
         let mut left = left_keys.as_slice();
         while left_pos < self.len && right_pos < right.len() {
             let left_key = &left[left_pos];
@@ -372,7 +372,7 @@ where
         } else {
             panic!()
         };
-        let mut key_slice = *KS::init();
+        let mut key_slice = KS::init();
         let mut key_count = 0;
         for (i, key_val) in keys_array.iter().enumerate() {
             key_slice.as_slice()[i] = EntryKey::from(key_val.as_slice());

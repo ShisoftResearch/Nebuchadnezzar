@@ -47,17 +47,17 @@ pub trait Slice<T: Default> {
     #[inline]
     fn slice_len() -> usize;
     #[inline]
-    fn init() -> Box<Self>;
+    fn init() -> Self;
     #[inline]
     fn item_default() -> T {
         T::default()
     }
 
-    fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Box<Self>
+    fn split_at_pivot(&mut self, pivot: usize, len: usize) -> Self
     where
         Self: Sized,
     {
-        let mut right_slice = *Self::init();
+        let mut right_slice = Self::init();
         {
             let mut slice1: &mut [T] = self.as_slice();
             let mut slice2: &mut [T] = right_slice.as_slice();
@@ -67,7 +67,7 @@ pub trait Slice<T: Default> {
                 mem::swap(&mut slice1[i], &mut slice2[right_pos]);
             }
         }
-        return box right_slice;
+        return right_slice;
     }
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
         debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
