@@ -62,7 +62,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub node_2: Box<ExtNode<KS, PS>>,
+    pub node_2: ExtNode<KS, PS>,
     pub keys_1_len: usize,
 }
 
