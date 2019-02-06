@@ -34,6 +34,7 @@ macro_rules! with_levels {
                 use smallvec::Array;
                 use std::fmt;
 
+                // use boxed slice for the slice itself may too large to been put on stack
                 pub struct KeySlice {
                     inner: Box<[Key; $level_size]>
                 }
