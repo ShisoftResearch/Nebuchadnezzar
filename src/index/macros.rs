@@ -16,8 +16,8 @@ macro_rules! impl_slice_ops {
             fn as_slice(&mut self) -> &mut [$et] {
                 self
             }
-            fn init() -> Self {
-                make_array!($n, Self::item_default())
+            fn init() -> Box<Self> {
+                box make_array!($n, Self::item_default())
             }
             fn slice_len() -> usize {
                 $n
@@ -46,8 +46,8 @@ macro_rules! with_levels {
                     fn as_slice(&mut self) -> &mut [Key] {
                         &mut self.inner
                     }
-                    fn init() -> Self {
-                        Self {
+                    fn init() -> Box<Self> {
+                        box Self {
                             inner: make_array!($level_size, Self::item_default())
                         }
                     }
@@ -60,8 +60,8 @@ macro_rules! with_levels {
                     fn as_slice(&mut self) -> &mut [Ptr] {
                         &mut self.inner
                     }
-                    fn init() -> Self {
-                        Self {
+                    fn init() -> Box<Self> {
+                        box Self {
                             inner: make_array!($level_size + 1, Self::item_default())
                         }
                     }
