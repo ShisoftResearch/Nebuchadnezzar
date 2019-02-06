@@ -328,12 +328,12 @@ where
         }
     }
 
-    pub fn with_internal(innode: InNode<KS, PS>) -> Self {
-        Self::new(NodeData::Internal(box innode))
+    pub fn with_internal(innode: Box<InNode<KS, PS>>) -> Self {
+        Self::new(NodeData::Internal(innode))
     }
 
-    pub fn with_external(extnode: ExtNode<KS, PS>) -> Self {
-        Self::new(NodeData::External(box extnode))
+    pub fn with_external(extnode: Box<ExtNode<KS, PS>>) -> Self {
+        Self::new(NodeData::External(extnode))
     }
 
     pub fn with_none() -> Self {

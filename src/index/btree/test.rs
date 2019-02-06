@@ -609,8 +609,8 @@ fn node_lock() {
     );
     let client = Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     let tree = LevelBPlusTree::new(&client);
-    let inner_ext_node: ExtNode<KeySlice, PtrSlice> = ExtNode::new(Id::new(1, 2), max_entry_key());
-    let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(box inner_ext_node)));
+    let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> = ExtNode::new(Id::new(1, 2), max_entry_key());
+    let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(inner_ext_node)));
     let num = 100000;
     let mut nums = (0..num).collect_vec();
     let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::with_none();

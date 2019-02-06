@@ -71,8 +71,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(id: Id, right_bound: EntryKey) -> ExtNode<KS, PS> {
-        ExtNode {
+    pub fn new(id: Id, right_bound: EntryKey) -> Box<Self> {
+        box ExtNode {
             id,
             keys: KS::init(),
             next: Node::<KS, PS>::none_ref(),
@@ -143,7 +143,7 @@ where
             pos,
         );
         let pivot_key = keys_2.as_slice()[0].clone();
-        let extnode_2: ExtNode<KS, PS> = ExtNode {
+        let extnode_2: Box<ExtNode<KS, PS>> = box ExtNode {
             id: new_page_id,
             keys: keys_2,
             next: self.next.clone(),
@@ -360,7 +360,7 @@ where
             .clone()
     }
 
-    fn extnode_from_cell(&self, cell: Cell) -> ExtNode<KS, PS> {
+    fn extnode_from_cell(&self, cell: Cell) -> Box<ExtNode<KS, PS>> {
         let cell_id = cell.id();
         let cell_version = cell.header.version;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
@@ -378,7 +378,7 @@ where
             key_slice.as_slice()[i] = EntryKey::from(key_val.as_slice());
             key_count += 1;
         }
-        ExtNode {
+        box ExtNode {
             id: cell_id,
             keys: key_slice,
             next: self.get(next),

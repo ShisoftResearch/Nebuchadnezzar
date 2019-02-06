@@ -45,8 +45,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(len: usize, right_bound: EntryKey) -> Self {
-        InNode {
+    pub fn new(len: usize, right_bound: EntryKey) -> Box<Self> {
+        box InNode {
             keys: KS::init(),
             ptrs: PS::init(),
             right: NodeCellRef::new(Node::<KS, PS>::with_none()),
@@ -172,7 +172,7 @@ where
             }
         };
         let right_bound = mem::replace(&mut self.right_bound, pivot_key);
-        let node_2 = InNode {
+        let node_2 = box InNode {
             len: keys_split.keys_2_len,
             keys: keys_split.keys_2,
             ptrs: ptr_split.ptrs_2,
