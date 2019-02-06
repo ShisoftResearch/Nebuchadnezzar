@@ -158,6 +158,12 @@ mod test {
         key_slice
     }
 
+    fn dump_trees(lsm_tree: &LSMTree, name: &str) {
+        for i in 0..lsm_tree.trees.len() {
+            lsm_tree.trees[i].dump(&format!("{}_lsm_{}_dump.json", name, i));
+        }
+    }
+
     #[test]
     pub fn insertions() {
         env_logger::init();
@@ -212,6 +218,9 @@ mod test {
             debug!("Level trees sizes are {:?}", tree.level_sizes());
         }
         debug!("Start validations");
+
+        dump_trees(&*tree, "after_insertion");
+
         (0..num).collect::<Vec<_>>().iter().for_each(|i| {
             let mut rng = rand::rngs::OsRng::new().unwrap();
             let die_range = Uniform::new_inclusive(1, 6);
