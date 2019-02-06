@@ -69,17 +69,20 @@ where
             .unwrap_or_else(|i| i)
     }
     pub fn remove_at(&mut self, ptr_pos: usize) {
-        let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
-        let mut n_key_len = &mut self.len;
-        let mut n_ptr_len = *n_key_len + 1;
-        debug!(
-            "Removing from internal node pos {}, len {}, key {:?}",
-            key_pos,
-            n_key_len,
-            &self.keys.as_slice()[key_pos]
-        );
-        self.keys.remove_at(key_pos, n_key_len);
-        self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
+        {
+            let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
+            let mut n_key_len = &mut self.len;
+            let mut n_ptr_len = *n_key_len + 1;
+            debug!(
+                "Removing from internal node pos {}, len {}, key {:?}",
+                key_pos,
+                n_key_len,
+                &self.keys.as_slice()[key_pos]
+            );
+            self.keys.remove_at(key_pos, n_key_len);
+            self.ptrs.remove_at(ptr_pos, &mut n_ptr_len);
+        }
+        self.debug_check_integrity();
     }
 
     pub fn split_insert(
@@ -182,6 +185,7 @@ where
         let node_2_ref = NodeCellRef::new(Node::with_internal(node_2));
         self.len = keys_split.keys_1_len;
         self.right = node_2_ref.clone();
+        self.debug_check_integrity();
         (node_2_ref, keys_split.pivot_key)
     }
 
@@ -193,6 +197,7 @@ where
         self.ptrs
             .insert_at(new_node, pos + 1, &mut new_node_pointers);
         self.len = new_node_len;
+        self.debug_check_integrity();
     }
 
     pub fn insert(
@@ -278,13 +283,14 @@ where
             left: Some(left_node_ref.clone()),
             right: left_node_ref.clone(),
         });
-        self.remove_at(right_ptr_pos);
         debug!(
             "Removing merged node at {}, left {}, right {}, merged {}",
             right_ptr_pos, left_len, right_len, merged_len
         );
+        self.remove_at(right_ptr_pos);
         debug!("Merged parent level keys: {:?}", self.keys);
         debug!("Merged level keys {:?}", left_node.keys());
+        self.debug_check_integrity();
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
         debug!(
@@ -309,6 +315,7 @@ where
             );
         }
         self.len += right.len + 1;
+        self.debug_check_integrity();
     }
     pub fn relocate_children(
         &mut self,
@@ -451,6 +458,7 @@ where
         );
         debug_assert!(new_right_node_key > smallvec!(0));
         self.keys.as_slice()[right_key_pos] = new_right_node_key;
+        self.debug_check_integrity();
     }
 
     pub fn debug_check_integrity(&self) {
@@ -460,11 +468,29 @@ where
                 return;
             }
             for (i, key) in self.keys.as_slice_immute()[..self.len].iter().enumerate() {
-                debug_assert!(key > &smallvec!(0), "keys {}/{} {:?}", i, self.len, self.keys.as_slice_immute());
+                debug_assert!(
+                    key > &smallvec!(0),
+                    "{} keys {}/{} {:?}",
+                    KS::slice_len(),
+                    i,
+                    self.len,
+                    &self.keys.as_slice_immute()[..self.len]
+                );
             }
 
-            for (i, ptr) in self.ptrs.as_slice_immute()[..self.len + 1].iter().enumerate() {
-                debug_assert!(!ptr.is_default(), "ptrs {}/{}, len {}, keys: {:?}", i, self.len + 1, self.len, self.keys.as_slice_immute());
+            for (i, ptr) in self.ptrs.as_slice_immute()[..self.len + 1]
+                .iter()
+                .enumerate()
+            {
+                debug_assert!(
+                    !ptr.is_default(),
+                    "{} ptrs {}/{}, len {}, keys: {:?}",
+                    KS::slice_len(),
+                    i,
+                    self.len + 1,
+                    self.len,
+                    &self.keys.as_slice_immute()[..self.len]
+                );
             }
         }
     }
