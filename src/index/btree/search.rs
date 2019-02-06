@@ -62,7 +62,7 @@ where
                 );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                 debug_assert!(pos <= n.len);
-                debug_assert!(!next_node_ref.is_default());
+                debug_assert!(!next_node_ref.is_default(), "pos {}, len {}, keys {:?}", pos, n.len, &n.keys.as_slice_immute()[..pos]);
                 search_node(next_node_ref, key, ordering, deleted)
             }
             &NodeData::Empty(ref n) => search_node(&n.right, key, ordering, deleted),

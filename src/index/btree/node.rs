@@ -284,26 +284,33 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    if search_page.is_empty() || (search_page.len() > 0 && search_page.right_bound() < key) {
-        let right_ref = search_page.right_ref_mut_no_empty().unwrap();
-        let right_node = write_node(right_ref);
-        debug_assert!(!right_node.is_empty_node());
-        debug!(
-            "Shifting to right {} node for {:?}, first key {:?}",
-            right_node.type_name(),
-            key,
-            if !right_node.is_none() && right_node.len() > 0 {
-                Some(right_node.first_key())
+    loop {
+        if search_page.is_empty() || search_page.right_bound() < key {
+            let right_node = write_node(search_page.right_ref_mut_no_empty().unwrap());
+            debug_assert!(!right_node.is_empty_node());
+            debug!(
+                "Shifting to right {} node for {:?}, first key {:?}",
+                right_node.type_name(),
+                key,
+                if !right_node.is_none() && right_node.len() > 0 {
+                    Some(right_node.first_key())
+                } else {
+                    None
+                }
+            );
+            if !right_node.is_none() {
+                search_page = right_node;
             } else {
-                None
+                return search_page;
             }
-        );
-        if !right_node.is_none() {
-            return write_targeted(right_node, key);
+        } else {
+            break;
         }
     }
     search_page
 }
+
+//0x00007fb854907828
 
 const LATCH_FLAG: usize = !(!0 >> 1);
 

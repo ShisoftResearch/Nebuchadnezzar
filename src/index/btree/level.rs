@@ -115,14 +115,17 @@ fn apply_removal<'a, KS, PS>(
             innode.len = keys.len();
             debug!("Prune filtered page have keys {:?}", &keys);
             for (i, key) in keys.into_iter().enumerate() {
+                debug_assert!(key > &mut smallvec!(0));
                 mem::swap(&mut new_keys.as_slice()[i], key);
             }
             for (i, ptr) in ptrs.into_iter().enumerate() {
+                debug_assert!(!ptr.is_default());
                 mem::swap(&mut new_ptrs.as_slice()[i], ptr);
             }
         }
         innode.keys = new_keys;
         innode.ptrs = new_ptrs;
+        innode.debug_check_integrity();
 
         debug!(
             "Pruned page have keys {:?}",
@@ -273,23 +276,28 @@ where
     }
 
     // adjust leaf left, right references
-    let right_right_most = left_most_leaf_guards
-        .last()
-        .unwrap()
-        .right_ref()
-        .unwrap()
-        .clone();
-    let left_left_most = left_most_leaf_guards
-        .first()
-        .unwrap()
-        .left_ref()
-        .unwrap()
-        .clone();
-    for mut g in left_most_leaf_guards {
-        *g = NodeData::Empty(box EmptyNode {
-            left: Some(left_left_most.clone()),
-            right: right_right_most.clone(),
-        })
+    {
+        let right_right_most = left_most_leaf_guards
+            .last()
+            .unwrap()
+            .right_ref()
+            .unwrap()
+            .clone();
+
+        let left_left_most = left_most_leaf_guards
+            .first()
+            .unwrap()
+            .left_ref()
+            .unwrap()
+            .clone();
+
+        for mut g in left_most_leaf_guards {
+            *g = NodeData::Empty(box EmptyNode {
+                left: Some(left_left_most.clone()),
+                right: right_right_most.clone(),
+            })
+        }
     }
+
     merge_page_len
 }

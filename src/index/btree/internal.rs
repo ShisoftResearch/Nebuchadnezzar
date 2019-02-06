@@ -452,4 +452,20 @@ where
         debug_assert!(new_right_node_key > smallvec!(0));
         self.keys.as_slice()[right_key_pos] = new_right_node_key;
     }
+
+    pub fn debug_check_integrity(&self) {
+        if cfg!(debug_assertions) {
+            if self.len == 0 {
+                // will not check empty node
+                return;
+            }
+            for (i, key) in self.keys.as_slice_immute()[..self.len].iter().enumerate() {
+                debug_assert!(key > &smallvec!(0), "keys {}/{} {:?}", i, self.len, self.keys.as_slice_immute());
+            }
+
+            for (i, ptr) in self.ptrs.as_slice_immute()[..self.len + 1].iter().enumerate() {
+                debug_assert!(!ptr.is_default(), "ptrs {}/{}, len {}, keys: {:?}", i, self.len + 1, self.len, self.keys.as_slice_immute());
+            }
+        }
+    }
 }
