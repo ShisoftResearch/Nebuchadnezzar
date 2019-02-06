@@ -35,20 +35,20 @@ macro_rules! with_levels {
                 use std::fmt;
 
                 pub struct KeySlice {
-                    inner: [Key; $level_size]
+                    inner: Box<[Key; $level_size]>
                 }
 
                 pub struct PtrSlice {
-                    inner: [Ptr; $level_size + 1]
+                    inner: Box<[Ptr; $level_size + 1]>
                 }
 
                 impl Slice<Key> for KeySlice {
                     fn as_slice(&mut self) -> &mut [Key] {
-                        &mut self.inner
+                        &mut *self.inner
                     }
                     fn init() -> Self {
                         Self {
-                            inner: make_array!($level_size, Self::item_default())
+                            inner: box make_array!($level_size, Self::item_default())
                         }
                     }
                     fn slice_len() -> usize {
@@ -58,11 +58,11 @@ macro_rules! with_levels {
 
                 impl Slice<Ptr> for PtrSlice {
                     fn as_slice(&mut self) -> &mut [Ptr] {
-                        &mut self.inner
+                        &mut *self.inner
                     }
                     fn init() -> Self {
                         Self {
-                            inner: make_array!($level_size + 1, Self::item_default())
+                            inner: box make_array!($level_size + 1, Self::item_default())
                         }
                     }
                     fn slice_len() -> usize {
