@@ -48,12 +48,7 @@ impl LSMTree {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = init_lsm_level_trees(neb_client);
         debug!("Initialized LSM-tree");
-        let lsm_tree = Arc::new(LSMTree { trees, max_sizes });
-        let tree_clone = lsm_tree.clone();
-        thread::Builder::new().name("LSM-Tree Sentinel".to_string()).spawn(move || {
-            tree_clone.sentinel();
-        });
-        lsm_tree
+        Arc::new(LSMTree { trees, max_sizes })
     }
 
     pub fn insert(&self, mut key: EntryKey, id: &Id) {
@@ -83,18 +78,25 @@ impl LSMTree {
         return LSMTreeCursor::new(cursors);
     }
 
-    fn sentinel(&self) {
-        loop {
-            for i in 0..self.trees.len() - 1 {
-                debug!("Checking tree merge {}", i);
-                let lower = &*self.trees[i];
-                let upper = &*self.trees[i + 1];
-                if lower.count() > self.max_sizes[i] {
-                    lower.merge_to(upper);
-                }
+    pub fn check_and_merge(&self) {
+        for i in 0..self.trees.len() - 1 {
+            debug!("Checking tree merge {}", i);
+            let lower = &*self.trees[i];
+            let upper = &*self.trees[i + 1];
+            if lower.count() > self.max_sizes[i] {
+                lower.merge_to(upper);
             }
-            thread::sleep(Duration::from_millis(500));
         }
+    }
+
+    fn sentinel(this: &Arc<Self>) {
+        let this = this.clone();
+        thread::Builder::new().name("LSM-Tree Sentinel".to_string()).spawn(move || {
+            loop {
+                this.check_and_merge();
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
     }
 
     pub fn level_sizes(&self) -> Vec<usize> {
@@ -233,11 +235,13 @@ mod test {
         }
         debug!("Start validations");
 
+        dump_trees(&*tree, "before_insertion");
+        tree.check_and_merge();
         dump_trees(&*tree, "after_insertion");
 
         (0..num).collect::<Vec<_>>().iter().for_each(|i| {
             let mut rng = rand::rngs::OsRng::new().unwrap();
-            let die_range = Uniform::new_inclusive(1, 6);
+            let die_range = Uniform::new_inclusive(1, 15);
             let mut roll_die = rng.sample_iter(&die_range);
             let i = *i;
             let id = Id::new(0, i);
@@ -247,7 +251,7 @@ mod test {
             let mut cursor = tree.seek(key.clone(), Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
-            if roll_die.next().unwrap() == 6 {
+            if roll_die.next().unwrap() == 15 {
                 for j in i..num {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
