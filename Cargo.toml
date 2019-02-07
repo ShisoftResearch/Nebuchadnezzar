@@ -34,7 +34,7 @@ rayon = "1.0"
 futures-await = { git = "https://github.com/vorot93/futures-await.git" }
 num_cpus = "1.0"
 static_assertions = "*"
+serde_json = "1.0"
 
 [dev-dependencies]
 env_logger = "0.4"
-serde_json = "1.0"

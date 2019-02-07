@@ -93,7 +93,7 @@ impl LSMTree {
                     lower.merge_to(upper);
                 }
             }
-            thread::sleep(Duration::from_millis(1000));
+            thread::sleep(Duration::from_millis(500));
         }
     }
 
@@ -120,12 +120,26 @@ impl LSMTreeCursor {
 
 impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
-        self.level_cursors
-            .iter_mut()
-            .filter(|c| c.current().is_some())
-            .min_by(|a, b| a.current().unwrap().cmp(b.current().unwrap()))
-            .map(|c| c.next())
-            .unwrap_or(false)
+        if let Some(prev_key) = self.current().map(|k| k.to_owned()) {
+            let prob = self.level_cursors
+                .iter_mut()
+                .filter(|c| c.current().is_some())
+                .min_by(|a, b| a.current().unwrap().cmp(b.current().unwrap()))
+                .map(|c| (c.next(), c))
+                .map(|(has_next, c)| if !has_next || c.current().unwrap() <= &prev_key {
+                    None
+                } else {
+                    Some(has_next)
+                })
+                .unwrap_or(Some(false));
+            if let Some(res) = prob {
+                res
+            } else {
+                self.next()
+            }
+        } else {
+            false
+        }
     }
 
     fn current(&self) -> Option<&EntryKey> {
@@ -214,7 +228,7 @@ mod test {
 
         if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
             debug!("Level trees sizes are {:?}, wait for continuous merge", tree.level_sizes());
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(30));
             debug!("Level trees sizes are {:?}", tree.level_sizes());
         }
         debug!("Start validations");

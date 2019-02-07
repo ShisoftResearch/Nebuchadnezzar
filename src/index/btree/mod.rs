@@ -59,6 +59,7 @@ mod merge;
 mod node;
 mod remove;
 mod search;
+mod dump;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
@@ -280,7 +281,7 @@ where
     }
 
     fn dump(&self, f: &str) {
-        test::dump_tree(self, f);
+        dump::dump_tree(self, f);
     }
 }
 
