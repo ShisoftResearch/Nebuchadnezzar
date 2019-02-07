@@ -206,7 +206,7 @@ mod test {
         let num = env::var("LSM_TREE_TEST_ITEMS")
             // this value cannot do anything useful to the test
             // must arrange a long-term test to cover every levels
-            .unwrap_or("1000".to_string())
+            .unwrap_or("331776".to_string())
             .parse::<u64>()
             .unwrap();
 
