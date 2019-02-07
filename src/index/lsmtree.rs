@@ -89,7 +89,7 @@ impl LSMTree {
         }
     }
 
-    fn sentinel(this: &Arc<Self>) {
+    pub fn start_sentinel(this: &Arc<Self>) {
         let this = this.clone();
         thread::Builder::new().name("LSM-Tree Sentinel".to_string()).spawn(move || {
             loop {
@@ -123,19 +123,22 @@ impl LSMTreeCursor {
 impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
         if let Some(prev_key) = self.current().map(|k| k.to_owned()) {
-            let prob = self.level_cursors
+            self.level_cursors
                 .iter_mut()
                 .filter(|c| c.current().is_some())
                 .min_by(|a, b| a.current().unwrap().cmp(b.current().unwrap()))
-                .map(|c| (c.next(), c))
-                .map(|(has_next, c)| if !has_next || c.current().unwrap() <= &prev_key {
+                .map(|c| c.next());
+            let dedupe_current = if let Some(current) = self.current() {
+                if current <= &prev_key {
                     None
                 } else {
-                    Some(has_next)
-                })
-                .unwrap_or(Some(false));
-            if let Some(res) = prob {
-                res
+                    Some(true)
+                }
+            } else {
+                Some(false)
+            };
+            if let Some(has_next) = dedupe_current {
+                has_next
             } else {
                 self.next()
             }
@@ -228,21 +231,12 @@ mod test {
             tree.insert(key, &id);
         });
 
-        if tree.len() > LEVEL_M_MAX_ELEMENTS_COUNT {
-            debug!("Level trees sizes are {:?}, wait for continuous merge", tree.level_sizes());
-            thread::sleep(Duration::from_secs(30));
-            debug!("Level trees sizes are {:?}", tree.level_sizes());
-        }
-        debug!("Start validations");
-
-        dump_trees(&*tree, "before_insertion");
+        dump_trees(&*tree, "stage_1_before_insertion");
         tree.check_and_merge();
-        dump_trees(&*tree, "after_insertion");
+        dump_trees(&*tree, "stage_1_after_insertion");
 
-        (0..num).collect::<Vec<_>>().iter().for_each(|i| {
-            let mut rng = rand::rngs::OsRng::new().unwrap();
-            let die_range = Uniform::new_inclusive(1, 15);
-            let mut roll_die = rng.sample_iter(&die_range);
+        debug!("Start point search validations");
+        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
@@ -251,16 +245,31 @@ mod test {
             let mut cursor = tree.seek(key.clone(), Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
-            if roll_die.next().unwrap() == 15 {
-                for j in i..num {
-                    let id = Id::new(0, j);
-                    let key_slice = u64_to_slice(j);
-                    let mut key = SmallVec::from_slice(&key_slice);
-                    key_with_id(&mut key, &id);
-                    assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
-                }
-            }
+        });
+
+        LSMTree::start_sentinel(&tree);
+
+        (num..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
+            let i = *i;
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let key = SmallVec::from_slice(&key_slice);
+            tree.insert(key, &id);
+        });
+
+        dump_trees(&*tree, "stage_2_after_insertion");
+        thread::sleep(Duration::new(30, 0));
+        dump_trees(&*tree, "stage_2_waited_insertion");
+
+        (0..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
+            let i = *i;
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            debug!("checking: {}", i);
+            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
+            key_with_id(&mut key, &id);
+            assert_eq!(cursor.current(), Some(&key), "{}", i);
         });
     }
 }
