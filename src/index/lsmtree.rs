@@ -238,7 +238,7 @@ mod test {
         dump_trees(&*tree, "stage_1_after_insertion");
 
         debug!("Start point search validations");
-        (0..num).collect::<Vec<_>>().iter().for_each(|i| {
+        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
@@ -249,7 +249,6 @@ mod test {
             assert_eq!(cursor.current(), Some(&key), "{}", i);
         });
 
-        return;
         LSMTree::start_sentinel(&tree);
 
         (num..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
