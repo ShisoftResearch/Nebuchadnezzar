@@ -251,7 +251,9 @@ mod test {
 
         LSMTree::start_sentinel(&tree);
 
-        (num..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
+        let mut test_data = (num..num * 2).collect_vec();
+        thread_rng().shuffle(test_data.as_mut_slice());
+        test_data.par_iter().for_each(|i| {
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
