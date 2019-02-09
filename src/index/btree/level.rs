@@ -39,7 +39,6 @@ enum PruningSearch {
 
 struct NodeRemoval<'a> {
     empty_pages: Vec<&'a EntryKey>,
-    index_changed: Vec<(EntryKey, EntryKey)>,
     split: Vec<(NodeCellRef, EntryKey)>
 }
 
@@ -47,7 +46,6 @@ impl <'a> NodeRemoval <'a> {
     fn new() -> Self {
         Self {
             empty_pages: vec![],
-            index_changed: vec![],
             split: vec![]
         }
     }
@@ -82,7 +80,7 @@ where
     }
 }
 
-fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, prev_key: &'a EntryKey, removal: &mut NodeRemoval)
+fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, prev_key: &'a EntryKey, removal: &mut NodeRemoval<'a>)
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
@@ -92,23 +90,24 @@ fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, p
     let curr_right_bound = &curr_innode.right_bound;
     let curr_last_child = mem::replace(&mut curr_innode.ptrs.as_slice()[0], NodeCellRef::default());
     debug_assert_eq!(curr_innode.len, 0);
+    removal.empty_pages.push(prev_key);
     if curr_last_child.is_default() {
         return;
     }
-    let mut next_node = write_targeted::<KS, PS>(write_node(&curr_right_ref), curr_right_bound);
+    let mut next_node = write_node::<KS, PS>(&curr_right_ref);
     let pos = next_node.search(curr_right_bound);
-    if pos == 0 {
-        removal.index_changed.push((next_node.keys().first().unwrap().clone(), prev_key.clone()));
+    {
+        let next_first_key = next_node.first_key();
+        debug_assert!(next_first_key > prev_key);
+        debug_assert!(next_first_key >= curr_right_bound);
+        debug_assert_eq!(pos, 0);
     }
     let mut next_innode = next_node.innode_mut();
-    let overflow = if next_innode.len == KS::slice_len() {
-        Some(next_innode.split_insert(curr_right_bound.clone(), curr_last_child, pos, false))
+    next_innode.debug_check_integrity();
+    if next_innode.len == KS::slice_len() {
+        removal.split.push(next_innode.split_insert(curr_right_bound.clone(), curr_last_child, pos, false))
     } else {
         next_innode.insert_in_place(curr_right_bound.clone(), curr_last_child, pos, false);
-        None
-    };
-    if let Some(tuple) = overflow {
-        removal.split.push(tuple);
     }
 }
 
@@ -147,17 +146,19 @@ fn apply_removal<'a, KS, PS>(
                         write_node::<KS, PS>(r).right_ref_mut_no_empty();
                     });
             }
-            let mut keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
-                .iter_mut()
-                .enumerate()
-                .filter(|(i, _)| !poses.contains(i))
-                .map(|(_, k)| k)
-                .collect();
             let mut ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..innode.len + 1]
                 .iter_mut()
                 .enumerate()
                 .filter(|(i, _)| !poses.contains(i))
                 .map(|(_, p)| p)
+                .collect();
+
+            let mut keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| !poses.contains(i))
+                .take(if ptrs.len() == 0 { 0 } else { ptrs.len() - 1 })
+                .map(|(_, k)| k)
                 .collect();
             innode.len = keys.len();
             debug!("Prune filtered page have keys {:?}", &keys);
@@ -182,10 +183,8 @@ fn apply_removal<'a, KS, PS>(
 
     if cursor_guard.is_empty() {
         if let &Some(k) = prev_key {
-            node_removal.empty_pages.push(k);
-            if !cursor_guard.is_ext() {
-                merge_innode_remnant(cursor_guard, k, node_removal);
-            }
+            debug_assert!(!cursor_guard.is_ext());
+            merge_innode_remnant(cursor_guard, k, node_removal);
         }
         debug!("Pruned page is empty: {:?}", prev_key);
         cursor_guard.make_empty_node();
@@ -239,6 +238,10 @@ where
             cursor_guard.first_key(),
             level
         );
+        // iterate over all removal empty nodes
+        // in the beginning cursor_guard contains the first key
+        // if the empty node go out of the right bound of current cursor guard,
+        // it will `apply_removal` and switch to the next right page
         for (i, &key_to_del) in removal.empty_pages.iter().enumerate() {
             if key_to_del >= cursor_guard.right_bound() {
                 debug!(
@@ -295,20 +298,11 @@ where
             let innode = cursor_guard.innode_mut();
             let pivot = pivot.clone();
             let node = node.clone();
-            if innode.len == KS::slice_len() {
+            if innode.len >= KS::slice_len() {
                 upper_removal.split.push(innode.split_insert(pivot, node, pos, true));
             } else {
                 innode.insert_in_place(pivot, node, pos, true)
             }
-        }
-    }
-    if !removal.index_changed.is_empty() {
-        let mut cursor_guard = write_node::<KS, PS>(node);
-        for (search_key, change) in &removal.index_changed {
-            cursor_guard = write_targeted(cursor_guard, search_key);
-            let pos = cursor_guard.search(search_key);
-            let current_key = &mut cursor_guard.innode_mut().keys.as_slice()[pos];
-            *current_key = change.clone();
         }
     }
     debug!("Have empty nodes {:?}, level {:?}", &upper_removal.empty_pages, level);

@@ -232,13 +232,13 @@ mod test {
         });
 
         dump_trees(&*tree, "stage_1_before_insertion");
-        for _ in 0..15 {
+        for _ in 0..20 {
             tree.check_and_merge();
         }
         dump_trees(&*tree, "stage_1_after_insertion");
 
         debug!("Start point search validations");
-        (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+        (0..num).collect::<Vec<_>>().iter().for_each(|i| {
             let i = *i;
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
