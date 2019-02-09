@@ -38,12 +38,12 @@ fn merge_into_internal<KS, PS>(
             debug_assert!(!target_guard.is_none());
             let innode = target_guard.innode_mut();
             let pos = innode.search(&pivot);
-            if innode.len == KS::slice_len() - 1 {
+            if innode.len == KS::slice_len() - 1 { // TODO: check boundary
                 // full node, going to split
-                let (node_ref, key) = innode.split_insert(pivot, node, pos);
+                let (node_ref, key) = innode.split_insert(pivot, node, pos, true);
                 new_pages.push((key, node_ref));
             } else {
-                innode.insert_in_place(pivot, node, pos);
+                innode.insert_in_place(pivot, node, pos, true);
             }
         }
         node_guard = target_guard;

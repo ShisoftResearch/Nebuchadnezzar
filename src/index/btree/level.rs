@@ -21,6 +21,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
+use index::btree::node::write_non_empty;
 
 enum Selection<KS, PS>
 where
@@ -36,6 +37,22 @@ enum PruningSearch {
     Innode(NodeCellRef),
 }
 
+struct NodeRemoval<'a> {
+    empty_pages: Vec<&'a EntryKey>,
+    index_changed: Vec<(EntryKey, EntryKey)>,
+    split: Vec<(NodeCellRef, EntryKey)>
+}
+
+impl <'a> NodeRemoval <'a> {
+    fn new() -> Self {
+        Self {
+            empty_pages: vec![],
+            index_changed: vec![],
+            split: vec![]
+        }
+    }
+}
+
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -44,7 +61,7 @@ where
     let search = mut_search::<KS, PS>(node, &smallvec!());
     match search {
         MutSearchResult::External => {
-            let mut collected = vec![write_node(node)];
+            let mut collected = vec![write_non_empty(write_node(node))];
             while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
                 let right = write_node(
                     collected
@@ -65,10 +82,40 @@ where
     }
 }
 
+fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, prev_key: &'a EntryKey, removal: &mut NodeRemoval)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    let curr_right_ref = current_node.right_ref_mut_no_empty().unwrap().clone();
+    let curr_innode = current_node.innode_mut();
+    let curr_right_bound = &curr_innode.right_bound;
+    let curr_last_child = mem::replace(&mut curr_innode.ptrs.as_slice()[0], NodeCellRef::default());
+    debug_assert_eq!(curr_innode.len, 0);
+    if curr_last_child.is_default() {
+        return;
+    }
+    let mut next_node = write_targeted::<KS, PS>(write_node(&curr_right_ref), curr_right_bound);
+    let pos = next_node.search(curr_right_bound);
+    if pos == 0 {
+        removal.index_changed.push((next_node.keys().first().unwrap().clone(), prev_key.clone()));
+    }
+    let mut next_innode = next_node.innode_mut();
+    let overflow = if next_innode.len == KS::slice_len() {
+        Some(next_innode.split_insert(curr_right_bound.clone(), curr_last_child, pos, false))
+    } else {
+        next_innode.insert_in_place(curr_right_bound.clone(), curr_last_child, pos, false);
+        None
+    };
+    if let Some(tuple) = overflow {
+        removal.split.push(tuple);
+    }
+}
+
 fn apply_removal<'a, KS, PS>(
     cursor_guard: &mut NodeWriteGuard<KS, PS>,
     poses: &mut BTreeSet<usize>,
-    empty_pages: &mut Vec<&'a EntryKey>,
+    node_removal: &mut NodeRemoval<'a>,
     prev_key: &Option<&'a EntryKey>,
     remove_children_right_nodes: bool,
 ) where
@@ -134,26 +181,28 @@ fn apply_removal<'a, KS, PS>(
     }
 
     if cursor_guard.is_empty() {
+        if let &Some(k) = prev_key {
+            node_removal.empty_pages.push(k);
+            if !cursor_guard.is_ext() {
+                merge_innode_remnant(cursor_guard, k, node_removal);
+            }
+        }
         debug!("Pruned page is empty: {:?}", prev_key);
         cursor_guard.make_empty_node();
-        if let &Some(k) = prev_key {
-            empty_pages.push(k);
-        }
     }
     poses.clear();
 }
 
 fn prune_selected<'a, KS, PS>(
     node: &NodeCellRef,
-    mut keys: Box<Vec<&'a EntryKey>>,
+    mut removal: Box<NodeRemoval<'a>>,
     level: usize,
-) -> Box<Vec<&'a EntryKey>>
+) -> Box<NodeRemoval<'a>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let key_len = keys.len();
-    let first_search = mut_search::<KS, PS>(node, keys.first().unwrap());
+    let first_search = mut_search::<KS, PS>(node, removal.empty_pages.first().unwrap());
     let pruning = match first_search {
         MutSearchResult::Internal(sub_node) => {
             if read_unchecked::<KS, PS>(&sub_node).is_ext() {
@@ -169,18 +218,18 @@ where
         PruningSearch::DeepestInnode => {
             debug!(
                 "Removing in deepest nodes keys {:?}, level {}",
-                &keys, level
+                &removal.empty_pages, level
             );
             deepest = true;
         }
         PruningSearch::Innode(sub_node) => {
-            keys = prune_selected::<KS, PS>(&sub_node, keys, level + 1);
+            removal = prune_selected::<KS, PS>(&sub_node, removal, level + 1);
         }
     }
     // empty page references that will dealt with by upper level
-    let mut empty_pages = vec![];
-    if !keys.is_empty() {
-        debug!("Pruning page containing keys {:?}, level {}", &keys, level);
+    let mut upper_removal = NodeRemoval::new();
+    if !removal.empty_pages.is_empty() {
+        debug!("Pruning page containing keys {:?}, level {}", &removal.empty_pages, level);
         // start delete
         let mut cursor_guard = write_node::<KS, PS>(node);
         let mut guard_removing_poses = BTreeSet::new();
@@ -190,7 +239,7 @@ where
             cursor_guard.first_key(),
             level
         );
-        for (i, key_to_del) in keys.into_iter().enumerate() {
+        for (i, &key_to_del) in removal.empty_pages.iter().enumerate() {
             if key_to_del >= cursor_guard.right_bound() {
                 debug!(
                     "Applying removal for overflow current page ({}/{}) key: {:?} >= bound: {:?}. guard keys: {:?}, level {}",
@@ -204,7 +253,7 @@ where
                 apply_removal(
                     &mut cursor_guard,
                     &mut guard_removing_poses,
-                    &mut empty_pages,
+                    &mut upper_removal,
                     &prev_key,
                     !deepest,
                 );
@@ -232,14 +281,38 @@ where
             apply_removal(
                 &mut cursor_guard,
                 &mut guard_removing_poses,
-                &mut empty_pages,
+                &mut upper_removal,
                 &prev_key,
                 !deepest,
             );
         }
     }
-    debug!("Have empty nodes {:?}, level {:?}", &empty_pages, level);
-    box empty_pages
+    if !removal.split.is_empty() {
+        let mut cursor_guard = write_node::<KS, PS>(node);
+        for (node, pivot) in &removal.split {
+            cursor_guard = write_targeted(cursor_guard, &pivot);
+            let pos = cursor_guard.search(&pivot);
+            let innode = cursor_guard.innode_mut();
+            let pivot = pivot.clone();
+            let node = node.clone();
+            if innode.len == KS::slice_len() {
+                upper_removal.split.push(innode.split_insert(pivot, node, pos, true));
+            } else {
+                innode.insert_in_place(pivot, node, pos, true)
+            }
+        }
+    }
+    if !removal.index_changed.is_empty() {
+        let mut cursor_guard = write_node::<KS, PS>(node);
+        for (search_key, change) in &removal.index_changed {
+            cursor_guard = write_targeted(cursor_guard, search_key);
+            let pos = cursor_guard.search(search_key);
+            let current_key = &mut cursor_guard.innode_mut().keys.as_slice()[pos];
+            *current_key = change.clone();
+        }
+    }
+    debug!("Have empty nodes {:?}, level {:?}", &upper_removal.empty_pages, level);
+    box upper_removal
 }
 
 pub fn level_merge<KSA, PSA>(src_tree: &BPlusTree<KSA, PSA>, dest_tree: &LevelTree) -> usize
@@ -272,7 +345,9 @@ where
             .filter(|g| !g.is_empty())
             .map(|g| g.first_key())
             .collect_vec();
-        prune_selected::<KSA, PSA>(&src_tree.get_root(), box page_keys, 0);
+        let mut removal = NodeRemoval::new();
+        removal.empty_pages = page_keys;
+        prune_selected::<KSA, PSA>(&src_tree.get_root(), box removal, 0);
     }
 
     // adjust leaf left, right references

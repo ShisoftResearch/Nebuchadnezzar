@@ -90,6 +90,7 @@ where
         key: EntryKey,
         new_node: NodeCellRef,
         pos: usize,
+        padding_ptr_pos: bool
     ) -> (NodeCellRef, EntryKey) {
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -143,6 +144,7 @@ where
                 }
             }
         };
+        let ptr_padding = if padding_ptr_pos { 1 } else { 0 };
         let ptr_split = {
             if pivot == pos {
                 debug!("special ptr treatment when pivot == pos");
@@ -160,7 +162,7 @@ where
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
-                let mut ptr_pos = pos + 1;
+                let mut ptr_pos = pos + ptr_padding;
                 insert_into_split(
                     new_node,
                     ptrs_1,
@@ -189,13 +191,14 @@ where
         (node_2_ref, keys_split.pivot_key)
     }
 
-    pub fn insert_in_place(&mut self, key: EntryKey, new_node: NodeCellRef, pos: usize) {
+    pub fn insert_in_place(&mut self, key: EntryKey, new_node: NodeCellRef, pos: usize, padding_ptr_pos: bool) {
+        debug_assert!(self.len < KS::slice_len());
         let node_len = self.len;
         let mut new_node_len = node_len;
-        let mut new_node_pointers = node_len + 1;
+        let mut new_node_ptrs = node_len + 1;
+        let ptr_padding = if padding_ptr_pos { 1 } else { 0 };
         self.keys.insert_at(key, pos, &mut new_node_len);
-        self.ptrs
-            .insert_at(new_node, pos + 1, &mut new_node_pointers);
+        self.ptrs.insert_at(new_node, pos + ptr_padding, &mut new_node_ptrs);
         self.len = new_node_len;
         self.debug_check_integrity();
     }
@@ -213,7 +216,7 @@ where
         debug_assert!(node_len <= KS::slice_len());
         if node_len == KS::slice_len() {
             let parent_guard = write_node(parent);
-            let (node_2, pivot_key) = self.split_insert(key, new_node, pos);
+            let (node_2, pivot_key) = self.split_insert(key, new_node, pos, true);
             return Some(NodeSplit {
                 new_right_node: node_2,
                 left_node_latch: NodeWriteGuard::default(),
@@ -221,7 +224,7 @@ where
                 parent_latch: parent_guard,
             });
         } else {
-            self.insert_in_place(key, new_node, pos);
+            self.insert_in_place(key, new_node, pos, true);
             return None;
         }
     }
@@ -484,12 +487,13 @@ where
             {
                 debug_assert!(
                     !ptr.is_default(),
-                    "{} ptrs {}/{}, len {}, keys: {:?}",
+                    "{} ptrs {}/{}, len {}, keys: {:?}, default ptrs: {:?}",
                     KS::slice_len(),
                     i,
                     self.len + 1,
                     self.len,
-                    &self.keys.as_slice_immute()[..self.len]
+                    &self.keys.as_slice_immute()[..self.len],
+                    self.ptrs.as_slice_immute()[..self.len + 1].iter().map(|r| r.is_default()).collect_vec()
                 );
             }
         }
