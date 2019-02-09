@@ -232,7 +232,9 @@ mod test {
         });
 
         dump_trees(&*tree, "stage_1_before_insertion");
-        tree.check_and_merge();
+        for _ in 0..15 {
+            tree.check_and_merge();
+        }
         dump_trees(&*tree, "stage_1_after_insertion");
 
         debug!("Start point search validations");
@@ -247,6 +249,7 @@ mod test {
             assert_eq!(cursor.current(), Some(&key), "{}", i);
         });
 
+        return;
         LSMTree::start_sentinel(&tree);
 
         (num..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
