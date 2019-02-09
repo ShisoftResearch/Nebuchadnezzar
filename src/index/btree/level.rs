@@ -100,7 +100,7 @@ fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, p
         let next_first_key = next_node.first_key();
         debug_assert!(next_first_key > prev_key);
         debug_assert!(next_first_key >= curr_right_bound);
-        debug_assert_eq!(pos, 0);
+        // debug_assert_eq!(pos, 0);
     }
     let mut next_innode = next_node.innode_mut();
     next_innode.debug_check_integrity();
