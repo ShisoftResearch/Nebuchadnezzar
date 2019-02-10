@@ -243,7 +243,7 @@ where
             &removal.empty_pages, level
         );
         // start delete
-        let mut cursor_guard = write_node::<KS, PS>(node);
+        let mut cursor_guard = write_non_empty(write_node::<KS, PS>(node));
         let mut guard_removing_poses = BTreeSet::new();
         let mut prev_key = None;
         debug!(
