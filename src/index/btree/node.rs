@@ -273,7 +273,8 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     loop {
-        if search_page.is_empty() || search_page.right_bound() < key {
+        // check if node empty or key out of bound
+        if search_page.is_empty() || search_page.right_bound() <= key {
             let right_node = write_node(search_page.right_ref_mut_no_empty().unwrap());
             debug_assert!(!right_node.is_empty_node());
             debug!(
@@ -289,13 +290,14 @@ where
             if !right_node.is_none() {
                 search_page = right_node;
             } else {
+                // right node is none, should pick current one if not empty node
+                debug_assert!(!search_page.is_empty_node());
                 return search_page;
             }
         } else {
-            break;
+            return search_page;
         }
     }
-    search_page
 }
 
 //0x00007fb854907828
