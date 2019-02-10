@@ -141,13 +141,6 @@ where
                 let pivot = split.pivot;
                 let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
                 let mut old_root = self.get_root().clone();
-                // check latched root and current root are the same node
-                debug_assert_eq!(
-                    read_unchecked::<KS, PS>(&old_root).first_key(),
-                    split.left_node_latch.first_key(),
-                    "root verification failed, left node right node type: {}",
-                    read_unchecked::<KS, PS>(&split.left_node_latch.innode().right).type_name()
-                );
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;

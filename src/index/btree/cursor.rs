@@ -58,74 +58,81 @@ where
     }
 
     fn next_candidate(&mut self) -> bool {
-        if self.page.is_some() {
-            let current_page = self.page.clone().unwrap();
-            read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
-                // let ext_page = page.extnode();
-                // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
-                match self.ordering {
-                    Ordering::Forward => {
-                        if page.is_empty() || self.index + 1 >= page.len() {
-                            let next_node_ref = page.right_ref().unwrap();
-                            return read_node(
-                                next_node_ref,
-                                |next_node: &NodeReadHandler<KS, PS>| {
-                                    if next_node.is_none() {
-                                        self.page = None;
-                                        self.current = None;
-                                        return false;
-                                    } else if next_node.is_empty() {
-                                        return self.next();
-                                    } else if next_node.is_ext() {
-                                        self.index = 0;
-                                        self.page = Some(next_node_ref.clone());
-                                        self.current =
-                                            Some(Self::read_current(next_node_ref, self.index));
-                                        return true;
-                                    } else {
-                                        unreachable!()
-                                    }
-                                },
-                            );
-                        } else {
-                            self.index += 1;
-                            // debug!("Advancing cursor to index {}", self.index);
+        loop {
+            let search_result = if self.page.is_some() {
+                let current_page = self.page.clone().unwrap();
+                read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
+                    // let ext_page = page.extnode();
+                    // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
+                    match self.ordering {
+                        Ordering::Forward => {
+                            if page.is_empty() || self.index + 1 >= page.len() {
+                                let next_node_ref = page.right_ref().unwrap();
+                                return read_node(
+                                    next_node_ref,
+                                    |next_node: &NodeReadHandler<KS, PS>| {
+                                        if next_node.is_none() {
+                                            self.page = None;
+                                            self.current = None;
+                                            return Some(false);
+                                        } else if next_node.is_empty() {
+                                            return None;
+                                        } else if next_node.is_ext() {
+                                            self.index = 0;
+                                            self.page = Some(next_node_ref.clone());
+                                            self.current =
+                                                Some(Self::read_current(next_node_ref, self.index));
+                                            return Some(true);
+                                        } else {
+                                            unreachable!()
+                                        }
+                                    },
+                                );
+                            } else {
+                                self.index += 1;
+                                // debug!("Advancing cursor to index {}", self.index);
+                            }
+                        }
+                        Ordering::Backward => {
+                            if page.is_empty() || self.index == 0 {
+                                let prev_node_ref = page.left_ref().unwrap();
+                                return read_node(
+                                    prev_node_ref,
+                                    |prev_node: &NodeReadHandler<KS, PS>| {
+                                        if prev_node.is_none() {
+                                            self.page = None;
+                                            self.current = None;
+                                            return Some(false);
+                                        } else if prev_node.is_empty() {
+                                            return None;
+                                        } else if prev_node.is_ext() {
+                                            self.index = prev_node.len() - 1;
+                                            self.page = Some(prev_node_ref.clone());
+                                            self.current =
+                                                Some(Self::read_current(prev_node_ref, self.index));
+                                            return Some(true);
+                                        } else {
+                                            unreachable!()
+                                        }
+                                    },
+                                );
+                            } else {
+                                self.index -= 1;
+                                // debug!("Advancing cursor to index {}", self.index);
+                            }
                         }
                     }
-                    Ordering::Backward => {
-                        if page.is_empty() || self.index == 0 {
-                            let prev_node_ref = page.left_ref().unwrap();
-                            return read_node(
-                                prev_node_ref,
-                                |prev_node: &NodeReadHandler<KS, PS>| {
-                                    if prev_node.is_none() {
-                                        self.page = None;
-                                        self.current = None;
-                                        return false;
-                                    } else if prev_node.is_empty() {
-                                        return self.next();
-                                    } else if prev_node.is_ext() {
-                                        self.index = prev_node.len() - 1;
-                                        self.page = Some(prev_node_ref.clone());
-                                        self.current =
-                                            Some(Self::read_current(prev_node_ref, self.index));
-                                        return true;
-                                    } else {
-                                        unreachable!()
-                                    }
-                                },
-                            );
-                        } else {
-                            self.index -= 1;
-                            // debug!("Advancing cursor to index {}", self.index);
-                        }
-                    }
-                }
-                self.current = Some(Self::read_current(&current_page, self.index));
-                true
-            })
-        } else {
-            false
+                    self.current = Some(Self::read_current(&current_page, self.index));
+                    Some(true)
+                })
+
+            } else {
+                Some(false)
+            };
+
+            if let Some(res) = search_result {
+                return res;
+            }
         }
     }
 }
