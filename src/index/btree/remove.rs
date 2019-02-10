@@ -124,7 +124,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Removing {:?} from node, level {}", key, level);
-    let mut search = mut_search::<KS, PS>(node_ref, key);
+    let search = mut_search::<KS, PS>(node_ref, key);
     match search {
         MutSearchResult::Internal(mut sub_node) => {
             let mut node_remove_res =
@@ -160,8 +160,8 @@ where
                                 return;
                             }
 
-                            let mut left_node = &mut *rebalancing.left_guard;
-                            let mut right_node = &mut *rebalancing.right_guard;
+                            let left_node = &mut *rebalancing.left_guard;
+                            let right_node = &mut *rebalancing.right_guard;
                             // swap the content of left and right, then delete right
                             // this procedure will prevent locking left node for changing right reference
                             let left_left_ref = left_node.left_ref_mut().map(|r| r.clone());
@@ -211,7 +211,7 @@ where
                         level,
                         |rebalancing| {
                             // There is a right empty node that can be deleted directly without hassle
-                            let mut node_to_remove = &mut rebalancing.right_guard;
+                            let node_to_remove = &mut rebalancing.right_guard;
                             let owned_left_ref = rebalancing.left_ref.clone();
                             rebalancing.left_guard.right_ref_mut_no_empty().map(|r| {
                                 *r = node_to_remove.right_ref_mut_no_empty().unwrap().clone()
@@ -262,9 +262,9 @@ where
                         removed,
                         level,
                         |rebalancing| {
-                            let mut left_node = &mut *rebalancing.left_guard;
-                            let mut right_node = &mut *rebalancing.right_guard;
-                            let mut right_node_next = &mut *rebalancing.right_right_guard;
+                            let left_node = &mut *rebalancing.left_guard;
+                            let right_node = &mut *rebalancing.right_guard;
+                            let right_node_next = &mut *rebalancing.right_right_guard;
                             let left_pos = rebalancing.parent_pos;
                             let right_pos = left_pos + 1;
                             if left_node.is_empty() || right_node.is_empty() {
@@ -322,7 +322,7 @@ where
                 let mut node = target_guard.extnode_mut();
                 let pos = node.search(key);
                 let mut right_guard = write_node(&node.next);
-                let right_node_cannot_rebalance =
+                let _right_node_cannot_rebalance =
                     right_guard.is_none() || !right_guard.is_empty_node();
                 if !right_guard.is_none() && !is_left_half_full || !right_guard.is_half_full() {
                     let right_right_guard =

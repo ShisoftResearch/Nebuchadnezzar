@@ -84,7 +84,7 @@ fn init() {
     let mut entry_key = key.clone();
     key_with_id(&mut entry_key, &id);
     tree.insert(&entry_key);
-    let mut cursor = tree.seek(&key, Ordering::Forward);
+    let cursor = tree.seek(&key, Ordering::Forward);
     assert_eq!(id_from_key(cursor.current().unwrap()), id);
 }
 
@@ -519,9 +519,9 @@ fn node_lock() {
     thread_rng().shuffle(nums.as_mut_slice());
     nums.par_iter().for_each(|num| {
         let key_slice = u64_to_slice(*num);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let key = SmallVec::from_slice(&key_slice);
         let mut guard = write_node::<KeySlice, PtrSlice>(&node);
-        let mut ext_node = guard.extnode_mut();
+        let ext_node = guard.extnode_mut();
         ext_node.insert(&key, &tree, &node, &dummy_node);
     });
     let read = read_unchecked::<KeySlice, PtrSlice>(&node);

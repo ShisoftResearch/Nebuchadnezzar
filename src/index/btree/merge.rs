@@ -54,7 +54,7 @@ fn merge_into_internal<KS, PS>(
 pub fn merge_into_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node: &NodeCellRef,
-    parent: &NodeCellRef,
+    _parent: &NodeCellRef,
     keys: Box<Vec<EntryKey>>,
     level: usize,
 ) -> Box<Vec<(EntryKey, NodeCellRef)>>
@@ -63,7 +63,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let search = mut_search::<KS, PS>(node, &keys[0]);
-    let mut new_pages = match search {
+    let new_pages = match search {
         MutSearchResult::External => {
             // merge keys into internal pages
             // this is a oneshot action.

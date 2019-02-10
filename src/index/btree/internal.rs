@@ -71,7 +71,7 @@ where
     pub fn remove_at(&mut self, ptr_pos: usize) {
         {
             let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
-            let mut n_key_len = &mut self.len;
+            let n_key_len = &mut self.len;
             let mut n_ptr_len = *n_key_len + 1;
             debug!(
                 "Removing from internal node pos {}, len {}, key {:?}",
@@ -217,7 +217,7 @@ where
         parent: &NodeCellRef,
     ) -> Option<NodeSplit<KS, PS>> {
         let node_len = self.len;
-        let ptr_len = self.len + 1;
+        let _ptr_len = self.len + 1;
         let pos = self.search(&key);
         debug!("Insert into internal node at {}, key: {:?}", pos, key);
         debug_assert!(node_len <= KS::slice_len());
@@ -270,7 +270,7 @@ where
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
             {
-                let mut left_innode = left_node.innode_mut();
+                let left_innode = left_node.innode_mut();
                 let mut right_innode = right_node.innode_mut();
                 let right_key = self.keys.as_slice()[right_key_pos].clone();
                 left_innode.merge_with(&mut right_innode, right_key);
@@ -279,7 +279,7 @@ where
             }
         } else {
             let mut right_extnode = right_node.extnode_mut();
-            let mut left_extnode = left_node.extnode_mut();
+            let left_extnode = left_node.extnode_mut();
             {
                 left_extnode.merge_with(&mut right_extnode);
                 merged_len = left_extnode.len;
@@ -307,7 +307,7 @@ where
             "Merge internal node, left len {}, right len {}, right_key {:?}",
             self.len, right.len, right_key
         );
-        let mut self_len = self.len;
+        let self_len = self.len;
         let new_len = self_len + right.len + 1;
         debug_assert!(new_len <= KS::slice_len());
         // moving keys
@@ -342,8 +342,8 @@ where
             // relocate internal sub nodes
 
             {
-                let mut left_innode = left_node.innode_mut();
-                let mut right_innode = right_node.innode_mut();
+                let left_innode = left_node.innode_mut();
+                let right_innode = right_node.innode_mut();
 
                 debug!(
                     "Before relocation internal children. left {}:{:?} right {}:{:?}",
@@ -417,8 +417,8 @@ where
         } else if left_node.is_ext() {
             // relocate external sub nodes
 
-            let mut left_extnode = left_node.extnode_mut();
-            let mut right_extnode = right_node.extnode_mut();
+            let left_extnode = left_node.extnode_mut();
+            let right_extnode = right_node.extnode_mut();
 
             debug!(
                 "Before relocation external children. left {}:{:?} right {}:{:?}",

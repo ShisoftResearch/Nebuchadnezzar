@@ -132,7 +132,7 @@ impl CombinedCleaner {
                 cursor += 1;
                 continue;
             }
-            let mut last_segment = pending_segments.last_mut().unwrap();
+            let last_segment = pending_segments.last_mut().unwrap();
             last_segment.entries.push(entry.clone());
 
             // pump dummy segment head pointer
@@ -158,7 +158,7 @@ impl CombinedCleaner {
         }
 
         debug!("Updating cell reference");
-        let unstable_guards = pending_segments
+        let _unstable_guards = pending_segments
             .par_iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();

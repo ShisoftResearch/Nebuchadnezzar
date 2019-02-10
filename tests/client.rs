@@ -29,7 +29,7 @@ pub fn general() {
         &server_addr,
         &server_group,
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -52,7 +52,7 @@ pub fn general() {
         .unwrap()
         .unwrap();
     client
-        .transaction(|ref mut trans| {
+        .transaction(|ref mut _trans| {
             Ok(()) // empty transaction
         })
         .wait()
@@ -120,7 +120,7 @@ pub fn general() {
     for handle in threads {
         handle.join();
     }
-    let mut cell_1_r = client.read_cell(cell_1.id()).wait().unwrap().unwrap();
+    let cell_1_r = client.read_cell(cell_1.id()).wait().unwrap().unwrap();
     assert_eq!(
         cell_1_r.data["score"].U64().unwrap(),
         &(thread_count as u64)
@@ -141,7 +141,7 @@ pub fn multi_cell_update() {
         &server_addr,
         server_group,
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -169,7 +169,7 @@ pub fn multi_cell_update() {
     client.read_cell(cell_2.id()).wait().unwrap().unwrap();
     let cell_2_id = cell_2.id();
     threads = Vec::new();
-    for i in 0..thread_count {
+    for _i in 0..thread_count {
         let client = client.clone();
         threads.push(thread::spawn(move || {
             client
@@ -199,8 +199,8 @@ pub fn multi_cell_update() {
     for handle in threads {
         handle.join();
     }
-    let mut cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
-    let mut cell_2_r = client.read_cell(cell_2_id).wait().unwrap().unwrap();
+    let cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
+    let cell_2_r = client.read_cell(cell_2_id).wait().unwrap().unwrap();
     let cell_1_score = cell_1_r.data["score"].U64().unwrap();
     let cell_2_score = cell_2_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
@@ -220,7 +220,7 @@ pub fn write_skew() {
         &server_addr,
         server_group,
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -230,7 +230,7 @@ pub fn write_skew() {
     };
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    let thread_count = 100;
+    let _thread_count = 100;
     let schema_id = client.new_schema(schema).wait().unwrap().0;
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
@@ -282,7 +282,7 @@ pub fn write_skew() {
     });
     t2.join();
     t1.join();
-    let mut cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
+    let cell_1_r = client.read_cell(cell_1_id).wait().unwrap().unwrap();
     let cell_1_score = *cell_1_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score, 2);
     //    assert_eq!(*skew_tried.lock(), 2);
@@ -339,7 +339,7 @@ pub fn server_isolation() {
         .unwrap(),
     );
 
-    let mut schema1 = Schema {
+    let schema1 = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -347,7 +347,7 @@ pub fn server_isolation() {
         fields: default_fields(),
         is_dynamic: false,
     };
-    let mut schema2 = Schema {
+    let schema2 = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,

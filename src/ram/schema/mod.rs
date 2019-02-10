@@ -102,7 +102,7 @@ impl LocalSchemasCache {
         raft_client: Option<&Arc<RaftClient>>,
     ) -> Result<LocalSchemasCache, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
-        let sm = match raft_client {
+        let _sm = match raft_client {
             Some(raft) => {
                 let m1 = map.clone();
                 let m2 = map.clone();

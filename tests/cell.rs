@@ -15,7 +15,7 @@ pub fn cell_rw() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("dummy"),
         key_field: None,
@@ -75,7 +75,7 @@ pub fn dynamic() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("dummy"),
         key_field: None,

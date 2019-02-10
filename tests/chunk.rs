@@ -32,7 +32,7 @@ pub fn cell_rw() {
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
     let fields = default_fields();
-    let mut schema = Schema::new("dummy", None, fields, false);
+    let schema = Schema::new("dummy", None, fields, false);
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
     data_map.insert(&String::from("score"), Value::U64(70));
@@ -93,7 +93,7 @@ pub fn cell_rw() {
         data,
     };
     let header = chunks.update_cell(&mut cell).unwrap();
-    let cell_2_ptr = chunks.address_of(&Id::from_header(&header));
+    let _cell_2_ptr = chunks.address_of(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);

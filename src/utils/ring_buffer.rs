@@ -42,7 +42,7 @@ impl RingBuffer {
             let size = self.size;
             let start = self.start.load(DEFAULT_ORDERING);
             let end = self.end.load(DEFAULT_ORDERING);
-            let start_idx = start % size;
+            let _start_idx = start % size;
             let end_idx = end % size;
             if end >= size && end - size >= start {
                 // one loop ahead

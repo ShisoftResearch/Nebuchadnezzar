@@ -33,7 +33,7 @@ where
     }
     pub fn is_empty(&self) -> bool {
         match self {
-            &NodeData::Empty(ref n) => true,
+            &NodeData::Empty(ref _n) => true,
             &NodeData::External(ref n) => n.len == 0,
             &NodeData::Internal(ref n) => n.len == 0,
             &NodeData::None => unreachable!(),
@@ -41,12 +41,12 @@ where
     }
     pub fn is_empty_node(&self) -> bool {
         match self {
-            &NodeData::Empty(ref n) => true,
+            &NodeData::Empty(ref _n) => true,
             _ => false,
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
-        let len = self.len();
+        let _len = self.len();
         if self.is_ext() {
             self.extnode().search(key)
         } else {

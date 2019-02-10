@@ -59,8 +59,8 @@ pub trait Slice<T: Default> {
     {
         let mut right_slice = Self::init();
         {
-            let mut slice1: &mut [T] = self.as_slice();
-            let mut slice2: &mut [T] = right_slice.as_slice();
+            let slice1: &mut [T] = self.as_slice();
+            let slice2: &mut [T] = right_slice.as_slice();
             for i in pivot..len {
                 // leave pivot to the right slice
                 let right_pos = i - pivot;
@@ -72,7 +72,7 @@ pub trait Slice<T: Default> {
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
         debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
         debug!("insert into slice, pos: {}, len {}", pos, len);
-        let mut slice = self.as_slice();
+        let slice = self.as_slice();
         if *len > 0 {
             slice[*len] = T::default();
             for i in (pos..=*len - 1).rev() {

@@ -142,7 +142,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut search = mut_search::<KS, PS>(node_ref, key);
+    let search = mut_search::<KS, PS>(node_ref, key);
     let modification = match search {
         MutSearchResult::External => insert_external_tree_node(tree, node_ref, parent, key),
         MutSearchResult::Internal(sub_node) => {

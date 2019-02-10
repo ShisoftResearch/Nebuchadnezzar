@@ -95,10 +95,10 @@ pub fn plan_write_field(
 }
 
 pub fn plan_write_dynamic_fields(
-    mut offset: &mut usize,
+    offset: &mut usize,
     field: &Field,
     value: &Value,
-    mut ins: &mut Vec<Instruction>,
+    ins: &mut Vec<Instruction>,
 ) -> Result<(), WriteError> {
     if let (&Value::Map(ref data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();

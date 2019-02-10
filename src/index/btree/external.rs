@@ -108,7 +108,7 @@ where
             .unwrap_or_else(|i| i)
     }
     pub fn remove_at(&mut self, pos: usize) {
-        let mut cached_len = &mut self.len;
+        let cached_len = &mut self.len;
         debug!(
             "Removing from external pos {}, len {}, key {:?}",
             pos,
@@ -129,7 +129,7 @@ where
         // cached.dump();
         let pivot = self.len / 2;
         let new_page_id = tree.new_page_id();
-        let mut keys_1 = &mut self.keys;
+        let keys_1 = &mut self.keys;
         let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;
@@ -195,7 +195,7 @@ where
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
-            let mut parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
+            let parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
             let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
             Some(NodeSplit {
                 new_right_node: node_2,
@@ -238,7 +238,7 @@ where
             }
             remaining.into_iter().cloned().collect_vec()
         };
-        let mut self_key_slice = self.keys.as_slice();
+        let self_key_slice = self.keys.as_slice();
         self.len = remaining_keys.len();
         for (i, k_ref) in remaining_keys.into_iter().enumerate() {
             self_key_slice[i] = k_ref;
@@ -253,7 +253,7 @@ where
         let mut left_pos = 0;
         let mut right_pos = 0;
         let mut left_keys = mem::replace(&mut self.keys, KS::init());
-        let mut left = left_keys.as_slice();
+        let left = left_keys.as_slice();
         while left_pos < self.len && right_pos < right.len() {
             let left_key = &left[left_pos];
             let right_key = right[right_pos];
@@ -362,11 +362,11 @@ where
 
     fn extnode_from_cell(&self, cell: Cell) -> Box<ExtNode<KS, PS>> {
         let cell_id = cell.id();
-        let cell_version = cell.header.version;
+        let _cell_version = cell.header.version;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_len = keys.len().unwrap();
+        let _keys_len = keys.len().unwrap();
         let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
             array
         } else {

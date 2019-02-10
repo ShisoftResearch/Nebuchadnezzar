@@ -53,7 +53,7 @@ impl CompactCleaner {
         // scan and mark live entries
         // estimate segment live size for new allocation
         let mut live_size: usize = 0;
-        let mut entries = chunk
+        let entries = chunk
             .live_entries(seg)
             .map(|entry| {
                 live_size += entry.meta.entry_size;
@@ -72,7 +72,7 @@ impl CompactCleaner {
         ));
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
-        let unstable_guards = entries
+        let _unstable_guards = entries
             .into_iter()
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;

@@ -244,7 +244,7 @@ mod test {
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             debug!("checking: {}", i);
-            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
+            let cursor = tree.seek(key.clone(), Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
         });
@@ -271,7 +271,7 @@ mod test {
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             debug!("checking: {}", i);
-            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
+            let cursor = tree.seek(key.clone(), Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
         });
@@ -339,7 +339,7 @@ mod test {
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             debug!("checking: {}", i);
-            let mut cursor = tree.seek(key.clone(), Ordering::Forward);
+            let cursor = tree.seek(key.clone(), Ordering::Forward);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key), "{}", i);
         });

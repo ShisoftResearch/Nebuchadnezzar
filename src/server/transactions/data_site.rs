@@ -442,7 +442,7 @@ impl DataManagerInner {
     }
     fn prepare(
         this: Arc<Self>,
-        server_id: u64,
+        _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         cell_ids: Vec<Id>,
@@ -518,10 +518,10 @@ impl DataManagerInner {
         }
         let mut write_error: Option<(Id, WriteError)> = None;
         {
-            let mut commit_history = &mut txn.history; // for rollback in case of write error
+            let commit_history = &mut txn.history; // for rollback in case of write error
             for cell_op in cells {
                 match cell_op {
-                    CommitOp::Read(id, version) => {}
+                    CommitOp::Read(_id, _version) => {}
                     CommitOp::Write(ref cell) => {
                         let mut cell = cell.clone();
                         let write_result = this.server.chunks.write_cell(&mut cell);

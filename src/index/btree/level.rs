@@ -106,7 +106,7 @@ fn merge_innode_remnant<'a, KS, PS>(
         debug_assert!(next_first_key >= curr_right_bound);
         // debug_assert_eq!(pos, 0);
     }
-    let mut next_innode = next_node.innode_mut();
+    let next_innode = next_node.innode_mut();
     next_innode.debug_check_integrity();
     if next_innode.len == KS::slice_len() {
         removal.split.push(next_innode.split_insert(
@@ -139,7 +139,7 @@ fn apply_removal<'a, KS, PS>(
         poses
     );
     {
-        let mut innode = cursor_guard.innode_mut();
+        let innode = cursor_guard.innode_mut();
         let mut new_keys = KS::init();
         let mut new_ptrs = PS::init();
         {
@@ -155,14 +155,14 @@ fn apply_removal<'a, KS, PS>(
                         write_node::<KS, PS>(r).right_ref_mut_no_empty();
                     });
             }
-            let mut ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..innode.len + 1]
+            let ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..innode.len + 1]
                 .iter_mut()
                 .enumerate()
                 .filter(|(i, _)| !poses.contains(i))
                 .map(|(_, p)| p)
                 .collect();
 
-            let mut keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
+            let keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
                 .iter_mut()
                 .enumerate()
                 .filter(|(i, _)| !poses.contains(i))
@@ -255,7 +255,7 @@ where
         // in the beginning cursor_guard contains the first key
         // if the empty node go out of the right bound of current cursor guard,
         // it will `apply_removal` and switch to the next right page
-        for (i, &key_to_del) in removal.empty_pages.iter().enumerate() {
+        for (_i, &key_to_del) in removal.empty_pages.iter().enumerate() {
             if key_to_del >= cursor_guard.right_bound() {
                 debug!(
                     "Applying removal for overflow current page ({}/{}) key: {:?} >= bound: {:?}. guard keys: {:?}, level {}",

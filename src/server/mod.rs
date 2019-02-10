@@ -289,7 +289,7 @@ mod tests {
         let id = Id::new(0, 1);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(2);
-        let mut cell = Cell::new_with_id(schema_id, &id, value);
+        let cell = Cell::new_with_id(schema_id, &id, value);
         let mut i = 0;
         b.iter(|| {
             let mut cell = cell.clone();
@@ -335,8 +335,8 @@ mod tests {
 
     #[bench]
     fn noop_txn(b: &mut Bencher) {
-        let (_, client, schema_id) = init_service(5304);
-        b.iter(|| client.transaction(move |txn| Ok(())).wait())
+        let (_, client, _schema_id) = init_service(5304);
+        b.iter(|| client.transaction(move |_txn| Ok(())).wait())
     }
 
     #[bench]

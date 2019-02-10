@@ -75,10 +75,10 @@ impl Chunk {
     }
 
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
-        let mut retried = 0;
+        let _retried = 0;
         loop {
             let head = self.head_seg.read().clone();
-            let mut head_seg_id = head.id;
+            let head_seg_id = head.id;
             match head.try_acquire(size) {
                 Some(addr) => {
                     debug!(
@@ -191,7 +191,7 @@ impl Chunk {
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
         let loc = self.location_for_read(hash)?;
-        let mut head_ptr = *loc + offset;
+        let head_ptr = *loc + offset;
         let mut data = Vec::with_capacity(len);
         for ptr in head_ptr..(head_ptr + len) {
             data.push(unsafe { (*(ptr as *const u8)) });
@@ -235,7 +235,7 @@ impl Chunk {
         cell: &mut Cell,
         guard: &mut CellWriteGuard,
     ) -> Result<CellHeader, WriteError> {
-        let old_location = **guard;
+        let _old_location = **guard;
         let new_location = cell.write_to_chunk(self)?;
         **guard = new_location;
         return Ok(cell.header);
@@ -296,7 +296,7 @@ impl Chunk {
         return res;
     }
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        let unstable_guard = self.unstable_cells.lock(hash);
+        let _unstable_guard = self.unstable_cells.lock(hash);
         if let Some(cell_location) = self.index.remove(&hash) {
             self.put_tombstone_by_cell_loc(cell_location)?;
             Ok(())

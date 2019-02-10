@@ -30,13 +30,13 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> Box<Future<Item = Cell, Error = ReadError>> {
         NebRPCServiceInner::read_cell(self.inner.clone(), key)
     }
-    fn write_cell(&self, mut cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
+    fn write_cell(&self, cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
         NebRPCServiceInner::write_cell(self.inner.clone(), cell)
     }
-    fn update_cell(&self, mut cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
+    fn update_cell(&self, cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
         NebRPCServiceInner::update_cell(self.inner.clone(), cell)
     }
-    fn upsert_cell(&self, mut cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
+    fn upsert_cell(&self, cell: Cell) -> Box<Future<Item = CellHeader, Error = WriteError>> {
         NebRPCServiceInner::upsert_cell(self.inner.clone(), cell)
     }
     fn remove_cell(&self, key: Id) -> Box<Future<Item = (), Error = WriteError>> {

@@ -242,7 +242,7 @@ impl TransactionManagerInner {
         server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId,
         id: Id,
-        mut txn: TxnGuard,
+        txn: TxnGuard,
         await: TxnAwaits,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
         let self_server_id = this.server.server_id;

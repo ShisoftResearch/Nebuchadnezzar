@@ -126,7 +126,7 @@ impl Segment {
     }
 
     pub fn used_spaces(&self) -> u32 {
-        let space = (self.append_header.load(Ordering::Relaxed) as usize - self.addr);
+        let space = self.append_header.load(Ordering::Relaxed) as usize - self.addr;
         debug_assert!(space <= MAX_SEGMENT_SIZE);
         return space as u32;
     }
@@ -234,7 +234,7 @@ impl Segment {
         if let &Some(ref backup_storage) = &self.backup_file_name {
             let path = Path::new(backup_storage);
             if path.exists() {
-                if let Err(e) = remove_file(path) {
+                if let Err(_e) = remove_file(path) {
                     error!("cannot reclaim segment file on dispense {}", backup_storage)
                 }
             } else {

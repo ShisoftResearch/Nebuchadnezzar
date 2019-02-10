@@ -24,7 +24,7 @@ pub fn workspace_wr() {
         &server_addr,
         "test",
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -154,7 +154,7 @@ pub fn data_site_wr() {
         &server_addr,
         "test",
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -182,7 +182,7 @@ pub fn data_site_wr() {
             cell_1_non_exists_read
         ),
     }
-    let cell_1_write = txn
+    let _cell_1_write = txn
         .write(txn_id.to_owned(), cell_1.to_owned())
         .wait()
         .unwrap()
@@ -241,7 +241,7 @@ pub fn multi_transaction() {
         &server_addr,
         "test",
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
@@ -258,7 +258,7 @@ pub fn multi_transaction() {
     data_map_1.insert(&String::from("score"), Value::U64(70));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
     let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
-    let cell_1_t1_write = txn
+    let _cell_1_t1_write = txn
         .update(txn_1_id.to_owned(), cell_1.to_owned())
         .wait()
         .unwrap()
@@ -266,7 +266,7 @@ pub fn multi_transaction() {
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), Value::U64(90));
     let cell_2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map_2.clone()));
-    let cell_1_t2_write = txn
+    let _cell_1_t2_write = txn
         .write(txn_2_id.to_owned(), cell_2.to_owned())
         .wait()
         .unwrap()
@@ -339,7 +339,7 @@ pub fn smoke_rw() {
         &server_addr,
         "test",
     );
-    let mut schema = Schema {
+    let schema = Schema {
         id: 1,
         name: String::from("test"),
         key_field: None,
