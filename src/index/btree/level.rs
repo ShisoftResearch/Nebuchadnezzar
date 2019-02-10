@@ -22,6 +22,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
 use index::btree::node::write_non_empty;
+use index::btree::node::Node;
 
 enum Selection<KS, PS>
 where
@@ -204,7 +205,7 @@ where
     let first_search = mut_search::<KS, PS>(node, removal.empty_pages.first().unwrap());
     let pruning = match first_search {
         MutSearchResult::Internal(sub_node) => {
-            if read_unchecked::<KS, PS>(&sub_node).is_ext() {
+            if read_unchecked::<KS, PS>(&NodeData::<KS, PS>::get_non_empty_node(&sub_node)).is_ext() {
                 PruningSearch::DeepestInnode
             } else {
                 PruningSearch::Innode(sub_node)

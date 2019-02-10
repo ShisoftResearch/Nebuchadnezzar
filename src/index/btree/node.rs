@@ -193,7 +193,7 @@ where
         }
     }
 
-    fn get_non_empty_node(node_ref: &NodeCellRef) -> NodeCellRef {
+    pub fn get_non_empty_node(node_ref: &NodeCellRef) -> NodeCellRef {
         let node = read_unchecked::<KS, PS>(node_ref);
         if node.is_empty_node() {
             let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
