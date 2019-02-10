@@ -38,7 +38,7 @@ where
                 cursor.next();
             }
             _ => {
-                cursor.current = Some(Self::read_current(page, pos));
+                cursor.current = Self::read_current(page, pos);
             }
         }
         debug!(
@@ -51,9 +51,15 @@ where
         box self
     }
 
-    fn read_current(node: &NodeCellRef, pos: usize) -> EntryKey {
+    fn read_current(node: &NodeCellRef, pos: usize) -> Option<EntryKey> {
         read_node(node, |node: &NodeReadHandler<KS, PS>| {
-            node.extnode().keys.as_slice_immute()[pos].clone()
+            // node can be empty only if the node have been changed in the middle
+            // if so the node should be reloaded from the outside by `read_node` function
+            if node.is_empty_node() {
+                None
+            } else {
+                Some(node.extnode().keys.as_slice_immute()[pos].clone())
+            }
         })
     }
 
@@ -80,8 +86,7 @@ where
                                         } else if next_node.is_ext() {
                                             self.index = 0;
                                             self.page = Some(next_node_ref.clone());
-                                            self.current =
-                                                Some(Self::read_current(next_node_ref, self.index));
+                                            self.current = Self::read_current(next_node_ref, self.index);
                                             return Some(true);
                                         } else {
                                             unreachable!()
@@ -108,8 +113,7 @@ where
                                         } else if prev_node.is_ext() {
                                             self.index = prev_node.len() - 1;
                                             self.page = Some(prev_node_ref.clone());
-                                            self.current =
-                                                Some(Self::read_current(prev_node_ref, self.index));
+                                            self.current = Self::read_current(prev_node_ref, self.index);
                                             return Some(true);
                                         } else {
                                             unreachable!()
@@ -122,7 +126,7 @@ where
                             }
                         }
                     }
-                    self.current = Some(Self::read_current(&current_page, self.index));
+                    self.current = Self::read_current(&current_page, self.index);
                     Some(true)
                 })
 
