@@ -1,15 +1,15 @@
-use index::btree::BPlusTree;
-use index::Slice;
-use index::EntryKey;
-use index::btree::NodeCellRef;
-use std::fs::File;
-use std::fmt::Debug;
+use index::btree::external::ExtNode;
 use index::btree::node::read_unchecked;
 use index::btree::node::NodeData;
-use index::btree::external::ExtNode;
+use index::btree::BPlusTree;
+use index::btree::NodeCellRef;
 use index::id_from_key;
-use std::io::Write;
+use index::EntryKey;
+use index::Slice;
 use serde_json;
+use std::fmt::Debug;
+use std::fs::File;
+use std::io::Write;
 
 #[derive(Serialize, Deserialize)]
 struct DebugNode {
@@ -23,9 +23,9 @@ struct DebugNode {
 }
 
 pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     debug!("dumping {}", f);
     let debug_root = cascading_dump_node::<KS, PS>(&tree.get_root());
@@ -35,9 +35,9 @@ pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
 }
 
 fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     if node.is_default() {
         return DebugNode {

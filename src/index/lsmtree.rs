@@ -91,12 +91,12 @@ impl LSMTree {
 
     pub fn start_sentinel(this: &Arc<Self>) {
         let this = this.clone();
-        thread::Builder::new().name("LSM-Tree Sentinel".to_string()).spawn(move || {
-            loop {
+        thread::Builder::new()
+            .name("LSM-Tree Sentinel".to_string())
+            .spawn(move || loop {
                 this.check_and_merge();
                 thread::sleep(Duration::from_millis(500));
-            }
-        });
+            });
     }
 
     pub fn level_sizes(&self) -> Vec<usize> {

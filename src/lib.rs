@@ -44,8 +44,8 @@ extern crate cuckoofilter;
 extern crate hermes;
 extern crate owning_ref;
 extern crate rayon;
-extern crate test;
 extern crate serde_json;
+extern crate test;
 
 pub mod utils;
 #[macro_use]

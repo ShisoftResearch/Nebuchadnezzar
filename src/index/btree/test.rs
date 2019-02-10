@@ -6,6 +6,7 @@ use client;
 use dovahkiin::types::custom_types::id::Id;
 use futures::future::Future;
 use hermes::stm::TxnValRef;
+use index::btree::dump::dump_tree;
 use index::btree::node::*;
 use index::btree::NodeCellRef;
 use index::btree::NodeData;
@@ -29,7 +30,6 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use index::btree::dump::dump_tree;
 
 extern crate env_logger;
 
@@ -509,7 +509,8 @@ fn node_lock() {
     );
     let client = Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     let tree = LevelBPlusTree::new(&client);
-    let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> = ExtNode::new(Id::new(1, 2), max_entry_key());
+    let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> =
+        ExtNode::new(Id::new(1, 2), max_entry_key());
     let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(inner_ext_node)));
     let num = 100000;
     let mut nums = (0..num).collect_vec();

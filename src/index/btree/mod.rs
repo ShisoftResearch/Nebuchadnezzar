@@ -8,6 +8,7 @@ use dovahkiin::types::{key_hash, Map, PrimitiveArray, ToValue, Value};
 use futures::Future;
 use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
 pub use index::btree::cursor::*;
+pub use index::btree::external::page_schema;
 use index::btree::external::*;
 use index::btree::insert::*;
 use index::btree::internal::*;
@@ -48,9 +49,9 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-pub use index::btree::external::page_schema;
 
 mod cursor;
+mod dump;
 mod external;
 mod insert;
 mod internal;
@@ -59,7 +60,6 @@ mod merge;
 mod node;
 mod remove;
 mod search;
-mod dump;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
@@ -151,8 +151,7 @@ where
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
-                *self.root.write() =
-                    NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
+                *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             }
             None => {}
         }

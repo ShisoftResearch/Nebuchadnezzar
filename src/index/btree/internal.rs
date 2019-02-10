@@ -90,7 +90,7 @@ where
         key: EntryKey,
         new_node: NodeCellRef,
         pos: usize,
-        padding_ptr_pos: bool
+        padding_ptr_pos: bool,
     ) -> (NodeCellRef, EntryKey) {
         let node_len = self.len;
         let ptr_len = self.len + 1;
@@ -191,14 +191,21 @@ where
         (node_2_ref, keys_split.pivot_key)
     }
 
-    pub fn insert_in_place(&mut self, key: EntryKey, new_node: NodeCellRef, pos: usize, padding_ptr_pos: bool) {
+    pub fn insert_in_place(
+        &mut self,
+        key: EntryKey,
+        new_node: NodeCellRef,
+        pos: usize,
+        padding_ptr_pos: bool,
+    ) {
         debug_assert!(self.len < KS::slice_len());
         let node_len = self.len;
         let mut new_node_len = node_len;
         let mut new_node_ptrs = node_len + 1;
         let ptr_padding = if padding_ptr_pos { 1 } else { 0 };
         self.keys.insert_at(key, pos, &mut new_node_len);
-        self.ptrs.insert_at(new_node, pos + ptr_padding, &mut new_node_ptrs);
+        self.ptrs
+            .insert_at(new_node, pos + ptr_padding, &mut new_node_ptrs);
         self.len = new_node_len;
         self.debug_check_integrity();
     }
@@ -493,7 +500,10 @@ where
                     self.len + 1,
                     self.len,
                     &self.keys.as_slice_immute()[..self.len],
-                    self.ptrs.as_slice_immute()[..self.len + 1].iter().map(|r| r.is_default()).collect_vec()
+                    self.ptrs.as_slice_immute()[..self.len + 1]
+                        .iter()
+                        .map(|r| r.is_default())
+                        .collect_vec()
                 );
             }
         }

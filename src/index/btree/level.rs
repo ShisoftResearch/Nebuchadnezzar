@@ -3,9 +3,11 @@ use index::btree::node::is_node_locked;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
+use index::btree::node::write_non_empty;
 use index::btree::node::write_targeted;
 use index::btree::node::write_unchecked;
 use index::btree::node::EmptyNode;
+use index::btree::node::Node;
 use index::btree::node::NodeData;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
@@ -21,8 +23,6 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
-use index::btree::node::write_non_empty;
-use index::btree::node::Node;
 
 enum Selection<KS, PS>
 where
@@ -40,14 +40,14 @@ enum PruningSearch {
 
 struct NodeRemoval<'a> {
     empty_pages: Vec<&'a EntryKey>,
-    split: Vec<(NodeCellRef, EntryKey)>
+    split: Vec<(NodeCellRef, EntryKey)>,
 }
 
-impl <'a> NodeRemoval <'a> {
+impl<'a> NodeRemoval<'a> {
     fn new() -> Self {
         Self {
             empty_pages: vec![],
-            split: vec![]
+            split: vec![],
         }
     }
 }
@@ -81,10 +81,13 @@ where
     }
 }
 
-fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, prev_key: &'a EntryKey, removal: &mut NodeRemoval<'a>)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+fn merge_innode_remnant<'a, KS, PS>(
+    current_node: &mut NodeWriteGuard<KS, PS>,
+    prev_key: &'a EntryKey,
+    removal: &mut NodeRemoval<'a>,
+) where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let curr_right_ref = current_node.right_ref_mut_no_empty().unwrap().clone();
     let curr_innode = current_node.innode_mut();
@@ -106,7 +109,12 @@ fn merge_innode_remnant<'a, KS, PS>(current_node: &mut NodeWriteGuard<KS, PS>, p
     let mut next_innode = next_node.innode_mut();
     next_innode.debug_check_integrity();
     if next_innode.len == KS::slice_len() {
-        removal.split.push(next_innode.split_insert(curr_right_bound.clone(), curr_last_child, pos, false))
+        removal.split.push(next_innode.split_insert(
+            curr_right_bound.clone(),
+            curr_last_child,
+            pos,
+            false,
+        ))
     } else {
         next_innode.insert_in_place(curr_right_bound.clone(), curr_last_child, pos, false);
     }
@@ -205,7 +213,8 @@ where
     let first_search = mut_search::<KS, PS>(node, removal.empty_pages.first().unwrap());
     let pruning = match first_search {
         MutSearchResult::Internal(sub_node) => {
-            if read_unchecked::<KS, PS>(&NodeData::<KS, PS>::get_non_empty_node(&sub_node)).is_ext() {
+            if read_unchecked::<KS, PS>(&NodeData::<KS, PS>::get_non_empty_node(&sub_node)).is_ext()
+            {
                 PruningSearch::DeepestInnode
             } else {
                 PruningSearch::Innode(sub_node)
@@ -229,7 +238,10 @@ where
     // empty page references that will dealt with by upper level
     let mut upper_removal = NodeRemoval::new();
     if !removal.empty_pages.is_empty() {
-        debug!("Pruning page containing keys {:?}, level {}", &removal.empty_pages, level);
+        debug!(
+            "Pruning page containing keys {:?}, level {}",
+            &removal.empty_pages, level
+        );
         // start delete
         let mut cursor_guard = write_node::<KS, PS>(node);
         let mut guard_removing_poses = BTreeSet::new();
@@ -300,13 +312,18 @@ where
             let pivot = pivot.clone();
             let node = node.clone();
             if innode.len >= KS::slice_len() {
-                upper_removal.split.push(innode.split_insert(pivot, node, pos, true));
+                upper_removal
+                    .split
+                    .push(innode.split_insert(pivot, node, pos, true));
             } else {
                 innode.insert_in_place(pivot, node, pos, true)
             }
         }
     }
-    debug!("Have empty nodes {:?}, level {:?}", &upper_removal.empty_pages, level);
+    debug!(
+        "Have empty nodes {:?}, level {:?}",
+        &upper_removal.empty_pages, level
+    );
     box upper_removal
 }
 
