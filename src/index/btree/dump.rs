@@ -20,6 +20,7 @@ struct DebugNode {
     prev: Option<String>,
     len: usize,
     is_external: bool,
+    bound: String
 }
 
 pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
@@ -48,6 +49,7 @@ where
             prev: None,
             len: 0,
             is_external: false,
+            bound: "-".to_string()
         };
     }
     let node = read_unchecked(&*node);
@@ -75,6 +77,7 @@ where
                 )),
                 len: node.len,
                 is_external: true,
+                bound: format!("{:?}", node.right_bound)
             };
         }
         &NodeData::Internal(ref innode) => {
@@ -95,6 +98,7 @@ where
                 prev: None,
                 len,
                 is_external: false,
+                bound: format!("{:?}", innode.right_bound)
             };
         }
         &NodeData::None => {
@@ -106,6 +110,7 @@ where
                 prev: None,
                 len: 0,
                 is_external: false,
+                bound: "-".to_string()
             };
         }
         &NodeData::Empty(ref n) => {
@@ -117,6 +122,7 @@ where
                 prev: None,
                 len: 0,
                 is_external: false,
+                bound: "-".to_string()
             };
         }
     }
