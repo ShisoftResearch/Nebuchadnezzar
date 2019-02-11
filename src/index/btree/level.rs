@@ -98,14 +98,8 @@ fn merge_innode_remnant<'a, KS, PS>(
     if curr_last_child.is_default() {
         return;
     }
-    let mut next_node = write_node::<KS, PS>(&curr_right_ref);
+    let mut next_node = write_targeted(write_node::<KS, PS>(&curr_right_ref), curr_right_bound);
     let pos = next_node.search(curr_right_bound);
-    {
-        let next_first_key = next_node.first_key();
-        debug_assert!(next_first_key > prev_key);
-        debug_assert!(next_first_key >= curr_right_bound);
-        // debug_assert_eq!(pos, 0);
-    }
     let next_innode = next_node.innode_mut();
     next_innode.debug_check_integrity();
     if next_innode.len == KS::slice_len() {

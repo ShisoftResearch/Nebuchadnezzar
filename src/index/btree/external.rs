@@ -161,7 +161,6 @@ where
             &keys_1.as_slice()[keys_1_len - 1],
             pos
         );
-        debug_assert!(read_unchecked::<KS, PS>(&extnode_2.prev).is_ext());
         self.len = keys_1_len;
         debug!(
             "Split to left len {}, right len {}, right prev id: {:?}",
