@@ -51,6 +51,14 @@ fn merge_into_internal<KS, PS>(
     }
 }
 
+fn debug_check_serialized(keys: &Vec<EntryKey>) {
+    if cfg!(debug_assertions) && keys.len() > 0 {
+        for i in 0..keys.len() - 1 {
+            assert!(keys[i] < keys[i + 1])
+        }
+    }
+}
+
 pub fn merge_into_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node: &NodeCellRef,
@@ -62,6 +70,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    debug_check_serialized(&*keys);
     let search = mut_search::<KS, PS>(node, &keys[0]);
     let new_pages = match search {
         MutSearchResult::External => {
@@ -77,56 +86,32 @@ where
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
                 debug!("Start merging with page at {:?}", start_key);
-                let mut target_page_guard = write_targeted(current_guard, start_key);
-                let mut right_guard =
-                    write_node::<KS, PS>(target_page_guard.right_ref_mut_no_empty().unwrap());
-                let key_upper_bound = if right_guard.is_none() {
-                    None
-                } else {
-                    Some(right_guard.first_key().clone())
-                };
-                {
-                    let mut ext_node = target_page_guard.extnode_mut();
+                current_guard = write_targeted(current_guard, start_key);
+                let remain_slots = KS::slice_len() - current_guard.len();
+                if remain_slots > 0 {
+                    let mut ext_node = current_guard.extnode_mut();
                     ext_node.remove_contains(&mut *tree.deleted.write());
                     let selection = keys[merging_pos..keys_len]
                         .iter()
-                        .filter(|k| match &key_upper_bound {
-                            &Some(ref upper) => k < &upper,
-                            &None => true,
-                        })
-                        .take(KS::slice_len() - ext_node.len)
+                        .filter(|&k| k < &ext_node.right_bound)
+                        .take(remain_slots)
                         .collect_vec();
                     ext_node.merge_sort(selection.as_slice());
                     merging_pos += selection.len();
-                }
-                if merging_pos >= keys_len {
-                    break;
-                }
-                let next_insert_key = &keys[merging_pos];
-                debug_assert!(
-                    next_insert_key > &smallvec!(0),
-                    "empty key at {}, keys {:?}",
-                    merging_pos,
-                    keys
-                );
-                if key_upper_bound.is_none() || next_insert_key < key_upper_bound.as_ref().unwrap()
-                {
-                    // trigger a split and put the split node into a cache
-                    let insert_pos = target_page_guard.search(&keys[merging_pos]);
-                    let target_node_ref = target_page_guard.node_ref().clone();
-                    let (new_node, pivot) = target_page_guard.extnode_mut().split_insert(
-                        next_insert_key.clone(),
+                } else if remain_slots == 0 {
+                    let insert_pos = current_guard.search(&start_key);
+                    let target_node_ref = current_guard.node_ref().clone();
+                    let mut right_guard =
+                        write_node::<KS, PS>(current_guard.right_ref_mut_no_empty().unwrap());
+                    let (new_node, pivot) = current_guard.extnode_mut().split_insert(
+                        start_key.clone(),
                         insert_pos,
                         &target_node_ref,
                         &mut right_guard,
                         tree,
                     );
                     merging_pos += 1;
-                    current_guard = write_node(&new_node);
                     new_pages.push((pivot, new_node));
-                } else {
-                    debug_assert!(!right_guard.is_none());
-                    current_guard = right_guard;
                 }
             }
             new_pages
