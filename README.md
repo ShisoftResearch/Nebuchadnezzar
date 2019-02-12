@@ -1,5 +1,5 @@
 # Nebuchadnezzar
-[![Build Status](http://hq.shisoft.net:4211/buildStatus/icon?job=Neb Build Check)](http://hq.shisoft.net:4211/job/Neb Build Check)
+[![Build Status](http://hq.shisoft.net:4211/buildStatus/icon?job=Neb Build Check)](http://hq.shisoft.net:4211/job/Neb%20Build%20Check/)
 
 > "This is my ship...the Nebuchadnezzar, it's a hovercraft."
 > ― Morpheus, The Matrix
