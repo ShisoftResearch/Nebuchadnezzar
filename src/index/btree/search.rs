@@ -61,7 +61,6 @@ where
                     key, n.len, pos
                 );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
-                n.debug_check_integrity();
                 debug_assert!(pos <= n.len);
                 debug_assert!(
                     !next_node_ref.is_default(),
