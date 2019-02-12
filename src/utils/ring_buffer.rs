@@ -1,39 +1,37 @@
-use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 const DEFAULT_ORDERING: Ordering = Ordering::Relaxed;
 
 pub struct RingBuffer {
     size: usize,
     buffer: Vec<AtomicUsize>,
-    start: AtomicUsize, // reader
-    end: AtomicUsize, // writer
-    waiting: AtomicBool // spin lock
+    start: AtomicUsize,  // reader
+    end: AtomicUsize,    // writer
+    waiting: AtomicBool, // spin lock
 }
 
 pub struct RingBufferIter<'a> {
-    inner: &'a RingBuffer
+    inner: &'a RingBuffer,
 }
 
 impl RingBuffer {
-
     pub fn new(size: usize) -> RingBuffer {
         let mut buffer = Vec::with_capacity(size);
         for _ in 0..size {
             buffer.push(AtomicUsize::new(0));
         }
+        assert!(size > 0);
         RingBuffer {
             size,
             buffer,
             start: AtomicUsize::new(0),
             end: AtomicUsize::new(0),
-            waiting: AtomicBool::new(false)
+            waiting: AtomicBool::new(false),
         }
     }
 
     pub fn iter(&self) -> RingBufferIter {
-        RingBufferIter {
-            inner: self
-        }
+        RingBufferIter { inner: self }
     }
 
     pub fn push(&self, val: usize) {
@@ -44,9 +42,10 @@ impl RingBuffer {
             let size = self.size;
             let start = self.start.load(DEFAULT_ORDERING);
             let end = self.end.load(DEFAULT_ORDERING);
-            let start_idx = start % size;
+            let _start_idx = start % size;
             let end_idx = end % size;
-            if end >= size && end - size >= start { // one loop ahead
+            if end >= size && end - size >= start {
+                // one loop ahead
                 // debug!("Buffer full {} -> {}, {}", start, end, size);
                 self.set_free();
                 continue; // try again
@@ -67,10 +66,9 @@ impl RingBuffer {
     fn set_free(&self) {
         assert!(self.waiting.compare_and_swap(true, false, DEFAULT_ORDERING));
     }
-
 }
 
-impl <'a> RingBufferIter<'a> {
+impl<'a> RingBufferIter<'a> {
     #[inline]
     fn wait_lock(&self) {
         self.inner.wait_lock();
@@ -82,7 +80,7 @@ impl <'a> RingBufferIter<'a> {
     }
 }
 
-impl <'a> Iterator for RingBufferIter<'a> {
+impl<'a> Iterator for RingBufferIter<'a> {
     type Item = usize;
 
     // single consumer
@@ -103,8 +101,3 @@ impl <'a> Iterator for RingBufferIter<'a> {
         return Some(val);
     }
 }
-
-
-
-
-

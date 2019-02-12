@@ -1,7 +1,7 @@
-use ram::schema::{Field};
 use ram::cell::*;
+use ram::schema::Field;
 use ram::types;
-use ram::types::{Value, Map, NULL_TYPE_ID, Any, Type, type_id_of};
+use ram::types::{type_id_of, Any, Map, Type, Value, NULL_TYPE_ID};
 
 use std::collections::HashSet;
 
@@ -10,24 +10,24 @@ use bifrost_hasher::hash_str;
 pub struct Instruction {
     type_id: u32,
     val: Value,
-    offset: usize
+    offset: usize,
 }
 
-pub fn plan_write_field (
+pub fn plan_write_field(
     mut offset: &mut usize,
     field: &Field,
     value: &Value,
-    mut ins: &mut Vec<Instruction>
+    mut ins: &mut Vec<Instruction>,
 ) -> Result<(), WriteError> {
     if field.nullable {
         let null_bit = match value {
             &Value::Null => 1,
-            _ => 0
+            _ => 0,
         };
         ins.push(Instruction {
             type_id: NULL_TYPE_ID,
             val: Value::U8(null_bit),
-            offset: *offset
+            offset: *offset,
         });
         *offset += 1;
     }
@@ -39,12 +39,28 @@ pub fn plan_write_field (
             ins.push(Instruction {
                 type_id: types::ARRAY_LEN_TYPE_ID,
                 val: Value::U32(len as u32),
-                offset: *offset
+                offset: *offset,
             });
-            *offset += types::u16_io::size(0);
+            *offset += types::u32_io::size(0);
             for val in array {
                 plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
+        } else if let &Value::PrimArray(ref array) = value {
+            let len = array.len();
+            let size = array.size();
+            // for prim array, just clone it and push into the instruction list with length
+            ins.push(Instruction {
+                type_id: types::ARRAY_LEN_TYPE_ID,
+                val: Value::U32(len as u32),
+                offset: *offset,
+            });
+            *offset += types::u32_io::size(0);
+            ins.push(Instruction {
+                type_id: field.type_id,
+                val: value.clone(),
+                offset: *offset,
+            });
+            *offset += size;
         } else {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
@@ -55,42 +71,49 @@ pub fn plan_write_field (
                 plan_write_field(&mut offset, &sub, val, &mut ins)?;
             }
         } else {
-            return Err(WriteError::DataMismatchSchema(field.clone(),value.clone()));
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else {
-        let is_null = match value {&Value::Null => true, _ => false};
+        let is_null = match value {
+            &Value::Null => true,
+            _ => false,
+        };
         if !field.nullable && is_null {
-            return Err(WriteError::DataMismatchSchema(field.clone(),value.clone()))
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
         if !is_null {
             let size = types::get_vsize(field.type_id, value);
             ins.push(Instruction {
                 type_id: field.type_id,
                 val: value.clone(),
-                offset: *offset
+                offset: *offset,
             });
             *offset += size;
         }
     }
-    return Ok(())
+    return Ok(());
 }
 
 pub fn plan_write_dynamic_fields(
-    mut offset: &mut usize,
+    offset: &mut usize,
     field: &Field,
     value: &Value,
-    mut ins: &mut Vec<Instruction>
+    ins: &mut Vec<Instruction>,
 ) -> Result<(), WriteError> {
     if let (&Value::Map(ref data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();
-        let dynamic_keys: HashSet<u64> = data_all.map
+        let dynamic_keys: HashSet<u64> = data_all
+            .map
             .keys()
             .filter(|k| !schema_keys.contains(k))
-            .cloned().collect();
-        let dynamic_names: Vec<String> = data_all.fields
+            .cloned()
+            .collect();
+        let dynamic_names: Vec<String> = data_all
+            .fields
             .iter()
             .filter(|n| dynamic_keys.contains(&hash_str(n)))
-            .cloned().collect();
+            .cloned()
+            .collect();
         let mut dynamic_map = Map::new();
         for key_id in dynamic_keys {
             dynamic_map.insert_key_id(key_id, data_all.get_by_key_id(key_id).clone());
@@ -102,14 +125,14 @@ pub fn plan_write_dynamic_fields(
         ins.push(Instruction {
             type_id: any_type_id,
             val: dynamic_value,
-            offset: *offset
+            offset: *offset,
         });
         *offset += dynamic_size;
     }
-    return Ok(())
+    return Ok(());
 }
 
-pub fn execute_plan (ptr: usize, instructions: &Vec<Instruction>) {
+pub fn execute_plan(ptr: usize, instructions: &Vec<Instruction>) {
     for ins in instructions {
         types::set_val(ins.type_id, &ins.val, ptr + ins.offset);
     }

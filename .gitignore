@@ -193,4 +193,10 @@ profile.log
 callgrind.out.*
 *.iml
 .vscode
+
 /rls/
+/*_dump.json
+/dumps
+*.log
+/test-data/
+core

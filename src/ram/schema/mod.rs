@@ -2,14 +2,15 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use parking_lot::{RwLock};
 
-use std::sync::{Arc};
-use std::string::String;
-use core::borrow::Borrow;
 use super::types;
+use core::borrow::Borrow;
+use std::string::String;
+use std::sync::Arc;
 
+use bifrost::utils::fut_exec::wait;
 use futures::Future;
 
 pub mod sm;
@@ -21,27 +22,35 @@ pub struct Schema {
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
     pub fields: Field,
-    pub is_dynamic: bool
+    pub is_dynamic: bool,
 }
 
 impl Schema {
-    pub fn new<'a>(name: &'a str, key_field: Option<Vec<String>>, fields: Field, is_dynamic: bool) -> Schema {
+    pub fn new(
+        name: &str,
+        key_field: Option<Vec<String>>,
+        fields: Field,
+        is_dynamic: bool,
+    ) -> Schema {
         Schema {
             id: 0,
             name: name.to_string(),
             key_field: match key_field {
                 None => None,
-                Some(ref keys) => Some(keys
-                    .iter()
-                    .map(|f| hash_str(f))
-                    .collect())             // field list into field ids
+                Some(ref keys) => Some(keys.iter().map(|f| hash_str(f)).collect()), // field list into field ids
             },
             str_key_field: key_field,
             fields,
-            is_dynamic
+            is_dynamic,
         }
     }
-    pub fn new_with_id<'a>(id: u32, name: &'a str, key_field: Option<Vec<String>>, fields: Field, dynamic: bool) -> Schema {
+    pub fn new_with_id(
+        id: u32,
+        name: &str,
+        key_field: Option<Vec<String>>,
+        fields: Field,
+        dynamic: bool,
+    ) -> Schema {
         let mut schema = Schema::new(name, key_field, fields, dynamic);
         schema.id = id;
         schema
@@ -59,20 +68,20 @@ pub struct Field {
 }
 
 impl Field {
-    pub fn new<'a>(
-        name: & 'a str,
+    pub fn new(
+        name: &str,
         type_id: u32,
         nullable: bool,
         is_array: bool,
-        sub_fields: Option<Vec<Field>>)
-        -> Field {
+        sub_fields: Option<Vec<Field>>,
+    ) -> Field {
         Field {
             name: name.to_string(),
             name_id: types::key_hash(name),
             type_id,
             nullable,
             is_array,
-            sub_fields
+            sub_fields,
         }
     }
 }
@@ -84,13 +93,16 @@ pub struct SchemasMap {
 }
 
 pub struct LocalSchemasCache {
-    map: Arc<RwLock<SchemasMap>>
+    map: Arc<RwLock<SchemasMap>>,
 }
 
 impl LocalSchemasCache {
-    pub fn new<'a>(group: &'a str, raft_client: Option<&Arc<RaftClient>>) -> Result<LocalSchemasCache, ExecError> {
+    pub fn new(
+        group: &str,
+        raft_client: Option<&Arc<RaftClient>>,
+    ) -> Result<LocalSchemasCache, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
-        let sm = match raft_client {
+        let _sm = match raft_client {
             Some(raft) => {
                 let m1 = map.clone();
                 let m2 = map.clone();
@@ -102,19 +114,23 @@ impl LocalSchemasCache {
                         map.new_schema(schema);
                     }
                 }
-                let _ = sm.on_schema_added(move |r| {
-                    let schema = r.unwrap();
-                    debug!("Add schema {} from subscription", schema.id);
-                    let mut m1 = m1.write();
-                    m1.new_schema(schema);
-                }).wait()?;
-                let _ = sm.on_schema_deleted(move |r| {
-                    let mut m2 = m2.write();
-                    m2.del_schema(&r.unwrap());
-                }).wait()?;
+                let _ = sm
+                    .on_schema_added(move |r| {
+                        let schema = r.unwrap();
+                        debug!("Add schema {} from subscription", schema.id);
+                        let mut m1 = m1.write();
+                        m1.new_schema(schema);
+                    })
+                    .wait()?;
+                let _ = sm
+                    .on_schema_deleted(move |r| {
+                        let mut m2 = m2.write();
+                        m2.del_schema(&r.unwrap()).unwrap();
+                    })
+                    .wait()?;
                 Some(sm)
-            },
-            None => None
+            }
+            None => None,
         };
         let schemas = LocalSchemasCache { map };
         return Ok(schemas);
@@ -123,11 +139,12 @@ impl LocalSchemasCache {
         let m = self.map.read();
         m.get(id)
     }
-    pub fn new_schema(&self, schema: Schema) { // for debug only
+    pub fn new_schema(&self, schema: Schema) {
+        // for debug only
         let mut m = self.map.write();
         m.new_schema(schema)
     }
-    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+    pub fn name_to_id(&self, name: &str) -> Option<u32> {
         let m = self.map.read();
         m.name_to_id(name)
     }
@@ -147,26 +164,26 @@ impl SchemasMap {
         self.schema_map.insert(id, Arc::new(schema.clone()));
         self.name_map.insert(name, id);
     }
-    pub fn del_schema<'a>(&mut self, name: & 'a str) -> Result<(), ()> {
-        if let Some(id) =self.name_to_id(name) {
+    pub fn del_schema(&mut self, name: &str) -> Result<(), ()> {
+        if let Some(id) = self.name_to_id(name) {
             self.schema_map.remove(&id);
         }
         self.name_map.remove(&name.to_string());
         Ok(())
     }
-    pub fn get_by_name<'a>(&self, name: & 'a str) -> Option<Arc<Schema>> {
+    pub fn get_by_name(&self, name: &str) -> Option<Arc<Schema>> {
         if let Some(id) = self.name_to_id(name) {
-            return self.get(&id)
+            return self.get(&id);
         }
         return None;
     }
     pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {
         if let Some(schema) = self.schema_map.get(id) {
-            return Some(schema.clone())
+            return Some(schema.clone());
         }
         return None;
     }
-    pub fn name_to_id<'a>(&self, name: &'a str) -> Option<u32> {
+    pub fn name_to_id(&self, name: &str) -> Option<u32> {
         self.name_map.get(&name.to_string()).cloned()
     }
     fn next_id(&mut self) -> u32 {
@@ -187,10 +204,10 @@ impl SchemasMap {
             .collect()
     }
     fn load_from_list(&mut self, data: &Vec<Schema>) {
-         for schema in data {
-             let id = schema.id;
-             self.name_map.insert(schema.name.clone(), id);
-             self.schema_map.insert(id, Arc::new(schema.clone()));
-         }
+        for schema in data {
+            let id = schema.id;
+            self.name_map.insert(schema.name.clone(), id);
+            self.schema_map.insert(id, Arc::new(schema.clone()));
+        }
     }
 }
