@@ -1,2 +1,2 @@
 mod rpc;
-mod cursor;
+mod inner;

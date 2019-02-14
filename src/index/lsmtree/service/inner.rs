@@ -26,7 +26,7 @@ struct DelegatedCursor {
 type CursorMap = LinkedHashMap<u64, DelegatedCursor>;
 type MutCursorRef = Rc<RefCell<LSMTreeCursor>>;
 
-pub struct CursorCache {
+pub struct TreeServiceInner {
     tree: LSMTree,
     counter: AtomicU64,
     cursors: Mutex<CursorMap>
@@ -42,7 +42,7 @@ impl DelegatedCursor {
     }
 }
 
-impl CursorCache {
+impl TreeServiceInner {
 
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         Self {
@@ -92,5 +92,5 @@ impl CursorCache {
     }
 }
 
-unsafe impl Send for CursorCache {}
-unsafe impl Sync for CursorCache {}
+unsafe impl Send for TreeServiceInner {}
+unsafe impl Sync for TreeServiceInner {}
