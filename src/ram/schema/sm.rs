@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
 
-pub fn generate_sm_id<'a>(group: &'a str) -> u64 {
+pub fn generate_sm_id(group: &str) -> u64 {
     hash_str(&format!("{}-{}", SM_ID_PREFIX, group))
 }
 
