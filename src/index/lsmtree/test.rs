@@ -133,7 +133,7 @@ pub fn insertions() {
 }
 
 #[test]
-pub fn hybird() {
+pub fn hybrid() {
     env_logger::init();
     let server_group = "lsm_hybird";
     let server_addr = String::from("127.0.0.1:5701");
