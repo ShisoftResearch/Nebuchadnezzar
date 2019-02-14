@@ -11,4 +11,4 @@ pub mod segs;
 pub mod tombstone;
 pub mod types;
 
-mod clock;
+pub mod clock;

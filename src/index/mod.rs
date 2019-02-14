@@ -102,7 +102,7 @@ pub trait Cursor {
     fn current(&self) -> Option<&EntryKey>;
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Ordering {
     Forward,
     Backward,

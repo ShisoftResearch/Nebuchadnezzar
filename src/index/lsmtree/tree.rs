@@ -50,11 +50,11 @@ unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
+    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = init_lsm_level_trees(neb_client);
         debug!("Initialized LSM-tree");
-        Arc::new(LSMTree { trees, max_sizes })
+        LSMTree { trees, max_sizes }
     }
 
     pub fn insert(&self, mut key: EntryKey, id: &Id) {
