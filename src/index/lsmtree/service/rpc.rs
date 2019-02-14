@@ -41,7 +41,7 @@ impl Service for LSMTreeService {
 impl LSMTreeService {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
         Arc::new(Self {
-            inner: TreeServiceInner::new(neb)
+            inner: TreeServiceInner::new(neb_client)
         })
     }
 }
