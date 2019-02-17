@@ -1,6 +1,6 @@
 use bifrost::rpc::*;
 use index::{EntryKey, Ordering};
-use index::lsmtree::service::inner::TreeServiceInner;
+use index::lsmtree::service::inner::LSMTreeIns;
 use smallvec::SmallVec;
 use index::lsmtree::tree::LSMTree;
 use client::AsyncClient;
@@ -15,7 +15,7 @@ service! {
 
 
 pub struct LSMTreeService {
-    inner: TreeServiceInner
+    inner: LSMTreeIns
 }
 
 dispatch_rpc_service_functions!(LSMTreeService);
@@ -41,7 +41,7 @@ impl Service for LSMTreeService {
 impl LSMTreeService {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
         Arc::new(Self {
-            inner: TreeServiceInner::new(neb_client)
+            inner: LSMTreeIns::new(neb_client)
         })
     }
 }

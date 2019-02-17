@@ -26,7 +26,7 @@ struct DelegatedCursor {
 type CursorMap = LinkedHashMap<u64, DelegatedCursor>;
 type MutCursorRef = Rc<RefCell<LSMTreeCursor>>;
 
-pub struct TreeServiceInner {
+pub struct LSMTreeIns {
     tree: LSMTree,
     counter: AtomicU64,
     cursors: Mutex<CursorMap>
@@ -42,7 +42,7 @@ impl DelegatedCursor {
     }
 }
 
-impl TreeServiceInner {
+impl LSMTreeIns {
 
     pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
         Self {
@@ -60,14 +60,17 @@ impl TreeServiceInner {
     }
 
     fn pop_expired(map: &mut MutexGuard<CursorMap>) {
-        if let Some((_, c)) = map.iter().next() {
-            if c.timestamp + CURSOR_DEFAULT_TTL > clock::now() {
-                return;
+        let mut expired_cursors = 0;
+        while let Some((_, c)) = map.iter().next() {
+            if c.timestamp + CURSOR_DEFAULT_TTL < clock::now() {
+                expired_cursors += 1;
+            } else {
+                break;
             }
-        } else {
-            return;
         }
-        map.pop_front();
+        for _ in expired_cursors {
+            map.pop_front();
+        }
     }
 
     pub fn seek(&self, key: EntryKey, ordering: index::Ordering) -> u64 {
@@ -92,5 +95,5 @@ impl TreeServiceInner {
     }
 }
 
-unsafe impl Send for TreeServiceInner {}
-unsafe impl Sync for TreeServiceInner {}
+unsafe impl Send for LSMTreeIns {}
+unsafe impl Sync for LSMTreeIns {}
