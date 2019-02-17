@@ -29,7 +29,8 @@ type MutCursorRef = Rc<RefCell<LSMTreeCursor>>;
 pub struct LSMTreeIns {
     tree: LSMTree,
     counter: AtomicU64,
-    cursors: Mutex<CursorMap>
+    cursors: Mutex<CursorMap>,
+    range: (EntryKey, EntryKey)
 }
 
 impl DelegatedCursor {
@@ -44,11 +45,12 @@ impl DelegatedCursor {
 
 impl LSMTreeIns {
 
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, range: (EntryKey, EntryKey)) -> Self {
         Self {
+            range,
             tree: LSMTree::new(neb_client),
             counter: AtomicU64::new(0),
-            cursors: Mutex::new(CursorMap::new())
+            cursors: Mutex::new(CursorMap::new()),
         }
     }
 
@@ -68,7 +70,7 @@ impl LSMTreeIns {
                 break;
             }
         }
-        for _ in expired_cursors {
+        for _ in 0..expired_cursors {
             map.pop_front();
         }
     }

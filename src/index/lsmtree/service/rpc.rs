@@ -5,43 +5,84 @@ use smallvec::SmallVec;
 use index::lsmtree::tree::LSMTree;
 use client::AsyncClient;
 use std::path::Component::CurDir;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use parking_lot::RwLock;
+use std::sync::atomic;
+
+#[derive(Serialize, Deserialize)]
+enum LSMTreeServiceError {
+    TreeNotFound
+}
 
 service! {
-    rpc seek(key: Vec<u8>, ordering: Ordering) -> u64;
-    rpc next(id: u64) -> Option<bool>;
-    rpc current(id: u64) -> Option<Option<Vec<u8>>>;
-    rpc complete(id: u64) -> bool;
+    rpc seek(tree_id: u64, key: Vec<u8>, ordering: Ordering) -> u64 | LSMTreeServiceError;
+    rpc next(tree_id: u64, id: u64) -> Option<bool> | LSMTreeServiceError;
+    rpc current(tree_id: u64, id: u64) -> Option<Option<Vec<u8>>> | LSMTreeServiceError;
+    rpc complete(tree_id: u64, id: u64) -> bool | LSMTreeServiceError;
+    rpc new_tree(start: Vec<u8>, end: Vec<u8>) -> u64;
 }
 
 
 pub struct LSMTreeService {
-    inner: LSMTreeIns
+    neb_client: Arc<AsyncClient>,
+    counter: AtomicU64,
+    trees: RwLock<HashMap<u64, LSMTreeIns>>
 }
 
 dispatch_rpc_service_functions!(LSMTreeService);
 
 impl Service for LSMTreeService {
-    fn seek(&self, key: Vec<u8>, ordering: Ordering) -> Box<Future<Item=u64, Error=()>> {
-        box future::ok(self.inner.seek(SmallVec::from(key), ordering))
+    fn seek(&self, tree_id: u64, key: Vec<u8>, ordering: Ordering) -> Box<Future<Item=u64, Error=LSMTreeServiceError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .map(|tree|tree.seek(SmallVec::from(key), ordering)))
     }
 
-    fn next(&self, id: u64) -> Box<Future<Item=Option<bool>, Error=()>> {
-        box future::ok(self.inner.next(&id))
+    fn next(&self, tree_id: u64, id: u64) -> Box<Future<Item=Option<bool>, Error=LSMTreeServiceError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .map(|tree|tree.next(&id)))
     }
 
-    fn current(&self, id: u64) -> Box<Future<Item=Option<Option<Vec<u8>>>, Error=()>> {
-        box future::ok(self.inner.current(&id))
+    fn current(&self, tree_id: u64, id: u64) -> Box<Future<Item=Option<Option<Vec<u8>>>, Error=LSMTreeServiceError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .map(|tree| tree.current(&id)))
     }
 
-    fn complete(&self, id: u64) -> Box<Future<Item=bool, Error=()>> {
-        box future::ok(self.inner.complete(&id))
+    fn complete(&self, tree_id: u64, id: u64) -> Box<Future<Item=bool, Error=LSMTreeServiceError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .map(|tree| tree.complete(&id)))
+    }
+
+    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>) -> Box<Future<Item=u64, Error=()>> {
+        let mut trees = self.trees.write();
+        let tree_id = self.counter.fetch_add(1, atomic::Ordering::Relaxed);
+        trees.insert(tree_id, LSMTreeIns::new(&self.neb_client, (EntryKey::from(start), EntryKey::from(end))));
+        box future::ok(tree_id)
     }
 }
 
 impl LSMTreeService {
     pub fn new(neb_client: &Arc<AsyncClient>) -> Arc<Self> {
         Arc::new(Self {
-            inner: LSMTreeIns::new(neb_client)
+            neb_client: neb_client.clone(),
+            counter: AtomicU64::new(0),
+            trees: RwLock::new(HashMap::new())
         })
     }
 }
