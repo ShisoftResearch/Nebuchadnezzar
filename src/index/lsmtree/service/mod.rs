@@ -1,2 +1,2 @@
-mod rpc;
 mod inner;
+mod rpc;

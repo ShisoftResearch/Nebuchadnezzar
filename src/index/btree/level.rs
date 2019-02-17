@@ -15,6 +15,7 @@ use index::btree::search::MutSearchResult;
 use index::btree::BPlusTree;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
+use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
@@ -22,7 +23,6 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
-use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
 
 enum Selection<KS, PS>
 where

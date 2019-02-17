@@ -3,25 +3,25 @@ use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
 use client;
 use futures::prelude::*;
+use index::btree;
+use index::key_with_id;
+use index::lsmtree::tree::LSMTree;
+use index::Cursor;
+use index::Ordering;
+use itertools::Itertools;
+use ram::types::Id;
 use rand::distributions::Uniform;
 use rand::thread_rng;
 use rand::Rng;
 use rayon::prelude::*;
 use server::NebServer;
 use server::ServerOptions;
+use smallvec::SmallVec;
 use std::env;
 use std::io::Cursor as StdCursor;
-use index::lsmtree::tree::LSMTree;
 use std::sync::Arc;
-use index::btree;
 use std::thread;
-use ram::types::Id;
-use index::Cursor;
-use smallvec::SmallVec;
 use std::time::Duration;
-use index::key_with_id;
-use index::Ordering;
-use itertools::Itertools;
 
 fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
@@ -53,9 +53,8 @@ pub fn insertions() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
     let tree = Arc::new(LSMTree::new(&client));
     let num = env::var("LSM_TREE_TEST_ITEMS")
@@ -147,9 +146,8 @@ pub fn hybrid() {
         &server_addr,
         &server_group,
     );
-    let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap(),
-    );
+    let client =
+        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
     let tree = Arc::new(LSMTree::new(&client));
     let num = env::var("LSM_TREE_TEST_ITEMS")

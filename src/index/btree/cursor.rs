@@ -86,7 +86,8 @@ where
                                         } else if next_node.is_ext() {
                                             self.index = 0;
                                             self.page = Some(next_node_ref.clone());
-                                            self.current = Self::read_current(next_node_ref, self.index);
+                                            self.current =
+                                                Self::read_current(next_node_ref, self.index);
                                             return Some(true);
                                         } else {
                                             unreachable!()
@@ -113,7 +114,8 @@ where
                                         } else if prev_node.is_ext() {
                                             self.index = prev_node.len() - 1;
                                             self.page = Some(prev_node_ref.clone());
-                                            self.current = Self::read_current(prev_node_ref, self.index);
+                                            self.current =
+                                                Self::read_current(prev_node_ref, self.index);
                                             return Some(true);
                                         } else {
                                             unreachable!()
@@ -129,7 +131,6 @@ where
                     self.current = Self::read_current(&current_page, self.index);
                     Some(true)
                 })
-
             } else {
                 Some(false)
             };
