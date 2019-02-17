@@ -93,6 +93,17 @@ impl LSMTreeIns {
     pub fn complete(&self, id: &u64) -> bool {
         self.cursors.lock().remove(id).is_some()
     }
+
+    pub fn count(&self) -> u64 {
+        self.tree.count() as u64
+    }
+
+    pub fn range(&self) -> (Vec<u8>, Vec<u8>) {
+        (
+            self.range.0.clone().into_vec(),
+            self.range.1.clone().into_vec(),
+        )
+    }
 }
 
 unsafe impl Send for LSMTreeIns {}

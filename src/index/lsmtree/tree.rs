@@ -109,6 +109,10 @@ impl LSMTree {
         self.trees.iter().map(|t| t.count()).collect()
     }
 
+    pub fn count(&self) -> usize {
+        self.trees.iter().map(|t| t.count()).sum()
+    }
+
     pub fn len(&self) -> usize {
         self.trees.iter().map(|tree| tree.count()).sum::<usize>()
     }

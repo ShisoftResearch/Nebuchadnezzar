@@ -11,16 +11,24 @@ use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 
 #[derive(Serialize, Deserialize)]
-enum LSMTreeServiceError {
+enum LSMTreeSvrError {
     TreeNotFound,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LSMTreeSummary {
+    id: u64,
+    count: u64,
+    range: (Vec<u8>, Vec<u8>),
+}
+
 service! {
-    rpc seek(tree_id: u64, key: Vec<u8>, ordering: Ordering) -> u64 | LSMTreeServiceError;
-    rpc next(tree_id: u64, id: u64) -> Option<bool> | LSMTreeServiceError;
-    rpc current(tree_id: u64, id: u64) -> Option<Option<Vec<u8>>> | LSMTreeServiceError;
-    rpc complete(tree_id: u64, id: u64) -> bool | LSMTreeServiceError;
+    rpc seek(tree_id: u64, key: Vec<u8>, ordering: Ordering) -> u64 | LSMTreeSvrError;
+    rpc next(tree_id: u64, id: u64) -> Option<bool> | LSMTreeSvrError;
+    rpc current(tree_id: u64, id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
+    rpc complete(tree_id: u64, id: u64) -> bool | LSMTreeSvrError;
     rpc new_tree(start: Vec<u8>, end: Vec<u8>) -> u64;
+    rpc summary() -> Vec<LSMTreeSummary>;
 }
 
 pub struct LSMTreeService {
@@ -37,12 +45,12 @@ impl Service for LSMTreeService {
         tree_id: u64,
         key: Vec<u8>,
         ordering: Ordering,
-    ) -> Box<Future<Item = u64, Error = LSMTreeServiceError>> {
+    ) -> Box<Future<Item = u64, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
-                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| tree.seek(SmallVec::from(key), ordering)),
         )
     }
@@ -51,12 +59,12 @@ impl Service for LSMTreeService {
         &self,
         tree_id: u64,
         id: u64,
-    ) -> Box<Future<Item = Option<bool>, Error = LSMTreeServiceError>> {
+    ) -> Box<Future<Item = Option<bool>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
-                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| tree.next(&id)),
         )
     }
@@ -65,26 +73,22 @@ impl Service for LSMTreeService {
         &self,
         tree_id: u64,
         id: u64,
-    ) -> Box<Future<Item = Option<Option<Vec<u8>>>, Error = LSMTreeServiceError>> {
+    ) -> Box<Future<Item = Option<Option<Vec<u8>>>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
-                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| tree.current(&id)),
         )
     }
 
-    fn complete(
-        &self,
-        tree_id: u64,
-        id: u64,
-    ) -> Box<Future<Item = bool, Error = LSMTreeServiceError>> {
+    fn complete(&self, tree_id: u64, id: u64) -> Box<Future<Item = bool, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
-                .ok_or(LSMTreeServiceError::TreeNotFound)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| tree.complete(&id)),
         )
     }
@@ -100,6 +104,20 @@ impl Service for LSMTreeService {
             ),
         );
         box future::ok(tree_id)
+    }
+
+    fn summary(&self) -> Box<Future<Item = Vec<LSMTreeSummary>, Error = ()>> {
+        let trees = self.trees.read();
+        box future::ok(
+            trees
+                .iter()
+                .map(|(id, tree)| LSMTreeSummary {
+                    id: *id,
+                    count: tree.count(),
+                    range: tree.range(),
+                })
+                .collect(),
+        )
     }
 }
 
