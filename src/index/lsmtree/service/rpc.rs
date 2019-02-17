@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
+use itertools::Itertools;
 
 #[derive(Serialize, Deserialize)]
 enum LSMTreeSvrError {
@@ -116,6 +117,7 @@ impl Service for LSMTreeService {
                     count: tree.count(),
                     range: tree.range(),
                 })
+                .sorted_by_key(|tree| tree.range.0.clone())
                 .collect(),
         )
     }
