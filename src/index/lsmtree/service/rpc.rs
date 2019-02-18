@@ -141,8 +141,8 @@ impl LSMTreeService {
             .name("LSM-Tree Serivce Sentinel".to_string())
             .spawn(move || {
                 loop {
-                    let trees = trees_lock.read();
-                    trees.par_iter().for_each(|(_, tree)| {
+                    let trees = trees_lock.read().values().cloned().collect_vec();
+                    trees.par_iter().for_each(|tree| {
                         tree.check_and_merge();
                     });
                     thread::sleep(Duration::from_millis(50));
