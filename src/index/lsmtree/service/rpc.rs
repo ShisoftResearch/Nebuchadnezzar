@@ -3,13 +3,16 @@ use client::AsyncClient;
 use index::lsmtree::service::inner::LSMTreeIns;
 use index::lsmtree::tree::LSMTree;
 use index::{EntryKey, Ordering};
+use itertools::Itertools;
 use parking_lot::RwLock;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
-use itertools::Itertools;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
+use std::thread;
 
 #[derive(Serialize, Deserialize)]
 enum LSMTreeSvrError {
@@ -35,7 +38,7 @@ service! {
 pub struct LSMTreeService {
     neb_client: Arc<AsyncClient>,
     counter: AtomicU64,
-    trees: RwLock<HashMap<u64, LSMTreeIns>>,
+    trees: Arc<RwLock<HashMap<u64, Arc<LSMTreeIns>>>>,
 }
 
 dispatch_rpc_service_functions!(LSMTreeService);
@@ -99,10 +102,10 @@ impl Service for LSMTreeService {
         let tree_id = self.counter.fetch_add(1, atomic::Ordering::Relaxed);
         trees.insert(
             tree_id,
-            LSMTreeIns::new(
+            Arc::new(LSMTreeIns::new(
                 &self.neb_client,
                 (EntryKey::from(start), EntryKey::from(end)),
-            ),
+            )),
         );
         box future::ok(tree_id)
     }
@@ -128,7 +131,22 @@ impl LSMTreeService {
         Arc::new(Self {
             neb_client: neb_client.clone(),
             counter: AtomicU64::new(0),
-            trees: RwLock::new(HashMap::new()),
+            trees: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    pub fn start_sentinel(&self) {
+        let trees_lock = self.trees.clone();
+        thread::Builder::new()
+            .name("LSM-Tree Serivce Sentinel".to_string())
+            .spawn(move || {
+                loop {
+                    let trees = trees_lock.read();
+                    trees.par_iter().for_each(|(_, tree)| {
+                        tree.check_and_merge();
+                    });
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
     }
 }

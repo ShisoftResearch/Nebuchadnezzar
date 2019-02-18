@@ -104,6 +104,10 @@ impl LSMTreeIns {
             self.range.1.clone().into_vec(),
         )
     }
+
+    pub fn check_and_merge(&self) {
+        self.tree.check_and_merge()
+    }
 }
 
 unsafe impl Send for LSMTreeIns {}
