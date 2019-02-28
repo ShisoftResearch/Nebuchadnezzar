@@ -6,7 +6,7 @@ use index::btree::node::NodeReadHandler;
 use std::fmt::Debug;
 use index::btree::node::NodeData;
 
-pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> EntryKey
+pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
@@ -16,12 +16,15 @@ pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> EntryKey
         let node = &**node_handler;
         match node {
             &NodeData::External(ref n) => {
-                n.keys[n.len / 2].clone()
+                Some(n.keys.as_slice_immute()[n.len / 2].clone())
             }
             &NodeData::Internal(ref n) => {
-                mid_key(&n.ptrs[n.len / 2])
+                mid_key::<KS, PS>(&n.ptrs.as_slice_immute()[n.len / 2])
             }
-            &NodeData::Empty(_) | &NodeData::None => smallvec!()
+            &NodeData::Empty(ref n) => {
+                mid_key::<KS, PS>(&n.right)
+            }
+            &NodeData::None => None
         }
     })
 }

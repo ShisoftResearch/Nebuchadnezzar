@@ -234,6 +234,7 @@ pub trait LevelTree {
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
+    fn mid_key(&self) -> Option<EntryKey>;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -276,6 +277,10 @@ where
 
     fn dump(&self, f: &str) {
         dump::dump_tree(self, f);
+    }
+
+    fn mid_key(&self) -> Option<EntryKey> {
+        split::mid_key::<KS, PS>(&self.get_root())
     }
 }
 
