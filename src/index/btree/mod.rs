@@ -60,6 +60,8 @@ mod merge;
 mod node;
 mod remove;
 mod search;
+mod split;
+
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
