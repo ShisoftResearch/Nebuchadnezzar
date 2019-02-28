@@ -333,15 +333,22 @@ where
     // merge to dest_tree
     {
         let mut deleted_keys = src_tree.deleted.write();
+        let mut removed_keys = vec![];
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
             .map(|g| &g.keys()[..g.len()])
             .flatten()
-            .filter(|&k| !deleted_keys.remove(k))
+            .filter(|&k| if deleted_keys.contains(k) {
+                removed_keys.push(k.clone());
+                false
+            } else { true })
             .cloned()
             .collect_vec();
         debug!("Merge selected keys are {:?}", &keys);
         dest_tree.merge_with_keys(box keys);
+        for rk in &removed_keys {
+            deleted_keys.remove(rk);
+        }
     }
 
     // cleanup upper level references
