@@ -22,6 +22,7 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use index::lsmtree::tree::KeyRange;
 
 fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
@@ -36,6 +37,10 @@ fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {
         lsm_tree.trees[i].dump(&format!("{}_lsm_{}_dump.json", name, i));
     }
+}
+
+fn default_key_range() -> KeyRange {
+    (smallvec!(), smallvec!())
 }
 
 #[test]
@@ -56,7 +61,7 @@ pub fn insertions() {
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client));
+    let tree = Arc::new(LSMTree::new(&client, default_key_range()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -149,7 +154,7 @@ pub fn hybrid() {
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client));
+    let tree = Arc::new(LSMTree::new(&client, default_key_range()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels

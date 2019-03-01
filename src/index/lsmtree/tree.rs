@@ -17,6 +17,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
+use index::lsmtree::split::SplitStatus;
+use parking_lot::Mutex;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -32,6 +34,8 @@ type LevelTrees = Vec<Box<LevelTree>>;
 pub type Ptr = NodeCellRef;
 pub type Key = EntryKey;
 
+pub type KeyRange = (EntryKey, EntryKey);
+
 with_levels! {
     LM, LEVEL_M;
     L1, LEVEL_1;
@@ -42,19 +46,26 @@ with_levels! {
 
 pub struct LSMTree {
     pub trees: LevelTrees,
+    pub split: Mutex<Option<SplitStatus>>,
+    pub range: Mutex<KeyRange>,
     // use Vec here for convenience
     max_sizes: Vec<usize>,
+    lsm_tree_max_size: usize,
+
 }
 
 unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange) -> Self {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = init_lsm_level_trees(neb_client);
+        let lsm_tree_max_size = max_sizes.iter().sum();
+        let split = Mutex::new(None);
+        let range = Mutex::new(range);
         debug!("Initialized LSM-tree");
-        LSMTree { trees, max_sizes }
+        LSMTree { trees, max_sizes, lsm_tree_max_size, split, range }
     }
 
     pub fn insert(&self, mut key: EntryKey, id: &Id) {
@@ -115,5 +126,9 @@ impl LSMTree {
 
     pub fn len(&self) -> usize {
         self.trees.iter().map(|tree| tree.count()).sum::<usize>()
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len() > self.lsm_tree_max_size
     }
 }

@@ -15,6 +15,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use index::lsmtree::tree::KeyRange;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -30,7 +31,6 @@ pub struct LSMTreeIns {
     tree: LSMTree,
     counter: AtomicU64,
     cursors: Mutex<CursorMap>,
-    range: (EntryKey, EntryKey),
 }
 
 impl DelegatedCursor {
@@ -42,10 +42,9 @@ impl DelegatedCursor {
 }
 
 impl LSMTreeIns {
-    pub fn new(neb_client: &Arc<AsyncClient>, range: (EntryKey, EntryKey)) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange) -> Self {
         Self {
-            range,
-            tree: LSMTree::new(neb_client),
+            tree: LSMTree::new(neb_client, range),
             counter: AtomicU64::new(0),
             cursors: Mutex::new(CursorMap::new()),
         }
@@ -99,9 +98,10 @@ impl LSMTreeIns {
     }
 
     pub fn range(&self) -> (Vec<u8>, Vec<u8>) {
+        let range = self.tree.range.lock();
         (
-            self.range.0.clone().into_vec(),
-            self.range.1.clone().into_vec(),
+            range.0.clone().into_vec(),
+            range.1.clone().into_vec(),
         )
     }
 
