@@ -235,6 +235,7 @@ pub trait LevelTree {
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
+    fn remove_following_tombstones(&self, start: &EntryKey);
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -281,6 +282,12 @@ where
 
     fn mid_key(&self) -> Option<EntryKey> {
         split::mid_key::<KS, PS>(&self.get_root())
+    }
+
+    fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
+        let mut tombstones = self.deleted.write();
+        let original_tombstones = mem::replace(&mut *tombstones, BTreeSet::new());
+        *tombstones = original_tombstones.into_iter().filter(|k| k < start).collect();
     }
 }
 

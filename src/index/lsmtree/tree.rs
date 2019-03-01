@@ -19,6 +19,8 @@ use std::time::Duration;
 use std::{mem, ptr};
 use index::lsmtree::split::SplitStatus;
 use parking_lot::Mutex;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::atomic::AtomicU64;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -36,6 +38,12 @@ pub type Key = EntryKey;
 
 pub type KeyRange = (EntryKey, EntryKey);
 
+#[derive(Serialize, Deserialize)]
+pub enum LSMTreeResult<T> {
+    Ok(T),
+    EpochMismatch
+}
+
 with_levels! {
     LM, LEVEL_M;
     L1, LEVEL_1;
@@ -48,10 +56,10 @@ pub struct LSMTree {
     pub trees: LevelTrees,
     pub split: Mutex<Option<SplitStatus>>,
     pub range: Mutex<KeyRange>,
+    pub epoch: AtomicU64,
     // use Vec here for convenience
     max_sizes: Vec<usize>,
     lsm_tree_max_size: usize,
-
 }
 
 unsafe impl Send for LSMTree {}
@@ -64,23 +72,32 @@ impl LSMTree {
         let lsm_tree_max_size = max_sizes.iter().sum();
         let split = Mutex::new(None);
         let range = Mutex::new(range);
+        let epoch = AtomicU64::new(0);
         debug!("Initialized LSM-tree");
-        LSMTree { trees, max_sizes, lsm_tree_max_size, split, range }
+        LSMTree { trees, max_sizes, lsm_tree_max_size, split, range, epoch }
     }
 
-    pub fn insert(&self, mut key: EntryKey, id: &Id) {
+    pub fn insert(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<()> {
+        if self.epoch.load(Relaxed) != epoch {
+            return LSMTreeResult::EpochMismatch
+        }
         key_with_id(&mut key, id);
-        self.trees[0].insert_into(&key)
+        self.trees[0].insert_into(&key);
+        LSMTreeResult::Ok(())
     }
 
-    pub fn remove(&self, mut key: EntryKey, id: &Id) -> bool {
+    pub fn remove(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<bool> {
+        if self.epoch.load(Relaxed) != epoch {
+            return LSMTreeResult::EpochMismatch
+        }
         key_with_id(&mut key, id);
-        self.trees
+        let res= self.trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
             .collect_vec() // collect here to prevent short circuit
             .into_iter()
-            .any(|d| d)
+            .any(|d| d);
+        LSMTreeResult::Ok(res)
     }
 
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
@@ -130,5 +147,13 @@ impl LSMTree {
 
     pub fn is_full(&self) -> bool {
         self.len() > self.lsm_tree_max_size
+    }
+
+    pub fn last_level_size(&self) -> usize {
+        *self.max_sizes.last().unwrap()
+    }
+
+    pub fn remove_following_tombstones(&self, start: &EntryKey) {
+        self.trees.iter().for_each(|tree| tree.remove_following_tombstones(start))
     }
 }
