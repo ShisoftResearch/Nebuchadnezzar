@@ -5,6 +5,7 @@ use client;
 use futures::prelude::*;
 use index::btree;
 use index::key_with_id;
+use index::lsmtree::tree::KeyRange;
 use index::lsmtree::tree::LSMTree;
 use index::Cursor;
 use index::Ordering;
@@ -22,7 +23,6 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use index::lsmtree::tree::KeyRange;
 
 fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];

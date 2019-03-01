@@ -4,23 +4,23 @@ use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
+use index::lsmtree::split::SplitStatus;
 use index::Cursor;
 use index::EntryKey;
 use index::Ordering;
 use index::*;
 use itertools::Itertools;
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 use ram::segs::MAX_SEGMENT_SIZE;
 use ram::types::Id;
 use std::collections::BTreeSet;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use index::lsmtree::split::SplitStatus;
-use parking_lot::Mutex;
-use std::sync::atomic::Ordering::Relaxed;
-use std::sync::atomic::AtomicU64;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -41,7 +41,7 @@ pub type KeyRange = (EntryKey, EntryKey);
 #[derive(Serialize, Deserialize)]
 pub enum LSMTreeResult<T> {
     Ok(T),
-    EpochMismatch
+    EpochMismatch,
 }
 
 with_levels! {
@@ -74,12 +74,19 @@ impl LSMTree {
         let range = Mutex::new(range);
         let epoch = AtomicU64::new(0);
         debug!("Initialized LSM-tree");
-        LSMTree { trees, max_sizes, lsm_tree_max_size, split, range, epoch }
+        LSMTree {
+            trees,
+            max_sizes,
+            lsm_tree_max_size,
+            split,
+            range,
+            epoch,
+        }
     }
 
     pub fn insert(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<()> {
         if self.epoch.load(Relaxed) != epoch {
-            return LSMTreeResult::EpochMismatch
+            return LSMTreeResult::EpochMismatch;
         }
         key_with_id(&mut key, id);
         self.trees[0].insert_into(&key);
@@ -88,10 +95,11 @@ impl LSMTree {
 
     pub fn remove(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<bool> {
         if self.epoch.load(Relaxed) != epoch {
-            return LSMTreeResult::EpochMismatch
+            return LSMTreeResult::EpochMismatch;
         }
         key_with_id(&mut key, id);
-        let res= self.trees
+        let res = self
+            .trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
             .collect_vec() // collect here to prevent short circuit
@@ -154,6 +162,8 @@ impl LSMTree {
     }
 
     pub fn remove_following_tombstones(&self, start: &EntryKey) {
-        self.trees.iter().for_each(|tree| tree.remove_following_tombstones(start))
+        self.trees
+            .iter()
+            .for_each(|tree| tree.remove_following_tombstones(start))
     }
 }

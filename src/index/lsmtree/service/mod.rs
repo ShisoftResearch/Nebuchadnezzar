@@ -5,13 +5,13 @@ use index::lsmtree::tree::LSMTree;
 use index::{EntryKey, Ordering};
 use itertools::Itertools;
 use parking_lot::RwLock;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
-use rayon::iter::IntoParallelRefIterator;
-use rayon::iter::ParallelIterator;
 use std::thread;
 
 mod inner;
@@ -141,14 +141,12 @@ impl LSMTreeService {
         let trees_lock = self.trees.clone();
         thread::Builder::new()
             .name("LSM-Tree Serivce Sentinel".to_string())
-            .spawn(move || {
-                loop {
-                    let trees = trees_lock.read().values().cloned().collect_vec();
-                    trees.par_iter().for_each(|tree| {
-                        tree.check_and_merge();
-                    });
-                    thread::sleep(Duration::from_millis(50));
-                }
+            .spawn(move || loop {
+                let trees = trees_lock.read().values().cloned().collect_vec();
+                trees.par_iter().for_each(|tree| {
+                    tree.check_and_merge();
+                });
+                thread::sleep(Duration::from_millis(50));
             });
     }
 }

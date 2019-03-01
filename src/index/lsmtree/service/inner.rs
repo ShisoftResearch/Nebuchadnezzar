@@ -1,6 +1,7 @@
 use client::AsyncClient;
 use index;
 use index::lsmtree::cursor::LSMTreeCursor;
+use index::lsmtree::tree::KeyRange;
 use index::lsmtree::tree::LSMTree;
 use index::Cursor;
 use index::EntryKey;
@@ -15,7 +16,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use index::lsmtree::tree::KeyRange;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -99,10 +99,7 @@ impl LSMTreeIns {
 
     pub fn range(&self) -> (Vec<u8>, Vec<u8>) {
         let range = self.tree.range.lock();
-        (
-            range.0.clone().into_vec(),
-            range.1.clone().into_vec(),
-        )
+        (range.0.clone().into_vec(), range.1.clone().into_vec())
     }
 
     pub fn check_and_merge(&self) {

@@ -62,7 +62,6 @@ mod remove;
 mod search;
 mod split;
 
-
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
 
@@ -287,7 +286,10 @@ where
     fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
         let mut tombstones = self.deleted.write();
         let original_tombstones = mem::replace(&mut *tombstones, BTreeSet::new());
-        *tombstones = original_tombstones.into_iter().filter(|k| k < start).collect();
+        *tombstones = original_tombstones
+            .into_iter()
+            .filter(|k| k < start)
+            .collect();
     }
 }
 

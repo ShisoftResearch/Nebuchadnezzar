@@ -52,5 +52,5 @@ pub mod utils;
 pub mod ram;
 pub mod client;
 pub mod index;
-pub mod server;
 pub mod placement;
+pub mod server;

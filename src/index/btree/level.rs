@@ -340,10 +340,14 @@ where
             .iter()
             .map(|g| &g.keys()[..g.len()])
             .flatten()
-            .filter(|&k| if deleted_keys.contains(k) {
-                merged_deleted_keys.push(k.clone());
-                false
-            } else { true })
+            .filter(|&k| {
+                if deleted_keys.contains(k) {
+                    merged_deleted_keys.push(k.clone());
+                    false
+                } else {
+                    true
+                }
+            })
             .cloned()
             .collect_vec();
         num_keys_removed = keys.len();

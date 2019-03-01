@@ -1,6 +1,6 @@
 mod cursor;
 mod service;
+mod split;
 #[cfg(test)]
 mod test;
-mod split;
 pub mod tree;

@@ -1,14 +1,14 @@
-use index::lsmtree::tree::LSMTree;
-use index::EntryKey;
-use rayon::prelude::*;
-use itertools::Itertools;
 use dovahkiin::types::custom_types::id::Id;
-use index::Ordering::Forward;
+use index::lsmtree::tree::LSMTree;
 use index::Cursor;
+use index::EntryKey;
+use index::Ordering::Forward;
+use itertools::Itertools;
+use rayon::prelude::*;
 
 pub struct SplitStatus {
     start: EntryKey,
-    target: Id
+    target: Id,
 }
 
 pub fn mid_key(tree: &LSMTree) -> EntryKey {
@@ -51,7 +51,7 @@ pub fn check_and_split(tree: &LSMTree) -> bool {
             }
             // submit this batch to new tree
             unimplemented!();
-            // remove such batch in current tree
+            // remove this batch in current tree
             unimplemented!();
         }
 
