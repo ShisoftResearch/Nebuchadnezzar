@@ -37,7 +37,7 @@ pub fn check_and_split(tree: &LSMTree) -> bool {
         // and read request to the new tree
         unimplemented!();
     }
-    let tree_split = tree.split.lock();
+    let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
         // Get a cursor from mid key, forwarding keys
