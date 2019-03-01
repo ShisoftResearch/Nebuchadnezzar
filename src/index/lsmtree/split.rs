@@ -54,9 +54,10 @@ pub fn check_and_split(tree: &LSMTree) -> bool {
             // remove this batch in current tree
             unimplemented!();
         }
-
         // split completed
         tree.remove_following_tombstones(&tree_split.start);
+        // Inform the placement driver this tree have completed split
+        unimplemented!()
     } else {
         return false;
     }
