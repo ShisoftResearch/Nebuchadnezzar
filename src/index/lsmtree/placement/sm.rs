@@ -1,20 +1,20 @@
-use std::collections::btree_map::BTreeMap;
-use index::EntryKey;
-use dovahkiin::types::Id;
-use std::collections::HashMap;
-use serde::Serialize;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils::bincode::serialize;
-use bincode::deserialize;
 use bifrost_plugins::hash_ident;
+use bincode::deserialize;
+use dovahkiin::types::Id;
+use index::EntryKey;
 use parking_lot::RwLock;
-use std::collections::HashSet;
-use std::collections::btree_set::BTreeSet;
 use ram::types::RandValue;
-use smallvec::SmallVec;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::ser::CharEscape::Quote;
+use smallvec::SmallVec;
+use std::collections::btree_map::BTreeMap;
+use std::collections::btree_set::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
 
@@ -25,12 +25,12 @@ pub enum SplitError {
     SplitUnmatchSource,
     NoSplitInProgress,
     MidOutOfRange,
-    PlacementNotFound
+    PlacementNotFound,
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum QueryError {
-    OutOfRange
+    OutOfRange,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,7 +43,7 @@ pub struct QueryResult {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InSplitStatus {
     dest: Id,
-    mid: Vec<u8>
+    mid: Vec<u8>,
 }
 
 pub struct Placement {
@@ -90,7 +90,7 @@ impl StateMachineCmds for PlacementSM {
 
             source_placement.in_split = Some(InSplitStatus {
                 dest,
-                mid: mid_key.into_iter().collect()
+                mid: mid_key.into_iter().collect(),
             });
             source_placement.epoch += 1;
             Ok(source_placement.epoch)
@@ -100,37 +100,38 @@ impl StateMachineCmds for PlacementSM {
     }
 
     fn complete_split(&mut self, source: Id, dest: Id) -> Result<u64, SplitError> {
-        let (dest_placement, src_epoch) = if let Some(mut source_placement) = self.placements.get_mut(&source) {
-            if let Some(pending_src) = self.pending_new_ids.get(&dest) {
-                if pending_src != &source {
-                    return Err(SplitError::SplitUnmatchSource)
+        let (dest_placement, src_epoch) =
+            if let Some(mut source_placement) = self.placements.get_mut(&source) {
+                if let Some(pending_src) = self.pending_new_ids.get(&dest) {
+                    if pending_src != &source {
+                        return Err(SplitError::SplitUnmatchSource);
+                    }
+                } else {
+                    return Err(SplitError::CannotFindSplitMeta);
                 }
+                let dest_placement = if let &Some(ref in_progress) = &source_placement.in_split {
+                    if in_progress.dest != dest {
+                        return Err(SplitError::AnotherSplitInProgress(in_progress.clone()));
+                    }
+                    let dest_ends = source_placement.ends.clone();
+                    let source_ends = SmallVec::from(in_progress.mid.clone());
+                    source_placement.ends = source_ends.clone();
+                    Placement {
+                        starts: source_ends,
+                        ends: dest_ends,
+                        in_split: None,
+                        epoch: 0,
+                        id: dest,
+                    }
+                } else {
+                    return Err(SplitError::NoSplitInProgress);
+                };
+                source_placement.in_split = None;
+                source_placement.epoch += 1;
+                (dest_placement, source_placement.epoch)
             } else {
-                return Err(SplitError::CannotFindSplitMeta)
-            }
-            let dest_placement = if let &Some(ref in_progress) = &source_placement.in_split {
-                if in_progress.dest != dest {
-                    return Err(SplitError::AnotherSplitInProgress(in_progress.clone()));
-                }
-                let dest_ends = source_placement.ends.clone();
-                let source_ends = SmallVec::from(in_progress.mid.clone());
-                source_placement.ends = source_ends.clone();
-                Placement {
-                    starts: source_ends,
-                    ends: dest_ends,
-                    in_split: None,
-                    epoch: 0,
-                    id: dest
-                }
-            } else {
-                return Err(SplitError::NoSplitInProgress);
+                return Err(SplitError::PlacementNotFound);
             };
-            source_placement.in_split = None;
-            source_placement.epoch += 1;
-            (dest_placement, source_placement.epoch)
-        } else {
-            return Err(SplitError::PlacementNotFound)
-        };
         self.starts.insert(dest_placement.starts.clone(), dest);
         self.placements.insert(dest, dest_placement);
         self.pending_new_ids.remove(&dest);
@@ -142,13 +143,13 @@ impl StateMachineCmds for PlacementSM {
         if let Some((_, placement_id)) = self.starts.range(..=search_key).last() {
             let placement = self.placements.get(placement_id).unwrap();
             let split = placement.in_split.as_ref().map(|s| s.dest);
-            return Ok(QueryResult{
+            return Ok(QueryResult {
                 id: placement.id,
                 split,
-                epoch: placement.epoch
-            })
+                epoch: placement.epoch,
+            });
         } else {
-            return Err(QueryError::OutOfRange)
+            return Err(QueryError::OutOfRange);
         }
     }
 }
