@@ -259,23 +259,34 @@ where
         while left_pos < self.len && right_pos < right.len() {
             let left_key = &left[left_pos];
             let right_key = right[right_pos];
-            if left_key < right_key {
+            if left_key <= right_key {
                 self.keys.as_slice()[pos] = left_key.clone();
                 left_pos += 1;
-            } else {
+            } else if left_key > right_key {
                 self.keys.as_slice()[pos] = right_key.clone();
                 right_pos += 1;
             }
-            pos += 1;
+            if left_key == right_key {
+                // when duplication detected, skip the duplicated one
+                right_pos += 1;
+            }
+            if pos == 0 || self.keys.as_slice_immute()[pos - 1] != self.keys.as_slice_immute()[pos] {
+                // if no duplicate assigned, step further
+                pos += 1;
+            }
         }
         for key in &left[left_pos..self.len] {
-            self.keys.as_slice()[pos] = key.clone();
-            pos += 1;
+            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != key {
+                self.keys.as_slice()[pos] = key.clone();
+                pos += 1;
+            }
             left_pos += 1;
         }
         for key in &right[right_pos..] {
-            self.keys.as_slice()[pos] = (*key).clone();
-            pos += 1;
+            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != *key {
+                self.keys.as_slice()[pos] = (*key).clone();
+                pos += 1;
+            }
             right_pos += 1;
         }
         debug!(
