@@ -136,7 +136,7 @@ where
 
     pub fn insert(&self, key: &EntryKey) {
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
-            Some(split) => {
+            Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
@@ -147,7 +147,8 @@ where
                 new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             }
-            None => {}
+            Some(None) => {},
+            None => return,
         }
         self.len.fetch_add(1, Relaxed);
     }

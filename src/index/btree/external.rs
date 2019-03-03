@@ -185,12 +185,15 @@ where
         tree: &BPlusTree<KS, PS>,
         self_ref: &NodeCellRef,
         parent: &NodeCellRef,
-    ) -> Option<NodeSplit<KS, PS>> {
+    ) -> Option<Option<NodeSplit<KS, PS>>> {
         let key = key.clone();
         let pos = self.search(&key);
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
-        if self.len == KS::slice_len() {
+        if self.len > pos && self.keys.as_slice_immute()[pos] == key {
+            return None
+        }
+        Some(if self.len == KS::slice_len() {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
             let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
@@ -206,7 +209,7 @@ where
             debug!("insert to external without split at {}, key {:?}", pos, key);
             self.keys.insert_at(key, pos, &mut self.len);
             None
-        }
+        })
     }
 
     pub fn merge_with(&mut self, right: &mut Self) {

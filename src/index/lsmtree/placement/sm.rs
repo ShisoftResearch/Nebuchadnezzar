@@ -140,7 +140,7 @@ impl StateMachineCmds for PlacementSM {
     }
 
     fn update_epoch(&mut self, source: Id, epoch: u64) -> Result<u64, CmdError> {
-        // unconditionally update placement epoch in state machine
+        // unconditionally update placement epoch in state machine and return its original value
         if let Some(mut source_placement) = self.placements.get_mut(&source) {
             let original = source_placement.epoch;
             source_placement.epoch = epoch;
