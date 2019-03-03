@@ -19,7 +19,7 @@ use std::collections::HashSet;
 pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
 
 #[derive(Serialize, Deserialize)]
-pub enum SplitError {
+pub enum CmdError {
     AnotherSplitInProgress(InSplitStatus),
     CannotFindSplitMeta,
     SplitUnmatchSource,
@@ -61,57 +61,58 @@ pub struct PlacementSM {
 }
 
 raft_state_machine! {
-    def cmd prepare_split(source: Id)  -> Id | SplitError;
-    def cmd start_split(source: Id, dest: Id, mid: Vec<u8>) -> u64 | SplitError;
-    def cmd complete_split(source: Id, dest: Id) -> u64 | SplitError;
+    def cmd prepare_split(source: Id)  -> Id | CmdError;
+    def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> u64 | CmdError;
+    def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
+    def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
     def qry locate(id: Vec<u8>) -> QueryResult | QueryError;
 }
 
 impl StateMachineCmds for PlacementSM {
-    fn prepare_split(&mut self, source: Id) -> Result<Id, SplitError> {
+    fn prepare_split(&mut self, source: Id) -> Result<Id, CmdError> {
         if !self.placements.contains_key(&source) {
-            return Err(SplitError::PlacementNotFound);
+            return Err(CmdError::PlacementNotFound);
         }
         let new_id = Id::rand();
         self.pending_new_ids.insert(new_id, source);
         Ok(new_id)
     }
 
-    fn start_split(&mut self, source: Id, dest: Id, mid: Vec<u8>) -> Result<u64, SplitError> {
+    fn start_split(&mut self, source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> Result<u64, CmdError> {
         if let Some(mut source_placement) = self.placements.get_mut(&source) {
             if let &Some(ref in_progress) = &source_placement.in_split {
-                return Err(SplitError::AnotherSplitInProgress(in_progress.clone()));
+                return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
             }
 
             let mid_key: EntryKey = SmallVec::from(mid);
             if mid_key < source_placement.starts || mid_key >= source_placement.ends {
-                return Err(SplitError::MidOutOfRange);
+                return Err(CmdError::MidOutOfRange);
             }
 
             source_placement.in_split = Some(InSplitStatus {
                 dest,
                 mid: mid_key.into_iter().collect(),
             });
-            source_placement.epoch += 1;
+            source_placement.epoch = src_epoch;
             Ok(source_placement.epoch)
         } else {
-            Err(SplitError::PlacementNotFound)
+            Err(CmdError::PlacementNotFound)
         }
     }
 
-    fn complete_split(&mut self, source: Id, dest: Id) -> Result<u64, SplitError> {
+    fn complete_split(&mut self, source: Id, dest: Id, src_epoch: u64) -> Result<u64, CmdError> {
         let (dest_placement, src_epoch) =
             if let Some(mut source_placement) = self.placements.get_mut(&source) {
                 if let Some(pending_src) = self.pending_new_ids.get(&dest) {
                     if pending_src != &source {
-                        return Err(SplitError::SplitUnmatchSource);
+                        return Err(CmdError::SplitUnmatchSource);
                     }
                 } else {
-                    return Err(SplitError::CannotFindSplitMeta);
+                    return Err(CmdError::CannotFindSplitMeta);
                 }
                 let dest_placement = if let &Some(ref in_progress) = &source_placement.in_split {
                     if in_progress.dest != dest {
-                        return Err(SplitError::AnotherSplitInProgress(in_progress.clone()));
+                        return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
                     }
                     let dest_ends = source_placement.ends.clone();
                     let source_ends = SmallVec::from(in_progress.mid.clone());
@@ -124,18 +125,29 @@ impl StateMachineCmds for PlacementSM {
                         id: dest,
                     }
                 } else {
-                    return Err(SplitError::NoSplitInProgress);
+                    return Err(CmdError::NoSplitInProgress);
                 };
                 source_placement.in_split = None;
-                source_placement.epoch += 1;
+                source_placement.epoch = src_epoch;
                 (dest_placement, source_placement.epoch)
             } else {
-                return Err(SplitError::PlacementNotFound);
+                return Err(CmdError::PlacementNotFound);
             };
         self.starts.insert(dest_placement.starts.clone(), dest);
         self.placements.insert(dest, dest_placement);
         self.pending_new_ids.remove(&dest);
         Ok(src_epoch)
+    }
+
+    fn update_epoch(&mut self, source: Id, epoch: u64) -> Result<u64, CmdError> {
+        // unconditionally update placement epoch in state machine
+        if let Some(mut source_placement) = self.placements.get_mut(&source) {
+            let original = source_placement.epoch;
+            source_placement.epoch = epoch;
+            Ok(original)
+        } else {
+            Err(CmdError::PlacementNotFound)
+        }
     }
 
     fn locate(&self, entry: Vec<u8>) -> Result<QueryResult, QueryError> {

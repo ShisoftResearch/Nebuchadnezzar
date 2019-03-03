@@ -56,8 +56,10 @@ pub fn check_and_split(tree: &LSMTree) -> bool {
         }
         // split completed
         tree.remove_following_tombstones(&tree_split.start);
+        // Set new tree epoch from 0 to 1
+        unimplemented!();
         // Inform the placement driver this tree have completed split
-        unimplemented!()
+        unimplemented!();
     } else {
         return false;
     }
