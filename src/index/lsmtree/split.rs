@@ -1,20 +1,20 @@
+use super::placement::sm::client::SMClient;
+use super::placement::sm::CmdError;
+use super::service::{AsyncServiceClient, DEFAULT_SERVICE_ID};
+use bifrost::rpc::RPCError;
+use bifrost::rpc::DEFAULT_CLIENT_POOL;
+use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
+use futures::prelude::*;
 use index::lsmtree::tree::LSMTree;
 use index::Cursor;
 use index::EntryKey;
 use index::Ordering::Forward;
 use itertools::Itertools;
-use rayon::prelude::*;
-use std::sync::Arc;
-use futures::prelude::*;
-use super::placement::sm::client::SMClient;
-use super::service::{AsyncServiceClient, DEFAULT_SERVICE_ID};
 use ram::types::RandValue;
+use rayon::prelude::*;
 use smallvec::SmallVec;
-use super::placement::sm::CmdError;
-use client::AsyncClient;
-use bifrost::rpc::RPCError;
-use bifrost::rpc::DEFAULT_CLIENT_POOL;
+use std::sync::Arc;
 
 pub struct SplitStatus {
     start: EntryKey,
@@ -33,15 +33,16 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
         .unwrap()
 }
 
-pub fn placement_client(id: &Id, client: &Arc<AsyncClient>) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
+pub fn placement_client(
+    id: &Id,
+    client: &Arc<AsyncClient>,
+) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
     let server_id = client.locate_server_id(id).unwrap();
     let client = client.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id_async(server_id, move |sid| client.conshash().to_server_name(sid))
         .map_err(|e| RPCError::IOError(e))
-        .map(move |c| {
-            AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c)
-        })
+        .map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
 pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
@@ -55,19 +56,23 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
                 mid_key = SmallVec::from(split.mid);
                 new_placement_id = split.dest;
-            },
+            }
             Ok(Ok(())) => {}
-            _ => panic!("Error on split")
+            _ => panic!("Error on split"),
         }
         // Then save this metadata to current tree 'split' field
         let mut split = tree.split.lock();
-        *split = Some(SplitStatus{
+        *split = Some(SplitStatus {
             start: mid_key.clone(),
-            target: new_placement_id
+            target: new_placement_id,
         });
         // Create the tree in split host
         let client = placement_client(&new_placement_id, client).wait().unwrap();
-        client.new_tree(mid_key.iter().cloned().collect(), tree_key_range.1.iter().cloned().collect(), new_placement_id);
+        client.new_tree(
+            mid_key.iter().cloned().collect(),
+            tree_key_range.1.iter().cloned().collect(),
+            new_placement_id,
+        );
         unimplemented!();
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree

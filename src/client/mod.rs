@@ -333,5 +333,7 @@ impl AsyncClient {
         &self.inner.raft_client
     }
 
-    pub fn conshash(&self) -> &Arc<ConsistentHashing> { &self.inner.conshash }
+    pub fn conshash(&self) -> &Arc<ConsistentHashing> {
+        &self.inner.conshash
+    }
 }

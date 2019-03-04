@@ -1,4 +1,5 @@
 use bifrost::rpc::*;
+use bifrost_plugins::hash_ident;
 use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use index::lsmtree::service::inner::LSMTreeIns;
@@ -14,7 +15,6 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
-use bifrost_plugins::hash_ident;
 
 mod inner;
 
