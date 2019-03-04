@@ -15,6 +15,7 @@ use ram::types::RandValue;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 pub struct SplitStatus {
     start: EntryKey,
@@ -52,7 +53,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         let mut mid_key = mid_key(tree);
         let mut new_placement_id = Id::rand();
         // First check with the placement driver
-        match sm.prepare_split(&tree.id, &new_placement_id).wait() {
+        match sm.prepare_split(&tree.id).wait() {
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
                 mid_key = SmallVec::from(split.mid);
                 new_placement_id = split.dest;
@@ -68,15 +69,16 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         });
         // Create the tree in split host
         let client = placement_client(&new_placement_id, client).wait().unwrap();
+        let mid_vec = mid_key.iter().cloned().collect_vec();
         client.new_tree(
-            mid_key.iter().cloned().collect(),
+            mid_vec.clone(),
             tree_key_range.1.iter().cloned().collect(),
             new_placement_id,
         );
-        unimplemented!();
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
-        unimplemented!();
+        let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
+        sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch).wait().unwrap();
     }
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process

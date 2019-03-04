@@ -60,7 +60,7 @@ pub struct PlacementSM {
 }
 
 raft_state_machine! {
-    def cmd prepare_split(source: Id, dest: Id)  -> () | CmdError;
+    def cmd prepare_split(source: Id)  -> () | CmdError;
     def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> u64 | CmdError;
     def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
     def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
@@ -68,7 +68,7 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for PlacementSM {
-    fn prepare_split(&mut self, source: Id, dest: Id) -> Result<(), CmdError> {
+    fn prepare_split(&mut self, source: Id) -> Result<(), CmdError> {
         if let Some(src_placement) = self.placements.get(&source) {
             if let &Some(ref split) = &src_placement.in_split {
                 return Err(CmdError::AnotherSplitInProgress(split.clone()));
