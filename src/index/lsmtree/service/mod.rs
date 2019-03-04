@@ -14,8 +14,11 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
+use bifrost_plugins::hash_ident;
 
 mod inner;
+
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 
 #[derive(Serialize, Deserialize)]
 enum LSMTreeSvrError {

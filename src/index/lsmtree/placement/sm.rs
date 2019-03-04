@@ -42,8 +42,8 @@ pub struct QueryResult {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct InSplitStatus {
-    dest: Id,
-    mid: Vec<u8>,
+    pub dest: Id,
+    pub mid: Vec<u8>,
 }
 
 pub struct Placement {
