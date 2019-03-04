@@ -22,7 +22,7 @@ pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
 pub enum CmdError {
     AnotherSplitInProgress(InSplitStatus),
     CannotFindSplitMeta,
-    SplitUnmatchSource,
+    SplitUnmatchSource(Id),
     NoSplitInProgress,
     MidOutOfRange,
     PlacementNotFound,
@@ -56,12 +56,11 @@ pub struct Placement {
 
 pub struct PlacementSM {
     placements: HashMap<Id, Placement>,
-    starts: BTreeMap<EntryKey, Id>,
-    pending_new_ids: BTreeMap<Id, Id>,
+    starts: BTreeMap<EntryKey, Id>
 }
 
 raft_state_machine! {
-    def cmd prepare_split(source: Id)  -> Id | CmdError;
+    def cmd prepare_split(source: Id, dest: Id)  -> () | CmdError;
     def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> u64 | CmdError;
     def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
     def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
@@ -69,13 +68,16 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for PlacementSM {
-    fn prepare_split(&mut self, source: Id) -> Result<Id, CmdError> {
-        if !self.placements.contains_key(&source) {
+    fn prepare_split(&mut self, source: Id, dest: Id) -> Result<(), CmdError> {
+        if let Some(src_placement) = self.placements.get(&source) {
+            if let &Some(ref split) = &src_placement.in_split {
+                return Err(CmdError::AnotherSplitInProgress(split.clone()))
+            } else {
+                return Ok(())
+            }
+        } else {
             return Err(CmdError::PlacementNotFound);
         }
-        let new_id = Id::rand();
-        self.pending_new_ids.insert(new_id, source);
-        Ok(new_id)
     }
 
     fn start_split(&mut self, source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> Result<u64, CmdError> {
@@ -103,13 +105,6 @@ impl StateMachineCmds for PlacementSM {
     fn complete_split(&mut self, source: Id, dest: Id, src_epoch: u64) -> Result<u64, CmdError> {
         let (dest_placement, src_epoch) =
             if let Some(mut source_placement) = self.placements.get_mut(&source) {
-                if let Some(pending_src) = self.pending_new_ids.get(&dest) {
-                    if pending_src != &source {
-                        return Err(CmdError::SplitUnmatchSource);
-                    }
-                } else {
-                    return Err(CmdError::CannotFindSplitMeta);
-                }
                 let dest_placement = if let &Some(ref in_progress) = &source_placement.in_split {
                     if in_progress.dest != dest {
                         return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
@@ -135,7 +130,6 @@ impl StateMachineCmds for PlacementSM {
             };
         self.starts.insert(dest_placement.starts.clone(), dest);
         self.placements.insert(dest, dest_placement);
-        self.pending_new_ids.remove(&dest);
         Ok(src_epoch)
     }
 
