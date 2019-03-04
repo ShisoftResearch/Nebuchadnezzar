@@ -150,9 +150,10 @@ where
             } else {
                 return None;
             }
-        },
+        }
         MutSearchResult::Internal(sub_node) => {
-            if let Some(split_res) = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1) {
+            if let Some(split_res) = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1)
+            {
                 insert_internal_tree_node(split_res, parent)
             } else {
                 return None;

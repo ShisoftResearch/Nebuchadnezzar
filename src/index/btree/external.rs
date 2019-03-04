@@ -191,7 +191,7 @@ where
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
         if self.len > pos && self.keys.as_slice_immute()[pos] == key {
-            return None
+            return None;
         }
         Some(if self.len == KS::slice_len() {
             // need to split
@@ -270,7 +270,8 @@ where
                 // when duplication detected, skip the duplicated one
                 right_pos += 1;
             }
-            if pos == 0 || self.keys.as_slice_immute()[pos - 1] != self.keys.as_slice_immute()[pos] {
+            if pos == 0 || self.keys.as_slice_immute()[pos - 1] != self.keys.as_slice_immute()[pos]
+            {
                 // if no duplicate assigned, step further
                 pos += 1;
             }

@@ -60,7 +60,7 @@ pub struct LSMTree {
     // use Vec here for convenience
     max_sizes: Vec<usize>,
     lsm_tree_max_size: usize,
-    id: Id
+    id: Id,
 }
 
 unsafe impl Send for LSMTree {}
@@ -82,7 +82,7 @@ impl LSMTree {
             split,
             range,
             epoch,
-            id
+            id,
         }
     }
 

@@ -56,7 +56,7 @@ pub struct Placement {
 
 pub struct PlacementSM {
     placements: HashMap<Id, Placement>,
-    starts: BTreeMap<EntryKey, Id>
+    starts: BTreeMap<EntryKey, Id>,
 }
 
 raft_state_machine! {
@@ -71,16 +71,22 @@ impl StateMachineCmds for PlacementSM {
     fn prepare_split(&mut self, source: Id, dest: Id) -> Result<(), CmdError> {
         if let Some(src_placement) = self.placements.get(&source) {
             if let &Some(ref split) = &src_placement.in_split {
-                return Err(CmdError::AnotherSplitInProgress(split.clone()))
+                return Err(CmdError::AnotherSplitInProgress(split.clone()));
             } else {
-                return Ok(())
+                return Ok(());
             }
         } else {
             return Err(CmdError::PlacementNotFound);
         }
     }
 
-    fn start_split(&mut self, source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> Result<u64, CmdError> {
+    fn start_split(
+        &mut self,
+        source: Id,
+        dest: Id,
+        mid: Vec<u8>,
+        src_epoch: u64,
+    ) -> Result<u64, CmdError> {
         if let Some(mut source_placement) = self.placements.get_mut(&source) {
             if let &Some(ref in_progress) = &source_placement.in_split {
                 return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));

@@ -1,4 +1,5 @@
 use client::AsyncClient;
+use dovahkiin::types::custom_types::id::Id;
 use index;
 use index::lsmtree::cursor::LSMTreeCursor;
 use index::lsmtree::tree::KeyRange;
@@ -16,7 +17,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use dovahkiin::types::custom_types::id::Id;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 

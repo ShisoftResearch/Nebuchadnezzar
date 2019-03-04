@@ -1,5 +1,6 @@
 use bifrost::rpc::*;
 use client::AsyncClient;
+use dovahkiin::types::custom_types::id::Id;
 use index::lsmtree::service::inner::LSMTreeIns;
 use index::lsmtree::tree::LSMTree;
 use index::{EntryKey, Ordering};
@@ -13,7 +14,6 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
-use dovahkiin::types::custom_types::id::Id;
 
 mod inner;
 
@@ -100,7 +100,12 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = u64, Error = ()>> {
+    fn new_tree(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        id: Id,
+    ) -> Box<Future<Item = u64, Error = ()>> {
         let mut trees = self.trees.write();
         let tree_id = self.counter.fetch_add(1, atomic::Ordering::Relaxed);
         trees.insert(
@@ -108,7 +113,7 @@ impl Service for LSMTreeService {
             Arc::new(LSMTreeIns::new(
                 &self.neb_client,
                 (EntryKey::from(start), EntryKey::from(end)),
-                id
+                id,
             )),
         );
         box future::ok(tree_id)

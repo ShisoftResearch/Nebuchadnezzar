@@ -147,7 +147,7 @@ where
                 new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             }
-            Some(None) => {},
+            Some(None) => {}
             None => return,
         }
         self.len.fetch_add(1, Relaxed);
