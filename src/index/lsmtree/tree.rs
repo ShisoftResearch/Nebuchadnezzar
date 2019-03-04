@@ -60,13 +60,14 @@ pub struct LSMTree {
     // use Vec here for convenience
     max_sizes: Vec<usize>,
     lsm_tree_max_size: usize,
+    id: Id
 }
 
 unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
-    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = init_lsm_level_trees(neb_client);
         let lsm_tree_max_size = max_sizes.iter().sum();
@@ -81,6 +82,7 @@ impl LSMTree {
             split,
             range,
             epoch,
+            id
         }
     }
 

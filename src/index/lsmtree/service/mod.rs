@@ -13,6 +13,7 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
+use dovahkiin::types::custom_types::id::Id;
 
 mod inner;
 
@@ -33,7 +34,7 @@ service! {
     rpc next(tree_id: u64, id: u64) -> Option<bool> | LSMTreeSvrError;
     rpc current(tree_id: u64, id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
     rpc complete(tree_id: u64, id: u64) -> bool | LSMTreeSvrError;
-    rpc new_tree(start: Vec<u8>, end: Vec<u8>) -> u64;
+    rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id) -> u64;
     rpc summary() -> Vec<LSMTreeSummary>;
 }
 
@@ -99,7 +100,7 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>) -> Box<Future<Item = u64, Error = ()>> {
+    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = u64, Error = ()>> {
         let mut trees = self.trees.write();
         let tree_id = self.counter.fetch_add(1, atomic::Ordering::Relaxed);
         trees.insert(
@@ -107,6 +108,7 @@ impl Service for LSMTreeService {
             Arc::new(LSMTreeIns::new(
                 &self.neb_client,
                 (EntryKey::from(start), EntryKey::from(end)),
+                id
             )),
         );
         box future::ok(tree_id)

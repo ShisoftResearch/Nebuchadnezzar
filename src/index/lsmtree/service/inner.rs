@@ -16,6 +16,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use dovahkiin::types::custom_types::id::Id;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -42,9 +43,9 @@ impl DelegatedCursor {
 }
 
 impl LSMTreeIns {
-    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
         Self {
-            tree: LSMTree::new(neb_client, range),
+            tree: LSMTree::new(neb_client, range, id),
             counter: AtomicU64::new(0),
             cursors: Mutex::new(CursorMap::new()),
         }

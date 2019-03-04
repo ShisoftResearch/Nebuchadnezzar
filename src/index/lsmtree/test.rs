@@ -61,7 +61,7 @@ pub fn insertions() {
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client, default_key_range()));
+    let tree = Arc::new(LSMTree::new(&client, default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -154,7 +154,7 @@ pub fn hybrid() {
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client, default_key_range()));
+    let tree = Arc::new(LSMTree::new(&client, default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
