@@ -34,9 +34,9 @@ struct LSMTreeSummary {
 
 service! {
     rpc seek(tree_id: u64, key: Vec<u8>, ordering: Ordering) -> u64 | LSMTreeSvrError;
-    rpc next(tree_id: u64, id: u64) -> Option<bool> | LSMTreeSvrError;
-    rpc current(tree_id: u64, id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
-    rpc complete(tree_id: u64, id: u64) -> bool | LSMTreeSvrError;
+    rpc next(tree_id: u64, cursor_id: u64) -> Option<bool> | LSMTreeSvrError;
+    rpc current(tree_id: u64, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
+    rpc complete(tree_id: u64, cursor_id: u64) -> bool | LSMTreeSvrError;
     rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id) -> u64;
     rpc summary() -> Vec<LSMTreeSummary>;
 }
@@ -68,38 +68,38 @@ impl Service for LSMTreeService {
     fn next(
         &self,
         tree_id: u64,
-        id: u64,
+        cursor_id: u64,
     ) -> Box<Future<Item = Option<bool>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.next(&id)),
+                .map(|tree| tree.next(&cursor_id)),
         )
     }
 
     fn current(
         &self,
         tree_id: u64,
-        id: u64,
+        cursor_id: u64,
     ) -> Box<Future<Item = Option<Option<Vec<u8>>>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.current(&id)),
+                .map(|tree| tree.current(&cursor_id)),
         )
     }
 
-    fn complete(&self, tree_id: u64, id: u64) -> Box<Future<Item = bool, Error = LSMTreeSvrError>> {
+    fn complete(&self, tree_id: u64, cursor_id: u64) -> Box<Future<Item = bool, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.complete(&id)),
+                .map(|tree| tree.complete(&cursor_id)),
         )
     }
 
