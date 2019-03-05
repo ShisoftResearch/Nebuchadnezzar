@@ -87,7 +87,7 @@ pub fn insertions() {
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
         let key = SmallVec::from_slice(&key_slice);
-        tree.insert(key, &id, 0);
+        tree.insert(key, &id);
     });
 
     dump_trees(&*tree, "stage_1_before_insertion");
@@ -117,7 +117,7 @@ pub fn insertions() {
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
         let key = SmallVec::from_slice(&key_slice);
-        tree.insert(key, &id, 0);
+        tree.insert(key, &id);
     });
 
     dump_trees(&*tree, "stage_2_after_insertion");
@@ -183,7 +183,7 @@ pub fn hybrid() {
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
         let key = SmallVec::from_slice(&key_slice);
-        tree.insert(key, &id, 0);
+        tree.insert(key, &id);
     });
 
     dump_trees(&*tree, "hybird_after_insertion");

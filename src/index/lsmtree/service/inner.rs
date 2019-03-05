@@ -109,7 +109,11 @@ impl LSMTreeIns {
     }
 
     pub fn insert(&self, key: EntryKey, epoch: u64) -> LSMTreeResult<bool> {
-        self.tree.insert(key, epoch)
+        if self.tree.epoch_mismatch(epoch) {
+            LSMTreeResult::EpochMismatch
+        } else {
+            LSMTreeResult::Ok(self.tree.insert(key))
+        }
     }
 }
 

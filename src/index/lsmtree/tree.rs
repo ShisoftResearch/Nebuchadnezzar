@@ -86,25 +86,17 @@ impl LSMTree {
         }
     }
 
-    pub fn insert(&self, mut key: EntryKey, epoch: u64) -> LSMTreeResult<bool> {
-        if self.epoch.load(Relaxed) != epoch {
-            return LSMTreeResult::EpochMismatch;
-        }
-        LSMTreeResult::Ok(self.trees[0].insert_into(&key))
+    pub fn insert(&self, mut key: EntryKey) -> bool {
+        self.trees[0].insert_into(&key)
     }
 
-    pub fn remove(&self, mut key: EntryKey, epoch: u64) -> LSMTreeResult<bool> {
-        if self.epoch.load(Relaxed) != epoch {
-            return LSMTreeResult::EpochMismatch;
-        }
-        let res = self
-            .trees
+    pub fn remove(&self, mut key: EntryKey, epoch: u64) -> bool {
+        self.trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
             .collect_vec() // collect here to prevent short circuit
             .into_iter()
-            .any(|d| d);
-        LSMTreeResult::Ok(res)
+            .any(|d| d)
     }
 
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
@@ -116,7 +108,7 @@ impl LSMTree {
         for tree in &self.trees {
             cursors.push(tree.seek_for(&key, ordering));
         }
-        return LSMTreeCursor::new(cursors);
+        LSMTreeCursor::new(cursors)
     }
 
     pub fn check_and_merge(&self) {
@@ -164,5 +156,9 @@ impl LSMTree {
         self.trees
             .iter()
             .for_each(|tree| tree.remove_following_tombstones(start))
+    }
+
+    pub fn epoch_mismatch(&self, epoch: u64) -> bool {
+        self.epoch.load(Relaxed) != epoch
     }
 }
