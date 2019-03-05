@@ -59,19 +59,20 @@ impl Service for LSMTreeService {
         tree_id: Id,
         key: Vec<u8>,
         ordering: Ordering,
-        epoch: u64
+        epoch: u64,
     ) -> Box<Future<Item = LSMTreeResult<u64>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree|
+                .map(|tree| {
                     if tree.epoch_mismatch(epoch) {
                         LSMTreeResult::EpochMismatch
                     } else {
                         LSMTreeResult::Ok(tree.seek(SmallVec::from(key), ordering))
-                    }),
+                    }
+                }),
         )
     }
 
@@ -103,7 +104,11 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn complete(&self, tree_id: Id, cursor_id: u64) -> Box<Future<Item = bool, Error = LSMTreeSvrError>> {
+    fn complete(
+        &self,
+        tree_id: Id,
+        cursor_id: u64,
+    ) -> Box<Future<Item = bool, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
@@ -113,12 +118,7 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn new_tree(
-        &self,
-        start: Vec<u8>,
-        end: Vec<u8>,
-        id: Id,
-    ) -> Box<Future<Item = (), Error = ()>> {
+    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = (), Error = ()>> {
         let mut trees = self.trees.write();
         trees.insert(
             id,
@@ -147,32 +147,50 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn insert(&self, tree_id: Id, key: Vec<u8>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {
+    fn insert(
+        &self,
+        tree_id: Id,
+        key: Vec<u8>,
+        epoch: u64,
+    ) -> Box<Future<Item = LSMTreeResult<bool>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree|
-                         if tree.epoch_mismatch(epoch) {
-                             LSMTreeResult::EpochMismatch
-                         } else {
-                             LSMTreeResult::Ok(tree.insert(SmallVec::from(key)))
-                         }))
-    }
-
-    fn merge(&self, tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Box<Future<Item=LSMTreeResult<()>, Error=LSMTreeSvrError>> {
-        let trees = self.trees.read();
-        box future::result(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree|
+                .map(|tree| {
                     if tree.epoch_mismatch(epoch) {
                         LSMTreeResult::EpochMismatch
                     } else {
-                        LSMTreeResult::Ok(tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect()))
-                    }))
+                        LSMTreeResult::Ok(tree.insert(SmallVec::from(key)))
+                    }
+                }),
+        )
+    }
+
+    fn merge(
+        &self,
+        tree_id: Id,
+        keys: Vec<Vec<u8>>,
+        epoch: u64,
+    ) -> Box<Future<Item = LSMTreeResult<()>, Error = LSMTreeSvrError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
+                .map(|tree| {
+                    if tree.epoch_mismatch(epoch) {
+                        LSMTreeResult::EpochMismatch
+                    } else {
+                        LSMTreeResult::Ok(
+                            tree.merge(
+                                box keys.into_iter().map(|key| SmallVec::from(key)).collect(),
+                            ),
+                        )
+                    }
+                }),
+        )
     }
 }
 

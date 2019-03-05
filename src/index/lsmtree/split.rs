@@ -6,17 +6,17 @@ use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use futures::prelude::*;
+use index::btree::max_entry_key;
 use index::lsmtree::tree::LSMTree;
 use index::Cursor;
 use index::EntryKey;
-use index::Ordering::{Forward, Backward};
-use index::btree::max_entry_key;
+use index::Ordering::{Backward, Forward};
 use itertools::Itertools;
 use ram::types::RandValue;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
 pub struct SplitStatus {
     start: EntryKey,
@@ -79,7 +79,9 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
-        sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch).wait().unwrap();
+        sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch)
+            .wait()
+            .unwrap();
     }
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process

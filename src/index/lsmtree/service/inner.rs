@@ -2,8 +2,8 @@ use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use index;
 use index::lsmtree::cursor::LSMTreeCursor;
-use index::lsmtree::tree::{KeyRange, LSMTreeResult};
 use index::lsmtree::tree::LSMTree;
+use index::lsmtree::tree::{KeyRange, LSMTreeResult};
 use index::Cursor;
 use index::EntryKey;
 use linked_hash_map::LinkedHashMap;
@@ -13,11 +13,11 @@ use ram::clock;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::btree_map::BTreeMap;
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::collections::hash_map::Entry;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
