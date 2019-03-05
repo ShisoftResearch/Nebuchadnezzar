@@ -9,7 +9,8 @@ use futures::prelude::*;
 use index::lsmtree::tree::LSMTree;
 use index::Cursor;
 use index::EntryKey;
-use index::Ordering::Forward;
+use index::Ordering::{Forward, Backward};
+use index::btree::max_entry_key;
 use itertools::Itertools;
 use ram::types::RandValue;
 use rayon::prelude::*;
@@ -83,14 +84,25 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
-        // Get a cursor from mid key, forwarding keys
-        let mut cursor = tree.seek(tree_split.start.clone(), Forward);
+        // Get a cursor from the last key, backwards
+        // Backwards are better for rolling batch migration for migrated keys in a batch can be
+        // removed from the source tree right after they have been transferred to split tree
+        let mut cursor = tree.seek(max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
-        while cursor.current().is_some() {
+        loop {
             let mut batch = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
-                batch.push(cursor.current().unwrap().clone());
+                let key = cursor.current().unwrap().clone();
+                if key < &tree_split.start {
+                    // break batch loop when current key out of mid key bound
+                    break;
+                }
+                batch.push(key);
                 cursor.next();
+            }
+            if batch.is_empty() {
+                // break the main transfer loop when this batch is empty
+                break;
             }
             // submit this batch to new tree
             unimplemented!();

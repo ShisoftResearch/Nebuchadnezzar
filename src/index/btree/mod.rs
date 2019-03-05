@@ -377,7 +377,7 @@ lazy_static! {
     pub static ref MIN_ENTRY_KEY: EntryKey = smallvec!(0);
 }
 
-fn max_entry_key() -> EntryKey {
+pub fn max_entry_key() -> EntryKey {
     EntryKey::from(iter::repeat(255u8).take(KEY_SIZE).collect_vec())
 }
 
