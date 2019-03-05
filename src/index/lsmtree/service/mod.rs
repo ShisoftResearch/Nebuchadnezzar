@@ -3,7 +3,7 @@ use bifrost_plugins::hash_ident;
 use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use index::lsmtree::service::inner::LSMTreeIns;
-use index::lsmtree::tree::LSMTree;
+use index::lsmtree::tree::{LSMTree, LSMTreeResult};
 use index::{EntryKey, Ordering};
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -40,8 +40,8 @@ service! {
     rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id);
     rpc summary() -> Vec<LSMTreeSummary>;
 
-    rpc insert(tree_id: Id, key: Vec<u8>) -> bool;
-    rpc merge(tree: Id, keys: Vec<Vec<u8>>) -> bool;
+    rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
+    rpc merge(tree: Id, keys: Vec<Vec<u8>>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
 }
 
 pub struct LSMTreeService {
@@ -139,11 +139,12 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn insert(&self, tree_id: Id, key: Vec<u8>) -> Box<Future<Item=bool, Error=()>> {
-        unimplemented!()
+    fn insert(&self, tree_id: Id, key: Vec<u8>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {
+        let trees = self.trees.read();
+        box future::result(trees.get(&tree_id).ok_or(LSMTreeSvrError::TreeNotFound).map(|tree| tree.insert(SmallVec::from(key), epoch)))
     }
 
-    fn merge(&self, tree: Id, keys: Vec<Vec<u8>>) -> Box<Future<Item=bool, Error=()>> {
+    fn merge(&self, tree: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {
         unimplemented!()
     }
 }
