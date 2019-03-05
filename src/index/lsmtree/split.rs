@@ -48,7 +48,7 @@ pub fn placement_client(
 }
 
 pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
-    if tree.is_full() && tree.split.lock().is_none() {
+    if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
         // need to initiate a split
         let tree_key_range = tree.range.lock();
         let mut mid_key = mid_key(tree);
