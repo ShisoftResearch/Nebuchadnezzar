@@ -134,7 +134,7 @@ where
         search_node(&self.get_root(), key, ordering, &self.deleted)
     }
 
-    pub fn insert(&self, key: &EntryKey) {
+    pub fn insert(&self, key: &EntryKey) -> bool {
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
@@ -148,9 +148,10 @@ where
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             }
             Some(None) => {}
-            None => return,
+            None => return false,
         }
         self.len.fetch_add(1, Relaxed);
+        return true;
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
@@ -230,7 +231,7 @@ pub trait LevelTree {
     fn count(&self) -> usize;
     fn merge_to(&self, upper_level: &LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
-    fn insert_into(&self, key: &EntryKey);
+    fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
@@ -259,7 +260,7 @@ where
         self.merge_with_keys_(keys)
     }
 
-    fn insert_into(&self, key: &SmallVec<[u8; 32]>) {
+    fn insert_into(&self, key: &SmallVec<[u8; 32]>) -> bool {
         self.insert(key)
     }
 

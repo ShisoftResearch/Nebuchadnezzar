@@ -86,13 +86,12 @@ impl LSMTree {
         }
     }
 
-    pub fn insert(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<()> {
+    pub fn insert(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<bool> {
         if self.epoch.load(Relaxed) != epoch {
             return LSMTreeResult::EpochMismatch;
         }
         key_with_id(&mut key, id);
-        self.trees[0].insert_into(&key);
-        LSMTreeResult::Ok(())
+        LSMTreeResult::Ok(self.trees[0].insert_into(&key))
     }
 
     pub fn remove(&self, mut key: EntryKey, id: &Id, epoch: u64) -> LSMTreeResult<bool> {

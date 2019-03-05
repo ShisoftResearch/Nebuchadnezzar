@@ -39,6 +39,9 @@ service! {
     rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
     rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id);
     rpc summary() -> Vec<LSMTreeSummary>;
+
+    rpc insert(tree_id: Id, key: Vec<u8>) -> bool;
+    rpc merge(tree: Id, keys: Vec<Vec<u8>>) -> bool;
 }
 
 pub struct LSMTreeService {
@@ -134,6 +137,14 @@ impl Service for LSMTreeService {
                 .sorted_by_key(|tree| tree.range.0.clone())
                 .collect(),
         )
+    }
+
+    fn insert(&self, tree_id: Id, key: Vec<u8>) -> Box<Future<Item=bool, Error=()>> {
+        unimplemented!()
+    }
+
+    fn merge(&self, tree: Id, keys: Vec<Vec<u8>>) -> Box<Future<Item=bool, Error=()>> {
+        unimplemented!()
     }
 }
 
