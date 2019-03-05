@@ -29,6 +29,7 @@ enum LSMTreeSvrError {
 struct LSMTreeSummary {
     id: Id,
     count: u64,
+    epoch: u64,
     range: (Vec<u8>, Vec<u8>),
 }
 
@@ -132,6 +133,7 @@ impl Service for LSMTreeService {
                 .map(|(id, tree)| LSMTreeSummary {
                     id: *id,
                     count: tree.count(),
+                    epoch: tree.epoch(),
                     range: tree.range(),
                 })
                 .sorted_by_key(|tree| tree.range.0.clone())
@@ -141,7 +143,16 @@ impl Service for LSMTreeService {
 
     fn insert(&self, tree_id: Id, key: Vec<u8>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {
         let trees = self.trees.read();
-        box future::result(trees.get(&tree_id).ok_or(LSMTreeSvrError::TreeNotFound).map(|tree| tree.insert(SmallVec::from(key), epoch)))
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
+                .map(|tree|
+                         if tree.epoch_mismatch(epoch) {
+                             LSMTreeResult::EpochMismatch
+                         } else {
+                             LSMTreeResult::Ok(tree.insert(SmallVec::from(key), epoch))
+                         }))
     }
 
     fn merge(&self, tree: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {

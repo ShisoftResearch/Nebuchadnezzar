@@ -108,12 +108,16 @@ impl LSMTreeIns {
         self.tree.check_and_merge()
     }
 
-    pub fn insert(&self, key: EntryKey, epoch: u64) -> LSMTreeResult<bool> {
-        if self.tree.epoch_mismatch(epoch) {
-            LSMTreeResult::EpochMismatch
-        } else {
-            LSMTreeResult::Ok(self.tree.insert(key))
-        }
+    pub fn insert(&self, key: EntryKey, epoch: u64) -> bool {
+        self.tree.insert(key)
+    }
+
+    pub fn epoch_mismatch(&self, epoch: u64) -> bool {
+        self.tree.epoch_mismatch(epoch)
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.tree.epoch()
     }
 }
 

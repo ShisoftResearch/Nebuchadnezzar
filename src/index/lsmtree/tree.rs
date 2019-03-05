@@ -159,6 +159,10 @@ impl LSMTree {
     }
 
     pub fn epoch_mismatch(&self, epoch: u64) -> bool {
-        self.epoch.load(Relaxed) != epoch
+        self.epoch() != epoch
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Relaxed)
     }
 }
