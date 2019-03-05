@@ -34,7 +34,7 @@ struct LSMTreeSummary {
 }
 
 service! {
-    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering) -> u64 | LSMTreeSvrError;
+    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64) -> LSMTreeResult<u64> | LSMTreeSvrError;
     rpc next(tree_id: Id, cursor_id: u64) -> Option<bool> | LSMTreeSvrError;
     rpc current(tree_id: Id, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
     rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
@@ -59,13 +59,19 @@ impl Service for LSMTreeService {
         tree_id: Id,
         key: Vec<u8>,
         ordering: Ordering,
-    ) -> Box<Future<Item = u64, Error = LSMTreeSvrError>> {
+        epoch: u64
+    ) -> Box<Future<Item = LSMTreeResult<u64>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.seek(SmallVec::from(key), ordering)),
+                .map(|tree|
+                    if tree.epoch_mismatch(epoch) {
+                        LSMTreeResult::EpochMismatch
+                    } else {
+                        LSMTreeResult::Ok(tree.seek(SmallVec::from(key), ordering))
+                    }),
         )
     }
 
@@ -151,7 +157,7 @@ impl Service for LSMTreeService {
                          if tree.epoch_mismatch(epoch) {
                              LSMTreeResult::EpochMismatch
                          } else {
-                             LSMTreeResult::Ok(tree.insert(SmallVec::from(key), epoch))
+                             LSMTreeResult::Ok(tree.insert(SmallVec::from(key)))
                          }))
     }
 

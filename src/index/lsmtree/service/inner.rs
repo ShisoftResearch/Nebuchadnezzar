@@ -108,7 +108,7 @@ impl LSMTreeIns {
         self.tree.check_and_merge()
     }
 
-    pub fn insert(&self, key: EntryKey, epoch: u64) -> bool {
+    pub fn insert(&self, key: EntryKey) -> bool {
         self.tree.insert(key)
     }
 
