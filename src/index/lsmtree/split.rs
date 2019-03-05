@@ -91,15 +91,17 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         // removed from the source tree right after they have been transferred to split tree
         let mut cursor = tree.seek(max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
+        let target_id = tree_split.target;
+        let client = placement_client(&target_id, client).wait().unwrap();
         loop {
-            let mut batch = Vec::with_capacity(batch_size);
+            let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
                 let key = cursor.current().unwrap().clone();
                 if &key < &tree_split.start {
                     // break batch loop when current key out of mid key bound
                     break;
                 }
-                batch.push(key);
+                batch.push(key.into_iter().collect());
                 cursor.next();
             }
             if batch.is_empty() {
@@ -107,7 +109,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
                 break;
             }
             // submit this batch to new tree
-            unimplemented!();
+            client.merge(target_id, batch, 0).wait().unwrap();
             // remove this batch in current tree
             unimplemented!();
         }
