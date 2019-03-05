@@ -119,6 +119,10 @@ impl LSMTreeIns {
     pub fn epoch(&self) -> u64 {
         self.tree.epoch()
     }
+
+    pub fn merge(&self, keys: Box<Vec<EntryKey>>) {
+        self.tree.merge(keys)
+    }
 }
 
 unsafe impl Send for LSMTreeIns {}

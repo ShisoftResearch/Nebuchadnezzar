@@ -165,4 +165,8 @@ impl LSMTree {
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Relaxed)
     }
+
+    pub fn merge(&self, keys: Box<Vec<EntryKey>>) {
+        self.trees[0].merge_with_keys(keys)
+    }
 }

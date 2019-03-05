@@ -42,7 +42,7 @@ service! {
     rpc summary() -> Vec<LSMTreeSummary>;
 
     rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
-    rpc merge(tree: Id, keys: Vec<Vec<u8>>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
+    rpc merge(tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> LSMTreeResult<()> | LSMTreeSvrError;
 }
 
 pub struct LSMTreeService {
@@ -161,8 +161,18 @@ impl Service for LSMTreeService {
                          }))
     }
 
-    fn merge(&self, tree: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Box<Future<Item=LSMTreeResult<bool>, Error=LSMTreeSvrError>> {
-        unimplemented!()
+    fn merge(&self, tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Box<Future<Item=LSMTreeResult<()>, Error=LSMTreeSvrError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
+                .map(|tree|
+                    if tree.epoch_mismatch(epoch) {
+                        LSMTreeResult::EpochMismatch
+                    } else {
+                        LSMTreeResult::Ok(tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect()))
+                    }))
     }
 }
 
