@@ -20,7 +20,7 @@ mod inner;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum LSMTreeSvrError {
     TreeNotFound,
 }

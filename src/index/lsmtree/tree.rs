@@ -38,10 +38,20 @@ pub type Key = EntryKey;
 
 pub type KeyRange = (EntryKey, EntryKey);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum LSMTreeResult<T> {
     Ok(T),
     EpochMismatch,
+}
+
+impl <T> LSMTreeResult<T> {
+    pub fn unwrap(self) -> T {
+        if let LSMTreeResult::Ok(v) = self {
+            v
+        } else {
+            panic!("Cannot unwrap LSMTreeResult");
+        }
+    }
 }
 
 with_levels! {

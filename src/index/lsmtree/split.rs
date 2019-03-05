@@ -75,7 +75,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             mid_vec.clone(),
             tree_key_range.1.iter().cloned().collect(),
             new_placement_id,
-        );
+        ).wait().unwrap();
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
@@ -109,7 +109,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
                 break;
             }
             // submit this batch to new tree
-            client.merge(target_id, batch, 0).wait().unwrap();
+            client.merge(target_id, batch, 0).wait().unwrap().unwrap();
             // remove this batch in current tree
             unimplemented!();
         }
