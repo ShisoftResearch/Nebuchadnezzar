@@ -93,7 +93,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             let mut batch = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
                 let key = cursor.current().unwrap().clone();
-                if key < &tree_split.start {
+                if &key < &tree_split.start {
                     // break batch loop when current key out of mid key bound
                     break;
                 }
