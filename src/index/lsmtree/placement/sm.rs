@@ -36,7 +36,7 @@ pub enum QueryError {
 #[derive(Serialize, Deserialize)]
 pub struct QueryResult {
     id: Id,
-    split: Option<Id>,
+    split: Option<(Vec<u8>, Id)>,
     epoch: u64,
 }
 
@@ -154,7 +154,7 @@ impl StateMachineCmds for PlacementSM {
         let search_key = SmallVec::from(entry);
         if let Some((_, placement_id)) = self.starts.range(..=search_key).last() {
             let placement = self.placements.get(placement_id).unwrap();
-            let split = placement.in_split.as_ref().map(|s| s.dest);
+            let split = placement.in_split.as_ref().map(|s| (s.mid.clone(), s.dest));
             return Ok(QueryResult {
                 id: placement.id,
                 split,

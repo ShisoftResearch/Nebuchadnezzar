@@ -5,6 +5,8 @@ use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
+use index::btree::search::mut_search;
+use index::btree::search::MutSearchResult;
 
 pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>
 where
@@ -21,4 +23,17 @@ where
             &NodeData::None => None,
         }
     })
+}
+
+pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    let search = mut_search::<KS, PS>(node_ref, start_key);
+//    match search {
+//        MutSearchResult::External => {
+//
+//        }
+//    }
 }
