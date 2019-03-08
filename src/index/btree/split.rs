@@ -7,6 +7,7 @@ use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
+use index::btree::node::write_node;
 
 pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>
 where
@@ -31,9 +32,11 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let search = mut_search::<KS, PS>(node_ref, start_key);
-    //    match search {
-    //        MutSearchResult::External => {
-    //
-    //        }
-    //    }
+//    match search {
+//        MutSearchResult::Internal(ref node) => {
+//            {
+//                let innode = node
+//            }
+//        }
+//    }
 }
