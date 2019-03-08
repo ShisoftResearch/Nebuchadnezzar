@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
+use rayon::iter::IntoParallelRefIterator;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -178,5 +179,9 @@ impl LSMTree {
 
     pub fn merge(&self, keys: Box<Vec<EntryKey>>) {
         self.trees[0].merge_with_keys(keys)
+    }
+
+    pub fn remove_to_right(&self, start_key: &EntryKey) {
+        self.trees.iter().for_each(|tree| tree.remove_to_right(start_key));
     }
 }

@@ -123,6 +123,10 @@ impl LSMTreeIns {
     pub fn merge(&self, keys: Box<Vec<EntryKey>>) {
         self.tree.merge(keys)
     }
+
+    pub fn remove_to_right(&self, start_key: &EntryKey) {
+        self.tree.remove_to_right(start_key);
+    }
 }
 
 unsafe impl Send for LSMTreeIns {}

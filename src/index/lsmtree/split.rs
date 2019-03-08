@@ -111,10 +111,11 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
                 // break the main transfer loop when this batch is empty
                 break;
             }
+            let first_batch_key = batch.first().unwrap().clone();
             // submit this batch to new tree
             client.merge(target_id, batch, 0).wait().unwrap().unwrap();
             // remove this batch in current tree
-            unimplemented!();
+            tree.remove_to_right(&SmallVec::from(first_batch_key));
         }
         // split completed
         tree.remove_following_tombstones(&tree_split.start);

@@ -49,6 +49,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::btree::split::remove_to_right;
 
 mod cursor;
 mod dump;
@@ -237,6 +238,7 @@ pub trait LevelTree {
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
     fn remove_following_tombstones(&self, start: &EntryKey);
+    fn remove_to_right(&self, start_key: &EntryKey);
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -292,6 +294,10 @@ where
             .into_iter()
             .filter(|k| k < start)
             .collect();
+    }
+
+    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) {
+        remove_to_right::<KS, PS>(&self.get_root(), start_key);
     }
 }
 
