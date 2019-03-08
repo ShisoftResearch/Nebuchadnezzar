@@ -184,4 +184,8 @@ impl LSMTree {
     pub fn remove_to_right(&self, start_key: &EntryKey) {
         self.trees.iter().for_each(|tree| tree.remove_to_right(start_key));
     }
+
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, Relaxed);
+    }
 }

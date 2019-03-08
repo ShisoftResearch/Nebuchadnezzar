@@ -95,7 +95,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         let mut cursor = tree.seek(max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
-        let client = placement_client(&target_id, client).wait().unwrap();
+        let target_client = placement_client(&target_id, client).wait().unwrap();
         loop {
             let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
@@ -113,16 +113,17 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             }
             let first_batch_key = batch.first().unwrap().clone();
             // submit this batch to new tree
-            client.merge(target_id, batch, 0).wait().unwrap().unwrap();
+            target_client.merge(target_id, batch, 0).wait().unwrap().unwrap();
             // remove this batch in current tree
             tree.remove_to_right(&SmallVec::from(first_batch_key));
         }
         // split completed
         tree.remove_following_tombstones(&tree_split.start);
         // Set new tree epoch from 0 to 1
-        unimplemented!();
-        // Inform the placement driver this tree have completed split
-        unimplemented!();
+        target_client.set_epoch(target_id, 1).wait().unwrap().unwrap();
+        // Bump source epoch and inform the placement driver this tree have completed split
+        let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
+        sm.complete_split(&tree.id, &target_id, &src_epoch).wait().unwrap();
     } else {
         return false;
     }

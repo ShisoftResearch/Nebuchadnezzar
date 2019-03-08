@@ -127,6 +127,10 @@ impl LSMTreeIns {
     pub fn remove_to_right(&self, start_key: &EntryKey) {
         self.tree.remove_to_right(start_key);
     }
+
+    pub fn set_epoch(&self, epoch: u64) {
+        self.tree.set_epoch(epoch);
+    }
 }
 
 unsafe impl Send for LSMTreeIns {}
