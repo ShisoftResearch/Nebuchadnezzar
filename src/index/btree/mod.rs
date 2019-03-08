@@ -323,6 +323,14 @@ impl NodeCellRef {
         }
     }
 
+    pub fn new_none<KS, PS>() -> Self
+        where
+            KS: Slice<EntryKey> + Debug + 'static,
+            PS: Slice<NodeCellRef> + 'static,
+    {
+        Node::<KS, PS>::none_ref()
+    }
+
     #[inline]
     fn deref<KS, PS>(&self) -> &Node<KS, PS>
     where
