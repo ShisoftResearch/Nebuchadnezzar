@@ -44,7 +44,7 @@ pub enum LSMTreeResult<T> {
     EpochMismatch,
 }
 
-impl <T> LSMTreeResult<T> {
+impl<T> LSMTreeResult<T> {
     pub fn unwrap(self) -> T {
         if let LSMTreeResult::Ok(v) = self {
             v

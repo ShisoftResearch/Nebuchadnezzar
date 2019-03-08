@@ -71,11 +71,14 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         // Create the tree in split host
         let client = placement_client(&new_placement_id, client).wait().unwrap();
         let mid_vec = mid_key.iter().cloned().collect_vec();
-        client.new_tree(
-            mid_vec.clone(),
-            tree_key_range.1.iter().cloned().collect(),
-            new_placement_id,
-        ).wait().unwrap();
+        client
+            .new_tree(
+                mid_vec.clone(),
+                tree_key_range.1.iter().cloned().collect(),
+                new_placement_id,
+            )
+            .wait()
+            .unwrap();
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
