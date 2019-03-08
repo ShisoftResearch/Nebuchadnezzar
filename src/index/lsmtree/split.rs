@@ -113,17 +113,27 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             }
             let first_batch_key = batch.first().unwrap().clone();
             // submit this batch to new tree
-            target_client.merge(target_id, batch, 0).wait().unwrap().unwrap();
+            target_client
+                .merge(target_id, batch, 0)
+                .wait()
+                .unwrap()
+                .unwrap();
             // remove this batch in current tree
             tree.remove_to_right(&SmallVec::from(first_batch_key));
         }
         // split completed
         tree.remove_following_tombstones(&tree_split.start);
         // Set new tree epoch from 0 to 1
-        target_client.set_epoch(target_id, 1).wait().unwrap().unwrap();
+        target_client
+            .set_epoch(target_id, 1)
+            .wait()
+            .unwrap()
+            .unwrap();
         // Bump source epoch and inform the placement driver this tree have completed split
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
-        sm.complete_split(&tree.id, &target_id, &src_epoch).wait().unwrap();
+        sm.complete_split(&tree.id, &target_id, &src_epoch)
+            .wait()
+            .unwrap();
     } else {
         return false;
     }

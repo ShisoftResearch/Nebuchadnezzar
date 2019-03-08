@@ -14,6 +14,7 @@ use parking_lot::Mutex;
 use parking_lot::RwLock;
 use ram::segs::MAX_SEGMENT_SIZE;
 use ram::types::Id;
+use rayon::iter::IntoParallelRefIterator;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -21,7 +22,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use rayon::iter::IntoParallelRefIterator;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
@@ -182,7 +182,9 @@ impl LSMTree {
     }
 
     pub fn remove_to_right(&self, start_key: &EntryKey) {
-        self.trees.iter().for_each(|tree| tree.remove_to_right(start_key));
+        self.trees
+            .iter()
+            .for_each(|tree| tree.remove_to_right(start_key));
     }
 
     pub fn set_epoch(&self, epoch: u64) {

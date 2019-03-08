@@ -1,3 +1,4 @@
+use super::placement::sm::client::SMClient;
 use bifrost::rpc::*;
 use bifrost_plugins::hash_ident;
 use client::AsyncClient;
@@ -15,7 +16,6 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
-use super::placement::sm::client::SMClient;
 
 mod inner;
 
@@ -24,7 +24,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LSMTreeSvrError {
     TreeNotFound,
-    SMError
+    SMError,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -197,21 +197,24 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn set_epoch(&self, tree_id: Id, epoch: u64) -> Box<Future<Item=(), Error=LSMTreeSvrError>> {
+    fn set_epoch(
+        &self,
+        tree_id: Id,
+        epoch: u64,
+    ) -> Box<Future<Item = (), Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         let sm = self.sm.clone();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| {
-                    tree.set_epoch(epoch)
-                }))
-            .and_then(move |_| {
-                sm.update_epoch(&tree_id, &epoch)
-                    .map_err(|_| LSMTreeSvrError::SMError)
-                    .map(|_| ())
-            })
+                .map(|tree| tree.set_epoch(epoch)),
+        )
+        .and_then(move |_| {
+            sm.update_epoch(&tree_id, &epoch)
+                .map_err(|_| LSMTreeSvrError::SMError)
+                .map(|_| ())
+        })
     }
 }
 
@@ -221,7 +224,7 @@ impl LSMTreeService {
             neb_client: neb_client.clone(),
             counter: AtomicU64::new(0),
             trees: Arc::new(RwLock::new(HashMap::new())),
-            sm: sm.clone()
+            sm: sm.clone(),
         })
     }
 

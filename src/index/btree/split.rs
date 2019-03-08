@@ -1,15 +1,15 @@
 use index::btree::node::read_node;
+use index::btree::node::write_node;
+use index::btree::node::write_targeted;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
+use index::btree::remove::scatter_node;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
-use index::btree::node::write_node;
-use index::btree::node::write_targeted;
-use index::btree::remove::scatter_node;
 
 pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>
 where
@@ -45,7 +45,11 @@ where
                 debug_assert!(!pivot_node.is_empty_node());
                 debug_assert!(!pivot_node.is_ext());
                 let mut innode = pivot_node.innode_mut();
-                let right_pos = innode.keys.as_slice_immute().binary_search(start_key).unwrap_or_else(|x| x);
+                let right_pos = innode
+                    .keys
+                    .as_slice_immute()
+                    .binary_search(start_key)
+                    .unwrap_or_else(|x| x);
                 debug_assert!(right_pos < innode.len);
                 for i in right_pos..innode.len {
                     innode.ptrs.as_slice()[i + 1] = NodeCellRef::new_none::<KS, PS>();
@@ -64,7 +68,11 @@ where
             debug_assert!(!pivot_node.is_empty_node());
             debug_assert!(pivot_node.is_ext());
             let mut extnode = pivot_node.extnode_mut();
-            extnode.len = extnode.keys.as_slice_immute().binary_search(start_key).unwrap_or_else(|x| x);
+            extnode.len = extnode
+                .keys
+                .as_slice_immute()
+                .binary_search(start_key)
+                .unwrap_or_else(|x| x);
             scatter_node::<KS, PS>(&extnode.next);
         }
     }

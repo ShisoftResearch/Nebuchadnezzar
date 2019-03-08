@@ -376,12 +376,11 @@ where
     }
 }
 
-
 // scatter the node and its references to ensure garbage collection
 pub fn scatter_node<KS, PS>(node_ref: &NodeCellRef)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     if node_ref.is_default() {
         return;
@@ -392,7 +391,7 @@ pub fn scatter_node<KS, PS>(node_ref: &NodeCellRef)
             &NodeData::None => return,
             _ => {}
         }
-        let right  = node.right_ref().unwrap().clone();
+        let right = node.right_ref().unwrap().clone();
         *node = NodeData::None;
         node = write_node::<KS, PS>(&right);
     }

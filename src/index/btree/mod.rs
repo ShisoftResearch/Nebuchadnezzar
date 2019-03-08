@@ -16,6 +16,7 @@ use index::btree::merge::merge_into_tree_node;
 pub use index::btree::node::*;
 use index::btree::remove::*;
 use index::btree::search::*;
+use index::btree::split::remove_to_right;
 use index::Cursor;
 use index::EntryKey;
 use index::Slice;
@@ -49,7 +50,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::btree::split::remove_to_right;
 
 mod cursor;
 mod dump;
@@ -330,9 +330,9 @@ impl NodeCellRef {
     }
 
     pub fn new_none<KS, PS>() -> Self
-        where
-            KS: Slice<EntryKey> + Debug + 'static,
-            PS: Slice<NodeCellRef> + 'static,
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
     {
         Node::<KS, PS>::none_ref()
     }
