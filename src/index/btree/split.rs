@@ -48,7 +48,7 @@ where
                 let right_pos = innode.keys.as_slice_immute().binary_search(start_key).unwrap_or_else(|x| x);
                 debug_assert!(right_pos < innode.len);
                 for i in right_pos..innode.len {
-                    scatter_node::<KS, PS>(&innode.ptrs.as_slice()[i + 1]);
+                    innode.ptrs.as_slice()[i + 1] = NodeCellRef::new_none::<KS, PS>();
                 }
                 scatter_node::<KS, PS>(&innode.right);
                 innode.right = NodeCellRef::new_none::<KS, PS>();

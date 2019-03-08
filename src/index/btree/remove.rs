@@ -377,7 +377,7 @@ where
 }
 
 
-// cascading scatter the node and its references to ensure garbage collection
+// scatter the node and its references to ensure garbage collection
 pub fn scatter_node<KS, PS>(node_ref: &NodeCellRef)
     where
         KS: Slice<EntryKey> + Debug + 'static,
@@ -387,20 +387,13 @@ pub fn scatter_node<KS, PS>(node_ref: &NodeCellRef)
         return;
     }
     let mut node = write_node::<KS, PS>(node_ref);
-    match &mut*node {
-        &mut NodeData::External(ref mut n) => {
-            scatter_node::<KS, PS>(&n.next);
+    loop {
+        match &*node {
+            &NodeData::None => return,
+            _ => {}
         }
-        &mut NodeData::Internal(ref mut n) => {
-            for mut cn in n.ptrs.as_slice() {
-                scatter_node::<KS, PS>(cn);
-            }
-            scatter_node::<KS, PS>(&n.right);
-        }
-        &mut NodeData::Empty(ref mut n) => {
-            scatter_node::<KS, PS>(&n.right);
-        }
-        &mut NodeData::None => {}
+        let right  = node.right_ref().unwrap().clone();
+        *node = NodeData::None;
+        node = write_node::<KS, PS>(&right);
     }
-    *node = NodeData::None;
 }
