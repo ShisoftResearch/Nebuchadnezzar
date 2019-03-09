@@ -6,7 +6,7 @@ use index::btree;
 
 #[test]
 pub fn split() {
-    let server_group = "lsm_insertions";
+    let server_group = "lsm_service_split";
     let server_addr = String::from("127.0.0.1:5700");
     let server = NebServer::new_from_opts(
         &ServerOptions {
