@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
+use index::lsmtree::split::check_and_split;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;

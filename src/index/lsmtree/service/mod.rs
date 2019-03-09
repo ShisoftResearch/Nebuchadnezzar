@@ -16,6 +16,7 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
+use index::lsmtree::split::check_and_split;
 
 mod inner;
 
@@ -230,12 +231,15 @@ impl LSMTreeService {
 
     pub fn start_sentinel(&self) {
         let trees_lock = self.trees.clone();
+        let sm = self.sm.clone();
+        let neb = self.neb_client.clone();
         thread::Builder::new()
             .name("LSM-Tree Serivce Sentinel".to_string())
             .spawn(move || loop {
                 let trees = trees_lock.read().values().cloned().collect_vec();
                 trees.par_iter().for_each(|tree| {
                     tree.check_and_merge();
+                    tree.check_and_split(&tree.tree, &sm, &neb);
                 });
                 thread::sleep(Duration::from_millis(50));
             });

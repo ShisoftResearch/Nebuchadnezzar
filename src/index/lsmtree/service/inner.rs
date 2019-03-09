@@ -18,6 +18,8 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use index::lsmtree::split::check_and_split;
+use index::lsmtree::placement::sm::client::SMClient;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -30,7 +32,7 @@ type CursorMap = LinkedHashMap<u64, DelegatedCursor>;
 type MutCursorRef = Rc<RefCell<LSMTreeCursor>>;
 
 pub struct LSMTreeIns {
-    tree: LSMTree,
+    pub tree: LSMTree,
     counter: AtomicU64,
     cursors: Mutex<CursorMap>,
 }
@@ -130,6 +132,10 @@ impl LSMTreeIns {
 
     pub fn set_epoch(&self, epoch: u64) {
         self.tree.set_epoch(epoch);
+    }
+
+    pub fn check_and_split(&self, tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
+        check_and_split(&self.tree, sm, client)
     }
 }
 
