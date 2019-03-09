@@ -46,22 +46,7 @@ fn default_key_range() -> KeyRange {
 #[test]
 pub fn insertions() {
     env_logger::init();
-    let server_group = "lsm_insertions";
-    let server_addr = String::from("127.0.0.1:5700");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client, default_key_range(), Id::unit_id()));
+    let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -141,22 +126,7 @@ pub fn insertions() {
 #[test]
 pub fn hybrid() {
     env_logger::init();
-    let server_group = "lsm_hybird";
-    let server_addr = String::from("127.0.0.1:5701");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(btree::page_schema()).wait();
-    let tree = Arc::new(LSMTree::new(&client, default_key_range(), Id::unit_id()));
+    let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels

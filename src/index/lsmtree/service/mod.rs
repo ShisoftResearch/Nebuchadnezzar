@@ -19,6 +19,8 @@ use std::sync::atomic::AtomicU64;
 use std::thread;
 
 mod inner;
+#[cfg(test)]
+mod test;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 
@@ -136,7 +138,6 @@ impl Service for LSMTreeService {
             trees.insert(
                 id,
                 Arc::new(LSMTreeIns::new(
-                    &self.neb_client,
                     (EntryKey::from(start), EntryKey::from(end)),
                     id,
                 )),

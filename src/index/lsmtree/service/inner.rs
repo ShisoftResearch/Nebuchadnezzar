@@ -46,9 +46,9 @@ impl DelegatedCursor {
 }
 
 impl LSMTreeIns {
-    pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
+    pub fn new(range: KeyRange, id: Id) -> Self {
         Self {
-            tree: LSMTree::new(neb_client, range, id),
+            tree: LSMTree::new(range, id),
             counter: AtomicU64::new(0),
             cursors: Mutex::new(CursorMap::new()),
         }
