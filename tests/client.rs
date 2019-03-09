@@ -25,6 +25,7 @@ pub fn general() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         &server_group,
@@ -137,6 +138,7 @@ pub fn multi_cell_update() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         server_group,
@@ -216,6 +218,7 @@ pub fn write_skew() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         server_group,
@@ -307,6 +310,7 @@ pub fn server_isolation() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         server_address_1,
         server_1_group,
@@ -326,6 +330,7 @@ pub fn server_isolation() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         server_address_2,
         server_2_group,

@@ -20,6 +20,7 @@ pub fn workspace_wr() {
             memory_size: 16 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         "test",
@@ -150,6 +151,7 @@ pub fn data_site_wr() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         "test",
@@ -237,6 +239,7 @@ pub fn multi_transaction() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         "test",
@@ -335,6 +338,7 @@ pub fn smoke_rw() {
             memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![Service::Cell, Service::Transaction]
         },
         &server_addr,
         "test",

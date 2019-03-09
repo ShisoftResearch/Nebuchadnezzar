@@ -18,6 +18,7 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
+use bifrost::vector_clock::ServerVectorClock;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -42,6 +43,14 @@ pub struct ServerOptions {
     pub memory_size: usize,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
+    pub services: Vec<Service>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Service {
+    Cell,
+    Transaction,
+    LSMTreeIndex,
 }
 
 pub struct ServerMeta {
@@ -54,8 +63,8 @@ pub struct NebServer {
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
     pub member_pool: rpc::ClientPool,
-    pub txn_peer: transactions::Peer,
-    pub raft_service: Option<Arc<raft::RaftService>>,
+    pub txn_peer: Peer,
+    pub raft_service: Arc<raft::RaftService>,
     pub server_id: u64,
     pub cleaner: Cleaner,
 }
@@ -88,20 +97,18 @@ impl NebServer {
         server_addr: &String,
         group_name: &String,
         rpc_server: &Arc<rpc::Server>,
-        raft_service: &Option<Arc<raft::RaftService>>,
+        raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
     ) -> Result<Arc<NebServer>, ServerError> {
         debug!(
             "Creating key-value server instance, group name {}",
             group_name
         );
-        if let &Some(ref raft_service) = raft_service {
-            raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(
-                group_name,
-                raft_service,
-            )));
-            Weights::new_with_id(CONS_HASH_ID, raft_service);
-        }
+        raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(
+            group_name,
+            raft_service,
+        )));
+        Weights::new_with_id(CONS_HASH_ID, raft_service);
         let schemas = LocalSchemasCache::new(group_name, Some(raft_client)).unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
         let chunks = Chunks::new(
@@ -125,22 +132,19 @@ impl NebServer {
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             member_pool: rpc::ClientPool::new(),
-            txn_peer: transactions::Peer::new(server_addr),
+            txn_peer: Peer::new(server_addr),
             raft_service: raft_service.clone(),
             server_id: rpc_server.server_id,
         });
-        rpc_server.register_service(
-            cell_rpc::DEFAULT_SERVICE_ID,
-            &cell_rpc::NebRPCService::new(&server),
-        );
-        rpc_server.register_service(
-            transactions::manager::DEFAULT_SERVICE_ID,
-            &transactions::manager::TransactionManager::new(&server),
-        );
-        rpc_server.register_service(
-            transactions::data_site::DEFAULT_SERVICE_ID,
-            &transactions::data_site::DataManager::new(&server),
-        );
+
+        for service in &opts.services {
+            match service {
+                &Service::Cell => init_cell_rpc_service(rpc_server, &server),
+                &Service::Transaction => init_txn_service(rpc_server, &server),
+                &Service::LSMTreeIndex => init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client)
+            }
+        }
+
         Ok(server)
     }
 
@@ -188,7 +192,7 @@ impl NebServer {
             server_addr,
             group_name,
             &rpc_server,
-            &Some(raft_service),
+            &raft_service,
             &raft_client,
         )
         .unwrap()
@@ -205,6 +209,41 @@ impl NebServer {
         self.member_pool
             .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
     }
+}
+
+// Peer have a clock, meant to update with other servers in the cluster
+pub struct Peer {
+    pub clock: ServerVectorClock,
+}
+
+impl Peer {
+    pub fn new(server_address: &String) -> Peer {
+        Peer {
+            clock: ServerVectorClock::new(server_address),
+        }
+    }
+}
+
+pub fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+    rpc_server.register_service(
+        cell_rpc::DEFAULT_SERVICE_ID,
+        &cell_rpc::NebRPCService::new(&neb_server),
+    );
+}
+
+pub fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+    rpc_server.register_service(
+        transactions::manager::DEFAULT_SERVICE_ID,
+        &transactions::manager::TransactionManager::new(&neb_server),
+    );
+    rpc_server.register_service(
+        transactions::data_site::DEFAULT_SERVICE_ID,
+        &transactions::data_site::DataManager::new(&neb_server),
+    );
+}
+
+pub fn init_lsm_tree_index_serevice(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>, raft_svr: &Arc<raft::RaftService>, raft_client: &Arc<RaftClient>) {
+
 }
 
 #[cfg(test)]
@@ -225,6 +264,7 @@ mod tests {
     use server::ServerOptions;
     use std::sync::Arc;
     use test::Bencher;
+    use server::Service;
 
     const DATA: &'static str = "DATA";
 
@@ -238,6 +278,7 @@ mod tests {
                 memory_size: 512 * 1024 * 1024,
                 backup_storage: Some(format!("test-data/{}-bak", port)),
                 wal_storage: Some(format!("test-data/{}-wal", port)),
+                services: vec![Service::Cell, Service::Transaction, Service::LSMTreeIndex]
             },
             &server_addr,
             &server_group,

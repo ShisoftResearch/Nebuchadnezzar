@@ -3,6 +3,7 @@ use server::NebServer;
 use server::ServerOptions;
 use client;
 use index::btree;
+use server;
 
 #[test]
 pub fn split() {
@@ -14,6 +15,7 @@ pub fn split() {
             memory_size: 3 * 1024 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
+            services: vec![server::Service::Cell, server::Service::LSMTreeIndex]
         },
         &server_addr,
         &server_group,
