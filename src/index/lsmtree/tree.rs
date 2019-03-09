@@ -82,7 +82,7 @@ unsafe impl Sync for LSMTree {}
 impl LSMTree {
 
     pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
-        Self::new_with_levels(init_lsm_level_trees(neb_client), neb_client, range, id)
+        Self::new_with_levels(init_lsm_level_trees(), neb_client, range, id)
     }
 
     pub fn new_with_levels(levels: TreeLevels, neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {

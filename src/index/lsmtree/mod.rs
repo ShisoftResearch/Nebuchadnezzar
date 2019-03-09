@@ -1,3 +1,5 @@
+#[macro_use]
+mod macros;
 mod cursor;
 pub mod placement;
 mod service;

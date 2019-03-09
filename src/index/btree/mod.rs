@@ -77,7 +77,6 @@ where
 {
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
-    storage: Arc<AsyncClient>,
     len: AtomicUsize,
     deleted: DeletionSet,
     marker: PhantomData<(KS, PS)>,
@@ -108,12 +107,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree<KS, PS> {
+    pub fn new() -> BPlusTree<KS, PS> {
         debug!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::with_none())),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
-            storage: neb_client.clone(),
             len: AtomicUsize::new(0),
             deleted: Arc::new(RwLock::new(BTreeSet::new())),
             marker: PhantomData,
