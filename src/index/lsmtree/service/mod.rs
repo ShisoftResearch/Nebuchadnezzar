@@ -123,7 +123,12 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = bool, Error = ()>> {
+    fn new_tree(
+        &self,
+        start: Vec<u8>,
+        end: Vec<u8>,
+        id: Id,
+    ) -> Box<Future<Item = bool, Error = ()>> {
         let mut trees = self.trees.write();
         let succeed = if trees.contains_key(&id) {
             false

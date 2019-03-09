@@ -80,19 +80,26 @@ unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
-
     pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
         Self::new_with_levels(init_lsm_level_trees(), neb_client, range, id)
     }
 
-    pub fn new_with_levels(levels: TreeLevels, neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
+    pub fn new_with_levels(
+        levels: TreeLevels,
+        neb_client: &Arc<AsyncClient>,
+        range: KeyRange,
+        id: Id,
+    ) -> Self {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = levels;
         let lsm_tree_max_size = max_sizes.iter().sum();
         let split = Mutex::new(None);
         let range = Mutex::new(range);
         let epoch = AtomicU64::new(0);
-        debug!("Initialized LSM-tree. max size: {}, id {:?}", lsm_tree_max_size, id);
+        debug!(
+            "Initialized LSM-tree. max size: {}, id {:?}",
+            lsm_tree_max_size, id
+        );
         LSMTree {
             trees,
             max_sizes,

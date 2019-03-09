@@ -54,13 +54,19 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         let tree_key_range = tree.range.lock();
         let mut mid_key = mid_key(tree);
         let mut new_placement_id = Id::rand();
-        debug!("Split at {:?}, split tree id {:?}", mid_key, new_placement_id);
+        debug!(
+            "Split at {:?}, split tree id {:?}",
+            mid_key, new_placement_id
+        );
         // First check with the placement driver
         match sm.prepare_split(&tree.id).wait() {
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
                 mid_key = SmallVec::from(split.mid);
                 new_placement_id = split.dest;
-                debug!("Placement driver reported an ongoing id {:?}", new_placement_id);
+                debug!(
+                    "Placement driver reported an ongoing id {:?}",
+                    new_placement_id
+                );
             }
             Ok(Ok(())) => {}
             _ => panic!("Error on split"),
@@ -82,7 +88,10 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             )
             .wait()
             .unwrap();
-        debug!("Create new split tree with id {:?}, succeed {:?}", new_placement_id, new_tree_created);
+        debug!(
+            "Create new split tree with id {:?}, succeed {:?}",
+            new_placement_id, new_tree_created
+        );
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
@@ -94,7 +103,10 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
-        debug!("Start to split {:?} to {:?} at {:?}", tree.id, tree_split.target, tree_split.start);
+        debug!(
+            "Start to split {:?} to {:?} at {:?}",
+            tree.id, tree_split.target, tree_split.start
+        );
         // Get a cursor from the last key, backwards
         // Backwards are better for rolling batch migration for migrated keys in a batch can be
         // removed from the source tree right after they have been transferred to split tree
@@ -119,7 +131,11 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             }
             batch.reverse();
             let left_most_batch_key = batch.first().unwrap().clone();
-            debug!("Collected batch with size {:?}, first key {:?}", batch.len(), left_most_batch_key);
+            debug!(
+                "Collected batch with size {:?}, first key {:?}",
+                batch.len(),
+                left_most_batch_key
+            );
             // submit this batch to new tree
             target_client
                 .merge(target_id, batch, 0)
