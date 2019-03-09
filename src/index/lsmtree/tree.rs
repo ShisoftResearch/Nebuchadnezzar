@@ -4,6 +4,7 @@ use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
+use index::lsmtree::split::check_and_split;
 use index::lsmtree::split::SplitStatus;
 use index::Cursor;
 use index::EntryKey;
@@ -22,7 +23,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use index::lsmtree::split::check_and_split;
 
 pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;

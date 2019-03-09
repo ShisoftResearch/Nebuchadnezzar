@@ -4,6 +4,7 @@ use bifrost_plugins::hash_ident;
 use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use index::lsmtree::service::inner::LSMTreeIns;
+use index::lsmtree::split::check_and_split;
 use index::lsmtree::tree::{LSMTree, LSMTreeResult};
 use index::{EntryKey, Ordering};
 use itertools::Itertools;
@@ -16,7 +17,6 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
-use index::lsmtree::split::check_and_split;
 
 mod inner;
 

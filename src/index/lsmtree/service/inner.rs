@@ -2,6 +2,8 @@ use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use index;
 use index::lsmtree::cursor::LSMTreeCursor;
+use index::lsmtree::placement::sm::client::SMClient;
+use index::lsmtree::split::check_and_split;
 use index::lsmtree::tree::LSMTree;
 use index::lsmtree::tree::{KeyRange, LSMTreeResult};
 use index::Cursor;
@@ -18,8 +20,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use index::lsmtree::split::check_and_split;
-use index::lsmtree::placement::sm::client::SMClient;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -134,7 +134,12 @@ impl LSMTreeIns {
         self.tree.set_epoch(epoch);
     }
 
-    pub fn check_and_split(&self, tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
+    pub fn check_and_split(
+        &self,
+        tree: &LSMTree,
+        sm: &Arc<SMClient>,
+        client: &Arc<AsyncClient>,
+    ) -> bool {
         check_and_split(&self.tree, sm, client)
     }
 }
