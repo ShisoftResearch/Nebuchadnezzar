@@ -41,7 +41,7 @@ service! {
     rpc next(tree_id: Id, cursor_id: u64) -> Option<bool> | LSMTreeSvrError;
     rpc current(tree_id: Id, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
     rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
-    rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id);
+    rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id) -> bool;
     rpc summary() -> Vec<LSMTreeSummary>;
 
     rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
@@ -123,17 +123,22 @@ impl Service for LSMTreeService {
         )
     }
 
-    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = (), Error = ()>> {
+    fn new_tree(&self, start: Vec<u8>, end: Vec<u8>, id: Id) -> Box<Future<Item = bool, Error = ()>> {
         let mut trees = self.trees.write();
-        trees.insert(
-            id,
-            Arc::new(LSMTreeIns::new(
-                &self.neb_client,
-                (EntryKey::from(start), EntryKey::from(end)),
+        let succeed = if trees.contains_key(&id) {
+            false
+        } else {
+            trees.insert(
                 id,
-            )),
-        );
-        box future::ok(())
+                Arc::new(LSMTreeIns::new(
+                    &self.neb_client,
+                    (EntryKey::from(start), EntryKey::from(end)),
+                    id,
+                )),
+            );
+            true
+        };
+        box future::ok(succeed)
     }
 
     fn summary(&self) -> Box<Future<Item = Vec<LSMTreeSummary>, Error = ()>> {
@@ -234,14 +239,14 @@ impl LSMTreeService {
         let sm = self.sm.clone();
         let neb = self.neb_client.clone();
         thread::Builder::new()
-            .name("LSM-Tree Serivce Sentinel".to_string())
+            .name("LSM-Tree Service Sentinel".to_string())
             .spawn(move || loop {
                 let trees = trees_lock.read().values().cloned().collect_vec();
                 trees.par_iter().for_each(|tree| {
                     tree.check_and_merge();
                     tree.check_and_split(&tree.tree, &sm, &neb);
                 });
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(Duration::from_millis(100));
             });
     }
 }

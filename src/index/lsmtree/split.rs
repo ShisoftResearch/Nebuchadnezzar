@@ -49,15 +49,18 @@ pub fn placement_client(
 
 pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
     if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
+        debug!("LSM Tree {:?} is full, will split", tree.id);
         // need to initiate a split
         let tree_key_range = tree.range.lock();
         let mut mid_key = mid_key(tree);
         let mut new_placement_id = Id::rand();
+        debug!("Split at {:?}, split tree id {:?}", mid_key, new_placement_id);
         // First check with the placement driver
         match sm.prepare_split(&tree.id).wait() {
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
                 mid_key = SmallVec::from(split.mid);
                 new_placement_id = split.dest;
+                debug!("Placement driver reported an ongoing id {:?}", new_placement_id);
             }
             Ok(Ok(())) => {}
             _ => panic!("Error on split"),
@@ -71,7 +74,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         // Create the tree in split host
         let client = placement_client(&new_placement_id, client).wait().unwrap();
         let mid_vec = mid_key.iter().cloned().collect_vec();
-        client
+        let new_tree_created = client
             .new_tree(
                 mid_vec.clone(),
                 tree_key_range.1.iter().cloned().collect(),
@@ -79,16 +82,19 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             )
             .wait()
             .unwrap();
+        debug!("Create new split tree with id {:?}, succeed {:?}", new_placement_id, new_tree_created);
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
         sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch)
             .wait()
             .unwrap();
+        debug!("Bumped source tree {:?} epoch to {}", tree.id, src_epoch);
     }
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
+        debug!("Start to split {:?} to {:?} at {:?}", tree.id, tree_split.target, tree_split.start);
         // Get a cursor from the last key, backwards
         // Backwards are better for rolling batch migration for migrated keys in a batch can be
         // removed from the source tree right after they have been transferred to split tree
@@ -111,7 +117,9 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
                 // break the main transfer loop when this batch is empty
                 break;
             }
-            let first_batch_key = batch.first().unwrap().clone();
+            batch.reverse();
+            let left_most_batch_key = batch.first().unwrap().clone();
+            debug!("Collected batch with size {:?}, first key {:?}", batch.len(), left_most_batch_key);
             // submit this batch to new tree
             target_client
                 .merge(target_id, batch, 0)
@@ -119,10 +127,12 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
                 .unwrap()
                 .unwrap();
             // remove this batch in current tree
-            tree.remove_to_right(&SmallVec::from(first_batch_key));
+            tree.remove_to_right(&SmallVec::from(left_most_batch_key));
         }
+        debug!("Split completed, remove tomestones to right");
         // split completed
         tree.remove_following_tombstones(&tree_split.start);
+        debug!("Tomestones removed, finalizing target");
         // Set new tree epoch from 0 to 1
         target_client
             .set_epoch(target_id, 1)
@@ -130,6 +140,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             .unwrap()
             .unwrap();
         // Bump source epoch and inform the placement driver this tree have completed split
+        debug!("Updating placement driver");
         let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
         sm.complete_split(&tree.id, &target_id, &src_epoch)
             .wait()
@@ -138,5 +149,6 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         return false;
     }
     *tree_split = None;
+    debug!("LSM-Tree split completed for {:?}", tree.id);
     true
 }

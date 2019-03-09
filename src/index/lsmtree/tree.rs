@@ -92,7 +92,7 @@ impl LSMTree {
         let split = Mutex::new(None);
         let range = Mutex::new(range);
         let epoch = AtomicU64::new(0);
-        debug!("Initialized LSM-tree");
+        debug!("Initialized LSM-tree. max size: {}, id {:?}", lsm_tree_max_size, id);
         LSMTree {
             trees,
             max_sizes,
