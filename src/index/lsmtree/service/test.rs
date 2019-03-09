@@ -1,9 +1,9 @@
 use super::*;
-use server::NebServer;
-use server::ServerOptions;
 use client;
 use index::btree;
 use server;
+use server::NebServer;
+use server::ServerOptions;
 
 #[test]
 pub fn split() {
@@ -15,7 +15,7 @@ pub fn split() {
             memory_size: 3 * 1024 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
-            services: vec![server::Service::Cell, server::Service::LSMTreeIndex]
+            services: vec![server::Service::Cell, server::Service::LSMTreeIndex],
         },
         &server_addr,
         &server_group,
@@ -23,5 +23,4 @@ pub fn split() {
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
     client.new_schema_with_id(btree::page_schema()).wait();
-
 }

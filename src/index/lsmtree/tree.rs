@@ -84,11 +84,7 @@ impl LSMTree {
         Self::new_with_levels(init_lsm_level_trees(), range, id)
     }
 
-    pub fn new_with_levels(
-        levels: TreeLevels,
-        range: KeyRange,
-        id: Id,
-    ) -> Self {
+    pub fn new_with_levels(levels: TreeLevels, range: KeyRange, id: Id) -> Self {
         debug!("Initializing LSM-tree...");
         let (trees, max_sizes) = levels;
         let lsm_tree_max_size = max_sizes.iter().sum();

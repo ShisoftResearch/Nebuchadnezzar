@@ -34,7 +34,7 @@ pub fn init() {
             memory_size: 16 * 1024,
             backup_storage: None,
             wal_storage: None,
-            services: vec![]
+            services: vec![],
         },
         &String::from("127.0.0.1:5100"),
         &String::from("test"),
@@ -57,7 +57,7 @@ pub fn smoke_test() {
             memory_size: 512 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
-            services: vec![Service::Cell]
+            services: vec![Service::Cell],
         },
         &server_addr,
         &server_group,
@@ -135,7 +135,7 @@ pub fn smoke_test_parallel() {
             memory_size: 512 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
-            services: vec![Service::Cell]
+            services: vec![Service::Cell],
         },
         &server_addr,
         &server_group,
@@ -237,7 +237,7 @@ pub fn txn() {
             memory_size: 512 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
-            services: vec![Service::Cell, Service::Transaction]
+            services: vec![Service::Cell, Service::Transaction],
         },
         &server_addr,
         &server_group,

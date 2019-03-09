@@ -9,6 +9,7 @@ use bifrost::rpc;
 use bifrost::rpc::Server;
 use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use bifrost::utils::fut_exec::wait;
+use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 use futures::Future;
 use ram::chunk::Chunks;
@@ -18,7 +19,6 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
-use bifrost::vector_clock::ServerVectorClock;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -141,7 +141,9 @@ impl NebServer {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
                 &Service::Transaction => init_txn_service(rpc_server, &server),
-                &Service::LSMTreeIndex => init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client)
+                &Service::LSMTreeIndex => {
+                    init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client)
+                }
             }
         }
 
@@ -242,7 +244,12 @@ pub fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     );
 }
 
-pub fn init_lsm_tree_index_serevice(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>, raft_svr: &Arc<raft::RaftService>, raft_client: &Arc<RaftClient>) {
+pub fn init_lsm_tree_index_serevice(
+    rpc_server: &Arc<Server>,
+    neb_server: &Arc<NebServer>,
+    raft_svr: &Arc<raft::RaftService>,
+    raft_client: &Arc<RaftClient>,
+) {
 
 }
 
@@ -262,9 +269,9 @@ mod tests {
     use ram::types::*;
     use server::NebServer;
     use server::ServerOptions;
+    use server::Service;
     use std::sync::Arc;
     use test::Bencher;
-    use server::Service;
 
     const DATA: &'static str = "DATA";
 
@@ -278,7 +285,7 @@ mod tests {
                 memory_size: 512 * 1024 * 1024,
                 backup_storage: Some(format!("test-data/{}-bak", port)),
                 wal_storage: Some(format!("test-data/{}-wal", port)),
-                services: vec![Service::Cell, Service::Transaction, Service::LSMTreeIndex]
+                services: vec![Service::Cell, Service::Transaction, Service::LSMTreeIndex],
             },
             &server_addr,
             &server_group,
