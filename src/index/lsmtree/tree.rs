@@ -37,6 +37,7 @@ const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 type LevelTrees = Vec<Box<LevelTree>>;
 pub type Ptr = NodeCellRef;
 pub type Key = EntryKey;
+pub type TreeLevels = (LevelTrees, Vec<usize>);
 
 pub type KeyRange = (EntryKey, EntryKey);
 
@@ -79,9 +80,14 @@ unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
 
 impl LSMTree {
+
     pub fn new(neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
+        Self::new_with_levels(init_lsm_level_trees(neb_client), neb_client, range, id)
+    }
+
+    pub fn new_with_levels(levels: TreeLevels, neb_client: &Arc<AsyncClient>, range: KeyRange, id: Id) -> Self {
         debug!("Initializing LSM-tree...");
-        let (trees, max_sizes) = init_lsm_level_trees(neb_client);
+        let (trees, max_sizes) = levels;
         let lsm_tree_max_size = max_sizes.iter().sum();
         let split = Mutex::new(None);
         let range = Mutex::new(range);
