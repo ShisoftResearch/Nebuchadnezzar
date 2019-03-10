@@ -2,7 +2,7 @@
 mod macros;
 mod cursor;
 pub mod placement;
-mod service;
+pub mod service;
 mod split;
 #[cfg(test)]
 mod test;

@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use server::NebServer;
 
 pub struct SplitStatus {
     start: EntryKey,
@@ -37,17 +38,17 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
 
 pub fn placement_client(
     id: &Id,
-    client: &Arc<AsyncClient>,
+    neb: &Arc<NebServer>,
 ) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
-    let server_id = client.locate_server_id(id).unwrap();
-    let client = client.clone();
+    let server_id = neb.get_server_id_by_id(id).unwrap();
+    let neb = neb.clone();
     DEFAULT_CLIENT_POOL
-        .get_by_id_async(server_id, move |sid| client.conshash().to_server_name(sid))
+        .get_by_id_async(server_id, move |sid| neb.conshash().to_server_name(sid))
         .map_err(|e| RPCError::IOError(e))
         .map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
-pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncClient>) -> bool {
+pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> bool {
     if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
         debug!("LSM Tree {:?} is full, will split", tree.id);
         // need to initiate a split
@@ -78,7 +79,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
             target: new_placement_id,
         });
         // Create the tree in split host
-        let client = placement_client(&new_placement_id, client).wait().unwrap();
+        let client = placement_client(&new_placement_id, neb).wait().unwrap();
         let mid_vec = mid_key.iter().cloned().collect_vec();
         let new_tree_created = client
             .new_tree(
@@ -113,7 +114,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, client: &Arc<AsyncCli
         let mut cursor = tree.seek(max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
-        let target_client = placement_client(&target_id, client).wait().unwrap();
+        let target_client = placement_client(&target_id, neb).wait().unwrap();
         loop {
             let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {

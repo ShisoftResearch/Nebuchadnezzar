@@ -17,6 +17,7 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
+use server::NebServer;
 
 mod inner;
 #[cfg(test)]
@@ -31,7 +32,7 @@ pub enum LSMTreeSvrError {
 }
 
 #[derive(Serialize, Deserialize)]
-struct LSMTreeSummary {
+pub struct LSMTreeSummary {
     id: Id,
     count: u64,
     epoch: u64,
@@ -52,7 +53,7 @@ service! {
 }
 
 pub struct LSMTreeService {
-    neb_client: Arc<AsyncClient>,
+    neb_server: Arc<NebServer>,
     sm: Arc<SMClient>,
     counter: AtomicU64,
     trees: Arc<RwLock<HashMap<Id, Arc<LSMTreeIns>>>>,
@@ -231,9 +232,9 @@ impl Service for LSMTreeService {
 }
 
 impl LSMTreeService {
-    pub fn new(neb_client: &Arc<AsyncClient>, sm: &Arc<SMClient>) -> Arc<Self> {
+    pub fn new(neb_server: &Arc<NebServer>, sm: &Arc<SMClient>) -> Arc<Self> {
         Arc::new(Self {
-            neb_client: neb_client.clone(),
+            neb_server: neb_server.clone(),
             counter: AtomicU64::new(0),
             trees: Arc::new(RwLock::new(HashMap::new())),
             sm: sm.clone(),
@@ -243,7 +244,7 @@ impl LSMTreeService {
     pub fn start_sentinel(&self) {
         let trees_lock = self.trees.clone();
         let sm = self.sm.clone();
-        let neb = self.neb_client.clone();
+        let neb = self.neb_server.clone();
         thread::Builder::new()
             .name("LSM-Tree Service Sentinel".to_string())
             .spawn(move || loop {

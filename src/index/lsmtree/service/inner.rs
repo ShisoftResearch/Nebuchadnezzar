@@ -20,6 +20,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use server::NebServer;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -138,9 +139,9 @@ impl LSMTreeIns {
         &self,
         tree: &LSMTree,
         sm: &Arc<SMClient>,
-        client: &Arc<AsyncClient>,
+        neb: &Arc<NebServer>,
     ) -> bool {
-        check_and_split(&self.tree, sm, client)
+        check_and_split(&self.tree, sm, neb)
     }
 }
 

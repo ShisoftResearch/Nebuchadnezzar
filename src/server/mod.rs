@@ -19,6 +19,8 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
+use index::lsmtree;
+use client;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -136,7 +138,6 @@ impl NebServer {
             raft_service: raft_service.clone(),
             server_id: rpc_server.server_id,
         });
-
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
@@ -159,7 +160,7 @@ impl NebServer {
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         let rpc_server = rpc::Server::new(server_addr);
-        let meta_mambers = &vec![server_addr.to_owned()];
+        let meta_members = &vec![server_addr.to_owned()];
         let raft_service = raft::RaftService::new(raft::Options {
             storage: raft::Storage::MEMORY,
             address: server_addr.to_owned(),
@@ -168,7 +169,7 @@ impl NebServer {
         Server::listen_and_resume(&rpc_server);
         rpc_server.register_service(raft::DEFAULT_SERVICE_ID, &raft_service);
         raft::RaftService::start(&raft_service);
-        match raft_service.join(meta_mambers) {
+        match raft_service.join(meta_members) {
             Err(sm_master::ExecError::CannotConstructClient) => {
                 info!("Cannot join meta cluster, will bootstrap one.");
                 raft_service.bootstrap();
@@ -185,7 +186,7 @@ impl NebServer {
             }
         }
         Membership::new(&rpc_server, &raft_service);
-        let raft_client = RaftClient::new(meta_mambers, raft::DEFAULT_SERVICE_ID).unwrap();
+        let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).unwrap();
         RaftClient::prepare_subscription(&rpc_server);
         let member_service = MemberService::new(server_addr, &raft_client);
         member_service.join_group(group_name).wait().unwrap();
@@ -210,6 +211,9 @@ impl NebServer {
     pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
             .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
+    }
+    pub fn conshash(&self) -> &ConsistentHashing {
+        &*self.consh
     }
 }
 
@@ -250,7 +254,12 @@ pub fn init_lsm_tree_index_serevice(
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
 ) {
-
+    raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new());
+    let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(lsmtree::placement::sm::SM_ID, raft_client));
+    rpc_server.register_service(
+        lsmtree::service::DEFAULT_SERVICE_ID,
+        &lsmtree::service::LSMTreeService::new(neb_server, &sm_client)
+    );
 }
 
 #[cfg(test)]
