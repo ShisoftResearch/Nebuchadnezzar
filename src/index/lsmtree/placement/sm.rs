@@ -183,7 +183,7 @@ impl PlacementSM {
     pub fn new() -> Self {
         Self {
             placements: HashMap::new(),
-            starts: BTreeMap::new()
+            starts: BTreeMap::new(),
         }
     }
 }

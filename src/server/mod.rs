@@ -11,7 +11,9 @@ use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use bifrost::utils::fut_exec::wait;
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
+use client;
 use futures::Future;
+use index::lsmtree;
 use ram::chunk::Chunks;
 use ram::cleaner::Cleaner;
 use ram::schema::sm as schema_sm;
@@ -19,8 +21,6 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
-use index::lsmtree;
-use client;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -255,10 +255,13 @@ pub fn init_lsm_tree_index_serevice(
     raft_client: &Arc<RaftClient>,
 ) {
     raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new());
-    let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(lsmtree::placement::sm::SM_ID, raft_client));
+    let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(
+        lsmtree::placement::sm::SM_ID,
+        raft_client,
+    ));
     rpc_server.register_service(
         lsmtree::service::DEFAULT_SERVICE_ID,
-        &lsmtree::service::LSMTreeService::new(neb_server, &sm_client)
+        &lsmtree::service::LSMTreeService::new(neb_server, &sm_client),
     );
 }
 

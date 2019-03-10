@@ -14,10 +14,10 @@ use index::Ordering::{Backward, Forward};
 use itertools::Itertools;
 use ram::types::RandValue;
 use rayon::prelude::*;
+use server::NebServer;
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use server::NebServer;
 
 pub struct SplitStatus {
     start: EntryKey,

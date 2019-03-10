@@ -12,6 +12,7 @@ use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
 use ram::clock;
+use server::NebServer;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::collections::btree_map::BTreeMap;
@@ -20,7 +21,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use server::NebServer;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
