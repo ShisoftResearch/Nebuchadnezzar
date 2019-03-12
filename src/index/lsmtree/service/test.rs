@@ -87,7 +87,7 @@ pub fn split() {
         lsm_tree.insert(entry_key);
     });
     debug!("Inserted {} elements", test_volume);
-
+    
     lsm_tree.bump_epoch();
     // check_and_split(&lsm_tree, &sm_client, &server);
 

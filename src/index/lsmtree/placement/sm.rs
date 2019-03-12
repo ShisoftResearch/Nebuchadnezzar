@@ -26,11 +26,13 @@ pub enum CmdError {
     NoSplitInProgress,
     MidOutOfRange,
     PlacementNotFound,
+    PlacementExists
 }
 
 #[derive(Serialize, Deserialize)]
 pub enum QueryError {
     OutOfRange,
+    PlacementNotFound,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -46,9 +48,10 @@ pub struct InSplitStatus {
     pub mid: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Placement {
-    starts: EntryKey,
-    ends: EntryKey,
+    starts: Vec<u8>,
+    ends: Vec<u8>,
     in_split: Option<InSplitStatus>,
     epoch: u64,
     id: Id,
@@ -56,7 +59,7 @@ pub struct Placement {
 
 pub struct PlacementSM {
     placements: HashMap<Id, Placement>,
-    starts: BTreeMap<EntryKey, Id>,
+    starts: BTreeMap<Vec<u8>, Id>,
 }
 
 raft_state_machine! {
@@ -64,7 +67,10 @@ raft_state_machine! {
     def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> u64 | CmdError;
     def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
     def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
+    def cmd upsert(placement: Placement) -> () | CmdError;
     def qry locate(id: Vec<u8>) -> QueryResult | QueryError;
+    def qry all() -> Vec<Placement>;
+    def qry get(id: Id) -> Placement | QueryError;
 }
 
 impl StateMachineCmds for PlacementSM {
@@ -91,15 +97,13 @@ impl StateMachineCmds for PlacementSM {
             if let &Some(ref in_progress) = &source_placement.in_split {
                 return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
             }
-
-            let mid_key: EntryKey = SmallVec::from(mid);
-            if mid_key < source_placement.starts || mid_key >= source_placement.ends {
+            if mid < source_placement.starts || mid >= source_placement.ends {
                 return Err(CmdError::MidOutOfRange);
             }
 
             source_placement.in_split = Some(InSplitStatus {
                 dest,
-                mid: mid_key.into_iter().collect(),
+                mid,
             });
             source_placement.epoch = src_epoch;
             Ok(source_placement.epoch)
@@ -116,10 +120,9 @@ impl StateMachineCmds for PlacementSM {
                         return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
                     }
                     let dest_ends = source_placement.ends.clone();
-                    let source_ends = SmallVec::from(in_progress.mid.clone());
-                    source_placement.ends = source_ends.clone();
+                    source_placement.ends = in_progress.mid.clone();
                     Placement {
-                        starts: source_ends,
+                        starts: source_placement.ends.clone(),
                         ends: dest_ends,
                         in_split: None,
                         epoch: 0,
@@ -150,9 +153,22 @@ impl StateMachineCmds for PlacementSM {
         }
     }
 
+    fn upsert(&mut self, placement: Placement) -> Result<(), CmdError> {
+        if let Some(p) = self.placements.get(&placement.id) {
+            if let Some(id) = self.starts.get(&placement.starts) {
+                if id != &placement.id {
+                    // return error if existed id at this position is not we are inserting
+                    return Err(CmdError::PlacementExists);
+                }
+            }
+        }
+        self.starts.insert(placement.starts.clone(), placement.id);
+        self.placements.insert(placement.id, placement);
+        Ok(())
+    }
+
     fn locate(&self, entry: Vec<u8>) -> Result<QueryResult, QueryError> {
-        let search_key = SmallVec::from(entry);
-        if let Some((_, placement_id)) = self.starts.range(..=search_key).last() {
+        if let Some((_, placement_id)) = self.starts.range(..=entry).last() {
             let placement = self.placements.get(placement_id).unwrap();
             let split = placement.in_split.as_ref().map(|s| (s.mid.clone(), s.dest));
             return Ok(QueryResult {
@@ -163,6 +179,14 @@ impl StateMachineCmds for PlacementSM {
         } else {
             return Err(QueryError::OutOfRange);
         }
+    }
+
+    fn all(&self) -> Result<Vec<Placement>, ()> {
+        Ok(self.placements.values().cloned().collect())
+    }
+
+    fn get(&self, id: Id) -> Result<Placement, QueryError> {
+        self.placements.get(&id).ok_or(QueryError::PlacementNotFound).map(|p| p.clone())
     }
 }
 
