@@ -88,6 +88,7 @@ pub fn split() {
     });
     debug!("Inserted {} elements", test_volume);
 
+    sm_client.upsert(&lsm_tree.to_placement()).wait().unwrap();
     lsm_tree.bump_epoch();
-    // check_and_split(&lsm_tree, &sm_client, &server);
+    check_and_split(&lsm_tree, &sm_client, &server);
 }

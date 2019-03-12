@@ -20,8 +20,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 pub struct SplitStatus {
-    start: EntryKey,
-    target: Id,
+    pub pivot: EntryKey,
+    pub target: Id,
 }
 
 pub fn mid_key(tree: &LSMTree) -> EntryKey {
@@ -62,7 +62,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         // First check with the placement driver
         match sm.prepare_split(&tree.id).wait() {
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
-                mid_key = SmallVec::from(split.mid);
+                mid_key = SmallVec::from(split.pivot);
                 new_placement_id = split.dest;
                 debug!(
                     "Placement driver reported an ongoing id {:?}",
@@ -76,7 +76,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         // Then save this metadata to current tree 'split' field
         let mut split = tree.split.lock();
         *split = Some(SplitStatus {
-            start: mid_key.clone(),
+            pivot: mid_key.clone(),
             target: new_placement_id,
         });
         // Create the tree in split host
@@ -107,7 +107,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
     if let Some(tree_split) = &*tree_split {
         debug!(
             "Start to split {:?} to {:?} at {:?}",
-            tree.id, tree_split.target, tree_split.start
+            tree.id, tree_split.target, tree_split.pivot
         );
         // Get a cursor from the last key, backwards
         // Backwards are better for rolling batch migration for migrated keys in a batch can be
@@ -120,7 +120,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
                 let key = cursor.current().unwrap().clone();
-                if &key < &tree_split.start {
+                if &key < &tree_split.pivot {
                     // break batch loop when current key out of mid key bound
                     break;
                 }
@@ -149,7 +149,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         }
         debug!("Split completed, remove tomestones to right");
         // split completed
-        tree.remove_following_tombstones(&tree_split.start);
+        tree.remove_following_tombstones(&tree_split.pivot);
         debug!("Tomestones removed, finalizing target");
         // Set new tree epoch from 0 to 1
         target_client

@@ -45,16 +45,16 @@ pub struct QueryResult {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InSplitStatus {
     pub dest: Id,
-    pub mid: Vec<u8>,
+    pub pivot: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Placement {
-    starts: Vec<u8>,
-    ends: Vec<u8>,
-    in_split: Option<InSplitStatus>,
-    epoch: u64,
-    id: Id,
+    pub starts: Vec<u8>,
+    pub ends: Vec<u8>,
+    pub in_split: Option<InSplitStatus>,
+    pub epoch: u64,
+    pub id: Id,
 }
 
 pub struct PlacementSM {
@@ -101,7 +101,7 @@ impl StateMachineCmds for PlacementSM {
                 return Err(CmdError::MidOutOfRange);
             }
 
-            source_placement.in_split = Some(InSplitStatus { dest, mid });
+            source_placement.in_split = Some(InSplitStatus { dest, pivot: mid });
             source_placement.epoch = src_epoch;
             Ok(source_placement.epoch)
         } else {
@@ -117,7 +117,7 @@ impl StateMachineCmds for PlacementSM {
                         return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
                     }
                     let dest_ends = source_placement.ends.clone();
-                    source_placement.ends = in_progress.mid.clone();
+                    source_placement.ends = in_progress.pivot.clone();
                     Placement {
                         starts: source_placement.ends.clone(),
                         ends: dest_ends,
@@ -167,7 +167,7 @@ impl StateMachineCmds for PlacementSM {
     fn locate(&self, entry: Vec<u8>) -> Result<QueryResult, QueryError> {
         if let Some((_, placement_id)) = self.starts.range(..=entry).last() {
             let placement = self.placements.get(placement_id).unwrap();
-            let split = placement.in_split.as_ref().map(|s| (s.mid.clone(), s.dest));
+            let split = placement.in_split.as_ref().map(|s| (s.pivot.clone(), s.dest));
             return Ok(QueryResult {
                 id: placement.id,
                 split,

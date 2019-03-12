@@ -4,6 +4,8 @@ use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
+use index::lsmtree::placement::sm::InSplitStatus;
+use index::lsmtree::placement::sm::Placement;
 use index::lsmtree::split::check_and_split;
 use index::lsmtree::split::SplitStatus;
 use index::Cursor;
@@ -204,5 +206,19 @@ impl LSMTree {
 
     pub fn bump_epoch(&self) -> u64 {
         self.epoch.fetch_add(1, Relaxed) + 1
+    }
+
+    pub fn to_placement(&self) -> Placement {
+        let range = self.range.lock();
+        Placement {
+            starts: range.0.iter().cloned().collect(),
+            ends: range.1.iter().cloned().collect(),
+            in_split: self.split.lock().as_ref().map(|stat| InSplitStatus {
+                dest: stat.target,
+                pivot: stat.pivot.iter().cloned().collect(),
+            }),
+            epoch: self.epoch(),
+            id: self.id,
+        }
     }
 }
