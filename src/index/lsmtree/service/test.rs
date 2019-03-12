@@ -1,8 +1,11 @@
 use super::*;
+use bifrost::raft;
+use bifrost::raft::client::RaftClient;
 use client;
 use client::AsyncClient;
 use index::btree;
 use index::btree::max_entry_key;
+use index::btree::test::u64_to_slice;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
@@ -21,6 +24,8 @@ use parking_lot::RwLock;
 use ram::segs::MAX_SEGMENT_SIZE;
 use ram::types::Id;
 use ram::types::RandValue;
+use rand::thread_rng;
+use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use server;
 use server::NebServer;
@@ -32,11 +37,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use rand::thread_rng;
-use rand::Rng;
-use index::btree::test::u64_to_slice;
-use bifrost::raft::client::RaftClient;
-use bifrost::raft;
 
 with_levels! {
     lm, 8;
@@ -87,8 +87,7 @@ pub fn split() {
         lsm_tree.insert(entry_key);
     });
     debug!("Inserted {} elements", test_volume);
-    
+
     lsm_tree.bump_epoch();
     // check_and_split(&lsm_tree, &sm_client, &server);
-
 }

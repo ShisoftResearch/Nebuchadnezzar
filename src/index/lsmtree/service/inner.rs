@@ -20,8 +20,8 @@ use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -136,11 +136,7 @@ impl LSMTreeIns {
         self.tree.set_epoch(epoch);
     }
 
-    pub fn check_and_split(
-        &self,
-        sm: &Arc<SMClient>,
-        neb: &Arc<NebServer>,
-    ) -> bool {
+    pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> bool {
         check_and_split(&self.tree, sm, neb)
     }
 }

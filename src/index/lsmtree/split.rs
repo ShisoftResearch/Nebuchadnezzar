@@ -69,7 +69,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
                     new_placement_id
                 );
             }
-            Ok(Ok(())) => {},
+            Ok(Ok(())) => {}
             Ok(o) => panic!("Unknown state {:?}", o),
             Err(e) => panic!("Error on state machine {:?}", e),
         }

@@ -26,7 +26,7 @@ pub enum CmdError {
     NoSplitInProgress,
     MidOutOfRange,
     PlacementNotFound,
-    PlacementExists
+    PlacementExists,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -101,10 +101,7 @@ impl StateMachineCmds for PlacementSM {
                 return Err(CmdError::MidOutOfRange);
             }
 
-            source_placement.in_split = Some(InSplitStatus {
-                dest,
-                mid,
-            });
+            source_placement.in_split = Some(InSplitStatus { dest, mid });
             source_placement.epoch = src_epoch;
             Ok(source_placement.epoch)
         } else {
@@ -186,7 +183,10 @@ impl StateMachineCmds for PlacementSM {
     }
 
     fn get(&self, id: Id) -> Result<Placement, QueryError> {
-        self.placements.get(&id).ok_or(QueryError::PlacementNotFound).map(|p| p.clone())
+        self.placements
+            .get(&id)
+            .ok_or(QueryError::PlacementNotFound)
+            .map(|p| p.clone())
     }
 }
 
