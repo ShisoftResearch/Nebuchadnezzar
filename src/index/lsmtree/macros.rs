@@ -1,5 +1,5 @@
 macro_rules! with_levels {
-    ($($sym:ident, $level_size:ident;)*) => {
+    ($($sym:ident, $level_size:expr;)*) => {
         $(
             mod $sym {
                 use super::*;
@@ -69,15 +69,14 @@ macro_rules! with_levels {
         fn init_lsm_level_trees() -> (LevelTrees, Vec<usize>) {
             let mut trees = LevelTrees::new();
             let mut max_elements_list = Vec::new();
-            let mut max_elements = LEVEL_M_MAX_ELEMENTS_COUNT;
             debug!("Initialize level trees...");
             $(
                 debug!("Initialize tree {}...", stringify!($sym));
                 trees.push(box $sym::Tree::new());
                 debug!("Tree {} initialized...", stringify!($sym));
                 const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
-                max_elements *= LEVEL_ELEMENTS_MULTIPLIER;
-                max_elements_list.push(max_elements);
+                let level_size = $level_size * $level_size * $level_size;
+                max_elements_list.push(level_size);
             )*
             debug!("Level trees initialized...");
             return (trees, max_elements_list);

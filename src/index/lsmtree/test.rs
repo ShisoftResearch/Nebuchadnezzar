@@ -23,15 +23,7 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-
-fn u64_to_slice(n: u64) -> [u8; 8] {
-    let mut key_slice = [0u8; 8];
-    {
-        let mut cursor = StdCursor::new(&mut key_slice[..]);
-        cursor.write_u64::<BigEndian>(n);
-    };
-    key_slice
-}
+use index::btree::test::u64_to_slice;
 
 fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {

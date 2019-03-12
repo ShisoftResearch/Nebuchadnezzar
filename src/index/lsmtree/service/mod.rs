@@ -251,7 +251,7 @@ impl LSMTreeService {
                 let trees = trees_lock.read().values().cloned().collect_vec();
                 trees.par_iter().for_each(|tree| {
                     tree.check_and_merge();
-                    tree.check_and_split(&tree.tree, &sm, &neb);
+                    tree.check_and_split(&sm, &neb);
                 });
                 thread::sleep(Duration::from_millis(100));
             });

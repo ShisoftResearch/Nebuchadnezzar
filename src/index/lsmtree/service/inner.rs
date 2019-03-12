@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
 
@@ -62,7 +63,7 @@ impl LSMTreeIns {
         })
     }
 
-    fn pop_expired(map: &mut MutexGuard<CursorMap>) {
+    fn pop_expired_cursors(map: &mut MutexGuard<CursorMap>) {
         let mut expired_cursors = 0;
         while let Some((_, c)) = map.iter().next() {
             if c.timestamp + CURSOR_DEFAULT_TTL < clock::now() {
@@ -79,7 +80,7 @@ impl LSMTreeIns {
     pub fn seek(&self, key: EntryKey, ordering: index::Ordering) -> u64 {
         let cursor = self.tree.seek(key, ordering);
         let mut map = self.cursors.lock();
-        Self::pop_expired(&mut map);
+        Self::pop_expired_cursors(&mut map);
         let id = self.counter.fetch_and(1, Ordering::Relaxed);
         map.insert(id, DelegatedCursor::new(cursor));
         return id;
@@ -137,7 +138,6 @@ impl LSMTreeIns {
 
     pub fn check_and_split(
         &self,
-        tree: &LSMTree,
         sm: &Arc<SMClient>,
         neb: &Arc<NebServer>,
     ) -> bool {

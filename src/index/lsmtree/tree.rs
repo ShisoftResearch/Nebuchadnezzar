@@ -24,17 +24,15 @@ use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
 
-pub const LEVEL_ELEMENTS_MULTIPLIER: usize = 10;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
 
-const LEVEL_M_MAX_ELEMENTS_COUNT: usize = LEVEL_M * LEVEL_M * LEVEL_M;
 const LEVEL_M: usize = 24;
 const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
 const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
 const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-type LevelTrees = Vec<Box<LevelTree>>;
+pub type LevelTrees = Vec<Box<LevelTree>>;
 pub type Ptr = NodeCellRef;
 pub type Key = EntryKey;
 pub type TreeLevels = (LevelTrees, Vec<usize>);
@@ -58,11 +56,11 @@ impl<T> LSMTreeResult<T> {
 }
 
 with_levels! {
-    LM, LEVEL_M;
-    L1, LEVEL_1;
-    L2, LEVEL_2;
-    L3, LEVEL_3;
-    // L4, LEVEL_4; // See https://github.com/rust-lang/rust/issues/58164
+    lm, LEVEL_M;
+    l1, LEVEL_1;
+    l2, LEVEL_2;
+    l3, LEVEL_3;
+    // l4, LEVEL_4; // See https://github.com/rust-lang/rust/issues/58164
 }
 
 pub struct LSMTree {
@@ -168,6 +166,10 @@ impl LSMTree {
         self.len() > self.lsm_tree_max_size
     }
 
+    pub fn full_size(&self) -> usize {
+        self.lsm_tree_max_size
+    }
+
     pub fn last_level_size(&self) -> usize {
         *self.max_sizes.last().unwrap()
     }
@@ -198,5 +200,9 @@ impl LSMTree {
 
     pub fn set_epoch(&self, epoch: u64) {
         self.epoch.store(epoch, Relaxed);
+    }
+
+    pub fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Relaxed) + 1
     }
 }

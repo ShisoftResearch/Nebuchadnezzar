@@ -18,7 +18,7 @@ use std::collections::HashSet;
 
 pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum CmdError {
     AnotherSplitInProgress(InSplitStatus),
     CannotFindSplitMeta,
@@ -40,7 +40,7 @@ pub struct QueryResult {
     epoch: u64,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InSplitStatus {
     pub dest: Id,
     pub mid: Vec<u8>,

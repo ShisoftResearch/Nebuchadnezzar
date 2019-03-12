@@ -50,6 +50,15 @@ type KeySlice = [EntryKey; PAGE_SIZE];
 type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
 type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
 
+pub fn u64_to_slice(n: u64) -> [u8; 8] {
+    let mut key_slice = [0u8; 8];
+    {
+        let mut cursor = StdCursor::new(&mut key_slice[..]);
+        cursor.write_u64::<BigEndian>(n);
+    };
+    key_slice
+}
+
 #[test]
 fn node_size() {
     // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
@@ -71,15 +80,6 @@ fn init() {
     tree.insert(&entry_key);
     let cursor = tree.seek(&key, Ordering::Forward);
     assert_eq!(id_from_key(cursor.current().unwrap()), id);
-}
-
-fn u64_to_slice(n: u64) -> [u8; 8] {
-    let mut key_slice = [0u8; 8];
-    {
-        let mut cursor = StdCursor::new(&mut key_slice[..]);
-        cursor.write_u64::<BigEndian>(n);
-    };
-    key_slice
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {

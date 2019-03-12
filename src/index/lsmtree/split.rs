@@ -69,8 +69,9 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
                     new_placement_id
                 );
             }
-            Ok(Ok(())) => {}
-            _ => panic!("Error on split"),
+            Ok(Ok(())) => {},
+            Ok(o) => panic!("Unknown state {:?}", o),
+            Err(e) => panic!("Error on state machine {:?}", e),
         }
         // Then save this metadata to current tree 'split' field
         let mut split = tree.split.lock();
@@ -95,7 +96,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         );
         // Inform the placement driver that this tree is going to split so it can direct all write
         // and read request to the new tree
-        let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
+        let src_epoch = tree.bump_epoch();
         sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch)
             .wait()
             .unwrap();
@@ -158,7 +159,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             .unwrap();
         // Bump source epoch and inform the placement driver this tree have completed split
         debug!("Updating placement driver");
-        let src_epoch = tree.epoch.fetch_add(1, Relaxed) + 1;
+        let src_epoch = tree.bump_epoch();
         sm.complete_split(&tree.id, &target_id, &src_epoch)
             .wait()
             .unwrap();
