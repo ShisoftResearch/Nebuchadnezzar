@@ -48,7 +48,7 @@ where
                 let right_pos = innode.keys.as_slice_immute()[..innode.len]
                     .binary_search(start_key)
                     .unwrap_or_else(|x| x);
-                debug_assert!(right_pos < innode.len);
+                debug_assert!(right_pos <= innode.len, "pos {} >= len {}", right_pos, innode.len);
                 for i in right_pos..innode.len {
                     innode.ptrs.as_slice()[i + 1] = NodeCellRef::new_none::<KS, PS>();
                 }
