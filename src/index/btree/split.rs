@@ -47,7 +47,7 @@ where
                 let mut innode = pivot_node.innode_mut();
                 let right_pos = innode
                     .keys
-                    .as_slice_immute()
+                    .as_slice_immute()[..innode.len]
                     .binary_search(start_key)
                     .unwrap_or_else(|x| x);
                 debug_assert!(right_pos < innode.len);

@@ -34,7 +34,7 @@ impl Cursor for LSMTreeCursor {
                 pre.map(|c| c.next());
             }
             let dedupe_current = if let Some(current) = self.current() {
-                if current <= &prev_key {
+                if current == &prev_key {
                     None
                 } else {
                     Some(true)

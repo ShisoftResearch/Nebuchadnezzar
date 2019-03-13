@@ -120,10 +120,6 @@ impl LSMTree {
     }
 
     pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
-        match ordering {
-            Ordering::Forward => key_with_id(&mut key, &Id::unit_id()),
-            Ordering::Backward => key_with_id(&mut key, &Id::new(::std::u64::MAX, ::std::u64::MAX)),
-        };
         let mut cursors: Vec<Box<Cursor>> = vec![];
         for tree in &self.trees {
             cursors.push(tree.seek_for(&key, ordering));
@@ -191,7 +187,8 @@ impl LSMTree {
     }
 
     pub fn merge(&self, keys: Box<Vec<EntryKey>>) {
-        self.trees[0].merge_with_keys(keys)
+        // merge to highest level
+        self.trees.last().unwrap().merge_with_keys(keys)
     }
 
     pub fn remove_to_right(&self, start_key: &EntryKey) {

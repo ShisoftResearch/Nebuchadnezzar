@@ -118,7 +118,15 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         );
         loop {
             let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
-            while batch.len() < batch_size && cursor.current().is_some() {
+            loop {
+                if batch.len() >= batch_size {
+                    debug!("Collected one batch");
+                    break;
+                }
+                if !cursor.current().is_some() {
+                    debug!("Cursor depleted");
+                    break;
+                }
                 let key = cursor.current().unwrap().clone();
                 if &key < &tree_split.pivot {
                     // break batch loop when current key out of mid key bound
@@ -126,7 +134,10 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
                     break;
                 }
                 batch.push(key.into_iter().collect());
-                cursor.next();
+                if !cursor.next() {
+                    debug!("Cursor depleted on iteration");
+                    break;
+                }
             }
             if batch.is_empty() {
                 // break the main transfer loop when this batch is empty
