@@ -96,4 +96,9 @@ pub fn split() {
     debug!("After split there are {} entries", lsm_tree.count());
     assert!(!lsm_tree.is_full());
 
+    let first = sm_client.get(&lsm_tree.id).wait().unwrap().unwrap();
+    debug!("First placement now end with {:?}", first.ends);
+    assert!(first.ends < max_entry_key().into_iter().collect_vec());
+
+
 }

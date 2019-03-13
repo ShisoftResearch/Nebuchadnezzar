@@ -29,7 +29,7 @@ pub enum CmdError {
     PlacementExists,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum QueryError {
     OutOfRange,
     PlacementNotFound,
