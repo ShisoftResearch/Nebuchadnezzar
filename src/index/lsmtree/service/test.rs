@@ -75,7 +75,7 @@ pub fn split() {
     );
 
     let tree_capacity = lsm_tree.full_size() as u64;
-    let test_volume = (tree_capacity as f32 * 1.5) as u64;
+    let test_volume = (tree_capacity as f32 * 1.1) as u64;
     let mut nums = (0..test_volume).collect_vec();
     thread_rng().shuffle(nums.as_mut_slice());
     nums.par_iter().for_each(|n| {
@@ -88,8 +88,12 @@ pub fn split() {
     });
     debug!("Inserted {} elements", test_volume);
     assert!(lsm_tree.is_full());
+    debug!("Before split there are {} entries", lsm_tree.count());
 
     sm_client.upsert(&lsm_tree.to_placement()).wait().unwrap();
     lsm_tree.bump_epoch();
     check_and_split(&lsm_tree, &sm_client, &server);
+    debug!("After split there are {} entries", lsm_tree.count());
+    assert!(!lsm_tree.is_full());
+
 }

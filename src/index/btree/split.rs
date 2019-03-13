@@ -3,7 +3,7 @@ use index::btree::node::write_node;
 use index::btree::node::write_targeted;
 use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
-use index::btree::remove::scatter_node;
+use index::btree::remove::scatter_nodes;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::NodeCellRef;
@@ -28,19 +28,20 @@ where
     })
 }
 
-pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey)
+pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    let mut removed_nodes = 0;
     match mut_search::<KS, PS>(node_ref, start_key) {
         MutSearchResult::Internal(ref next_level_node) => {
             {
-                remove_to_right::<KS, PS>(next_level_node, start_key);
+                removed_nodes = remove_to_right::<KS, PS>(next_level_node, start_key);
                 let mut pivot_node = write_targeted::<KS, PS>(write_node(node_ref), start_key);
                 if pivot_node.is_none() {
                     // terminate when at and of nodes of this level
-                    return;
+                    return removed_nodes;
                 }
                 debug_assert!(!pivot_node.is_empty_node());
                 debug_assert!(!pivot_node.is_ext());
@@ -52,7 +53,7 @@ where
                 for i in right_pos..innode.len {
                     innode.ptrs.as_slice()[i + 1] = NodeCellRef::new_none::<KS, PS>();
                 }
-                scatter_node::<KS, PS>(&innode.right);
+                scatter_nodes::<KS, PS>(&innode.right);
                 innode.right = NodeCellRef::new_none::<KS, PS>();
                 innode.len = right_pos;
             }
@@ -61,17 +62,21 @@ where
             let mut pivot_node = write_targeted::<KS, PS>(write_node(node_ref), start_key);
             if pivot_node.is_none() {
                 // terminate when at and of nodes of this level
-                return;
+                return removed_nodes;
             }
             debug_assert!(!pivot_node.is_empty_node());
             debug_assert!(pivot_node.is_ext());
             let mut extnode = pivot_node.extnode_mut();
-            extnode.len = extnode
+            let len = extnode.len;
+            let new_len = extnode
                 .keys
-                .as_slice_immute()
+                .as_slice_immute()[..extnode.len]
                 .binary_search(start_key)
                 .unwrap_or_else(|x| x);
-            scatter_node::<KS, PS>(&extnode.next);
+            extnode.len = new_len;
+            let node_key_removed = len - new_len;
+            removed_nodes = scatter_nodes::<KS, PS>(&extnode.next) + node_key_removed;
         }
     }
+    removed_nodes
 }

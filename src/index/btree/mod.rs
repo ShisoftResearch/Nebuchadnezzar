@@ -295,7 +295,8 @@ where
     }
 
     fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) {
-        remove_to_right::<KS, PS>(&self.get_root(), start_key);
+        let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
+        self.len.fetch_sub(removed, Relaxed);
     }
 }
 
