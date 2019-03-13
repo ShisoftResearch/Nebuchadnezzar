@@ -167,7 +167,10 @@ impl StateMachineCmds for PlacementSM {
     fn locate(&self, entry: Vec<u8>) -> Result<QueryResult, QueryError> {
         if let Some((_, placement_id)) = self.starts.range(..=entry).last() {
             let placement = self.placements.get(placement_id).unwrap();
-            let split = placement.in_split.as_ref().map(|s| (s.pivot.clone(), s.dest));
+            let split = placement
+                .in_split
+                .as_ref()
+                .map(|s| (s.pivot.clone(), s.dest));
             return Ok(QueryResult {
                 id: placement.id,
                 split,

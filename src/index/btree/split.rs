@@ -45,9 +45,7 @@ where
                 debug_assert!(!pivot_node.is_empty_node());
                 debug_assert!(!pivot_node.is_ext());
                 let mut innode = pivot_node.innode_mut();
-                let right_pos = innode
-                    .keys
-                    .as_slice_immute()[..innode.len]
+                let right_pos = innode.keys.as_slice_immute()[..innode.len]
                     .binary_search(start_key)
                     .unwrap_or_else(|x| x);
                 debug_assert!(right_pos < innode.len);
