@@ -128,7 +128,7 @@ impl LSMTree {
         for tree in &self.trees {
             cursors.push(tree.seek_for(&key, ordering));
         }
-        LSMTreeCursor::new(cursors)
+        LSMTreeCursor::new(cursors, ordering)
     }
 
     pub fn check_and_merge(&self) {

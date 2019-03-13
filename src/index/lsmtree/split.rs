@@ -105,10 +105,6 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
     let mut tree_split = tree.split.lock();
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
-        debug!(
-            "Start to split {:?} to {:?} at {:?}",
-            tree.id, tree_split.target, tree_split.pivot
-        );
         // Get a cursor from the last key, backwards
         // Backwards are better for rolling batch migration for migrated keys in a batch can be
         // removed from the source tree right after they have been transferred to split tree
@@ -116,12 +112,17 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
         let target_client = placement_client(&target_id, neb).wait().unwrap();
+        debug!(
+            "Start to split {:?} to {:?} pivot {:?}, batch size {}",
+            tree.id, tree_split.target, tree_split.pivot, batch_size
+        );
         loop {
             let mut batch: Vec<Vec<_>> = Vec::with_capacity(batch_size);
             while batch.len() < batch_size && cursor.current().is_some() {
                 let key = cursor.current().unwrap().clone();
                 if &key < &tree_split.pivot {
                     // break batch loop when current key out of mid key bound
+                    debug!("Cursor out of pivot, break");
                     break;
                 }
                 batch.push(key.into_iter().collect());
@@ -129,6 +130,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             }
             if batch.is_empty() {
                 // break the main transfer loop when this batch is empty
+                debug!("Empty batch, assumed complete split");
                 break;
             }
             batch.reverse();

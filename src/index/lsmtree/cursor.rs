@@ -1,14 +1,17 @@
 use index::Cursor;
 use index::EntryKey;
+use index::Ordering;
 
 pub struct LSMTreeCursor {
     level_cursors: Vec<Box<Cursor>>,
+    ordering: Ordering,
 }
 
 impl LSMTreeCursor {
-    pub fn new(cursors: Vec<Box<Cursor>>) -> Self {
+    pub fn new(cursors: Vec<Box<Cursor>>, ordering: Ordering) -> Self {
         LSMTreeCursor {
             level_cursors: cursors,
+            ordering,
         }
     }
 }
@@ -16,11 +19,20 @@ impl LSMTreeCursor {
 impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
         if let Some(prev_key) = self.current().map(|k| k.to_owned()) {
-            self.level_cursors
-                .iter_mut()
-                .filter(|c| c.current().is_some())
-                .min_by(|a, b| a.current().unwrap().cmp(b.current().unwrap()))
-                .map(|c| c.next());
+            {
+                let cmp = |a: &&mut Box<Cursor>, b: &&mut Box<Cursor>| {
+                    a.current().unwrap().cmp(b.current().unwrap())
+                };
+                let pre = self
+                    .level_cursors
+                    .iter_mut()
+                    .filter(|c| c.current().is_some());
+                let pre = match self.ordering {
+                    Ordering::Forward => pre.min_by(cmp),
+                    Ordering::Backward => pre.max_by(cmp),
+                };
+                pre.map(|c| c.next());
+            }
             let dedupe_current = if let Some(current) = self.current() {
                 if current <= &prev_key {
                     None
@@ -41,6 +53,10 @@ impl Cursor for LSMTreeCursor {
     }
 
     fn current(&self) -> Option<&EntryKey> {
-        self.level_cursors.iter().filter_map(|c| c.current()).min()
+        let pre = self.level_cursors.iter().filter_map(|c| c.current());
+        match self.ordering {
+            Ordering::Forward => pre.min(),
+            Ordering::Backward => pre.max(),
+        }
     }
 }
