@@ -48,7 +48,7 @@ where
                 );
                 if ordering == Ordering::Backward {
                     debug!("found cursor pos {} for backwards, will be corrected", pos);
-                    if pos > 0 {
+                    if pos >= n.len || pos > 0 && &n.keys.as_slice_immute()[pos] != key {
                         pos -= 1;
                     }
                     debug!("cursor pos have been corrected to {}", pos);

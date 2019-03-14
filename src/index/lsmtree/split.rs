@@ -176,8 +176,8 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             debug_assert_eq!(
                 batch_len,
                 dbg_all_to_right,
-                "batch count and to right count unmatched, differ {}",
-                batch_len as isize - dbg_all_to_right as isize
+                "to right count and batch count unmatched, differ {}",
+                dbg_all_to_right - batch_len
             );
             debug_assert_eq!(
                 removed,
