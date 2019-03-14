@@ -11,12 +11,14 @@ use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
-use index::lsmtree::split::check_and_split;
+use index::lsmtree::placement::sm::Placement;
 use index::lsmtree::split::SplitStatus;
+use index::lsmtree::split::{check_and_split, placement_client};
 pub use index::lsmtree::tree::*;
 use index::Cursor;
 use index::EntryKey;
 use index::Ordering;
+use index::Ordering::Forward;
 use index::*;
 use itertools::Itertools;
 use parking_lot::Mutex;
@@ -30,6 +32,7 @@ use rayon::iter::IntoParallelRefIterator;
 use server;
 use server::NebServer;
 use server::ServerOptions;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -80,11 +83,16 @@ pub fn split() {
     thread_rng().shuffle(nums.as_mut_slice());
     nums.par_iter().for_each(|n| {
         let id = Id::new(0, *n);
-        let key_slice = u64_to_slice(*n);
-        let key = SmallVec::from_slice(&key_slice);
-        let mut entry_key = key.clone();
+        let mut entry_key: EntryKey = smallvec!();
         key_with_id(&mut entry_key, &id);
         lsm_tree.insert(entry_key);
+    });
+    nums.iter().for_each(|n| {
+        let id = Id::new(0, *n);
+        let mut entry_key: EntryKey = smallvec!();
+        key_with_id(&mut entry_key, &id);
+        let cursor = lsm_tree.seek(&entry_key, Forward);
+        assert_eq!(cursor.current(), Some(&entry_key));
     });
     debug!("Inserted {} elements", test_volume);
     assert!(lsm_tree.is_full());
@@ -100,5 +108,36 @@ pub fn split() {
     debug!("First placement now end with {:?}", first.ends);
     assert!(first.ends < max_entry_key().into_iter().collect_vec());
 
-
+    let pivot: EntryKey = SmallVec::from(first.ends.clone());
+    (0..test_volume).collect_vec().iter().for_each(|n| {
+        let id = Id::new(0, *n);
+        let mut entry_key: EntryKey = smallvec!();
+        key_with_id(&mut entry_key, &id);
+        let cursor = lsm_tree.seek(&entry_key, Forward);
+        if entry_key < pivot {
+            // should exists in source tree
+            assert_eq!(cursor.current(), Some(&entry_key));
+        } else {
+            assert_ne!(cursor.current(), Some(&entry_key));
+            // should exists in split tree
+            let vec_entry_key: Vec<_> = entry_key.iter().cloned().collect();
+            let placement: Placement = sm_client.locate(&vec_entry_key).wait().unwrap().unwrap();
+            assert_ne!(placement.id, lsm_tree.id);
+            let client = placement_client(&placement.id, &server).wait().unwrap();
+            let cursor_id = client
+                .seek(
+                    placement.id,
+                    vec_entry_key,
+                    Ordering::Forward,
+                    placement.epoch,
+                )
+                .wait()
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let remote_key_vec = client.current(placement.id, cursor_id).wait().unwrap().unwrap().unwrap().unwrap();
+            let remote_key: EntryKey = SmallVec::from(remote_key_vec);
+            assert_eq!(remote_key, entry_key);
+        }
+    });
 }

@@ -77,7 +77,7 @@ impl LSMTreeIns {
         }
     }
 
-    pub fn seek(&self, key: EntryKey, ordering: index::Ordering) -> u64 {
+    pub fn seek(&self, key: &EntryKey, ordering: index::Ordering) -> u64 {
         let cursor = self.tree.seek(key, ordering);
         let mut map = self.cursors.lock();
         Self::pop_expired_cursors(&mut map);
@@ -116,8 +116,15 @@ impl LSMTreeIns {
         self.tree.insert(key)
     }
 
-    pub fn epoch_mismatch(&self, epoch: u64) -> bool {
-        self.tree.epoch_mismatch(epoch)
+    pub fn with_epoch_check<F, T>(&self, epoch: u64, f: F) -> LSMTreeResult<T>
+        where  F: FnOnce() -> T
+    {
+        let tree_epoch = self.tree.epoch();
+        if tree_epoch != epoch {
+            LSMTreeResult::EpochMismatch(tree_epoch, epoch)
+        } else {
+            LSMTreeResult::Ok(f())
+        }
     }
 
     pub fn epoch(&self) -> u64 {
@@ -136,7 +143,7 @@ impl LSMTreeIns {
         self.tree.set_epoch(epoch);
     }
 
-    pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> bool {
+    pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
         check_and_split(&self.tree, sm, neb)
     }
 }

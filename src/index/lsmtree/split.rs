@@ -48,7 +48,7 @@ pub fn placement_client(
         .map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
-pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> bool {
+pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
     if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
         debug!("LSM Tree {:?} is full, will split", tree.id);
         // need to initiate a split
@@ -103,12 +103,13 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         debug!("Bumped source tree {:?} epoch to {}", tree.id, src_epoch);
     }
     let mut tree_split = tree.split.lock();
+    let mut total_removed = 0;
     // check if current tree is in the middle of split, so it can (re)start from the process
     if let Some(tree_split) = &*tree_split {
         // Get a cursor from the last key, backwards
         // Backwards are better for rolling batch migration for migrated keys in a batch can be
         // removed from the source tree right after they have been transferred to split tree
-        let mut cursor = tree.seek(max_entry_key(), Backward);
+        let mut cursor = tree.seek(&max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
         let target_client = placement_client(&target_id, neb).wait().unwrap();
@@ -146,10 +147,10 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             }
             batch.reverse();
             let left_most_batch_key = batch.first().unwrap().clone();
+            let batch_len = batch.len();
             debug!(
                 "Collected batch with size {:?}, first key {:?}",
-                batch.len(),
-                left_most_batch_key
+                batch_len, left_most_batch_key
             );
             // submit this batch to new tree
             target_client
@@ -158,28 +159,54 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
                 .unwrap()
                 .unwrap();
             // remove this batch in current tree
-            tree.remove_to_right(&SmallVec::from(left_most_batch_key));
+            let start_key = &SmallVec::from(left_most_batch_key);
+            let dbg_all_to_right = if cfg!(debug_assertions) {
+                tree.count_to_right(start_key)
+            } else {
+                0
+            };
+            let removed = tree.remove_to_right(start_key);
+            total_removed += removed;
+            debug_assert_eq!(
+                removed,
+                dbg_all_to_right,
+                "removed count and to right count unmatched, differ {}",
+                removed - dbg_all_to_right
+            );
+            debug_assert_eq!(
+                batch_len,
+                dbg_all_to_right,
+                "batch count and to right count unmatched, differ {}",
+                batch_len as isize - dbg_all_to_right as isize
+            );
+            debug_assert_eq!(
+                removed,
+                batch_len,
+                "batch count and removed count unmatched, differ {}",
+                removed - batch_len
+            );
         }
         debug!("Split completed, remove tomestones to right");
         // split completed
         tree.remove_following_tombstones(&tree_split.pivot);
         debug!("Tomestones removed, finalizing target");
-        // Set new tree epoch from 0 to 1
-        target_client
-            .set_epoch(target_id, 1)
-            .wait()
-            .unwrap()
-            .unwrap();
         // Bump source epoch and inform the placement driver this tree have completed split
         debug!("Updating placement driver");
         let src_epoch = tree.bump_epoch();
         sm.complete_split(&tree.id, &target_id, &src_epoch)
             .wait()
             .unwrap();
+        // Set new tree epoch from 0 to 1
+        let prev_epoch = target_client
+            .set_epoch(target_id, 1)
+            .wait()
+            .unwrap()
+            .unwrap();
+        debug_assert_eq!(prev_epoch, 0);
     } else {
-        return false;
+        return None;
     }
     *tree_split = None;
     debug!("LSM-Tree split completed for {:?}", tree.id);
-    true
+    Some(total_removed)
 }

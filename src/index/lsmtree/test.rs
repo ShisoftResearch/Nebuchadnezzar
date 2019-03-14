@@ -81,7 +81,7 @@ pub fn insertions() {
         let key_slice = u64_to_slice(i);
         let mut key = SmallVec::from_slice(&key_slice);
         debug!("checking: {}", i);
-        let cursor = tree.seek(key.clone(), Ordering::Forward);
+        let cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
         assert_eq!(cursor.current(), Some(&key), "{}", i);
     });
@@ -109,7 +109,7 @@ pub fn insertions() {
         let key_slice = u64_to_slice(i);
         let mut key = SmallVec::from_slice(&key_slice);
         debug!("checking: {}", i);
-        let cursor = tree.seek(key.clone(), Ordering::Forward);
+        let cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
         assert_eq!(cursor.current(), Some(&key), "{}", i);
     });
@@ -162,7 +162,7 @@ pub fn hybrid() {
         let key_slice = u64_to_slice(i);
         let mut key = SmallVec::from_slice(&key_slice);
         debug!("checking: {}", i);
-        let cursor = tree.seek(key.clone(), Ordering::Forward);
+        let cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
         assert_eq!(cursor.current(), Some(&key), "{}", i);
     });

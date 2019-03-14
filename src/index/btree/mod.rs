@@ -50,6 +50,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::MAX_KEY_SIZE;
 
 mod cursor;
 mod dump;
@@ -236,7 +237,7 @@ pub trait LevelTree {
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
     fn remove_following_tombstones(&self, start: &EntryKey);
-    fn remove_to_right(&self, start_key: &EntryKey);
+    fn remove_to_right(&self, start_key: &EntryKey) -> usize;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -294,9 +295,10 @@ where
             .collect();
     }
 
-    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) {
+    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) -> usize {
         let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
         self.len.fetch_sub(removed, Relaxed);
+        removed
     }
 }
 
@@ -392,7 +394,7 @@ lazy_static! {
 }
 
 pub fn max_entry_key() -> EntryKey {
-    EntryKey::from(iter::repeat(255u8).take(KEY_SIZE).collect_vec())
+    EntryKey::from(iter::repeat(255u8).take(MAX_KEY_SIZE).collect_vec())
 }
 
 type DefaultKeySliceType = [EntryKey; 0];

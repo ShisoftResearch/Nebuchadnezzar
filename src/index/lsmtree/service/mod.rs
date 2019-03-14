@@ -49,7 +49,7 @@ service! {
 
     rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
     rpc merge(tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> LSMTreeResult<()> | LSMTreeSvrError;
-    rpc set_epoch(tree_id: Id, epoch: u64) -> () | LSMTreeSvrError;
+    rpc set_epoch(tree_id: Id, epoch: u64) -> u64 | LSMTreeSvrError;
 }
 
 pub struct LSMTreeService {
@@ -75,11 +75,9 @@ impl Service for LSMTreeService {
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
-                    if tree.epoch_mismatch(epoch) {
-                        LSMTreeResult::EpochMismatch
-                    } else {
-                        LSMTreeResult::Ok(tree.seek(SmallVec::from(key), ordering))
-                    }
+                    tree.with_epoch_check(epoch, || {
+                        tree.seek(&SmallVec::from(key), ordering)
+                    })
                 }),
         )
     }
@@ -176,11 +174,7 @@ impl Service for LSMTreeService {
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
-                    if tree.epoch_mismatch(epoch) {
-                        LSMTreeResult::EpochMismatch
-                    } else {
-                        LSMTreeResult::Ok(tree.insert(SmallVec::from(key)))
-                    }
+                    tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))
                 }),
         )
     }
@@ -197,15 +191,11 @@ impl Service for LSMTreeService {
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
-                    if tree.epoch_mismatch(epoch) {
-                        LSMTreeResult::EpochMismatch
-                    } else {
-                        LSMTreeResult::Ok(
-                            tree.merge(
-                                box keys.into_iter().map(|key| SmallVec::from(key)).collect(),
-                            ),
+                    tree.with_epoch_check(epoch, || {
+                        tree.merge(
+                            box keys.into_iter().map(|key| SmallVec::from(key)).collect(),
                         )
-                    }
+                    })
                 }),
         )
     }
@@ -214,7 +204,7 @@ impl Service for LSMTreeService {
         &self,
         tree_id: Id,
         epoch: u64,
-    ) -> Box<Future<Item = (), Error = LSMTreeSvrError>> {
+    ) -> Box<Future<Item = u64, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         let sm = self.sm.clone();
         box future::result(
@@ -226,7 +216,7 @@ impl Service for LSMTreeService {
         .and_then(move |_| {
             sm.update_epoch(&tree_id, &epoch)
                 .map_err(|_| LSMTreeSvrError::SMError)
-                .map(|_| ())
+                .and_then(|r| r.map_err(|_| LSMTreeSvrError::SMError))
         })
     }
 }

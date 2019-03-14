@@ -35,13 +35,6 @@ pub enum QueryError {
     PlacementNotFound,
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct QueryResult {
-    id: Id,
-    split: Option<(Vec<u8>, Id)>,
-    epoch: u64,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct InSplitStatus {
     pub dest: Id,
@@ -68,7 +61,7 @@ raft_state_machine! {
     def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
     def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
     def cmd upsert(placement: Placement) -> () | CmdError;
-    def qry locate(id: Vec<u8>) -> QueryResult | QueryError;
+    def qry locate(id: Vec<u8>) -> Placement | QueryError;
     def qry all() -> Vec<Placement>;
     def qry get(id: Id) -> Placement | QueryError;
 }
@@ -146,6 +139,7 @@ impl StateMachineCmds for PlacementSM {
             source_placement.epoch = epoch;
             Ok(original)
         } else {
+            debug!("Cannot find placement or {:?} to update epoch", source);
             Err(CmdError::PlacementNotFound)
         }
     }
@@ -164,20 +158,12 @@ impl StateMachineCmds for PlacementSM {
         Ok(())
     }
 
-    fn locate(&self, entry: Vec<u8>) -> Result<QueryResult, QueryError> {
+    fn locate(&self, entry: Vec<u8>) -> Result<Placement, QueryError> {
         if let Some((_, placement_id)) = self.starts.range(..=entry).last() {
             let placement = self.placements.get(placement_id).unwrap();
-            let split = placement
-                .in_split
-                .as_ref()
-                .map(|s| (s.pivot.clone(), s.dest));
-            return Ok(QueryResult {
-                id: placement.id,
-                split,
-                epoch: placement.epoch,
-            });
+            Ok(placement.clone())
         } else {
-            return Err(QueryError::OutOfRange);
+            Err(QueryError::OutOfRange)
         }
     }
 

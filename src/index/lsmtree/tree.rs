@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
+use std::fmt::Debug;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
 
@@ -44,15 +45,15 @@ pub type KeyRange = (EntryKey, EntryKey);
 #[derive(Serialize, Deserialize, Debug)]
 pub enum LSMTreeResult<T> {
     Ok(T),
-    EpochMismatch,
+    EpochMismatch(u64, u64),
 }
 
 impl<T> LSMTreeResult<T> {
-    pub fn unwrap(self) -> T {
+    pub fn unwrap(self) -> T where T: Debug {
         if let LSMTreeResult::Ok(v) = self {
             v
         } else {
-            panic!("Cannot unwrap LSMTreeResult");
+            panic!("Cannot unwrap LSMTreeResult, {:?}", self);
         }
     }
 }
@@ -119,10 +120,10 @@ impl LSMTree {
             .any(|d| d)
     }
 
-    pub fn seek(&self, mut key: EntryKey, ordering: Ordering) -> LSMTreeCursor {
+    pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
         let mut cursors: Vec<Box<Cursor>> = vec![];
         for tree in &self.trees {
-            cursors.push(tree.seek_for(&key, ordering));
+            cursors.push(tree.seek_for(key, ordering));
         }
         LSMTreeCursor::new(cursors, ordering)
     }
@@ -178,10 +179,6 @@ impl LSMTree {
             .for_each(|tree| tree.remove_following_tombstones(start))
     }
 
-    pub fn epoch_mismatch(&self, epoch: u64) -> bool {
-        self.epoch() != epoch
-    }
-
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Relaxed)
     }
@@ -191,10 +188,20 @@ impl LSMTree {
         self.trees.last().unwrap().merge_with_keys(keys)
     }
 
-    pub fn remove_to_right(&self, start_key: &EntryKey) {
+    pub fn remove_to_right(&self, start_key: &EntryKey) -> usize {
         self.trees
             .iter()
-            .for_each(|tree| tree.remove_to_right(start_key));
+            .map(|tree| tree.remove_to_right(start_key))
+            .sum()
+    }
+
+    pub fn count_to_right(&self, start_key: &EntryKey) -> usize {
+        let mut cursor = self.seek(start_key, Ordering::Forward);
+        let mut count = 1;
+        while cursor.next() {
+            count += 1;
+        }
+        count
     }
 
     pub fn set_epoch(&self, epoch: u64) {
