@@ -16,6 +16,7 @@ use index::btree::merge::merge_into_tree_node;
 pub use index::btree::node::*;
 use index::btree::remove::*;
 use index::btree::search::*;
+use index::btree::split::remove_to_right;
 use index::Cursor;
 use index::EntryKey;
 use index::Slice;
@@ -49,6 +50,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use index::MAX_KEY_SIZE;
 
 mod cursor;
 mod dump;
@@ -60,6 +62,7 @@ mod merge;
 mod node;
 mod remove;
 mod search;
+mod split;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
@@ -75,7 +78,6 @@ where
 {
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
-    storage: Arc<AsyncClient>,
     len: AtomicUsize,
     deleted: DeletionSet,
     marker: PhantomData<(KS, PS)>,
@@ -106,12 +108,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(neb_client: &Arc<AsyncClient>) -> BPlusTree<KS, PS> {
+    pub fn new() -> BPlusTree<KS, PS> {
         debug!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::with_none())),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
-            storage: neb_client.clone(),
             len: AtomicUsize::new(0),
             deleted: Arc::new(RwLock::new(BTreeSet::new())),
             marker: PhantomData,
@@ -133,9 +134,9 @@ where
         search_node(&self.get_root(), key, ordering, &self.deleted)
     }
 
-    pub fn insert(&self, key: &EntryKey) {
+    pub fn insert(&self, key: &EntryKey) -> bool {
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
-            Some(split) => {
+            Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
@@ -146,9 +147,11 @@ where
                 new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             }
-            None => {}
+            Some(None) => {}
+            None => return false,
         }
         self.len.fetch_add(1, Relaxed);
+        return true;
     }
 
     pub fn remove(&self, key: &EntryKey) -> bool {
@@ -182,7 +185,7 @@ where
         if root_new_pages.len() > 0 {
             let _root_guard = write_node::<KS, PS>(&root);
             let new_root_len = root_new_pages.len();
-            debug_assert!(new_root_len < KS::slice_len());
+            debug_assert!(new_root_len + 1 < KS::slice_len());
             let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(new_root_len, max_entry_key());
             new_in_root.ptrs.as_slice()[0] = root.clone();
             for (i, (key, node)) in root_new_pages.into_iter().enumerate() {
@@ -228,10 +231,13 @@ pub trait LevelTree {
     fn count(&self) -> usize;
     fn merge_to(&self, upper_level: &LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
-    fn insert_into(&self, key: &EntryKey);
+    fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
+    fn mid_key(&self) -> Option<EntryKey>;
+    fn remove_following_tombstones(&self, start: &EntryKey);
+    fn remove_to_right(&self, start_key: &EntryKey) -> usize;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -255,7 +261,7 @@ where
         self.merge_with_keys_(keys)
     }
 
-    fn insert_into(&self, key: &SmallVec<[u8; 32]>) {
+    fn insert_into(&self, key: &SmallVec<[u8; 32]>) -> bool {
         self.insert(key)
     }
 
@@ -274,6 +280,25 @@ where
 
     fn dump(&self, f: &str) {
         dump::dump_tree(self, f);
+    }
+
+    fn mid_key(&self) -> Option<EntryKey> {
+        split::mid_key::<KS, PS>(&self.get_root())
+    }
+
+    fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
+        let mut tombstones = self.deleted.write();
+        let original_tombstones = mem::replace(&mut *tombstones, BTreeSet::new());
+        *tombstones = original_tombstones
+            .into_iter()
+            .filter(|k| k < start)
+            .collect();
+    }
+
+    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) -> usize {
+        let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
+        self.len.fetch_sub(removed, Relaxed);
+        removed
     }
 }
 
@@ -303,6 +328,14 @@ impl NodeCellRef {
         NodeCellRef {
             inner: Arc::new(node),
         }
+    }
+
+    pub fn new_none<KS, PS>() -> Self
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+    {
+        Node::<KS, PS>::none_ref()
     }
 
     #[inline]
@@ -360,8 +393,8 @@ lazy_static! {
     pub static ref MIN_ENTRY_KEY: EntryKey = smallvec!(0);
 }
 
-fn max_entry_key() -> EntryKey {
-    EntryKey::from(iter::repeat(255u8).take(KEY_SIZE).collect_vec())
+pub fn max_entry_key() -> EntryKey {
+    EntryKey::from(iter::repeat(255u8).take(MAX_KEY_SIZE).collect_vec())
 }
 
 type DefaultKeySliceType = [EntryKey; 0];

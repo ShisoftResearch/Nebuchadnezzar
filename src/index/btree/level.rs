@@ -15,7 +15,7 @@ use index::btree::search::MutSearchResult;
 use index::btree::BPlusTree;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
-use index::lsmtree::LEVEL_PAGE_DIFF_MULTIPLIER;
+use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
@@ -23,6 +23,7 @@ use smallvec::SmallVec;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
+use std::sync::atomic::Ordering::Relaxed;
 
 enum Selection<KS, PS>
 where
@@ -328,20 +329,33 @@ where
 {
     let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
+    let mut num_keys_removed = 0;
     debug!("Merge selected {} pages", left_most_leaf_guards.len());
 
     // merge to dest_tree
     {
         let mut deleted_keys = src_tree.deleted.write();
+        let mut merged_deleted_keys = vec![];
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
             .map(|g| &g.keys()[..g.len()])
             .flatten()
-            .filter(|&k| !deleted_keys.remove(k))
+            .filter(|&k| {
+                if deleted_keys.contains(k) {
+                    merged_deleted_keys.push(k.clone());
+                    false
+                } else {
+                    true
+                }
+            })
             .cloned()
             .collect_vec();
+        num_keys_removed = keys.len();
         debug!("Merge selected keys are {:?}", &keys);
         dest_tree.merge_with_keys(box keys);
+        for rk in &merged_deleted_keys {
+            deleted_keys.remove(rk);
+        }
     }
 
     // cleanup upper level references
@@ -379,6 +393,8 @@ where
             })
         }
     }
+
+    src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
     merge_page_len
 }

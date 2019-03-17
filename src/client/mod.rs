@@ -329,7 +329,11 @@ impl AsyncClient {
         AsyncClientInner::get_all_schema(self.inner.clone())
     }
 
-    pub fn raft_client(&self) -> Arc<RaftClient> {
-        self.inner.raft_client.clone()
+    pub fn raft_client(&self) -> &Arc<RaftClient> {
+        &self.inner.raft_client
+    }
+
+    pub fn conshash(&self) -> &Arc<ConsistentHashing> {
+        &self.inner.conshash
     }
 }

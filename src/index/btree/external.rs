@@ -169,10 +169,10 @@ where
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
-        {
-            if !self_next.is_none() {
-                self_next.extnode_mut().prev = node_2.clone();
-            }
+        if !self_next.is_none() {
+            let mut self_next_node = self_next.extnode_mut();
+            debug_assert!(Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner), "{:?}", self_next_node.keys.as_slice_immute()[0]);
+            self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
 
@@ -185,15 +185,18 @@ where
         tree: &BPlusTree<KS, PS>,
         self_ref: &NodeCellRef,
         parent: &NodeCellRef,
-    ) -> Option<NodeSplit<KS, PS>> {
+    ) -> Option<Option<NodeSplit<KS, PS>>> {
         let key = key.clone();
         let pos = self.search(&key);
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
-        if self.len == KS::slice_len() {
+        if self.len > pos && self.keys.as_slice_immute()[pos] == key {
+            return None;
+        }
+        Some(if self.len == KS::slice_len() {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
-            let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
+            let mut self_next: NodeWriteGuard<KS, PS> = write_non_empty(write_node(&self.next));
             let parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
             let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
             Some(NodeSplit {
@@ -206,7 +209,7 @@ where
             debug!("insert to external without split at {}, key {:?}", pos, key);
             self.keys.insert_at(key, pos, &mut self.len);
             None
-        }
+        })
     }
 
     pub fn merge_with(&mut self, right: &mut Self) {
@@ -256,23 +259,35 @@ where
         while left_pos < self.len && right_pos < right.len() {
             let left_key = &left[left_pos];
             let right_key = right[right_pos];
-            if left_key < right_key {
+            if left_key <= right_key {
                 self.keys.as_slice()[pos] = left_key.clone();
                 left_pos += 1;
-            } else {
+            } else if left_key > right_key {
                 self.keys.as_slice()[pos] = right_key.clone();
                 right_pos += 1;
             }
-            pos += 1;
+            if left_key == right_key {
+                // when duplication detected, skip the duplicated one
+                right_pos += 1;
+            }
+            if pos == 0 || self.keys.as_slice_immute()[pos - 1] != self.keys.as_slice_immute()[pos]
+            {
+                // if no duplicate assigned, step further
+                pos += 1;
+            }
         }
         for key in &left[left_pos..self.len] {
-            self.keys.as_slice()[pos] = key.clone();
-            pos += 1;
+            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != key {
+                self.keys.as_slice()[pos] = key.clone();
+                pos += 1;
+            }
             left_pos += 1;
         }
         for key in &right[right_pos..] {
-            self.keys.as_slice()[pos] = (*key).clone();
-            pos += 1;
+            if pos == 0 || &self.keys.as_slice_immute()[pos - 1] != *key {
+                self.keys.as_slice()[pos] = (*key).clone();
+                pos += 1;
+            }
             right_pos += 1;
         }
         debug!(

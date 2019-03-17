@@ -77,7 +77,7 @@ pub fn insert_external_tree_node<KS, PS>(
     node_ref: &NodeCellRef,
     parent: &NodeCellRef,
     key: &EntryKey,
-) -> Option<NodeSplit<KS, PS>>
+) -> Option<Option<NodeSplit<KS, PS>>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -85,6 +85,7 @@ where
     // latch nodes from left to right
     debug!("Obtain latch for external node");
     let mut searched_guard = write_targeted(write_node(node_ref), key);
+    let self_ref = searched_guard.node_ref().clone();
     debug_assert!(
         searched_guard.is_ext(),
         "{:?}",
@@ -92,8 +93,8 @@ where
     );
     let mut split_result = searched_guard
         .extnode_mut()
-        .insert(key, tree, node_ref, parent);
-    if let &mut Some(ref mut split) = &mut split_result {
+        .insert(key, tree, &self_ref, parent);
+    if let &mut Some(Some(ref mut split)) = &mut split_result {
         split.left_node_latch = searched_guard;
     }
     split_result
@@ -137,24 +138,34 @@ pub fn insert_to_tree_node<KS, PS>(
     parent: &NodeCellRef,
     key: &EntryKey,
     level: usize,
-) -> Option<NodeSplit<KS, PS>>
+) -> Option<Option<NodeSplit<KS, PS>>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let search = mut_search::<KS, PS>(node_ref, key);
     let modification = match search {
-        MutSearchResult::External => insert_external_tree_node(tree, node_ref, parent, key),
+        MutSearchResult::External => {
+            if let Some(insertion) = insert_external_tree_node(tree, node_ref, parent, key) {
+                insertion
+            } else {
+                return None;
+            }
+        }
         MutSearchResult::Internal(sub_node) => {
-            let split_res = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1);
-            insert_internal_tree_node(split_res, parent)
+            if let Some(split_res) = insert_to_tree_node(tree, &sub_node, node_ref, key, level + 1)
+            {
+                insert_internal_tree_node(split_res, parent)
+            } else {
+                return None;
+            }
         }
     };
     if level == 0 {
         let root_modified = check_root_modification(tree, &modification, parent);
         if root_modified.is_some() {
-            return root_modified;
+            return Some(root_modified);
         }
     }
-    modification
+    Some(modification)
 }

@@ -242,12 +242,8 @@ where
 
     pub fn right_bound(&self) -> &EntryKey {
         match self {
-            &NodeData::External(ref n) => {
-                &n.right_bound
-            }
-            &NodeData::Internal(ref n) => {
-                &n.right_bound
-            }
+            &NodeData::External(ref n) => &n.right_bound,
+            &NodeData::Internal(ref n) => &n.right_bound,
             _ => panic!(self.type_name()),
         }
     }

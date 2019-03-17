@@ -50,6 +50,15 @@ type KeySlice = [EntryKey; PAGE_SIZE];
 type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
 type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
 
+pub fn u64_to_slice(n: u64) -> [u8; 8] {
+    let mut key_slice = [0u8; 8];
+    {
+        let mut cursor = StdCursor::new(&mut key_slice[..]);
+        cursor.write_u64::<BigEndian>(n);
+    };
+    key_slice
+}
+
 #[test]
 fn node_size() {
     // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
@@ -62,22 +71,7 @@ fn node_size() {
 #[test]
 fn init() {
     env_logger::init();
-    let server_group = "bree_index_init";
-    let server_addr = String::from("127.0.0.1:5100");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(super::external::page_schema());
-    let tree = LevelBPlusTree::new(&client);
+    let tree = LevelBPlusTree::new();
     let id = Id::unit_id();
     let key = smallvec![1, 2, 3, 4, 5, 6];
     info!("test insertion");
@@ -86,15 +80,6 @@ fn init() {
     tree.insert(&entry_key);
     let cursor = tree.seek(&key, Ordering::Forward);
     assert_eq!(id_from_key(cursor.current().unwrap()), id);
-}
-
-fn u64_to_slice(n: u64) -> [u8; 8] {
-    let mut key_slice = [0u8; 8];
-    {
-        let mut cursor = StdCursor::new(&mut key_slice[..]);
-        cursor.write_u64::<BigEndian>(n);
-    };
-    key_slice
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
@@ -117,25 +102,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 fn crd() {
     use index::Cursor;
     env_logger::init();
-    let server_group = "index_insertions";
-    let server_addr = String::from("127.0.0.1:5101");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client
-        .new_schema_with_id(super::external::page_schema())
-        .wait()
-        .unwrap();
-    let tree = LevelBPlusTree::new(&client);
+    let tree = LevelBPlusTree::new();
     ::std::fs::remove_dir_all("dumps");
     ::std::fs::create_dir_all("dumps");
     let num = env::var("BTREE_TEST_ITEMS")
@@ -345,22 +312,7 @@ fn crd() {
 pub fn alternative_insertion_pattern() {
     use index::Cursor;
     env_logger::init();
-    let server_group = "b+ tree alternative insertion pattern";
-    let server_addr = String::from("127.0.0.1:5400");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(super::page_schema()).wait();
-    let tree = LevelBPlusTree::new(&client);
+    let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -404,22 +356,7 @@ pub fn alternative_insertion_pattern() {
 #[test]
 fn parallel() {
     env_logger::init();
-    let server_group = "b_plus_index_init";
-    let server_addr = String::from("127.0.0.1:5600");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(super::page_schema()).wait();
-    let tree = Arc::new(LevelBPlusTree::new(&client));
+    let tree = Arc::new(LevelBPlusTree::new());
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -452,27 +389,46 @@ fn parallel() {
 
     dump_tree(&*tree, "btree_parallel_insertion_dump.json");
     debug!("Start validation");
+
+    thread_rng().shuffle(nums.as_mut_slice());
     let mut rng = rand::rngs::OsRng::new().unwrap();
     let die_range = Uniform::new_inclusive(1, 6);
     let roll_die = RwLock::new(rng.sample_iter(&die_range));
-    (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+    (0..num).collect::<Vec<_>>().iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
         let mut key = SmallVec::from_slice(&key_slice);
-        debug!("checking: {}", i);
-        let mut cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
-        assert_eq!(cursor.current(), Some(&key), "{}", i);
-        if roll_die.write().next().unwrap() == 6 {
-            debug!("Scanning {}", num);
-            for j in i..num {
-                let id = Id::new(0, j);
-                let key_slice = u64_to_slice(j);
-                let mut key = SmallVec::from_slice(&key_slice);
-                key_with_id(&mut key, &id);
-                assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
+        debug!("checking: {}", i);
+        {
+            let mut cursor = tree.seek(&key, Ordering::Forward);
+            assert_eq!(cursor.current(), Some(&key), "{}", i);
+            if roll_die.write().next().unwrap() == 6 {
+                debug!("Scanning {}", num);
+                for j in i..num {
+                    let id = Id::new(0, j);
+                    let key_slice = u64_to_slice(j);
+                    let mut key = SmallVec::from_slice(&key_slice);
+                    key_with_id(&mut key, &id);
+                    assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                    assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
+                }
+            }
+        }
+        {
+            let mut cursor = tree.seek(&key, Ordering::Backward);
+            assert_eq!(cursor.current(), Some(&key), "{}", i);
+            if roll_die.write().next().unwrap() == 6 {
+                debug!("Scanning {}", num);
+                for j in (0..=i).rev() {
+                    let id = Id::new(0, j);
+                    let key_slice = u64_to_slice(j);
+                    let mut key = SmallVec::from_slice(&key_slice);
+                    key_with_id(&mut key, &id);
+                    assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
+                    assert_eq!(cursor.next(), j != 0, "{}/{}", i, j);
+                }
             }
         }
     });
@@ -495,20 +451,7 @@ fn parallel() {
 #[test]
 fn node_lock() {
     env_logger::init();
-    let server_group = "node_lock_test";
-    let server_addr = String::from("127.0.0.1:5610");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
-    let client = Arc::new(AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    let tree = LevelBPlusTree::new(&client);
+    let tree = LevelBPlusTree::new();
     let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> =
         ExtNode::new(Id::new(1, 2), max_entry_key());
     let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(inner_ext_node)));
@@ -541,24 +484,9 @@ type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 #[test]
 fn level_merge() {
     env_logger::init();
-    let server_group = "b_plus_level_merge";
-    let server_addr = String::from("127.0.0.1:5800");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-        },
-        &server_addr,
-        &server_group,
-    );
     let range = 1000;
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &vec![server_addr], server_group).unwrap());
-    client.new_schema_with_id(super::page_schema()).wait();
-    let tree_1 = Arc::new(TinyLevelBPlusTree::new(&client));
-    let tree_2 = Arc::new(LevelBPlusTree::new(&client));
+    let tree_1 = Arc::new(TinyLevelBPlusTree::new());
+    let tree_2 = Arc::new(LevelBPlusTree::new());
     for i in 0..range {
         let n = i * 2;
         let id = Id::new(0, n);

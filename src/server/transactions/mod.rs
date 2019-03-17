@@ -2,24 +2,12 @@ use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
 use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
 use ram::cell::{Cell, WriteError};
 use ram::types::Id;
+use server::Peer;
 use std::io;
 use std::sync::Arc;
 
 pub mod data_site;
 pub mod manager;
-
-// Peer have a clock, meant to update with other servers in the cluster
-pub struct Peer {
-    pub clock: ServerVectorClock,
-}
-
-impl Peer {
-    pub fn new(server_address: &String) -> Peer {
-        Peer {
-            clock: ServerVectorClock::new(server_address),
-        }
-    }
-}
 
 pub type TxnId = StandardVectorClock;
 
