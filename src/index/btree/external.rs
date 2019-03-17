@@ -169,10 +169,10 @@ where
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
-        {
-            if !self_next.is_none() {
-                self_next.extnode_mut().prev = node_2.clone();
-            }
+        if !self_next.is_none() {
+            let mut self_next_node = self_next.extnode_mut();
+            debug_assert!(Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner), "{:?}", self_next_node.keys.as_slice_immute()[0]);
+            self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
 
@@ -196,7 +196,7 @@ where
         Some(if self.len == KS::slice_len() {
             // need to split
             debug!("insert to external with split, key {:?}, pos {}", key, pos);
-            let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
+            let mut self_next: NodeWriteGuard<KS, PS> = write_non_empty(write_node(&self.next));
             let parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
             let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
             Some(NodeSplit {

@@ -85,6 +85,7 @@ where
     // latch nodes from left to right
     debug!("Obtain latch for external node");
     let mut searched_guard = write_targeted(write_node(node_ref), key);
+    let self_ref = searched_guard.node_ref().clone();
     debug_assert!(
         searched_guard.is_ext(),
         "{:?}",
@@ -92,7 +93,7 @@ where
     );
     let mut split_result = searched_guard
         .extnode_mut()
-        .insert(key, tree, node_ref, parent);
+        .insert(key, tree, &self_ref, parent);
     if let &mut Some(Some(ref mut split)) = &mut split_result {
         split.left_node_latch = searched_guard;
     }
