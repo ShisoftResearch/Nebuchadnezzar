@@ -42,6 +42,10 @@ lazy_static! {
     static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
 }
 
+thread_local! {
+    static CHANGED_NODES: RefCell<Vec<NodeCellRef>> = RefCell::new(vec![]);
+}
+
 pub struct ExtNode<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -403,4 +407,17 @@ where
             mark: PhantomData,
         }
     }
+}
+
+pub fn make_changed(node: &NodeCellRef) {
+    let node = node.clone();
+    CHANGED_NODES.with(|changes| {
+       changes.borrow_mut().push(node);
+    });
+}
+
+pub fn flush_changed() -> Vec<NodeCellRef> {
+    CHANGED_NODES.with(|changes| {
+        mem::replace(&mut*changes.borrow_mut(), vec![])
+    })
 }
