@@ -16,6 +16,7 @@ use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
 use std::mem;
+use index::btree::external::ExtNode;
 
 pub enum RemoveSearchResult {
     External,
@@ -395,6 +396,7 @@ where
         let right = node.right_ref().unwrap().clone();
         footprint += node.len();
         *node = NodeData::None;
+        ExtNode::make_deleted(node.node_ref());
         node = write_node::<KS, PS>(&right);
     }
 }
