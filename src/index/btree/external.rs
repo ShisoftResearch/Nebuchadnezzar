@@ -318,6 +318,27 @@ where
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
+
+
+    pub fn make_changed(node: &NodeCellRef) {
+        CHANGED_NODES.with(|changes| {
+            let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+            changes.borrow_mut().insert(id, Some(node.clone()));
+        });
+    }
+
+    pub fn make_deleted(node: &NodeCellRef) {
+        CHANGED_NODES.with(|changes| {
+            let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+            changes.borrow_mut().insert(id, None);
+        });
+    }
+
+    pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
+        CHANGED_NODES.with(|changes| {
+            mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
+        })
+    }
 }
 
 pub fn page_schema() -> Schema {
@@ -407,32 +428,4 @@ where
             mark: PhantomData,
         }
     }
-}
-
-pub fn make_changed<KS, PS>(node: &NodeCellRef)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
-{
-    CHANGED_NODES.with(|changes| {
-        let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
-       changes.borrow_mut().insert(id, Some(node.clone()));
-    });
-}
-
-pub fn make_deleted<KS, PS>(node: &NodeCellRef)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
-{
-    CHANGED_NODES.with(|changes| {
-        let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
-        changes.borrow_mut().insert(id, None);
-    });
-}
-
-pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
-    CHANGED_NODES.with(|changes| {
-        mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
-    })
 }
