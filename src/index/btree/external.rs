@@ -19,7 +19,7 @@ use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
@@ -43,7 +43,7 @@ lazy_static! {
 }
 
 thread_local! {
-    static CHANGED_NODES: RefCell<Vec<NodeCellRef>> = RefCell::new(vec![]);
+    static CHANGED_NODES: RefCell<BTreeMap<Id, Option<NodeCellRef>>> = RefCell::new(BTreeMap::new());
 }
 
 pub struct ExtNode<KS, PS>
@@ -316,7 +316,7 @@ where
         }
     }
     pub fn is_dirty(&self) -> bool {
-        unimplemented!()
+        self.dirty
     }
 }
 
@@ -409,15 +409,30 @@ where
     }
 }
 
-pub fn make_changed(node: &NodeCellRef) {
-    let node = node.clone();
+pub fn make_changed<KS, PS>(node: &NodeCellRef)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
     CHANGED_NODES.with(|changes| {
-       changes.borrow_mut().push(node);
+        let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+       changes.borrow_mut().insert(id, Some(node.clone()));
     });
 }
 
-pub fn flush_changed() -> Vec<NodeCellRef> {
+pub fn make_deleted<KS, PS>(node: &NodeCellRef)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
     CHANGED_NODES.with(|changes| {
-        mem::replace(&mut*changes.borrow_mut(), vec![])
+        let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+        changes.borrow_mut().insert(id, None);
+    });
+}
+
+pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
+    CHANGED_NODES.with(|changes| {
+        mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
     })
 }
