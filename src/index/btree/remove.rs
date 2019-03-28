@@ -396,7 +396,7 @@ where
         let right = node.right_ref().unwrap().clone();
         footprint += node.len();
         *node = NodeData::None;
-        ExtNode::make_deleted(node.node_ref());
+        ExtNode::<KS, PS>::make_deleted(node.node_ref());
         node = write_node::<KS, PS>(&right);
     }
 }
