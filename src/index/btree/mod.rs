@@ -154,6 +154,7 @@ where
         return true;
     }
 
+    #[depraceted]
     pub fn remove(&self, key: &EntryKey) -> bool {
         let mut root = self.get_root();
         let result = remove_from_node(self, &mut root, &mut key.clone(), &self.root_versioning, 0);
