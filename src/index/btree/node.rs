@@ -300,6 +300,10 @@ where
 
 const LATCH_FLAG: usize = !(!0 >> 1);
 
+pub trait AnyNode: Any {
+    fn persist(&self, node_ref: &NodeCellRef) -> bool;
+}
+
 pub struct Node<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -533,6 +537,23 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+}
+
+impl <KS, PS> AnyNode for Node<KS, PS>
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    fn persist(&self, node_ref: &NodeCellRef) -> bool {
+        let mut guard = write_node::<KS, PS>(node_ref);
+        match &mut  *guard {
+            &mut NodeData::External(ref node) => {
+                node.persist();
+                true
+            }
+            _ => false
+        }
+    }
 }
 
 pub struct NodeReadHandler<KS, PS>

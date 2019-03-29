@@ -327,10 +327,9 @@ where
         });
     }
 
-    pub fn make_deleted(node: &NodeCellRef) {
+    pub fn make_deleted(id: &Id) {
         CHANGED_NODES.with(|changes| {
-            let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
-            changes.borrow_mut().insert(id, None);
+            changes.borrow_mut().insert(*id, None);
         });
     }
 
@@ -338,6 +337,10 @@ where
         CHANGED_NODES.with(|changes| {
             mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
         })
+    }
+
+    pub fn persist(&self) {
+
     }
 }
 
