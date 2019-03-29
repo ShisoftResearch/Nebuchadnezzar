@@ -1,5 +1,5 @@
 use index::btree::internal::InNode;
-use index::btree::node::is_node_locked;
+use index::btree::node::{is_node_locked, NodeReadHandler};
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
@@ -62,9 +62,9 @@ where
     match search {
         MutSearchResult::External => {
             // pick the right node of the first node to start
-            // this will ensure that the left most node of the tree will been removed so it can be use
+            // this will ensure that the left most node of the tree will never been removed so it can be use
             // as the first node of the linked node of the tree for tree persistent
-            let next_to_left_most = read_node(node, |n| n.right_ref().unwrap().clone());
+            let next_to_left_most = read_node(node, |n: &NodeReadHandler<KS, PS>| n.right_ref().unwrap().clone());
             let mut collected = vec![write_non_empty(write_node(&next_to_left_most))];
             while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
                 let right = write_node(
