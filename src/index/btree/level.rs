@@ -61,7 +61,11 @@ where
     let search = mut_search::<KS, PS>(node, &smallvec!());
     match search {
         MutSearchResult::External => {
-            let mut collected = vec![write_non_empty(write_node(node))];
+            // pick the right node of the first node to start
+            // this will ensure that the left most node of the tree will been removed so it can be use
+            // as the first node of the linked node of the tree for tree persistent
+            let next_to_left_most = read_node(node, |n| n.right_ref().unwrap().clone());
+            let mut collected = vec![write_non_empty(write_node(&next_to_left_most))];
             while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
                 let right = write_node(
                     collected
