@@ -333,16 +333,16 @@ where
         });
     }
 
-    pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
-        CHANGED_NODES.with(|changes| {
-            mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
-        })
-    }
-
     pub fn persist(&self, neb: &AsyncClient) {
         let cell = self.to_cell();
         neb.upsert_cell(cell).wait().unwrap().unwrap();
     }
+}
+
+pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
+    CHANGED_NODES.with(|changes| {
+        mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
+    })
 }
 
 pub fn page_schema() -> Schema {
