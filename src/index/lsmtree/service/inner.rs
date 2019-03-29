@@ -117,7 +117,8 @@ impl LSMTreeIns {
     }
 
     pub fn with_epoch_check<F, T>(&self, epoch: u64, f: F) -> LSMTreeResult<T>
-        where  F: FnOnce() -> T
+    where
+        F: FnOnce() -> T,
     {
         let tree_epoch = self.tree.epoch();
         if tree_epoch != epoch {

@@ -49,7 +49,12 @@ where
                 let right_pos = innode.keys.as_slice_immute()[..innode.len]
                     .binary_search(start_key)
                     .unwrap_or_else(|x| x);
-                debug_assert!(right_pos <= innode.len, "pos {} >= len {}", right_pos, innode.len);
+                debug_assert!(
+                    right_pos <= innode.len,
+                    "pos {} >= len {}",
+                    right_pos,
+                    innode.len
+                );
                 for i in right_pos..innode.len {
                     innode.ptrs.as_slice()[i + 1] = NodeCellRef::new_none::<KS, PS>();
                 }
@@ -68,9 +73,7 @@ where
             debug_assert!(pivot_node.is_ext());
             let mut extnode = pivot_node.extnode_mut();
             let len = extnode.len;
-            let new_len = extnode
-                .keys
-                .as_slice_immute()[..extnode.len]
+            let new_len = extnode.keys.as_slice_immute()[..extnode.len]
                 .binary_search(start_key)
                 .unwrap_or_else(|x| x);
             extnode.len = new_len;

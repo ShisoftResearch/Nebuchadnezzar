@@ -1,5 +1,6 @@
 // This function is unstable yet, tests ignored
 
+use index::btree::external::ExtNode;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
@@ -16,7 +17,6 @@ use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
 use std::mem;
-use index::btree::external::ExtNode;
 
 pub enum RemoveSearchResult {
     External,

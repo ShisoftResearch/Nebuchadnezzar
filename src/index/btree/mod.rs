@@ -21,6 +21,7 @@ use index::Cursor;
 use index::EntryKey;
 use index::Slice;
 use index::KEY_SIZE;
+use index::MAX_KEY_SIZE;
 use index::{Cursor as IndexCursor, Ordering};
 use itertools::{chain, Itertools};
 use parking_lot::RwLock;
@@ -50,7 +51,6 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use index::MAX_KEY_SIZE;
 
 mod cursor;
 mod dump;

@@ -1,3 +1,4 @@
+use index::btree::external::ExtNode;
 use index::btree::insert::check_root_modification;
 use index::btree::internal::InNode;
 use index::btree::node::read_node;
@@ -16,7 +17,6 @@ use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
 use std::fmt::Debug;
-use index::btree::external::ExtNode;
 
 enum MergeSearch {
     External,

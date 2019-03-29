@@ -1,3 +1,5 @@
+use index::btree::external::ExtNode;
+use index::btree::insert::InsertSearchResult::External;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
@@ -12,8 +14,6 @@ use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Slice;
 use std::fmt::Debug;
-use index::btree::insert::InsertSearchResult::External;
-use index::btree::external::ExtNode;
 
 pub enum InsertSearchResult {
     External,

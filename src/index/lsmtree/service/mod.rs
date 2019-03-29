@@ -75,9 +75,7 @@ impl Service for LSMTreeService {
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
-                    tree.with_epoch_check(epoch, || {
-                        tree.seek(&SmallVec::from(key), ordering)
-                    })
+                    tree.with_epoch_check(epoch, || tree.seek(&SmallVec::from(key), ordering))
                 }),
         )
     }
@@ -173,9 +171,7 @@ impl Service for LSMTreeService {
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| {
-                    tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))
-                }),
+                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
         )
     }
 
@@ -192,9 +188,7 @@ impl Service for LSMTreeService {
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
                     tree.with_epoch_check(epoch, || {
-                        tree.merge(
-                            box keys.into_iter().map(|key| SmallVec::from(key)).collect(),
-                        )
+                        tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect())
                     })
                 }),
         )

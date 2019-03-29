@@ -175,7 +175,11 @@ where
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();
-            debug_assert!(Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner), "{:?}", self_next_node.keys.as_slice_immute()[0]);
+            debug_assert!(
+                Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner),
+                "{:?}",
+                self_next_node.keys.as_slice_immute()[0]
+            );
             self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
@@ -319,7 +323,6 @@ where
         self.dirty
     }
 
-
     pub fn make_changed(node: &NodeCellRef) {
         CHANGED_NODES.with(|changes| {
             let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
@@ -340,9 +343,7 @@ where
 }
 
 pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
-    CHANGED_NODES.with(|changes| {
-        mem::replace(&mut*changes.borrow_mut(), BTreeMap::new())
-    })
+    CHANGED_NODES.with(|changes| mem::replace(&mut *changes.borrow_mut(), BTreeMap::new()))
 }
 
 pub fn page_schema() -> Schema {

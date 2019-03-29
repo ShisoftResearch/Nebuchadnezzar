@@ -1,7 +1,7 @@
 use client::AsyncClient;
-use index::btree::external::ExtNode;
 use futures::Future;
 use index::btree::external;
+use index::btree::external::ExtNode;
 
 pub fn store_changed_nodes(neb: &AsyncClient) {
     let nodes = external::flush_changed();

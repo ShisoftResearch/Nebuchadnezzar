@@ -1,9 +1,9 @@
 use super::*;
+use std::any::TypeId;
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
-use std::any::TypeId;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -540,19 +540,19 @@ where
 {
 }
 
-impl <KS, PS> AnyNode for Node<KS, PS>
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+impl<KS, PS> AnyNode for Node<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn persist(&self, node_ref: &NodeCellRef, neb: &AsyncClient) -> bool {
         let mut guard = write_node::<KS, PS>(node_ref);
-        match &mut  *guard {
+        match &mut *guard {
             &mut NodeData::External(ref node) => {
                 node.persist(neb);
                 true
             }
-            _ => false
+            _ => false,
         }
     }
 }
