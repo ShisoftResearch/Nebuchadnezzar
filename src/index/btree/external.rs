@@ -339,8 +339,9 @@ where
         })
     }
 
-    pub fn persist(&self) {
-
+    pub fn persist(&self, neb: &AsyncClient) {
+        let cell = self.to_cell();
+        neb.upsert_cell(cell).wait().unwrap().unwrap();
     }
 }
 

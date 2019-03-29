@@ -314,7 +314,7 @@ macro_rules! impl_btree_level {
 }
 
 pub struct NodeCellRef {
-    inner: Arc<Any>,
+    inner: Arc<AnyNode>,
 }
 
 unsafe impl Send for NodeCellRef {}
@@ -349,16 +349,16 @@ impl NodeCellRef {
         // Because the size of different type of NodeData are the same, we can still cast them safely
         // for NodeData have a fixed size for all the time
         debug_assert!(
-            self.inner.is::<Node<KS, PS>>(),
+            self.inner.is_type::<Node<KS, PS>>(),
             "Node ref type unmatched, is default: {}",
             self.is_default()
         );
-        unsafe { &*(self.inner.deref() as *const dyn Any as *const Node<KS, PS>) }
+        unsafe { &*(self.inner.deref() as *const dyn AnyNode as *const Node<KS, PS>) }
     }
 
     pub fn is_default(&self) -> bool {
         self.inner
-            .is::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
+            .is_type::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
     }
 
     pub fn to_string<KS, PS>(&self) -> String
@@ -378,6 +378,10 @@ impl NodeCellRef {
                 format!("{:?}", node.first_key())
             }
         }
+    }
+
+    pub fn persist(&self, neb: &AsyncClient) -> bool {
+        self.inner.persist(self, neb)
     }
 }
 

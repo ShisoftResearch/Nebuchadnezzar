@@ -3,6 +3,7 @@ use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
+use std::any::TypeId;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -300,8 +301,8 @@ where
 
 const LATCH_FLAG: usize = !(!0 >> 1);
 
-pub trait AnyNode: Any {
-    fn persist(&self, node_ref: &NodeCellRef) -> bool;
+pub trait AnyNode: Any + 'static {
+    fn persist(&self, node_ref: &NodeCellRef, neb: &AsyncClient) -> bool;
 }
 
 pub struct Node<KS, PS>
@@ -544,15 +545,21 @@ impl <KS, PS> AnyNode for Node<KS, PS>
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
-    fn persist(&self, node_ref: &NodeCellRef) -> bool {
+    fn persist(&self, node_ref: &NodeCellRef, neb: &AsyncClient) -> bool {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut  *guard {
             &mut NodeData::External(ref node) => {
-                node.persist();
+                node.persist(neb);
                 true
             }
             _ => false
         }
+    }
+}
+
+impl dyn AnyNode {
+    pub fn is_type<T: AnyNode>(&self) -> bool {
+        TypeId::of::<T>() == self.type_id()
     }
 }
 
