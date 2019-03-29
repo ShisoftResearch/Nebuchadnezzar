@@ -19,7 +19,7 @@ use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::mem;
@@ -40,6 +40,10 @@ lazy_static! {
     static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
     static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
+}
+
+thread_local! {
+    static CHANGED_NODES: RefCell<BTreeMap<Id, Option<NodeCellRef>>> = RefCell::new(BTreeMap::new());
 }
 
 pub struct ExtNode<KS, PS>
@@ -171,7 +175,11 @@ where
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();
-            debug_assert!(Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner), "{:?}", self_next_node.keys.as_slice_immute()[0]);
+            debug_assert!(
+                Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner),
+                "{:?}",
+                self_next_node.keys.as_slice_immute()[0]
+            );
             self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
@@ -312,8 +320,30 @@ where
         }
     }
     pub fn is_dirty(&self) -> bool {
-        unimplemented!()
+        self.dirty
     }
+
+    pub fn make_changed(node: &NodeCellRef) {
+        CHANGED_NODES.with(|changes| {
+            let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+            changes.borrow_mut().insert(id, Some(node.clone()));
+        });
+    }
+
+    pub fn make_deleted(id: &Id) {
+        CHANGED_NODES.with(|changes| {
+            changes.borrow_mut().insert(*id, None);
+        });
+    }
+
+    pub fn persist(&self, neb: &AsyncClient) {
+        let cell = self.to_cell();
+        neb.upsert_cell(cell).wait().unwrap().unwrap();
+    }
+}
+
+pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
+    CHANGED_NODES.with(|changes| mem::replace(&mut *changes.borrow_mut(), BTreeMap::new()))
 }
 
 pub fn page_schema() -> Schema {

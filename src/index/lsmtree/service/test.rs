@@ -135,7 +135,13 @@ pub fn split() {
                 .unwrap()
                 .unwrap()
                 .unwrap();
-            let remote_key_vec = client.current(placement.id, cursor_id).wait().unwrap().unwrap().unwrap().unwrap();
+            let remote_key_vec = client
+                .current(placement.id, cursor_id)
+                .wait()
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let remote_key: EntryKey = SmallVec::from(remote_key_vec);
             assert_eq!(remote_key, entry_key);
         }

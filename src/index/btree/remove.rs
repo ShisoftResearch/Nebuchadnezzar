@@ -1,5 +1,6 @@
 // This function is unstable yet, tests ignored
 
+use index::btree::external::ExtNode;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
@@ -390,6 +391,9 @@ where
     loop {
         match &*node {
             &NodeData::None => return footprint,
+            &NodeData::External(ref node) => {
+                ExtNode::<KS, PS>::make_deleted(&node.id);
+            }
             _ => {}
         }
         let right = node.right_ref().unwrap().clone();

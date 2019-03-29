@@ -1,3 +1,5 @@
+use index::btree::external::ExtNode;
+use index::btree::insert::InsertSearchResult::External;
 use index::btree::node::read_node;
 use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
@@ -94,8 +96,10 @@ where
     let mut split_result = searched_guard
         .extnode_mut()
         .insert(key, tree, &self_ref, parent);
+    ExtNode::<KS, PS>::make_changed(node_ref);
     if let &mut Some(Some(ref mut split)) = &mut split_result {
         split.left_node_latch = searched_guard;
+        ExtNode::<KS, PS>::make_changed(&split.new_right_node);
     }
     split_result
 }

@@ -19,13 +19,13 @@ use ram::segs::MAX_SEGMENT_SIZE;
 use ram::types::Id;
 use rayon::iter::IntoParallelRefIterator;
 use std::collections::BTreeSet;
+use std::fmt::Debug;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::{mem, ptr};
-use std::fmt::Debug;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
 
@@ -49,7 +49,10 @@ pub enum LSMTreeResult<T> {
 }
 
 impl<T> LSMTreeResult<T> {
-    pub fn unwrap(self) -> T where T: Debug {
+    pub fn unwrap(self) -> T
+    where
+        T: Debug,
+    {
         if let LSMTreeResult::Ok(v) = self {
             v
         } else {
