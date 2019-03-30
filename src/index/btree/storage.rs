@@ -2,10 +2,11 @@ use client::AsyncClient;
 use futures::Future;
 use index::btree::external;
 use index::btree::external::ExtNode;
+use rayon::prelude::*;
 
 pub fn store_changed_nodes(neb: &AsyncClient) {
     let nodes = external::flush_changed();
-    nodes.into_iter().for_each(|(id, node)| {
+    nodes.into_par_iter().for_each(|(id, node)| {
         if let Some(node) = node {
             node.persist(neb);
         } else {
