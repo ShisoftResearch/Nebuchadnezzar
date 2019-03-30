@@ -325,7 +325,7 @@ where
 
     pub fn make_changed(node: &NodeCellRef) {
         CHANGED_NODES.with(|changes| {
-            let id = read_node(node, |n: &NodeReadHandler<KS, PS>| n.ext_id());
+            let id = read_unchecked::<KS, PS>(node).ext_id();
             changes.borrow_mut().insert(id, Some(node.clone()));
         });
     }
