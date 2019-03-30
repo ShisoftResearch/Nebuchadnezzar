@@ -82,7 +82,7 @@ where
             next: Node::<KS, PS>::none_ref(),
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
-            dirty: false,
+            dirty: true,
             right_bound,
             mark: PhantomData,
         }
@@ -330,12 +330,6 @@ where
         });
     }
 
-    pub fn make_deleted(id: &Id) {
-        CHANGED_NODES.with(|changes| {
-            changes.borrow_mut().insert(*id, None);
-        });
-    }
-
     pub fn persist(&self, neb: &AsyncClient) {
         let cell = self.to_cell();
         neb.upsert_cell(cell).wait().unwrap().unwrap();
@@ -344,6 +338,12 @@ where
 
 pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
     CHANGED_NODES.with(|changes| mem::replace(&mut *changes.borrow_mut(), BTreeMap::new()))
+}
+
+pub fn make_deleted(id: &Id) {
+    CHANGED_NODES.with(|changes| {
+        changes.borrow_mut().insert(*id, None);
+    });
 }
 
 pub fn page_schema() -> Schema {

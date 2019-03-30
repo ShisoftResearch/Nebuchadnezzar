@@ -11,7 +11,7 @@ use index::btree::node::NodeReadHandler;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
-use index::btree::BPlusTree;
+use index::btree::{BPlusTree, external};
 use index::btree::NodeCellRef;
 use index::EntryKey;
 use index::Slice;
@@ -392,7 +392,7 @@ where
         match &*node {
             &NodeData::None => return footprint,
             &NodeData::External(ref node) => {
-                ExtNode::<KS, PS>::make_deleted(&node.id);
+                external::make_deleted(&node.id);
             }
             _ => {}
         }

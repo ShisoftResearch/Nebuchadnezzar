@@ -121,7 +121,10 @@ where
 
     pub fn extnode_mut(&mut self) -> &mut ExtNode<KS, PS> {
         match self {
-            &mut NodeData::External(ref mut node) => node,
+            &mut NodeData::External(ref mut node) => {
+                node.dirty = true;
+                node
+            },
             _ => unreachable!(self.type_name()),
         }
     }

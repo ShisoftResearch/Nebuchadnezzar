@@ -12,7 +12,7 @@ use index::btree::node::NodeData;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
-use index::btree::BPlusTree;
+use index::btree::{BPlusTree, external};
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
 use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
+use index::btree::external::ExtNode;
 
 enum Selection<KS, PS>
 where
@@ -322,12 +323,12 @@ where
     box upper_removal
 }
 
-pub fn level_merge<KSA, PSA>(src_tree: &BPlusTree<KSA, PSA>, dest_tree: &LevelTree) -> usize
+pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
 where
-    KSA: Slice<EntryKey> + Debug + 'static,
-    PSA: Slice<NodeCellRef> + 'static,
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
-    let left_most_leaf_guards = select::<KSA, PSA>(&src_tree.get_root());
+    let mut left_most_leaf_guards = select::<KS, PS>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
     let mut num_keys_removed = 0;
     debug!("Merge selected {} pages", left_most_leaf_guards.len());
@@ -367,7 +368,7 @@ where
             .collect_vec();
         let mut removal = NodeRemoval::new();
         removal.empty_pages = page_keys;
-        prune_selected::<KSA, PSA>(&src_tree.get_root(), box removal, 0);
+        prune_selected::<KS, PS>(&src_tree.get_root(), box removal, 0);
     }
 
     // adjust leaf left, right references
@@ -386,12 +387,21 @@ where
             .unwrap()
             .clone();
 
-        for mut g in left_most_leaf_guards {
-            *g = NodeData::Empty(box EmptyNode {
+        debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
+        for mut g in &mut left_most_leaf_guards {
+            external::make_deleted(&g.ext_id());
+            **g = NodeData::Empty(box EmptyNode {
                 left: Some(left_left_most.clone()),
                 right: right_right_most.clone(),
-            })
+            });
         }
+
+        let mut new_first_node = write_node::<KS, PS>(&right_right_most);
+        let mut new_first_node_ext = new_first_node.extnode_mut();
+        new_first_node_ext.id = left_most_leaf_guards.first().unwrap().ext_id();
+        new_first_node_ext.prev = left_left_most;
+
+        ExtNode::<KS, PS>::make_changed(&right_right_most);
     }
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
