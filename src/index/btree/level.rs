@@ -388,6 +388,8 @@ where
             .clone();
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
+
+        let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
             **g = NodeData::Empty(box EmptyNode {
@@ -398,8 +400,10 @@ where
 
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut();
-        new_first_node_ext.id = left_most_leaf_guards.first().unwrap().ext_id();
+        new_first_node_ext.id = left_most_id;
         new_first_node_ext.prev = left_left_most;
+
+        debug_assert_eq!(new_first_node_ext.id, src_tree.head_page_id);
 
         ExtNode::<KS, PS>::make_changed(&right_right_most);
     }

@@ -79,6 +79,7 @@ where
 {
     root: RwLock<NodeCellRef>,
     root_versioning: NodeCellRef,
+    head_page_id: Id,
     len: AtomicUsize,
     deleted: DeletionSet,
     marker: PhantomData<(KS, PS)>,
@@ -111,9 +112,10 @@ where
 {
     pub fn new() -> BPlusTree<KS, PS> {
         debug!("Creating B+ Tree, with capacity {}", KS::slice_len());
-        let tree = BPlusTree {
+        let mut tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::with_none())),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
+            head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
             deleted: Arc::new(RwLock::new(BTreeSet::new())),
             marker: PhantomData,
@@ -124,6 +126,7 @@ where
         let root_inner = Node::<KS, PS>::new_external(root_id, max_key);
         debug!("B+ Tree created");
         *tree.root.write() = NodeCellRef::new(root_inner);
+        tree.head_page_id = root_id;
         return tree;
     }
 
@@ -240,6 +243,7 @@ pub trait LevelTree {
     fn mid_key(&self) -> Option<EntryKey>;
     fn remove_following_tombstones(&self, start: &EntryKey);
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
+    fn to_cell(&self) -> Cell;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -301,6 +305,12 @@ where
         let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
         self.len.fetch_sub(removed, Relaxed);
         removed
+    }
+
+    fn to_cell(&self) -> Cell {
+        let header_page_id = self.head_page_id;
+
+        unimplemented!()
     }
 }
 
