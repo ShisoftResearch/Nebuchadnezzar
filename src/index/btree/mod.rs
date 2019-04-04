@@ -64,6 +64,7 @@ mod remove;
 mod search;
 mod split;
 mod storage;
+mod reconstruct;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
@@ -128,6 +129,10 @@ where
         *tree.root.write() = NodeCellRef::new(root_inner);
         tree.head_page_id = root_id;
         return tree;
+    }
+
+    pub fn from_head_page(head_cell: Cell) -> Self {
+        reconstruct::reconstruct_from_head_page(head_cell)
     }
 
     pub fn get_root(&self) -> NodeCellRef {
@@ -243,7 +248,7 @@ pub trait LevelTree {
     fn mid_key(&self) -> Option<EntryKey>;
     fn remove_following_tombstones(&self, start: &EntryKey);
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
-    fn to_cell(&self) -> Cell;
+    fn head_id(&self) -> Id;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -307,10 +312,8 @@ where
         removed
     }
 
-    fn to_cell(&self) -> Cell {
-        let header_page_id = self.head_page_id;
-
-        unimplemented!()
+    fn head_id(&self) -> Id {
+        self.head_page_id
     }
 }
 

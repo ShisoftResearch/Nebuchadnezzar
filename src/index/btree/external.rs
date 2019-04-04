@@ -30,16 +30,16 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 
-const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
-const KEYS_FIELD: &'static str = "keys";
-const NEXT_FIELD: &'static str = "next";
-const PREV_FIELD: &'static str = "prev";
+pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
+pub const KEYS_FIELD: &'static str = "keys";
+pub const NEXT_FIELD: &'static str = "next";
+pub const PREV_FIELD: &'static str = "prev";
 
 lazy_static! {
-    static ref KEYS_KEY_HASH: u64 = key_hash(KEYS_FIELD);
-    static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
-    static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
-    static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
+    pub static ref KEYS_KEY_HASH: u64 = key_hash(KEYS_FIELD);
+    pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
+    pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
+    pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
 }
 
 thread_local! {
@@ -58,7 +58,7 @@ where
     pub len: usize,
     pub dirty: bool,
     pub right_bound: EntryKey,
-    mark: PhantomData<PS>,
+    pub mark: PhantomData<PS>,
 }
 
 pub struct ExtNodeSplit<KS, PS>
@@ -85,6 +85,41 @@ where
             dirty: true,
             right_bound,
             mark: PhantomData,
+        }
+    }
+
+    pub fn from_cell(cell: Cell) -> Box<IncubatingExtNode<KS, PS>> {
+        let cell_id = cell.id();
+        let _cell_version = cell.header.version;
+        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
+        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
+        let keys = &cell.data[*KEYS_KEY_HASH];
+        let _keys_len = keys.len().unwrap();
+        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+            array
+        } else {
+            panic!()
+        };
+        let mut key_slice = KS::init();
+        let mut key_count = 0;
+        for (i, key_val) in keys_array.iter().enumerate() {
+            key_slice.as_slice()[i] = EntryKey::from(key_val.as_slice());
+            key_count += 1;
+        }
+        let ext_node = ExtNode {
+            id: cell_id,
+            keys: key_slice,
+            next: NodeCellRef::default(), // UNDETERMINED
+            prev: NodeCellRef::default(), // UNDETERMINED
+            len: key_count,
+            dirty: false,
+            right_bound: max_entry_key(), // UNDETERMINED
+            mark: PhantomData,
+        };
+        box IncubatingExtNode {
+            node: ext_node,
+            prev_id: *prev,
+            next_id: *next
         }
     }
 
@@ -367,70 +402,12 @@ pub fn page_schema() -> Schema {
     }
 }
 
-pub struct NodeCache<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
+pub struct IncubatingExtNode<KS, PS>
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
 {
-    nodes: RefCell<HashMap<Id, NodeCellRef>>,
-    storage: Arc<AsyncClient>,
-    marker: PhantomData<(KS, PS)>,
-}
-
-impl<KS, PS> NodeCache<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    pub fn new(neb_client: &Arc<AsyncClient>) -> Self {
-        NodeCache {
-            nodes: RefCell::new(HashMap::new()),
-            storage: neb_client.clone(),
-            marker: PhantomData,
-        }
-    }
-
-    pub fn get(&self, id: &Id) -> NodeCellRef {
-        if id.is_unit_id() {
-            return NodeCellRef::new(Node::<KS, PS>::with_none());
-        }
-        let mut nodes = self.nodes.borrow_mut();
-        nodes
-            .entry(*id)
-            .or_insert_with(|| {
-                let cell = self.storage.read_cell(*id).wait().unwrap().unwrap();
-                NodeCellRef::new(Node::with_external(self.extnode_from_cell(cell)))
-            })
-            .clone()
-    }
-
-    fn extnode_from_cell(&self, cell: Cell) -> Box<ExtNode<KS, PS>> {
-        let cell_id = cell.id();
-        let _cell_version = cell.header.version;
-        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
-        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
-        let keys = &cell.data[*KEYS_KEY_HASH];
-        let _keys_len = keys.len().unwrap();
-        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
-            array
-        } else {
-            panic!()
-        };
-        let mut key_slice = KS::init();
-        let mut key_count = 0;
-        for (i, key_val) in keys_array.iter().enumerate() {
-            key_slice.as_slice()[i] = EntryKey::from(key_val.as_slice());
-            key_count += 1;
-        }
-        box ExtNode {
-            id: cell_id,
-            keys: key_slice,
-            next: self.get(next),
-            prev: self.get(prev),
-            len: key_count,
-            dirty: false,
-            right_bound: max_entry_key(), // TODO: assign a real one on reconstructing
-            mark: PhantomData,
-        }
-    }
+    node: ExtNode<KS, PS>,
+    prev_id: Id,
+    next_id: Id
 }
