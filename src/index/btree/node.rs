@@ -570,7 +570,7 @@ where
     ) -> bool {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
-            &mut NodeData::External(ref node) => {
+            &mut NodeData::External(ref mut node) => {
                 node.persist(deletion, neb);
                 true
             }

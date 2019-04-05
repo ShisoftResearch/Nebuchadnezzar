@@ -379,9 +379,12 @@ where
         });
     }
 
-    pub fn persist(&self, deleted: &DeletionSetInneer, neb: &AsyncClient) {
-        let cell = self.to_cell(deleted);
-        neb.upsert_cell(cell).wait().unwrap().unwrap();
+    pub fn persist(&mut self, deleted: &DeletionSetInneer, neb: &AsyncClient) {
+        if self.is_dirty() {
+            let cell = self.to_cell(deleted);
+            neb.upsert_cell(cell).wait().unwrap().unwrap();
+            self.dirty = false;
+        }
     }
 }
 
