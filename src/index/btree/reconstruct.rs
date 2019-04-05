@@ -4,7 +4,7 @@ use index::btree::external::*;
 use index::btree::internal::InNode;
 use index::btree::node::{write_node, Node, NodeWriteGuard};
 use index::btree::remove::SubNodeStatus::InNodeEmpty;
-use index::btree::{max_entry_key, BPlusTree, NodeCellRef};
+use index::btree::{max_entry_key, BPlusTree, NodeCellRef, DeletionSetInneer};
 use index::{EntryKey, Slice};
 use parking_lot::RwLock;
 use ram::cell::Cell;
@@ -136,7 +136,7 @@ where
         root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
         head_page_id,
         len: AtomicUsize::new(len),
-        deleted: Arc::new(RwLock::new(BTreeSet::new())),
+        deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
         marker: PhantomData,
     }
 }

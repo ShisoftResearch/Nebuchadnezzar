@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
 use std::cmp::{max, min};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::fmt::Error;
 use std::fmt::Formatter;
@@ -67,7 +67,8 @@ mod split;
 mod storage;
 
 const CACHE_SIZE: usize = 2048;
-pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
+pub type DeletionSetInneer = HashSet<EntryKey>;
+pub type DeletionSet = Arc<RwLock<DeletionSetInneer>>;
 
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
@@ -118,7 +119,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
-            deleted: Arc::new(RwLock::new(BTreeSet::new())),
+            deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
             marker: PhantomData,
         };
         let root_id = tree.new_page_id();
@@ -285,7 +286,7 @@ where
 
     fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
         let mut tombstones = self.deleted.write();
-        let original_tombstones = mem::replace(&mut *tombstones, BTreeSet::new());
+        let original_tombstones = mem::replace(&mut *tombstones, DeletionSetInneer::new());
         *tombstones = original_tombstones
             .into_iter()
             .filter(|k| k < start)
@@ -380,7 +381,7 @@ impl NodeCellRef {
         }
     }
 
-    pub fn persist(&self, deletion: &BTreeSet<EntryKey>, neb: &AsyncClient) -> bool {
+    pub fn persist(&self, deletion: &DeletionSetInneer, neb: &AsyncClient) -> bool {
         self.inner.persist(self, deletion, neb)
     }
 }

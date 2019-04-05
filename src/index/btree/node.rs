@@ -317,7 +317,7 @@ pub trait AnyNode: Any + 'static {
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &BTreeSet<EntryKey>,
+        deletion: &DeletionSetInneer,
         neb: &AsyncClient,
     ) -> bool;
 }
@@ -565,7 +565,7 @@ where
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &BTreeSet<EntryKey>,
+        deletion: &DeletionSetInneer,
         neb: &AsyncClient,
     ) -> bool {
         let mut guard = write_node::<KS, PS>(node_ref);

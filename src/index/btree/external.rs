@@ -129,7 +129,7 @@ where
         }
     }
 
-    pub fn to_cell(&self, deleted: &BTreeSet<EntryKey>) -> Cell {
+    pub fn to_cell(&self, deleted: &DeletionSetInneer) -> Cell {
         let mut value = Value::Map(Map::new());
         let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| {
             node.extnode().id
@@ -280,7 +280,7 @@ where
         self.len = new_len;
     }
 
-    pub fn remove_contains(&mut self, set: &mut BTreeSet<EntryKey>) {
+    pub fn remove_contains(&mut self, set: &mut DeletionSetInneer) {
         let remaining_keys = {
             let remaining = self.keys.as_slice()[..self.len]
                 .iter()
@@ -379,7 +379,7 @@ where
         });
     }
 
-    pub fn persist(&self, deleted: &BTreeSet<EntryKey>, neb: &AsyncClient) {
+    pub fn persist(&self, deleted: &DeletionSetInneer, neb: &AsyncClient) {
         let cell = self.to_cell(deleted);
         neb.upsert_cell(cell).wait().unwrap().unwrap();
     }
