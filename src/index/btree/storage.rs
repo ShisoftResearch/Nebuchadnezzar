@@ -8,8 +8,9 @@ use ram::cell::Cell;
 pub fn store_changed_nodes(neb: &AsyncClient) {
     let nodes = external::flush_changed();
     nodes.into_par_iter().for_each(|(id, node)| {
-        if let Some(node) = node {
-            node.persist(neb);
+        if let Some(changing) = node {
+            let deletion = changing.deletion.read();
+            changing.node.persist(&*deletion, neb);
         } else {
             neb.remove_cell(id).wait().unwrap().unwrap();
         }

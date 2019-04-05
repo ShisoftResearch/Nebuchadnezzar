@@ -405,7 +405,7 @@ where
 
         debug_assert_eq!(new_first_node_ext.id, src_tree.head_page_id);
 
-        ExtNode::<KS, PS>::make_changed(&right_right_most);
+        ExtNode::<KS, PS>::make_changed(&right_right_most, src_tree);
     }
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);

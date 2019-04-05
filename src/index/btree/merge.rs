@@ -89,7 +89,7 @@ where
                 debug!("Start merging with page at {:?}", start_key);
                 current_guard = write_targeted(current_guard, start_key);
                 let remain_slots = KS::slice_len() - current_guard.len();
-                ExtNode::<KS, PS>::make_changed(current_guard.node_ref());
+                ExtNode::<KS, PS>::make_changed(current_guard.node_ref(), tree);
                 if remain_slots > 0 {
                     let mut ext_node = current_guard.extnode_mut();
                     ext_node.remove_contains(&mut *tree.deleted.write());
@@ -113,7 +113,7 @@ where
                         tree,
                     );
                     merging_pos += 1;
-                    ExtNode::<KS, PS>::make_changed(&new_node);
+                    ExtNode::<KS, PS>::make_changed(&new_node, tree);
                     new_pages.push((pivot, new_node));
                 }
             }

@@ -29,6 +29,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
+use std::collections::btree_set::BTreeSet;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -43,7 +44,12 @@ lazy_static! {
 }
 
 thread_local! {
-    static CHANGED_NODES: RefCell<BTreeMap<Id, Option<NodeCellRef>>> = RefCell::new(BTreeMap::new());
+    static CHANGED_NODES: RefCell<BTreeMap<Id, Option<ChangingNode>>> = RefCell::new(BTreeMap::new());
+}
+
+pub struct ChangingNode {
+    pub node: NodeCellRef,
+    pub deletion: DeletionSet
 }
 
 pub struct ExtNode<KS, PS>
@@ -123,7 +129,7 @@ where
         }
     }
 
-    pub fn to_cell(&self) -> Cell {
+    pub fn to_cell(&self, deleted: &BTreeSet<EntryKey>) -> Cell {
         let mut value = Value::Map(Map::new());
         let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| {
             node.extnode().id
@@ -136,11 +142,13 @@ where
         value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
         value[*KEYS_KEY_HASH] = self.keys.as_slice_immute()[..self.len]
             .iter()
+            .filter(|&key| !deleted.contains(key))
             .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
             .collect_vec()
             .value();
         Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
+
     pub fn search(&self, key: &EntryKey) -> usize {
         self.keys.as_slice_immute()[..self.len]
             .binary_search(key)
@@ -358,20 +366,23 @@ where
         self.dirty
     }
 
-    pub fn make_changed(node: &NodeCellRef) {
+    pub fn make_changed(node: &NodeCellRef, tree: &BPlusTree<KS, PS>) {
         CHANGED_NODES.with(|changes| {
             let id = read_unchecked::<KS, PS>(node).ext_id();
-            changes.borrow_mut().insert(id, Some(node.clone()));
+            changes.borrow_mut().insert(id, Some(ChangingNode {
+                node: node.clone(),
+                deletion: tree.deleted.clone()
+            }));
         });
     }
 
-    pub fn persist(&self, neb: &AsyncClient) {
-        let cell = self.to_cell();
+    pub fn persist(&self, deleted: &BTreeSet<EntryKey>, neb: &AsyncClient) {
+        let cell = self.to_cell(deleted);
         neb.upsert_cell(cell).wait().unwrap().unwrap();
     }
 }
 
-pub fn flush_changed() -> BTreeMap<Id, Option<NodeCellRef>> {
+pub fn flush_changed() -> BTreeMap<Id, Option<ChangingNode>> {
     CHANGED_NODES.with(|changes| mem::replace(&mut *changes.borrow_mut(), BTreeMap::new()))
 }
 

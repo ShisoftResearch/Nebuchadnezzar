@@ -96,10 +96,10 @@ where
     let mut split_result = searched_guard
         .extnode_mut()
         .insert(key, tree, &self_ref, parent);
-    ExtNode::<KS, PS>::make_changed(node_ref);
+    ExtNode::<KS, PS>::make_changed(node_ref, tree);
     if let &mut Some(Some(ref mut split)) = &mut split_result {
         split.left_node_latch = searched_guard;
-        ExtNode::<KS, PS>::make_changed(&split.new_right_node);
+        ExtNode::<KS, PS>::make_changed(&split.new_right_node, tree);
     }
     split_result
 }

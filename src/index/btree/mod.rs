@@ -216,20 +216,6 @@ where
         self.len.load(Relaxed)
     }
 
-    fn flush_item(client: &Arc<AsyncClient>, value: &NodeCellRef) {
-        let cell = read_node(value, |node: &NodeReadHandler<KS, PS>| {
-            let extnode = node.extnode();
-            if extnode.is_dirty() {
-                Some(extnode.to_cell())
-            } else {
-                None
-            }
-        });
-        if let Some(cell) = cell {
-            client.upsert_cell(cell).wait().unwrap();
-        }
-    }
-
     fn new_page_id(&self) -> Id {
         // TODO: achieve locality
         Id::rand()
@@ -394,8 +380,8 @@ impl NodeCellRef {
         }
     }
 
-    pub fn persist(&self, neb: &AsyncClient) -> bool {
-        self.inner.persist(self, neb)
+    pub fn persist(&self, deletion: &BTreeSet<EntryKey>, neb: &AsyncClient) -> bool {
+        self.inner.persist(self, deletion, neb)
     }
 }
 
