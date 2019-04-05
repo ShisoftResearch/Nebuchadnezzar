@@ -1,9 +1,9 @@
 use client::AsyncClient;
 use futures::Future;
-use index::btree::{external, BPlusTree};
 use index::btree::external::ExtNode;
-use rayon::prelude::*;
+use index::btree::{external, BPlusTree};
 use ram::cell::Cell;
+use rayon::prelude::*;
 
 pub fn store_changed_nodes(neb: &AsyncClient) {
     let nodes = external::flush_changed();

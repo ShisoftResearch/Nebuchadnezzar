@@ -1,39 +1,39 @@
-use index::{EntryKey, Slice};
-use index::btree::{NodeCellRef, BPlusTree, max_entry_key};
-use index::btree::external::*;
-use ram::cell::Cell;
 use dovahkiin::types::*;
-use std::fmt::Debug;
 use index::btree::external::ExtNode;
-use index::btree::node::{write_node, Node, NodeWriteGuard};
+use index::btree::external::*;
 use index::btree::internal::InNode;
-use std::mem;
-use std::cell::RefCell;
-use std::rc::Rc;
+use index::btree::node::{write_node, Node, NodeWriteGuard};
 use index::btree::remove::SubNodeStatus::InNodeEmpty;
-use std::cmp::max;
+use index::btree::{max_entry_key, BPlusTree, NodeCellRef};
+use index::{EntryKey, Slice};
 use parking_lot::RwLock;
-use std::marker::PhantomData;
-use std::sync::Arc;
+use ram::cell::Cell;
+use std::cell::RefCell;
+use std::cmp::max;
 use std::collections::btree_set::BTreeSet;
+use std::fmt::Debug;
+use std::marker::PhantomData;
+use std::mem;
+use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 
 pub struct TreeConstructor<KS, PS>
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     level_guards: Vec<Rc<RefCell<NodeWriteGuard<KS, PS>>>>,
 }
 
-impl <KS, PS> TreeConstructor<KS, PS>
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+impl<KS, PS> TreeConstructor<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new() -> Self {
         TreeConstructor {
-            level_guards: vec![]
+            level_guards: vec![],
         }
     }
 
@@ -46,7 +46,8 @@ impl <KS, PS> TreeConstructor<KS, PS>
         if self.level_guards.len() < level + 1 {
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
             let new_root_ref = NodeCellRef::new(Node::with_internal(new_root_innode));
-            self.level_guards.push(Rc::new(RefCell::new(write_node::<KS, PS>(&new_root_ref))));
+            self.level_guards
+                .push(Rc::new(RefCell::new(write_node::<KS, PS>(&new_root_ref))));
             new_level = true;
         }
         let parent_page_ref = self.level_guards[level].clone();
@@ -55,11 +56,14 @@ impl <KS, PS> TreeConstructor<KS, PS>
         if parent_guard.len() >= cap {
             let mut new_innode = InNode::<KS, PS>::new(1, max_entry_key());
             let parent_right_bound = parent_guard.last_key().clone();
-            let new_innode_head_ptr= {
+            let new_innode_head_ptr = {
                 let mut parent_innode = parent_guard.innode_mut();
                 parent_innode.len -= 1;
                 parent_innode.right_bound = parent_right_bound.clone();
-                mem::replace(&mut parent_innode.ptrs.as_slice()[cap], NodeCellRef::default())
+                mem::replace(
+                    &mut parent_innode.ptrs.as_slice()[cap],
+                    NodeCellRef::default(),
+                )
             };
             new_innode.ptrs.as_slice()[0] = new_innode_head_ptr;
             new_innode.ptrs.as_slice()[1] = node.clone();
@@ -93,8 +97,9 @@ impl <KS, PS> TreeConstructor<KS, PS>
 }
 
 pub fn reconstruct_from_head_page<KS, PS>(head_page_cell: Cell) -> BPlusTree<KS, PS>
-    where KS: Slice<EntryKey> + Debug + 'static,
-          PS: Slice<NodeCellRef> + 'static
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let head_page_id = head_page_cell.id();
     let mut len = 0;
@@ -132,6 +137,6 @@ pub fn reconstruct_from_head_page<KS, PS>(head_page_cell: Cell) -> BPlusTree<KS,
         head_page_id,
         len: AtomicUsize::new(len),
         deleted: Arc::new(RwLock::new(BTreeSet::new())),
-        marker: PhantomData
+        marker: PhantomData,
     }
 }

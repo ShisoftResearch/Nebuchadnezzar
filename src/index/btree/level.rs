@@ -1,3 +1,4 @@
+use index::btree::external::ExtNode;
 use index::btree::internal::InNode;
 use index::btree::node::is_node_locked;
 use index::btree::node::read_node;
@@ -12,9 +13,9 @@ use index::btree::node::NodeData;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
-use index::btree::{BPlusTree, external};
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
+use index::btree::{external, BPlusTree};
 use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
 use index::EntryKey;
 use index::Slice;
@@ -24,7 +25,6 @@ use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
-use index::btree::external::ExtNode;
 
 enum Selection<KS, PS>
 where

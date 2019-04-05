@@ -1,10 +1,10 @@
 use super::*;
 use std::any::TypeId;
+use std::collections::btree_set::BTreeSet;
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
-use std::collections::btree_set::BTreeSet;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -125,7 +125,7 @@ where
             &mut NodeData::External(ref mut node) => {
                 node.dirty = true;
                 node
-            },
+            }
             _ => unreachable!(self.type_name()),
         }
     }
@@ -314,7 +314,12 @@ where
 const LATCH_FLAG: usize = !(!0 >> 1);
 
 pub trait AnyNode: Any + 'static {
-    fn persist(&self, node_ref: &NodeCellRef, deletion: &BTreeSet<EntryKey>, neb: &AsyncClient) -> bool;
+    fn persist(
+        &self,
+        node_ref: &NodeCellRef,
+        deletion: &BTreeSet<EntryKey>,
+        neb: &AsyncClient,
+    ) -> bool;
 }
 
 pub struct Node<KS, PS>
@@ -557,7 +562,12 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    fn persist(&self, node_ref: &NodeCellRef, deletion: &BTreeSet<EntryKey>, neb: &AsyncClient) -> bool {
+    fn persist(
+        &self,
+        node_ref: &NodeCellRef,
+        deletion: &BTreeSet<EntryKey>,
+        neb: &AsyncClient,
+    ) -> bool {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
             &mut NodeData::External(ref node) => {

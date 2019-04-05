@@ -19,6 +19,7 @@ use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
 use std::cell::UnsafeCell;
+use std::collections::btree_set::BTreeSet;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -29,7 +30,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
-use std::collections::btree_set::BTreeSet;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -49,7 +49,7 @@ thread_local! {
 
 pub struct ChangingNode {
     pub node: NodeCellRef,
-    pub deletion: DeletionSet
+    pub deletion: DeletionSet,
 }
 
 pub struct ExtNode<KS, PS>
@@ -125,7 +125,7 @@ where
         box IncubatingExtNode {
             node: ext_node,
             prev_id: *prev,
-            next_id: *next
+            next_id: *next,
         }
     }
 
@@ -369,10 +369,13 @@ where
     pub fn make_changed(node: &NodeCellRef, tree: &BPlusTree<KS, PS>) {
         CHANGED_NODES.with(|changes| {
             let id = read_unchecked::<KS, PS>(node).ext_id();
-            changes.borrow_mut().insert(id, Some(ChangingNode {
-                node: node.clone(),
-                deletion: tree.deleted.clone()
-            }));
+            changes.borrow_mut().insert(
+                id,
+                Some(ChangingNode {
+                    node: node.clone(),
+                    deletion: tree.deleted.clone(),
+                }),
+            );
         });
     }
 
@@ -414,11 +417,11 @@ pub fn page_schema() -> Schema {
 }
 
 pub struct IncubatingExtNode<KS, PS>
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     pub node: ExtNode<KS, PS>,
     pub prev_id: Id,
-    pub next_id: Id
+    pub next_id: Id,
 }

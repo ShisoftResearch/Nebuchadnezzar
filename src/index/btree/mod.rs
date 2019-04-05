@@ -60,11 +60,11 @@ mod internal;
 mod level;
 mod merge;
 mod node;
+mod reconstruct;
 mod remove;
 mod search;
 mod split;
 mod storage;
-mod reconstruct;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSet = Arc<RwLock<BTreeSet<EntryKey>>>;
