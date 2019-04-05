@@ -251,6 +251,14 @@ where
             _ => panic!(self.type_name()),
         }
     }
+
+    pub fn right_bound_mut(&mut self) -> &mut EntryKey {
+        match self {
+            &mut NodeData::External(ref mut n) => &mut n.right_bound,
+            &mut NodeData::Internal(ref mut n) => &mut n.right_bound,
+            _ => panic!(self.type_name()),
+        }
+    }
 }
 
 pub fn write_non_empty<KS, PS>(mut search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>

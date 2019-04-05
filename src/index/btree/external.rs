@@ -88,7 +88,7 @@ where
         }
     }
 
-    pub fn from_cell(cell: Cell) -> Box<IncubatingExtNode<KS, PS>> {
+    pub fn from_cell(cell: &Cell) -> Box<IncubatingExtNode<KS, PS>> {
         let cell_id = cell.id();
         let _cell_version = cell.header.version;
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
@@ -407,7 +407,7 @@ pub struct IncubatingExtNode<KS, PS>
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
-    node: ExtNode<KS, PS>,
-    prev_id: Id,
-    next_id: Id
+    pub node: ExtNode<KS, PS>,
+    pub prev_id: Id,
+    pub next_id: Id
 }
