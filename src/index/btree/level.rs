@@ -62,7 +62,7 @@ where
     let search = mut_search::<KS, PS>(node, &smallvec!());
     match search {
         MutSearchResult::External => {
-            let mut collected = vec![write_non_empty(write_node(node))];
+            let mut collected = vec![write_node(node)];
             while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
                 let right = write_node(
                     collected
