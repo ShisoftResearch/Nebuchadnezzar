@@ -56,9 +56,13 @@ where
         let mut parent_guard = parent_page_ref.borrow_mut();
         let cap = KS::slice_len();
         if parent_guard.len() >= cap {
+            // current page overflowed, need a new page
             let mut new_innode = InNode::<KS, PS>::new(1, max_entry_key());
             let parent_right_bound = parent_guard.last_key().clone();
             let new_innode_head_ptr = {
+                // take a key and a ptr from current page to new page
+                // reset current page right bound to the taken key
+                // return the taken ptr
                 let mut parent_innode = parent_guard.innode_mut();
                 parent_innode.len -= 1;
                 parent_innode.right_bound = parent_right_bound.clone();
@@ -67,6 +71,7 @@ where
                     NodeCellRef::default(),
                 )
             };
+            // arrange a valid new page by putting the ptr from current page at 1st
             new_innode.ptrs.as_slice()[0] = new_innode_head_ptr;
             new_innode.ptrs.as_slice()[1] = node.clone();
             new_innode.keys.as_slice()[0] = first_key;
