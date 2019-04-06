@@ -132,8 +132,8 @@ where
         return tree;
     }
 
-    pub fn from_head_page(head_cell: Cell) -> Self {
-        reconstruct::reconstruct_from_head_page(head_cell)
+    pub fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
+        reconstruct::reconstruct_from_head_id(*head_id, neb)
     }
 
     pub fn get_root(&self) -> NodeCellRef {

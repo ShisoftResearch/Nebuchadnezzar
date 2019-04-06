@@ -4,7 +4,7 @@ use index::btree::external::*;
 use index::btree::internal::InNode;
 use index::btree::node::{write_node, Node, NodeWriteGuard};
 use index::btree::remove::SubNodeStatus::InNodeEmpty;
-use index::btree::{max_entry_key, BPlusTree, DeletionSetInneer, NodeCellRef};
+use index::btree::{max_entry_key, BPlusTree, DeletionSetInneer, NodeCellRef, external};
 use index::{EntryKey, Slice};
 use parking_lot::RwLock;
 use ram::cell::Cell;
@@ -17,6 +17,8 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use client::AsyncClient;
+use futures::prelude::*;
 
 pub struct TreeConstructor<KS, PS>
 where
@@ -96,31 +98,44 @@ where
     }
 }
 
-pub fn reconstruct_from_head_page<KS, PS>(head_page_cell: Cell) -> BPlusTree<KS, PS>
+pub fn reconstruct_from_head_id<KS, PS>(
+    head_id: Id,
+    neb: &AsyncClient,
+) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let head_page_id = head_page_cell.id();
     let mut len = 0;
     let mut constructor = TreeConstructor::<KS, PS>::new();
     let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
-    let mut cell = head_page_cell;
+    let mut id = head_id;
     let mut at_end = false;
     while !at_end {
+        let cell = neb.read_cell(id).wait().unwrap().unwrap();
         let page = ExtNode::<KS, PS>::from_cell(&cell);
         let next_id = page.next_id;
         let prev_id = page.prev_id;
         let mut node = page.node;
-        let first_key = node.keys.as_slice_immute()[0].clone();
-        len += node.len;
-        at_end = next_id.is_unit_id();
-        node.prev = prev_ref.clone();
+        id = next_id;
+        at_end = id.is_unit_id();
         if at_end {
             node.next = NodeCellRef::new_none::<KS, PS>();
         }
-        let node_ref = NodeCellRef::new(Node::with_external(box node));
         let mut prev_lock = write_node::<KS, PS>(&prev_ref);
+        if node.len == 0 {
+            // skip this empty node and make it deleted
+            external::make_deleted(&node.id);
+            if at_end {
+                // if the empty node is the last node, assign the right none node to previous node
+                *prev_lock.right_ref_mut().unwrap() = node.next.clone();
+            }
+            continue;
+        }
+        let first_key = node.keys.as_slice_immute()[0].clone();
+        len += node.len;
+        node.prev = prev_ref.clone();
+        let node_ref = NodeCellRef::new(Node::with_external(box node));
         if !prev_lock.is_none() {
             *prev_lock.right_bound_mut() = first_key.clone();
             *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
@@ -134,7 +149,7 @@ where
     BPlusTree {
         root: RwLock::new(root),
         root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
-        head_page_id,
+        head_page_id: head_id,
         len: AtomicUsize::new(len),
         deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
         marker: PhantomData,
