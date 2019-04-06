@@ -339,7 +339,7 @@ where
         let mut merged_deleted_keys = vec![];
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
-            .filter(|&g| g.is_empty_node())
+            .filter(|&g| !g.is_empty_node())
             .map(|g| &g.keys()[..g.len()])
             .flatten()
             .filter(|&k| {
