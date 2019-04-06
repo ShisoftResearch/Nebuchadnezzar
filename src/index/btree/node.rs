@@ -194,6 +194,7 @@ where
     pub fn left_ref(&self) -> Option<&NodeCellRef> {
         match self {
             &NodeData::External(ref n) => Some(&n.prev),
+            &NodeData::Empty(ref n) => n.left.as_ref(),
             _ => None,
         }
     }

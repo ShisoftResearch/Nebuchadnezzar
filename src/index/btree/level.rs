@@ -380,7 +380,7 @@ where
             .right_ref()
             .unwrap()
             .clone();
-        
+
         let left_left_most = {
             let left_most = left_most_leaf_guards.first().unwrap();
             if left_most.is_none() {
