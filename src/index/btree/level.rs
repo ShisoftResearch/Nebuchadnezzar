@@ -380,13 +380,15 @@ where
             .right_ref()
             .unwrap()
             .clone();
-
-        let left_left_most = left_most_leaf_guards
-            .first()
-            .unwrap()
-            .left_ref()
-            .unwrap()
-            .clone();
+        
+        let left_left_most = {
+            let left_most = left_most_leaf_guards.first().unwrap();
+            if left_most.is_none() {
+                left_most.node_ref().clone()
+            } else {
+                left_most.left_ref().unwrap().clone()
+            }
+        };
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
 
