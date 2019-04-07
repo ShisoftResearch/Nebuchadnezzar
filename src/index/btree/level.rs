@@ -64,7 +64,7 @@ where
     }
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey, level: usize)
+fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -74,17 +74,15 @@ where
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
             if !sub_node.is_empty_node() && !sub_node.is_ext() {
-                prune_selected::<KS, PS>(&sub_node_ref, bound, level + 1);
+                prune_selected::<KS, PS>(&sub_node_ref, bound);
             }
         }
         MutSearchResult::External => unreachable!(),
     };
     let mut node_ref = node.clone();
     loop {
-        let mut page = write_node::<KS, PS>(&node);
-        if page.is_empty_node() {
-            node_ref = page.right_ref().unwrap().clone();
-        } else {
+        let mut page = write_node::<KS, PS>(&node_ref);
+        if !page.is_empty_node() {
             let mut ptr_indices: HashSet<_> = page.innode()
                 .ptrs
                 .as_slice_immute()
@@ -138,7 +136,11 @@ where
                 innode.keys = new_keys;
                 innode.ptrs = new_ptrs;
             }
+            if page.right_bound() >= bound {
+                break;
+            }
         }
+        node_ref = page.right_ref().unwrap().clone();
     }
 }
 
@@ -225,7 +227,7 @@ where
     }
 
     // cleanup upper level references
-    {}
+    prune_selected::<KS, PS>(&src_tree.get_root(), &prune_bound);
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
