@@ -83,7 +83,8 @@ where
     loop {
         let mut page = write_node::<KS, PS>(&node_ref);
         if !page.is_empty_node() {
-            let mut ptr_indices: HashSet<_> = page.innode()
+            let mut ptr_indices: HashSet<_> = page
+                .innode()
                 .ptrs
                 .as_slice_immute()
                 .iter()
