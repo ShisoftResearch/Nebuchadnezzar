@@ -331,7 +331,10 @@ where
     let mut left_most_leaf_guards = select::<KS, PS>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
     let mut num_keys_removed = 0;
+    let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
+
     debug!("Merge selected {} pages", left_most_leaf_guards.len());
+    debug_assert_eq!(left_most_id, src_tree.head_page_id, "{}", left_most_leaf_guards.first().unwrap().type_name());
 
     // merge to dest_tree
     {
@@ -381,18 +384,10 @@ where
             .unwrap()
             .clone();
 
-        let left_left_most = {
-            let left_most = left_most_leaf_guards.first().unwrap();
-            if left_most.is_none() {
-                left_most.node_ref().clone()
-            } else {
-                left_most.left_ref().unwrap().clone()
-            }
-        };
+        let left_left_most = left_most_leaf_guards.first().unwrap().left_ref().unwrap().clone();
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
 
-        let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
             **g = NodeData::Empty(box EmptyNode {
