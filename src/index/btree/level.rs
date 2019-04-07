@@ -82,11 +82,12 @@ where
     let mut node_ref = node.clone();
     loop {
         let mut page = write_node::<KS, PS>(&node_ref);
+        let page_len = page.len();
         if !page.is_empty_node() {
             let mut ptr_indices: HashSet<_> = page
                 .innode()
                 .ptrs
-                .as_slice_immute()
+                .as_slice_immute()[..page_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, sub_level)| {
@@ -97,6 +98,7 @@ where
                     }
                 })
                 .collect();
+            let page_right_bound = page.right_bound().clone();
             if ptr_indices.len() == page.len() + 1 {
                 // all sub nodes are empty
                 // will set current node empty either
@@ -110,34 +112,37 @@ where
                 let mut new_keys = KS::init();
                 let mut new_ptrs = PS::init();
                 {
-                    let ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..innode.len + 1]
+                    let ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..page_len + 1]
                         .iter_mut()
                         .enumerate()
                         .filter(|(i, _)| !ptr_indices.contains(&i))
                         .map(|(_, p)| p)
                         .collect();
 
-                    let keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
+                    let keys: Vec<&mut _> = innode.keys.as_slice()[..page_len]
                         .iter_mut()
                         .enumerate()
-                        .filter(|(i, _)| !ptr_indices.contains(&(i + 1)))
+                        .filter(|(i, _)| !ptr_indices.contains(&i))
                         .map(|(_, k)| k)
                         .collect();
                     debug!("Prune filtered page have keys {:?}", &keys);
+                    debug_assert_eq!(ptrs.len(), keys.len() + 1);
                     innode.len = keys.len();
+                    let new_keys = new_keys.as_slice();
+                    let new_ptrs = new_ptrs.as_slice();
                     for (i, key) in keys.into_iter().enumerate() {
                         debug_assert!(key > &mut smallvec!(0));
-                        mem::swap(&mut new_keys.as_slice()[i], key);
+                        mem::swap(&mut new_keys[i], key);
                     }
                     for (i, ptr) in ptrs.into_iter().enumerate() {
                         debug_assert!(!ptr.is_default());
-                        mem::swap(&mut new_ptrs.as_slice()[i], ptr);
+                        mem::swap(&mut new_ptrs[i], ptr);
                     }
                 }
                 innode.keys = new_keys;
                 innode.ptrs = new_ptrs;
             }
-            if page.right_bound() >= bound {
+            if &page_right_bound >= bound {
                 break;
             }
         }
