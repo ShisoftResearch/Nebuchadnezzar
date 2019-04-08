@@ -36,11 +36,7 @@ where
             return search_node(right_node, key, ordering, deleted);
         }
         debug!("search node have keys {:?}", node.keys());
-        let mut pos = if node.is_empty_node() {
-            0
-        } else {
-            node.search(key)
-        };
+        let mut pos = node.search(key);
         match node {
             &NodeData::External(ref n) => {
                 debug!(

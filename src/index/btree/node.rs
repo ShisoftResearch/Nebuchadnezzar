@@ -48,11 +48,10 @@ where
         }
     }
     pub fn search(&self, key: &EntryKey) -> usize {
-        let _len = self.len();
-        if self.is_ext() {
-            self.extnode().search(key)
-        } else {
-            self.innode().search(key)
+        match self {
+            &NodeData::Internal(ref innode) => innode.search(key),
+            &NodeData::External(ref extnode) => extnode.search(key),
+            _ => 0
         }
     }
 
