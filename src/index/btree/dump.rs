@@ -10,6 +10,7 @@ use serde_json;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::Write;
+use itertools::Itertools;
 
 #[derive(Serialize, Deserialize)]
 struct DebugNode {
@@ -88,7 +89,10 @@ where
                 .collect();
             let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
                 .iter()
-                .map(|node_ref| cascading_dump_node::<KS, PS>(node_ref))
+                .cloned()
+                .collect_vec()
+                .into_iter()
+                .map(|node_ref| cascading_dump_node::<KS, PS>(&node_ref))
                 .collect();
             return DebugNode {
                 keys,
