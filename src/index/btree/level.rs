@@ -15,16 +15,16 @@ use index::btree::search::MutSearchResult;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
-use index::lsmtree::tree::{LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3, LEVEL_2};
+use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
 use smallvec::SmallVec;
+use std::cmp::min;
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
-use std::cmp::min;
 
 enum Selection<KS, PS>
 where
@@ -59,8 +59,8 @@ where
                 if right.is_none() {
                     break;
                 } else {
-                        collected_keys += right.len();
-                        collected.push(right);
+                    collected_keys += right.len();
+                    collected.push(right);
                 }
             }
             return collected;

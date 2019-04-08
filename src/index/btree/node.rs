@@ -51,7 +51,7 @@ where
         match self {
             &NodeData::Internal(ref innode) => innode.search(key),
             &NodeData::External(ref extnode) => extnode.search(key),
-            _ => 0
+            _ => 0,
         }
     }
 
