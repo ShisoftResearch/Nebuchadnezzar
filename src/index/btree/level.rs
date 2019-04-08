@@ -15,7 +15,7 @@ use index::btree::search::MutSearchResult;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
-use index::lsmtree::tree::LEVEL_PAGE_DIFF_MULTIPLIER;
+use index::lsmtree::tree::{LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3, LEVEL_2};
 use index::EntryKey;
 use index::Slice;
 use itertools::Itertools;
@@ -24,6 +24,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
+use std::cmp::min;
 
 enum Selection<KS, PS>
 where
@@ -42,8 +43,12 @@ where
     let search = mut_search::<KS, PS>(node, &smallvec!());
     match search {
         MutSearchResult::External => {
-            let mut collected = vec![write_node(node)];
-            while collected.len() < LEVEL_PAGE_DIFF_MULTIPLIER {
+            let first_node = write_node(node);
+            let mut collected_keys = first_node.len();
+            let mut collected = vec![first_node];
+            let target_keys = min(KS::slice_len() * LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3);
+            let target_guards = LEVEL_2;
+            while collected_keys < target_keys && collected.len() < target_guards {
                 let right = write_node(
                     collected
                         .last_mut()
@@ -54,7 +59,8 @@ where
                 if right.is_none() {
                     break;
                 } else {
-                    collected.push(right);
+                        collected_keys += right.len();
+                        collected.push(right);
                 }
             }
             return collected;

@@ -29,11 +29,11 @@ use std::{mem, ptr};
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
 
-const LEVEL_M: usize = 24;
-const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
-const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
-const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
-const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_M: usize = 24;
+pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
 pub type LevelTrees = Vec<Box<LevelTree>>;
 pub type Ptr = NodeCellRef;
