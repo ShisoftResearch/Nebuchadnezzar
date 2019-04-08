@@ -6,11 +6,11 @@ use index::btree::NodeCellRef;
 use index::id_from_key;
 use index::EntryKey;
 use index::Slice;
+use itertools::Itertools;
 use serde_json;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::Write;
-use itertools::Itertools;
 
 #[derive(Serialize, Deserialize)]
 struct DebugNode {
@@ -90,8 +90,8 @@ where
             let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
                 .iter()
                 .cloned()
-                .collect_vec()  // clone all ptrs before cascading dump
-                .into_iter()    // or the NodeCellRef may be reclaimed in the middle of dump
+                .collect_vec() // clone all ptrs before cascading dump
+                .into_iter() // or the NodeCellRef may be reclaimed in the middle of dump
                 .map(|node_ref| cascading_dump_node::<KS, PS>(&node_ref))
                 .collect();
             return DebugNode {

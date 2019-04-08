@@ -83,10 +83,7 @@ where
         let mut page = write_node::<KS, PS>(&node_ref);
         let page_len = page.len();
         if !page.is_empty_node() {
-            let mut ptr_indices: HashSet<_> = page
-                .innode()
-                .ptrs
-                .as_slice_immute()[..page_len + 1]
+            let mut ptr_indices: HashSet<_> = page.innode().ptrs.as_slice_immute()[..page_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, sub_level)| {

@@ -441,7 +441,7 @@ where
     NodeReadHandler {
         version: 0,
         node_ref: node.clone(),
-        mark: PhantomData
+        mark: PhantomData,
     }
 }
 
@@ -584,7 +584,7 @@ where
 {
     pub version: usize,
     node_ref: NodeCellRef,
-    mark: PhantomData<(KS, PS)>
+    mark: PhantomData<(KS, PS)>,
 }
 
 impl<KS, PS> Deref for NodeReadHandler<KS, PS>
