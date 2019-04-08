@@ -220,10 +220,8 @@ where
 
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut();
-        new_first_node_ext.id = left_most_id;
+        new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = left_left_most;
-
-        debug_assert_eq!(new_first_node_ext.id, src_tree.head_page_id);
 
         ExtNode::<KS, PS>::make_changed(&right_right_most, src_tree);
     }
