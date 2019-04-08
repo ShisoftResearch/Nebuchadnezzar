@@ -90,8 +90,8 @@ where
             let nodes = innode.ptrs.as_slice_immute()[..node.len() + 1]
                 .iter()
                 .cloned()
-                .collect_vec()
-                .into_iter()
+                .collect_vec()  // clone all ptrs before cascading dump
+                .into_iter()    // or the NodeCellRef may be reclaimed in the middle of dump
                 .map(|node_ref| cascading_dump_node::<KS, PS>(&node_ref))
                 .collect();
             return DebugNode {
