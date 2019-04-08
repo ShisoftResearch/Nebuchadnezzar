@@ -55,7 +55,9 @@ fn merge_into_internal<KS, PS>(
 fn debug_check_serialized(keys: &Vec<EntryKey>) {
     if cfg!(debug_assertions) && keys.len() > 0 {
         for i in 0..keys.len() - 1 {
-            assert!(keys[i] < keys[i + 1])
+            let left = &keys[i];
+            let right = &keys[i + 1];
+            assert!(left < right, "at {}, {:?} >= {:?}", i, left, right);
         }
     }
 }
