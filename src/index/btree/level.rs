@@ -6,7 +6,6 @@ use index::btree::node::read_unchecked;
 use index::btree::node::write_node;
 use index::btree::node::write_non_empty;
 use index::btree::node::write_targeted;
-use index::btree::node::write_unchecked;
 use index::btree::node::EmptyNode;
 use index::btree::node::Node;
 use index::btree::node::NodeData;

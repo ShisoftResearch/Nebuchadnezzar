@@ -439,19 +439,10 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     NodeReadHandler {
-        ptr: node.deref().data.get(),
         version: 0,
         node_ref: node.clone(),
+        mark: PhantomData
     }
-}
-
-pub fn write_unchecked<KS, PS>(node: &NodeCellRef) -> &mut NodeData<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    let node_deref = node.deref();
-    unsafe { &mut *node_deref.data.get() }
 }
 
 pub struct NodeWriteGuard<KS, PS>
@@ -591,9 +582,9 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub ptr: *const NodeData<KS, PS>,
     pub version: usize,
     node_ref: NodeCellRef,
+    mark: PhantomData<(KS, PS)>
 }
 
 impl<KS, PS> Deref for NodeReadHandler<KS, PS>
@@ -604,7 +595,7 @@ where
     type Target = NodeData<KS, PS>;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        unsafe { &*self.ptr }
+        unsafe { &*self.node_ref.deref().data.get() }
     }
 }
 
