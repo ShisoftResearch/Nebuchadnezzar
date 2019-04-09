@@ -25,6 +25,7 @@ use std::collections::{BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
+use index::btree::dump::dump_tree;
 
 enum Selection<KS, PS>
 where
@@ -164,6 +165,11 @@ where
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
 
     debug!("Merge selected {} pages", left_most_leaf_guards.len());
+    if cfg!(debug_assertions) {
+        if left_most_id != src_tree.head_page_id {
+            dump_tree(src_tree, "level_lsm_merge_failure_dump.json");
+        }
+    }
     debug_assert_eq!(
         left_most_id,
         src_tree.head_page_id,
