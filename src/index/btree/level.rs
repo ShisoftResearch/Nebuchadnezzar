@@ -1,3 +1,4 @@
+use index::btree::dump::dump_tree;
 use index::btree::external::ExtNode;
 use index::btree::internal::InNode;
 use index::btree::node::is_node_locked;
@@ -21,11 +22,10 @@ use index::Slice;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::cmp::min;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet, HashMap};
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
-use index::btree::dump::dump_tree;
 
 enum Selection<KS, PS>
 where
@@ -91,22 +91,20 @@ where
         let mut page = write_node::<KS, PS>(&node_ref);
         let page_len = page.len();
         let page_right_ref = page.right_ref().unwrap().clone();
+        let page_right_bound = page.right_bound().clone();
         if !page.is_empty_node() {
-            if page.right_bound() >= bound {
-                break;
-            }
-            let mut ptr_indices: HashSet<_> = page.innode().ptrs.as_slice_immute()[..page_len + 1]
+            let mut live_ptrs: HashMap<_, _> = page.innode().ptrs.as_slice_immute()[..page_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, sub_level)| {
-                    if read_unchecked::<KS, PS>(sub_level).is_empty_node() {
-                        Some(i)
+                    if !read_unchecked::<KS, PS>(sub_level).is_empty_node() {
+                        Some((i, sub_level.clone()))
                     } else {
                         None
                     }
                 })
                 .collect();
-            if ptr_indices.len() == page.len() + 1 {
+            if live_ptrs.len() == 0 {
                 // all sub nodes are empty
                 // will set current node empty either
                 let next_page_ref = page.innode().right.clone();
@@ -123,21 +121,14 @@ where
                     let mut new_keys = KS::init();
                     let mut new_ptrs = PS::init();
                     {
-                        let ptrs: Vec<&mut _> = innode.ptrs.as_slice()[..page_len + 1]
-                            .iter_mut()
-                            .enumerate()
-                            .filter(|(i, _)| !ptr_indices.contains(&i))
-                            .map(|(_, p)| p)
-                            .collect();
-
                         let keys: Vec<&mut _> = innode.keys.as_slice()[..page_len]
                             .iter_mut()
                             .enumerate()
-                            .filter(|(i, _)| !ptr_indices.contains(&i))
+                            .filter(|(i, _)| live_ptrs.contains_key(&i))
                             .map(|(_, k)| k)
                             .collect();
                         debug!("Prune filtered page have keys {:?}", &keys);
-                        debug_assert_eq!(ptrs.len(), keys.len() + 1);
+                        debug_assert_eq!(live_ptrs.len(), keys.len() + 1);
                         innode.len = keys.len();
                         let new_keys = new_keys.as_slice();
                         let new_ptrs = new_ptrs.as_slice();
@@ -145,15 +136,18 @@ where
                             debug_assert!(key > &mut smallvec!(0));
                             mem::swap(&mut new_keys[i], key);
                         }
-                        for (i, ptr) in ptrs.into_iter().enumerate() {
+                        for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                             debug_assert!(!ptr.is_default());
-                            mem::swap(&mut new_ptrs[i], ptr);
+                            mem::replace(&mut new_ptrs[i], ptr);
                         }
                     }
                     innode.keys = new_keys;
                     innode.ptrs = new_ptrs;
                 }
                 prev_node_guard = Some(page);
+            }
+            if &page_right_bound >= bound {
+                break;
             }
             node_ref = page_right_ref;
         } else {
