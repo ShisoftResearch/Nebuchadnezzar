@@ -37,6 +37,12 @@ where
     Innode(NodeCellRef),
 }
 
+struct KeyAltered {
+    new_key: EntryKey,
+    search_key: EntryKey,
+    ptr: NodeCellRef
+}
+
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -71,7 +77,7 @@ where
     }
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey) -> Vec<NodeCellRef>
+fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey) -> Vec<KeyAltered>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -89,7 +95,7 @@ where
     let mut prev_node_guard: Option<NodeWriteGuard<KS, PS>> = None;
     let mut page = write_node::<KS, PS>(&node);
     let mut next_live_ptrs = None;
-    let mut emptying_nodes = vec![];
+    let mut altered = vec![];
     let mut empty_nodes = vec![];
     let select_live = |page: &NodeWriteGuard<KS, PS>| {
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
@@ -118,8 +124,35 @@ where
         };
         unreachable!()
     };
+    let preserve_live = |innode: &mut InNode<KS, PS>, live_ptrs: HashMap<usize, NodeCellRef>| {
+        let mut new_keys = KS::init();
+        let mut new_ptrs = PS::init();
+        {
+            let keys: Vec<&mut _> = innode.keys.as_slice()[..innode.len]
+                .iter_mut()
+                .enumerate()
+                .filter(|(i, _)| live_ptrs.contains_key(&i))
+                .map(|(_, k)| k)
+                .collect();
+            debug!("Prune filtered page have keys {:?}", &keys);
+            debug_assert_eq!(live_ptrs.len(), keys.len() + 1);
+            innode.len = keys.len();
+            let new_keys = new_keys.as_slice();
+            let new_ptrs = new_ptrs.as_slice();
+            for (i, key) in keys.into_iter().enumerate() {
+                debug_assert!(key > &mut smallvec!(0));
+                mem::swap(&mut new_keys[i], key);
+            }
+            for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
+                debug_assert!(!ptr.is_default());
+                mem::replace(&mut new_ptrs[i], ptr);
+            }
+        }
+        innode.keys = new_keys;
+        innode.ptrs = new_ptrs;
+        innode.len == 0
+    };
     loop {
-        let page_len = page.len();
         let page_right_ref = page.right_ref().unwrap().clone();
         if !page.is_empty_node() {
             let mut live_ptrs: HashMap<_, _> = next_live_ptrs.unwrap_or_else(|| select_live(&page));
@@ -127,39 +160,62 @@ where
             if !is_empty {
                 let emptying = {
                     let mut innode = page.innode_mut();
-                    let mut new_keys = KS::init();
-                    let mut new_ptrs = PS::init();
-                    {
-                        let keys: Vec<&mut _> = innode.keys.as_slice()[..page_len]
-                            .iter_mut()
-                            .enumerate()
-                            .filter(|(i, _)| live_ptrs.contains_key(&i))
-                            .map(|(_, k)| k)
-                            .collect();
-                        debug!("Prune filtered page have keys {:?}", &keys);
-                        debug_assert_eq!(live_ptrs.len(), keys.len() + 1);
-                        innode.len = keys.len();
-                        let new_keys = new_keys.as_slice();
-                        let new_ptrs = new_ptrs.as_slice();
-                        for (i, key) in keys.into_iter().enumerate() {
-                            debug_assert!(key > &mut smallvec!(0));
-                            mem::swap(&mut new_keys[i], key);
-                        }
-                        for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
-                            debug_assert!(!ptr.is_default());
-                            mem::replace(&mut new_ptrs[i], ptr);
-                        }
-                    }
-                    innode.keys = new_keys;
-                    innode.ptrs = new_ptrs;
-                    innode.len == 0
+                    preserve_live(&mut innode, live_ptrs)
                 };
                 if emptying {
                     // current innode have one ptr and no keys
                     // need to merge with the right page
                     // if the right page is full, partial of the right page will be moved to the current page
                     // merging right page will also been cleaned
+                    let (mut next_guard, next_ptrs) = next_non_empty(&page, &mut empty_nodes);
+                    let mid = next_guard.len() / 2;
+                    let next_ref = next_guard.node_ref().clone();
+                    let page_ref = page.node_ref().clone();
+                    let mut page_innode = page.innode_mut();
+                    let next_node_emptying = preserve_live(&mut next_guard.innode_mut(), next_ptrs);
+                    page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
+                    if next_guard.len() >= KS::slice_len() {
+                        // will overflow if merged, have to rebalance right node contents with current node
+                        let mut next_innode = next_guard.innode_mut();
+                        let next_search_key = next_innode.keys.as_slice()[0].clone();
+                        // move next node keys and ptrs to current node
+                        for i in 0..mid {
+                            mem::swap(&mut page_innode.keys.as_slice()[i + 1], &mut next_innode.keys.as_slice()[i]);
+                            mem::swap(&mut page_innode.ptrs.as_slice()[i + 1], &mut next_innode.ptrs.as_slice()[i]);
+                        }
+                        for i in mid..next_innode.len {
+                            next_innode.keys.as_slice().swap(i, i - mid);
+                            next_innode.ptrs.as_slice().swap(i, i - mid);
+                        }
+                        next_innode.len -= mid;
+                        page_innode.len += mid;
+                        page_innode.right_bound = mem::replace(&mut page_innode.keys.as_slice()[mid], smallvec!());
+                        page_innode.len = 1 + mid;
+                        altered.push(KeyAltered {
+                            new_key: page_innode.right_bound.clone(),
+                            search_key: next_search_key,
+                            ptr: next_ref
+                        });
 
+                    } else {
+                        // Can move right page contents to current node and empty next node
+                        {
+                            let mut next_innode = next_guard.innode_mut();
+                            let next_node_len = next_innode.len;
+                            for i in 0..next_innode.len {
+                                mem::swap(&mut page_innode.keys.as_slice()[i + 1], &mut next_innode.keys.as_slice()[i]);
+                                mem::swap(&mut page_innode.ptrs.as_slice()[i + 1], &mut next_innode.ptrs.as_slice()[i]);
+                            }
+                            mem::swap(&mut page_innode.ptrs.as_slice()[next_node_len + 1], &mut next_innode.ptrs.as_slice()[next_node_len]);
+                            page_innode.len = 1 + next_node_len;
+                            page_innode.right = next_innode.right.clone();
+                            page_innode.right_bound = next_innode.right_bound.clone();
+                        }
+                        *next_guard = NodeData::Empty(box EmptyNode {
+                            left: None,
+                            right: page_ref
+                        });
+                    }
                 }
             }
             let (next_page, ptrs) = next_non_empty(&page, &mut empty_nodes);
@@ -186,7 +242,7 @@ where
             right: last_page_ref.clone(),
         });
     }
-    emptying_nodes
+    altered
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
