@@ -104,12 +104,6 @@ where
             })
             .collect()
     };
-    let make_empty = |page: &mut NodeWriteGuard<KS, PS>, right: &NodeCellRef| {
-        **page = NodeData::Empty(box EmptyNode {
-            left: None,
-            right: right.clone(),
-        });
-    };
     let mut next_non_empty = |page: &NodeWriteGuard<KS, PS>, empty_nodes: &mut Vec<_>| {
         let mut next = page.right_ref().cloned();
         while let Some(next_ref) = next {
@@ -127,17 +121,10 @@ where
     loop {
         let page_len = page.len();
         let page_right_ref = page.right_ref().unwrap().clone();
-        let page_right_bound = page.right_bound().clone();
-        let next;
         if !page.is_empty_node() {
             let mut live_ptrs: HashMap<_, _> = next_live_ptrs.unwrap_or_else(|| select_live(&page));
-            // debug_assert_ne!(live_ptrs.len(), 1);
-            if live_ptrs.len() == 0 {
-                // all sub nodes are empty
-                // will set current node empty either
-                next = next_non_empty(&page, &mut empty_nodes);
-                empty_nodes.push(page);
-            } else {
+            let is_empty = live_ptrs.is_empty();
+            if !is_empty {
                 let emptying = {
                     let mut innode = page.innode_mut();
                     let mut new_keys = KS::init();
@@ -174,22 +161,30 @@ where
                     // merging right page will also been cleaned
 
                 }
-                next = next_non_empty(&page, &mut empty_nodes);
-                prev_node_guard = Some(page);
             }
-            let (next_page, ptrs) = next;
+            let (next_page, ptrs) = next_non_empty(&page, &mut empty_nodes);
+            if !is_empty {
+                if page.right_bound() >= bound {
+                    break;
+                } else {
+                    prev_node_guard = Some(page);
+                }
+            } else {
+                empty_nodes.push(page);
+            }
             page = next_page;
             next_live_ptrs = Some(ptrs);
-            if &page_right_bound >= bound {
-                break;
-            }
         } else {
             unreachable!();
         }
     }
+    let last_page_ref = page.node_ref();
     for empty in &mut empty_nodes {
         // make nodes empty and set its next ptr to last non empty node
-        make_empty(empty, page.node_ref());
+        **empty = NodeData::Empty(box EmptyNode {
+            left: None,
+            right: last_page_ref.clone(),
+        });
     }
     emptying_nodes
 }
