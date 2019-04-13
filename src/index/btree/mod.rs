@@ -384,6 +384,10 @@ impl NodeCellRef {
     pub fn persist(&self, deletion: &DeletionSetInneer, neb: &AsyncClient) -> bool {
         self.inner.persist(self, deletion, neb)
     }
+
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl Clone for NodeCellRef {

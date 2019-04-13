@@ -22,10 +22,11 @@ use index::Slice;
 use itertools::Itertools;
 use smallvec::SmallVec;
 use std::cmp::min;
-use std::collections::{BTreeSet, HashSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
 enum Selection<KS, PS>
 where
@@ -70,7 +71,7 @@ where
     }
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey)
+fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey) -> Vec<NodeCellRef>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -86,37 +87,58 @@ where
         MutSearchResult::External => unreachable!(),
     };
     let mut prev_node_guard: Option<NodeWriteGuard<KS, PS>> = None;
-    let mut node_ref = node.clone();
+    let mut page = write_node::<KS, PS>(&node);
+    let mut next_live_ptrs = None;
+    let mut emptying_nodes = vec![];
+    let mut empty_nodes = vec![];
+    let select_live = |page: &NodeWriteGuard<KS, PS>| {
+        page.innode().ptrs.as_slice_immute()[..page.len() + 1]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, sub_level)| {
+                if !read_unchecked::<KS, PS>(sub_level).is_empty_node() {
+                    Some((i, sub_level.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+    let make_empty = |page: &mut NodeWriteGuard<KS, PS>, right: &NodeCellRef| {
+        **page = NodeData::Empty(box EmptyNode {
+            left: None,
+            right: right.clone(),
+        });
+    };
+    let mut next_non_empty = |page: &NodeWriteGuard<KS, PS>, empty_nodes: &mut Vec<_>| {
+        let mut next = page.right_ref().cloned();
+        while let Some(next_ref) = next {
+            let guard = write_node::<KS, PS>(&next_ref);
+            next = guard.right_ref().cloned();
+            let live_ptrs: HashMap<_, _> = select_live(&guard);
+            if live_ptrs.is_empty() {
+                empty_nodes.push(guard);
+            } else {
+                return (guard, live_ptrs);
+            }
+        };
+        unreachable!()
+    };
     loop {
-        let mut page = write_node::<KS, PS>(&node_ref);
         let page_len = page.len();
         let page_right_ref = page.right_ref().unwrap().clone();
         let page_right_bound = page.right_bound().clone();
+        let next;
         if !page.is_empty_node() {
-            let mut live_ptrs: HashMap<_, _> = page.innode().ptrs.as_slice_immute()[..page_len + 1]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, sub_level)| {
-                    if !read_unchecked::<KS, PS>(sub_level).is_empty_node() {
-                        Some((i, sub_level.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut live_ptrs: HashMap<_, _> = next_live_ptrs.unwrap_or_else(|| select_live(&page));
+            // debug_assert_ne!(live_ptrs.len(), 1);
             if live_ptrs.len() == 0 {
                 // all sub nodes are empty
                 // will set current node empty either
-                let next_page_ref = page.innode().right.clone();
-                if let Some(ref mut prev_guard) = &mut prev_node_guard {
-                    *prev_guard.right_ref_mut().unwrap() = next_page_ref.clone();
-                }
-                *page = NodeData::Empty(box EmptyNode {
-                    left: None,
-                    right: next_page_ref,
-                });
+                next = next_non_empty(&page, &mut empty_nodes);
+                empty_nodes.push(page);
             } else {
-                {
+                let emptying = {
                     let mut innode = page.innode_mut();
                     let mut new_keys = KS::init();
                     let mut new_ptrs = PS::init();
@@ -143,17 +165,33 @@ where
                     }
                     innode.keys = new_keys;
                     innode.ptrs = new_ptrs;
+                    innode.len == 0
+                };
+                if emptying {
+                    // current innode have one ptr and no keys
+                    // need to merge with the right page
+                    // if the right page is full, partial of the right page will be moved to the current page
+                    // merging right page will also been cleaned
+
                 }
+                next = next_non_empty(&page, &mut empty_nodes);
                 prev_node_guard = Some(page);
             }
+            let (next_page, ptrs) = next;
+            page = next_page;
+            next_live_ptrs = Some(ptrs);
             if &page_right_bound >= bound {
                 break;
             }
-            node_ref = page_right_ref;
         } else {
             unreachable!();
         }
     }
+    for empty in &mut empty_nodes {
+        // make nodes empty and set its next ptr to last non empty node
+        make_empty(empty, page.node_ref());
+    }
+    emptying_nodes
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
@@ -224,6 +262,11 @@ where
             .clone();
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
+        debug_assert!(read_unchecked::<KS, PS>(&right_right_most).is_ext());
+        debug_assert!(!Arc::ptr_eq(
+            &right_right_most.inner,
+            &left_most_leaf_guards.last().unwrap().node_ref().inner
+        ));
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
@@ -237,6 +280,8 @@ where
         let mut new_first_node_ext = new_first_node.extnode_mut();
         new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = left_left_most;
+
+        debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
 
         ExtNode::<KS, PS>::make_changed(&right_right_most, src_tree);
     }
