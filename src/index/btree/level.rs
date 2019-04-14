@@ -150,7 +150,7 @@ where
             let new_ptrs = new_ptrs.as_slice();
             for (i, key) in keys.into_iter().enumerate() {
                 debug_assert!(key > &mut smallvec!(0));
-                mem::swap(&mut new_keys[i], key);
+                new_keys[i] = key.clone();
             }
             for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                 debug_assert!(!ptr.is_default());
@@ -163,7 +163,7 @@ where
                         })
                     }
                 }
-                mem::replace(&mut new_ptrs[i], ptr);
+                new_ptrs[i] = ptr;
             }
         }
         innode.keys = new_keys;
@@ -203,27 +203,27 @@ where
                         page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
                         if next_guard.len() >= KS::slice_len() {
                             // will overflow if merged, have to rebalance right node contents with current node
+                            debug!("Merge emptying page in rebalance style");
                             let mut next_innode = next_guard.innode_mut();
                             let next_search_key = next_innode.keys.as_slice()[0].clone();
                             // move next node keys and ptrs to current node
                             for i in 0..mid {
-                                mem::swap(
-                                    &mut page_innode.keys.as_slice()[i + 1],
-                                    &mut next_innode.keys.as_slice()[i],
-                                );
-                                mem::swap(
-                                    &mut page_innode.ptrs.as_slice()[i + 1],
-                                    &mut next_innode.ptrs.as_slice()[i],
-                                );
+                                page_innode.keys.as_slice()[i + 1] = next_innode.keys.as_slice()[i].clone();
+                                next_innode.keys.as_slice()[i] = Default::default();
+
+                                page_innode.ptrs.as_slice()[i + 1] = next_innode.ptrs.as_slice()[i].clone();
+                                next_innode.ptrs.as_slice()[i] = Default::default();
                             }
                             for i in mid..next_innode.len {
-                                next_innode.keys.as_slice().swap(i, i - mid);
-                                next_innode.ptrs.as_slice().swap(i, i - mid);
+                                let target_pos = i - mid;
+                                next_innode.keys.as_slice()[target_pos] = Default::default();
+                                next_innode.ptrs.as_slice()[target_pos] = Default::default();
+                                next_innode.keys.as_slice().swap(i, target_pos);
+                                next_innode.ptrs.as_slice().swap(i, target_pos);
                             }
                             next_innode.len -= mid;
                             page_innode.len += mid;
-                            page_innode.right_bound =
-                                mem::replace(&mut page_innode.keys.as_slice()[mid], smallvec!());
+                            page_innode.right_bound = page_innode.keys.as_slice()[mid].clone();
                             page_innode.len = 1 + mid;
                             altered_list.push(KeyAltered {
                                 new_key: page_innode.right_bound.clone(),
@@ -231,23 +231,19 @@ where
                             });
                         } else {
                             // Can move right page contents to current node and empty next node
+                            debug!("Merge emptying page in merge style");
                             {
                                 let mut next_innode = next_guard.innode_mut();
                                 let next_node_len = next_innode.len;
                                 for i in 0..next_innode.len {
-                                    mem::swap(
-                                        &mut page_innode.keys.as_slice()[i + 1],
-                                        &mut next_innode.keys.as_slice()[i],
-                                    );
-                                    mem::swap(
-                                        &mut page_innode.ptrs.as_slice()[i + 1],
-                                        &mut next_innode.ptrs.as_slice()[i],
-                                    );
+                                    page_innode.keys.as_slice()[i + 1] = next_innode.keys.as_slice()[i].clone();
+                                    next_innode.keys.as_slice()[i] = Default::default();
+
+                                    page_innode.ptrs.as_slice()[i + 1] = next_innode.ptrs.as_slice()[i].clone();
+                                    next_innode.ptrs.as_slice()[i] = Default::default();
                                 }
-                                mem::swap(
-                                    &mut page_innode.ptrs.as_slice()[next_node_len + 1],
-                                    &mut next_innode.ptrs.as_slice()[next_node_len],
-                                );
+                                page_innode.ptrs.as_slice()[next_node_len + 1] = next_innode.ptrs.as_slice()[next_node_len].clone();
+                                next_innode.ptrs.as_slice()[next_node_len] = Default::default();
                                 page_innode.len = 1 + next_node_len;
                                 page_innode.right = next_innode.right.clone();
                                 page_innode.right_bound = next_innode.right_bound.clone();
