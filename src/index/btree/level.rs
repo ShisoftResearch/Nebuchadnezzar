@@ -96,7 +96,7 @@ where
         }
         MutSearchResult::External => unreachable!(),
     };
-    let mut all_pages = vec![RefCell::new(write_node::<KS, PS>(node))];
+    let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
     loop {
         let (right_ref, right_bound) = {
@@ -109,7 +109,7 @@ where
                 last_page.right_bound().clone(),
             )
         };
-        all_pages.push(RefCell::new(write_node::<KS, PS>(&right_ref)));
+        all_pages.push(write_node::<KS, PS>(&right_ref));
         if &right_bound > bound {
             break;
         }
@@ -127,12 +127,11 @@ where
             })
             .collect_vec()
     };
-    let page_lives = all_pages.iter().map(|p| select_live(&*p.borrow())).collect_vec();
+    let page_lives = all_pages.iter().map(|p| select_live(p)).collect_vec();
     all_pages
-        .iter()
+        .iter_mut()
         .zip(page_lives)
-        .for_each(|(page, live_ptrs)| {
-            let mut page = page.borrow_mut();
+        .for_each(|(mut page, live_ptrs)| {
             if live_ptrs.len() == 0 {
                 **page = NodeData::Empty(box EmptyNode {
                     left: None,
@@ -155,7 +154,7 @@ where
             }
         });
 
-    let non_empty_right_node = |i: usize, pages: &Vec<RefCell<NodeWriteGuard<KS, PS>>>| {
+    let non_empty_right_node = |i: usize, pages: &Vec<NodeWriteGuard<KS, PS>>| {
         let mut i = i + 1;
         loop {
             if i == pages.len() {
@@ -179,9 +178,9 @@ where
         .map(|(i, _)| non_empty_right_node(i, &all_pages))
         .collect_vec();
     all_pages
-        .iter()
+        .iter_mut()
         .zip(right_ptrs.into_iter())
-        .for_each(|(p, r)| *p.borrow_mut().right_ref_mut().unwrap() = r);
+        .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
 
     all_pages = all_pages
         .into_iter()
@@ -190,43 +189,48 @@ where
 
     let mut index = 0;
     while index < all_pages.len() {
-        let mut page = all_pages[index].borrow_mut();
-        if page.len() == 0 {
+        if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
             // need to merge with the right page
             // if the right page is full, partial of the right page will be moved to the current page
             // merging right page will also been cleaned
-            index += 1;
-            let page_innode = page.innode_mut();
-            let next_from_ptr = if index >= all_pages.len() {
-                Some(RefCell::new(write_node::<KS, PS>(&page_innode.right)))
+            let mut next_from_ptr = if index + 1 >= all_pages.len() {
+                Some(write_node::<KS, PS>(all_pages[index].right_ref().unwrap()))
             } else {
                 None
             };
-            let next_ref = next_from_ptr.as_ref().unwrap_or_else(|| &all_pages[index]);
-            let mut next = next_ref.borrow_mut();
-            if next.len() < KS::slice_len() - 1 {
-                {
-                    let mut next_innode = next.innode_mut();
-                    page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
-                    page_innode.right_bound = next_innode.right_bound.clone();
-                    page_innode.right = next_innode.right.clone();
-                    page_innode.len = 1 + next_innode.len;
-                    for i in 0..next_innode.len {
-                        page_innode.keys.as_slice()[i + 1] = next_innode.keys.as_slice()[i].clone();
-                        next_innode.keys.as_slice()[i] = Default::default();
-                    }
-                    for i in 0..next_innode.len + 1 {
-                        page_innode.ptrs.as_slice()[i + 1] = next_innode.ptrs.as_slice()[i].clone();
-                        next_innode.ptrs.as_slice()[i] = Default::default();
-                    }
+            let (keys, ptrs, right_bound, right_ref) = {
+                let mut next = next_from_ptr.as_mut().unwrap_or_else(|| &mut all_pages[index + 1]);
+                if next.len() < KS::slice_len() - 1 {
+                    let tuple = {
+                        let next_innode = next.innode();
+                        let len = next_innode.len;
+                        (
+                            next_innode.keys.as_slice_immute()[..len].to_vec(),
+                            next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
+                            next_innode.right_bound.clone(),
+                            next_innode.right.clone()
+                        )
+                    };
+                    **next = NodeData::Empty(box EmptyNode {
+                        left: None,
+                        right: NodeCellRef::default()
+                    });
+                    tuple
+                } else {
+                    unreachable!()
                 }
-                **next = NodeData::Empty(box EmptyNode {
-                    left: None,
-                    right: NodeCellRef::default()
-                });
-            } else {
-                unreachable!()
+            };
+            let page_innode = all_pages[index].innode_mut();
+            page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
+            page_innode.right_bound = right_bound;
+            page_innode.right = right_ref;
+            page_innode.len = 1 + keys.len();
+            for (i, key) in keys.into_iter().enumerate() {
+                page_innode.keys.as_slice()[i + 1] = key;
+            }
+            for (i, ptr) in ptrs.into_iter().enumerate() {
+                page_innode.ptrs.as_slice()[i + 1] = ptr;
             }
         }
     }
