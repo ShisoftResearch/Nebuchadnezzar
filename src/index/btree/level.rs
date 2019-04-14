@@ -24,7 +24,6 @@ use smallvec::SmallVec;
 use std::cmp::min;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
-use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
@@ -82,7 +81,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let first_search = mut_search::<KS, PS>(node, &smallvec!());
-    let extra_works = match first_search {
+    let altered_keys = match first_search {
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
             if !sub_node.is_empty_node() && !sub_node.is_ext() {
@@ -93,12 +92,8 @@ where
         }
         MutSearchResult::External => unreachable!(),
     };
-    let mut prev_node_guard: Option<NodeWriteGuard<KS, PS>> = None;
-    let mut page = write_node::<KS, PS>(&node);
-    let mut next_live_ptrs = None;
-    let mut altered_list = vec![];
-    let mut empty_nodes = vec![];
-    let is_altered = |ptr: &NodeCellRef| extra_works.iter().find(|a| a.ptr.ptr_eq(ptr));
+    debug!("Have {} altered keys", altered_keys.len());
+    let is_altered = |ptr: &NodeCellRef| altered_keys.iter().find(|a| a.ptr.ptr_eq(ptr));
     let select_live = |page: &NodeWriteGuard<KS, PS>| {
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
@@ -155,6 +150,7 @@ where
             for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                 debug_assert!(!ptr.is_default());
                 if let Some(altered) = is_altered(&ptr) {
+                    debug!("Node with first key {:?} was altered to {:?}",  new_keys[i], altered.new_key);
                     new_keys[i] = altered.new_key.clone();
                     if i == 0 {
                         altered_list.push(KeyAltered {
@@ -170,10 +166,13 @@ where
         innode.ptrs = new_ptrs;
         innode.len == 0
     };
+    let mut prev_node_guard: Option<NodeWriteGuard<KS, PS>> = None;
+    let mut page = write_node::<KS, PS>(&node);
+    let mut live_ptrs: HashMap<_, _> = select_live(&page);
+    let mut altered_list = vec![];
     loop {
         let page_right_ref = page.right_ref().unwrap().clone();
         if !page.is_empty_node() {
-            let mut live_ptrs: HashMap<_, _> = next_live_ptrs.unwrap_or_else(|| select_live(&page));
             let is_empty = live_ptrs.is_empty();
             if !is_empty {
                 let emptying = {
@@ -258,14 +257,10 @@ where
                     }
                 }
             }
-            if let Some((next_page, ptrs)) = next_non_empty(&page, &mut empty_nodes) {
-                if !is_empty {
-                    prev_node_guard = Some(page);
-                } else {
-                    empty_nodes.push(page);
-                }
+            if let Some((next_page, next_live_ptrs)) = next_non_empty(&page, &mut empty_nodes) {
+                prev_node_guard = Some(page);
                 page = next_page;
-                next_live_ptrs = Some(ptrs);
+                live_ptrs = next_live_ptrs;
             } else {
                 debug!("Cannot find any right node to continue prune - {}", level);
                 break;
@@ -277,14 +272,6 @@ where
         } else {
             unreachable!();
         }
-    }
-    let last_page_ref = page.node_ref();
-    for empty in &mut empty_nodes {
-        // make nodes empty and set its next ptr to last non empty node
-        **empty = NodeData::Empty(box EmptyNode {
-            left: None,
-            right: last_page_ref.clone(),
-        });
     }
     // Reverse the list so only latest pushed will take effect
     altered_list.reverse();
