@@ -76,7 +76,7 @@ where
     }
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey) -> Vec<KeyAltered>
+fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey, level: usize) -> Vec<KeyAltered>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -86,7 +86,7 @@ where
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
             if !sub_node.is_empty_node() && !sub_node.is_ext() {
-                prune_selected::<KS, PS>(&sub_node_ref, bound)
+                prune_selected::<KS, PS>(&sub_node_ref, bound, level + 1)
             } else {
                 vec![]
             }
@@ -133,6 +133,7 @@ where
                          node_ref: &NodeCellRef,
                          live_ptrs: HashMap<usize, NodeCellRef>,
                          altered_list: &mut Vec<KeyAltered>| {
+        debug!("preserving live ptrs - {}", level);
         let mut new_keys = KS::init();
         let mut new_ptrs = PS::init();
         {
@@ -142,7 +143,7 @@ where
                 .filter(|(i, _)| live_ptrs.contains_key(&i))
                 .map(|(_, k)| k)
                 .collect();
-            debug!("Prune filtered page have keys {:?}", &keys);
+            debug!("Prune filtered page have keys {}, was {}, node right bound: {:?}, prune right bound {:?} - {}", keys.len(), innode.len, innode.right_bound, bound, level);
             debug_assert_eq!(live_ptrs.len(), keys.len() + 1);
             innode.len = keys.len();
             let new_keys = new_keys.as_slice();
@@ -185,6 +186,7 @@ where
                     // need to merge with the right page
                     // if the right page is full, partial of the right page will be moved to the current page
                     // merging right page will also been cleaned
+                    debug!("node is emptying - {}", level);
                     if let Some((mut next_guard, next_ptrs)) =
                         next_non_empty(&page, &mut empty_nodes)
                     {
@@ -262,17 +264,18 @@ where
             }
             if let Some((next_page, ptrs)) = next_non_empty(&page, &mut empty_nodes) {
                 if !is_empty {
-                    if page.right_bound() >= bound {
-                        break;
-                    } else {
-                        prev_node_guard = Some(page);
-                    }
+                    prev_node_guard = Some(page);
                 } else {
                     empty_nodes.push(page);
                 }
                 page = next_page;
                 next_live_ptrs = Some(ptrs);
             } else {
+                debug!("Cannot find any right node to continue prune - {}", level);
+                break;
+            }
+            if page.right_bound() >= bound {
+                debug!("Out of bound to continue prune - {}", level);
                 break;
             }
         } else {
@@ -336,7 +339,7 @@ where
             .cloned()
             .collect_vec();
         num_keys_removed = keys.len();
-        debug!("Merge selected keys are {:?}", &keys);
+        debug!("Merge selected keys {:?}", keys.len());
         dest_tree.merge_with_keys(box keys);
         for rk in &merged_deleted_keys {
             deleted_keys.remove(rk);
@@ -361,13 +364,11 @@ where
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
         debug_assert!(read_unchecked::<KS, PS>(&right_right_most).is_ext());
-        debug_assert!(!Arc::ptr_eq(
-            &right_right_most.inner,
-            &left_most_leaf_guards.last().unwrap().node_ref().inner
-        ));
+        debug_assert!(!right_right_most.ptr_eq(left_most_leaf_guards.last().unwrap().node_ref()));
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
+            debug!("make deleted {:?}", g.ext_id());
             **g = NodeData::Empty(box EmptyNode {
                 left: Some(left_left_most.clone()),
                 right: right_right_most.clone(),
@@ -376,6 +377,14 @@ where
 
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut();
+        debug!(
+            "Right most original id is {:?}, now is {:?}",
+            new_first_node_ext.id, src_tree.head_page_id
+        );
+        debug!(
+            "New first node right is {:?}",
+            read_unchecked::<KS, PS>(&new_first_node_ext.next).ext_id()
+        );
         new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = left_left_most;
 
@@ -385,9 +394,14 @@ where
     }
 
     // cleanup upper level references
-    prune_selected::<KS, PS>(&src_tree.get_root(), &prune_bound);
+    prune_selected::<KS, PS>(&src_tree.get_root(), &prune_bound, 0);
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
+
+    if cfg!(debug_assertions) {
+        dump_tree(src_tree, "last_merged_tree_dump.json");
+    }
+    debug!("Merge completed");
 
     merge_page_len
 }
