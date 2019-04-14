@@ -39,8 +39,7 @@ where
 
 struct KeyAltered {
     new_key: EntryKey,
-    search_key: EntryKey,
-    ptr: NodeCellRef
+    ptr: NodeCellRef,
 }
 
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
@@ -83,11 +82,13 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let first_search = mut_search::<KS, PS>(node, &smallvec!());
-    match first_search {
+    let extra_works = match first_search {
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
             if !sub_node.is_empty_node() && !sub_node.is_ext() {
-                prune_selected::<KS, PS>(&sub_node_ref, bound);
+                prune_selected::<KS, PS>(&sub_node_ref, bound)
+            } else {
+                vec![]
             }
         }
         MutSearchResult::External => unreachable!(),
@@ -95,8 +96,9 @@ where
     let mut prev_node_guard: Option<NodeWriteGuard<KS, PS>> = None;
     let mut page = write_node::<KS, PS>(&node);
     let mut next_live_ptrs = None;
-    let mut altered = vec![];
+    let mut altered_list = vec![];
     let mut empty_nodes = vec![];
+    let is_altered = |ptr: &NodeCellRef| extra_works.iter().find(|a| a.ptr.ptr_eq(ptr));
     let select_live = |page: &NodeWriteGuard<KS, PS>| {
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
@@ -114,17 +116,23 @@ where
         let mut next = page.right_ref().cloned();
         while let Some(next_ref) = next {
             let guard = write_node::<KS, PS>(&next_ref);
+            if guard.is_none() {
+                return None;
+            }
             next = guard.right_ref().cloned();
             let live_ptrs: HashMap<_, _> = select_live(&guard);
             if live_ptrs.is_empty() {
                 empty_nodes.push(guard);
             } else {
-                return (guard, live_ptrs);
+                return Some((guard, live_ptrs));
             }
-        };
+        }
         unreachable!()
     };
-    let preserve_live = |innode: &mut InNode<KS, PS>, live_ptrs: HashMap<usize, NodeCellRef>| {
+    let preserve_live = |innode: &mut InNode<KS, PS>,
+                         node_ref: &NodeCellRef,
+                         live_ptrs: HashMap<usize, NodeCellRef>,
+                         altered_list: &mut Vec<KeyAltered>| {
         let mut new_keys = KS::init();
         let mut new_ptrs = PS::init();
         {
@@ -145,6 +153,15 @@ where
             }
             for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                 debug_assert!(!ptr.is_default());
+                if let Some(altered) = is_altered(&ptr) {
+                    new_keys[i] = altered.new_key.clone();
+                    if i == 0 {
+                        altered_list.push(KeyAltered {
+                            new_key: altered.new_key.clone(),
+                            ptr: node_ref.clone(),
+                        })
+                    }
+                }
                 mem::replace(&mut new_ptrs[i], ptr);
             }
         }
@@ -159,77 +176,105 @@ where
             let is_empty = live_ptrs.is_empty();
             if !is_empty {
                 let emptying = {
+                    let page_ref = page.node_ref().clone();
                     let mut innode = page.innode_mut();
-                    preserve_live(&mut innode, live_ptrs)
+                    preserve_live(&mut innode, &page_ref, live_ptrs, &mut altered_list)
                 };
                 if emptying {
                     // current innode have one ptr and no keys
                     // need to merge with the right page
                     // if the right page is full, partial of the right page will be moved to the current page
                     // merging right page will also been cleaned
-                    let (mut next_guard, next_ptrs) = next_non_empty(&page, &mut empty_nodes);
-                    let mid = next_guard.len() / 2;
-                    let next_ref = next_guard.node_ref().clone();
-                    let page_ref = page.node_ref().clone();
-                    let mut page_innode = page.innode_mut();
-                    let next_node_emptying = preserve_live(&mut next_guard.innode_mut(), next_ptrs);
-                    page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
-                    if next_guard.len() >= KS::slice_len() {
-                        // will overflow if merged, have to rebalance right node contents with current node
-                        let mut next_innode = next_guard.innode_mut();
-                        let next_search_key = next_innode.keys.as_slice()[0].clone();
-                        // move next node keys and ptrs to current node
-                        for i in 0..mid {
-                            mem::swap(&mut page_innode.keys.as_slice()[i + 1], &mut next_innode.keys.as_slice()[i]);
-                            mem::swap(&mut page_innode.ptrs.as_slice()[i + 1], &mut next_innode.ptrs.as_slice()[i]);
-                        }
-                        for i in mid..next_innode.len {
-                            next_innode.keys.as_slice().swap(i, i - mid);
-                            next_innode.ptrs.as_slice().swap(i, i - mid);
-                        }
-                        next_innode.len -= mid;
-                        page_innode.len += mid;
-                        page_innode.right_bound = mem::replace(&mut page_innode.keys.as_slice()[mid], smallvec!());
-                        page_innode.len = 1 + mid;
-                        altered.push(KeyAltered {
-                            new_key: page_innode.right_bound.clone(),
-                            search_key: next_search_key,
-                            ptr: next_ref
-                        });
-
-                    } else {
-                        // Can move right page contents to current node and empty next node
-                        {
+                    if let Some((mut next_guard, next_ptrs)) =
+                        next_non_empty(&page, &mut empty_nodes)
+                    {
+                        let mid = next_guard.len() / 2;
+                        let next_ref = next_guard.node_ref().clone();
+                        let page_ref = page.node_ref().clone();
+                        let mut page_innode = page.innode_mut();
+                        let next_node_emptying = preserve_live(
+                            &mut next_guard.innode_mut(),
+                            &next_ref,
+                            next_ptrs,
+                            &mut altered_list,
+                        );
+                        page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
+                        if next_guard.len() >= KS::slice_len() {
+                            // will overflow if merged, have to rebalance right node contents with current node
                             let mut next_innode = next_guard.innode_mut();
-                            let next_node_len = next_innode.len;
-                            for i in 0..next_innode.len {
-                                mem::swap(&mut page_innode.keys.as_slice()[i + 1], &mut next_innode.keys.as_slice()[i]);
-                                mem::swap(&mut page_innode.ptrs.as_slice()[i + 1], &mut next_innode.ptrs.as_slice()[i]);
+                            let next_search_key = next_innode.keys.as_slice()[0].clone();
+                            // move next node keys and ptrs to current node
+                            for i in 0..mid {
+                                mem::swap(
+                                    &mut page_innode.keys.as_slice()[i + 1],
+                                    &mut next_innode.keys.as_slice()[i],
+                                );
+                                mem::swap(
+                                    &mut page_innode.ptrs.as_slice()[i + 1],
+                                    &mut next_innode.ptrs.as_slice()[i],
+                                );
                             }
-                            mem::swap(&mut page_innode.ptrs.as_slice()[next_node_len + 1], &mut next_innode.ptrs.as_slice()[next_node_len]);
-                            page_innode.len = 1 + next_node_len;
-                            page_innode.right = next_innode.right.clone();
-                            page_innode.right_bound = next_innode.right_bound.clone();
+                            for i in mid..next_innode.len {
+                                next_innode.keys.as_slice().swap(i, i - mid);
+                                next_innode.ptrs.as_slice().swap(i, i - mid);
+                            }
+                            next_innode.len -= mid;
+                            page_innode.len += mid;
+                            page_innode.right_bound =
+                                mem::replace(&mut page_innode.keys.as_slice()[mid], smallvec!());
+                            page_innode.len = 1 + mid;
+                            altered_list.push(KeyAltered {
+                                new_key: page_innode.right_bound.clone(),
+                                ptr: next_ref,
+                            });
+                        } else {
+                            // Can move right page contents to current node and empty next node
+                            {
+                                let mut next_innode = next_guard.innode_mut();
+                                let next_node_len = next_innode.len;
+                                for i in 0..next_innode.len {
+                                    mem::swap(
+                                        &mut page_innode.keys.as_slice()[i + 1],
+                                        &mut next_innode.keys.as_slice()[i],
+                                    );
+                                    mem::swap(
+                                        &mut page_innode.ptrs.as_slice()[i + 1],
+                                        &mut next_innode.ptrs.as_slice()[i],
+                                    );
+                                }
+                                mem::swap(
+                                    &mut page_innode.ptrs.as_slice()[next_node_len + 1],
+                                    &mut next_innode.ptrs.as_slice()[next_node_len],
+                                );
+                                page_innode.len = 1 + next_node_len;
+                                page_innode.right = next_innode.right.clone();
+                                page_innode.right_bound = next_innode.right_bound.clone();
+                            }
+                            *next_guard = NodeData::Empty(box EmptyNode {
+                                left: None,
+                                right: page_ref,
+                            });
                         }
-                        *next_guard = NodeData::Empty(box EmptyNode {
-                            left: None,
-                            right: page_ref
-                        });
+                    } else {
+                        break;
                     }
                 }
             }
-            let (next_page, ptrs) = next_non_empty(&page, &mut empty_nodes);
-            if !is_empty {
-                if page.right_bound() >= bound {
-                    break;
+            if let Some((next_page, ptrs)) = next_non_empty(&page, &mut empty_nodes) {
+                if !is_empty {
+                    if page.right_bound() >= bound {
+                        break;
+                    } else {
+                        prev_node_guard = Some(page);
+                    }
                 } else {
-                    prev_node_guard = Some(page);
+                    empty_nodes.push(page);
                 }
+                page = next_page;
+                next_live_ptrs = Some(ptrs);
             } else {
-                empty_nodes.push(page);
+                break;
             }
-            page = next_page;
-            next_live_ptrs = Some(ptrs);
         } else {
             unreachable!();
         }
@@ -242,7 +287,9 @@ where
             right: last_page_ref.clone(),
         });
     }
-    altered
+    // Reverse the list so only latest pushed will take effect
+    altered_list.reverse();
+    altered_list
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
