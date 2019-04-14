@@ -232,7 +232,9 @@ where
             for (i, ptr) in ptrs.into_iter().enumerate() {
                 page_innode.ptrs.as_slice()[i + 1] = ptr;
             }
+            index += 1;
         }
+        index += 1;
     }
 
     vec![]
