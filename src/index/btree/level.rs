@@ -520,9 +520,6 @@ where
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
-    if cfg!(debug_assertions) {
-        dump_tree(src_tree, "last_merged_tree_dump.json");
-    }
     debug!("Merge completed");
 
     merge_page_len
