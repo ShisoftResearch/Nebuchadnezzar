@@ -109,7 +109,11 @@ where
                 last_page.right_bound().clone(),
             )
         };
-        all_pages.push(write_node::<KS, PS>(&right_ref));
+        let right = write_node::<KS, PS>(&right_ref);
+        if right.is_none() {
+            break;
+        }
+        all_pages.push(right);
         if &right_bound > bound {
             break;
         }
