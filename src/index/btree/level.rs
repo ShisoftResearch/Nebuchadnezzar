@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::cell::RefCell;
 use core::borrow::{Borrow, BorrowMut};
 use index::btree::node::NodeData::Empty;
+use serde_json::to_vec;
 
 enum Selection<KS, PS>
 where
@@ -84,6 +85,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    let mut level_page_altered = vec![];
     let first_search = mut_search::<KS, PS>(node, &smallvec!());
     let altered_keys = match first_search {
         MutSearchResult::Internal(sub_node_ref) => {
@@ -223,10 +225,37 @@ where
                     });
                     tuple
                 } else {
-                    // TODO: cope with this corner case
                     // Rebalance next node with current node
                     // Next node left bound need to be updated in upper level
-                    unreachable!()
+                    let right_ref = next.node_ref().clone();
+                    let next_innode = next.innode_mut();
+                    let next_len = next_innode.len;
+                    let next_mid = next_len / 2;
+                    let right_left_bound = next_innode.keys.as_slice_immute()[next_mid].clone();
+                    let tuple = (
+                        next_innode.keys.as_slice_immute()[..next_mid].to_vec(),
+                        next_innode.ptrs.as_slice_immute()[..next_mid + 1].to_vec(),
+                        right_left_bound.clone(),
+                        right_ref.clone()
+                    );
+                    let mut keys = KS::init();
+                    let mut ptrs = PS::init();
+
+                    for (i, key) in next_innode.keys.as_slice_immute()[next_mid + 1..next_len].iter().enumerate() {
+                        keys.as_slice()[i] = key.clone();
+                    }
+                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[next_mid + 1..next_len + 1].iter().enumerate() {
+                        ptrs.as_slice()[i] = ptr.clone();
+                    }
+                    next_innode.keys = keys;
+                    next_innode.ptrs = ptrs;
+                    next_innode.len = next_len - next_mid - 1;
+
+                    level_page_altered.push(KeyAltered {
+                        new_key: right_left_bound,
+                        ptr: right_ref
+                    });
+                    tuple
                 }
             };
             let page_innode = all_pages[index].innode_mut();
@@ -247,7 +276,7 @@ where
 
     // TODO: update right ptr after dealt with emptying nodes, cleanup empty nodes
 
-    vec![]
+    level_page_altered
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
