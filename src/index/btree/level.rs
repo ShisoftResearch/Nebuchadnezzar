@@ -164,9 +164,12 @@ where
         let mut i = i + 1;
         loop {
             if i == pages.len() {
-                return pages[i - 1].borrow().right_ref().unwrap().clone();
+                let right_node = pages[i - 1].borrow().right_ref().unwrap().clone();
+                debug_assert!(!right_node.is_default());
+                return right_node;
             } else if i < pages.len() {
                 let p = pages[i].borrow();
+                debug_assert!(!p.node_ref().is_default());
                 if !p.is_empty_node() {
                     return p.node_ref().clone();
                 } else {
@@ -181,9 +184,10 @@ where
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<KeyAltered>| {
             let mut innode = page.innode_mut();
+            let innde_len = innode.len;
             let marked_ptrs = innode
                 .ptrs
-                .as_slice_immute()
+                .as_slice_immute()[..innde_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, p)| {
@@ -216,7 +220,10 @@ where
         all_pages
             .iter_mut()
             .zip(right_ptrs.into_iter())
-            .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
+            .for_each(|(p, r)| {
+                debug_assert!(!r.is_default());
+                *p.right_ref_mut().unwrap() = r;
+            });
     };
 
     update_right_nodes(&mut all_pages);
@@ -303,6 +310,7 @@ where
                     tuple
                 }
             };
+            debug_assert!(!right_ref.is_default());
             let page_innode = all_pages[index].innode_mut();
             page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
             page_innode.right_bound = right_bound;
