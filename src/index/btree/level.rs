@@ -1,3 +1,4 @@
+use core::borrow::{Borrow, BorrowMut};
 use index::btree::dump::dump_tree;
 use index::btree::external::ExtNode;
 use index::btree::internal::InNode;
@@ -10,6 +11,7 @@ use index::btree::node::write_targeted;
 use index::btree::node::EmptyNode;
 use index::btree::node::Node;
 use index::btree::node::NodeData;
+use index::btree::node::NodeData::Empty;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
@@ -21,16 +23,14 @@ use index::EntryKey;
 use index::Slice;
 use itertools::free::all;
 use itertools::Itertools;
+use serde_json::to_vec;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::cell::RefCell;
-use core::borrow::{Borrow, BorrowMut};
-use index::btree::node::NodeData::Empty;
-use serde_json::to_vec;
 
 enum Selection<KS, PS>
 where
@@ -178,19 +178,56 @@ where
         }
     };
 
-    let right_ptrs = all_pages
-        .iter()
-        .enumerate()
-        .map(|(i, _)| non_empty_right_node(i, &all_pages))
-        .collect_vec();
-    all_pages
-        .iter_mut()
-        .zip(right_ptrs.into_iter())
-        .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
+    let update_and_mark_altered_keys =
+        |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<KeyAltered>| {
+            let mut innode = page.innode_mut();
+            let marked_ptrs = innode
+                .ptrs
+                .as_slice_immute()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| {
+                    altered_keys
+                        .iter()
+                        .find(|ak| ak.ptr.ptr_eq(p))
+                        .map(|ak| (i, ak.new_key.clone()))
+                })
+                .collect_vec();
+            for (i, new_key) in marked_ptrs {
+                if i == 0 {
+                    // cannot update the key in current page
+                    // will postpone to upper level
+                    altered.push(KeyAltered {
+                        new_key: new_key,
+                        ptr: innode.ptrs.as_slice_immute()[i].clone(),
+                    });
+                } else {
+                    innode.keys.as_slice()[i - 1] = new_key;
+                }
+            }
+        };
+
+    let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
+        let right_ptrs = all_pages
+            .iter()
+            .enumerate()
+            .map(|(i, _)| non_empty_right_node(i, &all_pages))
+            .collect_vec();
+        all_pages
+            .iter_mut()
+            .zip(right_ptrs.into_iter())
+            .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
+    };
+
+    update_right_nodes(&mut all_pages);
 
     all_pages = all_pages
         .into_iter()
         .filter(|p| !p.borrow().is_empty_node())
+        .map(|mut p| {
+            update_and_mark_altered_keys(&mut p, &mut level_page_altered);
+            p
+        })
         .collect_vec();
 
     let mut index = 0;
@@ -206,7 +243,9 @@ where
                 None
             };
             let (keys, ptrs, right_bound, right_ref) = {
-                let mut next = next_from_ptr.as_mut().unwrap_or_else(|| &mut all_pages[index + 1]);
+                let mut next = next_from_ptr
+                    .as_mut()
+                    .unwrap_or_else(|| &mut all_pages[index + 1]);
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
                     let tuple = {
@@ -216,12 +255,12 @@ where
                             next_innode.keys.as_slice_immute()[..len].to_vec(),
                             next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
                             next_innode.right_bound.clone(),
-                            next_innode.right.clone()
+                            next_innode.right.clone(),
                         )
                     };
                     **next = NodeData::Empty(box EmptyNode {
                         left: None,
-                        right: NodeCellRef::default()
+                        right: NodeCellRef::default(),
                     });
                     tuple
                 } else {
@@ -236,15 +275,21 @@ where
                         next_innode.keys.as_slice_immute()[..next_mid].to_vec(),
                         next_innode.ptrs.as_slice_immute()[..next_mid + 1].to_vec(),
                         right_left_bound.clone(),
-                        right_ref.clone()
+                        right_ref.clone(),
                     );
                     let mut keys = KS::init();
                     let mut ptrs = PS::init();
 
-                    for (i, key) in next_innode.keys.as_slice_immute()[next_mid + 1..next_len].iter().enumerate() {
+                    for (i, key) in next_innode.keys.as_slice_immute()[next_mid + 1..next_len]
+                        .iter()
+                        .enumerate()
+                    {
                         keys.as_slice()[i] = key.clone();
                     }
-                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[next_mid + 1..next_len + 1].iter().enumerate() {
+                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[next_mid + 1..next_len + 1]
+                        .iter()
+                        .enumerate()
+                    {
                         ptrs.as_slice()[i] = ptr.clone();
                     }
                     next_innode.keys = keys;
@@ -253,7 +298,7 @@ where
 
                     level_page_altered.push(KeyAltered {
                         new_key: right_left_bound,
-                        ptr: right_ref
+                        ptr: right_ref,
                     });
                     tuple
                 }
@@ -274,7 +319,7 @@ where
         index += 1;
     }
 
-    // TODO: update right ptr after dealt with emptying nodes, cleanup empty nodes
+    update_right_nodes(&mut all_pages);
 
     level_page_altered
 }
