@@ -80,7 +80,7 @@ where
     }
 }
 
-fn prune_selected<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey, level: usize) -> Vec<KeyAltered>
+fn prune_empty<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey, level: usize) -> Vec<KeyAltered>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -91,13 +91,14 @@ where
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
             if !sub_node.is_empty_node() && !sub_node.is_ext() {
-                prune_selected::<KS, PS>(&sub_node_ref, bound, level + 1)
+                prune_empty::<KS, PS>(&sub_node_ref, bound, level + 1)
             } else {
                 vec![]
             }
         }
         MutSearchResult::External => unreachable!(),
     };
+    debug!("Prune selected level {}", level);
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
     loop {
@@ -252,6 +253,7 @@ where
             // if the right page is full, partial of the right page will be moved to the current page
             // merging right page will also been cleaned
             let mut next_from_ptr = if index + 1 >= all_pages.len() {
+                debug!("Trying to fetch node guard for last node right");
                 Some(write_node::<KS, PS>(all_pages[index].right_ref().unwrap()))
             } else {
                 None
@@ -263,6 +265,7 @@ where
                 debug_assert!(is_node_serial(next.innode()), "node 2 not serial before rebalance - {}", level);
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
+                    // TODO: move the only ptr in left to right node
                     let tuple = {
                         let next_innode = next.innode();
                         let len = next_innode.len;
@@ -444,7 +447,7 @@ where
     }
 
     // cleanup upper level references
-    prune_selected::<KS, PS>(&src_tree.get_root(), &prune_bound, 0);
+    prune_empty::<KS, PS>(&src_tree.get_root(), &prune_bound, 0);
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
@@ -469,10 +472,10 @@ pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
     for (i, key) in node.keys.as_slice_immute()[..node.len].iter().enumerate() {
         let left = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i]);
         let right = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i + 1]);
-        if !left.is_empty() && left.last_key() >= key {
-            error!("serial check failed for left >= key");
-            return false;
-        }
+//        if !left.is_empty() && left.last_key() >= key {
+//            error!("serial check failed for left >= key");
+//            return false;
+//        }
         if !right.is_empty() && right.first_key() < key {
             error!("serial check failed for left < key");
             return false;
