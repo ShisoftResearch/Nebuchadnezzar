@@ -106,6 +106,7 @@ where
             if last_page.is_none() {
                 break;
             }
+            debug_assert!(is_node_serial(last_page.innode()), "node not serial on fetching pages {:?} - {}", last_page.keys(), level);
             (
                 last_page.right_ref().unwrap().clone(),
                 last_page.right_bound().clone(),
@@ -121,7 +122,7 @@ where
         }
     }
     let select_live = |page: &NodeWriteGuard<KS, PS>| {
-        debug_assert!(is_node_serial(page.innode()), "node not serial before update");
+        debug_assert!(is_node_serial(page.innode()), "node not serial before live selection - {}", level);
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
             .enumerate()
@@ -156,10 +157,11 @@ where
                     new_ptrs.as_slice()[i] = ptr;
                 }
                 let innode = page.innode_mut();
+                debug_assert!(is_node_serial(innode), "node not serial before update - {}", level);
                 innode.len = ptr_len - 1;
                 innode.keys = new_keys;
                 innode.ptrs = new_ptrs;
-                debug_assert!(is_node_serial(innode), "node not serial after update");
+                debug_assert!(is_node_serial(innode), "node not serial after update - {}", level);
             }
         });
 
@@ -188,6 +190,7 @@ where
         |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<KeyAltered>| {
             let mut innode = page.innode_mut();
             let innde_len = innode.len;
+            debug_assert!(is_node_serial(innode), "node not serial before update altered - {}", level);
             let marked_ptrs = innode
                 .ptrs
                 .as_slice_immute()[..innde_len + 1]
@@ -212,6 +215,7 @@ where
                     innode.keys.as_slice()[i - 1] = new_key;
                 }
             }
+            debug_assert!(is_node_serial(innode), "node not serial after update altered - {}", level);
         };
 
     let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
@@ -253,11 +257,10 @@ where
                 None
             };
             let (keys, ptrs, right_bound, right_ref) = {
-                debug_assert!(is_node_serial(all_pages[index].innode()), "node 1 not serial before rebalance");
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
-                debug_assert!(is_node_serial(next.innode()), "node 2 not serial before rebalance");
+                debug_assert!(is_node_serial(next.innode()), "node 2 not serial before rebalance - {}", level);
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
                     let tuple = {
@@ -309,7 +312,7 @@ where
                     next_innode.ptrs = ptrs;
                     next_innode.len = next_len - next_mid - 1;
 
-                    debug_assert!(is_node_serial(next_innode), "node 2 not serial after rebalance");
+                    debug_assert!(is_node_serial(next_innode), "node 2 not serial after rebalance - {}", level);
 
                     level_page_altered.push(KeyAltered {
                         new_key: right_left_bound,
@@ -320,6 +323,7 @@ where
             };
             debug_assert!(!right_ref.is_default());
             let page_innode = all_pages[index].innode_mut();
+            debug_assert!(is_node_serial(page_innode), "node 1 not serial before rebalance - {}", level);
             page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
             page_innode.right_bound = right_bound;
             page_innode.right = right_ref;
@@ -330,7 +334,7 @@ where
             for (i, ptr) in ptrs.into_iter().enumerate() {
                 page_innode.ptrs.as_slice()[i + 1] = ptr;
             }
-            debug_assert!(is_node_serial(page_innode), "node 1 not serial after rebalance");
+            debug_assert!(is_node_serial(page_innode), "node 1 not serial after rebalance - {}", level);
             index += 1;
         }
         index += 1;
@@ -457,6 +461,7 @@ pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
     // check keys
     for i in 1..node.len {
         if node.keys.as_slice_immute()[i - 1] >= node.keys.as_slice_immute()[i] {
+            error!("serial check failed for key ordering");
             return false;
         }
     }
@@ -465,9 +470,11 @@ pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
         let left = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i]);
         let right = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i + 1]);
         if !left.is_empty() && left.last_key() >= key {
+            error!("serial check failed for left >= key");
             return false;
         }
         if !right.is_empty() && right.first_key() < key {
+            error!("serial check failed for left < key");
             return false;
         }
     }
