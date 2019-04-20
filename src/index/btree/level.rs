@@ -121,6 +121,7 @@ where
         }
     }
     let select_live = |page: &NodeWriteGuard<KS, PS>| {
+        debug_assert!(is_node_serial(page.innode()), "node not serial before update");
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
             .enumerate()
@@ -138,10 +139,11 @@ where
         .iter_mut()
         .zip(page_lives)
         .for_each(|(mut page, live_ptrs)| {
+            let page_right = page.right_ref().unwrap().clone();
             if live_ptrs.len() == 0 {
                 **page = NodeData::Empty(box EmptyNode {
                     left: None,
-                    right: Default::default(),
+                    right: page_right,
                 })
             } else {
                 let mut new_keys = KS::init();
@@ -157,6 +159,7 @@ where
                 innode.len = ptr_len - 1;
                 innode.keys = new_keys;
                 innode.ptrs = new_ptrs;
+                debug_assert!(is_node_serial(innode), "node not serial after update");
             }
         });
 
@@ -250,9 +253,11 @@ where
                 None
             };
             let (keys, ptrs, right_bound, right_ref) = {
+                debug_assert!(is_node_serial(all_pages[index].innode()), "node 1 not serial before rebalance");
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
+                debug_assert!(is_node_serial(next.innode()), "node 2 not serial before rebalance");
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
                     let tuple = {
@@ -267,10 +272,11 @@ where
                     };
                     **next = NodeData::Empty(box EmptyNode {
                         left: None,
-                        right: NodeCellRef::default(),
+                        right: tuple.3.clone(),
                     });
                     tuple
                 } else {
+                    unreachable!();
                     // Rebalance next node with current node
                     // Next node left bound need to be updated in upper level
                     let right_ref = next.node_ref().clone();
@@ -303,6 +309,8 @@ where
                     next_innode.ptrs = ptrs;
                     next_innode.len = next_len - next_mid - 1;
 
+                    debug_assert!(is_node_serial(next_innode), "node 2 not serial after rebalance");
+
                     level_page_altered.push(KeyAltered {
                         new_key: right_left_bound,
                         ptr: right_ref,
@@ -322,6 +330,7 @@ where
             for (i, ptr) in ptrs.into_iter().enumerate() {
                 page_innode.ptrs.as_slice()[i + 1] = ptr;
             }
+            debug_assert!(is_node_serial(page_innode), "node 1 not serial after rebalance");
             index += 1;
         }
         index += 1;
@@ -438,4 +447,30 @@ where
     debug!("Merge completed");
 
     merge_page_len
+}
+
+pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    // check keys
+    for i in 1..node.len {
+        if node.keys.as_slice_immute()[i - 1] >= node.keys.as_slice_immute()[i] {
+            return false;
+        }
+    }
+
+    for (i, key) in node.keys.as_slice_immute()[..node.len].iter().enumerate() {
+        let left = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i]);
+        let right = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i + 1]);
+        if !left.is_empty() && left.last_key() >= key {
+            return false;
+        }
+        if !right.is_empty() && right.first_key() < key {
+            return false;
+        }
+    }
+
+    true
 }
