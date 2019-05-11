@@ -41,8 +41,8 @@ where
     Innode(NodeCellRef),
 }
 
-struct KeyAltered {
-    new_key: EntryKey,
+struct NodeAltered {
+    key: Option<EntryKey>,
     ptr: NodeCellRef,
 }
 
@@ -80,7 +80,7 @@ where
     }
 }
 
-fn prune_empty<'a, KS, PS>(node: &NodeCellRef, bound: &EntryKey, level: usize) -> Vec<KeyAltered>
+fn prune_removed<'a, KS, PS>(node: &NodeCellRef, removed: Box<Vec<NodeAltered>>, bound: &EntryKey, level: usize) -> Box<Vec<NodeAltered>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -90,10 +90,10 @@ where
     let altered_keys = match first_search {
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
-            if !sub_node.is_empty_node() && !sub_node.is_ext() {
-                prune_empty::<KS, PS>(&sub_node_ref, bound, level + 1)
+            if !sub_node.is_ext() {
+                prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
             } else {
-                vec![]
+                removed
             }
         }
         MutSearchResult::External => unreachable!(),
@@ -122,31 +122,38 @@ where
             break;
         }
     }
-    let select_live = |page: &NodeWriteGuard<KS, PS>| {
+    let select_live = |page: &NodeWriteGuard<KS, PS>, altered: &Box<Vec<NodeAltered>>| {
         debug_assert!(is_node_serial(page.innode()), "node not serial before live selection - {}", level);
+        let mut removed = altered.iter().filter(|na| na.key.is_none()).peekable();
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
             .enumerate()
             .filter_map(|(i, sub_level)| {
-                if !read_unchecked::<KS, PS>(sub_level).is_empty_node() {
+                let mut found_removed = false;
+                if let Some(rm) = removed.peek() {
+                    if sub_level.ptr_eq(&rm.ptr) {
+                        found_removed = true;
+                    }
+                }
+                if !found_removed {
                     Some((i, sub_level.clone()))
                 } else {
+                    removed.next();
                     None
                 }
             })
             .collect_vec()
     };
-    let page_lives = all_pages.iter().map(|p| select_live(p)).collect_vec();
+    let page_lives = all_pages.iter().map(|p| select_live(p, &altered_keys)).collect_vec();
     all_pages
         .iter_mut()
         .zip(page_lives)
         .for_each(|(mut page, live_ptrs)| {
-            let page_right = page.right_ref().unwrap().clone();
             if live_ptrs.len() == 0 {
-                **page = NodeData::Empty(box EmptyNode {
-                    left: None,
-                    right: page_right,
-                })
+                level_page_altered.push(NodeAltered {
+                    key: None,
+                    ptr: page.node_ref().clone()
+                });
             } else {
                 let mut new_keys = KS::init();
                 let mut new_ptrs = PS::init();
@@ -188,9 +195,10 @@ where
     };
 
     let update_and_mark_altered_keys =
-        |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<KeyAltered>| {
+        |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<NodeAltered>| {
             let mut innode = page.innode_mut();
             let innde_len = innode.len;
+            let changed = altered_keys.iter().filter(|ak| ak.key.is_some()).collect_vec();
             debug_assert!(is_node_serial(innode), "node not serial before update altered - {}", level);
             let marked_ptrs = innode
                 .ptrs
@@ -198,18 +206,18 @@ where
                 .iter()
                 .enumerate()
                 .filter_map(|(i, p)| {
-                    altered_keys
+                    changed
                         .iter()
                         .find(|ak| ak.ptr.ptr_eq(p))
-                        .map(|ak| (i, ak.new_key.clone()))
+                        .map(|ak| (i, ak.key.clone().unwrap()))
                 })
                 .collect_vec();
             for (i, new_key) in marked_ptrs {
                 if i == 0 {
                     // cannot update the key in current page
                     // will postpone to upper level
-                    altered.push(KeyAltered {
-                        new_key: new_key,
+                    altered.push(NodeAltered {
+                        key: Some(new_key),
                         ptr: innode.ptrs.as_slice_immute()[i].clone(),
                     });
                 } else {
@@ -266,6 +274,7 @@ where
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
                     // TODO: move the only ptr in left to right node
+                    debug!("Merging node...");
                     let tuple = {
                         let next_innode = next.innode();
                         let len = next_innode.len;
@@ -282,9 +291,9 @@ where
                     });
                     tuple
                 } else {
-                    unreachable!();
                     // Rebalance next node with current node
                     // Next node left bound need to be updated in upper level
+                    debug!("Rebalancing node...");
                     let right_ref = next.node_ref().clone();
                     let next_innode = next.innode_mut();
                     let next_len = next_innode.len;
@@ -317,8 +326,8 @@ where
 
                     debug_assert!(is_node_serial(next_innode), "node 2 not serial after rebalance - {}", level);
 
-                    level_page_altered.push(KeyAltered {
-                        new_key: right_left_bound,
+                    level_page_altered.push(NodeAltered {
+                        key: Some(right_left_bound),
                         ptr: right_ref,
                     });
                     tuple
@@ -345,7 +354,7 @@ where
 
     update_right_nodes(&mut all_pages);
 
-    level_page_altered
+    box level_page_altered
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
@@ -400,6 +409,7 @@ where
     }
 
     // adjust leaf left, right references
+    let mut removed_nodes = box vec![];
     {
         let right_right_most = left_most_leaf_guards
             .last()
@@ -422,9 +432,9 @@ where
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
             debug!("make deleted {:?}", g.ext_id());
-            **g = NodeData::Empty(box EmptyNode {
-                left: Some(left_left_most.clone()),
-                right: right_right_most.clone(),
+            removed_nodes.push(NodeAltered {
+                key: None,
+                ptr: g.node_ref().clone()
             });
         }
 
@@ -447,7 +457,7 @@ where
     }
 
     // cleanup upper level references
-    prune_empty::<KS, PS>(&src_tree.get_root(), &prune_bound, 0);
+    prune_removed::<KS, PS>(&src_tree.get_root(), removed_nodes, &prune_bound, 0);
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
