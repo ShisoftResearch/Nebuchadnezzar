@@ -322,6 +322,8 @@ where
             .collect()
     };
 
+    // dealing with corner cases
+    // here, a page may have one ptr and no keys, then the remaining ptr need to be merge to right page
     let mut index = 0;
     while index < all_pages.len() {
         if all_pages[index].len() == 0 {
