@@ -31,6 +31,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::iter::Peekable;
 
 enum Selection<KS, PS>
 where
@@ -122,15 +123,17 @@ where
             break;
         }
     }
-    let select_live = |page: &NodeWriteGuard<KS, PS>, altered: &Box<Vec<NodeAltered>>| {
+    let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
+        // removed is a sequential external nodes that have been removed and their length set to 0
+        // nodes are ordered so we can iterate them while scanning the reference in upper levels.
         debug_assert!(is_node_serial(page.innode()), "node not serial before live selection - {}", level);
-        let mut removed = altered.iter().filter(|na| na.key.is_none()).peekable();
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
             .enumerate()
             .filter_map(|(i, sub_level)| {
                 let mut found_removed = false;
-                if let Some(rm) = removed.peek() {
+                if let Some(&rm) = removed.peek() {
+                    let rm: &NodeAltered = rm;
                     if sub_level.ptr_eq(&rm.ptr) {
                         found_removed = true;
                     }
@@ -144,17 +147,28 @@ where
             })
             .collect_vec()
     };
-    let page_lives = all_pages.iter().map(|p| select_live(p, &altered_keys)).collect_vec();
+    let page_lives_ptrs = {
+        let mut removed = altered_keys.iter().filter(|na| na.key.is_none()).peekable();
+        all_pages.iter().map(|p| select_live(p, &mut removed)).collect_vec()
+    };
+
+    // make all the necessary changes in current level pages according to is living children
     all_pages
         .iter_mut()
-        .zip(page_lives)
+        .zip(page_lives_ptrs)
         .for_each(|(mut page, live_ptrs)| {
             if live_ptrs.len() == 0 {
+                // check if all the children ptr in this page have been removed
+                // if yes mark it and upper level will handel it
                 level_page_altered.push(NodeAltered {
                     key: None,
                     ptr: page.node_ref().clone()
                 });
+                // set length zero without do anything else
+                // this will ease read hazard
+                page.innode_mut().len = 0;
             } else {
+                // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
                 let mut new_ptrs = PS::init();
                 let ptr_len = live_ptrs.len();
@@ -164,7 +178,7 @@ where
                 for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                     new_ptrs.as_slice()[i] = ptr;
                 }
-                let innode = page.innode_mut();
+                let mut innode = page.innode_mut();
                 debug_assert!(is_node_serial(innode), "node not serial before update - {}", level);
                 innode.len = ptr_len - 1;
                 innode.keys = new_keys;
@@ -174,16 +188,22 @@ where
         });
 
     let non_empty_right_node = |i: usize, pages: &Vec<NodeWriteGuard<KS, PS>>| {
+        // pick a right non empty node next to the indexed node from the pages
         let mut i = i + 1;
         loop {
             if i == pages.len() {
+                // in this case, the node have already reach the end of the vec provided
+                // right node should been picked from the last node right reference
                 let right_node = pages[i - 1].borrow().right_ref().unwrap().clone();
+                // ensure the picked node is not default and it should never to be
                 debug_assert!(!right_node.is_default());
                 return right_node;
             } else if i < pages.len() {
+                // in this case we can check the next page and ensure it is not empty
                 let p = pages[i].borrow();
+                // again, check the picked on is not default
                 debug_assert!(!p.node_ref().is_default());
-                if !p.is_empty_node() {
+                if !p.is_empty() {
                     return p.node_ref().clone();
                 } else {
                     i += 1;
@@ -195,32 +215,45 @@ where
     };
 
     let update_and_mark_altered_keys =
-        |page: &mut NodeWriteGuard<KS, PS>, altered: &mut Vec<NodeAltered>| {
+        |page: &mut NodeWriteGuard<KS, PS>, current_altered: &mut Peekable<_>, next_level_altered: &mut Vec<NodeAltered>| {
+            // update all nodes marked changed, not removed
             let mut innode = page.innode_mut();
             let innde_len = innode.len;
-            let changed = altered_keys.iter().filter(|ak| ak.key.is_some()).collect_vec();
+
             debug_assert!(is_node_serial(innode), "node not serial before update altered - {}", level);
+            // search for all children nodes in this page to find the altered pointers
             let marked_ptrs = innode
                 .ptrs
                 .as_slice_immute()[..innde_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, p)| {
-                    changed
-                        .iter()
-                        .find(|ak| ak.ptr.ptr_eq(p))
-                        .map(|ak| (i, ak.key.clone().unwrap()))
+                    let mut found_key = None;
+                    if let Some(&ak) = current_altered.peek() {
+                        let ak: &NodeAltered = ak;
+                        if ak.ptr.ptr_eq(p) {
+                            found_key = Some((i, ak.key.clone().unwrap()));
+                        }
+                    }
+                    if found_key.is_some() {
+                        current_altered.next();
+                    }
+                    found_key
                 })
                 .collect_vec();
+
+            // alter keys corresponding to the ptr, which is ptr id - 1; 0 will postpone to upper level
             for (i, new_key) in marked_ptrs {
+                // update key for children ptr, note that node all key can be updated in this level
                 if i == 0 {
-                    // cannot update the key in current page
+                    // cannot update the key in current level
                     // will postpone to upper level
-                    altered.push(NodeAltered {
+                    next_level_altered.push(NodeAltered {
                         key: Some(new_key),
                         ptr: innode.ptrs.as_slice_immute()[i].clone(),
                     });
                 } else {
+                    // can be updated, set the new key
                     innode.keys.as_slice()[i - 1] = new_key;
                 }
             }
@@ -244,14 +277,17 @@ where
 
     update_right_nodes(&mut all_pages);
 
-    all_pages = all_pages
-        .into_iter()
-        .filter(|p| !p.borrow().is_empty_node())
-        .map(|mut p| {
-            update_and_mark_altered_keys(&mut p, &mut level_page_altered);
-            p
-        })
-        .collect_vec();
+    all_pages = {
+        let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
+        all_pages
+            .into_iter()
+            .filter(|p| !p.borrow().is_empty())
+            .map(|mut p| {
+                update_and_mark_altered_keys(&mut p, &mut current_altered, &mut level_page_altered);
+                p
+            })
+            .collect()
+    };
 
     let mut index = 0;
     while index < all_pages.len() {
@@ -334,7 +370,7 @@ where
                 }
             };
             debug_assert!(!right_ref.is_default());
-            let page_innode = all_pages[index].innode_mut();
+            let mut page_innode = all_pages[index].innode_mut();
             debug_assert!(is_node_serial(page_innode), "node 1 not serial before rebalance - {}", level);
             page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
             page_innode.right_bound = right_bound;
@@ -431,7 +467,7 @@ where
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
-            debug!("make deleted {:?}", g.ext_id());
+            g.extnode_mut().len = 0;
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone()
