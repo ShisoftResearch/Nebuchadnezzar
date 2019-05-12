@@ -323,7 +323,7 @@ where
     };
 
     // dealing with corner cases
-    // here, a page may have one ptr and no keys, then the remaining ptr need to be merge to right page
+    // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
     let mut index = 0;
     while index < all_pages.len() {
         if all_pages[index].len() == 0 {
@@ -337,7 +337,10 @@ where
             } else {
                 None
             };
+            // extract keys, ptrs from right that will merge to left
+            // new right key bound and right ref  from right (if right will be removed) also defines here
             let (keys, ptrs, right_bound, right_ref) = {
+                // get next page from right reference or next in the vec
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
@@ -346,9 +349,9 @@ where
                     "node 2 not serial before rebalance - {}",
                     level
                 );
+
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
-                    // TODO: move the only ptr in left to right node
                     debug!("Merging node...");
                     let tuple = {
                         let next_innode = next.innode();
@@ -360,10 +363,11 @@ where
                             next_innode.right.clone(),
                         )
                     };
-                    **next = NodeData::Empty(box EmptyNode {
-                        left: None,
-                        right: tuple.3.clone(),
+                    level_page_altered.push(NodeAltered {
+                        key: None,
+                        ptr: next.node_ref().clone()
                     });
+                    next.innode_mut().len = 0;
                     tuple
                 } else {
                     // Rebalance next node with current node
@@ -423,6 +427,7 @@ where
             page_innode.right_bound = right_bound;
             page_innode.right = right_ref;
             page_innode.len = 1 + keys.len();
+            // again, keys and pres here are vec that will merge into the current emptying node
             for (i, key) in keys.into_iter().enumerate() {
                 page_innode.keys.as_slice()[i + 1] = key;
             }
