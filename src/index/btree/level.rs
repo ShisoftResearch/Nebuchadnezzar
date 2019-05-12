@@ -29,9 +29,9 @@ use std::cell::RefCell;
 use std::cmp::min;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
+use std::iter::Peekable;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::iter::Peekable;
 
 enum Selection<KS, PS>
 where
@@ -81,7 +81,12 @@ where
     }
 }
 
-fn prune_removed<'a, KS, PS>(node: &NodeCellRef, removed: Box<Vec<NodeAltered>>, bound: &EntryKey, level: usize) -> Box<Vec<NodeAltered>>
+fn prune_removed<'a, KS, PS>(
+    node: &NodeCellRef,
+    removed: Box<Vec<NodeAltered>>,
+    bound: &EntryKey,
+    level: usize,
+) -> Box<Vec<NodeAltered>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -108,7 +113,12 @@ where
             if last_page.is_none() {
                 break;
             }
-            debug_assert!(is_node_serial(last_page.innode()), "node not serial on fetching pages {:?} - {}", last_page.keys(), level);
+            debug_assert!(
+                is_node_serial(last_page.innode()),
+                "node not serial on fetching pages {:?} - {}",
+                last_page.keys(),
+                level
+            );
             (
                 last_page.right_ref().unwrap().clone(),
                 last_page.right_bound().clone(),
@@ -126,7 +136,11 @@ where
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
         // removed is a sequential external nodes that have been removed and their length set to 0
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
-        debug_assert!(is_node_serial(page.innode()), "node not serial before live selection - {}", level);
+        debug_assert!(
+            is_node_serial(page.innode()),
+            "node not serial before live selection - {}",
+            level
+        );
         page.innode().ptrs.as_slice_immute()[..page.len() + 1]
             .iter()
             .enumerate()
@@ -149,7 +163,10 @@ where
     };
     let page_lives_ptrs = {
         let mut removed = altered_keys.iter().filter(|na| na.key.is_none()).peekable();
-        all_pages.iter().map(|p| select_live(p, &mut removed)).collect_vec()
+        all_pages
+            .iter()
+            .map(|p| select_live(p, &mut removed))
+            .collect_vec()
     };
 
     // make all the necessary changes in current level pages according to is living children
@@ -162,7 +179,7 @@ where
                 // if yes mark it and upper level will handel it
                 level_page_altered.push(NodeAltered {
                     key: None,
-                    ptr: page.node_ref().clone()
+                    ptr: page.node_ref().clone(),
                 });
                 // set length zero without do anything else
                 // this will ease read hazard
@@ -179,11 +196,19 @@ where
                     new_ptrs.as_slice()[i] = ptr;
                 }
                 let mut innode = page.innode_mut();
-                debug_assert!(is_node_serial(innode), "node not serial before update - {}", level);
+                debug_assert!(
+                    is_node_serial(innode),
+                    "node not serial before update - {}",
+                    level
+                );
                 innode.len = ptr_len - 1;
                 innode.keys = new_keys;
                 innode.ptrs = new_ptrs;
-                debug_assert!(is_node_serial(innode), "node not serial after update - {}", level);
+                debug_assert!(
+                    is_node_serial(innode),
+                    "node not serial after update - {}",
+                    level
+                );
             }
         });
 
@@ -215,16 +240,20 @@ where
     };
 
     let update_and_mark_altered_keys =
-        |page: &mut NodeWriteGuard<KS, PS>, current_altered: &mut Peekable<_>, next_level_altered: &mut Vec<NodeAltered>| {
+        |page: &mut NodeWriteGuard<KS, PS>,
+         current_altered: &mut Peekable<_>,
+         next_level_altered: &mut Vec<NodeAltered>| {
             // update all nodes marked changed, not removed
             let mut innode = page.innode_mut();
             let innde_len = innode.len;
 
-            debug_assert!(is_node_serial(innode), "node not serial before update altered - {}", level);
+            debug_assert!(
+                is_node_serial(innode),
+                "node not serial before update altered - {}",
+                level
+            );
             // search for all children nodes in this page to find the altered pointers
-            let marked_ptrs = innode
-                .ptrs
-                .as_slice_immute()[..innde_len + 1]
+            let marked_ptrs = innode.ptrs.as_slice_immute()[..innde_len + 1]
                 .iter()
                 .enumerate()
                 .filter_map(|(i, p)| {
@@ -257,7 +286,11 @@ where
                     innode.keys.as_slice()[i - 1] = new_key;
                 }
             }
-            debug_assert!(is_node_serial(innode), "node not serial after update altered - {}", level);
+            debug_assert!(
+                is_node_serial(innode),
+                "node not serial after update altered - {}",
+                level
+            );
         };
 
     let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
@@ -306,7 +339,11 @@ where
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
-                debug_assert!(is_node_serial(next.innode()), "node 2 not serial before rebalance - {}", level);
+                debug_assert!(
+                    is_node_serial(next.innode()),
+                    "node 2 not serial before rebalance - {}",
+                    level
+                );
                 if next.len() < KS::slice_len() - 1 {
                     // Merge next node with current node
                     // TODO: move the only ptr in left to right node
@@ -360,7 +397,11 @@ where
                     next_innode.ptrs = ptrs;
                     next_innode.len = next_len - next_mid - 1;
 
-                    debug_assert!(is_node_serial(next_innode), "node 2 not serial after rebalance - {}", level);
+                    debug_assert!(
+                        is_node_serial(next_innode),
+                        "node 2 not serial after rebalance - {}",
+                        level
+                    );
 
                     level_page_altered.push(NodeAltered {
                         key: Some(right_left_bound),
@@ -371,7 +412,11 @@ where
             };
             debug_assert!(!right_ref.is_default());
             let mut page_innode = all_pages[index].innode_mut();
-            debug_assert!(is_node_serial(page_innode), "node 1 not serial before rebalance - {}", level);
+            debug_assert!(
+                is_node_serial(page_innode),
+                "node 1 not serial before rebalance - {}",
+                level
+            );
             page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
             page_innode.right_bound = right_bound;
             page_innode.right = right_ref;
@@ -382,7 +427,11 @@ where
             for (i, ptr) in ptrs.into_iter().enumerate() {
                 page_innode.ptrs.as_slice()[i + 1] = ptr;
             }
-            debug_assert!(is_node_serial(page_innode), "node 1 not serial after rebalance - {}", level);
+            debug_assert!(
+                is_node_serial(page_innode),
+                "node 1 not serial after rebalance - {}",
+                level
+            );
             index += 1;
         }
         index += 1;
@@ -470,7 +519,7 @@ where
             g.extnode_mut().len = 0;
             removed_nodes.push(NodeAltered {
                 key: None,
-                ptr: g.node_ref().clone()
+                ptr: g.node_ref().clone(),
             });
         }
 
@@ -503,9 +552,9 @@ where
 }
 
 pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
     for i in 1..node.len {
@@ -518,10 +567,10 @@ pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
     for (i, key) in node.keys.as_slice_immute()[..node.len].iter().enumerate() {
         let left = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i]);
         let right = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i + 1]);
-//        if !left.is_empty() && left.last_key() >= key {
-//            error!("serial check failed for left >= key");
-//            return false;
-//        }
+        //        if !left.is_empty() && left.last_key() >= key {
+        //            error!("serial check failed for left >= key");
+        //            return false;
+        //        }
         if !right.is_empty() && right.first_key() < key {
             error!("serial check failed for left < key");
             return false;
