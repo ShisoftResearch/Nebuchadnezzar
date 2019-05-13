@@ -339,18 +339,19 @@ where
             };
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here
-            let (keys, ptrs, right_bound, right_ref) = {
+            let (keys, ptrs, right_bound, right_ref, merging) = {
                 // get next page from right reference or next in the vec
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
+                let merging_node = next.len() < KS::slice_len() - 1;
                 debug_assert!(
                     is_node_serial(next.innode()),
                     "node 2 not serial before rebalance - {}",
                     level
                 );
 
-                if next.len() < KS::slice_len() - 1 {
+                if merging_node {
                     // Merge next node with current node
                     debug!("Merging node...");
                     let tuple = {
@@ -361,6 +362,7 @@ where
                             next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
                             next_innode.right_bound.clone(),
                             next_innode.right.clone(),
+                            merging_node
                         )
                     };
                     level_page_altered.push(NodeAltered {
@@ -383,6 +385,7 @@ where
                         next_innode.ptrs.as_slice_immute()[..next_mid + 1].to_vec(),
                         right_left_bound.clone(),
                         right_ref.clone(),
+                        merging_node
                     );
                     let mut keys = KS::init();
                     let mut ptrs = PS::init();
@@ -436,8 +439,10 @@ where
             }
             debug_assert!(
                 is_node_serial(page_innode),
-                "node 1 not serial after rebalance - {}",
-                level
+                "node 1 not serial after rebalance - {} - {} - {:?}",
+                level,
+                merging,
+                page_innode.keys
             );
             index += 1;
         }
