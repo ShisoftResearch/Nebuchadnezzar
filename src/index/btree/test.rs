@@ -596,7 +596,8 @@ fn level_merge_insertion() {
             key_with_id(&mut entry_key, &id);
             entry_key
         })
-        .collect_vec();
+        .sorted()
+        .collect();
     let th2 = thread::spawn(move || {
         tree_3.merge_with_keys(merge_keys);
     });
