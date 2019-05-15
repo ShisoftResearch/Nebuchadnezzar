@@ -543,3 +543,76 @@ fn level_merge() {
         tree_2.seek(&key2, Default::default());
     }
 }
+
+#[test]
+fn level_merge_insertion() {
+    env_logger::init();
+    let range = 10000;
+    let nums = range * 3;
+    let tree = Arc::new(TinyLevelBPlusTree::new());
+    let mut numbers = (0..nums).collect_vec();
+    let mut rng = thread_rng();
+    rng.shuffle(numbers.as_mut());
+    let tree_nums = numbers.as_slice()[0..range].iter().cloned().collect_vec();
+    let merge_nums = numbers.as_slice()[range..range * 2]
+        .iter()
+        .cloned()
+        .collect_vec();
+    let insert_nums = numbers.as_slice()[range * 2..]
+        .iter()
+        .cloned()
+        .collect_vec();
+    for i in tree_nums {
+        let n = i as u64;
+        let id = Id::new(0, n);
+        let key_slice = u64_to_slice(n);
+        let mut key = SmallVec::from_slice(&key_slice);
+        key_with_id(&mut key, &id);
+        assert!(tree.insert(&key));
+    }
+
+    dump_tree(&tree, "lsm-tree_level_merge_insert_orig_dump.json");
+
+    let tree_2 = tree.clone();
+    let th1 = thread::spawn(move || {
+        for i in insert_nums {
+            let n = i as u64;
+            let id = Id::new(0, n);
+            let key_slice = u64_to_slice(n);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            assert!(tree_2.insert(&key));
+        }
+    });
+
+    let tree_3 = tree.clone();
+    let merge_keys = box merge_nums
+        .into_iter()
+        .map(|i| {
+            let n = i as u64;
+            let id = Id::new(0, n);
+            let key_slice = u64_to_slice(n);
+            let mut entry_key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut entry_key, &id);
+            entry_key
+        })
+        .collect_vec();
+    let th2 = thread::spawn(move || {
+        tree_3.merge_with_keys(merge_keys);
+    });
+    th1.join();
+    th2.join();
+
+    dump_tree(&tree, "lsm-tree_level_merge_insert_ins_dump.json");
+
+    numbers.sort();
+    for num in numbers {
+        let n = num as u64;
+        let id = Id::new(0, n);
+        let key_slice = u64_to_slice(n);
+        let mut key = SmallVec::from_slice(&key_slice);
+        key_with_id(&mut key, &id);
+        let cursor = tree.seek(&key, Ordering::Forward);
+        assert_eq!(&key, cursor.current().unwrap());
+    }
+}
