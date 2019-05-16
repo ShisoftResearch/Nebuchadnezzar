@@ -183,7 +183,7 @@ where
                 });
                 // set length zero without do anything else
                 // this will ease read hazard
-                page.innode_mut().len = 0;
+                page.make_empty_node();
             } else {
                 // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
@@ -369,7 +369,7 @@ where
                         key: None,
                         ptr: next.node_ref().clone()
                     });
-                    next.innode_mut().len = 0;
+                    next.make_empty_node();
                     tuple
                 } else {
                     // Rebalance next node with current node
@@ -528,7 +528,7 @@ where
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
-            g.extnode_mut().len = 0;
+            g.make_empty_node();
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone(),

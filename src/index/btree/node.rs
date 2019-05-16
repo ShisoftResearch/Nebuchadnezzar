@@ -524,7 +524,6 @@ where
         if self.is_empty_node() {
             return;
         }
-        debug_assert!(self.is_empty());
         let data = &mut (**self);
         let left_node = data.left_ref().cloned();
         let right_node = data.right_ref().cloned().unwrap();
