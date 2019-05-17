@@ -96,10 +96,11 @@ where
     let altered_keys = match first_search {
         MutSearchResult::Internal(sub_node_ref) => {
             let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
-            if !sub_node.is_ext() {
-                prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
-            } else {
+            // first meet empty should be the removed external node
+            if  sub_node.is_empty_node() || sub_node.is_ext() {
                 removed
+            } else {
+                prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
             }
         }
         MutSearchResult::External => unreachable!(),
@@ -183,7 +184,7 @@ where
                 });
                 // set length zero without do anything else
                 // this will ease read hazard
-                page.make_empty_node();
+                page.make_empty_node(false);
             } else {
                 // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
@@ -369,7 +370,7 @@ where
                         key: None,
                         ptr: next.node_ref().clone()
                     });
-                    next.make_empty_node();
+                    next.make_empty_node(false);
                     tuple
                 } else {
                     // Rebalance next node with current node
@@ -528,7 +529,7 @@ where
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
-            g.make_empty_node();
+            g.make_empty_node(false);
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone(),
