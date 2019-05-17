@@ -578,19 +578,5 @@ where
             return false;
         }
     }
-
-    for (i, key) in node.keys.as_slice_immute()[..node.len].iter().enumerate() {
-        let left = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i]);
-        let right = read_unchecked::<KS, PS>(&node.ptrs.as_slice_immute()[i + 1]);
-        //        if !left.is_empty() && left.last_key() >= key {
-        //            error!("serial check failed for left >= key");
-        //            return false;
-        //        }
-        if !right.is_empty() && right.first_key() < key {
-            error!("serial check failed for left < key");
-            return false;
-        }
-    }
-
     true
 }
