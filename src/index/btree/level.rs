@@ -164,10 +164,12 @@ where
     };
     let page_lives_ptrs = {
         let mut removed = altered_keys.iter().filter(|na| na.key.is_none()).peekable();
-        all_pages
+        let pages = all_pages
             .iter()
             .map(|p| select_live(p, &mut removed))
-            .collect_vec()
+            .collect_vec();
+        debug_assert!(removed.next().is_none());
+        pages
     };
 
     // make all the necessary changes in current level pages according to is living children
@@ -313,14 +315,16 @@ where
 
     all_pages = {
         let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
-        all_pages
+        let pages = all_pages
             .into_iter()
             .filter(|p| !p.borrow().is_empty())
             .map(|mut p| {
                 update_and_mark_altered_keys(&mut p, &mut current_altered, &mut level_page_altered);
                 p
             })
-            .collect()
+            .collect();
+        debug_assert!(current_altered.next().is_none());
+        pages
     };
 
     // dealing with corner cases
