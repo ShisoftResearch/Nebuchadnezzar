@@ -9,6 +9,7 @@ use index::Ordering;
 use index::Slice;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use index::btree::NodeData::Empty;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
@@ -87,14 +88,22 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+    enum R {
+        Result(MutSearchResult),
+        Empty(NodeCellRef)
+    }
+    let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
         &NodeData::Internal(ref n) => {
             let pos = n.search(key);
             let sub_node = n.ptrs.as_slice_immute()[pos].clone();
-            MutSearchResult::Internal(sub_node)
+            R::Result(MutSearchResult::Internal(sub_node))
         }
-        &NodeData::External(_) => MutSearchResult::External,
-        &NodeData::Empty(ref n) => mut_search::<KS, PS>(&n.right, key),
+        &NodeData::External(_) => R::Result(MutSearchResult::External),
+        &NodeData::Empty(ref n) => R::Empty(n.right.clone()),
         &NodeData::None => unreachable!(),
-    })
+    });
+    match res {
+        R::Result(r) => r,
+        R::Empty(r) => mut_search::<KS, PS>(&r, key)
+    }
 }
