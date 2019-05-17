@@ -22,7 +22,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!("searching for {:?}", key);
-    read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
+    let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
         let node = &**node_handler;
         let gen_empty_cursor = || RTCursor {
             index: 0,
@@ -34,7 +34,7 @@ where
         };
         if let Some(right_node) = node.key_at_right_node(key) {
             debug!("Search found a node at the right side");
-            return search_node(right_node, key, ordering, deleted);
+            return Err(right_node.clone());
         }
         debug!("search node have keys {:?}", node.keys());
         let mut pos = node.search(key);
@@ -54,7 +54,7 @@ where
                     }
                     debug!("cursor pos have been corrected to {}", pos);
                 }
-                RTCursor::new(pos, node_ref, ordering, deleted)
+                Ok(RTCursor::new(pos, node_ref, ordering, deleted))
             }
             &NodeData::Internal(ref n) => {
                 debug!(
@@ -70,12 +70,13 @@ where
                     n.len,
                     &n.keys.as_slice_immute()[..pos]
                 );
-                search_node(next_node_ref, key, ordering, deleted)
+                Err(next_node_ref.clone())
             }
-            &NodeData::Empty(ref n) => search_node(&n.right, key, ordering, deleted),
-            &NodeData::None => gen_empty_cursor(),
+            &NodeData::Empty(ref n) => Err(n.right.clone()),
+            &NodeData::None => Ok(gen_empty_cursor()),
         }
-    })
+    });
+    r.unwrap_or_else(|e| search_node(&e, key, ordering, deleted))
 }
 
 pub enum MutSearchResult {
@@ -88,22 +89,15 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    enum R {
-        Result(MutSearchResult),
-        Empty(NodeCellRef)
-    }
     let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
         &NodeData::Internal(ref n) => {
             let pos = n.search(key);
             let sub_node = n.ptrs.as_slice_immute()[pos].clone();
-            R::Result(MutSearchResult::Internal(sub_node))
+            Ok(MutSearchResult::Internal(sub_node))
         }
-        &NodeData::External(_) => R::Result(MutSearchResult::External),
-        &NodeData::Empty(ref n) => R::Empty(n.right.clone()),
+        &NodeData::External(_) => Ok(MutSearchResult::External),
+        &NodeData::Empty(ref n) => Err(n.right.clone()),
         &NodeData::None => unreachable!(),
     });
-    match res {
-        R::Result(r) => r,
-        R::Empty(r) => mut_search::<KS, PS>(&r, key)
-    }
+    res.unwrap_or_else(|e| mut_search::<KS, PS>(&e, key))
 }
