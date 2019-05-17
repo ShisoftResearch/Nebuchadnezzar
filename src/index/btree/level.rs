@@ -530,6 +530,8 @@ where
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
             g.make_empty_node(false);
+            g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
+            g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone(),
