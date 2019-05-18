@@ -238,7 +238,7 @@ where
                 let p = pages[i].borrow();
                 // again, check the picked on is not default
                 debug_assert!(!p.node_ref().is_default());
-                if !p.is_empty() {
+                if !p.is_empty_node() {
                     return p.node_ref().clone();
                 } else {
                     debug!("Shifting to skip empty node for next right node");
@@ -325,7 +325,7 @@ where
         let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
         let pages = all_pages
             .into_iter()
-            .filter(|p| !p.borrow().is_empty())
+            .filter(|p| !p.borrow().is_empty_node())
             .map(|mut p| {
                 update_and_mark_altered_keys(&mut p, &mut current_altered, &mut level_page_altered);
                 p
