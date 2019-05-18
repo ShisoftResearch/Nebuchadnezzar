@@ -15,7 +15,7 @@ use index::btree::node::NodeData::Empty;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
-use index::btree::LevelTree;
+use index::btree::{LevelTree, NodeReadHandler};
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
 use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
@@ -94,18 +94,15 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut level_page_altered = vec![];
-    let first_search = mut_search::<KS, PS>(node, &smallvec!());
-    let altered_keys = match first_search {
-        MutSearchResult::Internal(sub_node_ref) => {
-            let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
-            // first meet empty should be the removed external node
-            if  sub_node.is_empty_node() || sub_node.is_ext() {
-                removed
-            } else {
-                prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
-            }
+    let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| n.innode().ptrs.as_slice_immute()[0].clone());
+    let altered_keys = {
+        let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
+        // first meet empty should be the removed external node
+        if  sub_node.is_empty_node() || sub_node.is_ext() {
+            removed
+        } else {
+            prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
         }
-        MutSearchResult::External => unreachable!(),
     };
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
@@ -494,7 +491,6 @@ where
         let mut merged_deleted_keys = vec![];
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()
-            .filter(|&g| !g.is_empty_node())
             .map(|g| &g.keys()[..g.len()])
             .flatten()
             .filter(|&k| {
