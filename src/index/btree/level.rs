@@ -15,9 +15,9 @@ use index::btree::node::NodeData::Empty;
 use index::btree::node::NodeWriteGuard;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
-use index::btree::{LevelTree, NodeReadHandler};
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
+use index::btree::{LevelTree, NodeReadHandler};
 use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use index::EntryKey;
 use index::Slice;
@@ -62,13 +62,7 @@ where
             let target_keys = min(KS::slice_len() * LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3);
             let target_guards = LEVEL_2;
             while collected_keys < target_keys && collected.len() < target_guards {
-                let right = write_node(
-                    collected
-                        .last_mut()
-                        .unwrap()
-                        .right_ref()
-                        .unwrap(),
-                );
+                let right = write_node(collected.last_mut().unwrap().right_ref().unwrap());
                 if right.is_none() {
                     break;
                 } else {
@@ -94,11 +88,13 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut level_page_altered = vec![];
-    let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| n.innode().ptrs.as_slice_immute()[0].clone());
+    let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| {
+        n.innode().ptrs.as_slice_immute()[0].clone()
+    });
     let altered_keys = {
         let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
         // first meet empty should be the removed external node
-        if  sub_node.is_empty_node() || sub_node.is_ext() {
+        if sub_node.is_empty_node() || sub_node.is_ext() {
             removed
         } else {
             prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
@@ -132,7 +128,7 @@ where
     }
     debug!("Prune selected level {}, {} pages", level, all_pages.len());
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
-        // removed is a sequential external nodes that have been removed and their length set to 0
+        // removed is a sequential external nodes that have been removed and have been set to empty
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
         debug_assert!(
             is_node_serial(page.innode()),
@@ -144,8 +140,14 @@ where
             .enumerate()
             .filter_map(|(i, sub_level)| {
                 let mut found_removed = false;
-                if let Some(&rm) = removed.peek() {
-                    let rm: &NodeAltered = rm;
+                let current_removed: Option<&&NodeAltered> = removed.peek();
+                debug_assert_ne!(
+                    current_removed
+                        .clone()
+                        .map(|cr| read_unchecked::<KS, PS>(&cr.ptr).is_empty()),
+                    Some(false)
+                );
+                if let Some(&rm) = current_removed {
                     if sub_level.ptr_eq(&rm.ptr) {
                         found_removed = true;
                     }
@@ -165,7 +167,13 @@ where
             .iter()
             .map(|p| select_live(p, &mut removed))
             .collect_vec();
-        debug_assert!(removed.next().is_none(), "remaining removed {}, total {}, level {}", removed.count() + 1, altered_keys.len(), level);
+        debug_assert!(
+            removed.next().is_none(),
+            "remaining removed {}, total {}, level {}",
+            removed.count() + 1,
+            altered_keys.len(),
+            level
+        );
         pages
     };
 
@@ -367,12 +375,12 @@ where
                             next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
                             next_innode.right_bound.clone(),
                             next_innode.right.clone(),
-                            merging_node
+                            merging_node,
                         )
                     };
                     level_page_altered.push(NodeAltered {
                         key: None,
-                        ptr: next.node_ref().clone()
+                        ptr: next.node_ref().clone(),
                     });
                     next.make_empty_node(false);
                     tuple
@@ -390,7 +398,7 @@ where
                         next_innode.ptrs.as_slice_immute()[..next_mid + 1].to_vec(),
                         right_left_bound.clone(),
                         right_ref.clone(),
-                        merging_node
+                        merging_node,
                     );
                     let mut keys = KS::init();
                     let mut ptrs = PS::init();
