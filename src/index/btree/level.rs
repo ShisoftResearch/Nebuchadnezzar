@@ -218,7 +218,7 @@ where
                     "node not serial after update - {}",
                     level
                 );
-                debug!("Found non-empty node");
+                debug!("Found non-empty node, new ptr length {}, node len {}", ptr_len, innode.len);
             }
         });
 
