@@ -4,12 +4,12 @@ use index::btree::node::NodeData;
 use index::btree::node::NodeReadHandler;
 use index::btree::DeletionSet;
 use index::btree::NodeCellRef;
+use index::btree::NodeData::Empty;
 use index::EntryKey;
 use index::Ordering;
 use index::Slice;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use index::btree::NodeData::Empty;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
