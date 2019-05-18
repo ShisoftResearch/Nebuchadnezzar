@@ -178,10 +178,10 @@ where
     };
 
     // make all the necessary changes in current level pages according to is living children
-    all_pages
-        .iter_mut()
+    all_pages = all_pages
+        .into_iter()
         .zip(page_lives_ptrs)
-        .for_each(|(mut page, live_ptrs)| {
+        .filter_map(|(mut page, live_ptrs)| {
             if live_ptrs.len() == 0 {
                 // check if all the children ptr in this page have been removed
                 // if yes mark it and upper level will handel it
@@ -193,6 +193,7 @@ where
                 // this will ease read hazard
                 page.make_empty_node(false);
                 debug!("Found empty node");
+                None
             } else {
                 // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
@@ -204,23 +205,27 @@ where
                 for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                     new_ptrs.as_slice()[i] = ptr;
                 }
-                let mut innode = page.innode_mut();
-                debug_assert!(
-                    is_node_serial(innode),
-                    "node not serial before update - {}",
-                    level
-                );
-                innode.len = ptr_len - 1;
-                innode.keys = new_keys;
-                innode.ptrs = new_ptrs;
-                debug_assert!(
-                    is_node_serial(innode),
-                    "node not serial after update - {}",
-                    level
-                );
-                debug!("Found non-empty node, new ptr length {}, node len {}", ptr_len, innode.len);
+                {
+                    let mut innode = page.innode_mut();
+                    debug_assert!(
+                        is_node_serial(innode),
+                        "node not serial before update - {}",
+                        level
+                    );
+                    innode.len = ptr_len - 1;
+                    innode.keys = new_keys;
+                    innode.ptrs = new_ptrs;
+                    debug_assert!(
+                        is_node_serial(innode),
+                        "node not serial after update - {}",
+                        level
+                    );
+                    debug!("Found non-empty node, new ptr length {}, node len {}", ptr_len, innode.len);
+                }
+                Some(page)
             }
-        });
+        })
+        .collect_vec();
 
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>,
@@ -278,41 +283,12 @@ where
             );
         };
 
-    let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
-        let right_ptrs = all_pages
-            .iter()
-            .filter(|p| !p.is_empty_node())
-            .enumerate()
-            .map(|(i, p)| {
-                if i == all_pages.len() - 1 {
-                    p.right_ref().unwrap().clone()
-                } else {
-                    all_pages[i + 1].node_ref().clone()
-                }
-            })
-            .collect_vec();
-        all_pages
-            .iter_mut()
-            .zip(right_ptrs.into_iter())
-            .for_each(|(p, r)| {
-                debug_assert!(!r.is_default());
-                *p.right_ref_mut().unwrap() = r;
-            });
-    };
-
-    all_pages = {
+    // alter keys
+    {
         let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
-        let pages = all_pages
-            .into_iter()
-            .filter(|p| !p.borrow().is_empty_node())
-            .map(|mut p| {
-                update_and_mark_altered_keys(&mut p, &mut current_altered, &mut level_page_altered);
-                p
-            })
-            .collect();
+        all_pages.iter_mut().for_each(|p| update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered));
         debug_assert!(current_altered.next().is_none());
-        pages
-    };
+    }
 
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
@@ -443,6 +419,27 @@ where
         index += 1;
     }
 
+    let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
+        let right_ptrs = all_pages
+            .iter()
+            .filter(|p| !p.is_empty_node())
+            .enumerate()
+            .map(|(i, p)| {
+                if i == all_pages.len() - 1 {
+                    p.right_ref().unwrap().clone()
+                } else {
+                    all_pages[i + 1].node_ref().clone()
+                }
+            })
+            .collect_vec();
+        all_pages
+            .iter_mut()
+            .zip(right_ptrs.into_iter())
+            .for_each(|(p, r)| {
+                debug_assert!(!r.is_default());
+                *p.right_ref_mut().unwrap() = r;
+            });
+    };
     update_right_nodes(&mut all_pages);
 
     box level_page_altered
