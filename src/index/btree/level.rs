@@ -109,9 +109,7 @@ where
     loop {
         let (right_ref, right_bound) = {
             let last_page = all_pages.last().unwrap().borrow();
-            if last_page.is_none() {
-                break;
-            }
+            debug_assert!(!last_page.is_none());
             debug_assert!(
                 is_node_serial(last_page.innode()),
                 "node not serial on fetching pages {:?} - {}",
