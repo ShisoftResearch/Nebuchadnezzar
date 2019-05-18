@@ -56,6 +56,7 @@ where
     match search {
         MutSearchResult::External => {
             let first_node = write_node(node);
+            assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
             let mut collected_keys = first_node.len();
             let mut collected = vec![first_node];
             let target_keys = min(KS::slice_len() * LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3);
@@ -65,12 +66,13 @@ where
                     collected
                         .last_mut()
                         .unwrap()
-                        .right_ref_mut_no_empty()
+                        .right_ref()
                         .unwrap(),
                 );
                 if right.is_none() {
                     break;
                 } else {
+                    debug_assert!(!right.is_empty(), "found empty node on selection!!!");
                     collected_keys += right.len();
                     collected.push(right);
                 }
@@ -234,6 +236,7 @@ where
                 if !p.is_empty() {
                     return p.node_ref().clone();
                 } else {
+                    debug!("Shifting to skip empty node for next right node");
                     i += 1;
                 }
             } else {
