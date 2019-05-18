@@ -198,8 +198,8 @@ where
                 let mut new_keys = KS::init();
                 let mut new_ptrs = PS::init();
                 let ptr_len = live_ptrs.len();
-                for (i, &(oi, _)) in live_ptrs.iter().take(live_ptrs.len() - 1).enumerate() {
-                    new_keys.as_slice()[i] = page.keys()[oi].clone();
+                for (i, &(oi, _)) in live_ptrs.iter().skip(1).enumerate() {
+                    new_keys.as_slice()[i] = page.keys()[oi - 1].clone();
                 }
                 for (i, (_, ptr)) in live_ptrs.into_iter().enumerate() {
                     new_ptrs.as_slice()[i] = ptr;
