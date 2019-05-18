@@ -222,39 +222,12 @@ where
             }
         });
 
-    let non_empty_right_node = |i: usize, pages: &Vec<NodeWriteGuard<KS, PS>>| {
-        // pick a right non empty node next to the indexed node from the pages
-        let mut i = i + 1;
-        loop {
-            if i == pages.len() {
-                // in this case, the node have already reach the end of the vec provided
-                // right node should been picked from the last node right reference
-                let right_node = pages[i - 1].borrow().right_ref().unwrap().clone();
-                // ensure the picked node is not default and it should never to be
-                debug_assert!(!right_node.is_default());
-                return right_node;
-            } else if i < pages.len() {
-                // in this case we can check the next page and ensure it is not empty
-                let p = pages[i].borrow();
-                // again, check the picked on is not default
-                debug_assert!(!p.node_ref().is_default());
-                if !p.is_empty_node() {
-                    return p.node_ref().clone();
-                } else {
-                    debug!("Shifting to skip empty node for next right node");
-                    i += 1;
-                }
-            } else {
-                unreachable!()
-            }
-        }
-    };
-
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>,
          current_altered: &mut Peekable<_>,
          next_level_altered: &mut Vec<NodeAltered>| {
             // update all nodes marked changed, not removed
+            let page_ref = page.node_ref().clone();
             let mut innode = page.innode_mut();
             let innde_len = innode.len;
 
@@ -283,6 +256,7 @@ where
                 .collect_vec();
 
             // alter keys corresponding to the ptr, which is ptr id - 1; 0 will postpone to upper level
+            debug!("We have {} altered pointers", marked_ptrs.len());
             for (i, new_key) in marked_ptrs {
                 // update key for children ptr, note that node all key can be updated in this level
                 if i == 0 {
@@ -290,7 +264,7 @@ where
                     // will postpone to upper level
                     next_level_altered.push(NodeAltered {
                         key: Some(new_key),
-                        ptr: innode.ptrs.as_slice_immute()[i].clone(),
+                        ptr: page_ref.clone(),
                     });
                 } else {
                     // can be updated, set the new key
@@ -307,8 +281,15 @@ where
     let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
         let right_ptrs = all_pages
             .iter()
+            .filter(|p| !p.is_empty_node())
             .enumerate()
-            .map(|(i, _)| non_empty_right_node(i, &all_pages))
+            .map(|(i, p)| {
+                if i == all_pages.len() - 1 {
+                    p.right_ref().unwrap().clone()
+                } else {
+                    all_pages[i + 1].node_ref().clone()
+                }
+            })
             .collect_vec();
         all_pages
             .iter_mut()
@@ -318,8 +299,6 @@ where
                 *p.right_ref_mut().unwrap() = r;
             });
     };
-
-    update_right_nodes(&mut all_pages);
 
     all_pages = {
         let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
