@@ -168,7 +168,7 @@ where
             .iter()
             .map(|p| select_live(p, &mut removed))
             .collect_vec();
-        debug_assert!(removed.next().is_none());
+        debug_assert!(removed.next().is_none(), "remaining removed {}, total {}, level {}", removed.count() + 1, altered_keys.len(), level);
         pages
     };
 

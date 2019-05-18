@@ -575,14 +575,14 @@ fn level_merge_insertion() {
 
     let tree_2 = tree.clone();
     let th1 = thread::spawn(move || {
-        for i in insert_nums {
+        insert_nums.into_par_iter().for_each(|i| {
             let n = i as u64;
             let id = Id::new(0, n);
             let key_slice = u64_to_slice(n);
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             assert!(tree_2.insert(&key));
-        }
+        });
     });
 
     let tree_3 = tree.clone();
