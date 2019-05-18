@@ -105,7 +105,6 @@ where
         }
         MutSearchResult::External => unreachable!(),
     };
-    debug!("Prune selected level {}", level);
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
     loop {
@@ -134,6 +133,7 @@ where
             break;
         }
     }
+    debug!("Prune selected level {}, {} pages", level, all_pages.len());
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
         // removed is a sequential external nodes that have been removed and their length set to 0
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
@@ -329,6 +329,7 @@ where
 
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
+    debug!("Checking corner cases");
     let mut index = 0;
     while index < all_pages.len() {
         if all_pages[index].len() == 0 {
@@ -336,6 +337,7 @@ where
             // need to merge with the right page
             // if the right page is full, partial of the right page will be moved to the current page
             // merging right page will also been cleaned
+            debug!("Dealing with emptying node {}", index);
             let mut next_from_ptr = if index + 1 >= all_pages.len() {
                 debug!("Trying to fetch node guard for last node right");
                 Some(write_node::<KS, PS>(all_pages[index].right_ref().unwrap()))
