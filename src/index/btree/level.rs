@@ -163,7 +163,7 @@ where
     };
     let page_lives_ptrs = {
         let mut removed = altered_keys.iter().filter(|na| na.key.is_none()).peekable();
-        let pages = all_pages
+        let living_ptrs = all_pages
             .iter()
             .map(|p| select_live(p, &mut removed))
             .collect_vec();
@@ -174,7 +174,7 @@ where
             altered_keys.len(),
             level
         );
-        pages
+        living_ptrs
     };
 
     // make all the necessary changes in current level pages according to is living children
@@ -192,6 +192,7 @@ where
                 // set length zero without do anything else
                 // this will ease read hazard
                 page.make_empty_node(false);
+                debug!("Found empty node");
             } else {
                 // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
@@ -217,6 +218,7 @@ where
                     "node not serial after update - {}",
                     level
                 );
+                debug!("Found non-empty node");
             }
         });
 
