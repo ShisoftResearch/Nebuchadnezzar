@@ -451,7 +451,7 @@ where
         index += 1;
     }
 
-    if corner_case_handle {
+    if corner_case_handled {
         all_pages = update_right_nodes(all_pages);
     }
 
