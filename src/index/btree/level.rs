@@ -444,7 +444,7 @@ where
                 "node 1 not serial after rebalance - {} - {} - {:?}",
                 level,
                 merging,
-                page_innode.keys
+                page_innode.keys[..page_innode.len]
             );
             index += 1;
         }
