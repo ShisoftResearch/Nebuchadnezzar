@@ -290,6 +290,33 @@ where
         debug_assert!(current_altered.next().is_none());
     }
 
+    let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
+        let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
+        debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_empty_node());
+        let mut non_emptys = all_pages
+            .into_iter()
+            .filter(|p| !p.is_empty_node())
+            .collect_vec();
+        let right_refs = non_emptys
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i == non_emptys.len() - 1 {
+                    last_right_ref.clone()
+                } else {
+                    non_emptys[i + 1].node_ref().clone()
+                }
+            })
+            .collect_vec();
+        non_emptys
+            .iter_mut()
+            .zip(right_refs.into_iter())
+            .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
+        return non_emptys;
+    };
+
+    all_pages = update_right_nodes(all_pages);
+
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
     debug!("Checking corner cases");
@@ -301,12 +328,15 @@ where
             // if the right page is full, partial of the right page will be moved to the current page
             // merging right page will also been cleaned
             debug!("Dealing with emptying node {}", index);
-            let mut next_from_ptr = if index + 1 >= all_pages.len() {
-                debug!("Trying to fetch node guard for last node right");
-                Some(write_node::<KS, PS>(all_pages[index].right_ref().unwrap()))
-            } else {
-                None
-            };
+            let mut next_from_ptr =
+                if index + 1 >= all_pages.len() {
+                    debug!("Trying to fetch node guard for last node right");
+                    let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
+                    debug_assert!(!ptr_right.is_empty_node());
+                    Some(ptr_right)
+                } else {
+                    None
+                };
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here
             let (keys, ptrs, right_bound, right_ref, merging) = {
@@ -419,28 +449,7 @@ where
         index += 1;
     }
 
-    let update_right_nodes = |all_pages: &mut Vec<NodeWriteGuard<KS, PS>>| {
-        let right_ptrs = all_pages
-            .iter()
-            .filter(|p| !p.is_empty_node())
-            .enumerate()
-            .map(|(i, p)| {
-                if i == all_pages.len() - 1 {
-                    p.right_ref().unwrap().clone()
-                } else {
-                    all_pages[i + 1].node_ref().clone()
-                }
-            })
-            .collect_vec();
-        all_pages
-            .iter_mut()
-            .zip(right_ptrs.into_iter())
-            .for_each(|(p, r)| {
-                debug_assert!(!r.is_default());
-                *p.right_ref_mut().unwrap() = r;
-            });
-    };
-    update_right_nodes(&mut all_pages);
+    all_pages = update_right_nodes(all_pages);
 
     box level_page_altered
 }
