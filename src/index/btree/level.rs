@@ -321,6 +321,7 @@ where
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
     debug!("Checking corner cases");
     let mut index = 0;
+    let mut corner_case_handled = false;
     while index < all_pages.len() {
         if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
@@ -328,6 +329,7 @@ where
             // if the right page is full, partial of the right page will be moved to the current page
             // merging right page will also been cleaned
             debug!("Dealing with emptying node {}", index);
+            corner_case_handled = true;
             let mut next_from_ptr =
                 if index + 1 >= all_pages.len() {
                     debug!("Trying to fetch node guard for last node right");
@@ -449,7 +451,9 @@ where
         index += 1;
     }
 
-    all_pages = update_right_nodes(all_pages);
+    if corner_case_handle {
+        all_pages = update_right_nodes(all_pages);
+    }
 
     box level_page_altered
 }
