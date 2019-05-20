@@ -109,6 +109,7 @@ where
         let (right_ref, right_bound) = {
             let last_page = all_pages.last().unwrap().borrow();
             debug_assert!(!last_page.is_none());
+            debug_assert!(!last_page.is_empty_node());
             debug_assert!(
                 is_node_serial(last_page.innode()),
                 "node not serial on fetching pages {:?} - {}",
@@ -534,6 +535,7 @@ where
             .clone();
 
         debug_assert!(read_unchecked::<KS, PS>(&left_left_most).is_none());
+        debug_assert!(!read_unchecked::<KS, PS>(&right_right_most).is_none());
         debug_assert!(read_unchecked::<KS, PS>(&right_right_most).is_ext());
         debug_assert!(!right_right_most.ptr_eq(left_most_leaf_guards.last().unwrap().node_ref()));
 
