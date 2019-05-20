@@ -352,7 +352,7 @@ where
                     "node 2 not serial before rebalance - {}",
                     level
                 );
-
+                debug_assert!(all_pages[index].node_ref().ptr_eq(next.node_ref()));
                 if merging_node {
                     // Merge next node with current node
                     debug!("Merging node...");
