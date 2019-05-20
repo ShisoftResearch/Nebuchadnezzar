@@ -293,6 +293,7 @@ where
     let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
         let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
         debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_empty_node());
+        debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_none());
         let mut non_emptys = all_pages
             .into_iter()
             .filter(|p| !p.is_empty_node())
@@ -301,11 +302,15 @@ where
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                if i == non_emptys.len() - 1 {
+                let right_ref = if i == non_emptys.len() - 1 {
                     last_right_ref.clone()
                 } else {
+
                     non_emptys[i + 1].node_ref().clone()
-                }
+                };
+                debug_assert!(!p.is_none());
+                debug_assert!(read_unchecked::<KS, PS>(&right_ref).right_bound() > p.right_bound());
+                right_ref
             })
             .collect_vec();
         non_emptys
@@ -358,6 +363,7 @@ where
                     let tuple = {
                         let next_innode = next.innode();
                         let len = next_innode.len;
+                        debug_assert!(!read_unchecked::<KS, PS>(&next_innode.right).is_empty_node());
                         (
                             next_innode.keys.as_slice_immute()[..len].to_vec(),
                             next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
