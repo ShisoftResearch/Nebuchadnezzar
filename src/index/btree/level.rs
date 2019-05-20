@@ -297,7 +297,8 @@ where
     let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
         let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
         debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_empty_node());
-        debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_none());
+        // none right node should be allowed
+        // debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_none());
         let mut non_emptys = all_pages
             .into_iter()
             .filter(|p| !p.is_empty_node())
