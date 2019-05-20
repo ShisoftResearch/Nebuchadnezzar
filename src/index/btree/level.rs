@@ -380,25 +380,25 @@ where
                     let right_ref = next.node_ref().clone();
                     let next_innode = next.innode_mut();
                     let next_len = next_innode.len;
-                    let next_mid = next_len / 2;
-                    let right_left_bound = next_innode.keys.as_slice_immute()[next_mid].clone();
+                    let mid = next_len / 2;
+                    let left_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
                     let tuple = (
-                        next_innode.keys.as_slice_immute()[..next_mid].to_vec(),
-                        next_innode.ptrs.as_slice_immute()[..next_mid + 1].to_vec(),
-                        right_left_bound.clone(),
+                        next_innode.keys.as_slice_immute()[..mid].to_vec(),
+                        next_innode.ptrs.as_slice_immute()[..mid + 1].to_vec(),
+                        left_right_bound.clone(),
                         right_ref.clone(),
                         merging_node,
                     );
                     let mut keys = KS::init();
                     let mut ptrs = PS::init();
 
-                    for (i, key) in next_innode.keys.as_slice_immute()[next_mid + 1..next_len]
+                    for (i, key) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
                         .iter()
                         .enumerate()
                     {
                         keys.as_slice()[i] = key.clone();
                     }
-                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[next_mid + 1..next_len + 1]
+                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
                         .iter()
                         .enumerate()
                     {
@@ -406,7 +406,7 @@ where
                     }
                     next_innode.keys = keys;
                     next_innode.ptrs = ptrs;
-                    next_innode.len = next_len - next_mid - 1;
+                    next_innode.len = next_len - mid - 1;
 
                     debug_assert!(
                         is_node_serial(next_innode),
@@ -415,7 +415,7 @@ where
                     );
 
                     level_page_altered.push(NodeAltered {
-                        key: Some(right_left_bound),
+                        key: Some(left_right_bound),
                         ptr: right_ref,
                     });
                     tuple
