@@ -68,11 +68,12 @@ where
                 } else {
                     debug_assert!(!right.is_empty(), "found empty node on selection!!!");
                     debug_assert!(!right.is_none(), "found none node on selection!!!");
+                    debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_none());
+                    debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node());
                     collected_keys += right.len();
                     collected.push(right);
                 }
             }
-            debug_assert!(!read_unchecked::<KS, PS>(collected.last().unwrap().right_ref().unwrap()).is_none());
             return collected;
         }
         MutSearchResult::Internal(node) => select::<KS, PS>(&node),
