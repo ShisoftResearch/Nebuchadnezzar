@@ -314,7 +314,12 @@ where
                     non_emptys[i + 1].node_ref().clone()
                 };
                 debug_assert!(!p.is_none());
-                debug_assert!(read_unchecked::<KS, PS>(&right_ref).right_bound() > p.right_bound());
+                if cfg!(debug_assertions) {
+                    let right = read_unchecked::<KS, PS>(&right_ref);
+                    if !right.is_none() {
+                        assert!(right.right_bound() > p.right_bound());
+                    }
+                }
                 right_ref
             })
             .collect_vec();
