@@ -45,6 +45,7 @@ where
 struct NodeAltered {
     key: Option<EntryKey>,
     ptr: NodeCellRef,
+    new: bool
 }
 
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
@@ -166,7 +167,7 @@ where
             .collect_vec()
     };
     let page_lives_ptrs = {
-        let mut removed = altered_keys.iter().filter(|na| na.key.is_none()).peekable();
+        let mut removed = altered_keys.iter().filter(|na| na.key.is_none() && !na.new).peekable();
         let living_ptrs = all_pages
             .iter()
             .map(|p| select_live(p, &mut removed))
@@ -192,6 +193,7 @@ where
                 level_page_altered.push(NodeAltered {
                     key: None,
                     ptr: page.node_ref().clone(),
+                    new: false
                 });
                 // set length zero without do anything else
                 // this will ease read hazard
@@ -274,6 +276,7 @@ where
                     next_level_altered.push(NodeAltered {
                         key: Some(new_key),
                         ptr: page_ref.clone(),
+                        new: false
                     });
                 } else {
                     // can be updated, set the new key
@@ -287,12 +290,45 @@ where
             );
         };
 
+    let insert_new_and_mark_altered_keys =
+        |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
+         current_altered: &Vec<NodeAltered>,
+         next_level_altered: &mut Vec<NodeAltered>| {
+            // write lock and insert all nodes marked new to current all pages
+            let mut new_nodes = current_altered.iter().filter(|na| na.new).peekable();
+            let mut pages = pages.iter_mut();
+            let mut p = pages.nth(0).unwrap();
+            while let Some(&n) = new_nodes.peek() {
+                if n.key.as_ref().unwrap() < p.right_bound() {
+                    let innode = (*p).innode_mut();
+                    let new_key = n.key.clone().unwrap().clone();
+                    let pos = innode.search(&new_key);
+                    let new_node_ref = n.ptr.clone();
+                    if innode.len >= KS::slice_len() {
+                        innode.split_insert(new_key, new_node_ref, pos, true);
+                    } else {
+                        innode.insert_in_place(new_key, new_node_ref, pos, true);
+                    }
+                    new_nodes.next();
+                } else {
+                    if let Some(np) = pages.next() {
+                        p = np;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        };
+
     // alter keys
     {
-        let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some()).peekable();
+        let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some() && !ak.new).peekable();
         all_pages.iter_mut().for_each(|p| update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered));
         debug_assert!(current_altered.next().is_none());
     }
+
+    // insert new nodes
+    insert_new_and_mark_altered_keys(&mut all_pages, &altered_keys, &mut level_page_altered);
 
     let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
         let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
@@ -385,6 +421,7 @@ where
                     level_page_altered.push(NodeAltered {
                         key: None,
                         ptr: next.node_ref().clone(),
+                        new: false
                     });
                     next.make_empty_node(false);
                     tuple
@@ -432,6 +469,7 @@ where
                     level_page_altered.push(NodeAltered {
                         key: Some(left_right_bound),
                         ptr: right_ref,
+                        new: false,
                     });
                     tuple
                 }
@@ -553,6 +591,7 @@ where
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone(),
+                new: false
             });
         }
 
