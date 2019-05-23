@@ -305,7 +305,12 @@ where
                     let pos = innode.search(&new_key);
                     let new_node_ref = n.ptr.clone();
                     if innode.len >= KS::slice_len() {
-                        innode.split_insert(new_key, new_node_ref, pos, true);
+                        let (split_ref, split_key) = innode.split_insert(new_key, new_node_ref, pos, true);
+                        next_level_altered.push(NodeAltered {
+                            key: Some(split_key),
+                            ptr: split_ref,
+                            new: true
+                        });
                     } else {
                         innode.insert_in_place(new_key, new_node_ref, pos, true);
                     }
