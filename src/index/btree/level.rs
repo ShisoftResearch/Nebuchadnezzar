@@ -151,7 +151,8 @@ where
             break;
         }
         let next = write_node::<KS, PS>(&last_innode.right);
-        debug_assert!(!next.is_none());
+        debug_assert!(!next.is_none(), "ended at none without empty altered list, remains, removed {}; altered {}; added {}",
+                      removed_ptrs.count(), altered_ptrs.count(), added_ptrs.count());
         all_pages.push(next);
     }
     debug!("Prune selected level {}, {} pages", level, all_pages.len());
@@ -650,12 +651,12 @@ where
 
         for mut g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
-            g.make_empty_node(false);
-            g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
-            g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
             removed_nodes
                 .removed
                 .push((g.right_bound().clone(), g.node_ref().clone()));
+            g.make_empty_node(false);
+            g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
+            g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
         }
 
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
