@@ -101,7 +101,7 @@ where
     let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| {
         n.innode().ptrs.as_slice_immute()[0].clone()
     });
-    let (altered_keys, sub_level_locks) = {
+    let (mut altered_keys, sub_level_locks) = {
         let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
         // first meet empty should be the removed external node
         if sub_node.is_empty_node() || sub_node.is_ext() {
@@ -110,17 +110,24 @@ where
             prune_removed::<KS, PS>(&sub_node_ref, removed, level + 1)
         }
     };
+
+    altered_keys.removed.sort_by(|a, b| a.0.cmp(&b.0));
+    altered_keys.key_modified.sort_by(|a, b| a.0.cmp(&b.0));
+    altered_keys.added.sort_by(|a, b| a.0.cmp(&b.0));
+
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     let removed_iter = || altered_keys.removed.iter();
     let altered_iter = || altered_keys.key_modified.iter();
     let added_iter = || altered_keys.added.iter();
+
     // collect all pages in bound and in this level
+    let mut removed_ptrs = removed_iter().map(|(_, p)| p).peekable();
+    let mut altered_ptrs = altered_iter().map(|(_, p)| p).peekable();
+    let mut added_ptrs = added_iter().map(|(k, _)| k).peekable();
     loop {
         let last_page = all_pages.last().unwrap().borrow();
         let last_innode = last_page.innode();
-        let mut removed_ptrs = removed_iter().map(|(_, p)| p).peekable();
-        let mut altered_ptrs = altered_iter().map(|(_, p)| p).peekable();
-        let mut added_ptrs = added_iter().map(|(k, _)| k).peekable();
+
         debug_assert!(!last_page.is_none());
         debug_assert!(!last_page.is_empty_node());
         debug_assert!(
@@ -129,17 +136,20 @@ where
             last_page.keys(),
             level
         );
-        for p in last_innode.ptrs.as_slice_immute() {
+        for p in &last_innode.ptrs.as_slice_immute()[..=last_innode.len ] {
             if removed_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
                 removed_ptrs.next();
+                debug!("remove hit !!!");
             }
             if altered_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
                 altered_ptrs.next();
+                debug!("key modified hit !!!");
             }
         }
         while let Some(add_key) = added_ptrs.peek() {
             if add_key < &&last_innode.right_bound {
                 added_ptrs.next();
+                debug!("add node page hit !!!")
             } else {
                 break;
             }
@@ -151,8 +161,12 @@ where
             break;
         }
         let next = write_node::<KS, PS>(&last_innode.right);
-        debug_assert!(!next.is_none(), "ended at none without empty altered list, remains, removed {}; altered {}; added {}",
-                      removed_ptrs.count(), altered_ptrs.count(), added_ptrs.count());
+        debug_assert!(!next.is_none(), "ended at none without empty altered list, remains, removed {}; altered {}; added {}, was {} - {} - {}",
+                      removed_ptrs.count(), altered_ptrs.count(), added_ptrs.count(),
+                      altered_keys.removed.len(), altered_keys.key_modified.len(), altered_keys.added.len()
+
+        );
+        debug_assert!(!next.is_empty());
         all_pages.push(next);
     }
     debug!("Prune selected level {}, {} pages", level, all_pages.len());
@@ -563,12 +577,6 @@ where
     if corner_case_handled {
         all_pages = update_right_nodes(all_pages);
     }
-
-    level_page_altered.removed.sort_by(|a, b| a.0.cmp(&b.0));
-    level_page_altered
-        .key_modified
-        .sort_by(|a, b| a.0.cmp(&b.0));
-    level_page_altered.added.sort_by(|a, b| a.0.cmp(&b.0));
 
     (box level_page_altered, box all_pages)
 }
