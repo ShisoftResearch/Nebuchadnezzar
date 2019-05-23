@@ -45,7 +45,7 @@ where
 struct NodeAltered {
     key: Option<EntryKey>,
     ptr: NodeCellRef,
-    new: bool
+    new: bool,
 }
 
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
@@ -70,7 +70,9 @@ where
                     debug_assert!(!right.is_empty(), "found empty node on selection!!!");
                     debug_assert!(!right.is_none(), "found none node on selection!!!");
                     debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_none());
-                    debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node());
+                    debug_assert!(
+                        !read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node()
+                    );
                     collected_keys += right.len();
                     collected.push(right);
                 }
@@ -167,7 +169,10 @@ where
             .collect_vec()
     };
     let page_lives_ptrs = {
-        let mut removed = altered_keys.iter().filter(|na| na.key.is_none() && !na.new).peekable();
+        let mut removed = altered_keys
+            .iter()
+            .filter(|na| na.key.is_none() && !na.new)
+            .peekable();
         let living_ptrs = all_pages
             .iter()
             .map(|p| select_live(p, &mut removed))
@@ -193,7 +198,7 @@ where
                 level_page_altered.push(NodeAltered {
                     key: None,
                     ptr: page.node_ref().clone(),
-                    new: false
+                    new: false,
                 });
                 // set length zero without do anything else
                 // this will ease read hazard
@@ -226,7 +231,10 @@ where
                         "node not serial after update - {}",
                         level
                     );
-                    debug!("Found non-empty node, new ptr length {}, node len {}", ptr_len, innode.len);
+                    debug!(
+                        "Found non-empty node, new ptr length {}, node len {}",
+                        ptr_len, innode.len
+                    );
                 }
                 Some(page)
             }
@@ -276,7 +284,7 @@ where
                     next_level_altered.push(NodeAltered {
                         key: Some(new_key),
                         ptr: page_ref.clone(),
-                        new: false
+                        new: false,
                     });
                 } else {
                     // can be updated, set the new key
@@ -305,11 +313,12 @@ where
                     let pos = innode.search(&new_key);
                     let new_node_ref = n.ptr.clone();
                     if innode.len >= KS::slice_len() {
-                        let (split_ref, split_key) = innode.split_insert(new_key, new_node_ref, pos, true);
+                        let (split_ref, split_key) =
+                            innode.split_insert(new_key, new_node_ref, pos, true);
                         next_level_altered.push(NodeAltered {
                             key: Some(split_key),
                             ptr: split_ref,
-                            new: true
+                            new: true,
                         });
                     } else {
                         innode.insert_in_place(new_key, new_node_ref, pos, true);
@@ -327,8 +336,13 @@ where
 
     // alter keys
     {
-        let mut current_altered = altered_keys.iter().filter(|ak| ak.key.is_some() && !ak.new).peekable();
-        all_pages.iter_mut().for_each(|p| update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered));
+        let mut current_altered = altered_keys
+            .iter()
+            .filter(|ak| ak.key.is_some() && !ak.new)
+            .peekable();
+        all_pages.iter_mut().for_each(|p| {
+            update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered)
+        });
         debug_assert!(current_altered.next().is_none());
     }
 
@@ -351,7 +365,6 @@ where
                 let right_ref = if i == non_emptys.len() - 1 {
                     last_right_ref.clone()
                 } else {
-
                     non_emptys[i + 1].node_ref().clone()
                 };
                 debug_assert!(!p.is_none());
@@ -386,15 +399,14 @@ where
             // merging right page will also been cleaned
             debug!("Dealing with emptying node {}", index);
             corner_case_handled = true;
-            let mut next_from_ptr =
-                if index + 1 >= all_pages.len() {
-                    debug!("Trying to fetch node guard for last node right");
-                    let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
-                    debug_assert!(!ptr_right.is_empty_node());
-                    Some(ptr_right)
-                } else {
-                    None
-                };
+            let mut next_from_ptr = if index + 1 >= all_pages.len() {
+                debug!("Trying to fetch node guard for last node right");
+                let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
+                debug_assert!(!ptr_right.is_empty_node());
+                Some(ptr_right)
+            } else {
+                None
+            };
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here
             let (keys, ptrs, right_bound, right_ref, merging) = {
@@ -426,7 +438,7 @@ where
                     level_page_altered.push(NodeAltered {
                         key: None,
                         ptr: next.node_ref().clone(),
-                        new: false
+                        new: false,
                     });
                     next.make_empty_node(false);
                     tuple
@@ -596,7 +608,7 @@ where
             removed_nodes.push(NodeAltered {
                 key: None,
                 ptr: g.node_ref().clone(),
-                new: false
+                new: false,
             });
         }
 
