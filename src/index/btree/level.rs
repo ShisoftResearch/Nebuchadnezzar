@@ -32,6 +32,7 @@ use std::fmt::Debug;
 use std::iter::Peekable;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use index::btree::remove::SubNodeStatus::InNodeEmpty;
 
 enum Selection<KS, PS>
 where
@@ -42,10 +43,10 @@ where
     Innode(NodeCellRef),
 }
 
-struct NodeAltered {
-    key: Option<EntryKey>,
-    ptr: NodeCellRef,
-    new: bool,
+struct AlteredNodes {
+    removed: Vec<(EntryKey, NodeCellRef)>,
+    added: Vec<(EntryKey, NodeCellRef)>,
+    key_modified: Vec<(EntryKey, NodeCellRef)>
 }
 
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
@@ -85,53 +86,70 @@ where
 
 fn prune_removed<'a, KS, PS>(
     node: &NodeCellRef,
-    removed: Box<Vec<NodeAltered>>,
-    bound: &EntryKey,
+    removed: Box<AlteredNodes>,
     level: usize,
-) -> Box<Vec<NodeAltered>>
+) -> (Box<AlteredNodes>, Box<Vec<NodeWriteGuard<KS, PS>>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut level_page_altered = vec![];
+    let mut level_page_altered = AlteredNodes{
+        removed: vec![],
+        added: vec![],
+        key_modified: vec![]
+    };
     let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| {
         n.innode().ptrs.as_slice_immute()[0].clone()
     });
-    let altered_keys = {
+    let (altered_keys, sub_level_locks) = {
         let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
         // first meet empty should be the removed external node
         if sub_node.is_empty_node() || sub_node.is_ext() {
-            removed
+            (removed, box vec![])
         } else {
-            prune_removed::<KS, PS>(&sub_node_ref, removed, bound, level + 1)
+            prune_removed::<KS, PS>(&sub_node_ref, removed, level + 1)
         }
     };
     let mut all_pages = vec![write_node::<KS, PS>(node)];
+    let removed_iter = || altered_keys.removed.iter();
+    let altered_iter = || altered_keys.key_modified.iter();
+    let added_iter = || altered_keys.added.iter();
     // collect all pages in bound and in this level
     loop {
-        let (right_ref, right_bound) = {
-            let last_page = all_pages.last().unwrap().borrow();
-            debug_assert!(!last_page.is_none());
-            debug_assert!(!last_page.is_empty_node());
-            debug_assert!(
-                is_node_serial(last_page.innode()),
-                "node not serial on fetching pages {:?} - {}",
-                last_page.keys(),
-                level
-            );
-            (
-                last_page.right_ref().unwrap().clone(),
-                last_page.right_bound().clone(),
-            )
-        };
-        let right = write_node::<KS, PS>(&right_ref);
-        if right.is_none() {
+        let last_page = all_pages.last().unwrap().borrow();
+        let last_innode = last_page.innode();
+        let mut removed_ptrs = removed_iter().map(|(_, p)| p).peekable();
+        let mut altered_ptrs = altered_iter().map(|(_, p)| p).peekable();
+        let mut added_ptrs = added_iter().map(|(k, _)| k).peekable();
+        debug_assert!(!last_page.is_none());
+        debug_assert!(!last_page.is_empty_node());
+        debug_assert!(
+            is_node_serial(last_page.innode()),
+            "node not serial on fetching pages {:?} - {}",
+            last_page.keys(),
+            level
+        );
+        for p in last_innode.ptrs.as_slice_immute() {
+            if removed_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
+                removed_ptrs.next();
+            }
+            if altered_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
+                altered_ptrs.next();
+            }
+        }
+        while let Some(add_key) = added_ptrs.peek() {
+            if add_key < &&last_innode.right_bound {
+                added_ptrs.next();
+            } else {
+                break;
+            }
+        }
+        if removed_ptrs.peek().is_none() && altered_ptrs.peek().is_none() && added_ptrs.peek().is_none() {
             break;
         }
-        all_pages.push(right);
-        if &right_bound > bound {
-            break;
-        }
+        let next = write_node::<KS, PS>(&last_innode.right);
+        debug_assert!(!next.is_none());
+        all_pages.push(next);
     }
     debug!("Prune selected level {}, {} pages", level, all_pages.len());
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
@@ -147,15 +165,14 @@ where
             .enumerate()
             .filter_map(|(i, sub_level)| {
                 let mut found_removed = false;
-                let current_removed: Option<&&NodeAltered> = removed.peek();
+                let current_removed = removed.peek();
                 debug_assert_ne!(
                     current_removed
-                        .clone()
-                        .map(|cr| read_unchecked::<KS, PS>(&cr.ptr).is_empty()),
+                        .map(|t: &&(EntryKey, NodeCellRef)| read_unchecked::<KS, PS>(&t.1).is_empty()),
                     Some(false)
                 );
-                if let Some(&rm) = current_removed {
-                    if sub_level.ptr_eq(&rm.ptr) {
+                if let Some((removed_key, removed_ptr)) = current_removed {
+                    if sub_level.ptr_eq(removed_ptr) {
                         found_removed = true;
                     }
                 }
@@ -169,10 +186,7 @@ where
             .collect_vec()
     };
     let page_lives_ptrs = {
-        let mut removed = altered_keys
-            .iter()
-            .filter(|na| na.key.is_none() && !na.new)
-            .peekable();
+        let mut removed = removed_iter().peekable();
         let living_ptrs = all_pages
             .iter()
             .map(|p| select_live(p, &mut removed))
@@ -181,7 +195,7 @@ where
             removed.next().is_none(),
             "remaining removed {}, total {}, level {}",
             removed.count() + 1,
-            altered_keys.len(),
+            altered_keys.removed.len(),
             level
         );
         living_ptrs
@@ -195,11 +209,7 @@ where
             if live_ptrs.len() == 0 {
                 // check if all the children ptr in this page have been removed
                 // if yes mark it and upper level will handel it
-                level_page_altered.push(NodeAltered {
-                    key: None,
-                    ptr: page.node_ref().clone(),
-                    new: false,
-                });
+                level_page_altered.removed.push((page.right_bound().clone(), page.node_ref().clone()));
                 // set length zero without do anything else
                 // this will ease read hazard
                 page.make_empty_node(false);
@@ -244,7 +254,7 @@ where
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>,
          current_altered: &mut Peekable<_>,
-         next_level_altered: &mut Vec<NodeAltered>| {
+         next_level_altered: &mut AlteredNodes| {
             // update all nodes marked changed, not removed
             let page_ref = page.node_ref().clone();
             let mut innode = page.innode_mut();
@@ -261,10 +271,12 @@ where
                 .enumerate()
                 .filter_map(|(i, p)| {
                     let mut found_key = None;
-                    if let Some(&ak) = current_altered.peek() {
-                        let ak: &NodeAltered = ak;
-                        if ak.ptr.ptr_eq(p) {
-                            found_key = Some((i, ak.key.clone().unwrap()));
+                    if let Some(t) = current_altered.peek() {
+                        let t: &&(EntryKey, NodeCellRef) = t;
+                        let k: &EntryKey = &t.0;
+                        let p: &NodeCellRef = &t.1;
+                        if p.ptr_eq(&p) {
+                            found_key = Some((i, k.clone()));
                         }
                     }
                     if found_key.is_some() {
@@ -281,11 +293,7 @@ where
                 if i == 0 {
                     // cannot update the key in current level
                     // will postpone to upper level
-                    next_level_altered.push(NodeAltered {
-                        key: Some(new_key),
-                        ptr: page_ref.clone(),
-                        new: false,
-                    });
+                    next_level_altered.key_modified.push((new_key, page_ref.clone()));
                 } else {
                     // can be updated, set the new key
                     innode.keys.as_slice()[i - 1] = new_key;
@@ -300,26 +308,22 @@ where
 
     let insert_new_and_mark_altered_keys =
         |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
-         current_altered: &Vec<NodeAltered>,
-         next_level_altered: &mut Vec<NodeAltered>| {
+         current_altered: &AlteredNodes,
+         next_level_altered: &mut AlteredNodes| {
             // write lock and insert all nodes marked new to current all pages
-            let mut new_nodes = current_altered.iter().filter(|na| na.new).peekable();
+            let mut new_nodes = added_iter().peekable();
             let mut pages = pages.iter_mut();
             let mut p = pages.nth(0).unwrap();
-            while let Some(&n) = new_nodes.peek() {
-                if n.key.as_ref().unwrap() < p.right_bound() {
+            while let Some(&(k, n)) = new_nodes.peek() {
+                if k < p.right_bound() {
                     let innode = (*p).innode_mut();
-                    let new_key = n.key.clone().unwrap().clone();
+                    let new_key = k.clone();
+                    let new_node_ref = n.clone();
                     let pos = innode.search(&new_key);
-                    let new_node_ref = n.ptr.clone();
                     if innode.len >= KS::slice_len() {
                         let (split_ref, split_key) =
                             innode.split_insert(new_key, new_node_ref, pos, true);
-                        next_level_altered.push(NodeAltered {
-                            key: Some(split_key),
-                            ptr: split_ref,
-                            new: true,
-                        });
+                        next_level_altered.added.push((split_key, split_ref));
                     } else {
                         innode.insert_in_place(new_key, new_node_ref, pos, true);
                     }
@@ -336,14 +340,11 @@ where
 
     // alter keys
     {
-        let mut current_altered = altered_keys
-            .iter()
-            .filter(|ak| ak.key.is_some() && !ak.new)
-            .peekable();
+        let mut current_altered = altered_iter().peekable();
         all_pages.iter_mut().for_each(|p| {
             update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered)
         });
-        debug_assert!(current_altered.next().is_none());
+        debug_assert!(current_altered.next().is_none(), "there are {} pages remain unaltered", current_altered.count() + 1);
     }
 
     // insert new nodes
@@ -394,11 +395,15 @@ where
     while index < all_pages.len() {
         if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
-            // need to merge with the right page
-            // if the right page is full, partial of the right page will be moved to the current page
-            // merging right page will also been cleaned
+            // need to merge to the right page
+            // if the right page is full, partial of the right page will be moved to the third page
+            // the emptying node will always been cleaned
+            // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
             debug!("Dealing with emptying node {}", index);
             corner_case_handled = true;
+            let current_node_left_bound = if index == 0 { smallvec!() } else {
+                all_pages[index - 1].right_bound().clone()
+            };
             let mut next_from_ptr = if index + 1 >= all_pages.len() {
                 debug!("Trying to fetch node guard for last node right");
                 let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
@@ -409,114 +414,106 @@ where
             };
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here
-            let (keys, ptrs, right_bound, right_ref, merging) = {
-                // get next page from right reference or next in the vec
+            let has_new = {
+                let (remaining_key, remaining_ptr) = {
+                    let current_innode = all_pages[index].innode();
+                    (current_innode.right_bound.clone(), current_innode.ptrs.as_slice_immute()[0].clone())
+                };
+                let mut new_next_keys = KS::init();
+                let mut new_next_ptrs = PS::init();
+                let mut has_new = None;
+
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
-                let merging_node = next.len() < KS::slice_len() - 1;
+                let mut next_innode = next.innode_mut();
+
+                let keys_slice = new_next_keys.as_slice();
+                let ptrs_slice = new_next_ptrs.as_slice();
                 debug_assert!(
-                    is_node_serial(next.innode()),
-                    "node 2 not serial before rebalance - {}",
+                    is_node_serial(next_innode),
+                    "node not serial before next updated - {}",
                     level
                 );
-                if merging_node {
-                    // Merge next node with current node
-                    debug!("Merging node...");
-                    let tuple = {
-                        let next_innode = next.innode();
-                        let len = next_innode.len;
-                        debug_assert!(!read_unchecked::<KS, PS>(&next_innode.right).is_empty_node());
-                        (
-                            next_innode.keys.as_slice_immute()[..len].to_vec(),
-                            next_innode.ptrs.as_slice_immute()[..len + 1].to_vec(),
-                            next_innode.right_bound.clone(),
-                            next_innode.right.clone(),
-                            merging_node,
-                        )
-                    };
-                    level_page_altered.push(NodeAltered {
-                        key: None,
-                        ptr: next.node_ref().clone(),
-                        new: false,
-                    });
-                    next.make_empty_node(false);
-                    tuple
-                } else {
-                    // Rebalance next node with current node
-                    // Next node left bound need to be updated in upper level
-                    debug!("Rebalancing node...");
-                    let right_ref = next.node_ref().clone();
-                    let next_innode = next.innode_mut();
-                    let next_len = next_innode.len;
+                keys_slice[0] = remaining_key;
+                ptrs_slice[0] = remaining_ptr;
+                let mut next_len = next_innode.len;
+                if next_len >= KS::slice_len() {
+                    // full node, need to be split and relocated
                     let mid = next_len / 2;
-                    let left_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
-                    let tuple = (
-                        next_innode.keys.as_slice_immute()[..mid].to_vec(),
-                        next_innode.ptrs.as_slice_immute()[..mid + 1].to_vec(),
-                        left_right_bound.clone(),
-                        right_ref.clone(),
-                        merging_node,
-                    );
-                    let mut keys = KS::init();
-                    let mut ptrs = PS::init();
-
-                    for (i, key) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
-                        .iter()
-                        .enumerate()
-                    {
-                        keys.as_slice()[i] = key.clone();
+                    for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
+                        keys_slice[i + 1] = k.clone();
                     }
-                    for (i, ptr) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
-                        .iter()
-                        .enumerate()
-                    {
-                        ptrs.as_slice()[i] = ptr.clone();
+                    for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid].iter().enumerate() {
+                        ptrs_slice[i + 1] = p.clone();
                     }
-                    next_innode.keys = keys;
-                    next_innode.ptrs = ptrs;
-                    next_innode.len = next_len - mid - 1;
-
+                    let mut third_node_keys = KS::init();
+                    let mut third_node_ptrs = PS::init();
+                    for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len].iter().enumerate() {
+                        third_node_keys.as_slice()[i] = k.clone();
+                    }
+                    for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1].iter().enumerate() {
+                        third_node_ptrs.as_slice()[i] = p.clone();
+                    }
+                    let third_len = next_len - mid - 1;
+                    let third_right_bound = next_innode.right_bound.clone();
+                    let third_right_ptr = next_innode.right.clone();
+                    let third_innode = InNode{
+                        keys: third_node_keys,
+                        ptrs: third_node_ptrs,
+                        len: third_len,
+                        right: third_right_ptr,
+                        right_bound: third_right_bound
+                    };
                     debug_assert!(
-                        is_node_serial(next_innode),
-                        "node 2 not serial after rebalance - {}",
+                        is_node_serial(&third_innode),
+                        "node not serial for third node - {}",
                         level
                     );
+                    let third_node_ref = NodeCellRef::new(Node::new(NodeData::Internal(box third_innode)));
+                    let next_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
+                    next_innode.right = third_node_ref.clone();
+                    next_innode.right_bound = next_right_bound.clone();
+                    next_innode.keys = new_next_keys;
+                    next_innode.ptrs = new_next_ptrs;
+                    next_innode.len = mid + 1;
+                    // insert the third page
+                    level_page_altered.added.push((next_right_bound.clone(), third_node_ref.clone()));
 
-                    level_page_altered.push(NodeAltered {
-                        key: Some(left_right_bound),
-                        ptr: right_ref,
-                        new: false,
-                    });
-                    tuple
+                    // return the locked third node to be inserted into the all_pages
+                    has_new = Some(write_node(&third_node_ref))
+                } else {
+                    // not full node, can be relocated
+                    for (i, k) in next_innode.keys.as_slice_immute()[..next_len].iter().enumerate() {
+                        keys_slice[i + 1] = k.clone();
+                    }
+                    for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len].iter().enumerate() {
+                        ptrs_slice[i + 1] = p.clone();
+                    }
+                    next_innode.keys = new_next_keys;
+                    next_innode.ptrs = new_next_ptrs;
+                    next_innode.len = next_len + 1;
                 }
+                debug_assert!(
+                    is_node_serial(next_innode),
+                    "node not serial after next updated - {}",
+                    level
+                );
+                // modify next node key
+                level_page_altered.key_modified.push((current_node_left_bound, next.node_ref().clone()));
+
+                // make current node empty
+                all_pages[index].make_empty_node(false);
+                level_page_altered.removed.push((all_pages[index].right_bound().clone(), all_pages[index].node_ref().clone()));
+                has_new
             };
-            debug_assert!(!right_ref.is_default());
-            let mut page_innode = all_pages[index].innode_mut();
-            debug_assert!(
-                is_node_serial(page_innode),
-                "node 1 not serial before rebalance - {}",
-                level
-            );
-            page_innode.keys.as_slice()[0] = page_innode.right_bound.clone();
-            page_innode.right_bound = right_bound;
-            page_innode.right = right_ref;
-            page_innode.len = 1 + keys.len();
-            // again, keys and pres here are vec that will merge into the current emptying node
-            for (i, key) in keys.into_iter().enumerate() {
-                page_innode.keys.as_slice()[i + 1] = key;
-            }
-            for (i, ptr) in ptrs.into_iter().enumerate() {
-                page_innode.ptrs.as_slice()[i + 1] = ptr;
-            }
-            debug_assert!(
-                is_node_serial(page_innode),
-                "node 1 not serial after rebalance - {} - {} - {:?}",
-                level,
-                merging,
-                &page_innode.keys.as_slice_immute()[..page_innode.len]
-            );
-            index += 1;
+            index += if let Some(new_page) = has_new {
+                all_pages.insert(index + 1, new_page);
+                // because there have been a new inserted page, it have to been skipped with next node
+                2
+            } else {
+                1
+            };
         }
         index += 1;
     }
@@ -525,7 +522,11 @@ where
         all_pages = update_right_nodes(all_pages);
     }
 
-    box level_page_altered
+    level_page_altered.removed.sort_by(|a, b| a.0.cmp(&b.0));
+    level_page_altered.key_modified.sort_by(|a, b| a.0.cmp(&b.0));
+    level_page_altered.added.sort_by(|a, b| a.0.cmp(&b.0));
+
+    (box level_page_altered, box all_pages)
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
@@ -579,7 +580,11 @@ where
     }
 
     // adjust leaf left, right references
-    let mut removed_nodes = box vec![];
+    let mut removed_nodes = AlteredNodes {
+        removed: vec![],
+        added: vec![],
+        key_modified: vec![]
+    };
     {
         let right_right_most = left_most_leaf_guards
             .last()
@@ -605,11 +610,7 @@ where
             g.make_empty_node(false);
             g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
             g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
-            removed_nodes.push(NodeAltered {
-                key: None,
-                ptr: g.node_ref().clone(),
-                new: false,
-            });
+            removed_nodes.removed.push((g.right_bound().clone(), g.node_ref().clone()));
         }
 
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
@@ -631,7 +632,7 @@ where
     }
 
     // cleanup upper level references
-    prune_removed::<KS, PS>(&src_tree.get_root(), removed_nodes, &prune_bound, 0);
+    prune_removed::<KS, PS>(&src_tree.get_root(), box removed_nodes, 0);
 
     src_tree.len.fetch_sub(num_keys_removed, Relaxed);
 
