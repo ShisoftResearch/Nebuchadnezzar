@@ -170,6 +170,12 @@ where
         all_pages.push(next);
     }
     debug!("Prune selected level {}, {} pages", level, all_pages.len());
+
+    if all_pages.is_empty() {
+        debug!("No node to prune at this level - {}", level);
+        return (box level_page_altered, box vec![]);
+    }
+
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
         // removed is a sequential external nodes that have been removed and have been set to empty
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
@@ -337,7 +343,7 @@ where
             // write lock and insert all nodes marked new to current all pages
             let mut new_nodes = added_iter().peekable();
             let mut pages = pages.iter_mut();
-            let mut p = pages.nth(0).unwrap();
+            let mut p = pages.next().unwrap();
             while let Some(&(k, n)) = new_nodes.peek() {
                 if k < p.right_bound() {
                     let innode = (*p).innode_mut();
@@ -556,11 +562,11 @@ where
                     .push((current_node_left_bound, next.node_ref().clone()));
 
                 // make current node empty
-                all_pages[index].make_empty_node(false);
                 level_page_altered.removed.push((
                     all_pages[index].right_bound().clone(),
                     all_pages[index].node_ref().clone(),
                 ));
+                all_pages[index].make_empty_node(false);
                 has_new
             };
             index += if let Some(new_page) = has_new {
