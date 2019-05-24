@@ -21,6 +21,9 @@ const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
 type EntryKey = SmallVec<[u8; KEY_SIZE]>;
 
 fn id_from_key(key: &EntryKey) -> Id {
+    if key.len() < ID_SIZE {
+        return Id::new(1111, 1111);
+    }
     let mut id_cursor = StdCursor::new(&key[key.len() - ID_SIZE..]);
     return Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
 }

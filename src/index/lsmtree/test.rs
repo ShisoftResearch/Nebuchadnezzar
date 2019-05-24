@@ -68,8 +68,20 @@ pub fn insertions() {
         tree.insert(key);
     });
 
+    debug!("Start point search validations");
+    (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
+        let i = *i;
+        let id = Id::new(0, i);
+        let key_slice = u64_to_slice(i);
+        let mut key = SmallVec::from_slice(&key_slice);
+        debug!("checking: {}", i);
+        let cursor = tree.seek(&key, Ordering::Forward);
+        key_with_id(&mut key, &id);
+        assert_eq!(cursor.current(), Some(&key), "{}", i);
+    });
+
     dump_trees(&*tree, "stage_1_before_insertion");
-    for _ in 0..20 {
+    for _ in 0..50 {
         tree.check_and_merge();
     }
     dump_trees(&*tree, "stage_1_after_insertion");
@@ -83,35 +95,7 @@ pub fn insertions() {
         debug!("checking: {}", i);
         let cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
-        assert_eq!(cursor.current(), Some(&key), "{}", i);
-    });
-
-    LSMTree::start_sentinel(&tree);
-
-    let mut test_data = (num..num * 2).collect_vec();
-    thread_rng().shuffle(test_data.as_mut_slice());
-    test_data.par_iter().for_each(|i| {
-        let i = *i;
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
-        tree.insert(key);
-    });
-
-    dump_trees(&*tree, "stage_2_after_insertion");
-    thread::sleep(Duration::new(30, 0));
-    dump_trees(&*tree, "stage_2_waited_insertion");
-
-    (0..num * 2).collect::<Vec<_>>().par_iter().for_each(|i| {
-        let i = *i;
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
-        debug!("checking: {}", i);
-        let cursor = tree.seek(&key, Ordering::Forward);
-        key_with_id(&mut key, &id);
-        assert_eq!(cursor.current(), Some(&key), "{}", i);
+        assert_eq!(cursor.current(), Some(&key), "{}, looking for {:?}", i, key);
     });
 }
 
