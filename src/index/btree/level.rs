@@ -33,6 +33,7 @@ use std::fmt::Debug;
 use std::iter::Peekable;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use index::btree::verification::{is_node_serial, is_node_list_serial};
 
 enum Selection<KS, PS>
 where
@@ -131,7 +132,7 @@ where
         debug_assert!(!last_page.is_none());
         debug_assert!(!last_page.is_empty_node());
         debug_assert!(
-            is_node_serial(last_page.innode()),
+            is_node_serial(last_page),
             "node not serial on fetching pages {:?} - {}",
             last_page.keys(),
             level
@@ -216,7 +217,7 @@ where
         // removed is a sequential external nodes that have been removed and have been set to empty
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
         debug_assert!(
-            is_node_serial(page.innode()),
+            is_node_serial(page),
             "node not serial before live selection - {}",
             level
         );
@@ -291,25 +292,25 @@ where
                     new_ptrs.as_slice()[i] = ptr;
                 }
                 {
-                    let mut innode = page.innode_mut();
                     debug_assert!(
-                        is_node_serial(innode),
+                        is_node_serial(&page),
                         "node not serial before update - {}",
                         level
                     );
+                    let mut innode = page.innode_mut();
                     innode.len = ptr_len - 1;
                     innode.keys = new_keys;
                     innode.ptrs = new_ptrs;
-                    debug_assert!(
-                        is_node_serial(innode),
-                        "node not serial after update - {}",
-                        level
-                    );
                     debug!(
                         "Found non-empty node, new ptr length {}, node len {}",
                         ptr_len, innode.len
                     );
                 }
+                debug_assert!(
+                    is_node_serial(&page),
+                    "node not serial after update - {}",
+                    level
+                );
                 Some(page)
             }
         })
@@ -319,56 +320,59 @@ where
         |page: &mut NodeWriteGuard<KS, PS>,
          current_altered: &mut Peekable<_>,
          next_level_altered: &mut AlteredNodes| {
-            // update all nodes marked changed, not removed
-            let page_ref = page.node_ref().clone();
-            let mut innode = page.innode_mut();
-            let innde_len = innode.len;
 
             debug_assert!(
-                is_node_serial(innode),
+                is_node_serial(page),
                 "node not serial before update altered - {}",
                 level
             );
-            // search for all children nodes in this page to find the altered pointers
-            let marked_ptrs = innode.ptrs.as_slice_immute()[..innde_len + 1]
-                .iter()
-                .enumerate()
-                .filter_map(|(i, p)| {
-                    let mut found_key = None;
-                    if let Some(t) = current_altered.peek() {
-                        let t: &&(EntryKey, NodeCellRef) = t;
-                        let k: &EntryKey = &t.0;
-                        let p: &NodeCellRef = &t.1;
-                        debug_assert!(k > &smallvec!());
-                        if p.ptr_eq(&p) {
-                            found_key = Some((i, k.clone()));
-                        }
-                    }
-                    if found_key.is_some() {
-                        current_altered.next();
-                    }
-                    found_key
-                })
-                .collect_vec();
+            {
+                // update all nodes marked changed, not removed
+                let page_ref = page.node_ref().clone();
+                let mut innode = page.innode_mut();
+                let innde_len = innode.len;
 
-            // alter keys corresponding to the ptr, which is ptr id - 1; 0 will postpone to upper level
-            debug!("We have {} altered pointers", marked_ptrs.len());
-            for (i, new_key) in marked_ptrs {
-                // update key for children ptr, note that node all key can be updated in this level
-                if i == 0 {
-                    // cannot update the key in current level
-                    // will postpone to upper level
-                    debug_assert!(new_key > smallvec!());
-                    next_level_altered
-                        .key_modified
-                        .push((new_key, page_ref.clone()));
-                } else {
-                    // can be updated, set the new key
-                    innode.keys.as_slice()[i - 1] = new_key;
+                // search for all children nodes in this page to find the altered pointers
+                let marked_ptrs = innode.ptrs.as_slice_immute()[..innde_len + 1]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| {
+                        let mut found_key = None;
+                        if let Some(t) = current_altered.peek() {
+                            let t: &&(EntryKey, NodeCellRef) = t;
+                            let k: &EntryKey = &t.0;
+                            let p: &NodeCellRef = &t.1;
+                            debug_assert!(k > &smallvec!());
+                            if p.ptr_eq(&p) {
+                                found_key = Some((i, k.clone()));
+                            }
+                        }
+                        if found_key.is_some() {
+                            current_altered.next();
+                        }
+                        found_key
+                    })
+                    .collect_vec();
+
+                // alter keys corresponding to the ptr, which is ptr id - 1; 0 will postpone to upper level
+                debug!("We have {} altered pointers", marked_ptrs.len());
+                for (i, new_key) in marked_ptrs {
+                    // update key for children ptr, note that node all key can be updated in this level
+                    if i == 0 {
+                        // cannot update the key in current level
+                        // will postpone to upper level
+                        debug_assert!(new_key > smallvec!());
+                        next_level_altered
+                            .key_modified
+                            .push((new_key, page_ref.clone()));
+                    } else {
+                        // can be updated, set the new key
+                        innode.keys.as_slice()[i - 1] = new_key;
+                    }
                 }
             }
             debug_assert!(
-                is_node_serial(innode),
+                is_node_serial(page),
                 "node not serial after update altered - {}",
                 level
             );
@@ -471,103 +475,109 @@ where
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
-                let mut next_innode = next.innode_mut();
-
-                let keys_slice = new_next_keys.as_slice();
-                let ptrs_slice = new_next_ptrs.as_slice();
                 debug_assert!(
-                    is_node_serial(next_innode),
+                    is_node_serial(next),
                     "node not serial before next updated - {}",
                     level
                 );
-                debug_assert!(current_right_bound < next_innode.right_bound);
-                debug_assert!(current_right_bound <= next_innode.keys.as_slice_immute()[0],
-                              "Bad boundary current right bound {:?} should less than or eq next first element {:?}",
-                              current_right_bound, next_innode.keys.as_slice_immute()[0]);
-                keys_slice[0] = remaining_key;
-                ptrs_slice[0] = remaining_ptr;
-                let mut next_len = next_innode.len;
-                if next_len >= KS::slice_len() {
-                    // full node, need to be split and relocated
-                    debug!("Full node, will split");
-                    let mid = next_len / 2;
-                    for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
-                        keys_slice[i + 1] = k.clone();
-                    }
-                    for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid]
-                        .iter()
-                        .enumerate()
-                    {
-                        ptrs_slice[i + 1] = p.clone();
-                    }
-                    let mut third_node_keys = KS::init();
-                    let mut third_node_ptrs = PS::init();
-                    for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
-                        .iter()
-                        .enumerate()
-                    {
-                        third_node_keys.as_slice()[i] = k.clone();
-                    }
-                    for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
-                        .iter()
-                        .enumerate()
-                    {
-                        third_node_ptrs.as_slice()[i] = p.clone();
-                    }
-                    let third_len = next_len - mid - 1;
-                    let third_right_bound = next_innode.right_bound.clone();
-                    let third_right_ptr = next_innode.right.clone();
-                    let third_innode = InNode {
-                        keys: third_node_keys,
-                        ptrs: third_node_ptrs,
-                        len: third_len,
-                        right: third_right_ptr,
-                        right_bound: third_right_bound,
-                    };
-                    debug_assert!(
-                        is_node_serial(&third_innode),
-                        "node not serial for third node - {}",
-                        level
-                    );
-                    let third_node_ref =
-                        NodeCellRef::new(Node::new(NodeData::Internal(box third_innode)));
-                    let next_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
-                    next_innode.right = third_node_ref.clone();
-                    next_innode.right_bound = next_right_bound.clone();
-                    next_innode.keys = new_next_keys;
-                    next_innode.ptrs = new_next_ptrs;
-                    next_innode.len = mid + 1;
-                    // insert the third page
-                    level_page_altered
-                        .added
-                        .push((next_right_bound.clone(), third_node_ref.clone()));
 
-                    // return the locked third node to be inserted into the all_pages
-                    has_new = Some(write_node(&third_node_ref))
-                } else {
-                    // not full node, can be relocated
-                    debug!("Not full node, wil relocated");
-                    for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
-                        .iter()
-                        .enumerate()
-                    {
-                        keys_slice[i + 1] = k.clone();
+                {
+                    let mut next_innode = next.innode_mut();
+
+                    let keys_slice = new_next_keys.as_slice();
+                    let ptrs_slice = new_next_ptrs.as_slice();
+                    debug_assert!(current_right_bound < next_innode.right_bound);
+                    debug_assert!(current_right_bound <= next_innode.keys.as_slice_immute()[0],
+                                  "Bad boundary current right bound {:?} should less than or eq next first element {:?}",
+                                  current_right_bound, next_innode.keys.as_slice_immute()[0]);
+                    keys_slice[0] = remaining_key;
+                    ptrs_slice[0] = remaining_ptr;
+                    let mut next_len = next_innode.len;
+                    if next_len >= KS::slice_len() {
+                        // full node, need to be split and relocated
+                        debug!("Full node, will split");
+                        let mid = next_len / 2;
+                        for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
+                            keys_slice[i + 1] = k.clone();
+                        }
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid]
+                            .iter()
+                            .enumerate()
+                            {
+                                ptrs_slice[i + 1] = p.clone();
+                            }
+                        let mut third_node_keys = KS::init();
+                        let mut third_node_ptrs = PS::init();
+                        for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
+                            .iter()
+                            .enumerate()
+                            {
+                                third_node_keys.as_slice()[i] = k.clone();
+                            }
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
+                            .iter()
+                            .enumerate()
+                            {
+                                third_node_ptrs.as_slice()[i] = p.clone();
+                            }
+                        let third_len = next_len - mid - 1;
+                        let third_right_bound = next_innode.right_bound.clone();
+                        let third_right_ptr = next_innode.right.clone();
+                        let third_innode = InNode {
+                            keys: third_node_keys,
+                            ptrs: third_node_ptrs,
+                            len: third_len,
+                            right: third_right_ptr,
+                            right_bound: third_right_bound,
+                        };
+                        let third_node_ref =
+                            NodeCellRef::new(Node::new(NodeData::Internal(box third_innode)));
+                        let next_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
+                        next_innode.right = third_node_ref.clone();
+                        next_innode.right_bound = next_right_bound.clone();
+                        next_innode.keys = new_next_keys;
+                        next_innode.ptrs = new_next_ptrs;
+                        next_innode.len = mid + 1;
+                        // insert the third page
+                        level_page_altered
+                            .added
+                            .push((next_right_bound.clone(), third_node_ref.clone()));
+
+                        // return the locked third node to be inserted into the all_pages
+
+                        let third_node = write_node(&third_node_ref);
+                        debug_assert!(
+                            is_node_serial(&third_node),
+                            "node not serial for third node - {}",
+                            level
+                        );
+                        has_new = Some(third_node)
+                    } else {
+                        // not full node, can be relocated
+                        debug!("Not full node, wil relocated");
+                        for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
+                            .iter()
+                            .enumerate()
+                            {
+                                keys_slice[i + 1] = k.clone();
+                            }
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len]
+                            .iter()
+                            .enumerate()
+                            {
+                                ptrs_slice[i + 1] = p.clone();
+                            }
+                        next_innode.keys = new_next_keys;
+                        next_innode.ptrs = new_next_ptrs;
+                        next_innode.len = next_len + 1;
                     }
-                    for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len]
-                        .iter()
-                        .enumerate()
-                    {
-                        ptrs_slice[i + 1] = p.clone();
-                    }
-                    next_innode.keys = new_next_keys;
-                    next_innode.ptrs = new_next_ptrs;
-                    next_innode.len = next_len + 1;
                 }
+
                 debug_assert!(
-                    is_node_serial(next_innode),
+                    is_node_serial(next),
                     "node not serial after next updated - {} - {:?}",
                     level,
-                    &next_innode.keys.as_slice()[..next_innode.len]
+                    &next.keys()
                 );
                 debug_assert!(current_right_bound > smallvec!());
                 // modify next node key
@@ -714,57 +724,4 @@ where
     debug!("Merge completed");
 
     merge_page_len
-}
-
-pub fn is_node_serial<KS, PS>(node: &InNode<KS, PS>) -> bool
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    // check keys
-    for i in 0..node.len {
-        if node.keys.as_slice_immute()[i] <= smallvec!() {
-            error!("EMPTY KEY DETECTED !!!");
-            return false;
-        }
-    }
-    for i in 1..node.len {
-        if node.keys.as_slice_immute()[i - 1] >= node.keys.as_slice_immute()[i] {
-            error!("serial check failed for key ordering");
-            return false;
-        }
-    }
-    true
-}
-
-pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
-{
-    if nodes.len() == 0 {
-        return true;
-    }
-    for (i, n) in nodes.iter().enumerate() {
-        if !is_node_serial(n.innode()) {
-            error!("node at {} not serial", i);
-            return false;
-        }
-    }
-
-    // check right ref
-    for i in 0..nodes.len() - 1 {
-        let first_right_bound = nodes[i].right_bound();
-        let second_first_node = nodes[i + 1].first_key();
-        let second_right_bound = nodes[i + 1].right_bound();
-        if first_right_bound >= second_right_bound {
-            error!("right bound at {} larger than right right bound", i);
-            return false
-        }
-        if first_right_bound > second_first_node {
-            error!("right bound at {} larger than right first node", i);
-            return false
-        }
-    }
-    return true;
 }

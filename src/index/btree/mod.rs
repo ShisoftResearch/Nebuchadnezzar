@@ -65,6 +65,7 @@ mod remove;
 mod search;
 mod split;
 mod storage;
+mod verification;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSetInneer = HashSet<EntryKey>;
