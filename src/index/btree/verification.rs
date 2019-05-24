@@ -1,12 +1,12 @@
-use index::{Slice, EntryKey};
-use index::btree::{NodeCellRef, NodeWriteGuard};
-use std::fmt::Debug;
 use index::btree::internal::InNode;
+use index::btree::{NodeCellRef, NodeWriteGuard};
+use index::{EntryKey, Slice};
+use std::fmt::Debug;
 
 pub fn is_node_serial<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
     for i in 0..node.len() {
@@ -25,9 +25,9 @@ pub fn is_node_serial<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> bool
 }
 
 pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     if nodes.len() == 0 {
         return true;
@@ -46,11 +46,11 @@ pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
         let second_right_bound = nodes[i + 1].right_bound();
         if first_right_bound >= second_right_bound {
             error!("right bound at {} larger than right right bound", i);
-            return false
+            return false;
         }
         if first_right_bound > second_first_node {
             error!("right bound at {} larger than right first node", i);
-            return false
+            return false;
         }
     }
     return true;

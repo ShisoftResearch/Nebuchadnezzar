@@ -16,6 +16,7 @@ use index::btree::node::NodeWriteGuard;
 use index::btree::remove::SubNodeStatus::InNodeEmpty;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
+use index::btree::verification::{is_node_list_serial, is_node_serial};
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
 use index::btree::{LevelTree, NodeReadHandler};
@@ -33,7 +34,6 @@ use std::fmt::Debug;
 use std::iter::Peekable;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use index::btree::verification::{is_node_serial, is_node_list_serial};
 
 enum Selection<KS, PS>
 where
@@ -176,7 +176,10 @@ where
         debug!("No node to prune at this level - {}", level);
         return (box level_page_altered, box vec![]);
     }
-    debug_assert!(is_node_list_serial(&all_pages), "node list not serial after selection");
+    debug_assert!(
+        is_node_list_serial(&all_pages),
+        "node list not serial after selection"
+    );
 
     let insert_new_and_mark_altered_keys =
         |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
@@ -320,7 +323,6 @@ where
         |page: &mut NodeWriteGuard<KS, PS>,
          current_altered: &mut Peekable<_>,
          next_level_altered: &mut AlteredNodes| {
-
             debug_assert!(
                 is_node_serial(page),
                 "node not serial before update altered - {}",
@@ -433,7 +435,10 @@ where
     };
 
     all_pages = update_right_nodes(all_pages);
-    debug_assert!(is_node_list_serial(&all_pages), "node not serial before checking corner cases");
+    debug_assert!(
+        is_node_list_serial(&all_pages),
+        "node not serial before checking corner cases"
+    );
 
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
@@ -503,23 +508,23 @@ where
                         for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid]
                             .iter()
                             .enumerate()
-                            {
-                                ptrs_slice[i + 1] = p.clone();
-                            }
+                        {
+                            ptrs_slice[i + 1] = p.clone();
+                        }
                         let mut third_node_keys = KS::init();
                         let mut third_node_ptrs = PS::init();
                         for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
                             .iter()
                             .enumerate()
-                            {
-                                third_node_keys.as_slice()[i] = k.clone();
-                            }
+                        {
+                            third_node_keys.as_slice()[i] = k.clone();
+                        }
                         for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
                             .iter()
                             .enumerate()
-                            {
-                                third_node_ptrs.as_slice()[i] = p.clone();
-                            }
+                        {
+                            third_node_ptrs.as_slice()[i] = p.clone();
+                        }
                         let third_len = next_len - mid - 1;
                         let third_right_bound = next_innode.right_bound.clone();
                         let third_right_ptr = next_innode.right.clone();
@@ -558,15 +563,15 @@ where
                         for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
                             .iter()
                             .enumerate()
-                            {
-                                keys_slice[i + 1] = k.clone();
-                            }
+                        {
+                            keys_slice[i + 1] = k.clone();
+                        }
                         for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len]
                             .iter()
                             .enumerate()
-                            {
-                                ptrs_slice[i + 1] = p.clone();
-                            }
+                        {
+                            ptrs_slice[i + 1] = p.clone();
+                        }
                         next_innode.keys = new_next_keys;
                         next_innode.ptrs = new_next_ptrs;
                         next_innode.len = next_len + 1;
@@ -607,7 +612,10 @@ where
         all_pages = update_right_nodes(all_pages);
     }
 
-    debug_assert!(is_node_list_serial(&all_pages), "node not serial after checked corner cases");
+    debug_assert!(
+        is_node_list_serial(&all_pages),
+        "node not serial after checked corner cases"
+    );
 
     (box level_page_altered, box all_pages)
 }
