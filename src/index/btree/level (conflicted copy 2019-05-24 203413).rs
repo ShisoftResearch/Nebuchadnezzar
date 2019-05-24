@@ -175,7 +175,6 @@ where
         debug!("No node to prune at this level - {}", level);
         return (box level_page_altered, box vec![]);
     }
-    debug_assert!(is_node_list_serial(&all_pages), "node list not serial after selection");
 
     let insert_new_and_mark_altered_keys =
         |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
@@ -429,7 +428,6 @@ where
     };
 
     all_pages = update_right_nodes(all_pages);
-    debug_assert!(is_node_list_serial(&all_pages), "node not serial before checking corner cases");
 
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
@@ -597,8 +595,6 @@ where
         all_pages = update_right_nodes(all_pages);
     }
 
-    debug_assert!(is_node_list_serial(&all_pages), "node not serial after checked corner cases");
-
     (box level_page_altered, box all_pages)
 }
 
@@ -737,7 +733,7 @@ where
     true
 }
 
-pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
+pub fn is_node_list_seiral<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
@@ -745,23 +741,8 @@ pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
     for (i, n) in nodes.iter().enumerate() {
         if !is_node_serial(n.innode()) {
             error!("node at {} not serial", i);
-            return false;
         }
     }
 
-    // check right ref
-    for i in 0..nodes.len() - 1 {
-        let first_right_bound = nodes[i].right_bound();
-        let second_first_node = nodes[i + 1].first_key();
-        let second_right_bound = nodes[i + 1].right_bound();
-        if first_right_bound >= second_right_bound {
-            error!("right bound at {} larger than right right bound", i);
-            return false
-        }
-        if first_right_bound > second_first_node {
-            error!("right bound at {} larger than right first node", i);
-            return false
-        }
-    }
     return true;
 }
