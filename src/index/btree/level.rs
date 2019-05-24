@@ -412,7 +412,9 @@ where
                 if cfg!(debug_assertions) {
                     let right = read_unchecked::<KS, PS>(&right_ref);
                     if !right.is_none() {
-                        assert!(right.right_bound() > p.right_bound());
+                        let left = p.right_bound();
+                        let right = right.right_bound();
+                        assert!(left < right, "failed on checking left right page right bound, expecting {:?} less than {:?}", left, right);
                     }
                 }
                 right_ref
@@ -481,6 +483,7 @@ where
                 let mut next_len = next_innode.len;
                 if next_len >= KS::slice_len() {
                     // full node, need to be split and relocated
+                    debug!("Full node, will split");
                     let mid = next_len / 2;
                     for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
                         keys_slice[i + 1] = k.clone();
@@ -537,6 +540,7 @@ where
                     has_new = Some(write_node(&third_node_ref))
                 } else {
                     // not full node, can be relocated
+                    debug!("Not full node, wil relocated");
                     for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
                         .iter()
                         .enumerate()
@@ -555,8 +559,8 @@ where
                 }
                 debug_assert!(
                     is_node_serial(next_innode),
-                    "node not serial after next updated - {}",
-                    level
+                    "node not serial after next updated - {} - {:?}",
+                    level, &next_innode.keys.as_slice()[..next_innode.len]
                 );
                 debug_assert!(current_right_bound > smallvec!());
                 // modify next node key
