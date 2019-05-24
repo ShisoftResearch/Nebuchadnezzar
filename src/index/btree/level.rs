@@ -338,6 +338,7 @@ where
                         let t: &&(EntryKey, NodeCellRef) = t;
                         let k: &EntryKey = &t.0;
                         let p: &NodeCellRef = &t.1;
+                        debug_assert!(k > &smallvec!());
                         if p.ptr_eq(&p) {
                             found_key = Some((i, k.clone()));
                         }
@@ -356,6 +357,7 @@ where
                 if i == 0 {
                     // cannot update the key in current level
                     // will postpone to upper level
+                    debug_assert!(new_key > smallvec!());
                     next_level_altered
                         .key_modified
                         .push((new_key, page_ref.clone()));
@@ -439,11 +441,6 @@ where
             // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
             debug!("Dealing with emptying node {}", index);
             corner_case_handled = true;
-            let current_node_left_bound = if index == 0 {
-                smallvec!()
-            } else {
-                all_pages[index - 1].right_bound().clone()
-            };
             let mut next_from_ptr = if index + 1 >= all_pages.len() {
                 debug!("Trying to fetch node guard for last node right");
                 let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
@@ -466,6 +463,7 @@ where
                 let mut new_next_ptrs = PS::init();
                 let mut has_new = None;
 
+                let current_right_bound = all_pages[index].right_bound().clone();
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
@@ -560,14 +558,15 @@ where
                     "node not serial after next updated - {}",
                     level
                 );
+                debug_assert!(current_right_bound > smallvec!());
                 // modify next node key
                 level_page_altered
                     .key_modified
-                    .push((current_node_left_bound, next.node_ref().clone()));
+                    .push((current_right_bound.clone(), next.node_ref().clone()));
 
                 // make current node empty
                 level_page_altered.removed.push((
-                    all_pages[index].right_bound().clone(),
+                    current_right_bound,
                     all_pages[index].node_ref().clone(),
                 ));
                 all_pages[index].make_empty_node(false);
@@ -711,6 +710,12 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
+    for i in 0..node.len {
+        if node.keys.as_slice_immute()[i] <= smallvec!() {
+            error!("EMPTY KEY DETECTED !!!");
+            return false;
+        }
+    }
     for i in 1..node.len {
         if node.keys.as_slice_immute()[i - 1] >= node.keys.as_slice_immute()[i] {
             error!("serial check failed for key ordering");
