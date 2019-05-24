@@ -176,6 +176,41 @@ where
         return (box level_page_altered, box vec![]);
     }
 
+    let insert_new_and_mark_altered_keys =
+        |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
+         current_altered: &AlteredNodes,
+         next_level_altered: &mut AlteredNodes| {
+            // write lock and insert all nodes marked new to current all pages
+            let mut new_nodes = added_iter().peekable();
+            let mut pages = pages.iter_mut();
+            let mut p = pages.next().unwrap();
+            while let Some(&(k, n)) = new_nodes.peek() {
+                if k < p.right_bound() {
+                    let innode = (*p).innode_mut();
+                    let new_key = k.clone();
+                    let new_node_ref = n.clone();
+                    let pos = innode.search(&new_key);
+                    if innode.len >= KS::slice_len() {
+                        let (split_ref, split_key) =
+                            innode.split_insert(new_key, new_node_ref, pos, true);
+                        next_level_altered.added.push((split_key, split_ref));
+                    } else {
+                        innode.insert_in_place(new_key, new_node_ref, pos, true);
+                    }
+                    new_nodes.next();
+                } else {
+                    if let Some(np) = pages.next() {
+                        p = np;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        };
+
+    // insert new nodes
+    insert_new_and_mark_altered_keys(&mut all_pages, &altered_keys, &mut level_page_altered);
+
     let select_live = |page: &NodeWriteGuard<KS, PS>, removed: &mut Peekable<_>| {
         // removed is a sequential external nodes that have been removed and have been set to empty
         // nodes are ordered so we can iterate them while scanning the reference in upper levels.
@@ -278,7 +313,6 @@ where
             }
         })
         .collect_vec();
-    debug_assert!(!all_pages.is_empty(), "all pages empty after changes made");
 
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>,
@@ -337,41 +371,8 @@ where
             );
         };
 
-    let insert_new_and_mark_altered_keys =
-        |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
-         current_altered: &AlteredNodes,
-         next_level_altered: &mut AlteredNodes| {
-            // write lock and insert all nodes marked new to current all pages
-            let mut new_nodes = added_iter().peekable();
-            let mut pages = pages.iter_mut();
-            let mut p = pages.next().unwrap();
-            while let Some(&(k, n)) = new_nodes.peek() {
-                if k < p.right_bound() {
-                    let innode = (*p).innode_mut();
-                    let new_key = k.clone();
-                    let new_node_ref = n.clone();
-                    let pos = innode.search(&new_key);
-                    if innode.len >= KS::slice_len() {
-                        let (split_ref, split_key) =
-                            innode.split_insert(new_key, new_node_ref, pos, true);
-                        next_level_altered.added.push((split_key, split_ref));
-                    } else {
-                        innode.insert_in_place(new_key, new_node_ref, pos, true);
-                    }
-                    new_nodes.next();
-                } else {
-                    if let Some(np) = pages.next() {
-                        p = np;
-                    } else {
-                        break;
-                    }
-                }
-            }
-        };
-
     // alter keys
     {
-        debug_assert!(!all_pages.is_empty(), "all pages empty before altering keys");
         let mut current_altered = altered_iter().peekable();
         all_pages.iter_mut().for_each(|p| {
             update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered)
@@ -381,14 +382,13 @@ where
             "there are {} pages remain unaltered",
             current_altered.count() + 1
         );
-        debug_assert!(!all_pages.is_empty(), "all pages empty after altering keys");
     }
 
-    // insert new nodes
-    debug_assert!(!all_pages.is_empty(), "all pages empty before insert new nodes");
-    insert_new_and_mark_altered_keys(&mut all_pages, &altered_keys, &mut level_page_altered);
-
     let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
+        if all_pages.is_empty() {
+            debug!("No nodes available to update right node");
+            return all_pages;
+        }
         let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
         debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_empty_node());
         // none right node should be allowed
