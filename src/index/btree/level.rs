@@ -136,7 +136,7 @@ where
             last_page.keys(),
             level
         );
-        for p in &last_innode.ptrs.as_slice_immute()[..=last_innode.len ] {
+        for p in &last_innode.ptrs.as_slice_immute()[..=last_innode.len] {
             if removed_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
                 removed_ptrs.next();
                 debug!("remove hit !!!");
@@ -478,6 +478,10 @@ where
                     "node not serial before next updated - {}",
                     level
                 );
+                debug_assert!(current_right_bound < next_innode.right_bound);
+                debug_assert!(current_right_bound < next_innode.keys.as_slice_immute()[0],
+                              "Bad boundary current right bound {:?} should less than next first element {:?}",
+                              current_right_bound, next_innode.keys.as_slice_immute()[0]);
                 keys_slice[0] = remaining_key;
                 ptrs_slice[0] = remaining_ptr;
                 let mut next_len = next_innode.len;
@@ -560,7 +564,8 @@ where
                 debug_assert!(
                     is_node_serial(next_innode),
                     "node not serial after next updated - {} - {:?}",
-                    level, &next_innode.keys.as_slice()[..next_innode.len]
+                    level,
+                    &next_innode.keys.as_slice()[..next_innode.len]
                 );
                 debug_assert!(current_right_bound > smallvec!());
                 // modify next node key
@@ -569,10 +574,9 @@ where
                     .push((current_right_bound.clone(), next.node_ref().clone()));
 
                 // make current node empty
-                level_page_altered.removed.push((
-                    current_right_bound,
-                    all_pages[index].node_ref().clone(),
-                ));
+                level_page_altered
+                    .removed
+                    .push((current_right_bound, all_pages[index].node_ref().clone()));
                 all_pages[index].make_empty_node(false);
                 has_new
             };
