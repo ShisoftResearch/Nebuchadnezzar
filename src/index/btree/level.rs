@@ -278,6 +278,7 @@ where
             }
         })
         .collect_vec();
+    debug_assert!(!all_pages.is_empty(), "all pages empty after changes made");
 
     let update_and_mark_altered_keys =
         |page: &mut NodeWriteGuard<KS, PS>,
@@ -370,6 +371,7 @@ where
 
     // alter keys
     {
+        debug_assert!(!all_pages.is_empty(), "all pages empty before altering keys");
         let mut current_altered = altered_iter().peekable();
         all_pages.iter_mut().for_each(|p| {
             update_and_mark_altered_keys(p, &mut current_altered, &mut level_page_altered)
@@ -379,9 +381,11 @@ where
             "there are {} pages remain unaltered",
             current_altered.count() + 1
         );
+        debug_assert!(!all_pages.is_empty(), "all pages empty after altering keys");
     }
 
     // insert new nodes
+    debug_assert!(!all_pages.is_empty(), "all pages empty before insert new nodes");
     insert_new_and_mark_altered_keys(&mut all_pages, &altered_keys, &mut level_page_altered);
 
     let update_right_nodes = |all_pages: Vec<NodeWriteGuard<KS, PS>>| {
