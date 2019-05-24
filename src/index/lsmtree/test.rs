@@ -95,7 +95,7 @@ pub fn insertions() {
         debug!("checking: {}", i);
         let cursor = tree.seek(&key, Ordering::Forward);
         key_with_id(&mut key, &id);
-        assert_eq!(cursor.current(), Some(&key), "{}", i);
+        assert_eq!(cursor.current(), Some(&key), "{}, looking for {:?}", i, key);
     });
 }
 
