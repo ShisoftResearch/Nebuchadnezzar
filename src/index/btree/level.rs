@@ -479,8 +479,8 @@ where
                     level
                 );
                 debug_assert!(current_right_bound < next_innode.right_bound);
-                debug_assert!(current_right_bound < next_innode.keys.as_slice_immute()[0],
-                              "Bad boundary current right bound {:?} should less than next first element {:?}",
+                debug_assert!(current_right_bound <= next_innode.keys.as_slice_immute()[0],
+                              "Bad boundary current right bound {:?} should less than or eq next first element {:?}",
                               current_right_bound, next_innode.keys.as_slice_immute()[0]);
                 keys_slice[0] = remaining_key;
                 ptrs_slice[0] = remaining_ptr;
