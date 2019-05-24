@@ -742,6 +742,9 @@ pub fn is_node_list_serial<KS, PS>(nodes: &Vec<NodeWriteGuard<KS, PS>>) -> bool
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
+    if nodes.len() == 0 {
+        return true;
+    }
     for (i, n) in nodes.iter().enumerate() {
         if !is_node_serial(n.innode()) {
             error!("node at {} not serial", i);
