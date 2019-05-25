@@ -1,5 +1,5 @@
 use client::AsyncClient;
-use index::btree::LevelTree;
+use index::btree::{LevelTree, verification};
 use index::btree::NodeCellRef;
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
@@ -226,6 +226,12 @@ impl LSMTree {
             }),
             epoch: self.epoch(),
             id: self.id,
+        }
+    }
+
+    pub fn ensure_trees_in_order(&self) {
+        for (i, t) in self.trees.iter().enumerate() {
+            assert!(t.verify(i), "tree not in order {}", i);
         }
     }
 }

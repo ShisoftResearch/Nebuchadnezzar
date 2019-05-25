@@ -390,6 +390,8 @@ fn parallel() {
     dump_tree(&*tree, "btree_parallel_insertion_dump.json");
     debug!("Start validation");
 
+    debug_assert!(verification::is_tree_in_order(&*tree, 0));
+
     thread_rng().shuffle(nums.as_mut_slice());
     let mut rng = rand::rngs::OsRng::new().unwrap();
     let die_range = Uniform::new_inclusive(1, 6);

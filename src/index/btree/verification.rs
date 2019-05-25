@@ -56,7 +56,7 @@ where
     return true;
 }
 
-pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>) -> bool
+pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level: usize, tree_level: usize) -> bool
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
@@ -65,43 +65,43 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>) -> bool
         let right_ref = node.right_ref().unwrap();
         let right_bound = node.right_bound();
         if !is_node_serial(&node) {
-            error!("Node not serial");
+            error!("Node not serial - {} - {}", lsm_level, tree_level);
             return false;
         }
         if node.first_key() > right_bound {
-            error!("Node have right key smaller than the first");
+            error!("Node have right key smaller than the first - {} - {}", lsm_level, tree_level);
             return false;
         }
         if node.last_key() > right_bound {
-            error!("Node have right key smaller than the last");
+            error!("Node have right key smaller than the last - {} - {}", lsm_level, tree_level);
             return false;
         }
         let next = write_node(right_ref);
         if next.is_none() {
-            debug!("Node level check reached non node");
+            debug!("Node level check reached non node - {} - {}", lsm_level, tree_level);
             return true;
         }
         if next.first_key() < right_bound {
-            error!("next first key smaller than right bound");
+            error!("next first key smaller than right bound - {} - {}", lsm_level, tree_level);
             return false;
         }
         if next.right_bound() < right_bound {
-            error!("next right bound key smaller than right bound");
+            error!("next right bound key smaller than right bound - {} - {}", lsm_level, tree_level);
             return false
         }
         node = next;
     }
 }
 
-pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool
+pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>, level: usize) -> bool
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
-    return ensure_level_in_order::<KS, PS>(&tree.get_root());
+    return ensure_level_in_order::<KS, PS>(&tree.get_root(), level, 0);
 }
 
-fn ensure_level_in_order<KS, PS>(node: &NodeCellRef) -> bool
+fn ensure_level_in_order<KS, PS>(node: &NodeCellRef, lsm_level: usize, tree_level: usize) -> bool
     where
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
@@ -111,11 +111,11 @@ fn ensure_level_in_order<KS, PS>(node: &NodeCellRef) -> bool
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None
     };
-    if !is_node_level_serial(first_node) {
+    if !is_node_level_serial(first_node, lsm_level, tree_level) {
         return false;
     }
     if let Some(sub_level) = sub_ref {
-        return ensure_level_in_order::<KS, PS>(&sub_level);
+        return ensure_level_in_order::<KS, PS>(&sub_level, lsm_level, tree_level + 1);
     }
     return true;
 }

@@ -52,6 +52,8 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use utils::lru_cache::LRUCache;
 
+pub mod verification;
+
 mod cursor;
 mod dump;
 mod external;
@@ -65,7 +67,6 @@ mod remove;
 mod search;
 mod split;
 mod storage;
-mod verification;
 
 const CACHE_SIZE: usize = 2048;
 pub type DeletionSetInneer = HashSet<EntryKey>;
@@ -237,6 +238,7 @@ pub trait LevelTree {
     fn remove_following_tombstones(&self, start: &EntryKey);
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
+    fn verify(&self, level: usize) -> bool;
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -302,6 +304,10 @@ where
 
     fn head_id(&self) -> Id {
         self.head_page_id
+    }
+
+    fn verify(&self, level: usize) -> bool {
+        verification::is_tree_in_order(self, level)
     }
 }
 
