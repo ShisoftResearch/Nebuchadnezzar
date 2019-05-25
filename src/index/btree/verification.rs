@@ -82,7 +82,8 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
             return true;
         }
         if next.first_key() < right_bound {
-            error!("next first key smaller than right bound - {} - {}", lsm_level, tree_level);
+            error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
+                   lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
             return false;
         }
         if next.right_bound() < right_bound {
