@@ -215,6 +215,8 @@ where
             extnode_2.len,
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
+        debug_assert!(self.right_bound < extnode_2.right_bound);
+        debug_assert!(self.right_bound <= extnode_2.keys.as_slice_immute()[0]);
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();
