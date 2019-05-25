@@ -184,6 +184,8 @@ where
             right: self.right.clone(),
             right_bound,
         };
+        debug_assert!(self.right_bound < node_2.right_bound);
+        debug_assert!(self.right_bound <= node_2.keys.as_slice_immute()[0]);
         let node_2_ref = NodeCellRef::new(Node::with_internal(node_2));
         self.len = keys_split.keys_1_len;
         self.right = node_2_ref.clone();
