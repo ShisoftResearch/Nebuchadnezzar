@@ -1,5 +1,5 @@
 use index::btree::internal::InNode;
-use index::btree::{NodeCellRef, NodeWriteGuard, write_node};
+use index::btree::{NodeCellRef, NodeWriteGuard, write_node, BPlusTree, NodeData};
 use index::{EntryKey, Slice};
 use std::fmt::Debug;
 
@@ -81,13 +81,41 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>) -> bool
             debug!("Node level check reached non node");
             return true;
         }
-        {
-            let next_first = next.first_key();
-            if next_first < right_bound {
-                error!("next first key smaller than right bound");
-                return false;
-            }
+        if next.first_key() < right_bound {
+            error!("next first key smaller than right bound");
+            return false;
+        }
+        if next.right_bound() < right_bound {
+            error!("next right bound key smaller than right bound");
+            return false
         }
         node = next;
     }
+}
+
+pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    return ensure_level_in_order::<KS, PS>(&tree.get_root());
+}
+
+fn ensure_level_in_order<KS, PS>(node: &NodeCellRef) -> bool
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    let first_node = write_node::<KS, PS>(&node);
+    let sub_ref = match &*first_node {
+        &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
+        _ => None
+    };
+    if !is_node_level_serial(first_node) {
+        return false;
+    }
+    if let Some(sub_level) = sub_ref {
+        return ensure_level_in_order::<KS, PS>(&sub_level);
+    }
+    return true;
 }
