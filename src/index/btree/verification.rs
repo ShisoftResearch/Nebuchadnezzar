@@ -1,5 +1,5 @@
 use index::btree::internal::InNode;
-use index::btree::{NodeCellRef, NodeWriteGuard};
+use index::btree::{NodeCellRef, NodeWriteGuard, write_node};
 use index::{EntryKey, Slice};
 use std::fmt::Debug;
 
@@ -54,4 +54,40 @@ where
         }
     }
     return true;
+}
+
+pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>) -> bool
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    loop {
+        let right_ref = node.right_ref().unwrap();
+        let right_bound = node.right_bound();
+        if !is_node_serial(&node) {
+            error!("Node not serial");
+            return false;
+        }
+        if node.first_key() > right_bound {
+            error!("Node have right key smaller than the first");
+            return false;
+        }
+        if node.last_key() > right_bound {
+            error!("Node have right key smaller than the last");
+            return false;
+        }
+        let next = write_node(right_ref);
+        if next.is_none() {
+            debug!("Node level check reached non node");
+            return true;
+        }
+        {
+            let next_first = next.first_key();
+            if next_first < right_bound {
+                error!("next first key smaller than right bound");
+                return false;
+            }
+        }
+        node = next;
+    }
 }
