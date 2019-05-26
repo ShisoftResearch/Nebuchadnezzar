@@ -66,6 +66,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
             let right_bound = node.right_bound();
+            assert!(right_bound > &min_key);
             if !is_node_serial(&node) {
                 error!("Node not serial - {} - {}", lsm_level, tree_level);
                 return false;
