@@ -134,8 +134,9 @@ fn crd() {
             }
             i += 1;
         }
-        assert_eq!(tree.len(), num as usize);
         dump_tree(&tree, "tree_dump.json");
+        assert_eq!(tree.len(), num as usize);
+        assert!(verification::is_tree_in_order(&tree, 0));
     }
 
     {
@@ -329,6 +330,8 @@ pub fn alternative_insertion_pattern() {
         tree.insert(&key);
     }
 
+    assert!(verification::is_tree_in_order(&tree, 0));
+
     let mut rng = thread_rng();
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
@@ -390,7 +393,7 @@ fn parallel() {
     dump_tree(&*tree, "btree_parallel_insertion_dump.json");
     debug!("Start validation");
 
-    debug_assert!(verification::is_tree_in_order(&*tree, 0));
+    assert!(verification::is_tree_in_order(&*tree, 0));
 
     thread_rng().shuffle(nums.as_mut_slice());
     let mut rng = rand::rngs::OsRng::new().unwrap();
@@ -469,6 +472,7 @@ fn node_lock() {
         let ext_node = guard.extnode_mut();
         ext_node.insert(&key, &tree, &node, &dummy_node);
     });
+    assert!(verification::is_tree_in_order(&tree, 0));
     let read = read_unchecked::<KeySlice, PtrSlice>(&node);
     let extnode = read.extnode();
     for i in 0..read.len() - 1 {
@@ -514,12 +518,18 @@ fn level_merge() {
     dump_tree(&tree_1, "lsm-tree_level_merge_1_before_dump.json");
     dump_tree(&tree_2, "lsm-tree_level_merge_2_before_dump.json");
 
+    assert!(verification::is_tree_in_order(&*tree_1, 0));
+    assert!(verification::is_tree_in_order(&*tree_2, 0));
+
     debug!("MERGING...");
     let merged = tree_1.merge_to(&*tree_2);
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
     dump_tree(&tree_2, "lsm-tree_level_merge_2_after_dump.json");
+
+    assert!(verification::is_tree_in_order(&*tree_1, 0));
+    assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     for i in 0..range {
         let n2 = i * 2 + 1;
@@ -574,6 +584,7 @@ fn level_merge_insertion() {
     }
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_orig_dump.json");
+    assert!(verification::is_tree_in_order(&*tree, 0));
 
     let tree_2 = tree.clone();
     let th1 = thread::spawn(move || {
@@ -607,6 +618,7 @@ fn level_merge_insertion() {
     th2.join();
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_ins_dump.json");
+    assert!(verification::is_tree_in_order(&*tree, 0));
 
     numbers.sort();
     for num in numbers {
