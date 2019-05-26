@@ -453,34 +453,6 @@ fn parallel() {
     //    dump_tree(&*tree, "btree_parallel_deletion_dump.json");
 }
 
-#[test]
-fn node_lock() {
-    env_logger::init();
-    let tree = LevelBPlusTree::new();
-    let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> =
-        ExtNode::new(Id::new(1, 2), max_entry_key());
-    let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(inner_ext_node)));
-    let num = 100000;
-    let mut nums = (0..num).collect_vec();
-    let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::with_none();
-    let dummy_node = NodeCellRef::new(inner_dummy_node);
-    thread_rng().shuffle(nums.as_mut_slice());
-    nums.par_iter().for_each(|num| {
-        let key_slice = u64_to_slice(*num);
-        let key = SmallVec::from_slice(&key_slice);
-        let mut guard = write_node::<KeySlice, PtrSlice>(&node);
-        let ext_node = guard.extnode_mut();
-        ext_node.insert(&key, &tree, &node, &dummy_node);
-    });
-    assert!(verification::is_tree_in_order(&tree, 0));
-    let read = read_unchecked::<KeySlice, PtrSlice>(&node);
-    let extnode = read.extnode();
-    for i in 0..read.len() - 1 {
-        assert!(extnode.keys[i] < extnode.keys[i + 1]);
-    }
-    assert_eq!(node.deref::<KeySlice, PtrSlice>().version(), num as usize);
-}
-
 const TINY_PAGE_SIZE: usize = 5;
 impl_btree_level!(TINY_PAGE_SIZE);
 type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];

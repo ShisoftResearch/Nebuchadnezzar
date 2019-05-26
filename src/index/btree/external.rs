@@ -202,7 +202,7 @@ where
         };
         debug_assert!(pivot_key < self.right_bound, "pivot {:?}, right bound {:?}",
                       pivot_key, self.right_bound);
-        debug_assert!(pivot_key > smallvec!(0));
+        debug_assert!(pivot_key > smallvec!());
         debug_assert!(
             &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
             "{:?} / {:?} @ {}",
