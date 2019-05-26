@@ -174,9 +174,9 @@ where
         tree: &BPlusTree<KS, PS>,
     ) -> (NodeCellRef, EntryKey) {
         // cached.dump();
+        let keys_1 = &mut self.keys;
         let pivot = self.len / 2;
         let new_page_id = tree.new_page_id();
-        let keys_1 = &mut self.keys;
         let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;
@@ -189,7 +189,7 @@ where
             &mut keys_2_len,
             pos,
         );
-        let pivot_key = keys_2.as_slice()[0].clone();
+        let pivot_key = keys_2.as_slice_immute()[0].clone();
         let extnode_2: Box<ExtNode<KS, PS>> = box ExtNode {
             id: new_page_id,
             keys: keys_2,
@@ -197,9 +197,11 @@ where
             prev: self_ref.clone(),
             len: keys_2_len,
             dirty: true,
-            right_bound: mem::replace(&mut self.right_bound, pivot_key.clone()),
+            right_bound: self.right_bound.clone(),
             mark: PhantomData,
         };
+        debug_assert!(pivot_key < self.right_bound, "pivot {:?}, right bound {:?}",
+                      pivot_key, self.right_bound);
         debug_assert!(pivot_key > smallvec!(0));
         debug_assert!(
             &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
@@ -209,14 +211,19 @@ where
             pos
         );
         self.len = keys_1_len;
+        self.right_bound = pivot_key.clone();
         debug!(
             "Split to left len {}, right len {}, right prev id: {:?}",
             self.len,
             extnode_2.len,
             read_unchecked::<KS, PS>(&extnode_2.prev).ext_id()
         );
-        debug_assert!(self.right_bound < extnode_2.right_bound);
-        debug_assert!(self.right_bound <= extnode_2.keys.as_slice_immute()[0]);
+        debug_assert_eq!(self.right_bound, pivot_key);
+        debug_assert_eq!(&self.right_bound, &extnode_2.keys.as_slice_immute()[0]);
+        debug_assert!(self.right_bound < extnode_2.right_bound, "node right bound >= next right bound {:?} - {:?}",
+                      self.right_bound, extnode_2.right_bound);
+        debug_assert!(self.right_bound <= extnode_2.keys.as_slice_immute()[0], "node right bound < next first key, {:?} - {:?}",
+                      self.right_bound, &extnode_2.keys.as_slice_immute()[..extnode_2.len]);
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();
