@@ -66,7 +66,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
             let right_bound = node.right_bound();
-            assert!(right_bound > &min_key);
+            assert!(right_bound > &min_key, "node right bound > smallest possible key");
             if !is_node_serial(&node) {
                 error!("Node not serial - {} - {}", lsm_level, tree_level);
                 return false;
@@ -89,7 +89,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
             return true;
         }
         if !next.is_empty_node() {
-            assert!(right_bound > &min_key);
+            assert!(right_bound > &min_key, "unreachable");
             if next.first_key() < right_bound {
                 error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
                        lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
