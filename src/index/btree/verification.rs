@@ -106,6 +106,7 @@ pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>, level: usize) -> bool
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
+    debug!("Checking tree {} in order...", level);
     return ensure_level_in_order::<KS, PS>(&tree.get_root(), level, 0);
 }
 
