@@ -61,6 +61,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
 {
+    let min_key = smallvec!();
     loop {
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
@@ -79,7 +80,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
             }
             right_bound
         } else {
-            unreachable!()
+            &min_key
         };
         let next = write_node(right_ref);
         if next.is_none() {
@@ -87,6 +88,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
             return true;
         }
         if !next.is_empty_node() {
+            assert!(right_bound > &min_key);
             if next.first_key() < right_bound {
                 error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
                        lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
