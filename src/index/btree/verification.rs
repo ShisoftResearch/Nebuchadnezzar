@@ -63,32 +63,39 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
 {
     loop {
         let right_ref = node.right_ref().unwrap();
-        let right_bound = node.right_bound();
-        if !is_node_serial(&node) {
-            error!("Node not serial - {} - {}", lsm_level, tree_level);
-            return false;
-        }
-        if node.first_key() > right_bound {
-            error!("Node have right key smaller than the first - {} - {}", lsm_level, tree_level);
-            return false;
-        }
-        if node.last_key() > right_bound {
-            error!("Node have right key smaller than the last - {} - {}", lsm_level, tree_level);
-            return false;
-        }
+        let right_bound = if !node.is_empty_node() {
+            let right_bound = node.right_bound();
+            if !is_node_serial(&node) {
+                error!("Node not serial - {} - {}", lsm_level, tree_level);
+                return false;
+            }
+            if node.first_key() > right_bound {
+                error!("Node have right key smaller than the first - {} - {}", lsm_level, tree_level);
+                return false;
+            }
+            if node.last_key() > right_bound {
+                error!("Node have right key smaller than the last - {} - {}", lsm_level, tree_level);
+                return false;
+            }
+            right_bound
+        } else {
+            unreachable!()
+        };
         let next = write_node(right_ref);
         if next.is_none() {
             debug!("Node level check reached non node - {} - {}", lsm_level, tree_level);
             return true;
         }
-        if next.first_key() < right_bound {
-            error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
-                   lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
-            return false;
-        }
-        if next.right_bound() < right_bound {
-            error!("next right bound key smaller than right bound - {} - {}", lsm_level, tree_level);
-            return false
+        if !next.is_empty_node() {
+            if next.first_key() < right_bound {
+                error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
+                       lsm_level, tree_level, node.type_name(), node.keys(), next.keys(), node.right_bound(), next.right_bound());
+                return false;
+            }
+            if next.right_bound() < right_bound {
+                error!("next right bound key smaller than right bound - {} - {}", lsm_level, tree_level);
+                return false
+            }
         }
         node = next;
     }
