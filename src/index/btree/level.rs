@@ -468,10 +468,12 @@ where
                 let (remaining_key, remaining_ptr) = {
                     let current_innode = all_pages[index].innode();
                     let new_first_key = current_innode.right_bound.clone();
+                    let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
+                    debug_assert!(read_unchecked::<KS, PS>(&new_first_ptr).first_key() < &new_first_key);
                     debug!("Using new first key as remaining key {:?}", new_first_key);
                     (
                         new_first_key,
-                        current_innode.ptrs.as_slice_immute()[0].clone(),
+                        new_first_ptr,
                     )
                 };
                 let mut new_next_keys = KS::init();
