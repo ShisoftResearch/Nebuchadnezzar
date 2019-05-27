@@ -81,11 +81,12 @@ pub fn insertions() {
         assert_eq!(cursor.current(), Some(&key), "{}", i);
     });
 
-    dump_trees(&*tree, "stage_1_before_insertion");
+    dump_trees(&*tree, "insertions_before_merge");
     for _ in 0..50 {
         tree.check_and_merge();
     }
-    dump_trees(&*tree, "stage_1_after_insertion");
+    dump_trees(&*tree, "insertions_after_merge");
+    tree.ensure_trees_in_order();
 
     debug!("Start point search validations");
     (0..num).collect::<Vec<_>>().iter().for_each(|i| {
