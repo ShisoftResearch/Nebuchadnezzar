@@ -467,8 +467,10 @@ where
             let has_new = {
                 let (remaining_key, remaining_ptr) = {
                     let current_innode = all_pages[index].innode();
+                    let new_first_key = current_innode.right_bound.clone();
+                    debug!("Using new first key as remaining key {:?}", new_first_key);
                     (
-                        current_innode.right_bound.clone(),
+                        new_first_key,
                         current_innode.ptrs.as_slice_immute()[0].clone(),
                     )
                 };
