@@ -88,7 +88,7 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
             debug!("Node level check reached non node - {} - {}", lsm_level, tree_level);
             return true;
         }
-        if !next.is_empty_node() {
+        if !next.is_empty_node() && !node.is_empty_node() {
             assert!(right_bound > &min_key, "unreachable");
             if next.first_key() < right_bound {
                 error!("next first key smaller than right bound - {} - {}, type {}. Left keys {:?}, right keys {:?}, right bound {:?}, next right bound {:?}",
