@@ -469,12 +469,11 @@ where
                     let current_innode = all_pages[index].innode();
                     let new_first_key = current_innode.right_bound.clone();
                     let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
-                    debug_assert!(read_unchecked::<KS, PS>(&new_first_ptr).first_key() < &new_first_key);
+                    debug_assert!(
+                        read_unchecked::<KS, PS>(&new_first_ptr).first_key() < &new_first_key
+                    );
                     debug!("Using new first key as remaining key {:?}", new_first_key);
-                    (
-                        new_first_key,
-                        new_first_ptr,
-                    )
+                    (new_first_key, new_first_ptr)
                 };
                 let mut new_next_keys = KS::init();
                 let mut new_next_ptrs = PS::init();
@@ -554,11 +553,18 @@ where
 
                         // return the locked third node to be inserted into the all_pages
 
-                        let third_node = write_node(&third_node_ref);
+                        let third_node = write_node::<KS, PS>(&third_node_ref);
                         debug_assert!(
                             is_node_serial(&third_node),
                             "node not serial for third node - {}",
                             level
+                        );
+                        debug_assert!(
+                            third_node.first_key()
+                                > read_unchecked::<KS, PS>(
+                                    &third_node.innode().ptrs.as_slice_immute()[0]
+                                )
+                                .first_key()
                         );
                         has_new = Some(third_node)
                     } else {
@@ -589,6 +595,11 @@ where
                     &next.keys()
                 );
                 debug_assert!(current_right_bound > smallvec!());
+                debug_assert!(
+                    next.first_key()
+                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0])
+                            .first_key()
+                );
                 // modify next node key
                 level_page_altered
                     .key_modified
