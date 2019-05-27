@@ -69,6 +69,7 @@ pub fn insertions() {
     });
 
     debug!("Start point search validations");
+    tree.ensure_trees_in_order();
     (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);
@@ -135,9 +136,11 @@ pub fn hybrid() {
         tree.insert(key);
     });
 
+    tree.ensure_trees_in_order();
     dump_trees(&*tree, "hybird_after_insertion");
     thread::sleep(Duration::new(30, 0));
     dump_trees(&*tree, "hybird_after_sleep");
+    tree.ensure_trees_in_order();
 
     debug!("Start point search validations");
     (0..num).collect::<Vec<_>>().par_iter().for_each(|i| {

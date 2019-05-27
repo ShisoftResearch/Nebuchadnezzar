@@ -95,7 +95,7 @@ where
         let node_len = self.len;
         let ptr_len = self.len + 1;
         let pivot = node_len / 2; // pivot key will be removed
-        let pivot_key = self.keys.as_slice()[pivot].clone();
+        let pivot_key;
         debug!("Going to split at pivot {}", pivot);
         let keys_split = {
             debug!("insert into keys");
@@ -105,12 +105,12 @@ where
                 let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
                 let mut keys_1_len = pivot;
                 let mut keys_2_len = node_len - pivot;
-                let pivot_key = key;
+                pivot_key = key;
                 InNodeKeysSplit {
                     keys_2,
                     keys_1_len,
                     keys_2_len,
-                    pivot_key,
+                    pivot_key: pivot_key.clone(),
                 }
             } else {
                 let mut keys_1 = &mut self.keys;
@@ -127,7 +127,7 @@ where
                     keys_1_len, keys_2_len, key_pos
                 );
                 debug_assert_ne!(pivot, pos);
-                let pivot_key = keys_1.as_slice()[pivot].to_owned();
+                pivot_key = keys_1.as_slice()[pivot].to_owned();
                 insert_into_split(
                     key,
                     keys_1,
@@ -140,7 +140,7 @@ where
                     keys_2,
                     keys_1_len,
                     keys_2_len,
-                    pivot_key,
+                    pivot_key: pivot_key.clone(),
                 }
             }
         };
@@ -184,6 +184,8 @@ where
             right: self.right.clone(),
             right_bound,
         };
+        debug_assert!(self.right_bound < node_2.right_bound);
+        debug_assert!(self.right_bound <= node_2.keys.as_slice_immute()[0]);
         let node_2_ref = NodeCellRef::new(Node::with_internal(node_2));
         self.len = keys_split.keys_1_len;
         self.right = node_2_ref.clone();

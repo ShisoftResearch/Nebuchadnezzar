@@ -134,8 +134,9 @@ fn crd() {
             }
             i += 1;
         }
-        assert_eq!(tree.len(), num as usize);
         dump_tree(&tree, "tree_dump.json");
+        assert_eq!(tree.len(), num as usize);
+        assert!(verification::is_tree_in_order(&tree, 0));
     }
 
     {
@@ -329,6 +330,8 @@ pub fn alternative_insertion_pattern() {
         tree.insert(&key);
     }
 
+    assert!(verification::is_tree_in_order(&tree, 0));
+
     let mut rng = thread_rng();
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
@@ -390,6 +393,8 @@ fn parallel() {
     dump_tree(&*tree, "btree_parallel_insertion_dump.json");
     debug!("Start validation");
 
+    assert!(verification::is_tree_in_order(&*tree, 0));
+
     thread_rng().shuffle(nums.as_mut_slice());
     let mut rng = rand::rngs::OsRng::new().unwrap();
     let die_range = Uniform::new_inclusive(1, 6);
@@ -448,33 +453,6 @@ fn parallel() {
     //    dump_tree(&*tree, "btree_parallel_deletion_dump.json");
 }
 
-#[test]
-fn node_lock() {
-    env_logger::init();
-    let tree = LevelBPlusTree::new();
-    let inner_ext_node: Box<ExtNode<KeySlice, PtrSlice>> =
-        ExtNode::new(Id::new(1, 2), max_entry_key());
-    let node: NodeCellRef = NodeCellRef::new(Node::new(NodeData::External(inner_ext_node)));
-    let num = 100000;
-    let mut nums = (0..num).collect_vec();
-    let inner_dummy_node: Node<KeySlice, PtrSlice> = Node::with_none();
-    let dummy_node = NodeCellRef::new(inner_dummy_node);
-    thread_rng().shuffle(nums.as_mut_slice());
-    nums.par_iter().for_each(|num| {
-        let key_slice = u64_to_slice(*num);
-        let key = SmallVec::from_slice(&key_slice);
-        let mut guard = write_node::<KeySlice, PtrSlice>(&node);
-        let ext_node = guard.extnode_mut();
-        ext_node.insert(&key, &tree, &node, &dummy_node);
-    });
-    let read = read_unchecked::<KeySlice, PtrSlice>(&node);
-    let extnode = read.extnode();
-    for i in 0..read.len() - 1 {
-        assert!(extnode.keys[i] < extnode.keys[i + 1]);
-    }
-    assert_eq!(node.deref::<KeySlice, PtrSlice>().version(), num as usize);
-}
-
 const TINY_PAGE_SIZE: usize = 5;
 impl_btree_level!(TINY_PAGE_SIZE);
 type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
@@ -512,12 +490,18 @@ fn level_merge() {
     dump_tree(&tree_1, "lsm-tree_level_merge_1_before_dump.json");
     dump_tree(&tree_2, "lsm-tree_level_merge_2_before_dump.json");
 
+    assert!(verification::is_tree_in_order(&*tree_1, 0));
+    assert!(verification::is_tree_in_order(&*tree_2, 0));
+
     debug!("MERGING...");
     let merged = tree_1.merge_to(&*tree_2);
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
     dump_tree(&tree_2, "lsm-tree_level_merge_2_after_dump.json");
+
+    assert!(verification::is_tree_in_order(&*tree_1, 0));
+    assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     for i in 0..range {
         let n2 = i * 2 + 1;
@@ -572,6 +556,7 @@ fn level_merge_insertion() {
     }
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_orig_dump.json");
+    assert!(verification::is_tree_in_order(&*tree, 0));
 
     let tree_2 = tree.clone();
     let th1 = thread::spawn(move || {
@@ -605,6 +590,7 @@ fn level_merge_insertion() {
     th2.join();
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_ins_dump.json");
+    assert!(verification::is_tree_in_order(&*tree, 0));
 
     numbers.sort();
     for num in numbers {
