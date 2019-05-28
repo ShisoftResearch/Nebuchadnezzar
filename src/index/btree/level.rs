@@ -370,7 +370,7 @@ where
                     } else {
                         // can be updated, set the new key
                         debug!("perform key update {:?}", new_key);
-                        debug_assert!(new_key > smallvec!(), "at {}", i);
+                        // debug_assert!(new_key > smallvec!(), "new key is empty at {}", i);
                         innode.keys.as_slice()[i - 1] = new_key;
                     }
                 }
