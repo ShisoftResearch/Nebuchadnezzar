@@ -345,7 +345,6 @@ where
                             let t: &&(EntryKey, NodeCellRef) = t;
                             let k: &EntryKey = &t.0;
                             let p: &NodeCellRef = &t.1;
-                            debug_assert!(!(i > 0 && k <= &smallvec!()));
                             if p.ptr_eq(&p) {
                                 found_key = Some((i, k.clone()));
                             }
@@ -371,7 +370,7 @@ where
                     } else {
                         // can be updated, set the new key
                         debug!("perform key update {:?}", new_key);
-                        debug_assert!(new_key > smallvec!());
+                        debug_assert!(new_key > smallvec!(), "at {}", i);
                         innode.keys.as_slice()[i - 1] = new_key;
                     }
                 }
