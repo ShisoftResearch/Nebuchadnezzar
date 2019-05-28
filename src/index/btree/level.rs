@@ -601,10 +601,15 @@ where
                     next.first_key()
                         > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()
                 );
-                // modify next node key
-                level_page_altered
-                    .key_modified
-                    .push((current_left_bound.clone(), next.node_ref().clone()));
+
+                if &current_right_bound != &*MIN_ENTRY_KEY {
+                    // modify next node key
+                    level_page_altered
+                        .key_modified
+                        .push((current_left_bound.clone(), next.node_ref().clone()));
+                } else {
+                    debug!("Skipped modify key for left bound is min key");
+                }
 
                 // make current node empty
                 level_page_altered
