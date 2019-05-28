@@ -470,7 +470,7 @@ where
                     let new_first_key = current_innode.right_bound.clone();
                     let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
                     debug_assert!(
-                        read_unchecked::<KS, PS>(&new_first_ptr).first_key() < &new_first_key
+                        read_unchecked::<KS, PS>(&new_first_ptr).last_key() < &new_first_key
                     );
                     debug!("Using new first key as remaining key {:?}", new_first_key);
                     (new_first_key, new_first_ptr)
@@ -563,8 +563,7 @@ where
                             third_node.first_key()
                                 > read_unchecked::<KS, PS>(
                                     &third_node.innode().ptrs.as_slice_immute()[0]
-                                )
-                                .first_key()
+                                ).last_key()
                         );
                         has_new = Some(third_node)
                     } else {
@@ -597,8 +596,7 @@ where
                 debug_assert!(current_right_bound > smallvec!());
                 debug_assert!(
                     next.first_key()
-                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0])
-                            .first_key()
+                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()
                 );
                 // modify next node key
                 level_page_altered
