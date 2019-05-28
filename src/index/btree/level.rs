@@ -602,7 +602,7 @@ where
                         > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()
                 );
 
-                if &current_right_bound != &*MIN_ENTRY_KEY {
+                if &current_left_bound != &*MIN_ENTRY_KEY {
                     // modify next node key
                     level_page_altered
                         .key_modified
