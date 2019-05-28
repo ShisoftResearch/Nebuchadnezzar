@@ -195,6 +195,7 @@ where
                     let new_key = k.clone();
                     let new_node_ref = n.clone();
                     let pos = innode.search(&new_key);
+                    debug!("inserting new at {} with key {:?}", pos, new_key);
                     if innode.len >= KS::slice_len() {
                         let (split_ref, split_key) =
                             innode.split_insert(new_key, new_node_ref, pos, true);
@@ -364,6 +365,7 @@ where
                         // cannot update the key in current level
                         // will postpone to upper level
                         debug_assert!(new_key > smallvec!());
+                        debug!("postpone key update to upper level {:?}", new_key);
                         next_level_altered
                             .key_modified
                             .push((new_key, page_ref.clone()));
