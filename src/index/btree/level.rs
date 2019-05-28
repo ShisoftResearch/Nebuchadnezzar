@@ -345,7 +345,7 @@ where
                             let t: &&(EntryKey, NodeCellRef) = t;
                             let k: &EntryKey = &t.0;
                             let p: &NodeCellRef = &t.1;
-                            debug_assert!(k > &smallvec!());
+                            debug_assert!(!(i > 0 && k <= &smallvec!()));
                             if p.ptr_eq(&p) {
                                 found_key = Some((i, k.clone()));
                             }
@@ -364,13 +364,14 @@ where
                     if i == 0 {
                         // cannot update the key in current level
                         // will postpone to upper level
-                        debug_assert!(new_key > smallvec!());
                         debug!("postpone key update to upper level {:?}", new_key);
                         next_level_altered
                             .key_modified
                             .push((new_key, page_ref.clone()));
                     } else {
                         // can be updated, set the new key
+                        debug!("perform key update {:?}", new_key);
+                        debug_assert!(new_key > smallvec!());
                         innode.keys.as_slice()[i - 1] = new_key;
                     }
                 }
@@ -447,7 +448,9 @@ where
     debug!("Checking corner cases");
     let mut index = 0;
     let mut corner_case_handled = false;
+    let mut current_left_bound = smallvec!();
     while index < all_pages.len() {
+        let current_right_bound = all_pages[index].right_bound().clone();
         if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
             // need to merge to the right page
@@ -481,7 +484,6 @@ where
                 let mut new_next_ptrs = PS::init();
                 let mut has_new = None;
 
-                let current_right_bound = all_pages[index].right_bound().clone();
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
@@ -603,12 +605,12 @@ where
                 // modify next node key
                 level_page_altered
                     .key_modified
-                    .push((current_right_bound.clone(), next.node_ref().clone()));
+                    .push((current_left_bound.clone(), next.node_ref().clone()));
 
                 // make current node empty
                 level_page_altered
                     .removed
-                    .push((current_right_bound, all_pages[index].node_ref().clone()));
+                    .push((current_right_bound.clone(), all_pages[index].node_ref().clone()));
                 all_pages[index].make_empty_node(false);
                 has_new
             };
@@ -620,6 +622,7 @@ where
                 1
             };
         }
+        current_left_bound = current_right_bound;
         index += 1;
     }
 
