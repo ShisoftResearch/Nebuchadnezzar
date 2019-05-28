@@ -83,7 +83,7 @@ fn init() {
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
-    let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+    let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
     let mut last_key = cursor.current().unwrap().clone();
     while cursor.next() {
         let current = cursor.current().unwrap();
@@ -141,7 +141,7 @@ fn crd() {
 
     {
         debug!("Scanning for sequence");
-        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
             let id = id_from_key(cursor.current().unwrap());
             let unmatched = i != id.lower;
@@ -161,7 +161,7 @@ fn crd() {
             assert_eq!(cursor.next(), i + 1 < num);
         }
         debug!("Forward scanning for sequence verification");
-        let mut cursor = tree.seek(&smallvec!(0), Ordering::Forward);
+        let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
             let expected = Id::new(0, i);
             debug!("Expecting id {:?}", expected);

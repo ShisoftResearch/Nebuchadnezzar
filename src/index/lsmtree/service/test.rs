@@ -4,7 +4,7 @@ use bifrost::raft::client::RaftClient;
 use client;
 use client::AsyncClient;
 use index::btree;
-use index::btree::max_entry_key;
+use index::btree::{max_entry_key, min_entry_key};
 use index::btree::test::u64_to_slice;
 use index::btree::LevelTree;
 use index::btree::NodeCellRef;
@@ -73,7 +73,7 @@ pub fn split() {
     ));
     let lsm_tree = LSMTree::new_with_levels(
         init_lsm_level_trees(),
-        (smallvec!(), max_entry_key()),
+        (min_entry_key(), max_entry_key()),
         Id::rand(),
     );
 
@@ -83,13 +83,13 @@ pub fn split() {
     thread_rng().shuffle(nums.as_mut_slice());
     nums.par_iter().for_each(|n| {
         let id = Id::new(0, *n);
-        let mut entry_key: EntryKey = smallvec!();
+        let mut entry_key: EntryKey = min_entry_key();
         key_with_id(&mut entry_key, &id);
         lsm_tree.insert(entry_key);
     });
     nums.iter().for_each(|n| {
         let id = Id::new(0, *n);
-        let mut entry_key: EntryKey = smallvec!();
+        let mut entry_key: EntryKey = min_entry_key();
         key_with_id(&mut entry_key, &id);
         let cursor = lsm_tree.seek(&entry_key, Forward);
         assert_eq!(cursor.current(), Some(&entry_key));
@@ -111,7 +111,7 @@ pub fn split() {
     let pivot: EntryKey = SmallVec::from(first.ends.clone());
     (0..test_volume).collect_vec().iter().for_each(|n| {
         let id = Id::new(0, *n);
-        let mut entry_key: EntryKey = smallvec!();
+        let mut entry_key: EntryKey = min_entry_key();
         key_with_id(&mut entry_key, &id);
         let cursor = lsm_tree.seek(&entry_key, Forward);
         if entry_key < pivot {

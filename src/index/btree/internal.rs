@@ -366,7 +366,7 @@ where
                 );
                 let pivot_key_pos = right_ptr_pos - 1;
                 let pivot_key = self.keys.as_slice()[pivot_key_pos].to_owned();
-                debug_assert!(pivot_key > smallvec!(0),
+                debug_assert!(pivot_key > min_entry_key(),
                               "Current pivot key {:?} at {} is empty, left ptr {}, right ptr {}, now keys are {:?}",
                               pivot_key, pivot_key_pos, left_ptr_pos, right_ptr_pos, self.keys);
                 for (i, key) in chain(
@@ -468,7 +468,7 @@ where
             "Setting key at pos {} to new key {:?}",
             right_key_pos, new_right_node_key
         );
-        debug_assert!(new_right_node_key > smallvec!(0));
+        debug_assert!(new_right_node_key > min_entry_key());
         self.keys.as_slice()[right_key_pos] = new_right_node_key;
         self.debug_check_integrity();
     }
@@ -481,7 +481,7 @@ where
             }
             for (i, key) in self.keys.as_slice_immute()[..self.len].iter().enumerate() {
                 debug_assert!(
-                    key > &smallvec!(0),
+                    key > &*MIN_ENTRY_KEY,
                     "{} keys {}/{} {:?}",
                     KS::slice_len(),
                     i,

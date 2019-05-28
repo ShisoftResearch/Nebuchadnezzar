@@ -407,11 +407,15 @@ impl Clone for NodeCellRef {
 
 lazy_static! {
     pub static ref MAX_ENTRY_KEY: EntryKey = max_entry_key();
-    pub static ref MIN_ENTRY_KEY: EntryKey = smallvec!(0);
+    pub static ref MIN_ENTRY_KEY: EntryKey = min_entry_key();
 }
 
 pub fn max_entry_key() -> EntryKey {
     EntryKey::from(iter::repeat(255u8).take(MAX_KEY_SIZE).collect_vec())
+}
+
+pub fn min_entry_key() -> EntryKey {
+    smallvec!()
 }
 
 type DefaultKeySliceType = [EntryKey; 0];

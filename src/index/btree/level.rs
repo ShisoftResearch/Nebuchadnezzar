@@ -17,9 +17,9 @@ use index::btree::remove::SubNodeStatus::InNodeEmpty;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::verification::{is_node_list_serial, is_node_serial};
-use index::btree::NodeCellRef;
+use index::btree::{NodeCellRef, min_entry_key};
 use index::btree::{external, BPlusTree};
-use index::btree::{LevelTree, NodeReadHandler};
+use index::btree::{LevelTree, NodeReadHandler, MIN_ENTRY_KEY};
 use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use index::EntryKey;
 use index::Slice;
@@ -55,7 +55,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let search = mut_search::<KS, PS>(node, &smallvec!());
+    let search = mut_search::<KS, PS>(node, &*MIN_ENTRY_KEY);
     match search {
         MutSearchResult::External => {
             let first_node = write_node(node);
@@ -370,7 +370,7 @@ where
                     } else {
                         // can be updated, set the new key
                         debug!("perform key update {:?}", new_key);
-                        // debug_assert!(new_key > smallvec!(), "new key is empty at {}", i);
+                        // debug_assert!(new_key > MIN_ENTRY_KEY, "new key is empty at {}", i);
                         innode.keys.as_slice()[i - 1] = new_key;
                     }
                 }
@@ -447,7 +447,7 @@ where
     debug!("Checking corner cases");
     let mut index = 0;
     let mut corner_case_handled = false;
-    let mut current_left_bound = smallvec!();
+    let mut current_left_bound = min_entry_key();
     while index < all_pages.len() {
         let current_right_bound = all_pages[index].right_bound().clone();
         if all_pages[index].len() == 0 {
@@ -596,7 +596,7 @@ where
                     level,
                     &next.keys()
                 );
-                debug_assert!(current_right_bound > smallvec!());
+                debug_assert!(&current_right_bound > &*MIN_ENTRY_KEY);
                 debug_assert!(
                     next.first_key()
                         > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()

@@ -172,7 +172,7 @@ where
                     "found key to put to right page {:?}/{:?}",
                     key,
                     if right_node.is_empty() {
-                        smallvec!(0)
+                        min_entry_key()
                     } else {
                         right_node.first_key().clone()
                     }
