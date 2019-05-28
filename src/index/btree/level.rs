@@ -377,8 +377,8 @@ where
             }
             debug_assert!(
                 is_node_serial(page),
-                "node not serial after update altered - {}",
-                level
+                "node not serial after update altered - {}, keys {:?}",
+                level, page.keys()
             );
         };
 
