@@ -23,7 +23,7 @@ use std::collections::btree_set::BTreeSet;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::mem;
+use std::{mem, panic};
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::rc::Rc;
@@ -153,6 +153,12 @@ where
         self.keys.as_slice_immute()[..self.len]
             .binary_search(key)
             .unwrap_or_else(|i| i)
+    }
+    pub fn search_unwindable(&self, key: &EntryKey) -> Result<usize, Box<dyn std::any::Any + Send + 'static>> {
+        let node = panic::AssertUnwindSafe(self);
+        panic::catch_unwind(|| {
+            node.search(key)
+        })
     }
     pub fn remove_at(&mut self, pos: usize) {
         let cached_len = &mut self.len;

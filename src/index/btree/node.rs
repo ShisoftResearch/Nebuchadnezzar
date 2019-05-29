@@ -47,11 +47,21 @@ where
             _ => false,
         }
     }
+
     pub fn search(&self, key: &EntryKey) -> usize {
         match self {
             &NodeData::Internal(ref innode) => innode.search(key),
             &NodeData::External(ref extnode) => extnode.search(key),
             _ => 0,
+        }
+    }
+
+    // search may panic if another thread is writing, this will return error if panic occurred
+    pub fn search_unwindable(&self, key: &EntryKey) -> Result<usize, Box<dyn Any + Send + 'static>> {
+        match self {
+            &NodeData::Internal(ref innode) => innode.search_unwindable(key),
+            &NodeData::External(ref extnode) => extnode.search_unwindable(key),
+            _ => Ok(0),
         }
     }
 
