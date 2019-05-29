@@ -11,13 +11,13 @@ where
     // check keys
     for i in 0..node.len() {
         if &node.keys()[i] <= &*MIN_ENTRY_KEY {
-            error!("EMPTY KEY DETECTED !!!");
+            error!("EMPTY KEY DETECTED !!! {:?}", node.keys());
             return false;
         }
     }
     for i in 1..node.len() {
         if node.keys()[i - 1] >= node.keys()[i] {
-            error!("serial check failed for key ordering");
+            error!("serial check failed for key ordering: {:?}", node.keys());
             return false;
         }
     }
