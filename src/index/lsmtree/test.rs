@@ -24,6 +24,7 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use index::btree::min_entry_key;
 
 fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {
@@ -32,7 +33,7 @@ fn dump_trees(lsm_tree: &LSMTree, name: &str) {
 }
 
 fn default_key_range() -> KeyRange {
-    (smallvec!(), smallvec!())
+    (min_entry_key(), min_entry_key())
 }
 
 #[test]

@@ -17,9 +17,9 @@ use index::btree::remove::SubNodeStatus::InNodeEmpty;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::verification::{is_node_list_serial, is_node_serial};
-use index::btree::NodeCellRef;
+use index::btree::{NodeCellRef, min_entry_key};
 use index::btree::{external, BPlusTree};
-use index::btree::{LevelTree, NodeReadHandler};
+use index::btree::{LevelTree, NodeReadHandler, MIN_ENTRY_KEY};
 use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use index::EntryKey;
 use index::Slice;
@@ -55,7 +55,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let search = mut_search::<KS, PS>(node, &smallvec!());
+    let search = mut_search::<KS, PS>(node, &*MIN_ENTRY_KEY);
     match search {
         MutSearchResult::External => {
             let first_node = write_node(node);
@@ -195,6 +195,7 @@ where
                     let new_key = k.clone();
                     let new_node_ref = n.clone();
                     let pos = innode.search(&new_key);
+                    debug!("inserting new at {} with key {:?}", pos, new_key);
                     if innode.len >= KS::slice_len() {
                         let (split_ref, split_key) =
                             innode.split_insert(new_key, new_node_ref, pos, true);
@@ -344,7 +345,6 @@ where
                             let t: &&(EntryKey, NodeCellRef) = t;
                             let k: &EntryKey = &t.0;
                             let p: &NodeCellRef = &t.1;
-                            debug_assert!(k > &smallvec!());
                             if p.ptr_eq(&p) {
                                 found_key = Some((i, k.clone()));
                             }
@@ -363,20 +363,22 @@ where
                     if i == 0 {
                         // cannot update the key in current level
                         // will postpone to upper level
-                        debug_assert!(new_key > smallvec!());
+                        debug!("postpone key update to upper level {:?}", new_key);
                         next_level_altered
                             .key_modified
                             .push((new_key, page_ref.clone()));
                     } else {
                         // can be updated, set the new key
+                        debug!("perform key update {:?}", new_key);
+                        debug_assert!(&new_key > &*MIN_ENTRY_KEY, "new key is empty at {}", i);
                         innode.keys.as_slice()[i - 1] = new_key;
                     }
                 }
             }
             debug_assert!(
                 is_node_serial(page),
-                "node not serial after update altered - {}",
-                level
+                "node not serial after update altered - {}, keys {:?}",
+                level, page.keys()
             );
         };
 
@@ -445,7 +447,9 @@ where
     debug!("Checking corner cases");
     let mut index = 0;
     let mut corner_case_handled = false;
+    let mut current_left_bound = min_entry_key();
     while index < all_pages.len() {
+        let current_right_bound = all_pages[index].right_bound().clone();
         if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
             // need to merge to the right page
@@ -468,17 +472,17 @@ where
                 let (remaining_key, remaining_ptr) = {
                     let current_innode = all_pages[index].innode();
                     let new_first_key = current_innode.right_bound.clone();
+                    let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
+                    debug_assert!(
+                        read_unchecked::<KS, PS>(&new_first_ptr).last_key() < &new_first_key
+                    );
                     debug!("Using new first key as remaining key {:?}", new_first_key);
-                    (
-                        new_first_key,
-                        current_innode.ptrs.as_slice_immute()[0].clone(),
-                    )
+                    (new_first_key, new_first_ptr)
                 };
                 let mut new_next_keys = KS::init();
                 let mut new_next_ptrs = PS::init();
                 let mut has_new = None;
 
-                let current_right_bound = all_pages[index].right_bound().clone();
                 let mut next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
@@ -552,11 +556,17 @@ where
 
                         // return the locked third node to be inserted into the all_pages
 
-                        let third_node = write_node(&third_node_ref);
+                        let third_node = write_node::<KS, PS>(&third_node_ref);
                         debug_assert!(
                             is_node_serial(&third_node),
                             "node not serial for third node - {}",
                             level
+                        );
+                        debug_assert!(
+                            third_node.first_key()
+                                > read_unchecked::<KS, PS>(
+                                    &third_node.innode().ptrs.as_slice_immute()[0]
+                                ).last_key()
                         );
                         has_new = Some(third_node)
                     } else {
@@ -586,16 +596,25 @@ where
                     level,
                     &next.keys()
                 );
-                debug_assert!(current_right_bound > smallvec!());
-                // modify next node key
-                level_page_altered
-                    .key_modified
-                    .push((current_right_bound.clone(), next.node_ref().clone()));
+                debug_assert!(&current_right_bound > &*MIN_ENTRY_KEY);
+                debug_assert!(
+                    next.first_key()
+                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()
+                );
+
+                if &current_left_bound != &*MIN_ENTRY_KEY {
+                    // modify next node key
+                    level_page_altered
+                        .key_modified
+                        .push((current_left_bound.clone(), next.node_ref().clone()));
+                } else {
+                    debug!("Skipped modify key for left bound is min key");
+                }
 
                 // make current node empty
                 level_page_altered
                     .removed
-                    .push((current_right_bound, all_pages[index].node_ref().clone()));
+                    .push((current_right_bound.clone(), all_pages[index].node_ref().clone()));
                 all_pages[index].make_empty_node(false);
                 has_new
             };
@@ -607,6 +626,7 @@ where
                 1
             };
         }
+        current_left_bound = current_right_bound;
         index += 1;
     }
 
