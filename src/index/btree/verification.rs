@@ -1,5 +1,5 @@
 use index::btree::internal::InNode;
-use index::btree::{NodeCellRef, NodeWriteGuard, write_node, BPlusTree, NodeData};
+use index::btree::{write_node, BPlusTree, NodeCellRef, NodeData, NodeWriteGuard};
 use index::{EntryKey, Slice};
 use std::fmt::Debug;
 
@@ -56,27 +56,40 @@ where
     return true;
 }
 
-pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level: usize, tree_level: usize) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+pub fn is_node_level_serial<KS, PS>(
+    mut node: NodeWriteGuard<KS, PS>,
+    lsm_level: usize,
+    tree_level: usize,
+) -> bool
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let min_key = smallvec!();
     loop {
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
             let right_bound = node.right_bound();
-            assert!(right_bound > &min_key, "node right bound > smallest possible key");
+            assert!(
+                right_bound > &min_key,
+                "node right bound > smallest possible key"
+            );
             if !is_node_serial(&node) {
                 error!("Node not serial - {} - {}", lsm_level, tree_level);
                 return false;
             }
             if node.first_key() > right_bound {
-                error!("Node have right key smaller than the first - {} - {}", lsm_level, tree_level);
+                error!(
+                    "Node have right key smaller than the first - {} - {}",
+                    lsm_level, tree_level
+                );
                 return false;
             }
             if node.last_key() > right_bound {
-                error!("Node have right key smaller than the last - {} - {}", lsm_level, tree_level);
+                error!(
+                    "Node have right key smaller than the last - {} - {}",
+                    lsm_level, tree_level
+                );
                 return false;
             }
             right_bound
@@ -85,7 +98,10 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
         };
         let next = write_node(right_ref);
         if next.is_none() {
-            debug!("Node level check reached non node - {} - {}", lsm_level, tree_level);
+            debug!(
+                "Node level check reached non node - {} - {}",
+                lsm_level, tree_level
+            );
             return true;
         }
         if !next.is_empty_node() && !node.is_empty_node() {
@@ -96,8 +112,11 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
                 return false;
             }
             if next.right_bound() < right_bound {
-                error!("next right bound key smaller than right bound - {} - {}", lsm_level, tree_level);
-                return false
+                error!(
+                    "next right bound key smaller than right bound - {} - {}",
+                    lsm_level, tree_level
+                );
+                return false;
             }
         }
         node = next;
@@ -105,23 +124,23 @@ pub fn is_node_level_serial<KS, PS>(mut node: NodeWriteGuard<KS, PS>, lsm_level:
 }
 
 pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>, level: usize) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Checking tree {} in order...", level);
     return ensure_level_in_order::<KS, PS>(&tree.get_root(), level, 0);
 }
 
 fn ensure_level_in_order<KS, PS>(node: &NodeCellRef, lsm_level: usize, tree_level: usize) -> bool
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     let first_node = write_node::<KS, PS>(&node);
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
-        _ => None
+        _ => None,
     };
     if !is_node_level_serial(first_node, lsm_level, tree_level) {
         return false;

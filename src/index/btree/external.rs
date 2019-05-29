@@ -23,12 +23,12 @@ use std::collections::btree_set::BTreeSet;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::{mem, panic};
 use std::ops::Deref;
 use std::ops::DerefMut;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::{mem, panic};
 use utils::lru_cache::LRUCache;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
@@ -154,11 +154,12 @@ where
             .binary_search(key)
             .unwrap_or_else(|i| i)
     }
-    pub fn search_unwindable(&self, key: &EntryKey) -> Result<usize, Box<dyn std::any::Any + Send + 'static>> {
+    pub fn search_unwindable(
+        &self,
+        key: &EntryKey,
+    ) -> Result<usize, Box<dyn std::any::Any + Send + 'static>> {
         let node = panic::AssertUnwindSafe(self);
-        panic::catch_unwind(|| {
-            node.search(key)
-        })
+        panic::catch_unwind(|| node.search(key))
     }
     pub fn remove_at(&mut self, pos: usize) {
         let cached_len = &mut self.len;
@@ -206,8 +207,12 @@ where
             right_bound: self.right_bound.clone(),
             mark: PhantomData,
         };
-        debug_assert!(pivot_key < self.right_bound, "pivot {:?}, right bound {:?}",
-                      pivot_key, self.right_bound);
+        debug_assert!(
+            pivot_key < self.right_bound,
+            "pivot {:?}, right bound {:?}",
+            pivot_key,
+            self.right_bound
+        );
         debug_assert!(pivot_key > smallvec!());
         debug_assert!(
             &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
@@ -226,10 +231,18 @@ where
         );
         debug_assert_eq!(self.right_bound, pivot_key);
         debug_assert_eq!(&self.right_bound, &extnode_2.keys.as_slice_immute()[0]);
-        debug_assert!(self.right_bound < extnode_2.right_bound, "node right bound >= next right bound {:?} - {:?}",
-                      self.right_bound, extnode_2.right_bound);
-        debug_assert!(self.right_bound <= extnode_2.keys.as_slice_immute()[0], "node right bound < next first key, {:?} - {:?}",
-                      self.right_bound, &extnode_2.keys.as_slice_immute()[..extnode_2.len]);
+        debug_assert!(
+            self.right_bound < extnode_2.right_bound,
+            "node right bound >= next right bound {:?} - {:?}",
+            self.right_bound,
+            extnode_2.right_bound
+        );
+        debug_assert!(
+            self.right_bound <= extnode_2.keys.as_slice_immute()[0],
+            "node right bound < next first key, {:?} - {:?}",
+            self.right_bound,
+            &extnode_2.keys.as_slice_immute()[..extnode_2.len]
+        );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();
