@@ -58,6 +58,7 @@ where
     let search = mut_search::<KS, PS>(node, &*MIN_ENTRY_KEY);
     match search {
         MutSearchResult::External => {
+            debug!("Acquiring first node");
             let first_node = write_node(node);
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
             let mut collected_keys = first_node.len();
@@ -65,6 +66,7 @@ where
             let target_keys = min(KS::slice_len() * LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3);
             let target_guards = LEVEL_2;
             while collected_keys < target_keys && collected.len() < target_guards {
+                debug!("Acquiring select collection node");
                 let right = write_node(collected.last_mut().unwrap().right_ref().unwrap());
                 if right.is_none() {
                     break;
@@ -116,6 +118,7 @@ where
     altered_keys.key_modified.sort_by(|a, b| a.0.cmp(&b.0));
     altered_keys.added.sort_by(|a, b| a.0.cmp(&b.0));
 
+    debug!("Acquiring first prune node");
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     let removed_iter = || altered_keys.removed.iter();
     let altered_iter = || altered_keys.key_modified.iter();
@@ -161,6 +164,7 @@ where
         {
             break;
         }
+        debug!("Acquiring pruning node");
         let next = write_node::<KS, PS>(&last_innode.right);
         debug_assert!(!next.is_none(), "ended at none without empty altered list, remains, removed {}; altered {}; added {}, was {} - {} - {}",
                       removed_ptrs.count(), altered_ptrs.count(), added_ptrs.count(),
@@ -460,7 +464,7 @@ where
             debug!("Dealing with emptying node {}", index);
             corner_case_handled = true;
             let mut next_from_ptr = if index + 1 >= all_pages.len() {
-                debug!("Trying to fetch node guard for last node right");
+                debug!("Acquiring node guard for last node right");
                 let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
                 debug_assert!(!ptr_right.is_empty_node());
                 Some(ptr_right)
@@ -557,6 +561,7 @@ where
 
                         // return the locked third node to be inserted into the all_pages
 
+                        debug!("Acquiring for third node");
                         let third_node = write_node::<KS, PS>(&third_node_ref);
                         debug_assert!(
                             is_node_serial(&third_node),
@@ -732,6 +737,7 @@ where
             g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
         }
 
+        debug!("Acquiring new first node");
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut();
         debug!(
