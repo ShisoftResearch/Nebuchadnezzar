@@ -4,6 +4,7 @@ use byteorder::WriteBytesExt;
 use client;
 use futures::prelude::*;
 use index::btree;
+use index::btree::min_entry_key;
 use index::btree::test::u64_to_slice;
 use index::key_with_id;
 use index::lsmtree::tree::KeyRange;
@@ -24,7 +25,6 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use index::btree::min_entry_key;
 
 fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {

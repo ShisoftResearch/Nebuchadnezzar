@@ -17,8 +17,8 @@ use index::btree::remove::SubNodeStatus::InNodeEmpty;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::verification::{is_node_list_serial, is_node_serial};
-use index::btree::{NodeCellRef, min_entry_key};
 use index::btree::{external, BPlusTree};
+use index::btree::{min_entry_key, NodeCellRef};
 use index::btree::{LevelTree, NodeReadHandler, MIN_ENTRY_KEY};
 use index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use index::EntryKey;
@@ -378,7 +378,8 @@ where
             debug_assert!(
                 is_node_serial(page),
                 "node not serial after update altered - {}, keys {:?}",
-                level, page.keys()
+                level,
+                page.keys()
             );
         };
 
@@ -566,7 +567,8 @@ where
                             third_node.first_key()
                                 > read_unchecked::<KS, PS>(
                                     &third_node.innode().ptrs.as_slice_immute()[0]
-                                ).last_key()
+                                )
+                                .last_key()
                         );
                         has_new = Some(third_node)
                     } else {
@@ -599,7 +601,8 @@ where
                 debug_assert!(&current_right_bound > &*MIN_ENTRY_KEY);
                 debug_assert!(
                     next.first_key()
-                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0]).last_key()
+                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0])
+                            .last_key()
                 );
 
                 if &current_left_bound != &*MIN_ENTRY_KEY {
@@ -612,9 +615,10 @@ where
                 }
 
                 // make current node empty
-                level_page_altered
-                    .removed
-                    .push((current_right_bound.clone(), all_pages[index].node_ref().clone()));
+                level_page_altered.removed.push((
+                    current_right_bound.clone(),
+                    all_pages[index].node_ref().clone(),
+                ));
                 all_pages[index].make_empty_node(false);
                 has_new
             };

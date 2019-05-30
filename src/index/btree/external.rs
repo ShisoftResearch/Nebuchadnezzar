@@ -200,8 +200,12 @@ where
             right_bound: self.right_bound.clone(),
             mark: PhantomData,
         };
-        debug_assert!(pivot_key < self.right_bound, "pivot {:?}, right bound {:?}",
-                      pivot_key, self.right_bound);
+        debug_assert!(
+            pivot_key < self.right_bound,
+            "pivot {:?}, right bound {:?}",
+            pivot_key,
+            self.right_bound
+        );
         debug_assert!(pivot_key > smallvec!());
         debug_assert!(
             &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
@@ -220,10 +224,18 @@ where
         );
         debug_assert_eq!(self.right_bound, pivot_key);
         debug_assert_eq!(&self.right_bound, &extnode_2.keys.as_slice_immute()[0]);
-        debug_assert!(self.right_bound < extnode_2.right_bound, "node right bound >= next right bound {:?} - {:?}",
-                      self.right_bound, extnode_2.right_bound);
-        debug_assert!(self.right_bound <= extnode_2.keys.as_slice_immute()[0], "node right bound < next first key, {:?} - {:?}",
-                      self.right_bound, &extnode_2.keys.as_slice_immute()[..extnode_2.len]);
+        debug_assert!(
+            self.right_bound < extnode_2.right_bound,
+            "node right bound >= next right bound {:?} - {:?}",
+            self.right_bound,
+            extnode_2.right_bound
+        );
+        debug_assert!(
+            self.right_bound <= extnode_2.keys.as_slice_immute()[0],
+            "node right bound < next first key, {:?} - {:?}",
+            self.right_bound,
+            &extnode_2.keys.as_slice_immute()[..extnode_2.len]
+        );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut();

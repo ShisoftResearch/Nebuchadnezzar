@@ -1,6 +1,6 @@
 use client::AsyncClient;
-use index::btree::{LevelTree, verification};
 use index::btree::NodeCellRef;
+use index::btree::{verification, LevelTree};
 use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
 use index::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
