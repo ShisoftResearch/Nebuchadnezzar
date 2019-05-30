@@ -15,6 +15,6 @@ Distributed in-memory Key-Value store, optional transaction, made to power the [
 
 Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure version](https://github.com/shisoft/Nebuchadnezzar/tree/clojure-version) and will stay with rust afterwards.  
 
-Copyright © 2017 Shisoft Research
+Copyright © 2019 Shisoft Research
 
 Distributed under the GNU Lesser General Public License v3.0 or any later version.
