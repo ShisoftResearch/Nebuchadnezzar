@@ -3,24 +3,32 @@ use index::btree::{NodeCellRef, NodeWriteGuard, write_node, BPlusTree, NodeData,
 use index::{EntryKey, Slice};
 use std::fmt::Debug;
 
+pub fn are_keys_serial(keys: &[EntryKey]) -> bool {
+    for i in 1..keys.len() {
+        if keys[i - 1] >= keys[i] {
+            error!("serial check failed for key ordering");
+            return false;
+        }
+    }
+    return true
+}
+
 pub fn is_node_serial<KS, PS>(node: &NodeWriteGuard<KS, PS>) -> bool
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
+    if !are_keys_serial(node.keys()) {
+        return false;
+    }
     for i in 0..node.len() {
         if &node.keys()[i] <= &*MIN_ENTRY_KEY {
             error!("EMPTY KEY DETECTED !!!");
             return false;
         }
     }
-    for i in 1..node.len() {
-        if node.keys()[i - 1] >= node.keys()[i] {
-            error!("serial check failed for key ordering");
-            return false;
-        }
-    }
+
     true
 }
 
