@@ -6,10 +6,11 @@ use index::btree::Slice;
 use index::btree::*;
 use index::EntryKey;
 use itertools::free::chain;
+use std::any::Any;
 use std::cell::UnsafeCell;
-use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
+use std::{mem, panic};
 
 pub struct InNode<KS, PS>
 where
@@ -67,6 +68,13 @@ where
             .binary_search(key)
             .map(|i| i + 1)
             .unwrap_or_else(|i| i)
+    }
+    pub fn search_unwindable(
+        &self,
+        key: &EntryKey,
+    ) -> Result<usize, Box<dyn Any + Send + 'static>> {
+        let node = panic::AssertUnwindSafe(self);
+        panic::catch_unwind(|| node.search(key))
     }
     pub fn remove_at(&mut self, ptr_pos: usize) {
         {

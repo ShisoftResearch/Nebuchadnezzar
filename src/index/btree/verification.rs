@@ -24,11 +24,10 @@ where
     }
     for i in 0..node.len() {
         if &node.keys()[i] <= &*MIN_ENTRY_KEY {
-            error!("EMPTY KEY DETECTED !!!");
+            error!("EMPTY KEY DETECTED at {} !!! {:?}", i, node.keys());
             return false;
         }
     }
-
     true
 }
 

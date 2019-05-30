@@ -10,6 +10,7 @@ use index::Ordering;
 use index::Slice;
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::panic;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
@@ -37,7 +38,13 @@ where
             return Err(right_node.clone());
         }
         debug!("search node have keys {:?}", node.keys());
-        let mut pos = node.search(key);
+        let mut pos = match node.search_unwindable(key) {
+            Ok(pos) => pos,
+            Err(_) => {
+                warn!("Search cursor failed, expecting retry");
+                return Err(node_ref.clone());
+            }
+        };
         match node {
             &NodeData::External(ref n) => {
                 debug!(
@@ -91,7 +98,13 @@ where
 {
     let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
         &NodeData::Internal(ref n) => {
-            let pos = n.search(key);
+            let pos = match n.search_unwindable(key) {
+                Ok(pos) => pos,
+                Err(_) => {
+                    warn!("Search paniced in mut_search, expecting retry");
+                    return Err(node_ref.clone());
+                }
+            };
             let sub_node = n.ptrs.as_slice_immute()[pos].clone();
             Ok(MutSearchResult::Internal(sub_node))
         }
