@@ -247,7 +247,7 @@ where
             let mut self_next_node = self_next.extnode_mut();
             debug_assert!(
                 Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner),
-                "{:?}",
+                "node next node's prev node is not self {:?}",
                 self_next_node.keys.as_slice_immute()[0]
             );
             self_next_node.prev = node_2.clone();
