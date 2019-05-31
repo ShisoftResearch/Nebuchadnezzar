@@ -158,8 +158,7 @@ where
         &self,
         key: &EntryKey,
     ) -> Result<usize, Box<dyn std::any::Any + Send + 'static>> {
-        let node = panic::AssertUnwindSafe(self);
-        panic::catch_unwind(|| node.search(key))
+        panic::catch_unwind(panic::AssertUnwindSafe(|| self.search(key)))
     }
     pub fn remove_at(&mut self, pos: usize) {
         let cached_len = &mut self.len;
