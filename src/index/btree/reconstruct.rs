@@ -19,6 +19,7 @@ use std::mem;
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use utils::chashmap::WriteGuard;
 
 pub struct TreeConstructor<KS, PS>
 where
@@ -43,14 +44,15 @@ where
         self.push(0, node, None, first_key);
     }
 
-    fn push(&mut self, level: usize, node: &NodeCellRef, level_first: Option<&NodeCellRef>, left_bound: EntryKey) {
+    fn push(&mut self, level: usize, node: &NodeCellRef, left_node: Option<&mut NodeWriteGuard<KS, PS>>, left_bound: EntryKey) {
         let mut new_tree = false;
         debug!("Push node at {}", level);
         if self.level_guards.len() < level + 1 {
             debug!("Creating new level {}", level);
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
             if level > 0 {
-                new_root_innode.ptrs.as_slice()[0] = level_first.unwrap().clone();
+                let mut left_node = left_node.unwrap();
+                new_root_innode.ptrs.as_slice()[0] = left_node.node_ref().clone();
             } else {
                 new_tree = true;
             }
@@ -59,22 +61,22 @@ where
                 .push(Rc::new(RefCell::new(write_node::<KS, PS>(&new_root_ref))));
         }
         let parent_page_ref = self.level_guards[level].clone();
-        let mut parent_guard = parent_page_ref.borrow_mut();
+        let mut node_guard = parent_page_ref.borrow_mut();
         let cap = KS::slice_len();
-        if parent_guard.len() >= cap {
+        if node_guard.len() >= cap {
             // current page overflowed, need a new page
             debug!("Creating new node at level {}", level);
             let mut new_innode = InNode::<KS, PS>::new(1, max_entry_key());
-            let parent_right_bound = parent_guard.last_key().clone();
+            let parent_right_bound = node_guard.last_key().clone();
             let new_innode_head_ptr = {
                 // take a key and a ptr from current page to new page
                 // reset current page right bound to the taken key
                 // return the taken ptr
-                let mut parent_innode = parent_guard.innode_mut();
-                parent_innode.len -= 1;
-                parent_innode.right_bound = parent_right_bound.clone();
+                let mut node_innode = node_guard.innode_mut();
+                node_innode.len -= 1;
+                node_innode.right_bound = parent_right_bound.clone();
                 mem::replace(
-                    &mut parent_innode.ptrs.as_slice()[cap],
+                    &mut node_innode.ptrs.as_slice()[cap],
                     NodeCellRef::default(),
                 )
             };
@@ -83,10 +85,11 @@ where
             new_innode.ptrs.as_slice()[1] = node.clone();
             new_innode.keys.as_slice()[0] = left_bound;
             let new_node = NodeCellRef::new(Node::with_internal(new_innode));
-            self.push(level + 1, &new_node, Some(parent_guard.node_ref()), parent_right_bound);
-            *parent_guard = write_node::<KS, PS>(&new_node);
+            self.push(level + 1, &new_node, Some(&mut*node_guard), parent_right_bound);
+            node_guard.right_ref_mut().map(|rn| *rn = new_node.clone());
+            *node_guard = write_node::<KS, PS>(&new_node);
         } else {
-            let mut parent_innode = parent_guard.innode_mut();
+            let mut parent_innode = node_guard.innode_mut();
             let new_len = if new_tree {
                 0
             } else {
