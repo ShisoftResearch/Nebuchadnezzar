@@ -138,6 +138,17 @@ where
         reconstruct::reconstruct_from_head_id(*head_id, neb)
     }
 
+    pub fn from_root(root: NodeCellRef, head_id: Id, len: usize) -> Self {
+        BPlusTree {
+            root: RwLock::new(root),
+            root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
+            head_page_id: head_id,
+            len: AtomicUsize::new(len),
+            deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
+            marker: PhantomData,
+        }
+    }
+
     pub fn get_root(&self) -> NodeCellRef {
         self.root.read().clone()
     }

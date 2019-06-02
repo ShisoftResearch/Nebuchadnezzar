@@ -8,6 +8,7 @@ use futures::future::Future;
 use hermes::stm::TxnValRef;
 use index::btree::dump::dump_tree;
 use index::btree::node::*;
+use index::btree::reconstruct::TreeConstructor;
 use index::btree::NodeCellRef;
 use index::btree::NodeData;
 use index::Cursor;
@@ -595,6 +596,70 @@ fn level_merge_insertion() {
     numbers.sort();
     for num in numbers {
         let n = num as u64;
+        let id = Id::new(0, n);
+        let key_slice = u64_to_slice(n);
+        let mut key = SmallVec::from_slice(&key_slice);
+        key_with_id(&mut key, &id);
+        let cursor = tree.seek(&key, Ordering::Forward);
+        assert_eq!(&key, cursor.current().unwrap());
+    }
+}
+
+#[test]
+fn reconstruct() {
+    env_logger::init();
+    let server_addr = String::from("127.0.0.1:5800");
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 1,
+            memory_size: 3 * 1024 * 1024 * 1024,
+            backup_storage: None,
+            wal_storage: None,
+            services: vec![server::Service::Cell, server::Service::LSMTreeIndex],
+        },
+        &server_addr,
+        "reconstruct_test",
+    );
+    let num = env::var("BTREE_RECONSTRUCT_TEST")
+        // this value cannot do anything useful to the test
+        // must arrange a long-term test to cover every levels
+        .unwrap_or("1000".to_string())
+        .parse::<u64>()
+        .unwrap();
+
+    let tree = {
+        let mut reconstructor = TreeConstructor::<TinyKeySlice, TinyPtrSlice>::new();
+        let new_node = || ExtNode::<TinyKeySlice, TinyPtrSlice>::new(Id::rand(), max_entry_key());
+        let mut nodes = vec![];
+        let mut last_node = new_node();
+        for i in 0..num {
+            if last_node.len == TINY_PAGE_SIZE {
+                nodes.push(last_node);
+                last_node = new_node();
+            }
+            let id = Id::new(0, i);
+            let key_slice = u64_to_slice(i);
+            let mut key = SmallVec::from_slice(&key_slice);
+            key_with_id(&mut key, &id);
+            last_node.keys.as_slice()[last_node.len] = key;
+            last_node.len += 1;
+        }
+        nodes.push(last_node);
+        let nodes = nodes
+            .into_iter()
+            .map(|n| NodeCellRef::new(Node::with_external(n)))
+            .collect_vec();
+        debug!("Total {} external nodes", nodes.len());
+        nodes.iter().for_each(|n| {
+            let first_node = read_unchecked::<TinyKeySlice, TinyPtrSlice>(n)
+                .first_key()
+                .clone();
+            reconstructor.push_extnode(n, first_node);
+        });
+        BPlusTree::<TinyKeySlice, TinyPtrSlice>::from_root(reconstructor.root(), Id::rand(), num as usize)
+    };
+    dump_tree(&tree, "reconstruct_first_run_dump.json");
+    for n in 0..num {
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
         let mut key = SmallVec::from_slice(&key_slice);

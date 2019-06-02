@@ -45,6 +45,7 @@ where
 
     fn push(&mut self, level: usize, node: &NodeCellRef, first_key: EntryKey) {
         let mut new_level = false;
+        debug!("Push node with first key: {:?}", first_key);
         if self.level_guards.len() < level + 1 {
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
             let new_root_ref = NodeCellRef::new(Node::with_internal(new_root_innode));
@@ -93,6 +94,7 @@ where
     }
 
     pub fn root(&self) -> NodeCellRef {
+        debug_assert!(self.level_guards.len() > 0, "reconstructed levels is zero");
         let last_ref = self.level_guards.last().unwrap().clone();
         let last_guard = last_ref.borrow();
         if last_guard.len() == 0 {
@@ -119,8 +121,7 @@ where
         let next_id = page.next_id;
         let prev_id = page.prev_id;
         let mut node = page.node;
-        id = next_id;
-        at_end = id.is_unit_id();
+        at_end = next_id.is_unit_id();
         if at_end {
             node.next = NodeCellRef::new_none::<KS, PS>();
         }
@@ -146,14 +147,8 @@ where
         }
         constructor.push_extnode(&node_ref, first_key);
         prev_ref = node_ref;
+        id = next_id;
     }
     let root = constructor.root();
-    BPlusTree {
-        root: RwLock::new(root),
-        root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
-        head_page_id: head_id,
-        len: AtomicUsize::new(len),
-        deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
-        marker: PhantomData,
-    }
+    BPlusTree::from_root(root, head_id, len)
 }
