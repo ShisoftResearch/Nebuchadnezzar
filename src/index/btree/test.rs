@@ -650,7 +650,7 @@ fn reconstruct() {
             .into_iter()
             .map(|n| NodeCellRef::new(Node::with_external(n)))
             .collect_vec();
-        nodes.iter().enumerate().for_each(|(i, nr)|{
+        nodes.iter().enumerate().for_each(|(i, nr)| {
             if i == 0 {
                 return;
             }
@@ -670,7 +670,11 @@ fn reconstruct() {
                 .clone();
             reconstructor.push_extnode(n, first_node);
         });
-        BPlusTree::<TinyKeySlice, TinyPtrSlice>::from_root(reconstructor.root(), Id::rand(), num as usize)
+        BPlusTree::<TinyKeySlice, TinyPtrSlice>::from_root(
+            reconstructor.root(),
+            Id::rand(),
+            num as usize,
+        )
     };
     dump_tree(&tree, "reconstruct_first_run_dump.json");
     for n in 0..num {

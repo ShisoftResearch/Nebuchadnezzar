@@ -44,7 +44,13 @@ where
         self.push(0, node, None, first_key);
     }
 
-    fn push(&mut self, level: usize, node: &NodeCellRef, left_node: Option<&mut NodeWriteGuard<KS, PS>>, left_bound: EntryKey) {
+    fn push(
+        &mut self,
+        level: usize,
+        node: &NodeCellRef,
+        left_node: Option<&mut NodeWriteGuard<KS, PS>>,
+        left_bound: EntryKey,
+    ) {
         let mut new_tree = false;
         debug!("Push node at {}", level);
         if self.level_guards.len() < level + 1 {
@@ -85,7 +91,12 @@ where
             new_innode.ptrs.as_slice()[1] = node.clone();
             new_innode.keys.as_slice()[0] = left_bound;
             let new_node = NodeCellRef::new(Node::with_internal(new_innode));
-            self.push(level + 1, &new_node, Some(&mut*node_guard), parent_right_bound);
+            self.push(
+                level + 1,
+                &new_node,
+                Some(&mut *node_guard),
+                parent_right_bound,
+            );
             node_guard.right_ref_mut().map(|rn| *rn = new_node.clone());
             *node_guard = write_node::<KS, PS>(&new_node);
         } else {
