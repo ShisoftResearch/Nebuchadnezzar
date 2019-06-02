@@ -40,24 +40,30 @@ where
     }
 
     pub fn push_extnode(&mut self, node: &NodeCellRef, first_key: EntryKey) {
-        self.push(0, node, first_key);
+        self.push(0, node, None, first_key);
     }
 
-    fn push(&mut self, level: usize, node: &NodeCellRef, first_key: EntryKey) {
-        let mut new_level = false;
-        debug!("Push node with first key: {:?}", first_key);
+    fn push(&mut self, level: usize, node: &NodeCellRef, level_first: Option<&NodeCellRef>, left_bound: EntryKey) {
+        let mut new_tree = false;
+        debug!("Push node at {}", level);
         if self.level_guards.len() < level + 1 {
+            debug!("Creating new level {}", level);
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
+            if level > 0 {
+                new_root_innode.ptrs.as_slice()[0] = level_first.unwrap().clone();
+            } else {
+                new_tree = true;
+            }
             let new_root_ref = NodeCellRef::new(Node::with_internal(new_root_innode));
             self.level_guards
                 .push(Rc::new(RefCell::new(write_node::<KS, PS>(&new_root_ref))));
-            new_level = true;
         }
         let parent_page_ref = self.level_guards[level].clone();
         let mut parent_guard = parent_page_ref.borrow_mut();
         let cap = KS::slice_len();
         if parent_guard.len() >= cap {
             // current page overflowed, need a new page
+            debug!("Creating new node at level {}", level);
             let mut new_innode = InNode::<KS, PS>::new(1, max_entry_key());
             let parent_right_bound = parent_guard.last_key().clone();
             let new_innode_head_ptr = {
@@ -75,17 +81,17 @@ where
             // arrange a valid new page by putting the ptr from current page at 1st
             new_innode.ptrs.as_slice()[0] = new_innode_head_ptr;
             new_innode.ptrs.as_slice()[1] = node.clone();
-            new_innode.keys.as_slice()[0] = first_key;
+            new_innode.keys.as_slice()[0] = left_bound;
             let new_node = NodeCellRef::new(Node::with_internal(new_innode));
+            self.push(level + 1, &new_node, Some(parent_guard.node_ref()), parent_right_bound);
             *parent_guard = write_node::<KS, PS>(&new_node);
-            self.push(level + 1, &new_node, parent_right_bound)
         } else {
             let mut parent_innode = parent_guard.innode_mut();
-            let new_len = if new_level {
+            let new_len = if new_tree {
                 0
             } else {
                 let len = parent_innode.len;
-                parent_innode.keys.as_slice()[len] = first_key;
+                parent_innode.keys.as_slice()[len] = left_bound;
                 len + 1
             };
             parent_innode.ptrs.as_slice()[new_len] = node.clone();
@@ -95,11 +101,14 @@ where
 
     pub fn root(&self) -> NodeCellRef {
         debug_assert!(self.level_guards.len() > 0, "reconstructed levels is zero");
+        debug!("The tree have {} levels", self.level_guards.len());
         let last_ref = self.level_guards.last().unwrap().clone();
         let last_guard = last_ref.borrow();
         if last_guard.len() == 0 {
+            debug!("Taking root from first ptr of overprovisioned level root");
             last_guard.innode().ptrs.as_slice_immute()[0].clone()
         } else {
+            debug!("Taking level root");
             last_guard.node_ref().clone()
         }
     }

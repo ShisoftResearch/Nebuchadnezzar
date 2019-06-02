@@ -623,7 +623,7 @@ fn reconstruct() {
     let num = env::var("BTREE_RECONSTRUCT_TEST")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
-        .unwrap_or("1000".to_string())
+        .unwrap_or("1002".to_string())
         .parse::<u64>()
         .unwrap();
 
