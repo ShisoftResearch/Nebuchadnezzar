@@ -623,7 +623,7 @@ fn reconstruct() {
     let num = env::var("BTREE_RECONSTRUCT_TEST")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
-        .unwrap_or("1002".to_string())
+        .unwrap_or("1000".to_string())
         .parse::<u64>()
         .unwrap();
 
@@ -633,14 +633,15 @@ fn reconstruct() {
         let mut nodes = vec![];
         let mut last_node = new_node();
         for i in 0..num {
-            if last_node.len == TINY_PAGE_SIZE {
-                nodes.push(last_node);
-                last_node = new_node();
-            }
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
+            if last_node.len == TINY_PAGE_SIZE {
+                last_node.right_bound = key.clone();
+                nodes.push(last_node);
+                last_node = new_node();
+            }
             last_node.keys.as_slice()[last_node.len] = key;
             last_node.len += 1;
         }
@@ -649,6 +650,19 @@ fn reconstruct() {
             .into_iter()
             .map(|n| NodeCellRef::new(Node::with_external(n)))
             .collect_vec();
+        nodes.iter().enumerate().for_each(|(i, nr)|{
+            if i == 0 {
+                return;
+            }
+            let mut node = write_node::<TinyKeySlice, TinyPtrSlice>(&nodes[i]);
+            let mut prev = write_node::<TinyKeySlice, TinyPtrSlice>(&nodes[i - 1]);
+            let node_ref = node.node_ref().clone();
+            let prev_ref = prev.node_ref().clone();
+            let mut node_extnode = node.extnode_mut();
+            let mut prev_extnode = prev.extnode_mut();
+            node_extnode.prev = prev_ref;
+            prev_extnode.next = node_ref;
+        });
         debug!("Total {} external nodes", nodes.len());
         nodes.iter().for_each(|n| {
             let first_node = read_unchecked::<TinyKeySlice, TinyPtrSlice>(n)
