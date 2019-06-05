@@ -685,5 +685,4 @@ fn reconstruct() {
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());
     }
-
 }

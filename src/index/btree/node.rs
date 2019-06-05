@@ -1,12 +1,12 @@
 use super::*;
+use futures::future;
+use server;
 use std::any::TypeId;
 use std::collections::btree_set::BTreeSet;
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
-use futures::future;
-use server;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -575,9 +575,7 @@ where
     ) -> Box<Future<Item = (), Error = ()>> {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
-            &mut NodeData::External(ref mut node) => {
-                node.persist(deletion, neb)
-            }
+            &mut NodeData::External(ref mut node) => node.persist(deletion, neb),
             _ => box future::err(()),
         }
     }

@@ -14,7 +14,7 @@ use index::Ordering::{Backward, Forward};
 use itertools::Itertools;
 use ram::types::RandValue;
 use rayon::prelude::*;
-use server::{NebServer, rpc_client_by_id};
+use server::{rpc_client_by_id, NebServer};
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;

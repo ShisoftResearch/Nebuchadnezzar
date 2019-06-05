@@ -6,8 +6,8 @@ use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
-use bifrost::rpc::{Server, RPCError, RPCClient};
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
+use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use bifrost::utils::fut_exec::wait;
 use bifrost::vector_clock::ServerVectorClock;
@@ -209,7 +209,10 @@ impl NebServer {
         self.member_pool
             .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
     }
-    pub fn get_member_by_server_id_async(&self, server_id: u64) -> impl Future<Item = Arc<RPCClient>, Error = io::Error> {
+    pub fn get_member_by_server_id_async(
+        &self,
+        server_id: u64,
+    ) -> impl Future<Item = Arc<RPCClient>, Error = io::Error> {
         let cons_hash = self.consh.clone();
         self.member_pool
             .get_by_id_async(server_id, move |_| cons_hash.to_server_name(server_id))

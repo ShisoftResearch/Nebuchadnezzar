@@ -171,7 +171,7 @@ impl Service for LSMTreeService {
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key))))
+                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
         )
     }
 

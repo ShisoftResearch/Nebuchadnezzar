@@ -3,7 +3,7 @@ use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL, RPCClient};
+use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ struct AsyncClientInner {
     pub schema_client: SchemaClient,
 }
 
-pub fn client_by_rpc_client(rpc: &Arc<RPCClient>, ) -> Arc<plain_server::AsyncServiceClient> {
+pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
     plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
 }
 

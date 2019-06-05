@@ -6,6 +6,7 @@ use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
+use futures::future;
 use futures::Future;
 use index::btree::*;
 use index::EntryKey;
@@ -15,6 +16,7 @@ use owning_ref::{OwningHandle, OwningRef, RcRef};
 use ram::cell::Cell;
 use ram::schema::{Field, Schema};
 use ram::types::*;
+use server;
 use std::cell::Ref;
 use std::cell::RefCell;
 use std::cell::RefMut;
@@ -30,8 +32,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{mem, panic};
 use utils::lru_cache::LRUCache;
-use futures::future;
-use server;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -408,11 +408,18 @@ where
         });
     }
 
-    pub fn persist(&mut self, deleted: &DeletionSetInneer, neb: &server::cell_rpc::AsyncServiceClient) -> Box<Future<Item = (), Error = ()>> {
+    pub fn persist(
+        &mut self,
+        deleted: &DeletionSetInneer,
+        neb: &server::cell_rpc::AsyncServiceClient,
+    ) -> Box<Future<Item = (), Error = ()>> {
         if self.is_dirty() {
             self.dirty = false; // TODO: unset dirty after upsert
             let cell = self.to_cell(deleted);
-            box neb.upsert_cell(cell).map_err(|_| ()).map(|r| { r.unwrap(); () })
+            box neb.upsert_cell(cell).map_err(|_| ()).map(|r| {
+                r.unwrap();
+                ()
+            })
         } else {
             box future::err(())
         }
