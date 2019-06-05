@@ -3,6 +3,7 @@ use bifrost::rpc::*;
 use bifrost_plugins::hash_ident;
 use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
+use index::btree::storage::store_changed_nodes;
 use index::lsmtree::service::inner::LSMTreeIns;
 use index::lsmtree::split::check_and_split;
 use index::lsmtree::tree::{LSMTree, LSMTreeResult};
@@ -18,7 +19,6 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
-use index::btree::storage::store_changed_nodes;
 
 mod inner;
 #[cfg(test)]
@@ -173,8 +173,9 @@ impl Service for LSMTreeService {
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key))))
-        ).and_then(|o| persist(neb, o))
+                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
+        )
+        .and_then(|o| persist(neb, o))
     }
 
     fn merge(
@@ -194,7 +195,8 @@ impl Service for LSMTreeService {
                         tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect())
                     })
                 }),
-        ).and_then(|o| persist(neb, o))
+        )
+        .and_then(|o| persist(neb, o))
     }
 
     fn set_epoch(
@@ -230,5 +232,5 @@ impl LSMTreeService {
 }
 
 fn persist<T, E>(neb: Arc<NebServer>, val: T) -> impl Future<Item = T, Error = E> {
-    store_changed_nodes(neb).then(move |_|  future::ok(val))
+    store_changed_nodes(neb).then(move |_| future::ok(val))
 }
