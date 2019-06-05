@@ -16,12 +16,7 @@ pub fn store_changed_nodes(neb: Arc<NebServer>) -> impl Future<Item = (), Error 
         .into_iter()
         .group_by(move |(id, _)| neb.get_server_id_by_id(id).unwrap())
         .into_iter()
-        .map(|(sid, group)| {
-            (
-                sid,
-                group.map(|(id, node)| (id, node.clone())).collect_vec(),
-            )
-        })
+        .map(|(sid, group)| (sid, group.map(|(id, node)| (id, node)).collect_vec()))
         .map(move |(sid, group)| {
             let rpc_client = neb_2.get_member_by_server_id_async(sid);
             rpc_client.map_err(move |_| ()).and_then(|c| {
