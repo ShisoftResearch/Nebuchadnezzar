@@ -18,6 +18,7 @@ use std::path::Component::CurDir;
 use std::sync::atomic;
 use std::sync::atomic::AtomicU64;
 use std::thread;
+use index::btree::storage::store_changed_nodes;
 
 mod inner;
 #[cfg(test)]
@@ -167,12 +168,13 @@ impl Service for LSMTreeService {
         epoch: u64,
     ) -> Box<Future<Item = LSMTreeResult<bool>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
+        let neb = self.neb_server.clone();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
-        )
+                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key))))
+        ).and_then(|o| persist(neb, o))
     }
 
     fn merge(
@@ -182,6 +184,7 @@ impl Service for LSMTreeService {
         epoch: u64,
     ) -> Box<Future<Item = LSMTreeResult<()>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
+        let neb = self.neb_server.clone();
         box future::result(
             trees
                 .get(&tree_id)
@@ -191,7 +194,7 @@ impl Service for LSMTreeService {
                         tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect())
                     })
                 }),
-        )
+        ).and_then(|o| persist(neb, o))
     }
 
     fn set_epoch(
@@ -224,9 +227,8 @@ impl LSMTreeService {
             sm: sm.clone(),
         })
     }
+}
 
-    fn persist<T>(&self, val: T) -> T {
-        unimplemented!()
-        // let client =
-    }
+fn persist<T, E>(neb: Arc<NebServer>, val: T) -> impl Future<Item = T, Error = E> {
+    store_changed_nodes(neb).then(move |_|  future::ok(val))
 }

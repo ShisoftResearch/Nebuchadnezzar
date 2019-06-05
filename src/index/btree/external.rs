@@ -49,6 +49,7 @@ thread_local! {
     static CHANGED_NODES: RefCell<BTreeMap<Id, Option<ChangingNode>>> = RefCell::new(BTreeMap::new());
 }
 
+#[derive(Clone)]
 pub struct ChangingNode {
     pub node: NodeCellRef,
     pub deletion: DeletionSet,
