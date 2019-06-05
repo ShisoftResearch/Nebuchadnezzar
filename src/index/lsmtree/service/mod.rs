@@ -171,7 +171,7 @@ impl Service for LSMTreeService {
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
+                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key))))
         )
     }
 
@@ -225,19 +225,8 @@ impl LSMTreeService {
         })
     }
 
-    pub fn start_sentinel(&self) {
-        let trees_lock = self.trees.clone();
-        let sm = self.sm.clone();
-        let neb = self.neb_server.clone();
-        thread::Builder::new()
-            .name("LSM-Tree Service Sentinel".to_string())
-            .spawn(move || loop {
-                let trees = trees_lock.read().values().cloned().collect_vec();
-                trees.par_iter().for_each(|tree| {
-                    tree.check_and_merge();
-                    tree.check_and_split(&sm, &neb);
-                });
-                thread::sleep(Duration::from_millis(100));
-            });
+    fn persist<T>(&self, val: T) -> T {
+        unimplemented!()
+        // let client =
     }
 }

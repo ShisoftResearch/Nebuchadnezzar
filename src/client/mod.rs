@@ -3,7 +3,7 @@ use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL, RPCClient};
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ struct AsyncClientInner {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
+}
+
+pub fn client_by_rpc_client(rpc: &Arc<RPCClient>, ) -> Arc<plain_server::AsyncServiceClient> {
+    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
 }
 
 impl AsyncClientInner {
@@ -71,16 +75,14 @@ impl AsyncClientInner {
         }
     }
 
-    fn client_by_server_id(
+    pub fn client_by_server_id(
         this: Arc<Self>,
         server_id: u64,
     ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
         DEFAULT_CLIENT_POOL
             .get_by_id_async(server_id, move |sid| this.conshash.to_server_name(sid))
             .map_err(|e| RPCError::IOError(e))
-            .map(move |c| {
-                plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, &c)
-            })
+            .map(|c| client_by_rpc_client(&c))
     }
 
     pub fn locate_plain_server(

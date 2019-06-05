@@ -28,7 +28,7 @@ use parking_lot::RwLock;
 use ram::cell::Cell;
 use ram::types::RandValue;
 use smallvec::SmallVec;
-use std;
+use ::{std, server};
 use std::any::Any;
 use std::cell::Ref;
 use std::cell::RefCell;
@@ -425,7 +425,7 @@ impl NodeCellRef {
         }
     }
 
-    pub fn persist(&self, deletion: &DeletionSetInneer, neb: &AsyncClient) -> bool {
+    pub fn persist(&self, deletion: &DeletionSetInneer, neb: &server::cell_rpc::AsyncServiceClient) -> Box<Future<Item = (), Error = ()>> {
         self.inner.persist(self, deletion, neb)
     }
 

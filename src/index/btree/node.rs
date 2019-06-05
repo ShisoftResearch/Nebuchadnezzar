@@ -5,6 +5,8 @@ use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
+use futures::future;
+use server;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -331,8 +333,8 @@ pub trait AnyNode: Any + 'static {
         &self,
         node_ref: &NodeCellRef,
         deletion: &DeletionSetInneer,
-        neb: &AsyncClient,
-    ) -> bool;
+        neb: &server::cell_rpc::AsyncServiceClient,
+    ) -> Box<Future<Item = (), Error = ()>>;
 }
 
 pub struct Node<KS, PS>
@@ -569,15 +571,14 @@ where
         &self,
         node_ref: &NodeCellRef,
         deletion: &DeletionSetInneer,
-        neb: &AsyncClient,
-    ) -> bool {
+        neb: &server::cell_rpc::AsyncServiceClient,
+    ) -> Box<Future<Item = (), Error = ()>> {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
             &mut NodeData::External(ref mut node) => {
-                node.persist(deletion, neb);
-                true
+                node.persist(deletion, neb)
             }
-            _ => false,
+            _ => box future::err(()),
         }
     }
 }

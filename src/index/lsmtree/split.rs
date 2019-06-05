@@ -14,7 +14,7 @@ use index::Ordering::{Backward, Forward};
 use itertools::Itertools;
 use ram::types::RandValue;
 use rayon::prelude::*;
-use server::NebServer;
+use server::{NebServer, rpc_client_by_id};
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -40,12 +40,7 @@ pub fn placement_client(
     id: &Id,
     neb: &Arc<NebServer>,
 ) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
-    let server_id = neb.get_server_id_by_id(id).unwrap();
-    let neb = neb.clone();
-    DEFAULT_CLIENT_POOL
-        .get_by_id_async(server_id, move |sid| neb.conshash().to_server_name(sid))
-        .map_err(|e| RPCError::IOError(e))
-        .map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
+    rpc_client_by_id(id, neb).map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
 pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {

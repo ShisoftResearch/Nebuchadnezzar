@@ -30,6 +30,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{mem, panic};
 use utils::lru_cache::LRUCache;
+use futures::future;
+use server;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -406,11 +408,13 @@ where
         });
     }
 
-    pub fn persist(&mut self, deleted: &DeletionSetInneer, neb: &AsyncClient) {
+    pub fn persist(&mut self, deleted: &DeletionSetInneer, neb: &server::cell_rpc::AsyncServiceClient) -> Box<Future<Item = (), Error = ()>> {
         if self.is_dirty() {
+            self.dirty = false; // TODO: unset dirty after upsert
             let cell = self.to_cell(deleted);
-            neb.upsert_cell(cell).wait().unwrap().unwrap();
-            self.dirty = false;
+            box neb.upsert_cell(cell).map_err(|_| ()).map(|r| { r.unwrap(); () })
+        } else {
+            box future::err(())
         }
     }
 }
