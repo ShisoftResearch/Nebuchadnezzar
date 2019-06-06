@@ -135,10 +135,18 @@ where
     pub fn to_cell(&self, deleted: &DeletionSetInneer) -> Cell {
         let mut value = Value::Map(Map::new());
         let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| {
-            node.extnode().id
+            if node.is_none() {
+                Id::unit_id()
+            } else {
+                node.extnode().id
+            }
         });
         let next_id = read_node(&self.next, |node: &NodeReadHandler<KS, PS>| {
-            node.extnode().id
+            if node.is_none() {
+                Id::unit_id()
+            } else {
+                node.extnode().id
+            }
         });
 
         value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
