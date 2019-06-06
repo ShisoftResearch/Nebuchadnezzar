@@ -143,9 +143,7 @@ impl LSMTree {
     }
 
     pub fn oversized(&self) -> bool {
-        (0..self.trees.len() - 1).any(|i| {
-            self.trees[i].count() > self.max_sizes[i]
-        })
+        (0..self.trees.len() - 1).any(|i| self.trees[i].count() > self.max_sizes[i])
     }
 
     pub fn start_sentinel(this: &Arc<Self>) {
