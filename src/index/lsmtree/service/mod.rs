@@ -142,7 +142,7 @@ impl Service for LSMTreeService {
             );
             true
         };
-        box future::ok(succeed)
+        box persist(self.neb_server.clone(), succeed)
     }
 
     fn summary(&self) -> Box<Future<Item = Vec<LSMTreeSummary>, Error = ()>> {
