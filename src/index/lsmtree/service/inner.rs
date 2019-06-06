@@ -112,6 +112,10 @@ impl LSMTreeIns {
         self.tree.check_and_merge()
     }
 
+    pub fn oversized(&self) -> bool {
+        self.tree.oversized()
+    }
+
     pub fn insert(&self, key: EntryKey) -> bool {
         self.tree.insert(key)
     }

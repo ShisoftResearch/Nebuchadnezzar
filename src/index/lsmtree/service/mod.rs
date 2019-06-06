@@ -228,16 +228,18 @@ impl LSMTreeService {
         thread::Builder::new()
             .name("LSM-tree service sentinel".to_string())
             .spawn(move || {
+                thread::sleep(Duration::from_millis(500));
                 let tree_map = trees_clone.read();
                 tree_map
                     .values()
                     .cloned()
+                    .filter(|tree: &Arc<LSMTreeIns>| tree.oversized())
                     .collect_vec()
                     .par_iter()
                     .for_each(|tree: &Arc<LSMTreeIns>| {
                         tree.check_and_merge();
                     });
-                persist::<_, ()>(neb.clone(), ()).wait().unwrap()
+                persist::<_, ()>(neb.clone(), ()).wait().unwrap();
             });
         Arc::new(Self {
             neb_server: neb_server.clone(),
