@@ -229,9 +229,14 @@ impl LSMTreeService {
             .name("LSM-tree service sentinel".to_string())
             .spawn(move || {
                 let tree_map = trees_clone.read();
-                tree_map.values().cloned().collect_vec().par_iter().for_each(|tree: &Arc<LSMTreeIns>| {
-                    tree.check_and_merge();
-                });
+                tree_map
+                    .values()
+                    .cloned()
+                    .collect_vec()
+                    .par_iter()
+                    .for_each(|tree: &Arc<LSMTreeIns>| {
+                        tree.check_and_merge();
+                    });
                 persist::<_, ()>(neb.clone(), ()).wait().unwrap()
             });
         Arc::new(Self {
