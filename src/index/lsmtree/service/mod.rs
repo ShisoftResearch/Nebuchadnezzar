@@ -222,11 +222,23 @@ impl Service for LSMTreeService {
 
 impl LSMTreeService {
     pub fn new(neb_server: &Arc<NebServer>, sm: &Arc<SMClient>) -> Arc<Self> {
+        let trees = Arc::new(RwLock::new(HashMap::new()));
+        let trees_clone = trees.clone();
+        let neb = neb_server.clone();
+        thread::Builder::new()
+            .name("LSM-tree service sentinel".to_string())
+            .spawn(move || {
+                let tree_map = trees_clone.read();
+                tree_map.values().cloned().collect_vec().par_iter().for_each(|tree: &Arc<LSMTreeIns>| {
+                    tree.check_and_merge();
+                });
+                persist::<_, ()>(neb.clone(), ()).wait().unwrap()
+            });
         Arc::new(Self {
             neb_server: neb_server.clone(),
             counter: AtomicU64::new(0),
-            trees: Arc::new(RwLock::new(HashMap::new())),
             sm: sm.clone(),
+            trees,
         })
     }
 }
