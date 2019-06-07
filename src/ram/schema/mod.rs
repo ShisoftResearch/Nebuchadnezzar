@@ -25,6 +25,14 @@ pub struct Schema {
     pub is_dynamic: bool,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Index {
+    Ranged,
+    ByValue,
+    Vectorization,
+    None
+}
+
 impl Schema {
     pub fn new(
         name: &str,
@@ -65,6 +73,7 @@ pub struct Field {
     pub sub_fields: Option<Vec<Field>>,
     pub name: String,
     pub name_id: u64,
+    pub
 }
 
 impl Field {
