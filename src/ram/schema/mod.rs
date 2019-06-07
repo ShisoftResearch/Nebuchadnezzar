@@ -30,7 +30,7 @@ pub enum IndexType {
     Ranged,
     ByValue,
     Vectorization,
-    None
+    None,
 }
 
 impl Schema {
@@ -83,7 +83,7 @@ impl Field {
         nullable: bool,
         is_array: bool,
         sub_fields: Option<Vec<Field>>,
-        index: IndexType
+        index: IndexType,
     ) -> Field {
         Field {
             name: name.to_string(),
@@ -92,7 +92,7 @@ impl Field {
             nullable,
             is_array,
             sub_fields,
-            index
+            index,
         }
     }
 }

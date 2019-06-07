@@ -12,9 +12,9 @@ use futures::prelude::*;
 use itertools::Itertools;
 use neb::client;
 use neb::ram::cell::Cell;
-use neb::ram::schema::{Field, IndexType};
 use neb::ram::schema::LocalSchemasCache;
 use neb::ram::schema::Schema;
+use neb::ram::schema::{Field, IndexType};
 use neb::ram::types::*;
 use neb::server::*;
 use parking_lot::deadlock;
@@ -80,9 +80,9 @@ pub fn smoke_test() {
                 false,
                 false,
                 None,
-                IndexType::None
+                IndexType::None,
             )]),
-            IndexType::None
+            IndexType::None,
         ),
     };
 
@@ -160,9 +160,9 @@ pub fn smoke_test_parallel() {
                 false,
                 false,
                 None,
-                IndexType::None
+                IndexType::None,
             )]),
-            IndexType::None
+            IndexType::None,
         ),
     };
 
@@ -264,9 +264,9 @@ pub fn txn() {
                 false,
                 false,
                 None,
-                IndexType::None
+                IndexType::None,
             )]),
-            IndexType::None
+            IndexType::None,
         ),
     };
 

@@ -14,7 +14,7 @@ use index::Slice;
 use itertools::Itertools;
 use owning_ref::{OwningHandle, OwningRef, RcRef};
 use ram::cell::Cell;
-use ram::schema::{Field, Schema, IndexType};
+use ram::schema::{Field, IndexType, Schema};
 use ram::types::*;
 use server;
 use std::cell::Ref;
@@ -458,11 +458,32 @@ pub fn page_schema() -> Schema {
             false,
             false,
             Some(vec![
-                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None, IndexType::None),
-                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None, IndexType::None),
-                Field::new(KEYS_FIELD, type_id_of(Type::SmallBytes), false, true, None, IndexType::None),
+                Field::new(
+                    NEXT_FIELD,
+                    type_id_of(Type::Id),
+                    false,
+                    false,
+                    None,
+                    IndexType::None,
+                ),
+                Field::new(
+                    PREV_FIELD,
+                    type_id_of(Type::Id),
+                    false,
+                    false,
+                    None,
+                    IndexType::None,
+                ),
+                Field::new(
+                    KEYS_FIELD,
+                    type_id_of(Type::SmallBytes),
+                    false,
+                    true,
+                    None,
+                    IndexType::None,
+                ),
             ]),
-            IndexType::None
+            IndexType::None,
         ),
     }
 }

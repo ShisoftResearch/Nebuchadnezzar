@@ -292,8 +292,8 @@ mod tests {
     use dovahkiin::types::type_id_of;
     use futures::Future;
     use ram::cell::Cell;
-    use ram::schema::{Field, IndexType};
     use ram::schema::Schema;
+    use ram::schema::{Field, IndexType};
     use ram::types::*;
     use server::NebServer;
     use server::ServerOptions;
@@ -336,9 +336,9 @@ mod tests {
                     false,
                     false,
                     None,
-                    IndexType::None
+                    IndexType::None,
                 )]),
-                IndexType::None
+                IndexType::None,
             ),
         };
 
