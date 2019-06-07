@@ -25,8 +25,8 @@ pub struct Schema {
     pub is_dynamic: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum Index {
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub enum IndexType {
     Ranged,
     ByValue,
     Vectorization,
@@ -73,7 +73,7 @@ pub struct Field {
     pub sub_fields: Option<Vec<Field>>,
     pub name: String,
     pub name_id: u64,
-    pub
+    pub index: IndexType,
 }
 
 impl Field {
@@ -83,6 +83,7 @@ impl Field {
         nullable: bool,
         is_array: bool,
         sub_fields: Option<Vec<Field>>,
+        index: IndexType
     ) -> Field {
         Field {
             name: name.to_string(),
@@ -91,6 +92,7 @@ impl Field {
             nullable,
             is_array,
             sub_fields,
+            index
         }
     }
 }
