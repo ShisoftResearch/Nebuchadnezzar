@@ -17,8 +17,6 @@ use std::ops::Deref;
 
 pub mod sm;
 
-pub type RwLockReadGuardRef<'a, T, U = T> = OwningRef<RwLockReadGuard<'a, T>, U>;
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
     pub id: u32,
@@ -150,7 +148,7 @@ impl LocalSchemasCache {
         let schemas = LocalSchemasCache { map };
         return Ok(schemas);
     }
-    pub fn get<'a>(&'a self, id: &u32) -> Option<ReadingSchema<'a>> {
+    pub fn get(&self, id: &u32) -> Option<ReadingSchema> {
         let m = self.map.read();
         let so = m.get(id).map(|s| unsafe { s as *const Schema });
         so.map(|s| {
