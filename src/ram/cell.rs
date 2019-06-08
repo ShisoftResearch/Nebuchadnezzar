@@ -156,7 +156,7 @@ impl Cell {
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
                 header,
-                data: reader::read_by_schema(data_ptr, &schema),
+                data: reader::read_by_schema(data_ptr, &*schema),
             })
         } else {
             error!("Schema {} does not existed to read", schema_id);
@@ -171,7 +171,7 @@ impl Cell {
         let (header, data_ptr) = Cell::header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            Ok(reader::read_by_schema_selected(data_ptr, &schema, fields))
+            Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))
         } else {
             error!("Schema {} does not existed to read", schema_id);
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
@@ -180,7 +180,7 @@ impl Cell {
     pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            return self.write_to_chunk_with_schema(chunk, &schema);
+            return self.write_to_chunk_with_schema(chunk, &*schema);
         } else {
             error!("Schema {} does not existed to write", schema_id);
             return Err(WriteError::SchemaDoesNotExisted(schema_id));

@@ -2,7 +2,7 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 
 use super::types;
@@ -12,8 +12,12 @@ use std::sync::Arc;
 
 use bifrost::utils::fut_exec::wait;
 use futures::Future;
+use owning_ref::{OwningRef, OwningHandle};
+use std::ops::Deref;
 
 pub mod sm;
+
+pub type RwLockReadGuardRef<'a, T, U = T> = OwningRef<RwLockReadGuard<'a, T>, U>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
@@ -98,7 +102,7 @@ impl Field {
 }
 
 pub struct SchemasMap {
-    schema_map: HashMap<u32, Arc<Schema>>,
+    schema_map: HashMap<u32, Schema>,
     name_map: HashMap<String, u32>,
     id_counter: u32,
 }
@@ -146,9 +150,15 @@ impl LocalSchemasCache {
         let schemas = LocalSchemasCache { map };
         return Ok(schemas);
     }
-    pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {
+    pub fn get<'a>(&'a self, id: &u32) -> Option<ReadingSchema<'a>> {
         let m = self.map.read();
-        m.get(id)
+        let so = m.get(id).map(|s| unsafe { s as *const Schema });
+        so.map(|s| {
+            ReadingSchema {
+                owner: m,
+                reference: s
+            }
+        })
     }
     pub fn new_schema(&self, schema: Schema) {
         // for debug only
@@ -172,7 +182,7 @@ impl SchemasMap {
     pub fn new_schema(&mut self, schema: Schema) {
         let name = schema.name.clone();
         let id = schema.id;
-        self.schema_map.insert(id, Arc::new(schema.clone()));
+        self.schema_map.insert(id, schema);
         self.name_map.insert(name, id);
     }
     pub fn del_schema(&mut self, name: &str) -> Result<(), ()> {
@@ -182,15 +192,15 @@ impl SchemasMap {
         self.name_map.remove(&name.to_string());
         Ok(())
     }
-    pub fn get_by_name(&self, name: &str) -> Option<Arc<Schema>> {
+    pub fn get_by_name(&self, name: &str) -> Option<&Schema> {
         if let Some(id) = self.name_to_id(name) {
             return self.get(&id);
         }
         return None;
     }
-    pub fn get(&self, id: &u32) -> Option<Arc<Schema>> {
+    pub fn get(&self, id: &u32) -> Option<&Schema> {
         if let Some(schema) = self.schema_map.get(id) {
-            return Some(schema.clone());
+            return Some(schema);
         }
         return None;
     }
@@ -214,11 +224,28 @@ impl SchemasMap {
             })
             .collect()
     }
-    fn load_from_list(&mut self, data: &Vec<Schema>) {
+    fn load_from_list(&mut self, data: Vec<Schema>) {
         for schema in data {
             let id = schema.id;
             self.name_map.insert(schema.name.clone(), id);
-            self.schema_map.insert(id, Arc::new(schema.clone()));
+            self.schema_map.insert(id, schema);
+        }
+    }
+}
+
+pub struct ReadingRef<O, T: ?Sized> {
+    owner: O,
+    reference: *const T,
+}
+
+pub type ReadingSchema<'a> = ReadingRef<RwLockReadGuard<'a, SchemasMap>, Schema>;
+
+impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        unsafe {
+            &*self.reference
         }
     }
 }

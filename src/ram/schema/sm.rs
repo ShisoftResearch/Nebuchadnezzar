@@ -67,7 +67,7 @@ impl StateMachineCtl for SchemasSM {
     }
     fn recover(&mut self, data: Vec<u8>) {
         let schemas: Vec<Schema> = bincode::deserialize(&data);
-        self.map.load_from_list(&schemas);
+        self.map.load_from_list(schemas);
     }
 }
 
