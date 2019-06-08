@@ -201,7 +201,7 @@ impl Chunk {
 
     fn write_cell_unchecked(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let loc = cell.write_to_chunk(self)?;
+        let loc = cell.write_to_chunk(self, false)?;
         let mut need_rollback = false;
         self.index.upsert(
             cell.header.hash,
@@ -236,7 +236,7 @@ impl Chunk {
         guard: &mut CellWriteGuard,
     ) -> Result<CellHeader, WriteError> {
         let _old_location = **guard;
-        let new_location = cell.write_to_chunk(self)?;
+        let new_location = cell.write_to_chunk(self, true)?;
         **guard = new_location;
         return Ok(cell.header);
     }
@@ -280,7 +280,7 @@ impl Chunk {
                     let mut new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
                         let old_location = *cell_location;
-                        let new_location = new_cell.write_to_chunk(self)?;
+                        let new_location = new_cell.write_to_chunk(self, true)?;
                         *cell_location = new_location;
                         (Ok(new_cell), old_location)
                     } else {

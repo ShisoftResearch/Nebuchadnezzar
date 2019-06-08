@@ -11,6 +11,7 @@ use std::io::{Cursor, Read, Write};
 use std::ops::{Index, IndexMut};
 use std::ptr;
 use std::sync::Arc;
+use index;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 
@@ -177,13 +178,17 @@ impl Cell {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, update: bool) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            return self.write_to_chunk_with_schema(chunk, &*schema);
+            let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
+            if write_result.is_ok() {
+                index::client::make_index(self, &*schema, update);
+            }
+            write_result
         } else {
             error!("Schema {} does not existed to write", schema_id);
-            return Err(WriteError::SchemaDoesNotExisted(schema_id));
+            Err(WriteError::SchemaDoesNotExisted(schema_id))
         }
     }
     pub fn write_to_chunk_with_schema(
