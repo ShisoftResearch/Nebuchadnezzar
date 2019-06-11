@@ -464,7 +464,7 @@ pub fn page_schema() -> Schema {
                     false,
                     false,
                     None,
-                    IndexType::None,
+                    vec![],
                 ),
                 Field::new(
                     PREV_FIELD,
@@ -472,7 +472,7 @@ pub fn page_schema() -> Schema {
                     false,
                     false,
                     None,
-                    IndexType::None,
+                    vec![],
                 ),
                 Field::new(
                     KEYS_FIELD,
@@ -480,10 +480,10 @@ pub fn page_schema() -> Schema {
                     false,
                     true,
                     None,
-                    IndexType::None,
+                    vec![],
                 ),
             ]),
-            IndexType::None,
+            vec![],
         ),
     }
 }

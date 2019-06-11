@@ -31,8 +31,7 @@ pub struct Schema {
 pub enum IndexType {
     Ranged,
     ByValue,
-    Vectorization,
-    None,
+    Vectorization
 }
 
 impl Schema {
@@ -75,7 +74,7 @@ pub struct Field {
     pub sub_fields: Option<Vec<Field>>,
     pub name: String,
     pub name_id: u64,
-    pub index: IndexType,
+    pub indices: Vec<IndexType>,
 }
 
 impl Field {
@@ -85,7 +84,7 @@ impl Field {
         nullable: bool,
         is_array: bool,
         sub_fields: Option<Vec<Field>>,
-        index: IndexType,
+        indices: Vec<IndexType>,
     ) -> Field {
         Field {
             name: name.to_string(),
@@ -94,7 +93,7 @@ impl Field {
             nullable,
             is_array,
             sub_fields,
-            index,
+            indices,
         }
     }
 }

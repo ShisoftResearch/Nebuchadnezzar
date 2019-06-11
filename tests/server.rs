@@ -80,9 +80,9 @@ pub fn smoke_test() {
                 false,
                 false,
                 None,
-                IndexType::None,
+                vec![],
             )]),
-            IndexType::None,
+            vec![],
         ),
     };
 
@@ -160,9 +160,9 @@ pub fn smoke_test_parallel() {
                 false,
                 false,
                 None,
-                IndexType::None,
+                vec![],
             )]),
-            IndexType::None,
+            vec![],
         ),
     };
 
@@ -264,9 +264,9 @@ pub fn txn() {
                 false,
                 false,
                 None,
-                IndexType::None,
+                vec![],
             )]),
-            IndexType::None,
+            vec![],
         ),
     };
 

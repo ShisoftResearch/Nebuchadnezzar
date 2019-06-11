@@ -363,14 +363,14 @@ pub fn server_isolation() {
             false,
             false,
             Some(vec![
-                Field::new(&String::from("-id"), 6, false, false, None, IndexType::None),
+                Field::new(&String::from("-id"), 6, false, false, None, vec![]),
                 Field::new(
                     &String::from("-name"),
                     20,
                     false,
                     false,
                     None,
-                    IndexType::None,
+                    vec![],
                 ),
                 Field::new(
                     &String::from("-score"),
@@ -378,10 +378,10 @@ pub fn server_isolation() {
                     false,
                     false,
                     None,
-                    IndexType::None,
+                    vec![],
                 ),
             ]),
-            IndexType::None,
+            vec![],
         ),
         is_dynamic: false,
     };

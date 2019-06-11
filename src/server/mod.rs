@@ -336,9 +336,9 @@ mod tests {
                     false,
                     false,
                     None,
-                    IndexType::None,
+                    vec![],
                 )]),
-                IndexType::None,
+                vec![],
             ),
         };
 

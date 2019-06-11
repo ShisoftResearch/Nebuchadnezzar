@@ -44,7 +44,7 @@ fn default_fields() -> Field {
                 false,
                 false,
                 None,
-                IndexType::None,
+                vec![],
             ),
             Field::new(
                 "data",
@@ -52,10 +52,10 @@ fn default_fields() -> Field {
                 false,
                 true,
                 None,
-                IndexType::None,
+                vec![],
             ),
         ]),
-        IndexType::None,
+        vec![],
     )
 }
 
