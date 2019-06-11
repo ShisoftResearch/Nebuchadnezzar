@@ -30,8 +30,8 @@ pub struct Schema {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum IndexType {
     Ranged,
-    ByValue,
-    Vectorization
+    Hashed,
+    Vectorized
 }
 
 impl Schema {
