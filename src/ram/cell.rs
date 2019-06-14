@@ -183,7 +183,7 @@ impl Cell {
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
             let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
             if write_result.is_ok() {
-                index::client::make_index(self, &*schema, update);
+                // index::client::make_indices(self, &*schema, update);
             }
             write_result
         } else {

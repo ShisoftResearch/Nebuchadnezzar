@@ -104,7 +104,7 @@ where
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
         let _keys_len = keys.len().unwrap();
-        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+        let keys_array = if let Value::PrimArray(PrimitiveArray::Bytes(ref array)) = keys {
             array
         } else {
             panic!()
