@@ -1,4 +1,5 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use index;
 use ram::chunk::Chunk;
 use ram::clock;
 use ram::entry::*;
@@ -11,7 +12,6 @@ use std::io::{Cursor, Read, Write};
 use std::ops::{Index, IndexMut};
 use std::ptr;
 use std::sync::Arc;
-use index;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 

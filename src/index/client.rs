@@ -1,6 +1,6 @@
-use ram::cell::Cell;
-use ram::schema::{Schema, Field, IndexType};
 use index::EntryKey;
+use ram::cell::Cell;
+use ram::schema::{Field, IndexType, Schema};
 use ram::types::{Id, Value};
 use smallvec::SmallVec;
 
@@ -14,16 +14,16 @@ type IndexId = SmallVec<[u64; 5]>;
 // Index on nested fields are allowed
 
 pub struct RangedIndexMeta {
-    old_key: EntryKey
+    old_key: EntryKey,
 }
 
 pub struct HashedIndexMeta {
-    old_id: Id
+    old_id: Id,
 }
 
 pub struct VectorizedIndexMeta {
     old_cell_id: Id,
-    old_index: u32
+    old_index: u32,
 }
 
 pub enum IndexMeta {
@@ -34,20 +34,14 @@ pub enum IndexMeta {
 
 pub struct IndexRes {
     id: IndexId,
-    meta: Vec<IndexMeta>
+    meta: Vec<IndexMeta>,
 }
 
-pub fn make_indices(cell: &Cell, schema: &Schema) {
+pub fn make_indices(cell: &Cell, schema: &Schema) {}
 
-}
+pub fn remove_indies(indices: Vec<IndexMeta>) {}
 
-pub fn remove_indies(indices: Vec<IndexMeta>) {
-
-}
-
-pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Vec<IndexRes>) {
-
-}
+pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Vec<IndexRes>) {}
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
@@ -74,7 +68,7 @@ fn probe_field_indices(prefix: &IndexId, field: &Field, value: &Value, metas: &m
                 match index {
                     &IndexType::Ranged => components.append(&mut array.features()),
                     &IndexType::Hashed => components.append(&mut array.hashes()),
-                    &IndexType::Vectorized => components.append(&mut array.features())
+                    &IndexType::Vectorized => components.append(&mut array.features()),
                 }
             }
         } else {
@@ -82,10 +76,9 @@ fn probe_field_indices(prefix: &IndexId, field: &Field, value: &Value, metas: &m
                 match index {
                     &IndexType::Ranged => components.push(value.feature()),
                     &IndexType::Hashed => components.push(value.hash()),
-                    &IndexType::Vectorized => components.push(value.feature())
+                    &IndexType::Vectorized => components.push(value.feature()),
                 }
             }
         }
-
     }
 }

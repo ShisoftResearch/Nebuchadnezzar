@@ -39,22 +39,8 @@ pub fn default_fields() -> Field {
         false,
         Some(vec![
             Field::new(&String::from("id"), 6, false, false, None, vec![]),
-            Field::new(
-                &String::from("name"),
-                20,
-                false,
-                false,
-                None,
-                vec![],
-            ),
-            Field::new(
-                &String::from("score"),
-                10,
-                false,
-                false,
-                None,
-                vec![],
-            ),
+            Field::new(&String::from("name"), 20, false, false, None, vec![]),
+            Field::new(&String::from("score"), 10, false, false, None, vec![]),
         ]),
         vec![],
     )

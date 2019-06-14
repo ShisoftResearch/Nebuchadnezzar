@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use bifrost::utils::fut_exec::wait;
 use futures::Future;
-use owning_ref::{OwningRef, OwningHandle};
+use owning_ref::{OwningHandle, OwningRef};
 use std::ops::Deref;
 
 pub mod sm;
@@ -31,7 +31,7 @@ pub struct Schema {
 pub enum IndexType {
     Ranged,
     Hashed,
-    Vectorized
+    Vectorized,
 }
 
 impl Schema {
@@ -150,11 +150,9 @@ impl LocalSchemasCache {
     pub fn get(&self, id: &u32) -> Option<ReadingSchema> {
         let m = self.map.read();
         let so = m.get(id).map(|s| unsafe { s as *const Schema });
-        so.map(|s| {
-            ReadingSchema {
-                owner: m,
-                reference: s
-            }
+        so.map(|s| ReadingSchema {
+            owner: m,
+            reference: s,
         })
     }
     pub fn new_schema(&self, schema: Schema) {
@@ -241,8 +239,6 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        unsafe {
-            &*self.reference
-        }
+        unsafe { &*self.reference }
     }
 }

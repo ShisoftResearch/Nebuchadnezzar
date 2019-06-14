@@ -458,22 +458,8 @@ pub fn page_schema() -> Schema {
             false,
             false,
             Some(vec![
-                Field::new(
-                    NEXT_FIELD,
-                    type_id_of(Type::Id),
-                    false,
-                    false,
-                    None,
-                    vec![],
-                ),
-                Field::new(
-                    PREV_FIELD,
-                    type_id_of(Type::Id),
-                    false,
-                    false,
-                    None,
-                    vec![],
-                ),
+                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
+                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
                 Field::new(
                     KEYS_FIELD,
                     type_id_of(Type::SmallBytes),

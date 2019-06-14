@@ -38,22 +38,8 @@ fn default_fields() -> Field {
         false,
         false,
         Some(vec![
-            Field::new(
-                "id",
-                type_id_of(Type::I32),
-                false,
-                false,
-                None,
-                vec![],
-            ),
-            Field::new(
-                "data",
-                type_id_of(Type::U8),
-                false,
-                true,
-                None,
-                vec![],
-            ),
+            Field::new("id", type_id_of(Type::I32), false, false, None, vec![]),
+            Field::new("data", type_id_of(Type::U8), false, true, None, vec![]),
         ]),
         vec![],
     )
