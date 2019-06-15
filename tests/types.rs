@@ -54,8 +54,6 @@ test_nums!(u16, u16_io);
 test_nums!(u32, u32_io);
 test_nums!(u64, u64_io);
 
-test_nums!(isize, isize_io);
-test_nums!(usize, usize_io);
 test_nums!(f32, f32_io);
 test_nums!(f64, f64_io);
 
