@@ -174,6 +174,12 @@ where
             None => return false,
         }
         self.len.fetch_add(1, Relaxed);
+
+        // check returning deleted key
+        if self.deleted.read().contains( key) {
+            let mut deleted = self.deleted.write();
+            deleted.remove(key);
+        }
         return true;
     }
 
