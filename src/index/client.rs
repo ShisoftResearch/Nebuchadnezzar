@@ -27,12 +27,7 @@ pub struct HashedIndexMeta {
 pub struct VectorizedMeta {
     cell_id: Id,
     feature: Component,
-    details: Option<VectorizedDetails>,
-}
-
-pub struct VectorizedDetails {
-    vec_id: Id,
-    index: u32,
+    cell_ver: u64
 }
 
 pub enum IndexMeta {
@@ -61,7 +56,7 @@ pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Vec<IndexRes>) 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
     probe_field_indices(
-        cell.id(),
+        &cell,
         &"".to_string(),
         &schema.fields,
         schema.id,
@@ -72,7 +67,7 @@ pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
 }
 
 fn probe_field_indices(
-    id: Id,
+    cell: &Cell,
     fields_name: &FieldName,
     field: &Field,
     schema_id: u32,
@@ -84,7 +79,7 @@ fn probe_field_indices(
             let value = &value[field.name_id];
             let fields = format!("{} -> {}", fields_name, field.name);
             probe_field_indices(
-                id,
+                cell,
                 &fields,
                 field,
                 schema_id,
@@ -96,7 +91,7 @@ fn probe_field_indices(
         let mut components = vec![];
         if let &Value::Array(ref array) = value {
             for val in array {
-                probe_field_indices(id, &fields_name, field, schema_id, value, res);
+                probe_field_indices(cell, &fields_name, field, schema_id, value, res);
             }
         } else if let &Value::PrimArray(ref array) = value {
             for index in &field.indices {
@@ -136,6 +131,7 @@ fn probe_field_indices(
             }
         }
         let mut metas = vec![];
+        let id = cell.id();
         for comp in components {
             match comp {
                 IndexComps::Hashed(c) => {
@@ -164,7 +160,7 @@ fn probe_field_indices(
                     metas.push(IndexMeta::Vectorized(VectorizedMeta {
                         cell_id: id,
                         feature: c,
-                        details: None,
+                        cell_ver: cell.header.version,
                     }));
                 }
             }
