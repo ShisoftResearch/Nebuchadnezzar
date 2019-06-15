@@ -295,19 +295,19 @@ where
         level::level_merge(self, upper_level)
     }
 
-    fn merge_with_keys(&self, keys: Box<Vec<SmallVec<[u8; 32]>>>) {
+    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
         self.merge_with_keys_(keys)
     }
 
-    fn insert_into(&self, key: &SmallVec<[u8; 32]>) -> bool {
+    fn insert_into(&self, key: &EntryKey) -> bool {
         self.insert(key)
     }
 
-    fn seek_for(&self, key: &SmallVec<[u8; 32]>, ordering: Ordering) -> Box<Cursor> {
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
         box self.seek(key, ordering)
     }
 
-    fn mark_key_deleted(&self, key: &SmallVec<[u8; 32]>) -> bool {
+    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
         if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
             if seek_key == key {
                 return self.deleted.write().insert(key.clone());
@@ -324,7 +324,7 @@ where
         split::mid_key::<KS, PS>(&self.get_root())
     }
 
-    fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
+    fn remove_following_tombstones(&self, start: &EntryKey) {
         let mut tombstones = self.deleted.write();
         let original_tombstones = mem::replace(&mut *tombstones, DeletionSetInneer::new());
         *tombstones = original_tombstones
@@ -333,7 +333,7 @@ where
             .collect();
     }
 
-    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) -> usize {
+    fn remove_to_right(&self, start_key: &EntryKey) -> usize {
         let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
         self.len.fetch_sub(removed, Relaxed);
         removed

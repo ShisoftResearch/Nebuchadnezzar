@@ -1,11 +1,14 @@
+use bifrost_hasher::hash_str;
+use index::client::IndexComps::Vectorized;
 use index::EntryKey;
 use ram::cell::Cell;
 use ram::schema::{Field, IndexType, Schema};
 use ram::types::{Id, Value};
 use smallvec::SmallVec;
 
-// cascading field hashes
-type IndexId = SmallVec<[u64; 5]>;
+type FieldName = String;
+type Component = [u8; 8];
+const UNSETTLED: Component = [0u8; 8];
 
 // Define index rules
 // Index can be applied on scala value and scala arrays for both Ranged and Hashed
@@ -14,26 +17,38 @@ type IndexId = SmallVec<[u64; 5]>;
 // Index on nested fields are allowed
 
 pub struct RangedIndexMeta {
-    old_key: EntryKey,
+    key: EntryKey,
 }
 
 pub struct HashedIndexMeta {
-    old_id: Id,
+    id: Id,
 }
 
-pub struct VectorizedIndexMeta {
-    old_cell_id: Id,
-    old_index: u32,
+pub struct VectorizedMeta {
+    cell_id: Id,
+    feature: Component,
+    details: Option<VectorizedDetails>,
+}
+
+pub struct VectorizedDetails {
+    vec_id: Id,
+    index: u32,
 }
 
 pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
-    Vectorization(VectorizedIndexMeta),
+    Vectorized(VectorizedMeta),
+}
+
+pub enum IndexComps {
+    Ranged(Component),
+    Hashed(Component),
+    Vectorized(Component),
 }
 
 pub struct IndexRes {
-    id: IndexId,
+    id: FieldName,
     meta: Vec<IndexMeta>,
 }
 
@@ -45,39 +60,106 @@ pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Vec<IndexRes>) 
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
-    probe_field_indices(&smallvec!(), &schema.fields, &cell.data, &mut res);
+    probe_field_indices(
+        cell.id(),
+        &"".to_string(),
+        &schema.fields,
+        schema.id,
+        &cell.data,
+        &mut res,
+    );
     res
 }
 
-fn probe_field_indices(prefix: &IndexId, field: &Field, value: &Value, metas: &mut Vec<IndexRes>) {
-    let mut id = prefix.clone();
-    id.push(field.name_id);
+fn probe_field_indices(
+    id: Id,
+    prefix: &FieldName,
+    field: &Field,
+    schema_id: u32,
+    value: &Value,
+    metas: &mut Vec<IndexRes>,
+) {
+    let mut field_name = format!("{} -> {}", prefix, field.name);
     if let &Some(ref fields) = &field.sub_fields {
         for field in fields {
             let value = &value[field.name_id];
-            probe_field_indices(&id, field, value, metas);
+            probe_field_indices(id, &field_name, field, schema_id, value, metas);
         }
     } else {
         let mut components = vec![];
         if let &Value::Array(ref array) = value {
             for val in array {
-                probe_field_indices(&id, field, value, metas);
+                probe_field_indices(id, &field_name, field, schema_id, value, metas);
             }
         } else if let &Value::PrimArray(ref array) = value {
             for index in &field.indices {
                 match index {
-                    &IndexType::Ranged => components.append(&mut array.features()),
-                    &IndexType::Hashed => components.append(&mut array.hashes()),
-                    &IndexType::Vectorized => components.append(&mut array.features()),
+                    &IndexType::Ranged => components.append(
+                        &mut array
+                            .features()
+                            .into_iter()
+                            .map(|vec| IndexComps::Ranged(vec))
+                            .collect(),
+                    ),
+                    &IndexType::Hashed => components.append(
+                        &mut array
+                            .hashes()
+                            .into_iter()
+                            .map(|vec| IndexComps::Hashed(vec))
+                            .collect(),
+                    ),
+                    &IndexType::Vectorized => components.append(
+                        &mut array
+                            .features()
+                            .into_iter()
+                            .map(|vec| IndexComps::Vectorized(vec))
+                            .collect(),
+                    ),
                 }
             }
         } else {
             for index in &field.indices {
                 match index {
-                    &IndexType::Ranged => components.push(value.feature()),
-                    &IndexType::Hashed => components.push(value.hash()),
-                    &IndexType::Vectorized => components.push(value.feature()),
+                    &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
+                    &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                    &IndexType::Vectorized => {
+                        components.push(IndexComps::Vectorized(value.feature()))
+                    }
                 }
+            }
+        }
+        let mut metas = vec![];
+        for comp in components {
+            match comp {
+                IndexComps::Hashed(c) => {
+                    if c == UNSETTLED {
+                        continue;
+                    }
+                    let id = Id::from_obj(&(schema_id, field_name.clone(), c));
+                    metas.push(IndexMeta::Hashed(HashedIndexMeta { id }));
+                }
+                IndexComps::Ranged(c) => {
+                    if c == UNSETTLED {
+                        continue;
+                    }
+                    let mut key = EntryKey::new();
+                    let field = hash_str(&field_name);
+                    key.extend_from_slice(&id.to_binary()); // Id
+                    key.extend_from_slice(&c); // value
+                    key.extend_from_slice(&field.to_be_bytes()); // field
+                    key.extend_from_slice(&schema_id.to_be_bytes()); // schema id
+                    metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
+                }
+                IndexComps::Vectorized(c) => {
+                    if c == UNSETTLED {
+                        continue;
+                    }
+                    metas.push(IndexMeta::Vectorized(VectorizedMeta {
+                        cell_id: id,
+                        feature: c,
+                        details: None,
+                    }));
+                },
             }
         }
     }
