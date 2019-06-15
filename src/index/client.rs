@@ -48,7 +48,7 @@ pub enum IndexComps {
 }
 
 pub struct IndexRes {
-    id: FieldName,
+    fields: FieldName,
     meta: Vec<IndexMeta>,
 }
 
@@ -73,23 +73,30 @@ pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
 
 fn probe_field_indices(
     id: Id,
-    prefix: &FieldName,
+    fields: &FieldName,
     field: &Field,
     schema_id: u32,
     value: &Value,
-    metas: &mut Vec<IndexRes>,
+    res: &mut Vec<IndexRes>,
 ) {
-    let mut field_name = format!("{} -> {}", prefix, field.name);
     if let &Some(ref fields) = &field.sub_fields {
         for field in fields {
             let value = &value[field.name_id];
-            probe_field_indices(id, &field_name, field, schema_id, value, metas);
+            let fields = format!("{} -> {}", fields, field.name);
+            probe_field_indices(
+                id,
+                &fields,
+                field,
+                schema_id,
+                value,
+                res,
+            );
         }
     } else {
         let mut components = vec![];
         if let &Value::Array(ref array) = value {
             for val in array {
-                probe_field_indices(id, &field_name, field, schema_id, value, metas);
+                probe_field_indices(id, &fields, field, schema_id, value, res);
             }
         } else if let &Value::PrimArray(ref array) = value {
             for index in &field.indices {
@@ -135,7 +142,7 @@ fn probe_field_indices(
                     if c == UNSETTLED {
                         continue;
                     }
-                    let id = Id::from_obj(&(schema_id, field_name.clone(), c));
+                    let id = Id::from_obj(&(schema_id, fields.clone(), c));
                     metas.push(IndexMeta::Hashed(HashedIndexMeta { id }));
                 }
                 IndexComps::Ranged(c) => {
@@ -143,7 +150,7 @@ fn probe_field_indices(
                         continue;
                     }
                     let mut key = EntryKey::new();
-                    let field = hash_str(&field_name);
+                    let field = hash_str(&fields);
                     key.extend_from_slice(&id.to_binary()); // Id
                     key.extend_from_slice(&c); // value
                     key.extend_from_slice(&field.to_be_bytes()); // field
@@ -159,8 +166,12 @@ fn probe_field_indices(
                         feature: c,
                         details: None,
                     }));
-                },
+                }
             }
         }
+        res.push(IndexRes {
+            fields: fields.clone(),
+            meta: metas
+        });
     }
 }
