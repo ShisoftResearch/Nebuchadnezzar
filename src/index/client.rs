@@ -73,7 +73,7 @@ pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
 
 fn probe_field_indices(
     id: Id,
-    fields: &FieldName,
+    fields_name: &FieldName,
     field: &Field,
     schema_id: u32,
     value: &Value,
@@ -82,7 +82,7 @@ fn probe_field_indices(
     if let &Some(ref fields) = &field.sub_fields {
         for field in fields {
             let value = &value[field.name_id];
-            let fields = format!("{} -> {}", fields, field.name);
+            let fields = format!("{} -> {}", fields_name, field.name);
             probe_field_indices(
                 id,
                 &fields,
@@ -96,7 +96,7 @@ fn probe_field_indices(
         let mut components = vec![];
         if let &Value::Array(ref array) = value {
             for val in array {
-                probe_field_indices(id, &fields, field, schema_id, value, res);
+                probe_field_indices(id, &fields_name, field, schema_id, value, res);
             }
         } else if let &Value::PrimArray(ref array) = value {
             for index in &field.indices {
@@ -142,7 +142,7 @@ fn probe_field_indices(
                     if c == UNSETTLED {
                         continue;
                     }
-                    let id = Id::from_obj(&(schema_id, fields.clone(), c));
+                    let id = Id::from_obj(&(schema_id, fields_name.clone(), c));
                     metas.push(IndexMeta::Hashed(HashedIndexMeta { id }));
                 }
                 IndexComps::Ranged(c) => {
@@ -150,7 +150,7 @@ fn probe_field_indices(
                         continue;
                     }
                     let mut key = EntryKey::new();
-                    let field = hash_str(&fields);
+                    let field = hash_str(&fields_name);
                     key.extend_from_slice(&id.to_binary()); // Id
                     key.extend_from_slice(&c); // value
                     key.extend_from_slice(&field.to_be_bytes()); // field
@@ -170,7 +170,7 @@ fn probe_field_indices(
             }
         }
         res.push(IndexRes {
-            fields: fields.clone(),
+            fields: fields_name.clone(),
             meta: metas
         });
     }
