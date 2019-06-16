@@ -47,11 +47,10 @@ pub struct IndexRes {
     meta: Vec<IndexMeta>,
 }
 
-pub fn make_indices(cell: &Cell, schema: &Schema) {}
+pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
+    let new_index_res = probe_cell_indices(cell, schema);
 
-pub fn remove_indies(indices: Vec<IndexMeta>) {}
-
-pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Vec<IndexRes>) {}
+}
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
