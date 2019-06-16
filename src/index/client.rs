@@ -77,10 +77,10 @@ fn probe_field_indices(
     if let &Some(ref fields) = &field.sub_fields {
         for field in fields {
             let value = &value[field.name_id];
-            let fields = format!("{} -> {}", fields_name, field.name);
+            let field_name = format!("{} -> {}", fields_name, field.name);
             probe_field_indices(
                 cell,
-                &fields,
+                &field_name,
                 field,
                 schema_id,
                 value,

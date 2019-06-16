@@ -280,6 +280,7 @@ where
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
         if self.len > pos && self.keys.as_slice_immute()[pos] == key {
+            debug!("inserting existing key");
             return None;
         }
         Some(if self.len == KS::slice_len() {

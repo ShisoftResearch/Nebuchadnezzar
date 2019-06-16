@@ -158,6 +158,13 @@ where
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
+
+        // check returning deleted key
+        if self.deleted.read().contains( key) {
+            let mut deleted = self.deleted.write();
+            deleted.remove(key);
+        }
+
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
@@ -174,12 +181,6 @@ where
             None => return false,
         }
         self.len.fetch_add(1, Relaxed);
-
-        // check returning deleted key
-        if self.deleted.read().contains( key) {
-            let mut deleted = self.deleted.write();
-            deleted.remove(key);
-        }
         return true;
     }
 
