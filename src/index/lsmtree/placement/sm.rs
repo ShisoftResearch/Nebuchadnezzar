@@ -1,9 +1,11 @@
+use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::utils::bincode::serialize;
 use bifrost_plugins::hash_ident;
 use bincode::deserialize;
 use dovahkiin::types::Id;
 use index::EntryKey;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::types::RandValue;
 use serde::de::DeserializeOwned;
@@ -15,6 +17,7 @@ use std::collections::btree_map::BTreeMap;
 use std::collections::btree_set::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
 
@@ -53,6 +56,7 @@ pub struct Placement {
 pub struct PlacementSM {
     placements: HashMap<Id, Placement>,
     starts: BTreeMap<Vec<u8>, Id>,
+    cons_hash: Arc<ConsistentHashing>,
 }
 
 raft_state_machine! {
@@ -63,6 +67,7 @@ raft_state_machine! {
     def cmd upsert(placement: Placement) -> () | CmdError;
     def qry locate(id: Vec<u8>) -> Placement | QueryError;
     def qry all() -> Vec<Placement>;
+    def qry all_for_server(server_id: u64) -> Vec<Placement>;
     def qry get(id: Id) -> Placement | QueryError;
 }
 
@@ -171,6 +176,15 @@ impl StateMachineCmds for PlacementSM {
         Ok(self.placements.values().cloned().collect())
     }
 
+    fn all_for_server(&self, server_id: u64) -> Result<Vec<Placement>, ()> {
+        Ok(self
+            .placements
+            .values()
+            .filter(|p| self.cons_hash.get_server_id_by(&p.id) == Some(server_id))
+            .cloned()
+            .collect_vec())
+    }
+
     fn get(&self, id: Id) -> Result<Placement, QueryError> {
         self.placements
             .get(&id)
@@ -193,10 +207,11 @@ impl StateMachineCtl for PlacementSM {
 }
 
 impl PlacementSM {
-    pub fn new() -> Self {
+    pub fn new(cons_hash: &Arc<ConsistentHashing>) -> Self {
         Self {
             placements: HashMap::new(),
             starts: BTreeMap::new(),
+            cons_hash: cons_hash.clone(),
         }
     }
 }

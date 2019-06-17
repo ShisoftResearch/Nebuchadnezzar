@@ -144,7 +144,7 @@ impl NebServer {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
                 &Service::Transaction => init_txn_service(rpc_server, &server),
                 &Service::LSMTreeIndex => {
-                    init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client)
+                    init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client, &conshasing)
                 }
             }
         }
@@ -269,8 +269,9 @@ pub fn init_lsm_tree_index_serevice(
     neb_server: &Arc<NebServer>,
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
+    cons_hash: &Arc<ConsistentHashing>
 ) {
-    raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new());
+    raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new(cons_hash));
     let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(
         lsmtree::placement::sm::SM_ID,
         raft_client,

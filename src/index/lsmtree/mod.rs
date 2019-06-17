@@ -9,3 +9,7 @@ mod split;
 #[cfg(test)]
 mod test;
 pub mod tree;
+
+pub struct  RangedIndexer {
+    
+}
