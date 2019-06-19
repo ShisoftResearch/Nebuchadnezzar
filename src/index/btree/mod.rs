@@ -283,6 +283,7 @@ pub trait LevelTree {
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
+    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient);
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -352,6 +353,10 @@ where
 
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
+    }
+
+    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient) {
+        *self = Self::from_head_id(head_id, neb);
     }
 }
 

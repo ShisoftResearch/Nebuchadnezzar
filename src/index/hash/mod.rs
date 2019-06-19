@@ -3,7 +3,6 @@ use client::AsyncClient;
 use futures::prelude::*;
 use ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use ram::schema::{Field, Schema};
-use ram::types::Id;
 use ram::types::*;
 use std::sync::Arc;
 

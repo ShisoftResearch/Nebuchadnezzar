@@ -22,6 +22,7 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
+use client::AsyncClient;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -98,6 +99,7 @@ impl NebServer {
     pub fn new(
         opts: &ServerOptions,
         server_addr: &String,
+        meta_members: &Vec<String>,
         group_name: &String,
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
@@ -139,12 +141,17 @@ impl NebServer {
             raft_service: raft_service.clone(),
             server_id: rpc_server.server_id,
         });
+        let client = Arc::new(client::AsyncClient::new(
+            &server.rpc,
+            &meta_members,
+            group_name,
+        ).unwrap());
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
                 &Service::Transaction => init_txn_service(rpc_server, &server),
                 &Service::LSMTreeIndex => {
-                    init_lsm_tree_index_serevice(rpc_server, &server, raft_service, raft_client, &conshasing)
+                    init_lsm_tree_index_service(rpc_server, &server, &client, raft_service, raft_client, &conshasing)
                 }
             }
         }
@@ -194,6 +201,7 @@ impl NebServer {
         NebServer::new(
             opts,
             server_addr,
+            &meta_members,
             group_name,
             &rpc_server,
             &raft_service,
@@ -264,9 +272,10 @@ pub fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     );
 }
 
-pub fn init_lsm_tree_index_serevice(
+pub fn init_lsm_tree_index_service(
     rpc_server: &Arc<Server>,
     neb_server: &Arc<NebServer>,
+    neb_client: &Arc<AsyncClient>,
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>
@@ -278,7 +287,7 @@ pub fn init_lsm_tree_index_serevice(
     ));
     rpc_server.register_service(
         lsmtree::service::DEFAULT_SERVICE_ID,
-        &lsmtree::service::LSMTreeService::new(neb_server, &sm_client),
+        &lsmtree::service::LSMTreeService::new(neb_server, neb_client, &sm_client),
     );
 }
 

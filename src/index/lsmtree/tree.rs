@@ -110,6 +110,15 @@ impl LSMTree {
         }
     }
 
+    pub fn new_with_level_ids(range: KeyRange, id: Id, tree_ids: Vec<Id>, neb: &AsyncClient) -> Self {
+        let mut tree = Self::new(range, id);
+        debug_assert_eq!(tree.trees.len(), tree_ids.len());
+        tree.trees.iter_mut().zip(tree_ids).for_each(|(tree, id)| {
+            tree.from_tree_id(&id, neb);
+        });
+        tree
+    }
+
     pub fn insert(&self, mut key: EntryKey) -> bool {
         self.trees[0].insert_into(&key)
     }
