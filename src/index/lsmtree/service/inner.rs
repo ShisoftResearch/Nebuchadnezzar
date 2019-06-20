@@ -94,6 +94,21 @@ impl LSMTreeIns {
         self.get(id).map(|mut c| c.borrow_mut().next())
     }
 
+    pub fn next_block(&self, id: &u64, block_size: usize) -> Option<Vec<Vec<u8>>> {
+        self.get(id).map(|mut c| {
+            let mut keys = Vec::with_capacity(block_size);
+            let mut cursor = c.borrow_mut();
+            let current = |cursor: &LSMTreeCursor| cursor.current().map(|k| k.as_slice().to_vec());
+            if let Some(first_key) = current(&*cursor) {
+                keys.push(first_key);
+                while keys.len() < block_size && cursor.next() {
+                    keys.push(current(&*cursor).unwrap());
+                }
+            }
+            keys
+        })
+    }
+
     pub fn current(&self, id: &u64) -> Option<Option<Vec<u8>>> {
         self.get(id)
             .map(|c| c.borrow().current().map(|k| k.as_slice().to_vec()))

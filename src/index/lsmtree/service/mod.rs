@@ -45,6 +45,7 @@ pub struct LSMTreeSummary {
 service! {
     rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64) -> LSMTreeResult<u64> | LSMTreeSvrError;
     rpc next(tree_id: Id, cursor_id: u64) -> Option<bool> | LSMTreeSvrError;
+    rpc next_block(tree_id: Id, cursor_id: u64, size: u32) -> Option<Vec<Vec<u8>>> | LSMTreeSvrError;
     rpc current(tree_id: Id, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
     rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
     rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id) -> bool;
@@ -94,6 +95,18 @@ impl Service for LSMTreeService {
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| tree.next(&cursor_id)),
+        )
+    }
+
+    fn next_block(&self, tree_id: Id, cursor_id: u64, size: u32) -> Box<Future<Item=Option<Vec<Vec<u8>>>, Error=LSMTreeSvrError>> {
+        let trees = self.trees.read();
+        box future::result(
+            trees
+                .get(&tree_id)
+                .ok_or(LSMTreeSvrError::TreeNotFound)
+                .map(|tree| {
+                    tree.next_block(&cursor_id, size as usize)
+                }),
         )
     }
 
