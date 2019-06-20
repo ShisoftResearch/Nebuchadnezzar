@@ -49,12 +49,17 @@ impl DelegatedCursor {
 
 impl LSMTreeIns {
     pub fn new(range: KeyRange, id: Id) -> Self {
+        Self::new_from_tree(LSMTree::new(range, id))
+    }
+
+    pub fn new_from_tree(tree: LSMTree) -> Self {
         Self {
-            tree: LSMTree::new(range, id),
+            tree,
             counter: AtomicU64::new(0),
             cursors: Mutex::new(CursorMap::new()),
         }
     }
+
 
     fn get(&self, id: &u64) -> Option<MutCursorRef> {
         self.cursors.lock().get_refresh(id).map(|c| {

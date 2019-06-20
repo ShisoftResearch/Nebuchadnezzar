@@ -59,7 +59,7 @@ pub struct LSMTreeService {
     neb_server: Arc<NebServer>,
     sm: Arc<SMClient>,
     counter: AtomicU64,
-    trees: Arc<RwLock<HashMap<Id, Arc<LSMTreeIns>>>>,
+    trees: Arc<RwLock<HashMap<Id, LSMTreeIns>>>,
 }
 
 dispatch_rpc_service_functions!(LSMTreeService);
@@ -137,10 +137,10 @@ impl Service for LSMTreeService {
         } else {
             trees.insert(
                 id,
-                Arc::new(LSMTreeIns::new(
+                LSMTreeIns::new(
                     (EntryKey::from(start), EntryKey::from(end)),
                     id,
-                )),
+                ),
             );
             true
         };
@@ -224,7 +224,7 @@ impl Service for LSMTreeService {
 
 impl LSMTreeService {
     pub fn new(neb_server: &Arc<NebServer>, neb_client: &Arc<AsyncClient>, sm: &Arc<SMClient>) -> Arc<Self> {
-        let trees = Arc::new(RwLock::new(HashMap::new()));
+        let trees = Arc::new(RwLock::new(HashMap::<Id, LSMTreeIns>::new()));
         let trees_clone = trees.clone();
         let neb = neb_server.clone();
         thread::Builder::new()
@@ -233,12 +233,10 @@ impl LSMTreeService {
                 thread::sleep(Duration::from_millis(500));
                 let tree_map = trees_clone.read();
                 tree_map
-                    .values()
-                    .cloned()
-                    .filter(|tree: &Arc<LSMTreeIns>| tree.oversized())
-                    .collect_vec()
                     .par_iter()
-                    .for_each(|tree: &Arc<LSMTreeIns>| {
+                    .map(|(k, v)| v)
+                    .filter(|tree| tree.oversized())
+                    .for_each(|tree| {
                         tree.check_and_merge();
                     });
                 persist::<_, ()>(neb.clone(), ()).wait().unwrap();
@@ -250,7 +248,7 @@ impl LSMTreeService {
             trees,
         };
         {
-            let trees = service.trees.write();
+            let mut trees = service.trees.write();
             let placements = service.sm.all_for_server(&neb_server.server_id).wait().unwrap().unwrap();
             // the placement state machine have all the data except header id for each level, need to get them
             let fetches = placements.iter().map(|placement| {
@@ -262,8 +260,11 @@ impl LSMTreeService {
                 let tree_ids = level_trees_from_cell(cell);
                 let starts = EntryKey::from(p.starts);
                 let ends = EntryKey::from(p.ends);
-                LSMTree::new_with_level_ids((starts, ends), p.id, tree_ids, neb_client);
+                LSMTree::new_with_level_ids((starts, ends), p.id, tree_ids, neb_client)
             }).collect();
+            for lsm_tree in lsm_trees {
+                trees.insert(lsm_tree.id, LSMTreeIns::new_from_tree(lsm_tree));
+            }
         }
         Arc::new(service)
     }
