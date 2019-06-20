@@ -101,7 +101,7 @@ impl LSMTreeIns {
             let current = |cursor: &LSMTreeCursor| cursor.current().map(|k| k.as_slice().to_vec());
             if let Some(first_key) = current(&*cursor) {
                 keys.push(first_key);
-                while keys.len() < block_size && cursor.next() {
+                while cursor.next() && keys.len() < block_size {
                     keys.push(current(&*cursor).unwrap());
                 }
             }
