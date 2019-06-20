@@ -10,5 +10,6 @@ mod split;
 #[cfg(test)]
 mod test;
 pub mod tree;
+pub mod client;
 
 pub struct RangedIndexer {}
