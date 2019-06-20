@@ -60,7 +60,6 @@ impl LSMTreeIns {
         }
     }
 
-
     fn get(&self, id: &u64) -> Option<MutCursorRef> {
         self.cursors.lock().get_refresh(id).map(|c| {
             c.timestamp = clock::now();

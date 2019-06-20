@@ -158,9 +158,8 @@ where
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
-
         // check returning deleted key
-        if self.deleted.read().contains( key) {
+        if self.deleted.read().contains(key) {
             let mut deleted = self.deleted.write();
             deleted.remove(key);
         }

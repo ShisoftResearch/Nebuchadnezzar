@@ -27,7 +27,7 @@ pub struct HashedIndexMeta {
 pub struct VectorizedMeta {
     cell_id: Id,
     feature: Component,
-    cell_ver: u64
+    cell_ver: u64,
 }
 
 pub enum IndexMeta {
@@ -49,7 +49,6 @@ pub struct IndexRes {
 
 pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
     let new_index_res = probe_cell_indices(cell, schema);
-
 }
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
@@ -77,14 +76,7 @@ fn probe_field_indices(
         for field in fields {
             let value = &value[field.name_id];
             let field_name = format!("{} -> {}", fields_name, field.name);
-            probe_field_indices(
-                cell,
-                &field_name,
-                field,
-                schema_id,
-                value,
-                res,
-            );
+            probe_field_indices(cell, &field_name, field, schema_id, value, res);
         }
     } else {
         let mut components = vec![];
@@ -166,7 +158,7 @@ fn probe_field_indices(
         }
         res.push(IndexRes {
             fields: fields_name.clone(),
-            meta: metas
+            meta: metas,
         });
     }
 }

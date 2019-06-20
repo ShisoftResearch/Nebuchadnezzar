@@ -13,6 +13,7 @@ use bifrost::utils::fut_exec::wait;
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 use client;
+use client::AsyncClient;
 use futures::Future;
 use index::lsmtree;
 use ram::chunk::Chunks;
@@ -22,7 +23,6 @@ use ram::schema::LocalSchemasCache;
 use ram::types::Id;
 use std::io;
 use std::sync::Arc;
-use client::AsyncClient;
 
 pub mod cell_rpc;
 pub mod transactions;
@@ -141,18 +141,20 @@ impl NebServer {
             raft_service: raft_service.clone(),
             server_id: rpc_server.server_id,
         });
-        let client = Arc::new(client::AsyncClient::new(
-            &server.rpc,
-            &meta_members,
-            group_name,
-        ).unwrap());
+        let client =
+            Arc::new(client::AsyncClient::new(&server.rpc, &meta_members, group_name).unwrap());
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
                 &Service::Transaction => init_txn_service(rpc_server, &server),
-                &Service::LSMTreeIndex => {
-                    init_lsm_tree_index_service(rpc_server, &server, &client, raft_service, raft_client, &conshasing)
-                }
+                &Service::LSMTreeIndex => init_lsm_tree_index_service(
+                    rpc_server,
+                    &server,
+                    &client,
+                    raft_service,
+                    raft_client,
+                    &conshasing,
+                ),
             }
         }
 
@@ -278,7 +280,7 @@ pub fn init_lsm_tree_index_service(
     neb_client: &Arc<AsyncClient>,
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
-    cons_hash: &Arc<ConsistentHashing>
+    cons_hash: &Arc<ConsistentHashing>,
 ) {
     raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new(cons_hash));
     let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(

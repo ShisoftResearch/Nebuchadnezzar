@@ -14,8 +14,8 @@ mod macros;
 #[macro_use]
 pub mod btree;
 pub mod client;
-pub mod lsmtree;
 pub mod hash;
+pub mod lsmtree;
 
 const ID_SIZE: usize = 16;
 const KEY_SIZE: usize = ID_SIZE + 20; // 20 is the estimate length of: schema id u32 (4) + field id u64(8) and value u64(8)
