@@ -1,5 +1,5 @@
 use bifrost_hasher::hash_str;
-use index::client::IndexComps::Vectorized;
+use index::builder::IndexComps::Vectorized;
 use index::EntryKey;
 use ram::cell::Cell;
 use ram::schema::{Field, IndexType, Schema};

@@ -13,7 +13,7 @@ use std::slice::SliceIndex;
 mod macros;
 #[macro_use]
 pub mod btree;
-pub mod client;
+pub mod builder;
 pub mod hash;
 pub mod lsmtree;
 
