@@ -41,7 +41,7 @@ impl LSMTreeClient {
         match self.placement_client.get(id).wait().unwrap() {
             Ok(placement) => {
                 let mut placements = self.placements.write();
-                let rpc_client = placement_client(id, &self.neb).wait().unwrap();
+                let rpc_client = placement_client(&placement.id, &self.neb).wait().unwrap();
                 placements.insert(placement.starts.clone(), Placement {
                     meta: placement,
                     client: rpc_client
