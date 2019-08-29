@@ -7,8 +7,8 @@ use ram::types::{Id, Value};
 use smallvec::SmallVec;
 
 type FieldName = String;
-type Component = [u8; 8];
-const UNSETTLED: Component = [0u8; 8];
+type Feature = [u8; 8];
+const UNSETTLED: Feature = [0u8; 8];
 
 // Define index rules
 // Index can be applied on scala value and scala arrays for both Ranged and Hashed
@@ -26,7 +26,8 @@ pub struct HashedIndexMeta {
 
 pub struct VectorizedMeta {
     cell_id: Id,
-    feature: Component,
+    feature: Feature,
+    data_width: u8,
     cell_ver: u64,
 }
 
@@ -37,9 +38,9 @@ pub enum IndexMeta {
 }
 
 pub enum IndexComps {
-    Ranged(Component),
-    Hashed(Component),
-    Vectorized(Component),
+    Ranged(Feature),
+    Hashed(Feature),
+    Vectorized(Feature, u8),
 }
 
 pub struct IndexRes {
@@ -105,7 +106,7 @@ fn probe_field_indices(
                         &mut array
                             .features()
                             .into_iter()
-                            .map(|vec| IndexComps::Vectorized(vec))
+                            .map(|vec| IndexComps::Vectorized(vec, array.data_size()))
                             .collect(),
                     ),
                 }
@@ -116,7 +117,7 @@ fn probe_field_indices(
                     &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
                     &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
                     &IndexType::Vectorized => {
-                        components.push(IndexComps::Vectorized(value.feature()))
+                        components.push(IndexComps::Vectorized(value.feature(), value.base_size() as u8))
                     }
                 }
             }
@@ -125,32 +126,33 @@ fn probe_field_indices(
         let id = cell.id();
         for comp in components {
             match comp {
-                IndexComps::Hashed(c) => {
-                    if c == UNSETTLED {
+                IndexComps::Hashed(feat) => {
+                    if feat == UNSETTLED {
                         continue;
                     }
-                    let id = Id::from_obj(&(schema_id, fields_name.clone(), c));
+                    let id = Id::from_obj(&(schema_id, fields_name.clone(), feat));
                     metas.push(IndexMeta::Hashed(HashedIndexMeta { id }));
                 }
-                IndexComps::Ranged(c) => {
-                    if c == UNSETTLED {
+                IndexComps::Ranged(feat) => {
+                    if feat == UNSETTLED {
                         continue;
                     }
                     let mut key = EntryKey::new();
                     let field = hash_str(&fields_name);
                     key.extend_from_slice(&id.to_binary()); // Id
-                    key.extend_from_slice(&c); // value
+                    key.extend_from_slice(&feat); // value
                     key.extend_from_slice(&field.to_be_bytes()); // field
                     key.extend_from_slice(&schema_id.to_be_bytes()); // schema id
                     metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                 }
-                IndexComps::Vectorized(c) => {
-                    if c == UNSETTLED {
+                IndexComps::Vectorized(feat, size) => {
+                    if feat == UNSETTLED {
                         continue;
                     }
                     metas.push(IndexMeta::Vectorized(VectorizedMeta {
                         cell_id: id,
-                        feature: c,
+                        feature: feat,
+                        data_width: size,
                         cell_ver: cell.header.version,
                     }));
                 }
