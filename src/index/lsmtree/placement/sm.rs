@@ -4,7 +4,7 @@ use bifrost::utils::bincode::serialize;
 use bifrost_plugins::hash_ident;
 use bincode::deserialize;
 use dovahkiin::types::Id;
-use index::EntryKey;
+use index::trees::EntryKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::types::RandValue;

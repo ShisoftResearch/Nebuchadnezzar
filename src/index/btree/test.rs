@@ -11,9 +11,9 @@ use index::btree::node::*;
 use index::btree::reconstruct::TreeConstructor;
 use index::btree::NodeCellRef;
 use index::btree::NodeData;
-use index::Cursor;
-use index::EntryKey;
-use index::{id_from_key, key_with_id};
+use index::trees::Cursor;
+use index::trees::EntryKey;
+use index::trees::{id_from_key, key_with_id};
 use itertools::Itertools;
 use ram::types::RandValue;
 use rand::distributions::Uniform;
@@ -101,7 +101,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 
 #[test]
 fn crd() {
-    use index::Cursor;
+    use index::trees::Cursor;
     env_logger::init();
     let tree = LevelBPlusTree::new();
     ::std::fs::remove_dir_all("dumps");
@@ -312,7 +312,7 @@ fn crd() {
 
 #[test]
 pub fn alternative_insertion_pattern() {
-    use index::Cursor;
+    use index::trees::Cursor;
     env_logger::init();
     let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")

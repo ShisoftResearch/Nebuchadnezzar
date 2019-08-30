@@ -6,8 +6,8 @@ use index::lsmtree::placement::sm::client::SMClient;
 use index::lsmtree::split::check_and_split;
 use index::lsmtree::tree::LSMTree;
 use index::lsmtree::tree::{KeyRange, LSMTreeResult};
-use index::Cursor;
-use index::EntryKey;
+use index::trees::Cursor;
+use index::trees::EntryKey;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
@@ -81,7 +81,7 @@ impl LSMTreeIns {
         }
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: index::Ordering) -> u64 {
+    pub fn seek(&self, key: &EntryKey, ordering: index::trees::Ordering) -> u64 {
         let cursor = self.tree.seek(key, ordering);
         let mut map = self.cursors.lock();
         Self::pop_expired_cursors(&mut map);

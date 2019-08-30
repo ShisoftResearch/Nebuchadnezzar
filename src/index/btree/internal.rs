@@ -4,7 +4,7 @@ use hermes::stm::TxnValRef;
 use index::btree::node::EmptyNode;
 use index::btree::Slice;
 use index::btree::*;
-use index::EntryKey;
+use index::trees::EntryKey;
 use itertools::free::chain;
 use std::any::Any;
 use std::cell::UnsafeCell;

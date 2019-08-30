@@ -7,8 +7,8 @@ use index::btree::remove::scatter_nodes;
 use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::NodeCellRef;
-use index::EntryKey;
-use index::Slice;
+use index::trees::EntryKey;
+use index::trees::Slice;
 use std::fmt::Debug;
 
 pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>

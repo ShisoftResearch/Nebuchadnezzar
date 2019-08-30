@@ -9,7 +9,7 @@ use index::lsmtree::persistent::level_trees_from_cell;
 use index::lsmtree::service::inner::LSMTreeIns;
 use index::lsmtree::split::check_and_split;
 use index::lsmtree::tree::{LSMTree, LSMTreeResult};
-use index::{EntryKey, Ordering};
+use index::trees::{EntryKey, Ordering};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use ram::cell::{Cell, ReadError};

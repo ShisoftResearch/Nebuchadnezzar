@@ -7,7 +7,7 @@ use index::btree::internal::InNode;
 use index::btree::node::{write_node, Node, NodeWriteGuard};
 use index::btree::remove::SubNodeStatus::InNodeEmpty;
 use index::btree::{external, max_entry_key, BPlusTree, DeletionSetInneer, NodeCellRef};
-use index::{EntryKey, Slice};
+use index::trees::{EntryKey, Slice};
 use parking_lot::RwLock;
 use ram::cell::Cell;
 use std::cell::RefCell;

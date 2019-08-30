@@ -13,8 +13,8 @@ use index::btree::search::mut_search;
 use index::btree::search::MutSearchResult;
 use index::btree::NodeCellRef;
 use index::btree::{external, BPlusTree};
-use index::EntryKey;
-use index::Slice;
+use index::trees::EntryKey;
+use index::trees::Slice;
 use std::fmt::Debug;
 use std::mem;
 

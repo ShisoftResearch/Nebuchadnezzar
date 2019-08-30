@@ -1,7 +1,7 @@
 use index::lsmtree::placement::sm::client::SMClient as PlacementClient;
 use index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
 use index::lsmtree::service::AsyncServiceClient;
-use index::EntryKey;
+use index::trees::EntryKey;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
 use ram::types::Id;

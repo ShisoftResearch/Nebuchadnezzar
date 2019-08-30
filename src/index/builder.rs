@@ -1,6 +1,6 @@
 use bifrost_hasher::hash_str;
 use index::builder::IndexComps::Vectorized;
-use index::EntryKey;
+use index::trees::EntryKey;
 use ram::cell::Cell;
 use ram::schema::{Field, IndexType, Schema};
 use ram::types::{Id, Value};
@@ -49,7 +49,8 @@ pub struct IndexRes {
 }
 
 pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
-    let new_index_res = probe_cell_indices(cell, schema);
+    let new_index = probe_cell_indices(cell, schema);
+
 }
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {

@@ -1,6 +1,6 @@
 use index::btree::internal::InNode;
 use index::btree::{write_node, BPlusTree, NodeCellRef, NodeData, NodeWriteGuard, MIN_ENTRY_KEY};
-use index::{EntryKey, Slice};
+use index::trees::{EntryKey, Slice};
 use std::fmt::Debug;
 
 pub fn are_keys_serial(keys: &[EntryKey]) -> bool {
