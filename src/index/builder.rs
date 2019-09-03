@@ -50,7 +50,18 @@ pub struct IndexRes {
 
 pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
     let new_index = probe_cell_indices(cell, schema);
+    for index in new_index {
+        let field_id = hash_str(&index.fields);
+        for meta in index.meta {
+            match meta {
+                IndexMeta::Ranged(ranged) => {
 
+                }
+                IndexMeta::Hashed(_) => {}
+                IndexMeta::Vectorized(_) => {}
+            }
+        }
+    }
 }
 
 pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
