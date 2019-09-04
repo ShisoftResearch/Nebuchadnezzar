@@ -1,6 +1,6 @@
 use index::lsmtree::placement::sm::client::SMClient as PlacementClient;
 use index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
-use index::lsmtree::service::AsyncServiceClient;
+use index::lsmtree::service::{AsyncServiceClient, LSMTreeSvrError};
 use index::trees::{EntryKey, KEY_SIZE};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
@@ -14,6 +14,7 @@ use index::lsmtree::split::placement_client;
 use index::lsmtree::placement;
 use index::builder::Feature;
 use byteorder::{BigEndian, WriteBytesExt};
+use index::lsmtree::tree::LSMTreeResult;
 
 pub struct IndexEntry {
     id: Id,
@@ -42,23 +43,25 @@ pub struct LSMTreeClient {
 pub struct SubTree {
     client: Arc<AsyncServiceClient>,
     epoch: u64,
-    tree_id: Id
+    tree_id: Id,
+    starts: Vec<u8>
 }
 
 impl SubTree {
-    pub fn new(tree_id: Id, client: Arc<AsyncServiceClient>, epoch: u64) -> Self {
+    pub fn new(tree_id: Id, client: Arc<AsyncServiceClient>, epoch: u64, starts: &Vec<u8>) -> Self {
         Self {
-            tree_id, client, epoch
+            tree_id, client, epoch, starts: starts.clone()
         }
     }
 }
 
 impl LSMTreeClient {
-    fn inspect_placement(&self, id: &Id) {
-        match self.placement_client.get(id).wait().unwrap() {
+    fn update_placement(&self, sub_tree: &SubTree) {
+        match self.placement_client.get(&sub_tree.tree_id).wait().unwrap() {
             Ok(placement) => {
                 let mut placements = self.placements.write();
                 let rpc_client = placement_client(&placement.id, &self.neb).wait().unwrap();
+                placements.remove(&sub_tree.starts);
                 placements.insert(placement.starts.clone(), Placement {
                     meta: placement,
                     client: rpc_client
@@ -80,7 +83,8 @@ impl LSMTreeClient {
                     return SubTree::new(
                         candidate_placement.meta.id,
                         candidate_placement.client.clone(),
-                        candidate_placement.meta.epoch
+                        candidate_placement.meta.epoch,
+                        &candidate_placement.meta.starts
                     );
                 }
             }
@@ -96,21 +100,26 @@ impl LSMTreeClient {
                     return SubTree::new(
                         candidate_placement.meta.id,
                         candidate_placement.client.clone(),
-                        candidate_placement.meta.epoch
-                    );;
+                        candidate_placement.meta.epoch,
+                        &candidate_placement.meta.starts
+                    );
                 }
             }
             let placement: PlacementMeta = self.placement_client.locate(&Vec::from(key.as_slice()))
                 .wait().unwrap().unwrap();
             let rpc_client = placement_client(&placement.id, &self.neb)
                 .wait().unwrap();
-            let tree_id = placement.id;
-            let epoch = placement.epoch;
+            let sub_tree = SubTree::new(
+                placement.id,
+                rpc_client.clone(),
+                placement.epoch,
+                &placement.starts
+            );
             placements.insert(placement.starts.clone(), Placement {
                 meta: placement,
-                client: rpc_client.clone()
+                client: rpc_client
             });
-            SubTree::new(tree_id, rpc_client, epoch)
+            sub_tree
         }
     }
 
@@ -125,11 +134,27 @@ impl LSMTreeClient {
         key
     }
 
-    pub fn insert(&self,schema_id: u32, field_id: &u64, cell_id: &Id, feature: &Feature) {
+    pub fn insert(&self,schema_id: u32, field_id: &u64, cell_id: &Id, feature: &Feature) -> bool {
         let mut key = Self::essential_key_components(schema_id, field_id);
         key.extend_from_slice(feature); // 8 bytes
         key.extend_from_slice(&cell_id.to_binary()); // ID SIZE
-        let sub_tree = self.get_sub_tree(&key);
-
+        loop {
+            let sub_tree = self.get_sub_tree(&key);
+            let tree_client = &sub_tree.client;
+            let insertion_result = tree_client
+                    .insert(sub_tree.tree_id, key.clone(), sub_tree.epoch)
+                    .wait().unwrap();
+            match insertion_result {
+                Ok(LSMTreeResult::Ok(insert_res)) => {
+                    return insert_res;
+                },
+                Ok(LSMTreeResult::EpochMismatch(_, _)) | Err(LSMTreeSvrError::TreeNotFound) => {
+                    self.update_placement(&sub_tree);
+                },
+                Err(_) => {
+                    panic!("Error occurred on distributed LSM-tree insertion");
+                }
+            }
+        }
     }
 }
