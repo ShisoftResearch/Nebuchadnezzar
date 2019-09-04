@@ -7,7 +7,7 @@ use ram::types::{Id, Value};
 use smallvec::SmallVec;
 
 type FieldName = String;
-type Feature = [u8; 8];
+pub type Feature = [u8; 8];
 const UNSETTLED: Feature = [0u8; 8];
 
 // Define index rules

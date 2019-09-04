@@ -1,7 +1,7 @@
 use index::lsmtree::placement::sm::client::SMClient as PlacementClient;
 use index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
 use index::lsmtree::service::AsyncServiceClient;
-use index::trees::EntryKey;
+use index::trees::{EntryKey, KEY_SIZE};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::RwLock;
 use ram::types::Id;
@@ -12,6 +12,8 @@ use std::sync::Arc;
 use futures::prelude::*;
 use index::lsmtree::split::placement_client;
 use index::lsmtree::placement;
+use index::builder::Feature;
+use byteorder::{BigEndian, WriteBytesExt};
 
 pub struct IndexEntry {
     id: Id,
@@ -37,6 +39,20 @@ pub struct LSMTreeClient {
     neb: Arc<NebServer>,
 }
 
+pub struct SubTree {
+    client: Arc<AsyncServiceClient>,
+    epoch: u64,
+    tree_id: Id
+}
+
+impl SubTree {
+    pub fn new(tree_id: Id, client: Arc<AsyncServiceClient>, epoch: u64) -> Self {
+        Self {
+            tree_id, client, epoch
+        }
+    }
+}
+
 impl LSMTreeClient {
     fn inspect_placement(&self, id: &Id) {
         match self.placement_client.get(id).wait().unwrap() {
@@ -53,7 +69,7 @@ impl LSMTreeClient {
         }
     }
 
-    fn get_client(&self, key: &Vec<u8>) -> Arc<AsyncServiceClient> {
+    fn get_sub_tree(&self, key: &Vec<u8>) -> SubTree {
         // Stage one, early exit if placement founded. Read lock only
         {
             let placements = self.placements.read();
@@ -61,7 +77,11 @@ impl LSMTreeClient {
             if let Some((_, candidate_placement)) = candidate {
                 if &candidate_placement.meta.ends >= key {
                     // in range, return
-                    return candidate_placement.client.clone();
+                    return SubTree::new(
+                        candidate_placement.meta.id,
+                        candidate_placement.client.clone(),
+                        candidate_placement.meta.epoch
+                    );
                 }
             }
         }
@@ -73,18 +93,43 @@ impl LSMTreeClient {
             if let Some((_, candidate_placement)) = candidate {
                 if &candidate_placement.meta.ends >= key {
                     // in range, return
-                    return candidate_placement.client.clone();
+                    return SubTree::new(
+                        candidate_placement.meta.id,
+                        candidate_placement.client.clone(),
+                        candidate_placement.meta.epoch
+                    );;
                 }
             }
             let placement: PlacementMeta = self.placement_client.locate(&Vec::from(key.as_slice()))
                 .wait().unwrap().unwrap();
             let rpc_client = placement_client(&placement.id, &self.neb)
                 .wait().unwrap();
+            let tree_id = placement.id;
+            let epoch = placement.epoch;
             placements.insert(placement.starts.clone(), Placement {
                 meta: placement,
                 client: rpc_client.clone()
             });
-            return rpc_client;
+            SubTree::new(tree_id, rpc_client, epoch)
         }
+    }
+
+    fn essential_key_components(schema_id: u32, field_id: &u64) -> Vec<u8> {
+        let mut key = Vec::with_capacity(KEY_SIZE);
+        let mut schema_id_fut = [0u8; 4];
+        let mut field_id_fut = [0u8; 8];
+        (&mut schema_id_fut as &mut [u8]).write_u32::<BigEndian>(schema_id).unwrap();
+        (&mut field_id_fut as &mut [u8]).write_u64::<BigEndian>(*field_id).unwrap();
+        key.extend_from_slice(&schema_id_fut);  // 4 bytes
+        key.extend_from_slice(&field_id_fut);   // 8 bytes
+        key
+    }
+
+    pub fn insert(&self,schema_id: u32, field_id: &u64, cell_id: &Id, feature: &Feature) {
+        let mut key = Self::essential_key_components(schema_id, field_id);
+        key.extend_from_slice(feature); // 8 bytes
+        key.extend_from_slice(&cell_id.to_binary()); // ID SIZE
+        let sub_tree = self.get_sub_tree(&key);
+
     }
 }
