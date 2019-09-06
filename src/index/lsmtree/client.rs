@@ -3,7 +3,7 @@ use index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
 use index::lsmtree::service::{AsyncServiceClient, LSMTreeSvrError};
 use index::trees::{EntryKey, KEY_SIZE};
 use linked_hash_map::LinkedHashMap;
-use parking_lot::RwLock;
+use parking_lot::{RwLock, Mutex};
 use ram::types::Id;
 use server::NebServer;
 use std::collections::btree_map::BTreeMap;
@@ -15,6 +15,9 @@ use index::lsmtree::placement;
 use index::builder::Feature;
 use byteorder::{BigEndian, WriteBytesExt};
 use index::lsmtree::tree::LSMTreeResult;
+use bifrost::conshash::ConsistentHashing;
+use index::lsmtree;
+use bifrost::raft::client::RaftClient;
 
 pub struct IndexEntry {
     id: Id,
@@ -35,7 +38,7 @@ pub struct Placement {
 pub struct LSMTreeClient {
     counter: AtomicUsize,
     placements: RwLock<BTreeMap<Vec<u8>, Placement>>,
-    cursors: LinkedHashMap<usize, Cursor>,
+    cursors: RwLock<LinkedHashMap<usize, Mutex<Cursor>>>,
     placement_client: PlacementClient,
     neb: Arc<NebServer>,
 }
@@ -56,6 +59,20 @@ impl SubTree {
 }
 
 impl LSMTreeClient {
+
+    pub fn new(neb: &Arc<NebServer>, raft_client: &Arc<RaftClient>,) -> Self {
+        Self {
+            counter: AtomicUsize::new(0),
+            placements: RwLock::new(BTreeMap::new()),
+            cursors: RwLock::new(LinkedHashMap::new()),
+            placement_client: PlacementClient::new(
+                lsmtree::placement::sm::SM_ID,
+                raft_client
+            ),
+            neb: neb.clone()
+        }
+    }
+
     fn update_placement(&self, sub_tree: &SubTree) {
         match self.placement_client.get(&sub_tree.tree_id).wait().unwrap() {
             Ok(placement) => {
@@ -157,4 +174,5 @@ impl LSMTreeClient {
             }
         }
     }
+
 }
