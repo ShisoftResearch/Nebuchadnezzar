@@ -13,7 +13,7 @@ use index::trees::key_with_id;
 use index::lsmtree::cursor::LSMTreeCursor;
 use index::lsmtree::placement::sm::Placement;
 use index::lsmtree::split::SplitStatus;
-use index::lsmtree::split::{check_and_split, placement_client};
+use index::lsmtree::split::{check_and_split, tree_client};
 pub use index::lsmtree::tree::*;
 use index::trees::Cursor;
 use index::trees::EntryKey;
@@ -123,7 +123,7 @@ pub fn split() {
             let vec_entry_key: Vec<_> = entry_key.iter().cloned().collect();
             let placement: Placement = sm_client.locate(&vec_entry_key).wait().unwrap().unwrap();
             assert_ne!(placement.id, lsm_tree.id);
-            let client = placement_client(&placement.id, &server).wait().unwrap();
+            let client = tree_client(&placement.id, &server).wait().unwrap();
             let cursor_id = client
                 .seek(
                     placement.id,

@@ -42,9 +42,14 @@ pub struct LSMTreeSummary {
     range: (Vec<u8>, Vec<u8>),
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct LSMTreeBlock {
+    pub data: Vec<Vec<u8>>,
+    pub cursor_id: u64
+}
+
 service! {
-    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64) -> LSMTreeResult<u64> | LSMTreeSvrError;
-    rpc next(tree_id: Id, cursor_id: u64) -> Option<bool> | LSMTreeSvrError;
+    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64, block_size: u32) -> LSMTreeResult<Option<LSMTreeBlock>> | LSMTreeSvrError;
     rpc next_block(tree_id: Id, cursor_id: u64, size: u32) -> Option<Vec<Vec<u8>>> | LSMTreeSvrError;
     rpc current(tree_id: Id, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
     rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
@@ -72,29 +77,23 @@ impl Service for LSMTreeService {
         key: Vec<u8>,
         ordering: Ordering,
         epoch: u64,
-    ) -> Box<Future<Item = LSMTreeResult<u64>, Error = LSMTreeSvrError>> {
+        block_size: u32
+    ) -> Box<Future<Item = LSMTreeResult<Option<LSMTreeBlock>>, Error = LSMTreeSvrError>> {
         let trees = self.trees.read();
         box future::result(
             trees
                 .get(&tree_id)
                 .ok_or(LSMTreeSvrError::TreeNotFound)
                 .map(|tree| {
-                    tree.with_epoch_check(epoch, || tree.seek(&SmallVec::from(key), ordering))
+                    tree.with_epoch_check(epoch, || {
+                        let cursor_id = tree.seek(&SmallVec::from(key), ordering);
+                        let data = tree.next_block(&cursor_id, block_size as usize);
+                        data.map(|data| LSMTreeBlock {
+                            data,
+                            cursor_id
+                        })
+                    })
                 }),
-        )
-    }
-
-    fn next(
-        &self,
-        tree_id: Id,
-        cursor_id: u64,
-    ) -> Box<Future<Item = Option<bool>, Error = LSMTreeSvrError>> {
-        let trees = self.trees.read();
-        box future::result(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.next(&cursor_id)),
         )
     }
 

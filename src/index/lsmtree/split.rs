@@ -36,7 +36,7 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
         .unwrap()
 }
 
-pub fn placement_client(
+pub fn tree_client(
     id: &Id,
     neb: &Arc<NebServer>,
 ) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
@@ -75,7 +75,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             target: new_placement_id,
         });
         // Create the tree in split host
-        let client = placement_client(&new_placement_id, neb).wait().unwrap();
+        let client = tree_client(&new_placement_id, neb).wait().unwrap();
         let mid_vec = mid_key.iter().cloned().collect_vec();
         let new_tree_created = client
             .new_tree(
@@ -107,7 +107,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         let mut cursor = tree.seek(&max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
-        let target_client = placement_client(&target_id, neb).wait().unwrap();
+        let target_client = tree_client(&target_id, neb).wait().unwrap();
         debug!(
             "Start to split {:?} to {:?} pivot {:?}, batch size {}",
             tree.id, tree_split.target, tree_split.pivot, batch_size

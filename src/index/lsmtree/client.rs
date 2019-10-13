@@ -1,7 +1,7 @@
 use index::lsmtree::placement::sm::client::SMClient as PlacementClient;
 use index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
 use index::lsmtree::service::{AsyncServiceClient, LSMTreeSvrError};
-use index::trees::{EntryKey, KEY_SIZE};
+use index::trees::{EntryKey, KEY_SIZE, Ordering};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::{RwLock, Mutex};
 use ram::types::Id;
@@ -10,7 +10,7 @@ use std::collections::btree_map::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 use futures::prelude::*;
-use index::lsmtree::split::placement_client;
+use index::lsmtree::split::tree_client;
 use index::lsmtree::placement;
 use index::builder::Feature;
 use byteorder::{BigEndian, WriteBytesExt};
@@ -19,15 +19,13 @@ use bifrost::conshash::ConsistentHashing;
 use index::lsmtree;
 use bifrost::raft::client::RaftClient;
 
-pub struct IndexEntry {
-    id: Id,
-    val: u64,
-}
+const SEEK_BLOCK_SIZE: u32 = 128;
 
 pub struct Cursor {
-    buffer: Vec<IndexEntry>,
-    at_end: bool,
-    pos: usize,
+    tree: SubTree,
+    id: u64,
+    buffer: Vec<Vec<u8>>,
+    current: usize
 }
 
 pub struct Placement {
@@ -77,7 +75,7 @@ impl LSMTreeClient {
         match self.placement_client.get(&sub_tree.tree_id).wait().unwrap() {
             Ok(placement) => {
                 let mut placements = self.placements.write();
-                let rpc_client = placement_client(&placement.id, &self.neb).wait().unwrap();
+                let rpc_client = tree_client(&placement.id, &self.neb).wait().unwrap();
                 placements.remove(&sub_tree.starts);
                 placements.insert(placement.starts.clone(), Placement {
                     meta: placement,
@@ -124,7 +122,7 @@ impl LSMTreeClient {
             }
             let placement: PlacementMeta = self.placement_client.locate(&Vec::from(key.as_slice()))
                 .wait().unwrap().unwrap();
-            let rpc_client = placement_client(&placement.id, &self.neb)
+            let rpc_client = tree_client(&placement.id, &self.neb)
                 .wait().unwrap();
             let sub_tree = SubTree::new(
                 placement.id,
@@ -140,18 +138,18 @@ impl LSMTreeClient {
         }
     }
 
-    fn essential_key_components(schema_id: u32, field_id: &u64) -> Vec<u8> {
+    fn essential_key_components(schema_id: u32, field_id: u64) -> Vec<u8> {
         let mut key = Vec::with_capacity(KEY_SIZE);
         let mut schema_id_fut = [0u8; 4];
         let mut field_id_fut = [0u8; 8];
         (&mut schema_id_fut as &mut [u8]).write_u32::<BigEndian>(schema_id).unwrap();
-        (&mut field_id_fut as &mut [u8]).write_u64::<BigEndian>(*field_id).unwrap();
+        (&mut field_id_fut as &mut [u8]).write_u64::<BigEndian>(field_id).unwrap();
         key.extend_from_slice(&schema_id_fut);  // 4 bytes
         key.extend_from_slice(&field_id_fut);   // 8 bytes
         key
     }
 
-    pub fn insert(&self,schema_id: u32, field_id: &u64, cell_id: &Id, feature: &Feature) -> bool {
+    pub fn insert(&self,schema_id: u32, field_id: u64, cell_id: &Id, feature: &Feature) -> bool {
         let mut key = Self::essential_key_components(schema_id, field_id);
         key.extend_from_slice(feature); // 8 bytes
         key.extend_from_slice(&cell_id.to_binary()); // ID SIZE
@@ -175,4 +173,37 @@ impl LSMTreeClient {
         }
     }
 
+    pub fn seek(&self, schema_id: u32, field_id: u64, feature: &Feature, ordering: Ordering) -> Option<Cursor> {
+        let mut key = Self::essential_key_components(schema_id, field_id);
+        key.extend_from_slice(feature); // 8 bytes
+        loop {
+            let sub_tree = self.get_sub_tree(&key);
+            let tree_client = &sub_tree.client;
+            let seek_result = tree_client.seek(
+                sub_tree.tree_id,
+                key.clone(),
+                ordering,
+                sub_tree.epoch,
+                SEEK_BLOCK_SIZE
+            ).wait().unwrap();
+            match seek_result {
+                Ok(LSMTreeResult::Ok(insert_res)) => {
+                    return insert_res.map(|block| {
+                        Cursor {
+                            tree: sub_tree,
+                            id: block.cursor_id,
+                            buffer: block.data,
+                            current: 0
+                        }
+                    })
+                },
+                Ok(LSMTreeResult::EpochMismatch(_, _)) | Err(LSMTreeSvrError::TreeNotFound) => {
+                    self.update_placement(&sub_tree);
+                },
+                Err(_) => {
+                    panic!("Error occurred on distributed LSM-tree seek");
+                }
+            }
+        }
+    }
 }

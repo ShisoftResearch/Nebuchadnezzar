@@ -90,10 +90,6 @@ impl LSMTreeIns {
         return id;
     }
 
-    pub fn next(&self, id: &u64) -> Option<bool> {
-        self.get(id).map(|mut c| c.borrow_mut().next())
-    }
-
     pub fn next_block(&self, id: &u64, block_size: usize) -> Option<Vec<Vec<u8>>> {
         self.get(id).map(|mut c| {
             let mut keys = Vec::with_capacity(block_size);
