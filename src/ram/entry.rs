@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use libc;
-use ram::cell::CellHeader;
-use ram::tombstone::Tombstone;
+use crate::ram::cell::CellHeader;
+use crate::ram::tombstone::Tombstone;
 use std::ptr;
 
 bitflags! {

@@ -1,13 +1,11 @@
-use client;
-use client::AsyncClient;
-use futures::future::join_all;
-use futures::Future;
-use index::btree::external::ExtNode;
-use index::btree::{external, BPlusTree};
+use crate::client;
+use crate::client::AsyncClient;
+use crate::index::btree::external::ExtNode;
+use crate::index::btree::{external, BPlusTree};
 use itertools::Itertools;
-use ram::cell::Cell;
+use crate::ram::cell::Cell;
 use rayon::prelude::*;
-use server::NebServer;
+use crate::server::NebServer;
 use std::sync::Arc;
 
 pub fn store_changed_nodes(neb: Arc<NebServer>) -> impl Future<Item = (), Error = ()> {

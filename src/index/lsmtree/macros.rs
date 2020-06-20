@@ -3,7 +3,7 @@ macro_rules! with_levels {
         $(
             mod $sym {
                 use super::*;
-                use index::trees::*;
+                use crate::index::trees::*;
                 use smallvec::Array;
                 use std::fmt;
 

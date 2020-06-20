@@ -29,7 +29,6 @@ extern crate bitflags;
 extern crate bincode;
 extern crate byteorder;
 extern crate core;
-extern crate futures_await as futures;
 extern crate libc;
 extern crate linked_hash_map;
 extern crate num_cpus;
@@ -40,10 +39,7 @@ extern crate serde;
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
-extern crate cuckoofilter;
-extern crate hermes;
 extern crate owning_ref;
-extern crate rayon;
 extern crate serde_json;
 extern crate test;
 

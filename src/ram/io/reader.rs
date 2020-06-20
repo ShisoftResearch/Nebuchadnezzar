@@ -1,7 +1,7 @@
-use ram::cell::*;
-use ram::schema::{Field, Schema};
-use ram::types;
-use ram::types::{type_id_of, u32_io, u8_io, Map, Type, Value};
+use crate::ram::cell::*;
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types;
+use crate::ram::types::{type_id_of, u32_io, u8_io, Map, Type, Value};
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, usize) {
     let mut ptr = ptr;

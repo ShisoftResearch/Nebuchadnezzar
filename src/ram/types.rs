@@ -1,5 +1,5 @@
-use ram::cell::CellHeader;
-use utils::rand;
+use crate::ram::cell::CellHeader;
+use crate::utils::rand;
 
 pub use dovahkiin::types::*;
 

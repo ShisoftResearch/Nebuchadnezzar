@@ -1,7 +1,7 @@
 use super::mem_cursor::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use dovahkiin::types::Id;
-use ram::entry::*;
+use crate::ram::entry::*;
 use std::io::{Cursor, Read, Write};
 
 lazy_static! {

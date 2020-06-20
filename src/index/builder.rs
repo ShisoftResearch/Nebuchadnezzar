@@ -1,9 +1,9 @@
 use bifrost_hasher::hash_str;
-use index::builder::IndexComps::Vectorized;
-use index::trees::EntryKey;
-use ram::cell::Cell;
-use ram::schema::{Field, IndexType, Schema};
-use ram::types::{Id, Value};
+use crate::index::builder::IndexComps::Vectorized;
+use crate::index::trees::EntryKey;
+use crate::ram::cell::Cell;
+use crate::ram::schema::{Field, IndexType, Schema};
+use crate::ram::types::{Id, Value};
 use smallvec::SmallVec;
 
 type FieldName = String;

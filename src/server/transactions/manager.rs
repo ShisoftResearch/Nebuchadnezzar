@@ -1,18 +1,14 @@
 use super::*;
-use bifrost::utils::async_locks::{AsyncMutexGuard, Mutex, MutexGuard, RwLock};
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
-use futures::prelude::{async, await};
-use futures::sync::mpsc::{channel, Receiver, SendError, Sender};
-use futures::Sink;
-use ram::cell::CellHeader;
-use ram::cell::{Cell, ReadError, WriteError};
-use ram::types::{Id, Value};
-use server::NebServer;
+use crate::ram::cell::CellHeader;
+use crate::ram::cell::{Cell, ReadError, WriteError};
+use crate::ram::types::{Id, Value};
+use crate::server::NebServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use utils::chashmap::{CHashMap, WriteGuard};
-use utils::stream::PollableStream;
+use crate::utils::chashmap::{CHashMap, WriteGuard};
+use crate::utils::stream::PollableStream;
 
 type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;

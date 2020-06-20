@@ -1,10 +1,10 @@
 use hermes::stm::Txn;
 use hermes::stm::TxnErr;
 use hermes::stm::TxnValRef;
-use index::btree::node::EmptyNode;
-use index::btree::Slice;
-use index::btree::*;
-use index::trees::EntryKey;
+use crate::index::btree::node::EmptyNode;
+use crate::index::btree::Slice;
+use crate::index::btree::*;
+use crate::index::trees::EntryKey;
 use itertools::free::chain;
 use std::any::Any;
 use std::cell::UnsafeCell;

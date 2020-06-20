@@ -1,6 +1,6 @@
-use index::trees::Cursor;
-use index::trees::EntryKey;
-use index::trees::Ordering;
+use crate::index::trees::Cursor;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Ordering;
 
 pub struct LSMTreeCursor {
     level_cursors: Vec<Box<Cursor>>,

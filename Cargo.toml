@@ -2,6 +2,7 @@
 name = "neb"
 version = "0.1.0"
 authors = ["Hao Shi <shisoftgenius@gmail.com>"]
+edition = "2018"
 
 [lib]
 name = "neb"
@@ -11,30 +12,28 @@ name = "tests"
 
 [dependencies]
 libc = "*"
-log = "0.3"
+log = "*"
 lazy_static = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 dovahkiin = { git = "https://github.com/ShisoftResearch/Dovahkiin", branch = "develop" }
 hermes = { git = "https://github.com/ShisoftResearch/Hermes.git" }
-cuckoofilter = { git = "https://github.com/ShisoftResearch/rust-cuckoofilter.git" }
+rayon = "*"
 serde = "*"
 serde_derive = "*"
 bincode = "*"
-byteorder = "1"
-parking_lot = {version = "0.6", features = ["nightly", "deadlock_detection"]}
-rand = "0.5"
-linked-hash-map = "0.4"
-bitflags = "1.0"
+byteorder = "*"
+parking_lot = "*"
+rand = "*"
+linked-hash-map = "*"
+bitflags = "*"
 itertools = "*"
 smallvec = "*"
-owning_ref = "0.3"
-rayon = "1.0"
-futures-await = { git = "https://github.com/vorot93/futures-await.git" }
-num_cpus = "1.0"
+owning_ref = "*"
+num_cpus = "*"
 static_assertions = "*"
-serde_json = "1.0"
+serde_json = "*"
 
 [dev-dependencies]
-env_logger = "0.4"
+env_logger = "*"

@@ -1,7 +1,7 @@
 use itertools::Itertools;
-use ram::chunk::Chunk;
-use ram::entry::{Entry, EntryContent, EntryType};
-use ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use crate::ram::chunk::Chunk;
+use crate::ram::entry::{Entry, EntryContent, EntryType};
+use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;

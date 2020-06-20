@@ -2,9 +2,9 @@ use super::super::chunk::{Chunk, Chunks};
 use super::super::segs::Segment;
 use super::*;
 use dovahkiin::types::Id;
-use ram::cell::{Cell, CellHeader};
-use ram::entry::*;
-use ram::tombstone::Tombstone;
+use crate::ram::cell::{Cell, CellHeader};
+use crate::ram::entry::*;
+use crate::ram::tombstone::Tombstone;
 
 use std::collections::BTreeSet;
 use std::collections::Bound::{Included, Unbounded};

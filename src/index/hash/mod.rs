@@ -1,9 +1,8 @@
 use bifrost::rpc::RPCError;
-use client::AsyncClient;
-use futures::prelude::*;
-use ram::cell::{Cell, CellHeader, ReadError, WriteError};
-use ram::schema::{Field, Schema};
-use ram::types::*;
+use crate::client::AsyncClient;
+use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::*;
 use std::sync::Arc;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";

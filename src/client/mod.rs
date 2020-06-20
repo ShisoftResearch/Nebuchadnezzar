@@ -8,15 +8,12 @@ use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
 
-use ram::cell::{Cell, CellHeader, ReadError, WriteError};
-use ram::schema::sm as schema_sm;
-use ram::schema::sm::client::SMClient as SchemaClient;
-use ram::schema::Schema;
-use ram::types::Id;
-use server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
-
-use futures::prelude::{async, await};
-use futures::Future;
+use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::schema::sm as schema_sm;
+use crate::ram::schema::sm::SMClient as SchemaClient;
+use crate::ram::schema::Schema;
+use crate::ram::types::Id;
+use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
 use self::transaction::*;
 

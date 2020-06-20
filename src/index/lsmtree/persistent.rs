@@ -1,7 +1,7 @@
 use itertools::Itertools;
-use ram::cell::Cell;
-use ram::schema::{Field, Schema};
-use ram::types::*;
+use crate::ram::cell::Cell;
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::*;
 
 const LSM_TREE_SCHEMA: &'static str = "LSM_TREE_SCHEMA";
 

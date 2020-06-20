@@ -10,8 +10,6 @@ use core::borrow::Borrow;
 use std::string::String;
 use std::sync::Arc;
 
-use bifrost::utils::fut_exec::wait;
-use futures::Future;
 use owning_ref::{OwningHandle, OwningRef};
 use std::ops::Deref;
 

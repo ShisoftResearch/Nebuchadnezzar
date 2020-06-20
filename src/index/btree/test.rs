@@ -1,27 +1,25 @@
 use super::*;
-use bifrost::utils::fut_exec::wait;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
-use client;
+use crate::client;
 use dovahkiin::types::custom_types::id::Id;
-use futures::future::Future;
 use hermes::stm::TxnValRef;
-use index::btree::dump::dump_tree;
-use index::btree::node::*;
-use index::btree::reconstruct::TreeConstructor;
-use index::btree::NodeCellRef;
-use index::btree::NodeData;
-use index::trees::Cursor;
-use index::trees::EntryKey;
-use index::trees::{id_from_key, key_with_id};
+use crate::index::btree::dump::dump_tree;
+use crate::index::btree::node::*;
+use crate::index::btree::reconstruct::TreeConstructor;
+use crate::index::btree::NodeCellRef;
+use crate::index::btree::NodeData;
+use crate::index::trees::Cursor;
+use crate::index::trees::EntryKey;
+use crate::index::trees::{id_from_key, key_with_id};
 use itertools::Itertools;
-use ram::types::RandValue;
+use crate::ram::types::RandValue;
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rayon::prelude::*;
-use server;
-use server::NebServer;
-use server::ServerOptions;
+use crate::server;
+use crate::server::NebServer;
+use crate::server::ServerOptions;
 use smallvec::SmallVec;
 use std::env;
 use std::fs::File;
@@ -101,7 +99,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 
 #[test]
 fn crd() {
-    use index::trees::Cursor;
+    use crate::index::trees::Cursor;
     env_logger::init();
     let tree = LevelBPlusTree::new();
     ::std::fs::remove_dir_all("dumps");
@@ -312,7 +310,7 @@ fn crd() {
 
 #[test]
 pub fn alternative_insertion_pattern() {
-    use index::trees::Cursor;
+    use crate::index::trees::Cursor;
     env_logger::init();
     let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")

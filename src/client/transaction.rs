@@ -1,14 +1,12 @@
-use bifrost::utils::fut_exec::wait;
-use ram::cell::{Cell, CellHeader, ReadError, WriteError};
-use ram::types::{Id, Value};
-use server::transactions::TxnId;
-use server::transactions::*;
+use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::types::{Id, Value};
+use crate::server::transactions::TxnId;
+use crate::server::transactions::*;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
 
 use bifrost::rpc::RPCError;
-use futures::Future;
 
 #[derive(Debug)]
 pub enum TxnError {
