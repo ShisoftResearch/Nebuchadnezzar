@@ -1,9 +1,7 @@
 use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost_plugins::hash_ident;
-use bincode::deserialize;
 use dovahkiin::types::Id;
-use crate::index::trees::EntryKey;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use crate::ram::types::RandValue;
@@ -59,15 +57,15 @@ pub struct PlacementSM {
 }
 
 raft_state_machine! {
-    def cmd prepare_split(source: Id)  -> () | CmdError;
-    def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> u64 | CmdError;
-    def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> u64 | CmdError;
-    def cmd update_epoch(source: Id, epoch: u64) -> u64 | CmdError;
-    def cmd upsert(placement: Placement) -> () | CmdError;
-    def qry locate(id: Vec<u8>) -> Placement | QueryError;
+    def cmd prepare_split(source: Id)  -> Result<(), CmdError>;
+    def cmd start_split(source: Id, dest: Id, mid: Vec<u8>, src_epoch: u64) -> Result<u64, CmdError>;
+    def cmd complete_split(source: Id, dest: Id, src_epoch: u64) -> Result<u64, CmdError>;
+    def cmd update_epoch(source: Id, epoch: u64) -> Result<u64, CmdError>;
+    def cmd upsert(placement: Placement) -> Result<(), CmdError>;
+    def qry locate(id: Vec<u8>) -> Result<Placement, QueryError>;
     def qry all() -> Vec<Placement>;
     def qry all_for_server(server_id: u64) -> Vec<Placement>;
-    def qry get(id: Id) -> Placement | QueryError;
+    def qry get(id: Id) -> Result<Placement, QueryError>;
 }
 
 impl StateMachineCmds for PlacementSM {

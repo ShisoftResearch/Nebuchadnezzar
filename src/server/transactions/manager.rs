@@ -7,14 +7,16 @@ use crate::ram::cell::{Cell, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use crate::utils::chashmap::{CHashMap, WriteGuard};
-use crate::utils::stream::PollableStream;
+use lightning::map::{ObjectMap, HashMap as LFMap};
+use async_std::sync::{Mutex, MutexGuard};
+use futures::future::BoxFuture;
+use std::time::Duration;
 
-type TxnAwaits = Arc<Mutex<HashMap<u64, Arc<AwaitingServer>>>>;
+type TxnAwaits = ObjectMap<Arc<AwaitingServer>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
-type TxnGuard = MutexGuard<Transaction>;
+type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
-type DataSiteClients = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
+type DataSiteClients = ObjectMap<Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
 
@@ -35,112 +37,230 @@ struct Transaction {
 }
 
 service! {
-    rpc begin() -> TxnId | TMError;
-    rpc read(tid: TxnId, id: Id) -> TxnExecResult<Cell, ReadError> | TMError;
-    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> TxnExecResult<Vec<Value>, ReadError> | TMError;
-    rpc head(tid: TxnId, id: Id) -> TxnExecResult<CellHeader, ReadError> | TMError;
-    rpc write(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
-    rpc update(tid: TxnId, cell: Cell) -> TxnExecResult<(), WriteError> | TMError;
-    rpc remove(tid: TxnId, id: Id) -> TxnExecResult<(), WriteError> | TMError;
+    rpc begin() -> Result<TxnId, TMError>;
+    rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<Cell, ReadError>, TMError>;
+    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError>;
+    rpc head(tid: TxnId, id: Id) -> Result<TxnExecResult<CellHeader, ReadError>, TMError>;
+    rpc write(tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>;
+    rpc update(tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>;
+    rpc remove(tid: TxnId, id: Id) -> Result<TxnExecResult<(), WriteError>, TMError>;
 
-    rpc prepare(tid: TxnId) -> TMPrepareResult | TMError;
-    rpc commit(tid: TxnId) -> EndResult | TMError;
-    rpc abort(tid: TxnId) -> AbortResult | TMError;
+    rpc prepare(tid: TxnId) -> Result<TMPrepareResult, TMError>;
+    rpc commit(tid: TxnId) -> Result<EndResult, TMError>;
+    rpc abort(tid: TxnId) -> Result<AbortResult, TMError>;
 
     rpc go_ahead(tids: BTreeSet<TxnId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
 }
 
-pub struct TransactionManager {
-    inner: Arc<TransactionManagerInner>,
-}
 dispatch_rpc_service_functions!(TransactionManager);
 
-pub struct TransactionManagerInner {
+pub struct TransactionManager {
     server: Arc<NebServer>,
-    transactions: RwLock<HashMap<TxnId, TxnMutex>>,
-    data_sites: CHashMap<u64, Arc<data_site::AsyncServiceClient>>,
+    transactions: LFMap<TxnId, TxnMutex>,
+    data_sites: ObjectMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager,
 }
 
 impl TransactionManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
-        Arc::new(TransactionManager {
-            inner: Arc::new(TransactionManagerInner {
+        Arc::new(Self {
                 server: server.clone(),
-                transactions: RwLock::new(HashMap::new()),
-                data_sites: CHashMap::new(),
+                transactions: LFMap::with_capacity(128),
+                data_sites: ObjectMap::new(),
                 await_manager: AwaitManager::new(),
-            }),
-        })
+            })
     }
 }
 
 impl Service for TransactionManager {
-    fn begin(&self) -> Box<Future<Item = TxnId, Error = TMError>> {
-        box future::result(self.inner.begin())
-    }
+    ////////////////////////////
+    // STARTING IMPL RPC CALLS//
+    ////////////////////////////
     fn read(
+       &self,
+        tid: TxnId,
+        id: Id,
+    ) -> BoxFuture<Result<TxnExecResult<Cell, ReadError>, TMError>> {
+        async {
+            let txn_mutex = self.get_transaction(&tid)?;
+            let txn = txn_mutex.lock().await;
+            self.ensure_rw_state(&txn)?;
+            if let Some(data_obj) = txn.data.get(&id) {
+                match data_obj.cell {
+                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
+                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
+                }
+            }
+            let server = self.get_data_site_by_id(&id);
+            match server {
+                Ok((server_id, server)) => {
+                    let awaits = self.await_manager.get_txn(&tid);
+                    self.read_from_site(server_id, server, tid, id, txn, awaits).await
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    Err(TMError::CannotLocateCellServer)
+                }
+            }
+        }.boxed()
+    }
+
+    fn head(
         &self,
         tid: TxnId,
         id: Id,
-    ) -> Box<Future<Item = TxnExecResult<Cell, ReadError>, Error = TMError>> {
-        box TransactionManagerInner::read(self.inner.clone(), tid, id)
+    ) -> BoxFuture<Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
+        async {
+            let txn_mutex = self.get_transaction(&tid)?;
+            let txn = txn_mutex.lock().await;
+            self.ensure_rw_state(&txn)?;
+            if let Some(data_obj) = txn.data.get(&id) {
+                match data_obj.cell {
+                    Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.header.clone())),
+                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
+                }
+            }
+            let server = self.get_data_site_by_id(&id);
+            match server {
+                Ok((server_id, server)) => {
+                    let awaits = self.await_manager.get_txn(&tid);
+                    self.head_from_site(server_id, server, tid, id, txn, awaits).await
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    Err(TMError::CannotLocateCellServer)
+                }
+            }
+        }.boxed()
     }
     fn read_selected(
         &self,
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> Box<Future<Item = TxnExecResult<Vec<Value>, ReadError>, Error = TMError>> {
-        box TransactionManagerInner::read_selected(self.inner.clone(), tid, id, fields)
+    ) -> BoxFuture<Result<TxnExecResult<Vec<Value>, ReadError>, TMError>> {
+        async {
+            let txn_mutex = self.get_transaction(&tid)?;
+            let txn = txn_mutex.lock().await;
+            self.ensure_rw_state(&txn)?;
+            if let Some(data_obj) = txn.data.get(&id) {
+                match data_obj.cell {
+                    Some(ref cell) => {
+                        let mut result = Vec::with_capacity(fields.len());
+                        match cell.data {
+                            Value::Map(ref map) => {
+                                for field in fields {
+                                    result.push(map.get_by_key_id(field).clone())
+                                }
+                            }
+                            _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect)),
+                        }
+                        return Ok(TxnExecResult::Accepted(result));
+                    } // read from cache
+                    None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
+                }
+            }
+            let server = self.get_data_site_by_id(&id);
+            match server {
+                Ok((server_id, server)) => {
+                    let awaits = self.await_manager.get_txn(&tid);
+                    self.read_selected_from_site(
+                        server_id, server, tid, id, fields, txn, awaits
+                    ).await
+                }
+                Err(e) => {
+                    error!("{:?}", e);
+                    Err(TMError::CannotLocateCellServer)
+                }
+            }
+        }.boxed()
     }
-    fn head(
-        &self,
-        tid: TxnId,
-        id: Id,
-    ) -> Box<Future<Item = TxnExecResult<CellHeader, ReadError>, Error = TMError>> {
-        box TransactionManagerInner::head(self.inner.clone(), tid, id)
+
+    fn prepare(&self, tid: TxnId) -> BoxFuture<Result<TMPrepareResult, TMError>> {
+        async {
+            let conclusion = {
+                let txn_mutex = self.get_transaction(&tid)?;
+                let mut txn = txn_mutex.lock();
+                let result = {
+                    self.ensure_rw_state(&txn)?;
+                    self.generate_affected_objs(&mut txn);
+                    let affect_objs = &txn.affected_objects;
+                    let data_sites = self.data_sites(&affect_objs)?;
+                    let sites_prepare_result = self.sites_prepare(
+                        &tid,
+                        affect_objs,
+                        &data_sites
+                    ).await?;
+                    if sites_prepare_result == DMPrepareResult::Success {
+                        let sites_commit_result = self.sites_commit(
+                            &tid,
+                            affect_objs,
+                            &data_sites
+                        ).await?;
+                        match sites_commit_result {
+                            DMCommitResult::Success => TMPrepareResult::Success,
+                            _ => TMPrepareResult::DMCommitError(sites_commit_result),
+                        }
+                    } else {
+                        TMPrepareResult::DMPrepareError(sites_prepare_result)
+                    }
+                };
+                match result {
+                    TMPrepareResult::Success => {
+                        txn.state = TxnState::Prepared;
+                    }
+                    _ => {}
+                }
+                result
+            };
+            return Ok(conclusion);
+        }.boxed()
     }
-    fn write(
-        &self,
-        tid: TxnId,
-        cell: Cell,
-    ) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
-        box future::result(self.inner.write(tid, cell))
+    fn commit(&self, tid: TxnId) -> BoxFuture<Result<EndResult, TMError>> {
+        async {
+            let result = {
+                let txn_lock = self.get_transaction(&tid)?;
+                let txn = txn_lock.lock();
+                self.ensure_txn_state(&txn, TxnState::Prepared)?;
+                let affected_objs = &txn.affected_objects;
+                let data_sites = self.data_sites(&affected_objs)?;
+                self.sites_end(
+                    &tid,
+                    affected_objs,
+                    &data_sites
+                ).await
+            };
+            self.cleanup_transaction(&tid);
+            return result;
+        }.boxed()
     }
-    fn update(
-        &self,
-        tid: TxnId,
-        cell: Cell,
-    ) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
-        box future::result(self.inner.update(tid, cell))
+    fn abort(&self, tid: TxnId) -> BoxFuture<Result<AbortResult, TMError>> {
+        debug!("TXN ABORT IN MGR {:?}", &tid);
+        async {
+            let result = {
+                let txn_lock = self.get_transaction(&tid)?;
+                let txn = txn_lock.lock();
+                if txn.state != TxnState::Aborted {
+                    let changed_objs = &txn.affected_objects;
+                    let data_sites = self.data_sites(&changed_objs)?;
+                    debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
+                    self.sites_abort(
+                        &tid,
+                        changed_objs,
+                        &data_sites
+                    ).await // with end
+                } else {
+                    Ok(AbortResult::Success(None))
+                }
+            };
+            self.cleanup_transaction(&tid);
+            return result;
+        }.boxed()
     }
-    fn remove(
-        &self,
-        tid: TxnId,
-        id: Id,
-    ) -> Box<Future<Item = TxnExecResult<(), WriteError>, Error = TMError>> {
-        box future::result(self.inner.remove(tid, id))
-    }
-    fn prepare(&self, tid: TxnId) -> Box<Future<Item = TMPrepareResult, Error = TMError>> {
-        box TransactionManagerInner::prepare(self.inner.clone(), tid)
-    }
-    fn commit(&self, tid: TxnId) -> Box<Future<Item = EndResult, Error = TMError>> {
-        box TransactionManagerInner::commit(self.inner.clone(), tid)
-    }
-    fn abort(&self, tid: TxnId) -> Box<Future<Item = AbortResult, Error = TMError>> {
-        box TransactionManagerInner::abort(self.inner.clone(), tid)
-    }
-    fn go_ahead(
-        &self,
-        tids: BTreeSet<TxnId>,
-        server_id: u64,
-    ) -> Box<Future<Item = (), Error = ()>> {
-        box TransactionManagerInner::go_ahead(self.inner.clone(), tids, server_id)
-    }
+
 }
 
-impl TransactionManagerInner {
+impl TransactionManager {
     fn server_id(&self) -> u64 {
         self.server.server_id
     }
@@ -177,29 +297,27 @@ impl TransactionManagerInner {
         self.server.txn_peer.clock.merge_with(clock)
     }
     fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
-        let txns = self.transactions.read();
-        match txns.get(tid) {
+        match self.transactions.get(tid) {
             Some(txn) => Ok(txn.clone()),
             _ => Err(TMError::TransactionNotFound),
         }
     }
-    #[async(boxed)]
-    fn read_from_site(
-        this: Arc<Self>,
+    async fn read_from_site<'a>(
+        &self,
         server_id: u64,
         server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId,
         id: Id,
-        mut txn: TxnGuard,
-        await: TxnAwaits,
+        mut txn: TxnGuard<'a>,
+        awaits: TxnAwaits,
     ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let self_server_id = this.server.server_id;
+        let self_server_id = self.server.server_id;
         let read_response =
-            await!(server.read(self_server_id, this.get_clock(), tid.to_owned(), id));
+            server.read(self_server_id, self.get_clock(), tid.to_owned(), id).await;
         match read_response {
             Ok(dsr) => {
                 let dsr = dsr.unwrap();
-                this.merge_clock(&dsr.clock);
+                self.merge_clock(&dsr.clock);
                 let payload = dsr.payload;
                 let payload_out = payload.clone();
                 match payload {
@@ -216,10 +334,10 @@ impl TransactionManagerInner {
                         );
                     }
                     TxnExecResult::Wait => {
-                        await!(AwaitManager::txn_wait(&await, server_id));
-                        return await!(Self::read_from_site(
-                            this, server_id, server, tid, id, txn, await
-                        ));
+                        AwaitManager::txn_wait(&awaits, server_id).await;
+                        return self.read_from_site(
+                            server_id, server, tid, id, txn, awaits
+                        ).await;
                     }
                     _ => {}
                 }
@@ -231,71 +349,69 @@ impl TransactionManagerInner {
             }
         }
     }
-    #[async(boxed)]
-    fn head_from_site(
-        this: Arc<Self>,
+    
+    async fn head_from_site<'a>(
+        &self,
         server_id: u64,
         server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId,
         id: Id,
-        txn: TxnGuard,
-        await: TxnAwaits,
+        txn: TxnGuard<'a>,
+        awaits: TxnAwaits,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
-        let self_server_id = this.server.server_id;
-        let head_response =
-            await!(server.head(self_server_id, this.get_clock(), tid.to_owned(), id));
-        match head_response {
-            Ok(dsr) => {
-                let dsr = dsr.unwrap();
-                this.merge_clock(&dsr.clock);
-                let payload = dsr.payload;
-                match &payload {
-                    &TxnExecResult::Wait => {
-                        await!(AwaitManager::txn_wait(&await, server_id));
-                        return await!(Self::head_from_site(
-                            this, server_id, server, tid, id, txn, await
-                        ));
+        let self_server_id = self.server.server_id;
+        let head_response = self.server.head(self_server_id, self.get_clock(), tid.to_owned(), id).await;
+        loop {
+            match head_response {
+                Ok(dsr) => {
+                    let dsr = dsr.unwrap();
+                    self.merge_clock(&dsr.clock);
+                    let payload = dsr.payload;
+                    match &payload {
+                        &TxnExecResult::Wait => {
+                            AwaitManager::txn_wait(&awaits, server_id).await;
+                            continue;
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    return Ok(payload);
                 }
-                return Ok(payload);
-            }
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::RPCErrorFromCellServer)
+                Err(e) => {
+                    error!("{:?}", e);
+                    Err(TMError::RPCErrorFromCellServer)
+                }
             }
         }
     }
-    #[async(boxed)]
-    fn read_selected_from_site(
-        this: Arc<Self>,
+    async fn read_selected_from_site<'a>(
+        &self,
         server_id: u64,
         server: Arc<data_site::AsyncServiceClient>,
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-        txn: TxnGuard,
-        await: TxnAwaits,
+        txn: TxnGuard<'a>,
+        awaits: TxnAwaits,
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
-        let self_server_id = this.server.server_id;
-        let read_response = await!(server.read_selected(
+        let self_server_id = self.server.server_id;
+        let read_response = server.read_selected(
             self_server_id,
-            this.get_clock(),
+            self.get_clock(),
             tid.to_owned(),
             id,
             fields.to_owned()
-        ));
+        ).await;
         match read_response {
             Ok(dsr) => {
                 let dsr = dsr.unwrap();
-                this.merge_clock(&dsr.clock);
+                self.merge_clock(&dsr.clock);
                 let payload = dsr.payload;
                 match payload {
                     TxnExecResult::Wait => {
-                        await!(AwaitManager::txn_wait(&await, server_id));
-                        return await!(Self::read_selected_from_site(
-                            this, server_id, server, tid, id, fields, txn, await
-                        ));
+                        AwaitManager::txn_wait(&awaits, server_id).await;
+                        return self.read_selected_from_site(
+                            server_id, server, tid, id, fields, txn, awaits
+                        ).await;
                     }
                     _ => {}
                 }
@@ -331,8 +447,7 @@ impl TransactionManagerInner {
             .map(|(server_id, data_site)| (server_id, data_site.unwrap()))
             .collect())
     }
-    #[async(boxed)]
-    fn site_prepare(
+    async fn site_prepare(
         server: Arc<NebServer>,
         awaits: TxnAwaits,
         tid: TxnId,
@@ -373,12 +488,12 @@ impl TransactionManagerInner {
             Err(e) => Err(e),
         }
     }
-    #[async]
-    fn sites_prepare(
-        this: Arc<Self>,
-        tid: TxnId,
-        affected_objs: AffectedObjs,
-        data_sites: DataSiteClients,
+    
+    async fn sites_prepare(
+        &self,
+        tid: &TxnId,
+        affected_objs: &AffectedObjs,
+        data_sites: &DataSiteClients,
     ) -> Result<DMPrepareResult, TMError> {
         let prepare_futures: Vec<_> = affected_objs
             .into_iter()
@@ -547,9 +662,6 @@ impl TransactionManagerInner {
         txn.remove(tid);
         return Ok(());
     }
-    ////////////////////////////
-    // STARTING IMPL RPC CALLS//
-    ////////////////////////////
     fn begin(&self) -> Result<TxnId, TMError> {
         let id = self.server.txn_peer.clock.inc();
         let mut txns = self.transactions.write();
@@ -570,106 +682,7 @@ impl TransactionManagerInner {
             Ok(id)
         }
     }
-    #[async]
-    fn read(
-        this: Arc<Self>,
-        tid: TxnId,
-        id: Id,
-    ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let txn_mutex = this.get_transaction(&tid)?;
-        let txn = txn_mutex.lock();
-        this.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(&id) {
-            match data_obj.cell {
-                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.clone())), // read from cache
-                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-            }
-        }
-        let server = this.get_data_site_by_id(&id);
-        match server {
-            Ok((server_id, server)) => {
-                let await = this.await_manager.get_txn(&tid);
-                await!(Self::read_from_site(
-                    this, server_id, server, tid, id, txn, await
-                ))
-            }
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::CannotLocateCellServer)
-            }
-        }
-    }
-
-    #[async]
-    fn head(
-        this: Arc<Self>,
-        tid: TxnId,
-        id: Id,
-    ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
-        let txn_mutex = this.get_transaction(&tid)?;
-        let txn = txn_mutex.lock();
-        this.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(&id) {
-            match data_obj.cell {
-                Some(ref cell) => return Ok(TxnExecResult::Accepted(cell.header.clone())),
-                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-            }
-        }
-        let server = this.get_data_site_by_id(&id);
-        match server {
-            Ok((server_id, server)) => {
-                let await = this.await_manager.get_txn(&tid);
-                await!(Self::head_from_site(
-                    this, server_id, server, tid, id, txn, await
-                ))
-            }
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::CannotLocateCellServer)
-            }
-        }
-    }
-    #[async]
-    fn read_selected(
-        this: Arc<Self>,
-        tid: TxnId,
-        id: Id,
-        fields: Vec<u64>,
-    ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
-        let txn_mutex = this.get_transaction(&tid)?;
-        let txn = txn_mutex.lock();
-        this.ensure_rw_state(&txn)?;
-        if let Some(data_obj) = txn.data.get(&id) {
-            match data_obj.cell {
-                Some(ref cell) => {
-                    let mut result = Vec::with_capacity(fields.len());
-                    match cell.data {
-                        Value::Map(ref map) => {
-                            for field in fields {
-                                result.push(map.get_by_key_id(field).clone())
-                            }
-                        }
-                        _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect)),
-                    }
-                    return Ok(TxnExecResult::Accepted(result));
-                } // read from cache
-                None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
-            }
-        }
-        let server = this.get_data_site_by_id(&id);
-        match server {
-            Ok((server_id, server)) => {
-                let await = this.await_manager.get_txn(&tid);
-                await!(Self::read_selected_from_site(
-                    this, server_id, server, tid, id, fields, txn, await
-                ))
-            }
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::CannotLocateCellServer)
-            }
-        }
-    }
+    
     fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
         let txn_mutex = self.get_transaction(&tid)?;
         let mut txn = txn_mutex.lock();
@@ -772,88 +785,7 @@ impl TransactionManagerInner {
             None => Err(TMError::CannotLocateCellServer),
         }
     }
-    #[async]
-    fn prepare(this: Arc<Self>, tid: TxnId) -> Result<TMPrepareResult, TMError> {
-        let conclusion = {
-            let txn_mutex = this.get_transaction(&tid)?;
-            let mut txn = txn_mutex.lock();
-            let result = {
-                this.ensure_rw_state(&txn)?;
-                this.generate_affected_objs(&mut txn);
-                let affect_objs = txn.affected_objects.clone();
-                let data_sites = this.data_sites(&affect_objs)?;
-                let sites_prepare_result = await!(Self::sites_prepare(
-                    this.clone(),
-                    tid.clone(),
-                    affect_objs.clone(),
-                    data_sites.clone()
-                ))?;
-                if sites_prepare_result == DMPrepareResult::Success {
-                    let sites_commit_result = await!(Self::sites_commit(
-                        this.clone(),
-                        tid,
-                        affect_objs,
-                        data_sites
-                    ))?;
-                    match sites_commit_result {
-                        DMCommitResult::Success => TMPrepareResult::Success,
-                        _ => TMPrepareResult::DMCommitError(sites_commit_result),
-                    }
-                } else {
-                    TMPrepareResult::DMPrepareError(sites_prepare_result)
-                }
-            };
-            match result {
-                TMPrepareResult::Success => {
-                    txn.state = TxnState::Prepared;
-                }
-                _ => {}
-            }
-            result
-        };
-        return Ok(conclusion);
-    }
-    #[async]
-    fn commit(this: Arc<Self>, tid: TxnId) -> Result<EndResult, TMError> {
-        let result = {
-            let txn_lock = this.get_transaction(&tid)?;
-            let txn = txn_lock.lock();
-            this.ensure_txn_state(&txn, TxnState::Prepared)?;
-            let affected_objs = txn.affected_objects.clone();
-            let data_sites = this.data_sites(&affected_objs)?;
-            await!(Self::sites_end(
-                this.clone(),
-                tid.clone(),
-                affected_objs,
-                data_sites
-            ))
-        };
-        this.cleanup_transaction(&tid);
-        return result;
-    }
-    #[async]
-    fn abort(this: Arc<Self>, tid: TxnId) -> Result<AbortResult, TMError> {
-        debug!("TXN ABORT IN MGR {:?}", &tid);
-        let result = {
-            let txn_lock = this.get_transaction(&tid)?;
-            let txn = txn_lock.lock();
-            if txn.state != TxnState::Aborted {
-                let changed_objs = txn.affected_objects.clone();
-                let data_sites = this.data_sites(&changed_objs)?;
-                debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                await!(Self::sites_abort(
-                    this.clone(),
-                    tid.clone(),
-                    changed_objs,
-                    data_sites
-                )) // with end
-            } else {
-                Ok(AbortResult::Success(None))
-            }
-        };
-        this.cleanup_transaction(&tid);
-        return result;
-    }
+
     #[async]
     fn go_ahead(this: Arc<Self>, tids: BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
@@ -894,13 +826,13 @@ impl AwaitingServer {
 }
 
 struct AwaitManager {
-    channels: Mutex<HashMap<TxnId, TxnAwaits>>,
+    channels: LFMap<TxnId, TxnAwaits>,
 }
 
 impl AwaitManager {
     pub fn new() -> AwaitManager {
         AwaitManager {
-            channels: Mutex::new(HashMap::new()),
+            channels: LFMap::with_capacity(16),
         }
     }
     pub fn get_txn(&self, tid: &TxnId) -> TxnAwaits {

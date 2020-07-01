@@ -9,7 +9,6 @@ use bifrost::rpc;
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::tcp::STANDALONE_ADDRESS_STRING;
-use bifrost::utils::fut_exec::wait;
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 use crate::client;
@@ -213,33 +212,33 @@ impl NebServer {
 
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
         self.consh.get_server_id(id.higher)
-    }
+    }   
     pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
             .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
     }
-    pub fn get_member_by_server_id_async(
+    pub async fn get_member_by_server_id_async(
         &self,
         server_id: u64,
-    ) -> impl Future<Item = Arc<RPCClient>, Error = io::Error> {
+    ) -> Result<Arc<RPCClient>, io::Error> {
         let cons_hash = self.consh.clone();
         self.member_pool
-            .get_by_id_async(server_id, move |_| cons_hash.to_server_name(server_id))
+            .get_by_id_async(server_id, move |_| cons_hash.to_server_name(server_id)).await
     }
     pub fn conshash(&self) -> &ConsistentHashing {
         &*self.consh
     }
 }
 
-pub fn rpc_client_by_id(
+pub async fn rpc_client_by_id(
     id: &Id,
     neb: &Arc<NebServer>,
-) -> impl Future<Item = Arc<RPCClient>, Error = RPCError> {
+) -> Result<Arc<RPCClient>, RPCError> {
     let server_id = neb.get_server_id_by_id(id).unwrap();
     let neb = neb.clone();
     DEFAULT_CLIENT_POOL
         .get_by_id_async(server_id, move |sid| neb.conshash().to_server_name(sid))
-        .map_err(|e| RPCError::IOError(e))
+        .map_err(|e| RPCError::IOError(e)).await
 }
 
 // Peer have a clock, meant to update with other servers in the cluster
@@ -296,19 +295,19 @@ pub fn init_lsm_tree_index_service(
 mod tests {
     extern crate test;
 
-    use client;
-    use client::AsyncClient;
+    use crate::client;
+    use crate::client::AsyncClient;
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::type_id_of;
     use futures::Future;
-    use ram::cell::Cell;
-    use ram::schema::Schema;
-    use ram::schema::{Field, IndexType};
-    use ram::types::*;
-    use server::NebServer;
-    use server::ServerOptions;
-    use server::Service;
+    use crate::ram::cell::Cell;
+    use crate::ram::schema::Schema;
+    use crate::ram::schema::{Field, IndexType};
+    use crate::ram::types::*;
+    use crate::server::NebServer;
+    use crate::server::ServerOptions;
+    use crate::server::Service;
     use std::sync::Arc;
     use test::Bencher;
 

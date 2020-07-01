@@ -9,20 +9,16 @@ use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::utils::chashmap::{CHashMap, ReadGuard, WriteGuard};
 use crate::utils::raii_mutex_table::RAIIMutexTable;
 use crate::utils::ring_buffer::RingBuffer;
-
-pub type CellReadGuard<'a> = ReadGuard<'a, u64, usize>;
-pub type CellWriteGuard<'a> = WriteGuard<'a, u64, usize>;
+use lightning::map::{WordMap, ObjectMap};
 
 pub struct Chunk {
     pub id: usize,
-    pub index: Arc<CHashMap<u64, usize>>,
-    pub segs: Arc<CHashMap<u64, Arc<Segment>>>,
+    pub index: Arc<WordMap>,
+    pub segs: Arc<ObjectMap<Arc<Segment>>>,
     // Used only for locating segment for address
     // when putting tombstone, not normal data access
     pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
@@ -52,8 +48,8 @@ impl Chunk {
             &backup_storage,
             &wal_storage,
         ));
-        let segs = Arc::new(CHashMap::new());
-        let index = Arc::new(CHashMap::new());
+        let segs = Arc::new(WordMap::new());
+        let index = Arc::new(ObjectMap::new());
         let chunk = Chunk {
             id,
             segs,
