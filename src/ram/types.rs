@@ -1,5 +1,5 @@
 use crate::ram::cell::CellHeader;
-use crate::utils::rand;
+use lightning::rand;
 
 pub use dovahkiin::types::*;
 
