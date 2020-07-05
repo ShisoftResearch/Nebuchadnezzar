@@ -15,6 +15,9 @@ use crate::utils::raii_mutex_table::RAIIMutexTable;
 use crate::utils::ring_buffer::RingBuffer;
 use lightning::map::{WordMap, ObjectMap};
 
+pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
+pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
+
 pub struct Chunk {
     pub id: usize,
     pub index: Arc<WordMap>,
@@ -132,7 +135,7 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
-        match self.index.get(&hash) {
+        match self.index.lock(&hash) {
             Some(index) => {
                 if *index == 0 {
                     return Err(ReadError::CellDoesNotExisted);
@@ -150,7 +153,7 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
-        match self.index.get_mut(&hash) {
+        match self.index.lock(&hash) {
             Some(index) => {
                 if *index == 0 {
                     return None;
