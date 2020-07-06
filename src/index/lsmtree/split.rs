@@ -38,7 +38,7 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
 pub fn tree_client(
     id: &Id,
     neb: &Arc<NebServer>,
-) -> impl Future<Item = Arc<AsyncServiceClient>, Error = RPCError> {
+) -> impl Future<Result<Arc<AsyncServiceClient>, RPCError>> {
     rpc_client_by_id(id, neb).map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 

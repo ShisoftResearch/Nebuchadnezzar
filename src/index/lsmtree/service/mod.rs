@@ -48,16 +48,16 @@ pub struct LSMTreeBlock {
 }
 
 service! {
-    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64, block_size: u32) -> LSMTreeResult<Option<LSMTreeBlock>> | LSMTreeSvrError;
-    rpc next_block(tree_id: Id, cursor_id: u64, size: u32) -> Option<Vec<Vec<u8>>> | LSMTreeSvrError;
-    rpc current(tree_id: Id, cursor_id: u64) -> Option<Option<Vec<u8>>> | LSMTreeSvrError;
-    rpc complete(tree_id: Id, cursor_id: u64) -> bool | LSMTreeSvrError;
+    rpc seek(tree_id: Id, key: Vec<u8>, ordering: Ordering, epoch: u64, block_size: u32) -> Result<LSMTreeResult<Option<LSMTreeBlock>>, LSMTreeSvrError>;
+    rpc next_block(tree_id: Id, cursor_id: u64, size: u32) -> Result<Option<Vec<Vec<u8>>>, LSMTreeSvrError>;
+    rpc current(tree_id: Id, cursor_id: u64) -> Result<Option<Option<Vec<u8>>>, LSMTreeSvrError>;
+    rpc complete(tree_id: Id, cursor_id: u64) -> Result<bool, LSMTreeSvrError>;
     rpc new_tree(start: Vec<u8>, end: Vec<u8>, id: Id) -> bool;
     rpc summary() -> Vec<LSMTreeSummary>;
 
-    rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> LSMTreeResult<bool> | LSMTreeSvrError;
-    rpc merge(tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> LSMTreeResult<()> | LSMTreeSvrError;
-    rpc set_epoch(tree_id: Id, epoch: u64) -> u64 | LSMTreeSvrError;
+    rpc insert(tree_id: Id, key: Vec<u8>, epoch: u64) -> Result<LSMTreeResult<bool>, LSMTreeSvrError>;
+    rpc merge(tree_id: Id, keys: Vec<Vec<u8>>, epoch: u64) -> Result<LSMTreeResult<()>, LSMTreeSvrError>;
+    rpc set_epoch(tree_id: Id, epoch: u64) -> Result<u64, LSMTreeSvrError>;
 }
 
 pub struct LSMTreeService {
