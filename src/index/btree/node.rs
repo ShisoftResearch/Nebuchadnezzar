@@ -333,7 +333,7 @@ pub trait AnyNode: Any + 'static {
         node_ref: &NodeCellRef,
         deletion: &DeletionSetInneer,
         neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>>;
+    ) -> BoxFuture<()>;
 }
 
 pub struct Node<KS, PS>
@@ -571,11 +571,11 @@ where
         node_ref: &NodeCellRef,
         deletion: &DeletionSetInneer,
         neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>> {
+    ) -> BoxFuture<()> {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
             &mut NodeData::External(ref mut node) => node.persist(deletion, neb),
-            _ => box future::err(()),
+            _ => panic!(),
         }
     }
 }

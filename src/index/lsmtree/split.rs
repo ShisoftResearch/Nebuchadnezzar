@@ -17,6 +17,7 @@ use crate::server::{rpc_client_by_id, NebServer};
 use smallvec::SmallVec;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use futures::prelude::*;
 
 pub struct SplitStatus {
     pub pivot: EntryKey,
@@ -38,11 +39,11 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
 pub fn tree_client(
     id: &Id,
     neb: &Arc<NebServer>,
-) -> impl Future<Result<Arc<AsyncServiceClient>, RPCError>> {
+) -> impl Future<Output = Result<Arc<AsyncServiceClient>, RPCError>> {
     rpc_client_by_id(id, neb).map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
-pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
+pub async fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
     if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
         debug!("LSM Tree {:?} is full, will split", tree.id);
         // need to initiate a split
@@ -54,7 +55,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             mid_key, new_placement_id
         );
         // First check with the placement driver
-        match sm.prepare_split(&tree.id).wait() {
+        match sm.prepare_split(&tree.id).await {
             Ok(Err(CmdError::AnotherSplitInProgress(split))) => {
                 mid_key = SmallVec::from(split.pivot);
                 new_placement_id = split.dest;
@@ -74,7 +75,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             target: new_placement_id,
         });
         // Create the tree in split host
-        let client = tree_client(&new_placement_id, neb).wait().unwrap();
+        let client = tree_client(&new_placement_id, neb).await.unwrap();
         let mid_vec = mid_key.iter().cloned().collect_vec();
         let new_tree_created = client
             .new_tree(
@@ -82,7 +83,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
                 tree_key_range.1.iter().cloned().collect(),
                 new_placement_id,
             )
-            .wait()
+            .await
             .unwrap();
         debug!(
             "Create new split tree with id {:?}, succeed {:?}",
@@ -92,7 +93,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         // and read request to the new tree
         let src_epoch = tree.bump_epoch();
         sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch)
-            .wait()
+            .await
             .unwrap();
         debug!("Bumped source tree {:?} epoch to {}", tree.id, src_epoch);
     }
@@ -106,7 +107,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         let mut cursor = tree.seek(&max_entry_key(), Backward);
         let batch_size = tree.last_level_size();
         let target_id = tree_split.target;
-        let target_client = tree_client(&target_id, neb).wait().unwrap();
+        let target_client = tree_client(&target_id, neb).await.unwrap();
         debug!(
             "Start to split {:?} to {:?} pivot {:?}, batch size {}",
             tree.id, tree_split.target, tree_split.pivot, batch_size
@@ -149,7 +150,7 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
             // submit this batch to new tree
             target_client
                 .merge(target_id, batch, 0)
-                .wait()
+                .await
                 .unwrap()
                 .unwrap();
             // remove this batch in current tree
@@ -188,12 +189,12 @@ pub fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>)
         debug!("Updating placement driver");
         let src_epoch = tree.bump_epoch();
         sm.complete_split(&tree.id, &target_id, &src_epoch)
-            .wait()
+            .await
             .unwrap();
         // Set new tree epoch from 0 to 1
         let prev_epoch = target_client
             .set_epoch(target_id, 1)
-            .wait()
+            .await
             .unwrap()
             .unwrap();
         debug_assert_eq!(prev_epoch, 0);

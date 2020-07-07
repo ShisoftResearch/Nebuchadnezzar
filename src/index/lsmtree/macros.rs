@@ -3,8 +3,8 @@ macro_rules! with_levels {
         $(
             mod $sym {
                 use super::*;
-                use crate::index::trees::*;
-                use smallvec::Array;
+                use crate::index::lsmtree::Array;
+                use crate::index::trees::Slice;
                 use std::fmt;
 
                 // use boxed slice for the slice itself may too large to been put on stack
@@ -75,7 +75,7 @@ macro_rules! with_levels {
                 debug!("Initialize tree {}...", stringify!($sym));
                 trees.push(box $sym::Tree::new());
                 debug!("Tree {} initialized...", stringify!($sym));
-                const_assert!($level_size * KEY_SIZE <= MAX_SEGMENT_SIZE);
+                const_assert!($level_size *  crate::index::trees::KEY_SIZE <= MAX_SEGMENT_SIZE);
                 let level_size = $level_size * $level_size * $level_size;
                 max_elements_list.push(level_size);
             )*

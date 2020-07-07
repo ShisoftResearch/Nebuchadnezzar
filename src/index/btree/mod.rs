@@ -48,6 +48,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use crate::utils::lru_cache::LRUCache;
+use futures::future::BoxFuture;
 
 pub mod verification;
 
@@ -436,8 +437,8 @@ impl NodeCellRef {
     pub fn persist(
         &self,
         deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>> {
+        neb: &crate::server::cell_rpc::AsyncServiceClient,
+    ) -> BoxFuture<()> {
         self.inner.persist(self, deletion, neb)
     }
 

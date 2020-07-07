@@ -304,7 +304,7 @@ fn crd() {
     //
     //        tree.flush_all();
     //        assert_eq!(tree.len(), 0);
-    // assert_eq!(client.count().wait().unwrap(), 1);
+    // assert_eq!(client.count().await.unwrap(), 1);
     //    }
 }
 

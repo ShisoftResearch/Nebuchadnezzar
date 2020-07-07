@@ -12,7 +12,7 @@ use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 use crate::client;
-use client::AsyncClient;
+use crate::client::AsyncClient;
 use crate::index::lsmtree;
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::Cleaner;
@@ -71,7 +71,7 @@ pub struct NebServer {
     pub cleaner: Cleaner,
 }
 
-pub fn init_conshash(
+pub async fn init_conshash(
     group_name: &String,
     address: &String,
     memory_size: u64,
@@ -79,7 +79,7 @@ pub fn init_conshash(
 ) -> Result<Arc<ConsistentHashing>, ServerError> {
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client) {
         Ok(ch) => {
-            ch.set_weight(address, memory_size).wait();
+            ch.set_weight(address, memory_size).await;
             if !ch.init_table().is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
@@ -159,7 +159,7 @@ impl NebServer {
         Ok(server)
     }
 
-    pub fn new_from_opts<'a>(
+    pub async fn new_from_opts<'a>(
         opts: &ServerOptions,
         server_addr: &'a str,
         group_name: &'a str,
@@ -197,7 +197,7 @@ impl NebServer {
         let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).unwrap();
         RaftClient::prepare_subscription(&rpc_server);
         let member_service = MemberService::new(server_addr, &raft_client);
-        member_service.join_group(group_name).wait().unwrap();
+        member_service.join_group(group_name).await.unwrap();
         NebServer::new(
             opts,
             server_addr,
@@ -313,7 +313,7 @@ mod tests {
 
     const DATA: &'static str = "DATA";
 
-    fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
+    async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
         env_logger::init();
         let server_addr = String::from(format!("127.0.0.1:{}", port));
         let server_group = String::from("bench_test");
@@ -355,7 +355,7 @@ mod tests {
         let client = Arc::new(
             client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
         );
-        client.new_schema_with_id(schema).wait();
+        client.new_schema_with_id(schema).await;
         (server, client, schema_id)
     }
 

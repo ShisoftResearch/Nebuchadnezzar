@@ -11,7 +11,8 @@ use futures::future::BoxFuture;
 use futures::Future;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
-use crate::ram::schema::client::SMClient as SchemaClient;
+use crate::ram::schema::sm::client::SMClient as SchemaClient;
+use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::Schema;
 use crate::ram::types::Id;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
@@ -28,14 +29,14 @@ pub enum NebClientError {
     ConsistentHashtableError(CHError),
 }
 
-struct AsyncClient {
+pub struct AsyncClient {
     pub conshash: Arc<ConsistentHashing>,
     pub raft_client: Arc<RaftClient>,
     pub schema_client: SchemaClient,
 }
 
-pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
+pub async fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
+    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc).await
 }
 
 impl AsyncClient {
@@ -53,7 +54,7 @@ impl AsyncClient {
                         conshash: chash,
                         raft_client: raft_client.clone(),
                         schema_client: SchemaClient::new(
-                            schema_sm::generate_sm_id(group),
+                            generate_sm_id(group),
                             &raft_client,
                         ),
                     }),
@@ -90,16 +91,14 @@ impl AsyncClient {
         let server_id = this.locate_server_id(&id).unwrap();
         Self::client_by_server_id(this, server_id)
     }
-}
 
-impl Service for AsyncClient {
-    fn read_cell(&self, id: Id) -> BoxFuture<Result<Result<Cell, ReadError>, RPCError>> {
+    pub fn read_cell(&self, id: Id) -> BoxFuture<Result<Result<Cell, ReadError>, RPCError>> {
         async {
             let client = self.locate_plain_server(id).await?;
             client.read_cell(id).await
         }.boxed()
     }
-    fn write_cell(
+    pub fn write_cell(
         &self,
         cell: Cell,
     ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
@@ -108,7 +107,7 @@ impl Service for AsyncClient {
             client.write_cell(cell).await
         }.boxed()
     }
-    fn update_cell(
+    pub fn update_cell(
         &self,
         cell: Cell,
     ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
@@ -117,21 +116,21 @@ impl Service for AsyncClient {
             client.update_cell(cell).await
         }.boxed()
     }
-    fn upsert_cell(
+    pub fn upsert_cell(
         &self,
         cell: Cell,
     ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
-        async {let client = self::locate_plain_server(cell.id()).await?;
+        async {let client = self.locate_plain_server(cell.id()).await?;
             client.upsert_cell(cell).await
         }.boxed()
     }
-    fn remove_cell(&self, id: Id) -> BoxFuture<Result<Result<(), WriteError>, RPCError>> {
+    pub fn remove_cell(&self, id: Id) -> BoxFuture<Result<Result<(), WriteError>, RPCError>> {
         async {
-            let client = self.locate_plain_server(this, id).await?;
+            let client = self.locate_plain_server(id).await?;
             client.remove_cell(id).await
         }.boxed()
     }
-    fn count(&self) -> BoxFuture<Result<u64, RPCError>> {
+    pub fn count(&self) -> BoxFuture<Result<u64, RPCError>> {
         async {
             let (members, _) = self.conshash.membership().all_members(true).await
                 .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e)))?
@@ -145,14 +144,14 @@ impl Service for AsyncClient {
             Ok(sum)
         }
     }
-    fn transaction<TFN, TR>(&self, func: TFN) -> BoxFuture<Result<TR, TxnError>>
+    pub fn transaction<TFN, TR>(&self, func: TFN) -> BoxFuture<Result<TR, TxnError>>
     where
         TFN: Fn(&Transaction) -> Result<TR, TxnError>,
         TR: 'static,
         TFN: 'static,
     {
         async {
-            let server_name = match this.conshash.rand_server() {
+            let server_name = match self.conshash.rand_server() {
                 Some(name) => name,
                 None => return Err(TxnError::CannotFindAServer),
             };
@@ -211,13 +210,13 @@ impl Service for AsyncClient {
             Err(TxnError::TooManyRetry)
         }.boxed()
     }
-    fn new_schema_with_id(
+    pub fn new_schema_with_id(
         &self,
         schema: Schema,
     ) -> Result<Result<(), NotifyError>, ExecError> {
         self.schema_client.new_schema(&schema).boxed()
     }
-    fn new_schema(
+    pub fn new_schema(
         &self,
         mut schema: Schema,
     ) -> BoxFuture<Result<(u32, Option<NotifyError>), ExecError>> {
@@ -233,10 +232,10 @@ impl Service for AsyncClient {
             })
         }.boxed()
     }
-    fn del_schema(&self, name: String) -> BoxFuture<Result<Result<(), NotifyError>, ExecError>> {
+    pub fn del_schema(&self, name: String) -> BoxFuture<Result<Result<(), NotifyError>, ExecError>> {
         self.schema_client.del_schema(&name).boxed()
     }
-    fn get_all_schema(&self) -> BoxFuture<Result<Vec<Schema>, ExecError>> {
+    pub fn get_all_schema(&self) -> BoxFuture<Result<Vec<Schema>, ExecError>> {
         async {
             Ok(self.schema_client.get_all().await?.unwrap())
         }.boxed()

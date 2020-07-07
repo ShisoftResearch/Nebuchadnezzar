@@ -4,6 +4,7 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use std::sync::Arc;
+use futures::prelude::*;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 
@@ -20,7 +21,7 @@ impl HashIndexer {
         &self,
         cell_id: Id,
         index_id: Id,
-    ) -> impl Future<Item = Result<CellHeader, WriteError>, Error = RPCError> {
+    ) -> impl Future<Output = Result<Result<CellHeader, WriteError>, RPCError>> {
         let cell = Cell::new_with_id(*HASH_INDEX_SCHEMA_ID, &index_id, Value::Id(cell_id));
         self.neb_client.write_cell(cell)
     }
@@ -28,14 +29,14 @@ impl HashIndexer {
     pub fn remove_index(
         &self,
         index_id: Id,
-    ) -> impl Future<Item = Result<(), WriteError>, Error = RPCError> {
+    ) -> impl Future<Output = Result<Result<(), WriteError>, RPCError>> {
         self.neb_client.remove_cell(index_id)
     }
 
     pub fn query(
         &self,
         index_id: Id,
-    ) -> impl Future<Item = Result<Id, ReadError>, Error = RPCError> {
+    ) -> impl Future<Output = Result<Result<Id, ReadError>, RPCError>> {
         let res = self.neb_client.read_cell(index_id);
         res.then(|res| res.map(|read| read.map(|cell| *cell.data.Id().unwrap())))
     }

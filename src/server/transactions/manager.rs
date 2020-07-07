@@ -845,7 +845,7 @@ impl AwaitManager {
     pub fn txn_send(awaits: &TxnAwaits, server_id: u64) -> impl Future<Item = (), Error = ()> {
         AwaitManager::server_from_txn_awaits(awaits, server_id).send()
     }
-    pub fn txn_wait(awaits: &TxnAwaits, server_id: u64) -> impl Future<Item = (), Error = ()> {
-        AwaitManager::server_from_txn_awaits(awaits, server_id).wait()
+    pub async fn txn_wait(awaits: &TxnAwaits, server_id: u64) -> impl Future<Item = (), Error = ()> {
+        AwaitManager::server_from_txn_awaits(awaits, server_id).await
     }
 }

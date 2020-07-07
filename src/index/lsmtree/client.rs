@@ -12,7 +12,7 @@ use std::sync::Arc;
 use futures::prelude::*;
 use crate::index::lsmtree::split::tree_client;
 use crate::index::lsmtree::placement;
-use crate::builder::Feature;
+use crate::index::builder::Feature;
 use byteorder::{BigEndian, WriteBytesExt};
 use crate::index::lsmtree::tree::LSMTreeResult;
 use bifrost::conshash::ConsistentHashing;
@@ -71,11 +71,11 @@ impl LSMTreeClient {
         }
     }
 
-    fn update_placement(&self, sub_tree: &SubTree) {
-        match self.placement_client.get(&sub_tree.tree_id).wait().unwrap() {
+    async fn update_placement(&self, sub_tree: &SubTree) {
+        match self.placement_client.get(&sub_tree.tree_id).await.unwrap() {
             Ok(placement) => {
                 let mut placements = self.placements.write();
-                let rpc_client = tree_client(&placement.id, &self.neb).wait().unwrap();
+                let rpc_client = tree_client(&placement.id, &self.neb).await.unwrap();
                 placements.remove(&sub_tree.starts);
                 placements.insert(placement.starts.clone(), Placement {
                     meta: placement,
@@ -87,7 +87,7 @@ impl LSMTreeClient {
         }
     }
 
-    fn get_sub_tree(&self, key: &Vec<u8>) -> SubTree {
+    async fn get_sub_tree(&self, key: &Vec<u8>) -> SubTree {
         // Stage one, early exit if placement founded. Read lock only
         {
             let placements = self.placements.read();
@@ -121,9 +121,9 @@ impl LSMTreeClient {
                 }
             }
             let placement: PlacementMeta = self.placement_client.locate(&Vec::from(key.as_slice()))
-                .wait().unwrap().unwrap();
+                .await.unwrap().unwrap();
             let rpc_client = tree_client(&placement.id, &self.neb)
-                .wait().unwrap();
+                .await.unwrap();
             let sub_tree = SubTree::new(
                 placement.id,
                 rpc_client.clone(),
@@ -149,7 +149,7 @@ impl LSMTreeClient {
         key
     }
 
-    pub fn insert(&self,schema_id: u32, field_id: u64, cell_id: &Id, feature: &Feature) -> bool {
+    pub async fn insert(&self,schema_id: u32, field_id: u64, cell_id: &Id, feature: &Feature) -> bool {
         let mut key = Self::essential_key_components(schema_id, field_id);
         key.extend_from_slice(feature); // 8 bytes
         key.extend_from_slice(&cell_id.to_binary()); // ID SIZE
@@ -158,7 +158,7 @@ impl LSMTreeClient {
             let tree_client = &sub_tree.client;
             let insertion_result = tree_client
                     .insert(sub_tree.tree_id, key.clone(), sub_tree.epoch)
-                    .wait().unwrap();
+                    .await.unwrap();
             match insertion_result {
                 Ok(LSMTreeResult::Ok(insert_res)) => {
                     return insert_res;
@@ -173,7 +173,7 @@ impl LSMTreeClient {
         }
     }
 
-    pub fn seek(&self, schema_id: u32, field_id: u64, feature: &Feature, ordering: Ordering) -> Option<Cursor> {
+    pub async fn seek(&self, schema_id: u32, field_id: u64, feature: &Feature, ordering: Ordering) -> Option<Cursor> {
         let mut key = Self::essential_key_components(schema_id, field_id);
         key.extend_from_slice(feature); // 8 bytes
         loop {
@@ -185,7 +185,7 @@ impl LSMTreeClient {
                 ordering,
                 sub_tree.epoch,
                 SEEK_BLOCK_SIZE
-            ).wait().unwrap();
+            ).await.unwrap();
             match seek_result {
                 Ok(LSMTreeResult::Ok(insert_res)) => {
                     return insert_res.map(|block| {

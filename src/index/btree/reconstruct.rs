@@ -127,7 +127,7 @@ where
     }
 }
 
-pub fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
+pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -138,7 +138,7 @@ where
     let mut id = head_id;
     let mut at_end = false;
     while !at_end {
-        let cell = neb.read_cell(id).wait().unwrap().unwrap();
+        let cell = neb.read_cell(id).await.unwrap().unwrap();
         let page = ExtNode::<KS, PS>::from_cell(&cell);
         let next_id = page.next_id;
         let prev_id = page.prev_id;
