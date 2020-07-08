@@ -4,11 +4,13 @@ use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
+use bifrost::membership::client::ObserverClient;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
 use futures::future::BoxFuture;
-use futures::Future;
+use futures::prelude::*;
+use futures::FutureExt;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
@@ -35,21 +37,22 @@ pub struct AsyncClient {
     pub schema_client: SchemaClient,
 }
 
-pub async fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc).await
+pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
+    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
 }
 
 impl AsyncClient {
-    pub fn new<'a>(
+    pub async fn new<'a>(
         subscription_server: &Arc<RPCServer>,
+        membership: &Arc<ObserverClient>,
         meta_servers: &Vec<String>,
         group: &'a str,
     ) -> Result<Self, NebClientError> {
-        match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID) {
+        match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID).await {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server);
-                assert!(RaftClient::can_callback());
-                match ConsistentHashing::new_client_with_id(CONS_HASH_ID, group, &raft_client) {
+                assert!(RaftClient::can_callback().await);
+                match ConsistentHashing::new_client_with_id(CONS_HASH_ID, group, &raft_client, membership).await {
                     Ok(chash) => Ok(Self {
                         conshash: chash,
                         raft_client: raft_client.clone(),
@@ -64,7 +67,7 @@ impl AsyncClient {
             Err(err) => Err(NebClientError::RaftClientError(err)),
         }
     }
-    pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
+    pub async fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
         match self.conshash.get_server_id(id.higher) {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(
@@ -74,22 +77,22 @@ impl AsyncClient {
         }
     }
 
-    pub fn client_by_server_id(
-        this: Arc<Self>,
+    pub async fn client_by_server_id(
+        &self,
         server_id: u64,
-    ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
+    ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
         DEFAULT_CLIENT_POOL
-            .get_by_id_async(server_id, move |sid| this.conshash.to_server_name(sid))
+            .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid)).await
             .map_err(|e| RPCError::IOError(e))
             .map(|c| client_by_rpc_client(&c))
     }
 
-    pub fn locate_plain_server(
-        this: Arc<Self>,
+    pub async fn locate_plain_server(
+        &self,
         id: Id,
-    ) -> impl Future<Item = Arc<plain_server::AsyncServiceClient>, Error = RPCError> {
-        let server_id = this.locate_server_id(&id).unwrap();
-        Self::client_by_server_id(this, server_id)
+    ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+        let server_id = self.locate_server_id(&id).await.unwrap();
+        self.client_by_server_id(server_id).await
     }
 
     pub fn read_cell(&self, id: Id) -> BoxFuture<Result<Result<Cell, ReadError>, RPCError>> {

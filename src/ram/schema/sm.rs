@@ -4,7 +4,7 @@ use bifrost::raft::state_machine::callback::server::{NotifyError, SMCallback};
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost_hasher::hash_str;
-use futures::future::BoxFuture;
+use bifrost::raft;
 use futures::prelude::*;
 use std::sync::Arc;
 
