@@ -203,7 +203,7 @@ impl CombinedCleaner {
             .map(|(new, old, hash)| {
                 debug!("Reset cell {} ptr from {} to {}", hash, old, new);
                 let unstable_guard = chunk.unstable_cells.lock(hash);
-                if let Some(mut actual_addr) = chunk.index.get_mut(&hash) {
+                if let Some(mut actual_addr) = chunk.index.lock(&(hash as usize)) {
                     if *actual_addr == old {
                         *actual_addr = new
                     } else {

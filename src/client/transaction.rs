@@ -32,6 +32,9 @@ pub struct Transaction {
     pub client: Arc<manager::AsyncServiceClient>,
 }
 
+unsafe impl Send for Transaction {}
+unsafe impl Sync for Transaction {}
+
 impl Transaction {
     pub async fn read(&self, id: Id) -> Result<Option<Cell>, TxnError> {
         match self.client.read(self.tid.to_owned(), id).await {
@@ -100,10 +103,10 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
-    pub fn upsert(&self, cell: Cell) -> Result<(), TxnError> {
-        match self.head(cell.id()) {
-            Ok(Some(_)) => self.update(cell),
-            Ok(None) => self.write(cell),
+    pub async fn upsert(&self, cell: Cell) -> Result<(), TxnError> {
+        match self.head(cell.id()).await {
+            Ok(Some(_)) => self.update(cell).await,
+            Ok(None) => self.write(cell).await,
             Err(e) => Err(e),
         }
     }

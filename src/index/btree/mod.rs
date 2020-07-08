@@ -132,8 +132,8 @@ where
         return tree;
     }
 
-    pub fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb)
+    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
+        reconstruct::reconstruct_from_head_id(*head_id, neb).await
     }
 
     pub fn from_root(root: NodeCellRef, head_id: Id, len: usize) -> Self {
@@ -350,10 +350,6 @@ where
 
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
-    }
-
-    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient) {
-        *self = Self::from_head_id(head_id, neb);
     }
 }
 

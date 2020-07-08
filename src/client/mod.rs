@@ -135,23 +135,21 @@ impl AsyncClient {
     }
     pub fn count(&self) -> BoxFuture<Result<u64, RPCError>> {
         async {
-            let (members, _) = self.conshash.membership().all_members(true).await
-                .map_err(|e| RPCError::IOError(io::Error::new(io::ErrorKind::Other, e)))?
-                .unwrap();
+            let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
             let mut sum = 0;
             for m in members {
-                let client = self.client_by_server_id(m.id)?;
-                let count = client.count().await?.unwrap();
+                let client = self.client_by_server_id(m.id).await?;
+                let count = client.count().await?;
                 sum += count
             }
             Ok(sum)
-        }
+        }.boxed()
     }
     pub fn transaction<TFN, TR>(&self, func: TFN) -> BoxFuture<Result<TR, TxnError>>
     where
-        TFN: Fn(&Transaction) -> Result<TR, TxnError>,
-        TR: 'static,
-        TFN: 'static,
+        TFN: Fn(&Transaction) -> Result<TR, TxnError> + Sync + Send,
+        TR: 'static + Sync + Send,
+        TFN: 'static + Sync + Send,
     {
         async {
             let server_name = match self.conshash.rand_server() {
@@ -180,11 +178,11 @@ impl AsyncClient {
                 match exec_result {
                     Ok(val) => {
                         if txn.state.get() == txn_server::TxnState::Started {
-                            txn_result = txn.prepare();
+                            txn_result = txn.prepare().await;
                             debug!("PREPARE STATE: {:?}", txn_result);
                         }
                         if txn_result.is_ok() && txn.state.get() == txn_server::TxnState::Prepared {
-                            txn_result = txn.commit();
+                            txn_result = txn.commit().await;
                             debug!("COMMIT STATE: {:?}", txn_result);
                         }
                         exec_value = Some(val);
@@ -197,12 +195,12 @@ impl AsyncClient {
                         return Ok(exec_value.unwrap());
                     }
                     Err(TxnError::NotRealizable) => {
-                        let abort_result = txn.abort(); // continue the loop to retry
+                        let abort_result = txn.abort().await; // continue the loop to retry
                         debug!("TXN NOT REALIZABLE, ABORT: {:?}", abort_result);
                     }
                     Err(e) => {
                         // abort will always be an error to achieve early break
-                        let abort_result = txn.abort();
+                        let abort_result = txn.abort().await;
                         debug!("TXN ERROR, ABORT: {:?}", abort_result);
                         return Err(e);
                     }
@@ -216,7 +214,7 @@ impl AsyncClient {
     pub fn new_schema_with_id(
         &self,
         schema: Schema,
-    ) -> Result<Result<(), NotifyError>, ExecError> {
+    ) -> BoxFuture<Result<Result<(), NotifyError>, ExecError>> {
         self.schema_client.new_schema(&schema).boxed()
     }
     pub fn new_schema(
@@ -224,7 +222,7 @@ impl AsyncClient {
         mut schema: Schema,
     ) -> BoxFuture<Result<(u32, Option<NotifyError>), ExecError>> {
         async {
-            let schema_id = self.schema_client.next_id().await?.unwrap();
+            let schema_id = self.schema_client.next_id().await?;
             schema.id = schema_id;
             self.new_schema_with_id(schema).await.map(|r| {
                 let error = match r {
@@ -240,7 +238,7 @@ impl AsyncClient {
     }
     pub fn get_all_schema(&self) -> BoxFuture<Result<Vec<Schema>, ExecError>> {
         async {
-            Ok(self.schema_client.get_all().await?.unwrap())
+            Ok(self.schema_client.get_all().await?)
         }.boxed()
     }
 }

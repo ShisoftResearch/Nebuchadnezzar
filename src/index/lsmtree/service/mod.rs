@@ -251,7 +251,7 @@ impl LSMTreeService {
                 .for_each(|tree| {
                     tree.check_and_merge();
                 });
-            persist::<_, ()>(neb.clone(), ()).await.unwrap();
+            persist::<_>(&neb, ());
         });
         let service = Self {
             neb_server: neb_server.clone(),
@@ -265,7 +265,6 @@ impl LSMTreeService {
                 .sm
                 .all_for_server(&neb_server.server_id)
                 .await
-                .unwrap()
                 .unwrap();
             // the placement state machine have all the data except header id for each level, need to get them
             let tree_id_cells: Vec<Result<Cell, ReadError>> = placements
@@ -291,6 +290,6 @@ impl LSMTreeService {
     }
 }
 
-fn persist<T, E>(neb: Arc<NebServer>, val: T) -> impl Future<Result<T, E>> {
-    store_changed_nodes(neb).then(move |_| future::ready(val))
+fn persist<T>(neb: &Arc<NebServer>, val: T) {
+    store_changed_nodes(neb)
 }

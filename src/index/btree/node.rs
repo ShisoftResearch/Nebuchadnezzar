@@ -6,6 +6,7 @@ use std::sync::atomic::fence;
 use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
+use futures::FutureExt;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -563,18 +564,22 @@ where
 
 impl<KS, PS> AnyNode for Node<KS, PS>
 where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
+    KS: Slice<EntryKey> + Debug + Send + Sync + 'static,
+    PS: Slice<NodeCellRef> + Send + Sync + 'static,
 {
     fn persist(
         &self,
         node_ref: &NodeCellRef,
         deletion: &DeletionSetInneer,
         neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> BoxFuture<()> {
+    ) {
         let mut guard = write_node::<KS, PS>(node_ref);
         match &mut *guard {
-            &mut NodeData::External(ref mut node) => node.persist(deletion, neb),
+            &mut NodeData::External(ref mut node) => {
+                tokio::spawn(async move {
+                    node.persist(deletion, neb).await;
+                });
+            },
             _ => panic!(),
         }
     }

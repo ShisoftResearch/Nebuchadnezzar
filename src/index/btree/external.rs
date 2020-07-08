@@ -414,18 +414,15 @@ where
         });
     }
 
-    pub fn persist(
+    pub async fn persist(
         &mut self,
         deleted: &DeletionSetInneer,
         neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> BoxFuture<()> {
+    ) {
         if self.is_dirty() {
             self.dirty = false; // TODO: unset dirty after upsert
             let cell = self.to_cell(deleted);
-            box neb.upsert_cell(cell).map_err(|_| ()).map(|r| {
-                r.unwrap();
-                ()
-            })
+            neb.upsert_cell(cell).await;
         } else {
             panic!()
         }
