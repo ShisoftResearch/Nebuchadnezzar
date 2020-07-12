@@ -364,7 +364,7 @@ macro_rules! impl_btree_level {
 }
 
 pub struct NodeCellRef {
-    inner: Arc<AnyNode>,
+    inner: Arc<dyn AnyNode>,
 }
 
 unsafe impl Send for NodeCellRef {}

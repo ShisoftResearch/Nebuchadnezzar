@@ -31,7 +31,7 @@ pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
     return prefix.as_slice() == &x[..x.len() - ID_SIZE];
 }
 
-pub trait Slice<T: Default> {
+pub trait Slice<T: Default>: Send + Sync {
     #[inline]
     fn as_slice(&mut self) -> &mut [T];
     #[inline]

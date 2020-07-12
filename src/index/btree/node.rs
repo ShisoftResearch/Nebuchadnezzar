@@ -564,8 +564,8 @@ where
 
 impl<KS, PS> AnyNode for Node<KS, PS>
 where
-    KS: Slice<EntryKey> + Debug + Send + Sync + 'static,
-    PS: Slice<NodeCellRef> + Send + Sync + 'static,
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     fn persist(
         &self,
@@ -573,15 +573,16 @@ where
         deletion: &DeletionSetInneer,
         neb: &server::cell_rpc::AsyncServiceClient,
     ) {
-        let mut guard = write_node::<KS, PS>(node_ref);
-        match &mut *guard {
-            &mut NodeData::External(ref mut node) => {
-                tokio::spawn(async move {
+        tokio::spawn(async move {
+            let guard = write_node::<KS, PS>(node_ref);
+            match &*guard {
+                &NodeData::External(ref node) => {
                     node.persist(deletion, neb).await;
-                });
-            },
-            _ => panic!(),
-        }
+                },
+                _ => panic!(),
+            }
+        })
+        .boxed();
     }
 }
 
