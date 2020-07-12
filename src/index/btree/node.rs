@@ -332,8 +332,8 @@ pub trait AnyNode: Any + 'static {
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
+        deletion: &DeletionSet,
+        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
     ) -> BoxFuture<()>;
 }
 
@@ -555,6 +555,20 @@ where
     }
 }
 
+unsafe impl <KS, PS> Send for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
+
+unsafe impl <KS, PS> Sync for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
+
 unsafe impl<KS, PS> Sync for Node<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -570,17 +584,22 @@ where
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
+        deletion: &DeletionSet,
+        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
     ) {
+        let guard = write_node::<KS, PS>(node_ref);
+        let deletion = deletion.read();
+        let cell = match &*guard {
+            &NodeData::External(ref node) => {
+                node.prepare_persist(&*deletion)
+            },
+            _ => {
+                panic!("Cannot persist internal or other type of nodes")
+            },
+        };
+        let neb = neb.clone();
         tokio::spawn(async move {
-            let guard = write_node::<KS, PS>(node_ref);
-            match &*guard {
-                &NodeData::External(ref node) => {
-                    node.persist(deletion, neb).await;
-                },
-                _ => panic!(),
-            }
+            neb.upsert_cell(cell).await;
         })
         .boxed();
     }

@@ -11,7 +11,6 @@ use crate::index::trees::{EntryKey, Ordering};
 use itertools::Itertools;
 use parking_lot::RwLock;
 use crate::ram::cell::{Cell, ReadError};
-use rayon::prelude::*;
 use crate::server::NebServer;
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -96,16 +95,15 @@ impl Service for LSMTreeService {
         ).boxed()
     }
 
-    fn next_block(&self, tree_id: Id, cursor_id: u64, size: u32) -> Box<Future<Item=Option<Vec<Vec<u8>>>, Error=LSMTreeSvrError>> {
+    fn next_block(&self, tree_id: Id, cursor_id: u64, size: u32) -> BoxFuture<Result<Option<Vec<Vec<u8>>>, LSMTreeSvrError>> {
         let trees = self.trees.read();
-        future::ready(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| {
-                    tree.next_block(&cursor_id, size as usize)
-                }),
-        ).boxed()
+        let res = trees
+        .get(&tree_id)
+        .ok_or(LSMTreeSvrError::TreeNotFound)
+        .map(|tree| {
+            tree.next_block(&cursor_id, size as usize)
+        });
+        future::ready(res).boxed()
     }
 
     fn current(
@@ -150,9 +148,10 @@ impl Service for LSMTreeService {
                 id,
                 LSMTreeIns::new((EntryKey::from(start), EntryKey::from(end)), id),
             );
+            persist(&self.neb_server);
             true
         };
-        persist(&self.neb_server, succeed).boxed()
+        future::ready(succeed).boxed()
     }
 
     fn summary(&self) -> BoxFuture<Vec<LSMTreeSummary>> {
@@ -176,16 +175,14 @@ impl Service for LSMTreeService {
         tree_id: Id,
         key: Vec<u8>,
         epoch: u64,
-    ) -> BoxFuture<LSMTreeResult<bool>, LSMTreeSvrError> {
+    ) -> BoxFuture<Result<LSMTreeResult<bool>, LSMTreeSvrError>> {
         let trees = self.trees.read();
-        let neb = self.neb_server.clone();
-        future::ready(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key)))),
-        )
-        .and_then(|o| persist(neb, o)).boxed()
+        let res = trees
+            .get(&tree_id)
+            .ok_or(LSMTreeSvrError::TreeNotFound)
+            .map(|tree| tree.with_epoch_check(epoch, || tree.insert(SmallVec::from(key))));
+        persist(&self.neb_server);
+        future::ready(res).boxed()
     }
 
     fn merge(
@@ -193,21 +190,18 @@ impl Service for LSMTreeService {
         tree_id: Id,
         keys: Vec<Vec<u8>>,
         epoch: u64,
-    ) -> BoxFuture<LSMTreeResult<()>, LSMTreeSvrError> {
+    ) -> BoxFuture<Result<LSMTreeResult<()>, LSMTreeSvrError>> {
         let trees = self.trees.read();
-        let neb = self.neb_server.clone();
-        future::ready(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| {
-                    tree.with_epoch_check(epoch, || {
-                        tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect())
-                    })
-                }),
-        )
-        .and_then(|o| persist(neb, o))
-        .boxed()
+        let res = trees
+            .get(&tree_id)
+            .ok_or(LSMTreeSvrError::TreeNotFound)
+            .map(|tree| {
+                tree.with_epoch_check(epoch, || {
+                    tree.merge(box keys.into_iter().map(|key| SmallVec::from(key)).collect())
+                })
+            });
+        persist(&self.neb_server);
+        future::ready(res).boxed()
     }
 
     fn set_epoch(
@@ -216,19 +210,17 @@ impl Service for LSMTreeService {
         epoch: u64,
     ) -> BoxFuture<Result<u64, LSMTreeSvrError>> {
         let trees = self.trees.read();
-        let sm = self.sm.clone();
-        future::ready(
-            trees
-                .get(&tree_id)
-                .ok_or(LSMTreeSvrError::TreeNotFound)
-                .map(|tree| tree.set_epoch(epoch)),
-        )
-        .and_then(move |_| {
-            sm.update_epoch(&tree_id, &epoch)
-                .map_err(|_| LSMTreeSvrError::SMError)
-                .and_then(|r| r.map_err(|_| LSMTreeSvrError::SMError))
-        })
-        .boxed()
+        trees
+            .get(&tree_id)
+            .ok_or(LSMTreeSvrError::TreeNotFound)
+            .map(|tree| tree.set_epoch(epoch));
+        async {
+            if let Ok(Ok(res)) = self.sm.update_epoch(&tree_id, &epoch).await {
+                Ok(res)
+            } else {
+                Err(LSMTreeSvrError::SMError)
+            }
+        }.boxed()
     }
 }
 
@@ -242,16 +234,18 @@ impl LSMTreeService {
         let trees_clone = trees.clone();
         let neb = neb_server.clone();
         tokio::spawn(async move {
-            tokio::time::delay_for(Duration::from_millis(500)).await;
-            let tree_map = trees_clone.read();
-            tree_map
-                .par_iter()
-                .map(|(k, v)| v)
-                .filter(|tree| tree.oversized())
-                .for_each(|tree| {
-                    tree.check_and_merge();
-                });
-            persist::<_>(&neb, ());
+            loop {
+                tokio::time::delay_for(Duration::from_secs(5)).await;
+                let tree_map = trees_clone.read();
+                tree_map
+                    .iter()
+                    .map(|(k, v)| v)
+                    .filter(|tree| tree.oversized())
+                    .for_each(|tree| {
+                        tree.check_and_merge();
+                    });
+                persist(&neb);
+            }
         });
         let service = Self {
             neb_server: neb_server.clone(),
@@ -267,19 +261,23 @@ impl LSMTreeService {
                 .await
                 .unwrap();
             // the placement state machine have all the data except header id for each level, need to get them
-            let tree_id_cells: Vec<Result<Cell, ReadError>> = placements
+            let futs = placements
                 .iter()
                 .map(|placement| neb_client.read_cell(placement.id))
-                .collect::<FuturesUnordered<_>>().await.collect::<Vec<_>>();
+                .collect::<FuturesUnordered<_>>();
+            let tree_id_cells: Vec<_> = futs.collect().await;
             let lsm_trees: Vec<_> = tree_id_cells
-                .into_par_iter()
+                .into_iter()
                 .zip(placements)
-                .map(|(res, p)| {
-                    let cell = res.unwrap();
-                    let tree_ids = level_trees_from_cell(cell);
-                    let starts = EntryKey::from(p.starts);
-                    let ends = EntryKey::from(p.ends);
-                    LSMTree::new_with_level_ids((starts, ends), p.id, tree_ids, neb_client)
+                .filter_map(|(res, p)| {
+                    if let Ok(Ok(cell)) = res {
+                        let tree_ids = level_trees_from_cell(cell);
+                        let starts = EntryKey::from(p.starts);
+                        let ends = EntryKey::from(p.ends);
+                        Some(LSMTree::new_with_level_ids((starts, ends), p.id, tree_ids, neb_client))
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             for lsm_tree in lsm_trees {
@@ -290,6 +288,6 @@ impl LSMTreeService {
     }
 }
 
-fn persist<T>(neb: &Arc<NebServer>, val: T) {
+fn persist(neb: &Arc<NebServer>) {
     store_changed_nodes(neb)
 }

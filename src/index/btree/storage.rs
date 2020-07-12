@@ -19,8 +19,7 @@ pub fn store_changed_nodes(neb: &Arc<NebServer>) {
                     group.into_iter().for_each(move |(id, node)| {
                         tokio::spawn(async move {
                             if let Some(changing) = node {
-                                let deletion = changing.deletion.read();
-                                changing.node.persist(&*deletion, &*neb).await;
+                                changing.node.persist(&changing.deletion, &neb).await;
                             } else {
                                 neb.remove_cell(id).await;
                             }

@@ -17,28 +17,28 @@ pub struct HashIndexer {
 }
 
 impl HashIndexer {
-    pub fn add_index(
+    pub async fn add_index(
         &self,
         cell_id: Id,
         index_id: Id,
-    ) -> impl Future<Output = Result<Result<CellHeader, WriteError>, RPCError>> {
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let cell = Cell::new_with_id(*HASH_INDEX_SCHEMA_ID, &index_id, Value::Id(cell_id));
-        self.neb_client.write_cell(cell)
+        self.neb_client.write_cell(cell).await
     }
 
-    pub fn remove_index(
+    pub async fn remove_index(
         &self,
         index_id: Id,
-    ) -> impl Future<Output = Result<Result<(), WriteError>, RPCError>> {
-        self.neb_client.remove_cell(index_id)
+    ) -> Result<Result<(), WriteError>, RPCError> {
+        self.neb_client.remove_cell(index_id).await
     }
 
-    pub fn query(
+    pub async fn query(
         &self,
         index_id: Id,
-    ) -> impl Future<Output = Result<Result<Id, ReadError>, RPCError>> {
-        let res = self.neb_client.read_cell(index_id);
-        res.then(|res| res.map(|read| read.map(|cell| *cell.data.Id().unwrap())))
+    ) -> Result<Result<Id, ReadError>, RPCError> {
+        let res = self.neb_client.read_cell(index_id).await;
+        res.map(|read| read.map(|cell| *cell.data.Id().unwrap()))
     }
 }
 

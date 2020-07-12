@@ -4,8 +4,7 @@ use bifrost::raft::state_machine::callback::server::{NotifyError, SMCallback};
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost_hasher::hash_str;
-use bifrost::raft;
-use futures::prelude::*;
+use bifrost::utils;
 use std::sync::Arc;
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
@@ -44,14 +43,16 @@ impl StateMachineCmds for SchemasSM {
         self.map.new_schema(schema.clone());
         async move {
             self.callback
-            .notify(commands::on_schema_added::new(), Ok(schema)).await?;
+            .notify(commands::on_schema_added::new(), schema).await?;
+            Ok(())
         }.boxed()
     }
     fn del_schema(&mut self, name: String) -> BoxFuture<Result<(), NotifyError>> {
         self.map.del_schema(&name).unwrap();
         async move {
             self.callback
-                .notify(commands::on_schema_deleted::new(), Ok(name))?;
+                .notify(commands::on_schema_deleted::new(), name).await?;
+            Ok(())
         }.boxed()
     }
     fn next_id(&mut self) -> BoxFuture<u32> {
@@ -65,19 +66,19 @@ impl StateMachineCtl for SchemasSM {
         self.sm_id
     }
     fn snapshot(&self) -> Option<Vec<u8>> {
-        Some(bincode::serialize(&self.map.get_all()))
+        Some(utils::serde::serialize(&self.map.get_all()))
     }
     fn recover(&mut self, data: Vec<u8>) {
-        let schemas: Vec<Schema> = bincode::deserialize(&data);
+        let schemas: Vec<Schema> = utils::serde::deserialize(&data).unwrap();
         self.map.load_from_list(schemas);
     }
 }
 
 impl SchemasSM {
-    pub fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
+    pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
         let sm_id = generate_sm_id(group);
         SchemasSM {
-            callback: SMCallback::new(sm_id, raft_service.clone()),
+            callback: SMCallback::new(sm_id, raft_service.clone()).await,
             map: SchemasMap::new(),
             sm_id,
         }

@@ -432,8 +432,8 @@ impl NodeCellRef {
 
     pub fn persist(
         &self,
-        deletion: &DeletionSetInneer,
-        neb: &crate::server::cell_rpc::AsyncServiceClient,
+        deletion: &DeletionSet,
+        neb: &Arc<crate::server::cell_rpc::AsyncServiceClient>,
     ) -> BoxFuture<()> {
         self.inner.persist(self, deletion, neb)
     }

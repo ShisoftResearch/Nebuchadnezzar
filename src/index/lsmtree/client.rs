@@ -154,7 +154,7 @@ impl LSMTreeClient {
         key.extend_from_slice(feature); // 8 bytes
         key.extend_from_slice(&cell_id.to_binary()); // ID SIZE
         loop {
-            let sub_tree = self.get_sub_tree(&key);
+            let sub_tree = self.get_sub_tree(&key).await;
             let tree_client = &sub_tree.client;
             let insertion_result = tree_client
                     .insert(sub_tree.tree_id, key.clone(), sub_tree.epoch)
@@ -177,7 +177,7 @@ impl LSMTreeClient {
         let mut key = Self::essential_key_components(schema_id, field_id);
         key.extend_from_slice(feature); // 8 bytes
         loop {
-            let sub_tree = self.get_sub_tree(&key);
+            let sub_tree = self.get_sub_tree(&key).await;
             let tree_client = &sub_tree.client;
             let seek_result = tree_client.seek(
                 sub_tree.tree_id,

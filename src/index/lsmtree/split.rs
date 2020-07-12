@@ -36,11 +36,11 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
         .unwrap()
 }
 
-pub fn tree_client(
+pub async fn tree_client(
     id: &Id,
     neb: &Arc<NebServer>,
-) -> impl Future<Output = Result<Arc<AsyncServiceClient>, RPCError>> {
-    rpc_client_by_id(id, neb).map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
+) -> Result<Arc<AsyncServiceClient>, RPCError> {
+    rpc_client_by_id(id, neb).await.map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
 pub async fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {

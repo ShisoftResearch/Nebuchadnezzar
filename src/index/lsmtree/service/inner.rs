@@ -164,7 +164,8 @@ impl LSMTreeIns {
     }
 
     pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
-        check_and_split(&self.tree, sm, neb)
+        // self.tree.check_and_split(&self.tree, sm, neb)
+        unimplemented!();
     }
 }
 

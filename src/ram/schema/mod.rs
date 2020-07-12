@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 use owning_ref::{OwningHandle, OwningRef};
 use std::ops::Deref;
+use futures::prelude::*;
+use futures::FutureExt;
 
 pub mod sm;
 
@@ -117,7 +119,7 @@ impl LocalSchemasCache {
                 let m1 = map.clone();
                 let m2 = map.clone();
                 let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft);
-                let mut sm_data = sm.get_all().await?.unwrap();
+                let mut sm_data = sm.get_all().await?;
                 {
                     let mut map = map.write();
                     for schema in sm_data {
@@ -125,17 +127,18 @@ impl LocalSchemasCache {
                     }
                 }
                 let _ = sm
-                    .on_schema_added(move |r| {
-                        let schema = r.unwrap();
+                    .on_schema_added(move |schema| {
                         debug!("Add schema {} from subscription", schema.id);
                         let mut m1 = m1.write();
                         m1.new_schema(schema);
+                        future::ready(()).boxed()
                     })
                     .await?;
                 let _ = sm
-                    .on_schema_deleted(move |r| {
+                    .on_schema_deleted(move |schema| {
                         let mut m2 = m2.write();
-                        m2.del_schema(&r.unwrap()).unwrap();
+                        m2.del_schema(&schema);
+                        future::ready(()).boxed()
                     })
                     .await?;
                 Some(sm)
