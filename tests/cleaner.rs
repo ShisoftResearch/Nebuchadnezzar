@@ -84,10 +84,9 @@ pub fn full_clean_cycle() {
 
         println!("trying to delete cells");
 
-        let all_seg_positions = seg_positions(chunk);
-        let all_cell_addresses = chunk.cell_addresses();
+        let all_seg_positions = seg_positions(chunk);();
         assert_eq!(all_seg_positions.len(), 2);
-        assert_eq!(all_cell_addresses.len(), 16);
+        assert_eq!(chunk.cell_count(), 16);
 
         for i in 0..8 {
             chunks.remove_cell(&Id::new(0, i * 2)).unwrap();
@@ -121,7 +120,7 @@ pub fn full_clean_cycle() {
             }
         }
 
-        assert_eq!(chunk.cell_addresses().len(), 8);
+        assert_eq!(chunk.cell_count(), 8);
 
         chunk.apply_dead_entry();
     }
@@ -141,10 +140,9 @@ pub fn full_clean_cycle() {
             compact::CompactCleaner::clean_segment(chunk, &seg);
         });
 
-        let compacted_seg_positions = seg_positions(chunk);
-        let compacted_cell_addresses = chunk.cell_addresses();
+        let compacted_seg_positions = seg_positions(chunk);();
         assert_eq!(compacted_seg_positions.len(), 2);
-        assert_eq!(compacted_cell_addresses.len(), 8);
+        assert_eq!(chunk.cell_count(), 8);
 
         // scan segments to check entries
         let seg0 = &chunk.segs.get(&0).unwrap();

@@ -192,7 +192,7 @@ impl Chunk {
         let head_ptr = *loc + offset;
         let mut data = Vec::with_capacity(len);
         for ptr in head_ptr..(head_ptr + len) {
-            data.push(unsafe { (*(ptr as *const u8)) });
+            data.push(unsafe { *(ptr as *const u8) });
         }
         Ok(data.to_vec())
     }
@@ -200,22 +200,11 @@ impl Chunk {
     fn write_cell_unchecked(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let loc = cell.write_to_chunk(self, false)?;
-        let mut need_rollback = false;
-        self.index.upsert(
-            cell.header.hash as usize,
-            || loc,
-            |inserted_loc| {
-                if *inserted_loc == 0 {
-                    *inserted_loc = loc
-                } else {
-                    need_rollback = true;
-                }
-            },
-        );
-        if need_rollback {
-            return Err(WriteError::CellAlreadyExisted);
+        if self.index.insert(&(cell.header.hash as usize), loc).is_some() {
+            Err(WriteError::CellAlreadyExisted)
+        } else {
+            Ok(cell.header)
         }
-        return Ok(cell.header);
     }
 
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
@@ -303,42 +292,35 @@ impl Chunk {
             Err(WriteError::CellDoesNotExisted)
         }
     }
+   
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
         P: Fn(Cell) -> bool,
     {
-        let mut result = Ok(());
-        self.index.alter(hash, |loc_opt| match loc_opt {
-            Some(cell_location) => {
-                let cell = Cell::from_chunk_raw(cell_location, self);
+        if let Some(guard) = self.index.lock(&(hash as usize)) {
+            let cell_location = *guard;
+            let cell = Cell::from_chunk_raw(cell_location, self);
                 match cell {
                     Ok(cell) => {
                         if predict(cell) {
                             let put_tombstone_result =
                                 self.put_tombstone_by_cell_loc(cell_location);
                             if put_tombstone_result.is_err() {
-                                result = put_tombstone_result;
-                                loc_opt
+                                put_tombstone_result
                             } else {
-                                None
+                                Ok(())
                             }
                         } else {
-                            result = Err(WriteError::CellDoesNotExisted);
-                            loc_opt
+                            Err(WriteError::CellDoesNotExisted)
                         }
                     }
                     Err(e) => {
-                        result = Err(WriteError::ReadError(e));
-                        None
+                        Err(WriteError::ReadError(e))
                     }
                 }
-            }
-            None => {
-                result = Err(WriteError::CellDoesNotExisted);
-                None
-            }
-        });
-        return result;
+        } else {
+            Err(WriteError::CellDoesNotExisted)
+        }
     }
 
     pub fn put_segment(&self, segment: Arc<Segment>) {
@@ -572,7 +554,7 @@ impl Chunk {
                 continue;
             } // never archive head segments
             let seg_key = seg_id as usize;
-            if let Some(segment) = self.segs.get(&seg_id) {
+            if let Some(segment) = self.segs.get(&seg_key) {
                 if !segment
                     .archived
                     .compare_and_swap(false, true, Ordering::Relaxed)
@@ -604,9 +586,7 @@ impl Chunk {
                             Cell::cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
                         debug!("Cell header read, id is {:?}", cell_header.id());
-                        if chunk_index
-                            .get(&(cell_header.hash as usize))
-                            .map(|g| *g) == Some(entry_meta.entry_pos) {
+                        if chunk_index.get(&(cell_header.hash as usize)) == Some(entry_meta.entry_pos) {
                             debug!("Cell entry {:?} is valid", cell_header.id());
                             return Some(Entry {
                                 meta: entry_meta,
@@ -620,7 +600,7 @@ impl Chunk {
                         debug!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if chunk_segs.contains_key(&tombstone.segment_id) {
+                        if chunk_segs.contains(&(tombstone.segment_id as usize)) {
                             debug!("Tomestone entry {:?} - {:?} at {} is valid",
                                    tombstone.partition, tombstone.hash, tombstone.segment_id);
                             return Some(Entry {
@@ -640,8 +620,8 @@ impl Chunk {
             })
     }
 
-    pub fn cell_addresses(&self) -> BTreeMap<u64, usize> {
-        (*self.index).clone().into_iter().collect()
+    pub fn cell_count(&self) -> usize {
+        self.index.len()
     }
 
     pub fn count(&self) -> usize {
