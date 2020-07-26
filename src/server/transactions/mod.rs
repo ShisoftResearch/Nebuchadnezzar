@@ -14,8 +14,8 @@ pub type TxnId = StandardVectorClock;
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub enum TxnExecResult<A, E>
 where
-    A: Clone,
-    E: Clone,
+    A: Send + Clone,
+    E: Send + Clone,
 {
     Rejected,
     Wait,
@@ -26,8 +26,8 @@ where
 
 impl<A, E> TxnExecResult<A, E>
 where
-    A: Clone,
-    E: Clone,
+    A: Send + Clone,
+    E: Send + Clone,
 {
     pub fn unwrap(self) -> A {
         match self {

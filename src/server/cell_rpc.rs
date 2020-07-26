@@ -20,10 +20,6 @@ service! {
 }
 
 pub struct NebRPCService {
-    inner: Arc<NebRPCServiceInner>,
-}
-
-pub struct NebRPCServiceInner {
     server: Arc<NebServer>,
 }
 
@@ -62,9 +58,7 @@ dispatch_rpc_service_functions!(NebRPCService);
 impl NebRPCService {
     pub fn new(server: &Arc<NebServer>) -> Arc<NebRPCService> {
         Arc::new(NebRPCService {
-            inner: Arc::new(NebRPCServiceInner {
-                server: server.clone(),
-            }),
+            server: server.clone(),
         })
     }
 }

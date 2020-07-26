@@ -58,7 +58,7 @@ dispatch_rpc_service_functions!(TransactionManager);
 pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: LFMap<TxnId, TxnMutex>,
-    data_sites: ObjectMap<u64, Arc<data_site::AsyncServiceClient>>,
+    data_sites: ObjectMap<Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager,
 }
 

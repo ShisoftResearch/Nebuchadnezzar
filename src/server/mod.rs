@@ -213,9 +213,9 @@ impl NebServer {
     pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
         self.consh.get_server_id(id.higher)
     }   
-    pub fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
+    pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<rpc::RPCClient>> {
         self.member_pool
-            .get_by_id(server_id, |_| self.consh.to_server_name(server_id))
+            .get_by_id(server_id, |_| self.consh.to_server_name(server_id)).await
     }
     pub async fn get_member_by_server_id_async(
         &self,
