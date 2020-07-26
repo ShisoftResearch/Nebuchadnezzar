@@ -1,6 +1,7 @@
 use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::membership::member::MemberService;
+use bifrost::membership::client::ObserverClient;
 use bifrost::membership::server::Membership;
 use bifrost::raft;
 use bifrost::raft::client::RaftClient;
@@ -76,11 +77,12 @@ pub async fn init_conshash(
     address: &String,
     memory_size: u64,
     raft_client: &Arc<RaftClient>,
+    membership: &Arc<ObserverClient>
 ) -> Result<Arc<ConsistentHashing>, ServerError> {
-    match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client) {
+    match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client, membership).await {
         Ok(ch) => {
             ch.set_weight(address, memory_size).await;
-            if !ch.init_table().is_ok() {
+            if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);
             }
@@ -94,7 +96,7 @@ pub async fn init_conshash(
 }
 
 impl NebServer {
-    pub fn new(
+    pub async fn new(
         opts: &ServerOptions,
         server_addr: &String,
         meta_members: &Vec<String>,
@@ -110,9 +112,9 @@ impl NebServer {
         raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(
             group_name,
             raft_service,
-        )));
+        ).await));
         Weights::new_with_id(CONS_HASH_ID, raft_service);
-        let schemas = LocalSchemasCache::new(group_name, Some(raft_client)).unwrap();
+        let schemas = LocalSchemasCache::new(group_name, Some(raft_client)).await.unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
         let chunks = Chunks::new(
             opts.chunk_count,
@@ -127,7 +129,7 @@ impl NebServer {
             server_addr,
             opts.memory_size as u64,
             raft_client,
-        )?;
+        ).await?;
         let server = Arc::new(NebServer {
             chunks,
             cleaner,
@@ -140,7 +142,7 @@ impl NebServer {
             server_id: rpc_server.server_id,
         });
         let client =
-            Arc::new(client::AsyncClient::new(&server.rpc, &meta_members, group_name).unwrap());
+            Arc::new(client::AsyncClient::new(&server.rpc, &meta_members, group_name).await.unwrap());
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
@@ -152,7 +154,7 @@ impl NebServer {
                     raft_service,
                     raft_client,
                     &conshasing,
-                ),
+                ).await,
             }
         }
 
@@ -177,15 +179,15 @@ impl NebServer {
         Server::listen_and_resume(&rpc_server);
         rpc_server.register_service(raft::DEFAULT_SERVICE_ID, &raft_service);
         raft::RaftService::start(&raft_service);
-        match raft_service.join(meta_members) {
+        match raft_service.join(meta_members).await {
             Err(sm_master::ExecError::CannotConstructClient) => {
                 info!("Cannot join meta cluster, will bootstrap one.");
                 raft_service.bootstrap();
             }
-            Ok(Ok(())) => {
+            Ok(()) => {
                 info!(
                     "Joined meta cluster, number of members: {}",
-                    raft_service.num_members()
+                    raft_service.num_members().await
                 );
             }
             e => {
@@ -223,7 +225,7 @@ impl NebServer {
     ) -> Result<Arc<RPCClient>, io::Error> {
         let cons_hash = self.consh.clone();
         self.member_pool
-            .get_by_id_async(server_id, move |_| cons_hash.to_server_name(server_id)).await
+            .get_by_id(server_id, move |_| cons_hash.to_server_name(server_id)).await
     }
     pub fn conshash(&self) -> &ConsistentHashing {
         &*self.consh
@@ -237,8 +239,8 @@ pub async fn rpc_client_by_id(
     let server_id = neb.get_server_id_by_id(id).unwrap();
     let neb = neb.clone();
     DEFAULT_CLIENT_POOL
-        .get_by_id_async(server_id, move |sid| neb.conshash().to_server_name(sid))
-        .map_err(|e| RPCError::IOError(e)).await
+        .get_by_id(server_id, move |sid| neb.conshash().to_server_name(sid)).await
+        .map_err(|e| RPCError::IOError(e))
 }
 
 // Peer have a clock, meant to update with other servers in the cluster
@@ -272,7 +274,7 @@ pub fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     );
 }
 
-pub fn init_lsm_tree_index_service(
+pub async fn init_lsm_tree_index_service(
     rpc_server: &Arc<Server>,
     neb_server: &Arc<NebServer>,
     neb_client: &Arc<AsyncClient>,
@@ -287,7 +289,7 @@ pub fn init_lsm_tree_index_service(
     ));
     rpc_server.register_service(
         lsmtree::service::DEFAULT_SERVICE_ID,
-        &lsmtree::service::LSMTreeService::new(neb_server, neb_client, &sm_client),
+        &lsmtree::service::LSMTreeService::new(neb_server, neb_client, &sm_client).await,
     );
 }
 

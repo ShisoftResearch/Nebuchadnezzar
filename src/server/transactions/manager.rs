@@ -7,7 +7,7 @@ use crate::ram::cell::{Cell, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use lightning::map::{ObjectMap, HashMap as LFMap};
+use lightning::map::{ObjectMap, HashMap as LFMap, Map};
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
@@ -67,7 +67,7 @@ impl TransactionManager {
         Arc::new(Self {
                 server: server.clone(),
                 transactions: LFMap::with_capacity(128),
-                data_sites: ObjectMap::new(),
+                data_sites: ObjectMap::with_capacity(8),
                 await_manager: AwaitManager::new(),
             })
     }
@@ -78,7 +78,7 @@ impl Service for TransactionManager {
     // STARTING IMPL RPC CALLS//
     ////////////////////////////
     fn read(
-       &self,
+        &self,
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<Result<TxnExecResult<Cell, ReadError>, TMError>> {
@@ -92,11 +92,10 @@ impl Service for TransactionManager {
                     None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
                 }
             }
-            let server = self.get_data_site_by_id(&id);
-            match server {
+            match self.get_data_site_by_id(&id) {
                 Ok((server_id, server)) => {
                     let awaits = self.await_manager.get_txn(&tid);
-                    self.read_from_site(server_id, server, tid, id, txn, awaits).await
+                    self.read_from_site(server_id, &server, &tid, &id, &txn, &awaits).await
                 }
                 Err(e) => {
                     error!("{:?}", e);
@@ -121,11 +120,10 @@ impl Service for TransactionManager {
                     None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
                 }
             }
-            let server = self.get_data_site_by_id(&id);
-            match server {
+            match self.get_data_site_by_id(&id) {
                 Ok((server_id, server)) => {
                     let awaits = self.await_manager.get_txn(&tid);
-                    self.head_from_site(server_id, server, tid, id, txn, awaits).await
+                    self.head_from_site(server_id, &server, &tid, &id, &txn, &awaits).await
                 }
                 Err(e) => {
                     error!("{:?}", e);
@@ -258,7 +256,140 @@ impl Service for TransactionManager {
             return result;
         }.boxed()
     }
+    fn begin(&self) -> BoxFuture<Result<TxnId, TMError>> {
+        let id = self.server.txn_peer.clock.inc();
+        let mut txns = self.transactions.write();
+        if txns
+            .insert(
+                id.clone(),
+                Arc::new(Mutex::new(Transaction {
+                    start_time: get_time(),
+                    data: HashMap::new(),
+                    affected_objects: AffectedObjs::new(),
+                    state: TxnState::Started,
+                })),
+            )
+            .is_some()
+        {
+            Err(TMError::TransactionIdExisted)
+        } else {
+            Ok(id)
+        }
+    }
+    
+    fn write(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+        let txn_mutex = self.get_transaction(&tid)?;
+        let mut txn = txn_mutex.lock();
+        let id = cell.id();
+        self.ensure_rw_state(&txn)?;
+        match self.server.get_server_id_by_id(&id) {
+            Some(server_id) => {
+                let have_cached_cell = txn.data.contains_key(&id);
+                if !have_cached_cell {
+                    txn.data.insert(
+                        id,
+                        DataObject {
+                            server: server_id,
+                            cell: Some(cell.clone()),
+                            new: true,
+                            version: None,
+                            changed: true,
+                        },
+                    );
+                    Ok(TxnExecResult::Accepted(()))
+                } else {
+                    let mut data_obj = txn.data.get_mut(&id).unwrap();
+                    if !data_obj.cell.is_none() {
+                        return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
+                    }
+                    data_obj.cell = Some(cell.clone());
+                    data_obj.changed = true;
+                    Ok(TxnExecResult::Accepted(()))
+                }
+            }
+            None => Err(TMError::CannotLocateCellServer),
+        }
+    }
+    fn update(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+        let txn_mutex = self.get_transaction(&tid)?;
+        let mut txn = txn_mutex.lock();
+        let id = cell.id();
+        self.ensure_rw_state(&txn)?;
+        match self.server.get_server_id_by_id(&id) {
+            Some(server_id) => {
+                let cell = cell.clone();
+                if txn.data.contains_key(&id) {
+                    let mut data_obj = txn.data.get_mut(&id).unwrap();
+                    data_obj.cell = Some(cell);
+                    data_obj.changed = true
+                } else {
+                    txn.data.insert(
+                        id,
+                        DataObject {
+                            server: server_id,
+                            cell: Some(cell),
+                            new: false,
+                            version: None,
+                            changed: true,
+                        },
+                    );
+                }
+                Ok(TxnExecResult::Accepted(()))
+            }
+            None => Err(TMError::CannotLocateCellServer),
+        }
+    }
+    fn remove(&self, tid: TxnId, id: Id) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+        let txn_lock = self.get_transaction(&tid)?;
+        let mut txn = txn_lock.lock();
+        self.ensure_rw_state(&txn)?;
+        match self.server.get_server_id_by_id(&id) {
+            Some(server_id) => {
+                if txn.data.contains_key(&id) {
+                    let mut new_obj = false;
+                    {
+                        let data_obj = txn.data.get_mut(&id).unwrap();
+                        if data_obj.cell.is_none() {
+                            return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
+                        }
+                        if data_obj.new {
+                            new_obj = true;
+                        } else {
+                            data_obj.cell = None;
+                        }
+                        data_obj.changed = true;
+                    }
+                    if new_obj {
+                        txn.data.remove(&id);
+                    }
+                } else {
+                    txn.data.insert(
+                        id,
+                        DataObject {
+                            server: server_id,
+                            cell: None,
+                            new: false,
+                            version: None,
+                            changed: true,
+                        },
+                    );
+                }
+                Ok(TxnExecResult::Accepted(()))
+            }
+            None => Err(TMError::CannotLocateCellServer),
+        }
+    }
 
+    async fn go_ahead(&self, tids: &BTreeSet<TxnId>, server_id: u64) -> BoxFuture<()> {
+        debug!("=> TM WAKE UP TXN: {:?}", tids);
+        let mut futures = FuturesUnordered::new();
+        for tid in tids {
+            let await_txn = self.await_manager.get_txn(&tid);
+            futures.push(AwaitManager::txn_send(&await_txn, server_id));
+        }
+        futures.collect().await.collect();
+        Ok(())
+    }
 }
 
 impl TransactionManager {
@@ -660,140 +791,6 @@ impl TransactionManager {
         let mut txn = self.transactions.write();
         txn.remove(tid);
         return Ok(());
-    }
-    fn begin(&self) -> Result<TxnId, TMError> {
-        let id = self.server.txn_peer.clock.inc();
-        let mut txns = self.transactions.write();
-        if txns
-            .insert(
-                id.clone(),
-                Arc::new(Mutex::new(Transaction {
-                    start_time: get_time(),
-                    data: HashMap::new(),
-                    affected_objects: AffectedObjs::new(),
-                    state: TxnState::Started,
-                })),
-            )
-            .is_some()
-        {
-            Err(TMError::TransactionIdExisted)
-        } else {
-            Ok(id)
-        }
-    }
-    
-    fn write(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let txn_mutex = self.get_transaction(&tid)?;
-        let mut txn = txn_mutex.lock();
-        let id = cell.id();
-        self.ensure_rw_state(&txn)?;
-        match self.server.get_server_id_by_id(&id) {
-            Some(server_id) => {
-                let have_cached_cell = txn.data.contains_key(&id);
-                if !have_cached_cell {
-                    txn.data.insert(
-                        id,
-                        DataObject {
-                            server: server_id,
-                            cell: Some(cell.clone()),
-                            new: true,
-                            version: None,
-                            changed: true,
-                        },
-                    );
-                    Ok(TxnExecResult::Accepted(()))
-                } else {
-                    let mut data_obj = txn.data.get_mut(&id).unwrap();
-                    if !data_obj.cell.is_none() {
-                        return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
-                    }
-                    data_obj.cell = Some(cell.clone());
-                    data_obj.changed = true;
-                    Ok(TxnExecResult::Accepted(()))
-                }
-            }
-            None => Err(TMError::CannotLocateCellServer),
-        }
-    }
-    fn update(&self, tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let txn_mutex = self.get_transaction(&tid)?;
-        let mut txn = txn_mutex.lock();
-        let id = cell.id();
-        self.ensure_rw_state(&txn)?;
-        match self.server.get_server_id_by_id(&id) {
-            Some(server_id) => {
-                let cell = cell.clone();
-                if txn.data.contains_key(&id) {
-                    let mut data_obj = txn.data.get_mut(&id).unwrap();
-                    data_obj.cell = Some(cell);
-                    data_obj.changed = true
-                } else {
-                    txn.data.insert(
-                        id,
-                        DataObject {
-                            server: server_id,
-                            cell: Some(cell),
-                            new: false,
-                            version: None,
-                            changed: true,
-                        },
-                    );
-                }
-                Ok(TxnExecResult::Accepted(()))
-            }
-            None => Err(TMError::CannotLocateCellServer),
-        }
-    }
-    fn remove(&self, tid: TxnId, id: Id) -> Result<TxnExecResult<(), WriteError>, TMError> {
-        let txn_lock = self.get_transaction(&tid)?;
-        let mut txn = txn_lock.lock();
-        self.ensure_rw_state(&txn)?;
-        match self.server.get_server_id_by_id(&id) {
-            Some(server_id) => {
-                if txn.data.contains_key(&id) {
-                    let mut new_obj = false;
-                    {
-                        let data_obj = txn.data.get_mut(&id).unwrap();
-                        if data_obj.cell.is_none() {
-                            return Ok(TxnExecResult::Error(WriteError::CellDoesNotExisted));
-                        }
-                        if data_obj.new {
-                            new_obj = true;
-                        } else {
-                            data_obj.cell = None;
-                        }
-                        data_obj.changed = true;
-                    }
-                    if new_obj {
-                        txn.data.remove(&id);
-                    }
-                } else {
-                    txn.data.insert(
-                        id,
-                        DataObject {
-                            server: server_id,
-                            cell: None,
-                            new: false,
-                            version: None,
-                            changed: true,
-                        },
-                    );
-                }
-                Ok(TxnExecResult::Accepted(()))
-            }
-            None => Err(TMError::CannotLocateCellServer),
-        }
-    }
-
-    async fn go_ahead(&self, tids: &BTreeSet<TxnId>, server_id: u64) -> Result<(), ()> {
-        debug!("=> TM WAKE UP TXN: {:?}", tids);
-        let mut futures = FuturesUnordered::new();
-        for tid in tids {
-            let await_txn = self.await_manager.get_txn(&tid);
-            futures.push(AwaitManager::txn_send(&await_txn, server_id));
-        }
-        futures.collect().await.collect();
-        Ok(())
     }
 }
 

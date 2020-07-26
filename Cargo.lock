@@ -81,7 +81,7 @@ checksum = "f8aac770f1885fd7e387acedd76065302551364496e46b3dd00860b2f8359b9d"
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#2090db6fd50b17f88991422a32a36b80516fe78d"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
 dependencies = [
  "async-std",
  "bifrost_hasher",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#2090db6fd50b17f88991422a32a36b80516fe78d"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
 dependencies = [
  "twox-hash",
 ]
@@ -116,7 +116,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#2090db6fd50b17f88991422a32a36b80516fe78d"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
 dependencies = [
  "bifrost_hasher",
 ]
@@ -1008,9 +1008,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.56"
+version = "1.0.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3433e879a558dde8b5e8feb2a04899cf34fdde1fafb894687e52105fc1162ac3"
+checksum = "164eacbdb13512ec2745fb09d51fd5b22b0d65ed294a1dcf7285a360c80a675c"
 dependencies = [
  "itoa",
  "ryu",
