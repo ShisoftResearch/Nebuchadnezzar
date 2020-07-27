@@ -68,9 +68,10 @@ impl StateMachineCtl for SchemasSM {
     fn snapshot(&self) -> Option<Vec<u8>> {
         Some(utils::serde::serialize(&self.map.get_all()))
     }
-    fn recover(&mut self, data: Vec<u8>) {
+    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
         let schemas: Vec<Schema> = utils::serde::deserialize(&data).unwrap();
         self.map.load_from_list(schemas);
+        future::ready(()).boxed()
     }
 }
 

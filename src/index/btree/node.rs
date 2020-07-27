@@ -1,9 +1,6 @@
 use super::*;
 use crate::server;
 use std::any::TypeId;
-use std::collections::btree_set::BTreeSet;
-use std::sync::atomic::fence;
-use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
 use futures::FutureExt;
@@ -586,7 +583,7 @@ where
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
         neb: &Arc<server::cell_rpc::AsyncServiceClient>,
-    ) {
+    ) -> BoxFuture<()> {
         let guard = write_node::<KS, PS>(node_ref);
         let deletion = deletion.read();
         let cell = match &*guard {

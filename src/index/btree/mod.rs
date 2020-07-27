@@ -342,6 +342,10 @@ where
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
     }
+
+    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient){
+        unimplemented!()
+    }
 }
 
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);

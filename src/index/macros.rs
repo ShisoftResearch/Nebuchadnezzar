@@ -1,7 +1,7 @@
 macro_rules! make_array {
     ($n: expr, $constructor:expr) => {
         unsafe {
-            let mut items: [_; $n] = mem::uninitialized();
+            let mut items: [_; $n] = mem::zeroed();
             for place in items.iter_mut() {
                 ptr::write(place, $constructor);
             }
