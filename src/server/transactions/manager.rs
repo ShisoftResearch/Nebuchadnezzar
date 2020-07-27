@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc::{channel, Sender, Receiver};
 
-type TxnAwaits = ObjectMap<Arc<parking_lot::Mutex<AwaitingServer>>>;
+type TxnAwaits = ObjectMap<Arc<Mutex<AwaitingServer>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
@@ -438,7 +438,7 @@ impl TransactionManager {
             _ => Err(TMError::TransactionNotFound),
         }
     }
-    async fn read_from_site<'a>(
+    fn read_from_site<'a>(
         &self,
         server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
@@ -446,43 +446,45 @@ impl TransactionManager {
         id: &Id,
         mut txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
-    ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
-        let self_server_id = self.server.server_id;
-        let read_response =
-            server.read(self_server_id, self.get_clock(), tid.to_owned(), id).await;
-        match read_response {
-            Ok(dsr) => {
-                self.merge_clock(&dsr.clock);
-                let payload = dsr.payload;
-                let payload_out = payload.clone();
-                match payload {
-                    TxnExecResult::Accepted(cell) => {
-                        txn.data.insert(
-                            &id,
-                            DataObject {
-                                server: server_id,
-                                version: Some(cell.header.version),
-                                cell: Some(cell),
-                                new: false,
-                                changed: false,
-                            },
-                        );
+    ) -> BoxFuture<Result<TxnExecResult<Cell, ReadError>, TMError>> {
+        async move {
+            let self_server_id = self.server.server_id;
+            let read_response =
+            server.read(self_server_id, self.get_clock(), tid.to_owned(), id.clone()).await;
+            match read_response {
+                Ok(dsr) => {
+                    self.merge_clock(&dsr.clock);
+                    let payload = dsr.payload;
+                    let payload_out = payload.clone();
+                    match payload {
+                        TxnExecResult::Accepted(cell) => {
+                            txn.data.insert(
+                                id.clone(),
+                                DataObject {
+                                    server: server_id,
+                                    version: Some(cell.header.version),
+                                    cell: Some(cell),
+                                    new: false,
+                                    changed: false,
+                                },
+                            );
+                        }
+                        TxnExecResult::Wait => {
+                            AwaitManager::txn_wait(&awaits, server_id).await;
+                            return self.read_from_site(
+                                server_id, server, tid, id, txn, awaits
+                            ).await;
+                        }
+                        _ => {}
                     }
-                    TxnExecResult::Wait => {
-                        AwaitManager::txn_wait(&awaits, server_id).await;
-                        return self.read_from_site(
-                            server_id, server, tid, id, txn, awaits
-                        ).await;
-                    }
-                    _ => {}
+                    Ok(payload_out)
                 }
-                Ok(payload_out)
+                Err(e) => {
+                    error!("{:?}", e);
+                    Err(TMError::RPCErrorFromCellServer)
+                }
             }
-            Err(e) => {
-                error!("{:?}", e);
-                Err(TMError::RPCErrorFromCellServer)
-            }
-        }
+        }.boxed()
     }
     
     async fn head_from_site<'a>(
@@ -513,7 +515,7 @@ impl TransactionManager {
                 }
                 Err(e) => {
                     error!("{:?}", e);
-                    Err(TMError::RPCErrorFromCellServer)
+                    return Err(TMError::RPCErrorFromCellServer);
                 }
             }
         }
@@ -833,12 +835,17 @@ impl AwaitManager {
     pub fn get_txn(&self, tid: &TxnId) -> TxnAwaits {
         self.channels.get_or_insert(tid, || ObjectMap::with_capacity(8))
     }
-    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<parking_lot::Mutex<AwaitingServer>> {
-        awaits.get_or_insert(&(server_id as usize), || Arc::new(parking_lot::Mutex::new(AwaitingServer::new())))    }
+    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<Mutex<AwaitingServer>> {
+        awaits.get_or_insert(&(server_id as usize), || Arc::new(Mutex::new(AwaitingServer::new())))  
+    }
     pub async fn txn_send(awaits: &TxnAwaits, server_id: u64) {
-        AwaitManager::server_from_txn_awaits(awaits, server_id).lock().send().await
+        let manager_lock = AwaitManager::server_from_txn_awaits(awaits, server_id);
+        let mut manager = manager_lock.lock().await;
+        manager.send().await
     }
     pub async fn txn_wait(awaits: &TxnAwaits, server_id: u64) {
-        AwaitManager::server_from_txn_awaits(awaits, server_id).lock().wait().await
+        let manager_lock = AwaitManager::server_from_txn_awaits(awaits, server_id);
+        let mut manager = manager_lock.lock().await;
+        manager.wait().await
     }
 }
