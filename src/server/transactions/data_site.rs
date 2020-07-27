@@ -590,7 +590,7 @@ impl Service for DataManager {
                 cell_guards.push(cell_mutex.lock()); // lock all affected cells on by on
             }
             for mut meta in cell_guards {
-                if meta.owner == Some(tid) {
+                if meta.owner.as_ref() == Some(&tid) {
                     // collect waiting transactions
                     for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
                         waiting_list

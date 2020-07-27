@@ -198,7 +198,7 @@ impl StateMachineCtl for PlacementSM {
     fn snapshot(&self) -> Option<Vec<u8>> {
         unimplemented!()
     }
-    fn recover(&mut self, data: Vec<u8>) {
+    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
         unimplemented!()
     }
 }

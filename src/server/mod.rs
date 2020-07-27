@@ -104,6 +104,7 @@ impl NebServer {
         rpc_server: &Arc<rpc::Server>,
         raft_service: &Arc<raft::RaftService>,
         raft_client: &Arc<RaftClient>,
+        membership_client: &Arc<ObserverClient>
     ) -> Result<Arc<NebServer>, ServerError> {
         debug!(
             "Creating key-value server instance, group name {}",
@@ -129,6 +130,7 @@ impl NebServer {
             server_addr,
             opts.memory_size as u64,
             raft_client,
+            membership_client
         ).await?;
         let server = Arc::new(NebServer {
             chunks,
@@ -142,7 +144,7 @@ impl NebServer {
             server_id: rpc_server.server_id,
         });
         let client =
-            Arc::new(client::AsyncClient::new(&server.rpc, &meta_members, group_name).await.unwrap());
+            Arc::new(client::AsyncClient::new(&server.rpc, membership_client, &meta_members, group_name).await.unwrap());
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server),
@@ -184,7 +186,7 @@ impl NebServer {
                 info!("Cannot join meta cluster, will bootstrap one.");
                 raft_service.bootstrap();
             }
-            Ok(()) => {
+            Ok(true) => {
                 info!(
                     "Joined meta cluster, number of members: {}",
                     raft_service.num_members().await
@@ -196,10 +198,11 @@ impl NebServer {
             }
         }
         Membership::new(&rpc_server, &raft_service);
-        let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).unwrap();
+        let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).await.unwrap();
         RaftClient::prepare_subscription(&rpc_server);
-        let member_service = MemberService::new(server_addr, &raft_client);
+        let member_service = MemberService::new(server_addr, &raft_client).await;
         member_service.join_group(group_name).await.unwrap();
+        let membership_client = Arc::new(ObserverClient::new(&raft_client));
         NebServer::new(
             opts,
             server_addr,
@@ -208,7 +211,9 @@ impl NebServer {
             &rpc_server,
             &raft_service,
             &raft_client,
+            &membership_client
         )
+        .await
         .unwrap()
     }
 
