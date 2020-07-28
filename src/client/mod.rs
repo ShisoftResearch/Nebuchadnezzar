@@ -9,8 +9,10 @@ use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
 use futures::future::BoxFuture;
-use futures::prelude::*;
+use futures::stream::FuturesUnordered;
+use futures::stream::StreamExt;
 use futures::FutureExt;
+use futures::prelude::*;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
@@ -95,150 +97,140 @@ impl AsyncClient {
         self.client_by_server_id(server_id).await
     }
 
-    pub fn read_cell(&self, id: Id) -> BoxFuture<Result<Result<Cell, ReadError>, RPCError>> {
-        async {
-            let client = self.locate_plain_server(id).await?;
-            client.read_cell(id).await
-        }.boxed()
+    pub async fn read_cell(&self, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.read_cell(id).await
     }
-    pub fn write_cell(
+    pub async fn write_cell(
         &self,
         cell: Cell,
-    ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
-        async {
-            let client = self.locate_plain_server(cell.id()).await?;
-            client.write_cell(cell).await
-        }.boxed()
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(cell.id()).await?;
+        client.write_cell(cell).await
     }
-    pub fn update_cell(
+    pub async fn update_cell(
         &self,
         cell: Cell,
-    ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
-        async {
-            let client = self.locate_plain_server(cell.id()).await?;
-            client.update_cell(cell).await
-        }.boxed()
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(cell.id()).await?;
+        client.update_cell(cell).await
     }
-    pub fn upsert_cell(
+    pub async fn upsert_cell(
         &self,
         cell: Cell,
-    ) -> BoxFuture<Result<Result<CellHeader, WriteError>, RPCError>> {
-        async {let client = self.locate_plain_server(cell.id()).await?;
-            client.upsert_cell(cell).await
-        }.boxed()
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+        let client = self.locate_plain_server(cell.id()).await?;
+        client.upsert_cell(cell).await
     }
-    pub fn remove_cell(&self, id: Id) -> BoxFuture<Result<Result<(), WriteError>, RPCError>> {
-        async {
-            let client = self.locate_plain_server(id).await?;
-            client.remove_cell(id).await
-        }.boxed()
+    pub async fn remove_cell(&self, id: Id) -> Result<Result<(), WriteError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.remove_cell(id).await
     }
-    pub fn count(&self) -> BoxFuture<Result<u64, RPCError>> {
-        async {
-            let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
-            let mut sum = 0;
-            for m in members {
-                let client = self.client_by_server_id(m.id).await?;
-                let count = client.count().await?;
-                sum += count
-            }
-            Ok(sum)
-        }.boxed()
+    pub async fn count(&self) -> Result<u64, RPCError> {
+        let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
+        let mut member_futs: FuturesUnordered<_> = members
+            .into_iter()
+            .map(|m| {
+                async move {
+                    let client = self.client_by_server_id(m.id).await?;
+                    Ok(client.count().await?)
+                }
+            })
+            .collect();
+        let mut sum = 0;
+        while let Some(res) = member_futs.next().await {
+            sum += res?;
+        }
+        Ok(sum)
     }
-    pub fn transaction<TFN, TR>(&self, func: TFN) -> BoxFuture<Result<TR, TxnError>>
+    pub async fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
     where
         TFN: Fn(&Transaction) -> Result<TR, TxnError> + Sync + Send,
         TR: 'static + Sync + Send,
         TFN: 'static + Sync + Send,
     {
-        async {
-            let server_name = match self.conshash.rand_server() {
-                Some(name) => name,
-                None => return Err(TxnError::CannotFindAServer),
+        let server_name = match self.conshash.rand_server() {
+            Some(name) => name,
+            None => return Err(TxnError::CannotFindAServer),
+        };
+        let txn_client = match txn_server::new_async_client(&server_name).await {
+            Ok(client) => client,
+            Err(e) => return Err(TxnError::IoError(e)),
+        };
+        let mut txn_id: txn_server::TxnId;
+        let mut retried = 0;
+        while retried < TRANSACTION_MAX_RETRY {
+            txn_id = match txn_client.begin().await {
+                Ok(Ok(id)) => id,
+                _ => return Err(TxnError::CannotBegin),
             };
-            let txn_client = match txn_server::new_async_client(&server_name) {
-                Ok(client) => client,
-                Err(e) => return Err(TxnError::IoError(e)),
+            let txn = Transaction {
+                tid: txn_id,
+                state: StdCell::new(txn_server::TxnState::Started),
+                client: txn_client.clone(),
             };
-            let mut txn_id: txn_server::TxnId;
-            let mut retried = 0;
-            while retried < TRANSACTION_MAX_RETRY {
-                txn_id = match txn_client.begin().await {
-                    Ok(Ok(id)) => id,
-                    _ => return Err(TxnError::CannotBegin),
-                };
-                let txn = Transaction {
-                    tid: txn_id,
-                    state: StdCell::new(txn_server::TxnState::Started),
-                    client: txn_client.clone(),
-                };
-                let exec_result = func(&txn);
-                let mut exec_value = None;
-                let mut txn_result = Ok(());
-                match exec_result {
-                    Ok(val) => {
-                        if txn.state.get() == txn_server::TxnState::Started {
-                            txn_result = txn.prepare().await;
-                            debug!("PREPARE STATE: {:?}", txn_result);
-                        }
-                        if txn_result.is_ok() && txn.state.get() == txn_server::TxnState::Prepared {
-                            txn_result = txn.commit().await;
-                            debug!("COMMIT STATE: {:?}", txn_result);
-                        }
-                        exec_value = Some(val);
+            let exec_result = func(&txn);
+            let mut exec_value = None;
+            let mut txn_result = Ok(());
+            match exec_result {
+                Ok(val) => {
+                    if txn.state.get() == txn_server::TxnState::Started {
+                        txn_result = txn.prepare().await;
+                        debug!("PREPARE STATE: {:?}", txn_result);
                     }
-                    Err(e) => txn_result = Err(e),
+                    if txn_result.is_ok() && txn.state.get() == txn_server::TxnState::Prepared {
+                        txn_result = txn.commit().await;
+                        debug!("COMMIT STATE: {:?}", txn_result);
+                    }
+                    exec_value = Some(val);
                 }
-                debug!("TXN CONCLUSION: {:?}", txn_result);
-                match txn_result {
-                    Ok(()) => {
-                        return Ok(exec_value.unwrap());
-                    }
-                    Err(TxnError::NotRealizable) => {
-                        let abort_result = txn.abort().await; // continue the loop to retry
-                        debug!("TXN NOT REALIZABLE, ABORT: {:?}", abort_result);
-                    }
-                    Err(e) => {
-                        // abort will always be an error to achieve early break
-                        let abort_result = txn.abort().await;
-                        debug!("TXN ERROR, ABORT: {:?}", abort_result);
-                        return Err(e);
-                    }
-                }
-                retried += 1;
-                debug!("Client retry transaction, {:?} times", retried);
+                Err(e) => txn_result = Err(e),
             }
-            Err(TxnError::TooManyRetry)
-        }.boxed()
+            debug!("TXN CONCLUSION: {:?}", txn_result);
+            match txn_result {
+                Ok(()) => {
+                    return Ok(exec_value.unwrap());
+                }
+                Err(TxnError::NotRealizable) => {
+                    let abort_result = txn.abort().await; // continue the loop to retry
+                    debug!("TXN NOT REALIZABLE, ABORT: {:?}", abort_result);
+                }
+                Err(e) => {
+                    // abort will always be an error to achieve early break
+                    let abort_result = txn.abort().await;
+                    debug!("TXN ERROR, ABORT: {:?}", abort_result);
+                    return Err(e);
+                }
+            }
+            retried += 1;
+            debug!("Client retry transaction, {:?} times", retried);
+        }
+        Err(TxnError::TooManyRetry)
     }
-    pub fn new_schema_with_id(
+    pub async fn new_schema_with_id(
         &self,
         schema: Schema,
-    ) -> BoxFuture<Result<Result<(), NotifyError>, ExecError>> {
-        self.schema_client.new_schema(&schema).boxed()
+    ) -> Result<Result<(), NotifyError>, ExecError> {
+        self.schema_client.new_schema(&schema).await
     }
-    pub fn new_schema(
+    pub async fn new_schema(
         &self,
         mut schema: Schema,
-    ) -> BoxFuture<Result<(u32, Option<NotifyError>), ExecError>> {
-        async {
-            let schema_id = self.schema_client.next_id().await?;
-            schema.id = schema_id;
-            self.new_schema_with_id(schema).await.map(|r| {
-                let error = match r {
-                    Ok(_) => None,
-                    Err(e) => Some(e),
-                };
-                (schema_id, error)
-            })
-        }.boxed()
+    ) -> Result<(u32, Option<NotifyError>), ExecError> {
+        let schema_id = self.schema_client.next_id().await?;
+        schema.id = schema_id;
+        self.new_schema_with_id(schema).await.map(|r| {
+            let error = match r {
+                Ok(_) => None,
+                Err(e) => Some(e),
+            };
+            (schema_id, error)
+        })
     }
-    pub fn del_schema(&self, name: String) -> BoxFuture<Result<Result<(), NotifyError>, ExecError>> {
-        self.schema_client.del_schema(&name).boxed()
+    pub async fn del_schema(&self, name: String) -> Result<Result<(), NotifyError>, ExecError> {
+        self.schema_client.del_schema(&name).await
     }
-    pub fn get_all_schema(&self) -> BoxFuture<Result<Vec<Schema>, ExecError>> {
-        async {
-            Ok(self.schema_client.get_all().await?)
-        }.boxed()
+    pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
+        self.schema_client.get_all().await
     }
 }

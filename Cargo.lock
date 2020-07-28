@@ -81,7 +81,7 @@ checksum = "f8aac770f1885fd7e387acedd76065302551364496e46b3dd00860b2f8359b9d"
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#0c2cb392da7317f35e12c49ce32c2ce01db99ef5"
 dependencies = [
  "async-std",
  "bifrost_hasher",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#0c2cb392da7317f35e12c49ce32c2ce01db99ef5"
 dependencies = [
  "twox-hash",
 ]
@@ -116,7 +116,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#4f68bb80c84bd9437754a384f8064188e6005abe"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#0c2cb392da7317f35e12c49ce32c2ce01db99ef5"
 dependencies = [
  "bifrost_hasher",
 ]
@@ -382,9 +382,9 @@ checksum = "de27142b013a8e869c14957e6d2edeef89e97c289e69d042ee3a49acd8b51789"
 
 [[package]]
 name = "futures-lite"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8cc8771bd1bb4c7be3c5f072a1d5e18086ef220f100a0a4efece41076e87b9f2"
+checksum = "bbe71459749b2e8e66fb95df721b22fa08661ad384a0c5b519e11d3893b4692a"
 dependencies = [
  "fastrand",
  "futures-core",
@@ -790,18 +790,18 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "0.4.22"
+version = "0.4.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12e3a6cdbfe94a5e4572812a0201f8c0ed98c1c452c7b8563ce2276988ef9c17"
+checksum = "ca4433fff2ae79342e497d9f8ee990d174071408f28f726d6d83af93e58e48aa"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "0.4.22"
+version = "0.4.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a0ffd45cf79d88737d7cc85bfd5d2894bee1139b356e616fe85dc389c61aaf7"
+checksum = "2c0e815c3ee9a031fdf5af21c10aa17c573c9c6a566328d99e3936c34e36461f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1086,9 +1086,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"
-version = "1.0.35"
+version = "1.0.36"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb7f4c519df8c117855e19dd8cc851e89eb746fe7a73f0157e0d95fdec5369b0"
+checksum = "4cdb98bcb1f9d81d07b536179c269ea15999b5d14ea958196413869445bb5250"
 dependencies = [
  "proc-macro2",
  "quote",

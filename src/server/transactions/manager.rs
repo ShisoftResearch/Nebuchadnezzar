@@ -588,38 +588,38 @@ impl TransactionManager {
         objs: &BTreeMap<Id, DataObject>,
         data_site: &Arc<data_site::AsyncServiceClient>,
     ) -> Result<DMPrepareResult, TMError> {
-        let self_server_id = server.server_id;
-        let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
-        let server_for_clock = server.clone();
-        let prepare_payload = data_site
-            .prepare(
-                self_server_id,
-                server.txn_peer.clock.to_clock(),
-                tid.clone(),
-                cell_ids
-            )
-            .await
-            .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
-            .map(move |prepare_res| -> DMPrepareResult {
-                server_for_clock
-                    .txn_peer
-                    .clock
-                    .merge_with(&prepare_res.clock);
-                prepare_res.payload
-            });
-        match prepare_payload {
-            Ok(payload) => {
-                match payload {
-                    DMPrepareResult::Wait => {
-                        AwaitManager::txn_wait(&awaits, data_site.server_id).await;
-                        return TransactionManager::site_prepare(
-                            server, awaits, tid, objs, data_site
-                        ).await; // after waiting, retry
+        loop {
+            let self_server_id = server.server_id;
+            let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
+            let server_for_clock = server.clone();
+            let prepare_payload = data_site
+                .prepare(
+                    self_server_id,
+                    server.txn_peer.clock.to_clock(),
+                    tid.clone(),
+                    cell_ids
+                )
+                .await
+                .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
+                .map(move |prepare_res| -> DMPrepareResult {
+                    server_for_clock
+                        .txn_peer
+                        .clock
+                        .merge_with(&prepare_res.clock);
+                    prepare_res.payload
+                });
+            match prepare_payload {
+                Ok(payload) => {
+                    match payload {
+                        DMPrepareResult::Wait => {
+                            AwaitManager::txn_wait(&awaits, data_site.server_id()).await;
+                            continue; // after waiting, retry
+                        }
+                        _ => return Ok(payload),
                     }
-                    _ => return Ok(payload),
                 }
+                Err(e) => return Err(e),
             }
-            Err(e) => Err(e),
         }
     }
     
