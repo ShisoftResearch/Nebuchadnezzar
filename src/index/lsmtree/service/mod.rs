@@ -214,7 +214,7 @@ impl Service for LSMTreeService {
             .get(&tree_id)
             .ok_or(LSMTreeSvrError::TreeNotFound)
             .map(|tree| tree.set_epoch(epoch));
-        async {
+        async move {
             if let Ok(Ok(res)) = self.sm.update_epoch(&tree_id, &epoch).await {
                 Ok(res)
             } else {

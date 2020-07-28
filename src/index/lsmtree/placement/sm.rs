@@ -89,7 +89,7 @@ impl StateMachineCmds for PlacementSM {
         mid: Vec<u8>,
         src_epoch: u64,
     ) -> BoxFuture<Result<u64, CmdError>> {
-        async {
+        async move {
             if let Some(mut source_placement) = self.placements.get_mut(&source) {
                 if let &Some(ref in_progress) = &source_placement.in_split {
                     return Err(CmdError::AnotherSplitInProgress(in_progress.clone()));
@@ -108,7 +108,7 @@ impl StateMachineCmds for PlacementSM {
     }
 
     fn complete_split(&mut self, source: Id, dest: Id, src_epoch: u64) -> BoxFuture<Result<u64, CmdError>> {
-        async {
+        async move {
             let (dest_placement, src_epoch) =
             if let Some(mut source_placement) = self.placements.get_mut(&source) {
                 let dest_placement = if let &Some(ref in_progress) = &source_placement.in_split {
@@ -141,7 +141,7 @@ impl StateMachineCmds for PlacementSM {
 
     fn update_epoch(&mut self, source: Id, epoch: u64) -> BoxFuture<Result<u64, CmdError>> {
         // unconditionally update placement epoch in state machine and return its original value
-        async {
+        async move {
             if let Some(mut source_placement) = self.placements.get_mut(&source) {
                 let original = source_placement.epoch;
                 source_placement.epoch = epoch;
@@ -154,7 +154,7 @@ impl StateMachineCmds for PlacementSM {
     }
 
     fn upsert(&mut self, placement: Placement) -> BoxFuture<Result<(), CmdError>> {
-        async {
+        async move {
             if let Some(p) = self.placements.get(&placement.id) {
                 if let Some(id) = self.starts.get(&placement.starts) {
                     if id != &placement.id {

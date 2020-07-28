@@ -84,7 +84,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<Result<TxnExecResult<Cell, ReadError>, TMError>> {
-        async {
+        async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
@@ -112,7 +112,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
-        async {
+        async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
@@ -140,7 +140,7 @@ impl Service for TransactionManager {
         id: Id,
         fields: Vec<u64>,
     ) -> BoxFuture<Result<TxnExecResult<Vec<Value>, ReadError>, TMError>> {
-        async {
+        async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
             self.ensure_rw_state(&txn)?;
@@ -177,7 +177,7 @@ impl Service for TransactionManager {
     }
 
     fn prepare(&self, tid: TxnId) -> BoxFuture<Result<TMPrepareResult, TMError>> {
-        async {
+        async move {
             let conclusion = {
                 let txn_mutex = self.get_transaction(&tid)?;
                 let mut txn = txn_mutex.lock().await;
@@ -217,7 +217,7 @@ impl Service for TransactionManager {
         }.boxed()
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<Result<EndResult, TMError>> {
-        async {
+        async move {
             let result = {
                 let txn_lock = self.get_transaction(&tid)?;
                 let txn = txn_lock.lock().await;
@@ -236,7 +236,7 @@ impl Service for TransactionManager {
     }
     fn abort(&self, tid: TxnId) -> BoxFuture<Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
-        async {
+        async move {
             let result = {
                 let txn_lock = self.get_transaction(&tid)?;
                 let txn = txn_lock.lock().await;
@@ -277,7 +277,7 @@ impl Service for TransactionManager {
     }
     
     fn write(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
-        async {
+        async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             let id = cell.id();
@@ -312,7 +312,7 @@ impl Service for TransactionManager {
         }.boxed()
     }
     fn update(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
-        async {
+        async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
             let id = cell.id();
@@ -343,7 +343,7 @@ impl Service for TransactionManager {
         }.boxed()
     }
     fn remove(&self, tid: TxnId, id: Id) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
-        async {
+        async move {
             let txn_lock = self.get_transaction(&tid)?;
             let mut txn = txn_lock.lock().await;
             self.ensure_rw_state(&txn)?;
@@ -386,10 +386,12 @@ impl Service for TransactionManager {
     }
     fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<()> {
         debug!("=> TM WAKE UP TXN: {:?}", tids);
-        let mut futures = FuturesUnordered::new();
+        let futures = FuturesUnordered::new();
         for tid in tids {
             let await_txn = self.await_manager.get_txn(&tid);
-            futures.push(AwaitManager::txn_send(&await_txn, server_id));
+            futures.push(tokio::spawn(async move {
+                AwaitManager::txn_send(&await_txn, server_id).await;
+            }));
         }
         async move {
             let _: Vec<_> = futures.collect().await;

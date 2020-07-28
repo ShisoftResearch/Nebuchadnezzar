@@ -13,6 +13,8 @@ use parking_lot::Mutex;
 use lightning::map::{HashMap as LFMap, ObjectMap};
 use futures::future::BoxFuture;
 use lightning::map::Map;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::Duration;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -57,7 +59,7 @@ pub struct DataManager {
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
     managers: ObjectMap<Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
-    cleanup_sender: Sender<()>,
+    cleanup_signal: Arc<AtomicBool>,
 }
 
 service! {
@@ -81,7 +83,7 @@ dispatch_rpc_service_functions!(DataManager);
 
 impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
-        let (cleanup_sender, cleaup_recv) = channel(1);
+        let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(64),
             cell_lru: Mutex::new(LinkedHashMap::new()),
@@ -89,13 +91,16 @@ impl DataManager {
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: ObjectMap::with_capacity(16),
             server: server.clone(),
-            cleanup_sender,
+            cleanup_signal: cleanup_signal.clone(),
         });
         let manager_clone = manager.clone();
         tokio::spawn(async move {
             loop {
-                cleaup_recv.recv().await;
-                manager_clone.cell_meta_cleanup();
+                if cleanup_signal.load(Relaxed) {
+                    manager_clone.cell_meta_cleanup();
+                    cleanup_signal.store(false, Relaxed);
+                }
+                tokio::time::delay_for(Duration::from_secs(1)).await;
             } 
         });
         return manager;
@@ -608,7 +613,7 @@ impl Service for DataManager {
             debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
             for (server_id, transactions) in waiting_list {
                 // inform waiting servers to go on
-                wake_up_futures.push(async {
+                wake_up_futures.push(async move {
                     if let Ok(client) = self.get_tnx_manager(server_id).await {
                         client.go_ahead(transactions, self.server.server_id).await;
                     } else {
@@ -620,16 +625,15 @@ impl Service for DataManager {
                 });
             }
         }
-        let r = async {
-            let wake_up_res: Vec<_> = wake_up_futures.collect().await;
+        async move {
+            let _wake_up_res: Vec<_> = wake_up_futures.collect().await;
             self.wipe_out_transaction(&tid);
-            self.cleanup_sender.send(()).await;
+            self.cleanup_signal.store(true, Relaxed);
             if released_locks == affected_cells {
                 self.response_with(EndResult::Success).await
             } else {
                 self.response_with(EndResult::SomeLocksNotReleased).await
             }
-        };
-        r.boxed()
+        }.boxed()
     }
 }

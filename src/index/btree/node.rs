@@ -584,10 +584,11 @@ where
         deletion: &DeletionSet,
         neb: &Arc<server::cell_rpc::AsyncServiceClient>,
     ) -> BoxFuture<()> {
-        let guard = write_node::<KS, PS>(node_ref);
+        let mut guard = write_node::<KS, PS>(node_ref);
         let deletion = deletion.read();
-        let cell = match &*guard {
-            &NodeData::External(ref node) => {
+        let guard_ref = &mut *guard;
+        let cell = match guard_ref {
+            &mut NodeData::External(ref mut node) => {
                 node.prepare_persist(&*deletion)
             },
             _ => {
@@ -596,8 +597,8 @@ where
         };
         let neb = neb.clone();
         async move {
-            tokio::spawn(async move {
-                neb.upsert_cell(cell).await;
+            let _ = tokio::spawn(async move {
+                let _ = neb.upsert_cell(cell).await;
             }).await;
         }.boxed()
     }
