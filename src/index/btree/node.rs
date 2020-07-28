@@ -595,10 +595,11 @@ where
             },
         };
         let neb = neb.clone();
-        tokio::spawn(async move {
-            neb.upsert_cell(cell).await;
-        })
-        .boxed();
+        async move {
+            tokio::spawn(async move {
+                neb.upsert_cell(cell).await;
+            }).await;
+        }.boxed()
     }
 }
 
