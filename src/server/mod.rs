@@ -9,7 +9,6 @@ use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{RPCClient, RPCError, Server};
-use bifrost::tcp::STANDALONE_ADDRESS_STRING;
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 use crate::client;
@@ -65,6 +64,7 @@ pub struct NebServer {
     pub meta: Arc<ServerMeta>,
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
+    pub membership: Arc<ObserverClient>,
     pub member_pool: rpc::ClientPool,
     pub txn_peer: Peer,
     pub raft_service: Arc<raft::RaftService>,
@@ -113,8 +113,8 @@ impl NebServer {
         raft_service.register_state_machine(Box::new(schema_sm::SchemasSM::new(
             group_name,
             raft_service,
-        ).await));
-        Weights::new_with_id(CONS_HASH_ID, raft_service);
+        ).await)).await;
+        Weights::new_with_id(CONS_HASH_ID, raft_service).await;
         let schemas = LocalSchemasCache::new(group_name, Some(raft_client)).await.unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
         let chunks = Chunks::new(
@@ -138,6 +138,7 @@ impl NebServer {
             meta: meta_rc,
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
+            membership: membership_client.clone(),
             member_pool: rpc::ClientPool::new(),
             txn_peer: Peer::new(server_addr),
             raft_service: raft_service.clone(),
@@ -147,8 +148,8 @@ impl NebServer {
             Arc::new(client::AsyncClient::new(&server.rpc, membership_client, &meta_members, group_name).await.unwrap());
         for service in &opts.services {
             match service {
-                &Service::Cell => init_cell_rpc_service(rpc_server, &server),
-                &Service::Transaction => init_txn_service(rpc_server, &server),
+                &Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
+                &Service::Transaction => init_txn_service(rpc_server, &server).await,
                 &Service::LSMTreeIndex => init_lsm_tree_index_service(
                     rpc_server,
                     &server,
@@ -178,13 +179,13 @@ impl NebServer {
             address: server_addr.to_owned(),
             service_id: raft::DEFAULT_SERVICE_ID,
         });
-        Server::listen_and_resume(&rpc_server);
-        rpc_server.register_service(raft::DEFAULT_SERVICE_ID, &raft_service);
-        raft::RaftService::start(&raft_service);
+        Server::listen_and_resume(&rpc_server).await;
+        rpc_server.register_service(raft::DEFAULT_SERVICE_ID, &raft_service).await;
+        raft::RaftService::start(&raft_service).await;
         match raft_service.join(meta_members).await {
             Err(sm_master::ExecError::CannotConstructClient) => {
                 info!("Cannot join meta cluster, will bootstrap one.");
-                raft_service.bootstrap();
+                raft_service.bootstrap().await;
             }
             Ok(true) => {
                 info!(
@@ -197,9 +198,9 @@ impl NebServer {
                 panic!("{:?}", ServerError::CannotJoinCluster)
             }
         }
-        Membership::new(&rpc_server, &raft_service);
+        Membership::new(&rpc_server, &raft_service).await;
         let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).await.unwrap();
-        RaftClient::prepare_subscription(&rpc_server);
+        RaftClient::prepare_subscription(&rpc_server).await;
         let member_service = MemberService::new(server_addr, &raft_client).await;
         member_service.join_group(group_name).await.unwrap();
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
@@ -261,22 +262,22 @@ impl Peer {
     }
 }
 
-pub fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server.register_service(
         cell_rpc::DEFAULT_SERVICE_ID,
         &cell_rpc::NebRPCService::new(&neb_server),
-    );
+    ).await;
 }
 
-pub fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server.register_service(
         transactions::manager::DEFAULT_SERVICE_ID,
         &transactions::manager::TransactionManager::new(&neb_server),
-    );
+    ).await;
     rpc_server.register_service(
         transactions::data_site::DEFAULT_SERVICE_ID,
         &transactions::data_site::DataManager::new(&neb_server),
-    );
+    ).await;
 }
 
 pub async fn init_lsm_tree_index_service(
@@ -287,7 +288,7 @@ pub async fn init_lsm_tree_index_service(
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
 ) {
-    raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new(cons_hash));
+    raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new(cons_hash)).await;
     let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(
         lsmtree::placement::sm::SM_ID,
         raft_client,
@@ -295,7 +296,7 @@ pub async fn init_lsm_tree_index_service(
     rpc_server.register_service(
         lsmtree::service::DEFAULT_SERVICE_ID,
         &lsmtree::service::LSMTreeService::new(neb_server, neb_client, &sm_client).await,
-    );
+    ).await;
 }
 
 #[cfg(test)]
@@ -307,14 +308,14 @@ mod tests {
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::type_id_of;
-    use futures::Future;
     use crate::ram::cell::Cell;
     use crate::ram::schema::Schema;
-    use crate::ram::schema::{Field, IndexType};
+    use crate::ram::schema::Field;
     use crate::ram::types::*;
     use crate::server::NebServer;
     use crate::server::ServerOptions;
     use crate::server::Service;
+    use futures::executor::block_on;
     use std::sync::Arc;
     use test::Bencher;
 
@@ -334,7 +335,7 @@ mod tests {
             },
             &server_addr,
             &server_group,
-        );
+        ).await;
         let schema_id = 123;
         let schema = Schema {
             id: schema_id,
@@ -360,79 +361,79 @@ mod tests {
         };
 
         let client = Arc::new(
-            client::AsyncClient::new(&server.rpc, &vec![server_addr], &server_group).unwrap(),
+            client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap(),
         );
         client.new_schema_with_id(schema).await;
         (server, client, schema_id)
     }
 
-    #[bench]
-    fn wr(b: &mut Bencher) {
-        let (_, client, schema_id) = init_service(5302);
-        let id = Id::new(0, 1);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(2);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        b.iter(|| {
-            client.upsert_cell(cell.clone()).wait();
-        })
-    }
+    // #[bench]
+    // fn wr(b: &mut Bencher) {
+    //     let (_, client, schema_id) = init_service(5302);
+    //     let id = Id::new(0, 1);
+    //     let mut value = Value::Map(Map::new());
+    //     value[DATA] = Value::U64(2);
+    //     let cell = Cell::new_with_id(schema_id, &id, value);
+    //     b.iter(|| {
+    //         client.upsert_cell(cell.clone()).wait();
+    //     })
+    // }
 
-    #[bench]
-    fn w(b: &mut Bencher) {
-        let (_, client, schema_id) = init_service(5306);
-        let id = Id::new(0, 1);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(2);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        let mut i = 0;
-        b.iter(|| {
-            let mut cell = cell.clone();
-            cell.header.hash = i;
-            client.write_cell(cell).wait();
-            i += 1
-        })
-    }
+    // #[bench]
+    // fn w(b: &mut Bencher) {
+    //     let (_, client, schema_id) = init_service(5306);
+    //     let id = Id::new(0, 1);
+    //     let mut value = Value::Map(Map::new());
+    //     value[DATA] = Value::U64(2);
+    //     let cell = Cell::new_with_id(schema_id, &id, value);
+    //     let mut i = 0;
+    //     b.iter(|| {
+    //         let mut cell = cell.clone();
+    //         cell.header.hash = i;
+    //         client.write_cell(cell).wait();
+    //         i += 1
+    //     })
+    // }
 
-    #[bench]
-    fn txn_upsert(b: &mut Bencher) {
-        let (_, client, schema_id) = init_service(5303);
-        b.iter(|| {
-            client
-                .transaction(move |txn| {
-                    let id = Id::new(0, 1);
-                    let mut value = Value::Map(Map::new());
-                    value[DATA] = Value::U64(2);
-                    let cell = Cell::new_with_id(schema_id, &id, value);
-                    txn.upsert(cell)
-                })
-                .wait()
-        })
-    }
+    // #[bench]
+    // fn txn_upsert(b: &mut Bencher) {
+    //     let (_, client, schema_id) = init_service(5303);
+    //     b.iter(|| {
+    //         client
+    //             .transaction(move |txn| {
+    //                 let id = Id::new(0, 1);
+    //                 let mut value = Value::Map(Map::new());
+    //                 value[DATA] = Value::U64(2);
+    //                 let cell = Cell::new_with_id(schema_id, &id, value);
+    //                 txn.upsert(cell)
+    //             })
+    //             .wait()
+    //     })
+    // }
 
-    #[bench]
-    fn txn_insert(b: &mut Bencher) {
-        let (_, client, schema_id) = init_service(5305);
-        let mut i = 0;
-        b.iter(|| {
-            client
-                .transaction(move |txn| {
-                    let id = Id::new(0, i);
-                    let mut value = Value::Map(Map::new());
-                    value[DATA] = Value::U64(i);
-                    let cell = Cell::new_with_id(schema_id, &id, value);
-                    txn.write(cell)
-                })
-                .wait();
-            i += 1;
-        })
-    }
+    // #[bench]
+    // fn txn_insert(b: &mut Bencher) {
+    //     let (_, client, schema_id) = init_service(5305);
+    //     let mut i = 0;
+    //     b.iter(|| {
+    //         client
+    //             .transaction(move |txn| {
+    //                 let id = Id::new(0, i);
+    //                 let mut value = Value::Map(Map::new());
+    //                 value[DATA] = Value::U64(i);
+    //                 let cell = Cell::new_with_id(schema_id, &id, value);
+    //                 txn.write(cell)
+    //             })
+    //             .wait();
+    //         i += 1;
+    //     })
+    // }
 
-    #[bench]
-    fn noop_txn(b: &mut Bencher) {
-        let (_, client, _schema_id) = init_service(5304);
-        b.iter(|| client.transaction(move |_txn| Ok(())).wait())
-    }
+    // #[bench]
+    // fn noop_txn(b: &mut Bencher) {
+    //     let (_, client, _schema_id) = init_service(5304);
+    //     b.iter(|| client.transaction(move |_txn| Ok(())).wait())
+    // }
 
     #[bench]
     fn cell_construct(b: &mut Bencher) {

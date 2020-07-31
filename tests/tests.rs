@@ -19,15 +19,8 @@ mod types;
 
 #[macro_use]
 extern crate log;
-extern crate env_logger;
-extern crate rand;
 #[macro_use]
 extern crate lazy_static;
-extern crate futures_await as futures;
-extern crate itertools;
-extern crate parking_lot;
-extern crate rayon;
-extern crate test;
 
 use neb::ram::schema::{Field, IndexType};
 

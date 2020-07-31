@@ -13,9 +13,6 @@ use crate::ram::types::RandValue;
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rayon::prelude::*;
-use crate::server;
-use crate::server::NebServer;
-use crate::server::ServerOptions;
 use smallvec::SmallVec;
 use std::env;
 use std::fs::File;
@@ -328,7 +325,7 @@ pub fn alternative_insertion_pattern() {
 
     assert!(verification::is_tree_in_order(&tree, 0));
 
-    let mut rng = thread_rng();
+    let rng = thread_rng();
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
     for i in 0..num {
@@ -601,19 +598,7 @@ fn level_merge_insertion() {
 
 #[test]
 fn reconstruct() {
-    env_logger::init();
-    let server_addr = String::from("127.0.0.1:5800");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-            services: vec![server::Service::Cell, server::Service::LSMTreeIndex],
-        },
-        &server_addr,
-        "reconstruct_test",
-    );
+    let _ = env_logger::try_init();
     let num = env::var("BTREE_RECONSTRUCT_TEST")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -644,7 +629,7 @@ fn reconstruct() {
             .into_iter()
             .map(|n| NodeCellRef::new(Node::with_external(n)))
             .collect_vec();
-        nodes.iter().enumerate().for_each(|(i, nr)| {
+        nodes.iter().enumerate().for_each(|(i, _nr)| {
             if i == 0 {
                 return;
             }

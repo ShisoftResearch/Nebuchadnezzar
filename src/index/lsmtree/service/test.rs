@@ -82,7 +82,7 @@ pub async fn split() {
     let tree_capacity = lsm_tree.full_size() as u64;
     let test_volume = (tree_capacity as f32 * 1.1) as u64;
     let mut nums = (0..test_volume).collect_vec();
-    let rng = thread_rng();
+    let mut rng = thread_rng();
     nums.as_mut_slice().shuffle(&mut rng);
     nums.par_iter().for_each(|n| {
         let id = Id::new(0, *n);

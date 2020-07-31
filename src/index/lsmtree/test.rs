@@ -21,6 +21,8 @@ use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rayon::prelude::*;
+use rand::seq::SliceRandom;
 
 fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {
@@ -124,7 +126,8 @@ pub fn hybrid() {
     });
 
     let mut test_data = (0..num).collect_vec();
-    thread_rng().shuffle(test_data.as_mut_slice());
+    let mut rng = thread_rng();
+    test_data.as_mut_slice().shuffle(&mut rng);
     test_data.par_iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);
