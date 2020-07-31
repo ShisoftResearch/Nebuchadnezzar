@@ -241,7 +241,7 @@ mod string {
             "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ",
             "中文测试文本",
             "Hello Test",
-            "💖",
+            "🏳️‍🌈",
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let mut addr = chunk.segments()[0].addr;
