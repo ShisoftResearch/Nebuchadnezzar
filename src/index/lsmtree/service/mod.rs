@@ -40,7 +40,7 @@ pub struct LSMTreeSummary {
     range: (Vec<u8>, Vec<u8>),
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct LSMTreeBlock {
     pub data: Vec<Vec<u8>>,
     pub cursor_id: u64

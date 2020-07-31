@@ -1,14 +1,10 @@
 use super::*;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
-use crate::client;
 use dovahkiin::types::custom_types::id::Id;
-use hermes::stm::TxnValRef;
 use crate::index::btree::dump::dump_tree;
-use crate::index::btree::node::*;
 use crate::index::btree::reconstruct::TreeConstructor;
 use crate::index::btree::NodeCellRef;
-use crate::index::btree::NodeData;
 use crate::index::trees::Cursor;
 use crate::index::trees::EntryKey;
 use crate::index::trees::{id_from_key, key_with_id};
@@ -29,6 +25,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rand::seq::SliceRandom;
 
 extern crate env_logger;
 
@@ -115,7 +112,7 @@ fn crd() {
     {
         info!("test insertion");
         let mut nums = (0..num).collect_vec();
-        thread_rng().shuffle(nums.as_mut_slice());
+        nums.as_mut_slice().shuffle(&mut rng);
         let json = serde_json::to_string(&nums).unwrap();
         let mut file = File::create("nums_dump.json").unwrap();
         file.write_all(json.as_bytes());
@@ -377,9 +374,9 @@ fn parallel() {
             tree_len as f32 / num as f32 * 100.0
         );
     });
-
+    let mut rng = rand::thread_rng();
     let mut nums = (0..num).collect_vec();
-    thread_rng().shuffle(nums.as_mut_slice());
+    nums.as_mut_slice().shuffle(&mut rng);
     nums.par_iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);
@@ -394,8 +391,7 @@ fn parallel() {
 
     assert!(verification::is_tree_in_order(&*tree, 0));
 
-    thread_rng().shuffle(nums.as_mut_slice());
-    let mut rng = rand::rngs::OsRng::new().unwrap();
+    nums.as_mut_slice().shuffle(&mut rng);
     let die_range = Uniform::new_inclusive(1, 6);
     let roll_die = RwLock::new(rng.sample_iter(&die_range));
     (0..num).collect::<Vec<_>>().iter().for_each(|i| {
@@ -535,7 +531,7 @@ fn level_merge_insertion() {
     let tree = Arc::new(TinyLevelBPlusTree::new());
     let mut numbers = (0..nums).collect_vec();
     let mut rng = thread_rng();
-    rng.shuffle(numbers.as_mut());
+    numbers.as_mut_slice().shuffle(&mut rng);
     let tree_nums = numbers.as_slice()[0..range].iter().cloned().collect_vec();
     let merge_nums = numbers.as_slice()[range..range * 2]
         .iter()

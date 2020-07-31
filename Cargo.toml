@@ -42,3 +42,4 @@ tokio = "0.2"
 
 [dev-dependencies]
 env_logger = "*"
+rayon = "*"
