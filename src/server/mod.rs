@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 pub mod cell_rpc;
 pub mod transactions;
+#[cfg(test)]
+mod tests;
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
 

@@ -11,6 +11,8 @@ use lightning::map::Map;
 
 pub mod combine;
 pub mod compact;
+#[cfg(test)]
+pub mod tests;
 
 pub struct Cleaner {
     chunks: Arc<Chunks>,

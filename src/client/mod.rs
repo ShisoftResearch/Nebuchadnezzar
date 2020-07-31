@@ -26,6 +26,8 @@ use self::transaction::*;
 static TRANSACTION_MAX_RETRY: u32 = 1000;
 
 pub mod transaction;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug)]
 pub enum NebClientError {

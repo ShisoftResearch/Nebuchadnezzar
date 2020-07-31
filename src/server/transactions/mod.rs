@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 pub mod data_site;
 pub mod manager;
+#[cfg(test)]
+mod tests;
 
 pub type TxnId = StandardVectorClock;
 
