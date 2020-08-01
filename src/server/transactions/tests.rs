@@ -362,7 +362,7 @@ pub async fn smoke_rw() {
     let mut futs: Vec<_> = Vec::with_capacity(thread_count);
     for _ in 0..thread_count {
         let txn = txn.clone();
-        futs.push(tokio::spawn(async {
+        futs.push(tokio::spawn(async move {
             let txn_id = txn.begin().await.unwrap().unwrap();
             let read_result = txn
                 .read(txn_id.to_owned(), cell_id.to_owned())

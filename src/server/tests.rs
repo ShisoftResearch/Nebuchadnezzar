@@ -403,12 +403,12 @@ pub async fn txn() {
 
     for i in 0..num {
         client
-            .transaction(move |txn| {
+            .transaction(async move |txn| {
                 let id = Id::new(0, 1);
                 let mut value = Value::Map(Map::new());
                 value[DATA] = Value::U64(2);
                 let cell = Cell::new_with_id(schema_id, &id, value);
-                txn.upsert(cell)
+                txn.upsert(cell).await
             })
             .await;
     }

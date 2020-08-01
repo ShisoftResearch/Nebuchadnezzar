@@ -57,9 +57,7 @@ pub async fn general() {
         })
         .await
         .unwrap();
-    let should_aborted = client.transaction(async move |ref mut trans| {
-      trans.abort().await
-    }).await;
+    let should_aborted = client.transaction(|trans|trans.abort()).await;
     match should_aborted {
         Err(TxnError::Aborted(_)) => {}
         _ => panic!("{:?}", should_aborted),
@@ -70,7 +68,7 @@ pub async fn general() {
     //        trans.write(&cell_1) // regular fail case
     //    }).err().unwrap();
     client
-        .transaction(move |ref mut trans| {
+        .transaction(move |trans| {
             let empty_cell = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(Map::new()));
             trans.write(empty_cell.to_owned()) // empty cell write should fail
         })
@@ -83,41 +81,41 @@ pub async fn general() {
     let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
     for _ in 0..thread_count {
         let client = client.clone();
-        futs.push(tokio::spawn(async {
-          client
-              .transaction(async move |ref mut txn| {
-                  let mut cell = txn.read(cell_1_id.to_owned()).await?.unwrap();
-                  // WARNING: read_selected is subject to dirty read
-                  let selected = txn
-                      .read_selected(
-                          cell_1_id.to_owned(),
-                          types::key_hashes(&vec![String::from("score")]),
-                      ).await?
-                      .unwrap();
-                  let mut score = *cell.data["score"].U64().unwrap();
-                  assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
-                  score += 1;
-                  let mut data = cell.data.Map().unwrap().clone();
-                  data.insert(&String::from("score"), Value::U64(score));
-                  cell.data = Value::Map(data);
-                  txn.update(cell.to_owned()).await?;
-                  let selected = txn
-                      .read_selected(
-                          cell_1_id.to_owned(),
-                          types::key_hashes(&vec![String::from("score")]),
-                      ).await?
-                      .unwrap();
-                  assert_eq!(selected[0].U64().unwrap(), &score);
-
-                  let header = txn.head(cell.id()).await?.unwrap();
-                  assert_eq!(header.id(), cell.id());
-                  assert!(header.version > 1);
-
-                  Ok(())
-              })
-              .await
-              .unwrap();
-      }));
+        futs.push(async move {
+            client
+                .transaction(async move |ref mut txn| {
+                    let mut cell = txn.read(cell_1_id.to_owned()).await?.unwrap();
+                    // WARNING: read_selected is subject to dirty read
+                    let selected = txn
+                        .read_selected(
+                            cell_1_id.to_owned(),
+                            types::key_hashes(&vec![String::from("score")]),
+                        ).await?
+                        .unwrap();
+                    let mut score = *cell.data["score"].U64().unwrap();
+                    assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
+                    score += 1;
+                    let mut data = cell.data.Map().unwrap().clone();
+                    data.insert(&String::from("score"), Value::U64(score));
+                    cell.data = Value::Map(data);
+                    txn.update(cell.to_owned()).await?;
+                    let selected = txn
+                        .read_selected(
+                            cell_1_id.to_owned(),
+                            types::key_hashes(&vec![String::from("score")]),
+                        ).await?
+                        .unwrap();
+                    assert_eq!(selected[0].U64().unwrap(), &score);
+  
+                    let header = txn.head(cell.id()).await?.unwrap();
+                    assert_eq!(header.id(), cell.id());
+                    assert!(header.version > 1);
+  
+                    Ok(())
+                })
+                .await
+                .unwrap()
+        });
     }
     let _: Vec<_> = futs.collect().await;
     let cell_1_r = client.read_cell(cell_1.id()).await.unwrap().unwrap();
@@ -171,8 +169,9 @@ pub async fn multi_cell_update() {
     let futs: FuturesUnordered<_> = FuturesUnordered::new(); 
     for _i in 0..thread_count {
         let client = client.clone();
-        futs.push(tokio::spawn(async {
-            client
+        futs.push(
+            async move {
+                client
                 .transaction(async move |txn| {
                     let mut score_1 = 0;
                     let mut score_2 = 0;
@@ -194,7 +193,8 @@ pub async fn multi_cell_update() {
                 })
                 .await
                 .unwrap();
-        }));
+            }
+        );
     }
     let _: Vec<_> = futs.collect().await;
     let cell_1_r = client.read_cell(cell_1_id).await.unwrap().unwrap();
