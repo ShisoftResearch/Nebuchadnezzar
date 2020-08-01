@@ -1,6 +1,7 @@
 #![feature(asm)]
 #![feature(box_syntax)]
 #![feature(test)]
+#![feature(async_closure)]
 
 #[macro_use]
 extern crate static_assertions;

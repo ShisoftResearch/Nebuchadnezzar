@@ -8,10 +8,8 @@ use bifrost::membership::client::ObserverClient;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
-use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
-use futures::FutureExt;
 use futures::prelude::*;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
@@ -54,7 +52,7 @@ impl AsyncClient {
     ) -> Result<Self, NebClientError> {
         match RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID).await {
             Ok(raft_client) => {
-                RaftClient::prepare_subscription(subscription_server);
+                RaftClient::prepare_subscription(subscription_server).await;
                 assert!(RaftClient::can_callback().await);
                 match ConsistentHashing::new_client_with_id(CONS_HASH_ID, group, &raft_client, membership).await {
                     Ok(chash) => Ok(Self {
@@ -145,11 +143,11 @@ impl AsyncClient {
         }
         Ok(sum)
     }
-    pub async fn transaction<TFN, TR>(&self, func: TFN) -> Result<TR, TxnError>
+    pub async fn transaction<TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
-        TFN: Fn(&Transaction) -> Result<TR, TxnError> + Sync + Send,
+        TFN: Fn(&Transaction) -> RF,
         TR: 'static + Sync + Send,
-        TFN: 'static + Sync + Send,
+        RF: Future<Output = Result<TR, TxnError>>
     {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
@@ -171,7 +169,7 @@ impl AsyncClient {
                 state: StdCell::new(txn_server::TxnState::Started),
                 client: txn_client.clone(),
             };
-            let exec_result = func(&txn);
+            let exec_result = func(&txn).await;
             let mut exec_value = None;
             let mut txn_result = Ok(());
             match exec_result {

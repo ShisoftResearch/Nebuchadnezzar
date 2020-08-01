@@ -14,4 +14,4 @@ pub mod types;
 pub mod clock;
 
 #[cfg(test)]
-mod tests;
+pub mod tests;
