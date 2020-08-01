@@ -7,9 +7,6 @@ edition = "2018"
 [lib]
 name = "neb"
 
-[[test]]
-name = "tests"
-
 [dependencies]
 libc = "*"
 log = "*"

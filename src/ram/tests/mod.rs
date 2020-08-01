@@ -2,7 +2,7 @@ mod cell;
 mod chunk;
 mod types;
 
-use neb::ram::schema::{Field, IndexType};
+use crate::ram::schema::{Field, IndexType};
 
 pub fn default_fields() -> Field {
     Field::new(

@@ -54,11 +54,11 @@ fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
         .collect()
 }
 
-#[tokio::test(threaded_scheduler)]
-pub async fn full_clean_cycle() {
+#[test]
+pub fn full_clean_cycle() {
     env_logger::init();
     let schema = Schema::new("cleaner_test", None, default_fields(), false);
-    let schemas = LocalSchemasCache::new("", None).await.unwrap();
+    let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema);
     let chunks = Chunks::new(
         1,                    // single chunk

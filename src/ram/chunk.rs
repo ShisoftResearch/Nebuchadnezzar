@@ -675,12 +675,12 @@ impl Chunks {
         }
         Arc::new(Chunks { list: chunks })
     }
-    pub async fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
+    pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(
             count,
             size,
             Arc::<ServerMeta>::new(ServerMeta {
-                schemas: LocalSchemasCache::new("", None).await.unwrap(),
+                schemas: LocalSchemasCache::new_local(""),
             }),
             None,
             None,

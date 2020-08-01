@@ -111,42 +111,40 @@ pub struct LocalSchemasCache {
 impl LocalSchemasCache {
     pub async fn new(
         group: &str,
-        raft_client: Option<&Arc<RaftClient>>,
+        raft_client: &Arc<RaftClient>,
     ) -> Result<LocalSchemasCache, ExecError> {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
-        let _sm = match raft_client {
-            Some(raft) => {
-                let m1 = map.clone();
-                let m2 = map.clone();
-                let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft);
-                let mut sm_data = sm.get_all().await?;
-                {
-                    let mut map = map.write();
-                    for schema in sm_data {
-                        map.new_schema(schema);
-                    }
-                }
-                let _ = sm
-                    .on_schema_added(move |schema| {
-                        debug!("Add schema {} from subscription", schema.id);
-                        let mut m1 = m1.write();
-                        m1.new_schema(schema);
-                        future::ready(()).boxed()
-                    })
-                    .await?;
-                let _ = sm
-                    .on_schema_deleted(move |schema| {
-                        let mut m2 = m2.write();
-                        m2.del_schema(&schema);
-                        future::ready(()).boxed()
-                    })
-                    .await?;
-                Some(sm)
+        let m1 = map.clone();
+        let m2 = map.clone();
+        let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft_client);
+        let sm_data = sm.get_all().await?;
+        {
+            let mut map = map.write();
+            for schema in sm_data {
+                map.new_schema(schema);
             }
-            None => None,
-        };
+        }
+        let _ = sm
+            .on_schema_added(move |schema| {
+                debug!("Add schema {} from subscription", schema.id);
+                let mut m1 = m1.write();
+                m1.new_schema(schema);
+                future::ready(()).boxed()
+            })
+            .await?;
+        let _ = sm
+            .on_schema_deleted(move |schema| {
+                let mut m2 = m2.write();
+                m2.del_schema(&schema);
+                future::ready(()).boxed()
+            })
+            .await?;
         let schemas = LocalSchemasCache { map };
         return Ok(schemas);
+    }
+    pub fn new_local(group: &str) -> Self {
+        let map = Arc::new(RwLock::new(SchemasMap::new()));
+        LocalSchemasCache { map }
     }
     pub fn get(&self, id: &u32) -> Option<ReadingSchema> {
         let m = self.map.read();
