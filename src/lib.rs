@@ -13,6 +13,7 @@ extern crate lazy_static;
 extern crate bifrost;
 extern crate bifrost_hasher;
 extern crate bifrost_plugins;
+#[macro_use]
 pub extern crate dovahkiin;
 #[macro_use]
 extern crate serde_derive;
@@ -28,6 +29,7 @@ extern crate num_cpus;
 extern crate parking_lot;
 extern crate rand;
 extern crate serde;
+#[macro_use]
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
