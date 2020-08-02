@@ -3,7 +3,6 @@ use crate::ram::types::{Id, Value};
 use crate::server::transactions::TxnId;
 use crate::server::transactions::*;
 use std::cell::Cell as StdCell;
-use std::rc::Rc;
 use std::io;
 use std::sync::Arc;
 

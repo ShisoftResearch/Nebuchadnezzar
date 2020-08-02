@@ -3,12 +3,12 @@ use crate::index::trees::EntryKey;
 use crate::index::trees::Ordering;
 
 pub struct LSMTreeCursor {
-    level_cursors: Vec<Box<Cursor>>,
+    level_cursors: Vec<Box<dyn Cursor>>,
     ordering: Ordering,
 }
 
 impl LSMTreeCursor {
-    pub fn new(cursors: Vec<Box<Cursor>>, ordering: Ordering) -> Self {
+    pub fn new(cursors: Vec<Box<dyn Cursor>>, ordering: Ordering) -> Self {
         LSMTreeCursor {
             level_cursors: cursors,
             ordering,
@@ -20,7 +20,7 @@ impl Cursor for LSMTreeCursor {
     fn next(&mut self) -> bool {
         if let Some(prev_key) = self.current().map(|k| k.to_owned()) {
             {
-                let cmp = |a: &&mut Box<Cursor>, b: &&mut Box<Cursor>| {
+                let cmp = |a: &&mut Box<dyn Cursor>, b: &&mut Box<dyn Cursor>| {
                     a.current().unwrap().cmp(b.current().unwrap())
                 };
                 let pre = self

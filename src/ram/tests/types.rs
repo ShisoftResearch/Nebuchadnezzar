@@ -1,4 +1,3 @@
-use crate::ram::chunk;
 use crate::ram::types;
 
 pub const CHUNK_SIZE: usize = 2048;

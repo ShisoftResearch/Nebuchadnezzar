@@ -10,7 +10,6 @@ use core::borrow::Borrow;
 use std::string::String;
 use std::sync::Arc;
 
-use owning_ref::{OwningHandle, OwningRef};
 use std::ops::Deref;
 use futures::prelude::*;
 use futures::FutureExt;
@@ -135,22 +134,22 @@ impl LocalSchemasCache {
         let _ = sm
             .on_schema_deleted(move |schema| {
                 let mut m2 = m2.write();
-                m2.del_schema(&schema);
+                m2.del_schema(&schema) .unwrap();
                 future::ready(()).boxed()
             })
             .await?;
         let schemas = LocalSchemasCache { map };
         return Ok(schemas);
     }
-    pub fn new_local(group: &str) -> Self {
+    pub fn new_local(_group: &str) -> Self {
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         LocalSchemasCache { map }
     }
     pub fn get(&self, id: &u32) -> Option<ReadingSchema> {
         let m = self.map.read();
-        let so = m.get(id).map(|s| unsafe { s as *const Schema });
+        let so = m.get(id).map(|s| s as *const Schema);
         so.map(|s| ReadingSchema {
-            owner: m,
+            _owner: m,
             reference: s,
         })
     }
@@ -228,7 +227,7 @@ impl SchemasMap {
 }
 
 pub struct ReadingRef<O, T: ?Sized> {
-    owner: O,
+    _owner: O,
     reference: *const T,
 }
 

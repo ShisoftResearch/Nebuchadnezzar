@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::server;
 use super::*;
 
 #[tokio::test(threaded_scheduler)]
@@ -84,7 +83,7 @@ pub async fn general() {
 
     let cell_1_id = cell_1.id();
     let thread_count = 50;
-    let mut futs: FuturesUnordered<_> = FuturesUnordered::new();
+    let futs: FuturesUnordered<_> = FuturesUnordered::new();
     for _ in 0..thread_count {
         let client = client.clone();
         futs.push(async move {
@@ -179,8 +178,8 @@ pub async fn multi_cell_update() {
             async move {
                 client
                 .transaction(async move |txn| {
-                    let mut score_1 = 0;
-                    let mut score_2 = 0;
+                    let mut score_1;
+                    let mut score_2;
                     let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
                     let mut cell_2 = txn.read(cell_2_id.to_owned()).await?.unwrap();
                     score_1 = *cell_1.data["score"].U64().unwrap();
@@ -267,7 +266,8 @@ pub async fn write_skew() {
                     Ok(())
                 }
             })
-            .await;
+            .await
+            .unwrap();
     });
     let client_c2 = client.clone();
     let t2 = tokio::spawn(async move {
@@ -286,10 +286,11 @@ pub async fn write_skew() {
                     Ok(())
                 }
             })
-            .await;
+            .await
+            .unwrap();
     });
-    t2.await;
-    t1.await;
+    t2.await.unwrap();
+    t1.await.unwrap();
     let cell_1_r = client.read_cell(cell_1_id).await.unwrap().unwrap();
     let cell_1_score = *cell_1_r.data["score"].U64().unwrap();
     assert_eq!(cell_1_score, 2);

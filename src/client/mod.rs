@@ -7,7 +7,6 @@ use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL
 use bifrost::membership::client::ObserverClient;
 use std::cell::Cell as StdCell;
 use std::io;
-use std::rc::Rc;
 use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;

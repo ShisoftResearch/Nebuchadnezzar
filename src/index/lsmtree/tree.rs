@@ -1,19 +1,16 @@
 use crate::client::AsyncClient;
 use crate::index::btree::NodeCellRef;
-use crate::index::btree::{verification, LevelTree};
-use crate::index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
+use crate::index::btree::LevelTree;
+use crate::index::btree::BPlusTree;
 use crate::index::trees::*;
 use crate::index::lsmtree::cursor::LSMTreeCursor;
 use crate::index::lsmtree::placement::sm::InSplitStatus;
 use crate::index::lsmtree::placement::sm::Placement;
-use crate::index::lsmtree::split::check_and_split;
 use crate::index::lsmtree::split::SplitStatus;
 use itertools::Itertools;
 use parking_lot::Mutex;
-use parking_lot::RwLock;
 use crate::ram::segs::MAX_SEGMENT_SIZE;
 use crate::ram::types::Id;
-use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -30,7 +27,7 @@ pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-pub type LevelTrees = Vec<Box<LevelTree>>;
+pub type LevelTrees = Vec<Box<dyn LevelTree>>;
 pub type Ptr = NodeCellRef;
 pub type Key = EntryKey;
 pub type TreeLevels = (LevelTrees, Vec<usize>);
@@ -119,11 +116,11 @@ impl LSMTree {
         tree
     }
 
-    pub fn insert(&self, mut key: EntryKey) -> bool {
+    pub fn insert(&self, key: EntryKey) -> bool {
         self.trees[0].insert_into(&key)
     }
 
-    pub fn remove(&self, mut key: EntryKey, epoch: u64) -> bool {
+    pub fn remove(&self, key: EntryKey, _epoch: u64) -> bool {
         self.trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
@@ -133,7 +130,7 @@ impl LSMTree {
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
-        let mut cursors: Vec<Box<Cursor>> = vec![];
+        let mut cursors: Vec<Box<dyn Cursor>> = vec![];
         for tree in &self.trees {
             cursors.push(tree.seek_for(key, ordering));
         }
@@ -162,7 +159,7 @@ impl LSMTree {
             .spawn(move || loop {
                 this.check_and_merge();
                 thread::sleep(Duration::from_millis(500));
-            });
+            }).unwrap();
     }
 
     pub fn level_sizes(&self) -> Vec<usize> {

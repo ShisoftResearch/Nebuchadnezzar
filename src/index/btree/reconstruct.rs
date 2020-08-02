@@ -1,23 +1,14 @@
 use crate::client::AsyncClient;
 use dovahkiin::types::*;
 use crate::index::btree::external::ExtNode;
-use crate::index::btree::external::*;
 use crate::index::btree::internal::InNode;
 use crate::index::btree::node::{write_node, Node, NodeWriteGuard};
-use crate::index::btree::remove::SubNodeStatus::InNodeEmpty;
-use crate::index::btree::{external, max_entry_key, BPlusTree, DeletionSetInneer, NodeCellRef};
+use crate::index::btree::{external, max_entry_key, BPlusTree, NodeCellRef};
 use crate::index::trees::{EntryKey, Slice};
-use parking_lot::RwLock;
-use crate::ram::cell::Cell;
 use std::cell::RefCell;
-use std::cmp::max;
-use std::collections::btree_set::BTreeSet;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::mem;
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 
 pub struct TreeConstructor<KS, PS>
 where
@@ -55,7 +46,7 @@ where
             debug!("Creating new level {}", level);
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
             if level > 0 {
-                let mut left_node = left_node.unwrap();
+                let left_node = left_node.unwrap();
                 new_root_innode.ptrs.as_slice()[0] = left_node.node_ref().clone();
             } else {
                 new_tree = true;

@@ -1,21 +1,18 @@
 use crate::index::lsmtree::placement::sm::client::SMClient as PlacementClient;
 use crate::index::lsmtree::placement::sm::{Placement as PlacementMeta, QueryError};
 use crate::index::lsmtree::service::{AsyncServiceClient, LSMTreeSvrError};
-use crate::index::trees::{EntryKey, KEY_SIZE, Ordering};
+use crate::index::trees::{KEY_SIZE, Ordering};
 use linked_hash_map::LinkedHashMap;
 use parking_lot::{RwLock, Mutex};
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use std::collections::btree_map::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize};
 use std::sync::Arc;
-use futures::prelude::*;
 use crate::index::lsmtree::split::tree_client;
-use crate::index::lsmtree::placement;
 use crate::index::builder::Feature;
 use byteorder::{BigEndian, WriteBytesExt};
 use crate::index::lsmtree::tree::LSMTreeResult;
-use bifrost::conshash::ConsistentHashing;
 use crate::index::lsmtree;
 use bifrost::raft::client::RaftClient;
 
@@ -164,7 +161,7 @@ impl LSMTreeClient {
                     return insert_res;
                 },
                 Ok(LSMTreeResult::EpochMismatch(_, _)) | Err(LSMTreeSvrError::TreeNotFound) => {
-                    self.update_placement(&sub_tree);
+                    self.update_placement(&sub_tree).await;
                 },
                 Err(_) => {
                     panic!("Error occurred on distributed LSM-tree insertion");
@@ -198,7 +195,7 @@ impl LSMTreeClient {
                     })
                 },
                 Ok(LSMTreeResult::EpochMismatch(_, _)) | Err(LSMTreeSvrError::TreeNotFound) => {
-                    self.update_placement(&sub_tree);
+                    self.update_placement(&sub_tree).await;
                 },
                 Err(_) => {
                     panic!("Error occurred on distributed LSM-tree seek");

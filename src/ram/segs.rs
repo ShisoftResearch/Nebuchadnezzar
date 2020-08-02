@@ -1,12 +1,8 @@
 use libc;
 use parking_lot;
-use crate::ram::cell;
-use crate::ram::cell::Cell;
-use crate::ram::chunk::Chunk;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
-use crate::ram::tombstone::{Tombstone, TOMBSTONE_SIZE_U32};
-use std::collections::BTreeSet;
+use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
 use std::io::prelude::*;
@@ -14,7 +10,6 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
-use super::cell::CellHeader;
 
 pub const MAX_SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const MAX_SEGMENT_SIZE: usize = MAX_SEGMENT_SIZE_U32 as usize;

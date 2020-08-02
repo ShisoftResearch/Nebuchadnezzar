@@ -1,11 +1,7 @@
 use crate::index::btree::external::ExtNode;
-use crate::index::btree::insert::InsertSearchResult::External;
-use crate::index::btree::node::read_node;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::write_targeted;
-use crate::index::btree::node::NodeData;
-use crate::index::btree::node::NodeReadHandler;
 use crate::index::btree::node::NodeWriteGuard;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
@@ -14,22 +10,6 @@ use crate::index::btree::NodeCellRef;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use std::fmt::Debug;
-
-pub enum InsertSearchResult {
-    External,
-    Internal(NodeCellRef),
-    RightNode(NodeCellRef),
-}
-
-pub enum InsertToNodeResult<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static + Debug,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    NoSplit,
-    Split(NodeWriteGuard<KS, PS>, NodeCellRef, Option<EntryKey>),
-    SplitParentChanged,
-}
 
 pub struct NodeSplit<KS, PS>
 where

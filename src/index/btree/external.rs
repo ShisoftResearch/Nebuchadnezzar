@@ -1,5 +1,3 @@
-use crate::client::AsyncClient;
-use core::borrow::BorrowMut;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
@@ -8,26 +6,14 @@ use crate::index::btree::*;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use itertools::Itertools;
-use owning_ref::{OwningHandle, OwningRef, RcRef};
 use crate::ram::cell::Cell;
-use crate::ram::schema::{Field, IndexType, Schema};
+use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crate::server;
-use std::cell::Ref;
 use std::cell::RefCell;
-use std::cell::RefMut;
-use std::cell::UnsafeCell;
-use std::collections::btree_set::BTreeSet;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{mem, panic};
-use crate::utils::lru_cache::LRUCache;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -64,15 +50,6 @@ where
     pub dirty: bool,
     pub right_bound: EntryKey,
     pub mark: PhantomData<PS>,
-}
-
-pub struct ExtNodeSplit<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    pub node_2: ExtNode<KS, PS>,
-    pub keys_1_len: usize,
 }
 
 impl<KS, PS> ExtNode<KS, PS>

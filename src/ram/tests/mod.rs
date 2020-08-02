@@ -2,7 +2,7 @@ mod cell;
 mod chunk;
 mod types;
 
-use crate::ram::schema::{Field, IndexType};
+use crate::ram::schema::{Field};
 
 pub fn default_fields() -> Field {
     Field::new(

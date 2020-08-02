@@ -1,10 +1,8 @@
 use crate::client;
 use crate::index::btree::{external};
 use itertools::Itertools;
-use futures::prelude::*;
 use crate::server::NebServer;
 use std::sync::Arc;
-use tokio::prelude::*;
 
 pub fn store_changed_nodes(neb: &Arc<NebServer>) {
     external::flush_changed()
@@ -24,7 +22,7 @@ pub fn store_changed_nodes(neb: &Arc<NebServer>) {
                             if let Some(changing) = node {
                                 changing.node.persist(&changing.deletion, &neb).await;
                             } else {
-                                neb.remove_cell(id).await;
+                                neb.remove_cell(id).await.unwrap().unwrap();
                             }
                         });
                     });

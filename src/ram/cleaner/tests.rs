@@ -1,23 +1,15 @@
 use super::*;
 use env_logger;
-use crate::ram::cell;
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunk;
 use crate::ram::chunk::Chunks;
-use crate::ram::cleaner::Cleaner;
-use crate::ram::cleaner::*;
 use crate::ram::entry::{EntryContent, EntryType};
-use crate::ram::io::writer;
 use crate::ram::schema::Field;
 use crate::ram::schema::*;
-use crate::ram::tombstone::Tombstone;
-use crate::ram::types;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
 use std;
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub const DATA_SIZE: usize = 1000 * 1024; // nearly 1MB
@@ -105,13 +97,13 @@ pub fn full_clean_cycle() {
         println!("Scanning second segment for tombstones...");
         let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
         let tombstones: Vec<_> = live_entries
-            .filter(|e| e.meta.entry_header.entry_type == EntryType::Tombstone)
+            .filter(|e| e.meta.entry_header.entry_type == EntryType::TOMBSTONE)
             .collect();
         assert_eq!(tombstones.len(), 8);
         for i in 0..tombstones.len() {
             let hash = (i * 2) as u64;
             let e = &tombstones[i];
-            assert_eq!(e.meta.entry_header.entry_type, EntryType::Tombstone);
+            assert_eq!(e.meta.entry_header.entry_type, EntryType::TOMBSTONE);
             if let EntryContent::Tombstone(ref t) = e.content {
                 assert_eq!(t.hash, hash);
                 assert_eq!(t.partition, 0);
@@ -160,7 +152,7 @@ pub fn full_clean_cycle() {
             .iter()
             .zip(compacted_segment_0_ids)
             .for_each(|(entry, hash)| {
-                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                 if let EntryContent::Cell(header) = entry.content {
                     assert_eq!(header.hash, hash)
                 } else {
@@ -177,7 +169,7 @@ pub fn full_clean_cycle() {
             .for_each(|(entry, hash)| {
                 if hash > 1 {
                     // cell
-                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                     if let EntryContent::Cell(header) = entry.content {
                         assert_eq!(header.hash, hash as u64)
                     } else {
@@ -185,7 +177,7 @@ pub fn full_clean_cycle() {
                     }
                 } else {
                     // tombstone
-                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::Tombstone);
+                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::TOMBSTONE);
                     let tombstone = if let EntryContent::Tombstone(ref tombstone) = entry.content {
                         tombstone
                     } else {
@@ -205,7 +197,7 @@ pub fn full_clean_cycle() {
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {
-                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                 if let EntryContent::Cell(ref header) = entry.content {
                     return header.hash;
                 } else {

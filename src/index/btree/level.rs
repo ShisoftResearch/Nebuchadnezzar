@@ -1,19 +1,13 @@
-use core::borrow::{Borrow, BorrowMut};
+use std::borrow::Borrow;
 use crate::index::btree::dump::dump_tree;
 use crate::index::btree::external::ExtNode;
 use crate::index::btree::internal::InNode;
-use crate::index::btree::node::is_node_locked;
 use crate::index::btree::node::read_node;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
-use crate::index::btree::node::write_non_empty;
-use crate::index::btree::node::write_targeted;
-use crate::index::btree::node::EmptyNode;
 use crate::index::btree::node::Node;
 use crate::index::btree::node::NodeData;
-use crate::index::btree::node::NodeData::Empty;
 use crate::index::btree::node::NodeWriteGuard;
-use crate::index::btree::remove::SubNodeStatus::InNodeEmpty;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
 use crate::index::btree::verification::{is_node_list_serial, is_node_serial};
@@ -23,26 +17,11 @@ use crate::index::btree::{LevelTree, NodeReadHandler, MIN_ENTRY_KEY};
 use crate::index::lsmtree::tree::{LEVEL_2, LEVEL_3, LEVEL_PAGE_DIFF_MULTIPLIER};
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
-use itertools::free::all;
 use itertools::Itertools;
-use serde_json::to_vec;
-use smallvec::SmallVec;
-use std::cell::RefCell;
 use std::cmp::min;
-use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
 use std::iter::Peekable;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
-
-enum Selection<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    Selected(Vec<NodeWriteGuard<KS, PS>>),
-    Innode(NodeCellRef),
-}
 
 struct AlteredNodes {
     removed: Vec<(EntryKey, NodeCellRef)>,
@@ -104,7 +83,7 @@ where
     let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| {
         n.innode().ptrs.as_slice_immute()[0].clone()
     });
-    let (mut altered_keys, sub_level_locks) = {
+    let (mut altered_keys, _sub_level_locks) = {
         let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
         // first meet empty should be the removed external node
         if sub_node.is_empty_node() || sub_node.is_ext() {
@@ -187,7 +166,7 @@ where
 
     let insert_new_and_mark_altered_keys =
         |pages: &mut Vec<NodeWriteGuard<KS, PS>>,
-         current_altered: &AlteredNodes,
+         _current_altered: &AlteredNodes,
          next_level_altered: &mut AlteredNodes| {
             // write lock and insert all nodes marked new to current all pages
             let mut new_nodes = added_iter().peekable();
@@ -242,7 +221,7 @@ where
                     .is_empty()),
                     Some(false)
                 );
-                if let Some((removed_key, removed_ptr)) = current_removed {
+                if let Some((_removed_key, removed_ptr)) = current_removed {
                     if sub_level.ptr_eq(removed_ptr) {
                         found_removed = true;
                     }
@@ -336,14 +315,14 @@ where
             {
                 // update all nodes marked changed, not removed
                 let page_ref = page.node_ref().clone();
-                let mut innode = page.innode_mut();
+                let innode = page.innode_mut();
                 let innde_len = innode.len;
 
                 // search for all children nodes in this page to find the altered pointers
                 let marked_ptrs = innode.ptrs.as_slice_immute()[..innde_len + 1]
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, p)| {
+                    .filter_map(|(i, _p)| {
                         let mut found_key = None;
                         if let Some(t) = current_altered.peek() {
                             let t: &&(EntryKey, NodeCellRef) = t;
@@ -488,7 +467,7 @@ where
                 let mut new_next_ptrs = PS::init();
                 let mut has_new = None;
 
-                let mut next = next_from_ptr
+                let next = next_from_ptr
                     .as_mut()
                     .unwrap_or_else(|| &mut all_pages[index + 1]);
                 debug_assert!(
@@ -508,7 +487,7 @@ where
                                   current_right_bound, next_innode.keys.as_slice_immute()[0]);
                     keys_slice[0] = remaining_key;
                     ptrs_slice[0] = remaining_ptr;
-                    let mut next_len = next_innode.len;
+                    let next_len = next_innode.len;
                     if next_len >= KS::slice_len() {
                         // full node, need to be split and relocated
                         debug!("Full node, will split");
@@ -651,14 +630,14 @@ where
     (box level_page_altered, box all_pages)
 }
 
-pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &LevelTree) -> usize
+pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &dyn LevelTree) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut left_most_leaf_guards = select::<KS, PS>(&src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
-    let mut num_keys_removed = 0;
+    let num_keys_removed;
     let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
 
@@ -727,7 +706,7 @@ where
         debug_assert!(read_unchecked::<KS, PS>(&right_right_most).is_ext());
         debug_assert!(!right_right_most.ptr_eq(left_most_leaf_guards.last().unwrap().node_ref()));
 
-        for mut g in &mut left_most_leaf_guards {
+        for g in &mut left_most_leaf_guards {
             external::make_deleted(&g.ext_id());
             removed_nodes
                 .removed

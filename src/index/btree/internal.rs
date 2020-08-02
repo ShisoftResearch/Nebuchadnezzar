@@ -1,15 +1,9 @@
-use hermes::stm::Txn;
-use hermes::stm::TxnErr;
-use hermes::stm::TxnValRef;
 use crate::index::btree::node::EmptyNode;
 use crate::index::btree::Slice;
 use crate::index::btree::*;
 use crate::index::trees::EntryKey;
 use itertools::free::chain;
 use std::any::Any;
-use std::cell::UnsafeCell;
-use std::sync::atomic::AtomicPtr;
-use std::sync::Arc;
 use std::{mem, panic};
 
 pub struct InNode<KS, PS>
@@ -108,10 +102,10 @@ where
             debug!("insert into keys");
             if pivot == pos {
                 debug!("special key treatment when pivot == pos");
-                let mut keys_1 = &mut self.keys;
-                let mut keys_2 = keys_1.split_at_pivot(pivot, node_len);
-                let mut keys_1_len = pivot;
-                let mut keys_2_len = node_len - pivot;
+                let keys_1 = &mut self.keys;
+                let keys_2 = keys_1.split_at_pivot(pivot, node_len);
+                let keys_1_len = pivot;
+                let keys_2_len = node_len - pivot;
                 pivot_key = key;
                 InNodeKeysSplit {
                     keys_2,
@@ -120,7 +114,7 @@ where
                     pivot_key: pivot_key.clone(),
                 }
             } else {
-                let mut keys_1 = &mut self.keys;
+                let keys_1 = &mut self.keys;
                 let mut keys_2 = keys_1.split_at_pivot(pivot + 1, node_len);
                 let mut keys_1_len = pivot; // will not count the pivot
                 let mut keys_2_len = node_len - pivot - 1;
@@ -155,9 +149,9 @@ where
         let ptr_split = {
             if pivot == pos {
                 debug!("special ptr treatment when pivot == pos");
-                let mut ptrs_1 = &mut self.ptrs;
+                let ptrs_1 = &mut self.ptrs;
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
-                let mut ptrs_1_len = pivot + 1;
+                let ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
                 ptrs_2.insert_at(new_node, 0, &mut ptrs_2_len);
                 debug_assert_eq!(ptrs_1_len, keys_split.keys_1_len + 1);
@@ -165,11 +159,11 @@ where
                 InNodePtrSplit { ptrs_2 }
             } else {
                 debug!("insert into ptrs");
-                let mut ptrs_1 = &mut self.ptrs;
+                let ptrs_1 = &mut self.ptrs;
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
                 let mut ptrs_2_len = ptr_len - pivot - 1;
-                let mut ptr_pos = pos + ptr_padding;
+                let ptr_pos = pos + ptr_padding;
                 insert_into_split(
                     new_node,
                     ptrs_1,
@@ -273,7 +267,7 @@ where
         let left_len = left_node.len();
         let right_len = right_node.len();
         let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
-        let mut merged_len = 0;
+        let merged_len;
         debug!("Merge children, left len {}, right len {}, left_ptr_pos {}, right_ptr_pos {}, right_key_pos {}",
                 left_len, right_len, left_ptr_pos, right_ptr_pos, right_key_pos);
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());

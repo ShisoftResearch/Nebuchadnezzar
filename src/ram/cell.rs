@@ -1,5 +1,4 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use crate::index;
 use crate::ram::chunk::Chunk;
 use crate::ram::clock;
 use crate::ram::entry::*;
@@ -8,9 +7,8 @@ use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, RandValue, Value};
 use serde::Serialize;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor};
 use std::ops::{Index, IndexMut};
-use std::ptr;
 use std::sync::Arc;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
@@ -143,7 +141,7 @@ impl Cell {
             return Err(ReadError::CellIdIsUnitId);
         }
         let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
-            assert_eq!(entry_header.entry_type, EntryType::Cell);
+            assert_eq!(entry_header.entry_type, EntryType::CELL);
             let header = Self::cell_header_from_entry_content_addr(addr, &entry_header);
             (header, addr + CELL_HEADER_SIZE)
         });
@@ -178,7 +176,9 @@ impl Cell {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn write_to_chunk(&mut self, chunk: &Chunk, update: bool) -> Result<usize, WriteError> {
+    
+    //TODO: optimize for update
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, _update: bool) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
             let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
@@ -225,18 +225,18 @@ impl Cell {
                 let addr = pending_entry.addr;
                 Entry::encode_to(
                     addr,
-                    EntryType::Cell,
+                    EntryType::CELL,
                     entry_body_size as u32,
                     len_bytes,
                     move |content_addr| {
                         // write cell header
                         let header = &self.header;
                         let mut cursor = addr_to_header_cursor(content_addr);
-                        cursor.write_u64::<Endian>(header.version);
-                        cursor.write_u32::<Endian>(header.timestamp);
-                        cursor.write_u32::<Endian>(header.schema);
-                        cursor.write_u64::<Endian>(header.partition);
-                        cursor.write_u64::<Endian>(header.hash);
+                        cursor.write_u64::<Endian>(header.version).unwrap();
+                        cursor.write_u32::<Endian>(header.timestamp).unwrap();
+                        cursor.write_u32::<Endian>(header.schema).unwrap();
+                        cursor.write_u64::<Endian>(header.partition).unwrap();
+                        cursor.write_u64::<Endian>(header.hash).unwrap();
                         release_cursor(cursor);
                         writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
                     },

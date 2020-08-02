@@ -1,13 +1,10 @@
 // This function is unstable yet, tests ignored
 
-use crate::index::btree::external::ExtNode;
-use crate::index::btree::node::read_node;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::write_targeted;
 use crate::index::btree::node::EmptyNode;
 use crate::index::btree::node::NodeData;
-use crate::index::btree::node::NodeReadHandler;
 use crate::index::btree::node::NodeWriteGuard;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
@@ -17,20 +14,6 @@ use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use std::fmt::Debug;
 use std::mem;
-
-pub enum RemoveSearchResult {
-    External,
-    RightNode(NodeCellRef),
-    Internal(NodeCellRef),
-}
-
-pub enum SubNodeStatus {
-    ExtNodeEmpty,
-    InNodeEmpty,
-    Relocate(usize, usize),
-    Merge(usize, usize),
-    Ok,
-}
 
 pub struct RebalancingNodes<KS, PS>
 where
@@ -128,7 +111,7 @@ where
     let search = mut_search::<KS, PS>(node_ref, key);
     match search {
         MutSearchResult::Internal(mut sub_node) => {
-            let mut node_remove_res =
+            let node_remove_res =
                 remove_from_node(tree, &mut sub_node, key, node_ref, level + 1);
             let removed = node_remove_res.removed;
             if let Some(mut rebalancing) = node_remove_res.rebalancing {
@@ -237,8 +220,8 @@ where
                             "Remove {:?} sub level need relocation, level {}",
                             key, level
                         );
-                        let mut left_node = &mut *rebalancing.left_guard;
-                        let mut right_node = &mut *rebalancing.right_guard;
+                        let left_node = &mut *rebalancing.left_guard;
+                        let right_node = &mut *rebalancing.right_guard;
                         let left_pos = rebalancing.parent_pos;
                         let right_pos = left_pos + 1;
                         rebalancing
@@ -320,7 +303,7 @@ where
             };
             {
                 let is_left_half_full = target_guard.is_half_full();
-                let mut node = target_guard.extnode_mut();
+                let node = target_guard.extnode_mut();
                 let pos = node.search(key);
                 let mut right_guard = write_node(&node.next);
                 let _right_node_cannot_rebalance =

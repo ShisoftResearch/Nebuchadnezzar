@@ -4,7 +4,6 @@ use crate::index::btree::node::NodeData;
 use crate::index::btree::node::NodeReadHandler;
 use crate::index::btree::DeletionSet;
 use crate::index::btree::NodeCellRef;
-use crate::index::btree::NodeData::Empty;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Ordering;
 use crate::index::trees::Slice;

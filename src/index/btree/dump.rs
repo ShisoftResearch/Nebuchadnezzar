@@ -33,7 +33,7 @@ where
     let debug_root = cascading_dump_node::<KS, PS>(&tree.get_root());
     let json = serde_json::to_string_pretty(&debug_root).unwrap();
     let mut file = File::create(f).unwrap();
-    file.write_all(json.as_bytes());
+    file.write_all(json.as_bytes()).unwrap();
 }
 
 fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode

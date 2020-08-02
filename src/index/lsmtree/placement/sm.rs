@@ -3,17 +3,10 @@ use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Id;
 use itertools::Itertools;
-use parking_lot::RwLock;
-use crate::ram::types::RandValue;
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::ser::CharEscape::Quote;
-use smallvec::SmallVec;
 use std::collections::btree_map::BTreeMap;
-use std::collections::btree_set::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 pub static SM_ID: u64 = hash_ident!(LSM_TREE_PLACEMENT_SM) as u64;
@@ -156,7 +149,7 @@ impl StateMachineCmds for PlacementSM {
     fn upsert(&mut self, placement: Placement) -> BoxFuture<Result<(), CmdError>> {
         async move {
             if let Some(p) = self.placements.get(&placement.id) {
-                if let Some(id) = self.starts.get(&placement.starts) {
+                if let Some(id) = self.starts.get(&p.starts) {
                     if id != &placement.id {
                         // return error if existed id at this position is not we are inserting
                         return Err(CmdError::PlacementExists);
@@ -207,7 +200,7 @@ impl StateMachineCtl for PlacementSM {
     fn snapshot(&self) -> Option<Vec<u8>> {
         unimplemented!()
     }
-    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
+    fn recover(&mut self, _data: Vec<u8>) -> BoxFuture<()> {
         unimplemented!()
     }
 }

@@ -1,5 +1,3 @@
-use byteorder::BigEndian;
-
 #[macro_use]
 mod macros;
 mod cursor;

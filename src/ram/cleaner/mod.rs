@@ -1,6 +1,4 @@
-use crate::ram::cell::CellHeader;
 use crate::ram::chunk::Chunks;
-use crate::ram::tombstone::Tombstone;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +12,7 @@ pub mod compact;
 #[cfg(test)]
 mod tests;
 
+#[allow(dead_code)]
 pub struct Cleaner {
     chunks: Arc<Chunks>,
     stopped: Arc<AtomicBool>,
@@ -44,7 +43,7 @@ impl Cleaner {
                     });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
-            });
+            }).unwrap();
         thread::Builder::new()
             .name("Cleaner main".into())
             .spawn(move || {
@@ -106,7 +105,7 @@ impl Cleaner {
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");
-            });
+            }).unwrap();
         return cleaner;
     }
 }

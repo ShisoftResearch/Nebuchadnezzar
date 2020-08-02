@@ -47,7 +47,7 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
     {
         let mut cursor = StdCursor::new(&mut key_slice[..]);
-        cursor.write_u64::<BigEndian>(n);
+        cursor.write_u64::<BigEndian>(n).unwrap();
     };
     key_slice
 }
@@ -96,8 +96,8 @@ fn crd() {
     use crate::index::trees::Cursor;
     env_logger::init();
     let tree = LevelBPlusTree::new();
-    ::std::fs::remove_dir_all("dumps");
-    ::std::fs::create_dir_all("dumps");
+    std::fs::remove_dir_all("dumps").unwrap();
+    std::fs::create_dir_all("dumps").unwrap();
     let num = env::var("BTREE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
         .parse::<u64>()
@@ -112,7 +112,7 @@ fn crd() {
         nums.as_mut_slice().shuffle(&mut rng);
         let json = serde_json::to_string(&nums).unwrap();
         let mut file = File::create("nums_dump.json").unwrap();
-        file.write_all(json.as_bytes());
+        file.write_all(json.as_bytes()).unwrap();
         let mut i = 0;
         for n in nums {
             let id = Id::new(0, n);
@@ -578,8 +578,8 @@ fn level_merge_insertion() {
     let th2 = thread::spawn(move || {
         tree_3.merge_with_keys(merge_keys);
     });
-    th1.join();
-    th2.join();
+    th1.join().unwrap();
+    th2.join().unwrap();
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_ins_dump.json");
     assert!(verification::is_tree_in_order(&*tree, 0));

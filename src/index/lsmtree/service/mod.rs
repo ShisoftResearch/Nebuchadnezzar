@@ -10,13 +10,11 @@ use crate::index::lsmtree::tree::{LSMTree, LSMTreeResult};
 use crate::index::trees::{EntryKey, Ordering};
 use itertools::Itertools;
 use parking_lot::RwLock;
-use crate::ram::cell::{Cell, ReadError};
 use crate::server::NebServer;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use futures::prelude::*;
 use futures::future::BoxFuture;
-use std::sync::atomic::AtomicU64;
 use futures::stream::FuturesUnordered;
 use std::time::Duration;
 
@@ -62,7 +60,6 @@ service! {
 pub struct LSMTreeService {
     neb_server: Arc<NebServer>,
     sm: Arc<SMClient>,
-    counter: AtomicU64,
     trees: Arc<RwLock<HashMap<Id, LSMTreeIns>>>,
 }
 
@@ -210,10 +207,14 @@ impl Service for LSMTreeService {
         epoch: u64,
     ) -> BoxFuture<Result<u64, LSMTreeSvrError>> {
         let trees = self.trees.read();
-        trees
-            .get(&tree_id)
-            .ok_or(LSMTreeSvrError::TreeNotFound)
-            .map(|tree| tree.set_epoch(epoch));
+        match trees
+        .get(&tree_id)
+        .ok_or(LSMTreeSvrError::TreeNotFound)
+        .map(|tree| tree.set_epoch(epoch)) 
+        {
+            Err(e) => return future::ready(Err(e)).boxed(),
+            _ => {}
+        }
         async move {
             if let Ok(Ok(res)) = self.sm.update_epoch(&tree_id, &epoch).await {
                 Ok(res)
@@ -239,7 +240,7 @@ impl LSMTreeService {
                 let tree_map = trees_clone.read();
                 tree_map
                     .iter()
-                    .map(|(k, v)| v)
+                    .map(|(_k, v)| v)
                     .filter(|tree| tree.oversized())
                     .for_each(|tree| {
                         tree.check_and_merge();
@@ -249,7 +250,6 @@ impl LSMTreeService {
         });
         let service = Self {
             neb_server: neb_server.clone(),
-            counter: AtomicU64::new(0),
             sm: sm.clone(),
             trees,
         };

@@ -1,4 +1,3 @@
-use crate::index::btree::internal::InNode;
 use crate::index::btree::{write_node, BPlusTree, NodeCellRef, NodeData, NodeWriteGuard, MIN_ENTRY_KEY};
 use crate::index::trees::{EntryKey, Slice};
 use std::fmt::Debug;

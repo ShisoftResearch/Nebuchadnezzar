@@ -34,7 +34,7 @@ impl Tombstone {
     pub fn write(&self, addr: usize) {
         Entry::encode_to(
             addr,
-            EntryType::Tombstone,
+            EntryType::TOMBSTONE,
             TOMBSTONE_SIZE_U32,
             *TOMBSTONE_LEN_BYTES_COUNT,
             |addr| {
@@ -66,7 +66,7 @@ impl Tombstone {
         Entry::decode_from(addr, |addr, header| {
             assert_eq!(
                 header.entry_type,
-                EntryType::Tombstone,
+                EntryType::TOMBSTONE,
                 "Reading entry not tombstone"
             );
             return Self::read_from_entry_content_addr(addr);

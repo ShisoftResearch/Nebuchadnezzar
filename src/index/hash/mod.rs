@@ -4,7 +4,6 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use std::sync::Arc;
-use futures::prelude::*;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
 
@@ -42,6 +41,7 @@ impl HashIndexer {
     }
 }
 
+#[allow(dead_code)]
 fn hash_index_schema() -> Schema {
     Schema {
         id: *HASH_INDEX_SCHEMA_ID,

@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use crate::ram::chunk::Chunk;
-use crate::ram::entry::{Entry, EntryContent, EntryType};
+use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -197,7 +197,7 @@ impl CombinedCleaner {
                 debug!("Putting new segment {}", segment.id);
                 let seg_ref = Arc::new(segment);
                 chunk.put_segment(seg_ref.clone());
-                seg_ref.archive();
+                seg_ref.archive().unwrap();
                 return cells;
             })
             .map(|(new, old, hash)| {

@@ -1,6 +1,6 @@
 use crate::client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::{key_hash, Map, PrimitiveArray, ToValue, Value};
+use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use crate::index::btree::cursor::*;
 pub use crate::index::btree::external::page_schema;
 use crate::index::btree::external::*;
@@ -16,29 +16,21 @@ use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use crate::index::trees::MAX_KEY_SIZE;
 use crate::index::trees::{Cursor as IndexCursor, Ordering};
-use itertools::{chain, Itertools};
+use itertools::Itertools;
 use parking_lot::RwLock;
 use crate::ram::types::RandValue;
-use smallvec::SmallVec;
 use std::any::Any;
 use std::cell::UnsafeCell;
-use std::cmp::{max, min};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
-use std::fmt::Error;
-use std::fmt::Formatter;
-use std::io::Write;
 use std::iter;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ops::Range;
 use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
-use crate::utils::lru_cache::LRUCache;
 use futures::future::BoxFuture;
 
 pub mod verification;
@@ -57,7 +49,6 @@ mod search;
 mod split;
 pub mod storage;
 
-const CACHE_SIZE: usize = 2048;
 pub type DeletionSetInneer = HashSet<EntryKey>;
 pub type DeletionSet = Arc<RwLock<DeletionSetInneer>>;
 
@@ -159,7 +150,7 @@ where
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
                 let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
-                let mut old_root = self.get_root().clone();
+                let old_root = self.get_root().clone();
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
@@ -260,10 +251,10 @@ where
 pub trait LevelTree {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to(&self, upper_level: &LevelTree) -> usize;
+    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
@@ -287,7 +278,7 @@ where
         self.len()
     }
 
-    fn merge_to(&self, upper_level: &LevelTree) -> usize {
+    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize {
         level::level_merge(self, upper_level)
     }
 
@@ -299,7 +290,7 @@ where
         self.insert(key)
     }
 
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor> {
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
         box self.seek(key, ordering)
     }
 
@@ -343,7 +334,7 @@ where
         verification::is_tree_in_order(self, level)
     }
 
-    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient){
+    fn from_tree_id(&mut self, _head_id: &Id, _neb: &AsyncClient){
         unimplemented!()
     }
 }
@@ -351,13 +342,13 @@ where
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);
 impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
+#[allow(unused_macros)]
 macro_rules! impl_btree_level {
     ($items: expr) => {
         impl_slice_ops!([EntryKey; $items], EntryKey, $items);
         impl_slice_ops!([NodeCellRef; $items + 1], NodeCellRef, $items + 1);
     };
 }
-
 pub struct NodeCellRef {
     inner: Arc<dyn AnyNode>,
 }

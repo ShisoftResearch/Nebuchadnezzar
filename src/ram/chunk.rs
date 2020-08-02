@@ -1,10 +1,10 @@
 use bifrost::utils::time::get_time;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
-use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE, TOMBSTONE_SIZE_U32};
+use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use std::collections::BTreeMap;
@@ -264,7 +264,7 @@ impl Chunk {
             let cell = Cell::from_chunk_raw(*cell_location, self);
             match cell {
                 Ok(cell) => {
-                    let mut new_cell = update(cell);
+                    let new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
                         let old_location = *cell_location;
                         let new_location = new_cell.write_to_chunk(self, true)?;
@@ -485,7 +485,7 @@ impl Chunk {
                     self.id, seg_id
                 );
                 for entry_meta in segment.entry_iter() {
-                    if entry_meta.entry_header.entry_type == EntryType::Tombstone {
+                    if entry_meta.entry_header.entry_type == EntryType::TOMBSTONE {
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
                         if !self.segs.contains(&(tombstone.segment_id as usize)) {
@@ -580,7 +580,7 @@ impl Chunk {
                 debug!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
                        chunk_id, seg.id, entry_header.entry_type, entry_meta.entry_pos, entry_size);
                 match entry_header.entry_type {
-                    EntryType::Cell => {
+                    EntryType::CELL => {
                         debug!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
                             Cell::cell_header_from_entry_content_addr(
@@ -596,7 +596,7 @@ impl Chunk {
                             debug!("Cell entry index mismatch for {:?}, will be ditched", cell_header.id());
                         }
                     },
-                    EntryType::Tombstone => {
+                    EntryType::TOMBSTONE => {
                         debug!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
@@ -638,7 +638,7 @@ pub struct PendingEntry {
 impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
-        self.seg.write_wal(self.addr, self.size);
+        self.seg.write_wal(self.addr, self.size).unwrap();
         self.seg.references.fetch_sub(1, Ordering::Relaxed);
     }
 }

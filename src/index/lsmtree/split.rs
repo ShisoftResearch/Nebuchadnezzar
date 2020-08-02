@@ -2,28 +2,24 @@ use super::placement::sm::client::SMClient;
 use super::placement::sm::CmdError;
 use super::service::{AsyncServiceClient, DEFAULT_SERVICE_ID};
 use bifrost::rpc::RPCError;
-use bifrost::rpc::DEFAULT_CLIENT_POOL;
-use crate::client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use crate::index::btree::max_entry_key;
 use crate::index::lsmtree::tree::LSMTree;
 use crate::index::trees::Cursor;
 use crate::index::trees::EntryKey;
-use crate::index::trees::Ordering::{Backward, Forward};
+use crate::index::trees::Ordering::Backward;
 use itertools::Itertools;
 use crate::ram::types::RandValue;
-use rayon::prelude::*;
 use crate::server::{rpc_client_by_id, NebServer};
 use smallvec::SmallVec;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use futures::prelude::*;
 
 pub struct SplitStatus {
     pub pivot: EntryKey,
     pub target: Id,
 }
 
+#[allow(dead_code)]
 pub fn mid_key(tree: &LSMTree) -> EntryKey {
     // TODO: more accurate mid key take account of all tree levels
     // Current implementation only take the mid key from the tree with the most number of keys
@@ -31,7 +27,7 @@ pub fn mid_key(tree: &LSMTree) -> EntryKey {
         .iter()
         .map(|tree| (tree.mid_key(), tree.count()))
         .filter_map(|(mid, count)| mid.map(|mid| (mid, count)))
-        .max_by_key(|(mid, count)| *count)
+        .max_by_key(|(_mid, count)| *count)
         .map(|(mid, _)| mid)
         .unwrap()
 }
@@ -43,6 +39,7 @@ pub async fn tree_client(
     rpc_client_by_id(id, neb).await.map(move |c| AsyncServiceClient::new(DEFAULT_SERVICE_ID, &c))
 }
 
+#[allow(dead_code)]
 pub async fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
     if tree.epoch() > 0 && tree.is_full() && tree.split.lock().is_none() {
         debug!("LSM Tree {:?} is full, will split", tree.id);
@@ -94,6 +91,7 @@ pub async fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebSe
         let src_epoch = tree.bump_epoch();
         sm.start_split(&tree.id, &new_placement_id, &mid_vec, &src_epoch)
             .await
+            .unwrap()
             .unwrap();
         debug!("Bumped source tree {:?} epoch to {}", tree.id, src_epoch);
     }
@@ -190,6 +188,7 @@ pub async fn check_and_split(tree: &LSMTree, sm: &Arc<SMClient>, neb: &Arc<NebSe
         let src_epoch = tree.bump_epoch();
         sm.complete_split(&tree.id, &target_id, &src_epoch)
             .await
+            .unwrap()
             .unwrap();
         // Set new tree epoch from 0 to 1
         let prev_epoch = target_client

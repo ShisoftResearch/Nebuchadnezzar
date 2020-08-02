@@ -2,17 +2,12 @@ use super::*;
 use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use crate::client;
-use crate::client::AsyncClient;
+
 use crate::index::btree;
-use crate::index::btree::test::u64_to_slice;
-use crate::index::btree::LevelTree;
-use crate::index::btree::NodeCellRef;
 use crate::index::btree::{max_entry_key, min_entry_key};
-use crate::index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
+use crate::index::btree::BPlusTree;
 use crate::index::trees::key_with_id;
-use crate::index::lsmtree::cursor::LSMTreeCursor;
 use crate::index::lsmtree::placement::sm::Placement;
-use crate::index::lsmtree::split::SplitStatus;
 use crate::index::lsmtree::split::{check_and_split, tree_client};
 pub use crate::index::lsmtree::tree::*;
 use crate::index::trees::Cursor;
@@ -22,20 +17,14 @@ use crate::index::trees::Ordering::Forward;
 use crate::index::*;
 use bifrost::membership::client::ObserverClient;
 use itertools::Itertools;
-use parking_lot::Mutex;
-use parking_lot::RwLock;
 use crate::ram::segs::MAX_SEGMENT_SIZE;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
 use rand::thread_rng;
-use rand::Rng;
 use rayon::iter::IntoParallelRefIterator;
 use crate::server;
 use crate::server::NebServer;
 use crate::server::ServerOptions;
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 use std::{mem, ptr};
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -68,7 +57,7 @@ pub async fn split() {
     let membership = Arc::new(ObserverClient::new(&raft_client));
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &membership, &meta_servers, server_group).await.unwrap());
-    client.new_schema_with_id(btree::page_schema()).await;
+    client.new_schema_with_id(btree::page_schema()).await.unwrap().unwrap();
     let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(
         lsmtree::placement::sm::SM_ID,
         &raft_client,
@@ -101,9 +90,9 @@ pub async fn split() {
     assert!(lsm_tree.is_full());
     debug!("Before split there are {} entries", lsm_tree.count());
 
-    sm_client.upsert(&lsm_tree.to_placement()).await.unwrap();
+    sm_client.upsert(&lsm_tree.to_placement()).await.unwrap().unwrap();
     lsm_tree.bump_epoch();
-    check_and_split(&lsm_tree, &sm_client, &server);
+    check_and_split(&lsm_tree, &sm_client, &server).await;
     debug!("After split there are {} entries", lsm_tree.count());
     assert!(!lsm_tree.is_full());
 

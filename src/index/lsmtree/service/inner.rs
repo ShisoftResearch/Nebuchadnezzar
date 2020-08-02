@@ -1,9 +1,7 @@
-use crate::client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
 use crate::index;
 use crate::index::lsmtree::cursor::LSMTreeCursor;
 use crate::index::lsmtree::placement::sm::client::SMClient;
-use crate::index::lsmtree::split::check_and_split;
 use crate::index::lsmtree::tree::LSMTree;
 use crate::index::lsmtree::tree::{KeyRange, LSMTreeResult};
 use crate::index::trees::Cursor;
@@ -14,13 +12,9 @@ use parking_lot::MutexGuard;
 use crate::ram::clock;
 use crate::server::NebServer;
 use std::cell::RefCell;
-use std::cell::RefMut;
-use std::collections::btree_map::BTreeMap;
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
@@ -92,7 +86,7 @@ impl LSMTreeIns {
 
     // Fetch th
     pub fn next_block(&self, id: &u64, block_size: usize) -> Option<Vec<Vec<u8>>> {
-        self.get(id).map(|mut c| {
+        self.get(id).map(|c| {
             let mut keys = Vec::with_capacity(block_size);
             let mut cursor = c.borrow_mut();
             let current = |cursor: &LSMTreeCursor| cursor.current().map(|k| k.as_slice().to_vec());
@@ -156,6 +150,7 @@ impl LSMTreeIns {
         self.tree.merge(keys)
     }
 
+    #[allow(dead_code)]
     pub fn remove_to_right(&self, start_key: &EntryKey) {
         self.tree.remove_to_right(start_key);
     }
@@ -164,7 +159,8 @@ impl LSMTreeIns {
         self.tree.set_epoch(epoch);
     }
 
-    pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
+    #[allow(dead_code)]
+    pub fn check_and_split(&self, _sm: &Arc<SMClient>, _neb: &Arc<NebServer>) -> Option<usize> {
         // self.tree.check_and_split(&self.tree, sm, neb)
         unimplemented!();
     }

@@ -47,9 +47,6 @@ where
         );
         cursor
     }
-    fn boxed(self) -> Box<IndexCursor> {
-        box self
-    }
 
     fn read_current(node: &NodeCellRef, pos: usize) -> Option<EntryKey> {
         read_node(node, |node: &NodeReadHandler<KS, PS>| {
