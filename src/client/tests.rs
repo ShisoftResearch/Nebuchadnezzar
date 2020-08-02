@@ -57,7 +57,11 @@ pub async fn general() {
         })
         .await
         .unwrap();
-    let should_aborted = client.transaction(|trans|trans.abort()).await;
+    let should_aborted = client.transaction(|trans| {
+        async move {
+            trans.abort().await
+        }
+    }).await;
     match should_aborted {
         Err(TxnError::Aborted(_)) => {}
         _ => panic!("{:?}", should_aborted),
@@ -69,8 +73,10 @@ pub async fn general() {
     //    }).err().unwrap();
     client
         .transaction(move |trans| {
-            let empty_cell = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(Map::new()));
-            trans.write(empty_cell.to_owned()) // empty cell write should fail
+            async move {
+                let empty_cell = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(Map::new()));
+                trans.write(empty_cell.to_owned()).await // empty cell write should fail
+            }
         })
         .await
         .err()
@@ -83,7 +89,7 @@ pub async fn general() {
         let client = client.clone();
         futs.push(async move {
             client
-                .transaction(async move |ref mut txn| {
+                .transaction(async move |txn| {
                     let mut cell = txn.read(cell_1_id.to_owned()).await?.unwrap();
                     // WARNING: read_selected is subject to dirty read
                     let selected = txn
@@ -245,36 +251,40 @@ pub async fn write_skew() {
     let skew_tried_c = skew_tried.clone();
     let normal_tried_c = normal_tried.clone();
 
-    let t1 = tokio::spawn(async {
+    let t1 = tokio::spawn(async move {
         client_c1
-            .transaction(async move |ref mut txn| {
+            .transaction(|txn| {
                 *skew_tried_c.lock() += 1;
-                let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
-                let mut score_1 = *cell_1.data["score"].U64().unwrap();
-                thread::sleep(Duration::new(2, 0)); // wait 2 secs to let late write occur
-                score_1 += 1;
-                let mut data_1 = cell_1.data.Map().unwrap().clone();
-                data_1.insert(&String::from("score"), Value::U64(score_1));
-                cell_1.data = Value::Map(data_1);
-                txn.update(cell_1.to_owned()).await?;
-                Ok(())
+                async move {
+                    let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
+                    let mut score_1 = *cell_1.data["score"].U64().unwrap();
+                    thread::sleep(Duration::new(2, 0)); // wait 2 secs to let late write occur
+                    score_1 += 1;
+                    let mut data_1 = cell_1.data.Map().unwrap().clone();
+                    data_1.insert(&String::from("score"), Value::U64(score_1));
+                    cell_1.data = Value::Map(data_1);
+                    txn.update(cell_1.to_owned()).await?;
+                    Ok(())
+                }
             })
             .await;
     });
     let client_c2 = client.clone();
-    let t2 = tokio::spawn(async {
+    let t2 = tokio::spawn(async move {
         client_c2
-            .transaction(async move |ref mut txn| {
-                thread::sleep(Duration::new(1, 0));
+            .transaction(|txn| {
                 *normal_tried_c.lock() += 1;
-                let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
-                let mut score_1 = *cell_1.data["score"].U64().unwrap();
-                score_1 += 1;
-                let mut data_1 = cell_1.data.Map().unwrap().clone();
-                data_1.insert(&String::from("score"), Value::U64(score_1));
-                cell_1.data = Value::Map(data_1);
-                txn.update(cell_1.to_owned()).await?;
-                Ok(())
+                async move {
+                    tokio::time::delay_for(Duration::from_secs(1)).await;
+                    let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
+                    let mut score_1 = *cell_1.data["score"].U64().unwrap();
+                    score_1 += 1;
+                    let mut data_1 = cell_1.data.Map().unwrap().clone();
+                    data_1.insert(&String::from("score"), Value::U64(score_1));
+                    cell_1.data = Value::Map(data_1);
+                    txn.update(cell_1.to_owned()).await?;
+                    Ok(())
+                }
             })
             .await;
     });

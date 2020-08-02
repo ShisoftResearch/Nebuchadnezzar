@@ -3,6 +3,7 @@ use crate::ram::types::{Id, Value};
 use crate::server::transactions::TxnId;
 use crate::server::transactions::*;
 use std::cell::Cell as StdCell;
+use std::rc::Rc;
 use std::io;
 use std::sync::Arc;
 
@@ -26,9 +27,10 @@ pub enum TxnError {
     AbortError(AbortResult),
 }
 
+#[derive(Clone)]
 pub struct Transaction {
     pub tid: TxnId,
-    pub state: StdCell<TxnState>,
+    pub state: Arc<StdCell<TxnState>>,
     pub client: Arc<manager::AsyncServiceClient>,
 }
 

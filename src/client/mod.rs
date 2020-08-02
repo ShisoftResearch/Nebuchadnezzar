@@ -7,7 +7,7 @@ use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL
 use bifrost::membership::client::ObserverClient;
 use std::cell::Cell as StdCell;
 use std::io;
-use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
@@ -146,7 +146,7 @@ impl AsyncClient {
     }
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
-        TFN: Fn(&'a Transaction) -> RF,
+        TFN: Fn(Transaction) -> RF + 'a,
         RF: Future<Output = Result<TR, TxnError>> + 'a
     {
         let server_name = match self.conshash.rand_server() {
@@ -166,10 +166,10 @@ impl AsyncClient {
             };
             let txn = Transaction {
                 tid: txn_id,
-                state: StdCell::new(txn_server::TxnState::Started),
+                state: Arc::new(StdCell::new(txn_server::TxnState::Started)),
                 client: txn_client.clone(),
             };
-            let exec_result = func(&txn).await;
+            let exec_result = func(txn.clone()).await;
             let mut exec_value = None;
             let mut txn_result = Ok(());
             match exec_result {
