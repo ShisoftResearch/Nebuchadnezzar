@@ -6,7 +6,6 @@ use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::*;
 use crate::ram::tests::default_fields;
-use futures::stream::FuturesUnordered;
 
 #[tokio::test(threaded_scheduler)]
 pub async fn workspace_wr() {
@@ -356,7 +355,7 @@ pub async fn smoke_rw() {
     data_map_1.insert(&String::from("score"), Value::U64(0));
     data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
     let mut cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
-    server.chunks.write_cell(&mut cell_1);
+    server.chunks.write_cell(&mut cell_1).unwrap();
     let cell_id = cell_1.id();
     let thread_count = 200;
     let mut futs: Vec<_> = Vec::with_capacity(thread_count);
@@ -374,7 +373,7 @@ pub async fn smoke_rw() {
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
                 cell.data = Value::Map(data);
-                txn.update(txn_id.to_owned(), cell.to_owned());
+                txn.update(txn_id.to_owned(), cell.to_owned()).await.unwrap().unwrap();
             } else {
                 // println!("Failed read, {:?}", read_result);
             }
@@ -387,6 +386,6 @@ pub async fn smoke_rw() {
         }));
     }
     for f in futs {
-        f.await;
+        f.await.unwrap();
     }
 }

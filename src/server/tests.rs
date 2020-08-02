@@ -1,28 +1,21 @@
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
-use futures::prelude::*;
-use itertools::Itertools;
 use crate::client;
 use crate::ram::cell::Cell;
-use crate::ram::schema::LocalSchemasCache;
 use crate::ram::schema::Schema;
-use crate::ram::schema::{Field, IndexType};
+use crate::ram::schema::Field;
 use crate::ram::types::*;
 use crate::server::*;
-use rayon::iter::IntoParallelRefIterator;
-use rayon::prelude::*;
 use std::env;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 use test::Bencher;
 
 extern crate test;
 
 const DATA: &'static str = "DATA";
 
+#[allow(dead_code)]
 async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
     env_logger::init();
     let server_addr = String::from(format!("127.0.0.1:{}", port));
@@ -65,7 +58,7 @@ async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
     let client = Arc::new(
         client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap(),
     );
-    client.new_schema_with_id(schema).await;
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
     (server, client, schema_id)
 }
 
@@ -154,12 +147,12 @@ fn cell_clone(b: &mut Bencher) {
     value["DATA"] = Value::U64(2);
     let cell = Cell::new_with_id(1, &id, value);
     b.iter(|| {
-        cell.clone();
+        let _ = cell.clone();
     })
 }
 
-#[test]
-pub fn init() {
+#[tokio::test]
+pub async fn init() {
     NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
@@ -170,7 +163,7 @@ pub fn init() {
         },
         &String::from("127.0.0.1:5100"),
         &String::from("test"),
-    );
+    ).await;
 }
 
 #[tokio::test(threaded_scheduler)]
@@ -220,7 +213,7 @@ pub async fn smoke_test() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
-    client.new_schema_with_id(schema).await;
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..num {
         let client_clone = client.clone();
@@ -229,14 +222,14 @@ pub async fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).await;
+        client_clone.upsert_cell(cell).await.unwrap().unwrap();
 
         // read
         let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            client_clone.remove_cell(id).await;
+            client_clone.remove_cell(id).await.unwrap().unwrap();
         }
     }
 
@@ -245,7 +238,7 @@ pub async fn smoke_test() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).await;
+        client.upsert_cell(cell).await.unwrap().unwrap();
 
         // verify
         let read_cell = client.read_cell(id).await.unwrap().unwrap();
@@ -300,7 +293,7 @@ pub async fn smoke_test_parallel() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
-    client.new_schema_with_id(schema).await;
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     // // Create a background thread which checks for deadlocks every 10s
     // thread::Builder::new()
@@ -325,14 +318,14 @@ pub async fn smoke_test_parallel() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).await;
+        client_clone.upsert_cell(cell).await.unwrap().unwrap();
 
         // read
         let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
 
         if i % 2 == 0 {
-            client_clone.remove_cell(id).await;
+            client_clone.remove_cell(id).await.unwrap().unwrap();
         }
     }
 
@@ -344,7 +337,7 @@ pub async fn smoke_test_parallel() {
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).await;
+        client.upsert_cell(cell).await.unwrap().unwrap();
 
         // verify
         let read_cell = client.read_cell(id).await.unwrap().unwrap();
@@ -399,9 +392,9 @@ pub async fn txn() {
 
     let client =
         Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
-    client.new_schema_with_id(schema).await;
+    client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    for i in 0..num {
+    for _ in 0..num {
         client
             .transaction(async move |txn| {
                 let id = Id::new(0, 1);
@@ -410,6 +403,6 @@ pub async fn txn() {
                 let cell = Cell::new_with_id(schema_id, &id, value);
                 txn.upsert(cell).await
             })
-            .await;
+            .await.unwrap();
     }
 }

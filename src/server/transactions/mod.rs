@@ -1,5 +1,5 @@
 use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
-use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
+use bifrost::vector_clock::StandardVectorClock;
 use crate::ram::cell::{Cell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;

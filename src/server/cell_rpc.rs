@@ -6,7 +6,6 @@ use futures::prelude::*;
 use futures::future::BoxFuture;
 
 use bifrost_plugins::hash_ident;
-use num_cpus;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 

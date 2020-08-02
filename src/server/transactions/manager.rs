@@ -1,5 +1,4 @@
 use super::*;
-use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use crate::ram::cell::CellHeader;
@@ -18,7 +17,6 @@ type TxnAwaits = ObjectMap<Arc<Mutex<AwaitingServer>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
-type DataSiteClients = ObjectMap<Arc<data_site::AsyncServiceClient>>;
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
@@ -33,7 +31,6 @@ struct DataObject {
 }
 
 struct Transaction {
-    start_time: i64, // use for timeout detecting
     data: HashMap<Id, DataObject>,
     affected_objects: AffectedObjs,
     state: TxnState,
@@ -262,7 +259,6 @@ impl Service for TransactionManager {
         if self.transactions.insert(
                 &id,
                 Arc::new(Mutex::new(Transaction {
-                    start_time: get_time(),
                     data: HashMap::new(),
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
@@ -400,9 +396,6 @@ impl Service for TransactionManager {
 }
 
 impl TransactionManager {
-    fn server_id(&self) -> u64 {
-        self.server.server_id
-    }
     async fn get_data_site(&self, server_id: u64) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         let server_id_usize = server_id as usize;
         if !self.data_sites.contains(&server_id_usize) {
@@ -497,7 +490,7 @@ impl TransactionManager {
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
-        txn: &TxnGuard<'a>,
+        _txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
@@ -530,7 +523,7 @@ impl TransactionManager {
         tid: &TxnId,
         id: &Id,
         fields: &Vec<u64>,
-        txn: &TxnGuard<'a>,
+        _txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
         let self_server_id = self.server.server_id;

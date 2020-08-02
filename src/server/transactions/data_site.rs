@@ -7,7 +7,6 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
 use std::collections::{BTreeMap, BTreeSet};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
 use futures::stream::FuturesUnordered;
 use parking_lot::Mutex;
 use lightning::map::{HashMap as LFMap, ObjectMap};
@@ -97,7 +96,7 @@ impl DataManager {
         tokio::spawn(async move {
             loop {
                 if cleanup_signal.load(Relaxed) {
-                    manager_clone.cell_meta_cleanup();
+                    manager_clone.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
                 }
                 tokio::time::delay_for(Duration::from_secs(1)).await;
@@ -371,7 +370,7 @@ impl Service for DataManager {
             cell_mutices.push(self.cell_meta_mutex(cell_id));
         }
         for cell_mutex in &cell_mutices {
-            let mut meta = cell_mutex.lock();
+            let meta = cell_mutex.lock();
             if tid < meta.read || tid < meta.write {
                 // write too late
                 break;
@@ -565,7 +564,7 @@ impl Service for DataManager {
     ) -> BoxFuture<DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         self.update_clock(&clock);
-        let mut wake_up_futures = FuturesUnordered::new();
+        let wake_up_futures = FuturesUnordered::new();
         let mut released_locks = 0;
         let affected_cells;
         {
@@ -615,7 +614,7 @@ impl Service for DataManager {
                 // inform waiting servers to go on
                 wake_up_futures.push(async move {
                     if let Ok(client) = self.get_tnx_manager(server_id).await {
-                        client.go_ahead(transactions, self.server.server_id).await;
+                        client.go_ahead(transactions, self.server.server_id).await.unwrap();
                     } else {
                         debug!(
                             "cannot inform server {} to continue its transactions",

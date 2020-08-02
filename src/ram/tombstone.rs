@@ -1,8 +1,7 @@
 use super::mem_cursor::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use dovahkiin::types::Id;
 use crate::ram::entry::*;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Write};
 
 lazy_static! {
     pub static ref TOMBSTONE_LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);

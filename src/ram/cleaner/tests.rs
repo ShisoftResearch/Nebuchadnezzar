@@ -92,7 +92,7 @@ pub fn full_clean_cycle() {
 
         // try to scan first segment expect no panic
         println!("Scanning first segment...");
-        chunk.live_entries(&chunk.segs.get(&0).unwrap());
+        chunk.live_entries(&chunk.segs.get(&0).unwrap()).for_each(|_|{});
 
         println!("Scanning second segment for tombstones...");
         let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
@@ -118,10 +118,10 @@ pub fn full_clean_cycle() {
     }
 
     // check integrity
-    chunk
+    let _ = chunk
         .live_entries(&chunk.segs.get(&0).unwrap())
         .collect::<Vec<_>>();
-    chunk
+    let _ = chunk
         .live_entries(&chunk.segs.get(&1).unwrap())
         .collect::<Vec<_>>();
 

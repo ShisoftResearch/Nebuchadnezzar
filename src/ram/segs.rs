@@ -42,7 +42,7 @@ impl Segment {
         let mut wal_file_name = None;
         let mut wal_file = None;
         if let Some(wal_storage) = wal_storage {
-            create_dir_all(wal_storage);
+            create_dir_all(wal_storage).unwrap();
             let file_name = format!("{}/{}.log", wal_storage, id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
@@ -170,8 +170,8 @@ impl Segment {
                     // this should be redundant but I don't want to take the chance
                     // obtain the writer lock before continue
                     let _ = file_mutex.lock();
-                    copy(wal_file, backup_file);
-                    remove_file(wal_file);
+                    copy(wal_file, backup_file)?;
+                    remove_file(wal_file)?;
                 } else {
                     panic!()
                 }

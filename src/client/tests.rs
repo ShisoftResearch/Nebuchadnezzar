@@ -15,8 +15,10 @@ use super::*;
 
 #[tokio::test(threaded_scheduler)]
 pub async fn general() {
+    let _ = env_logger::try_init();
     let server_group = "general_test";
     let server_addr = String::from("127.0.0.1:5400");
+    debug!("Creating new neb server");
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,

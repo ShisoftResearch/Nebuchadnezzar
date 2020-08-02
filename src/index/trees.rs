@@ -3,11 +3,6 @@ use smallvec::SmallVec;
 use std::fmt::Debug;
 use std::io::Cursor as StdCursor;
 use std::mem;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::ops::Index;
-use std::ops::IndexMut;
-use std::slice::SliceIndex;
 
 pub const ID_SIZE: usize = 16;
 pub const KEY_SIZE: usize = ID_SIZE + 20; // 20 is the estimate length of: schema id u32 (4) + field id u64(8) and value u64(8)

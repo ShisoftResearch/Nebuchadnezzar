@@ -83,7 +83,7 @@ pub async fn init_conshash(
 ) -> Result<Arc<ConsistentHashing>, ServerError> {
     match ConsistentHashing::new_with_id(CONS_HASH_ID, group_name, raft_client, membership).await {
         Ok(ch) => {
-            ch.set_weight(address, memory_size).await;
+            ch.set_weight(address, memory_size).await.unwrap();
             if !ch.init_table().await.is_ok() {
                 error!("Cannot initialize member table");
                 return Err(ServerError::CannotInitMemberTable);

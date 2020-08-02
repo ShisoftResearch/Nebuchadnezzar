@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use crate::utils::raii_mutex_table::RAIIMutexTable;
 use crate::utils::ring_buffer::RingBuffer;
+use crate::utils::upper_power_of_2;
 use lightning::map::*;
 
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -51,7 +52,15 @@ impl Chunk {
             &backup_storage,
             &wal_storage,
         ));
-        let segs = Arc::new(ObjectMap::with_capacity(size / MAX_SEGMENT_SIZE));
+        let num_segs = {
+            let n = size / MAX_SEGMENT_SIZE;
+            if n > 0 {
+                n
+            } else {
+                n + 1
+            }
+        };
+        let segs = Arc::new(ObjectMap::with_capacity(upper_power_of_2(num_segs)));
         let index = Arc::new(WordMap::with_capacity(64));
         let chunk = Chunk {
             id,
@@ -65,7 +74,7 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
-            dead_entries: RingBuffer::new((size / MAX_SEGMENT_SIZE + 1) * 100),
+            dead_entries: RingBuffer::new((num_segs + 1) * 100),
             unstable_cells: RAIIMutexTable::new(),
         };
         chunk.put_segment(bootstrap_segment_ref);
