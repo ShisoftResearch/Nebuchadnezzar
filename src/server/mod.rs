@@ -174,6 +174,7 @@ impl NebServer {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
+        debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
         let meta_members = &vec![server_addr.to_owned()];
         let raft_service = raft::RaftService::new(raft::Options {
@@ -181,9 +182,11 @@ impl NebServer {
             address: server_addr.to_owned(),
             service_id: raft::DEFAULT_SERVICE_ID,
         });
-        Server::listen_and_resume(&rpc_server).await;
         rpc_server.register_service(raft::DEFAULT_SERVICE_ID, &raft_service).await;
+        Server::listen_and_resume(&rpc_server).await;
+        debug!("RPC server created, starting Raft service");
         raft::RaftService::start(&raft_service).await;
+        debug!("Raft service started, joining with members: {:?}", meta_members);
         match raft_service.join(meta_members).await {
             Err(sm_master::ExecError::CannotConstructClient) => {
                 info!("Cannot join meta cluster, will bootstrap one.");
@@ -200,12 +203,18 @@ impl NebServer {
                 panic!("{:?}", ServerError::CannotJoinCluster)
             }
         }
+        debug!("Joined with members, starting membership services");
         Membership::new(&rpc_server, &raft_service).await;
+        debug!("Starting raft client");
         let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).await.unwrap();
+        debug!("Prepare raft subscription");
         RaftClient::prepare_subscription(&rpc_server).await;
+        debug!("Starting member service");
         let member_service = MemberService::new(server_addr, &raft_client).await;
+        debug!("Member join group: {}", group_name);
         member_service.join_group(group_name).await.unwrap();
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
+        debug!("Creating neb server");
         NebServer::new(
             opts,
             server_addr,
