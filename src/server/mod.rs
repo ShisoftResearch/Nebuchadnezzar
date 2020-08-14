@@ -171,12 +171,21 @@ impl NebServer {
         server_addr: &'a str,
         group_name: &'a str,
     ) -> Arc<NebServer> {
+        Self::new_cluster_from_opts(opts, server_addr, &vec![server_addr.to_owned()], group_name).await
+    }
+
+    pub async fn new_cluster_from_opts<'a>(
+        opts: &ServerOptions,
+        server_addr: &'a str,
+        meta_servers: &Vec<String>,
+        group_name: &'a str,
+    ) -> Arc<NebServer> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
         let server_addr = &String::from(server_addr);
         debug!("Creating RPC server and listen");
         let rpc_server = rpc::Server::new(server_addr);
-        let meta_members = &vec![server_addr.to_owned()];
+        let meta_members: Vec<_> = meta_servers.iter().filter(|n| *n != server_addr).cloned().collect();
         let raft_service = raft::RaftService::new(raft::Options {
             storage: raft::Storage::MEMORY,
             address: server_addr.to_owned(),
@@ -186,27 +195,32 @@ impl NebServer {
         Server::listen_and_resume(&rpc_server).await;
         debug!("RPC server created, starting Raft service");
         raft::RaftService::start(&raft_service).await;
-        debug!("Raft service started, joining with members: {:?}", meta_members);
-        match raft_service.join(meta_members).await {
-            Err(sm_master::ExecError::CannotConstructClient) => {
-                info!("Cannot join meta cluster, will bootstrap one.");
-                raft_service.bootstrap().await;
-            }
-            Ok(true) => {
-                info!(
-                    "Joined meta cluster, number of members: {}",
-                    raft_service.num_members().await
-                );
-            }
-            e => {
-                error!("Cannot join into cluster: {:?}", e);
-                panic!("{:?}", ServerError::CannotJoinCluster)
+        if meta_members.is_empty() {
+            debug!("No other members in the cluster, will bootstrap");
+            raft_service.bootstrap().await;
+        } else {
+            debug!("Raft service started, joining with members: {:?}", &meta_members);
+            match raft_service.join(&meta_members).await {
+                Err(sm_master::ExecError::CannotConstructClient) => {
+                    info!("Cannot join meta cluster, will bootstrap one.");
+                    raft_service.bootstrap().await;
+                }
+                Ok(true) => {
+                    info!(
+                        "Joined meta cluster, number of members: {}",
+                        raft_service.num_members().await
+                    );
+                }
+                e => {
+                    error!("Cannot join into cluster: {:?}", e);
+                    panic!("{:?}", ServerError::CannotJoinCluster)
+                }
             }
         }
         debug!("Joined with members, starting membership services");
         Membership::new(&rpc_server, &raft_service).await;
         debug!("Starting raft client");
-        let raft_client = RaftClient::new(meta_members, raft::DEFAULT_SERVICE_ID).await.unwrap();
+        let raft_client = RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID).await.unwrap();
         debug!("Prepare raft subscription");
         RaftClient::prepare_subscription(&rpc_server).await;
         debug!("Starting member service");
@@ -218,7 +232,7 @@ impl NebServer {
         NebServer::new(
             opts,
             server_addr,
-            &meta_members,
+            &meta_servers,
             group_name,
             &rpc_server,
             &raft_service,

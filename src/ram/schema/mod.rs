@@ -112,6 +112,7 @@ impl LocalSchemasCache {
         group: &str,
         raft_client: &Arc<RaftClient>,
     ) -> Result<LocalSchemasCache, ExecError> {
+        info!("Initializing local schema cache");
         let map = Arc::new(RwLock::new(SchemasMap::new()));
         let m1 = map.clone();
         let m2 = map.clone();
@@ -119,10 +120,13 @@ impl LocalSchemasCache {
         let sm_data = sm.get_all().await?;
         {
             let mut map = map.write();
+            debug!("Importing {} schemas from cluster", sm_data.len());
             for schema in sm_data {
+                trace!("Importing schema {}", schema.name);
                 map.new_schema(schema);
             }
         }
+        debug!("Subscribing schema events...");
         let _ = sm
             .on_schema_added(move |schema| {
                 debug!("Add schema {} from subscription", schema.id);
@@ -139,6 +143,7 @@ impl LocalSchemasCache {
             })
             .await?;
         let schemas = LocalSchemasCache { map };
+        info!("Local schema initialization completed");
         return Ok(schemas);
     }
     pub fn new_local(_group: &str) -> Self {
