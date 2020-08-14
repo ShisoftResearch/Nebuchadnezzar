@@ -354,7 +354,6 @@ pub async fn txn() {
         .unwrap_or("1000".to_string())
         .parse::<u64>()
         .unwrap();
-    env_logger::init();
     let server_addr = String::from("127.0.0.1:5303");
     let server_group = String::from("bench_test");
     let server = NebServer::new_from_opts(
