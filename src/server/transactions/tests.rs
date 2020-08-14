@@ -9,6 +9,7 @@ use crate::ram::tests::default_fields;
 
 #[tokio::test(threaded_scheduler)]
 pub async fn workspace_wr() {
+    let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5200");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -140,6 +141,7 @@ pub async fn workspace_wr() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn data_site_wr() {
+    let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5201");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -228,6 +230,7 @@ pub async fn data_site_wr() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn multi_transaction() {
+    let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5202");
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -325,7 +328,7 @@ pub async fn multi_transaction() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn smoke_rw() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     // this test is likely to have unrealizable transactions and
     // should not cause any deadlock even if they failed
     let server_addr = String::from("127.0.0.1:5203");

@@ -17,7 +17,7 @@ const DATA: &'static str = "DATA";
 
 #[allow(dead_code)]
 async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let server_addr = String::from(format!("127.0.0.1:{}", port));
     let server_group = String::from("bench_test");
     let server = NebServer::new_from_opts(
@@ -153,6 +153,7 @@ fn cell_clone(b: &mut Bencher) {
 
 #[tokio::test]
 pub async fn init() {
+    let _ = env_logger::try_init();
     NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
@@ -168,12 +169,12 @@ pub async fn init() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn smoke_test() {
+    let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
         .parse::<u64>()
         .unwrap();
-    env_logger::init();
     let server_addr = String::from("127.0.0.1:5500");
     let server_group = String::from("smoke_test");
     let server = NebServer::new_from_opts(
@@ -248,12 +249,12 @@ pub async fn smoke_test() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn smoke_test_parallel() {
+    let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
         .parse::<u64>()
         .unwrap();
-    env_logger::init();
     let server_addr = String::from("127.0.0.1:5301");
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
@@ -347,6 +348,7 @@ pub async fn smoke_test_parallel() {
 
 #[tokio::test(threaded_scheduler)]
 pub async fn txn() {
+    let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
     let num = env::var("NEB_KV_TXN_TEST_ITEMS")
         .unwrap_or("1000".to_string())

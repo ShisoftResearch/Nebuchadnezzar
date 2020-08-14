@@ -48,7 +48,7 @@ fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
 
 #[test]
 pub fn full_clean_cycle() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let schema = Schema::new("cleaner_test", None, default_fields(), false);
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema);

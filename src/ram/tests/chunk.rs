@@ -22,7 +22,7 @@ pub fn round_robin_segment() {
 
 #[test]
 pub fn cell_rw() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     info!("START");
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
