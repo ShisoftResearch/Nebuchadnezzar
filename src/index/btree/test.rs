@@ -63,7 +63,7 @@ fn node_size() {
 
 #[test]
 fn init() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let id = Id::unit_id();
     let key = smallvec![1, 2, 3, 4, 5, 6];
@@ -94,7 +94,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 #[test]
 fn crd() {
     use crate::index::trees::Cursor;
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     std::fs::remove_dir_all("dumps").unwrap();
     std::fs::create_dir_all("dumps").unwrap();
@@ -305,7 +305,7 @@ fn crd() {
 #[test]
 pub fn alternative_insertion_pattern() {
     use crate::index::trees::Cursor;
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -351,7 +351,7 @@ pub fn alternative_insertion_pattern() {
 
 #[test]
 fn parallel() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LevelBPlusTree::new());
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -453,7 +453,7 @@ type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 
 #[test]
 fn level_merge() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let range = 1000;
     let tree_1 = Arc::new(TinyLevelBPlusTree::new());
     let tree_2 = Arc::new(LevelBPlusTree::new());
@@ -522,7 +522,7 @@ fn level_merge() {
 
 #[test]
 fn level_merge_insertion() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let range = 10000;
     let nums = range * 3;
     let tree = Arc::new(TinyLevelBPlusTree::new());
