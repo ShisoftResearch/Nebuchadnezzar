@@ -84,9 +84,9 @@ impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
-            cells: LFMap::with_capacity(64),
+            cells: LFMap::with_capacity(256),
             cell_lru: Mutex::new(LinkedHashMap::new()),
-            txns: LFMap::with_capacity(64),
+            txns: LFMap::with_capacity(128),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
             managers: ObjectMap::with_capacity(16),
             server: server.clone(),
@@ -614,6 +614,7 @@ impl Service for DataManager {
                 // inform waiting servers to go on
                 wake_up_futures.push(async move {
                     if let Ok(client) = self.get_tnx_manager(server_id).await {
+                        debug!("WAKING UP {} for {:?}", server_id, transactions);
                         client.go_ahead(transactions, self.server.server_id).await.unwrap();
                     } else {
                         debug!(
@@ -629,8 +630,10 @@ impl Service for DataManager {
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);
             if released_locks == affected_cells {
+                debug!("ENDED: {:?} with all locks ({}) released", tid, released_locks);
                 self.response_with(EndResult::Success).await
             } else {
+                warn!("ENDED: {:?} with SOME locks ({}/{}) NOT released", tid, released_locks, affected_cells);
                 self.response_with(EndResult::SomeLocksNotReleased).await
             }
         }.boxed()

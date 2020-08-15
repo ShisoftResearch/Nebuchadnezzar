@@ -13,7 +13,6 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use tokio::sync::mpsc::{channel, Sender, Receiver};
 
-type TxnAwaits = ObjectMap<Arc<Mutex<AwaitingServer>>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
 type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
@@ -381,13 +380,14 @@ impl Service for TransactionManager {
         }.boxed()
     }
     fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<()> {
-        debug!("=> TM WAKE UP TXN: {:?}", tids);
+        debug!("=> TM WAKE UP TXN from {} for {} txn", server_id, tids.len());
         let futures = FuturesUnordered::new();
         for tid in tids {
             let await_txn = self.await_manager.get_txn(&tid);
-            futures.push(tokio::spawn(async move {
-                AwaitManager::txn_send(&await_txn, server_id).await;
-            }));
+            futures.push(async move {
+                debug!("WAKE UP: {:?}", tid);
+                await_txn.send(server_id).await;
+            });
         }
         async move {
             let _: Vec<_> = futures.collect().await;
@@ -469,7 +469,7 @@ impl TransactionManager {
                             );
                         }
                         TxnExecResult::Wait => {
-                            AwaitManager::txn_wait(&awaits, server_id).await;
+                            awaits.wait(server_id).await;
                             continue;
                         }
                         _ => {}
@@ -502,7 +502,7 @@ impl TransactionManager {
                     let payload = &dsr.payload;
                     match &payload {
                         &TxnExecResult::Wait => {
-                            AwaitManager::txn_wait(&awaits, server_id).await;
+                            awaits.wait(server_id).await;
                             continue;
                         }
                         _ => {}
@@ -541,7 +541,7 @@ impl TransactionManager {
                     let payload = dsr.payload;
                     match payload {
                         TxnExecResult::Wait => {
-                            AwaitManager::txn_wait(&awaits, server_id).await;
+                            awaits.wait(server_id).await;
                             continue;
                         }
                         _ => {}
@@ -607,7 +607,7 @@ impl TransactionManager {
                 Ok(payload) => {
                     match payload {
                         DMPrepareResult::Wait => {
-                            AwaitManager::txn_wait(&awaits, data_site.server_id()).await;
+                            awaits.wait(data_site.server_id()).await;
                             continue; // after waiting, retry
                         }
                         _ => return Ok(payload),
@@ -790,50 +790,66 @@ impl TransactionManager {
 }
 
 struct AwaitingServer {
-    sender: Sender<()>,
-    receiver: Receiver<()>,
+    sender: Mutex<Sender<()>>,
+    receiver: Mutex<Receiver<()>>,
 }
 
 impl AwaitingServer {
     pub fn new() -> AwaitingServer {
         let (sender, receiver) = channel(1);
         AwaitingServer {
-            sender: sender,
-            receiver: receiver,
+            sender: Mutex::new(sender),
+            receiver: Mutex::new(receiver),
         }
     }
-    pub async fn send(&mut self) {
-        self.sender.send(()).await.unwrap();
+    pub async fn send(&self) {
+        self.sender.lock().await.send(()).await.unwrap();
     }
-    pub async fn wait(&mut self) {
-        self.receiver.recv().await.unwrap();
+    pub async fn wait(&self) {
+        self.receiver.lock().await.recv().await.unwrap();
     }
 }
 
 struct AwaitManager {
-    channels: LFMap<TxnId, TxnAwaits>,
+    channels: LFMap<TxnId, Arc<TxnAwaits>>,
+}
+
+struct TxnAwaits {
+    map: ObjectMap<Arc<AwaitingServer>>
 }
 
 impl AwaitManager {
     pub fn new() -> AwaitManager {
         AwaitManager {
-            channels: LFMap::with_capacity(16),
+            channels: LFMap::with_capacity(256),
         }
     }
-    pub fn get_txn(&self, tid: &TxnId) -> TxnAwaits {
-        self.channels.get_or_insert(tid, || ObjectMap::with_capacity(8))
+    pub fn get_txn(&self, tid: &TxnId) -> Arc<TxnAwaits> {
+        self.channels.get_or_insert(tid, || TxnAwaits::new_ref())
     }
-    pub fn server_from_txn_awaits(awaits: &TxnAwaits, server_id: u64) -> Arc<Mutex<AwaitingServer>> {
-        awaits.get_or_insert(&(server_id as usize), || Arc::new(Mutex::new(AwaitingServer::new())))  
+}
+
+impl TxnAwaits {
+    pub fn new_ref() -> Arc<Self> {
+        Arc::new(Self {
+            map: ObjectMap::with_capacity(8)
+        })
     }
-    pub async fn txn_send(awaits: &TxnAwaits, server_id: u64) {
-        let manager_lock = AwaitManager::server_from_txn_awaits(awaits, server_id);
-        let mut manager = manager_lock.lock().await;
-        manager.send().await
+    pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {
+        self.map.get_or_insert(&(server_id as usize), || Arc::new(AwaitingServer::new()))  
     }
-    pub async fn txn_wait(awaits: &TxnAwaits, server_id: u64) {
-        let manager_lock = AwaitManager::server_from_txn_awaits(awaits, server_id);
-        let mut manager = manager_lock.lock().await;
-        manager.wait().await
+    pub async fn send(&self, server_id: u64) {
+        debug!("Will sending to wakeup from {}", server_id);
+        let manager = self.manager_of_server(server_id);
+        debug!("Sending to wakeup from {}", server_id);
+        manager.send().await;
+        debug!("Wakeup sent from {}", server_id);
+    }
+    pub async fn wait(&self, server_id: u64) {
+        debug!("Will start waiting for server {}", server_id);
+        let manager = self.manager_of_server(server_id);
+        debug!("Start waiting for server {}", server_id);
+        manager.wait().await;
+        debug!("Waked up from server {}", server_id);
     }
 }

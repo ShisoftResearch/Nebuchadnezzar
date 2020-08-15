@@ -33,11 +33,12 @@ impl Cleaner {
             .unwrap_or("100".to_string())
             .parse::<u64>()
             .unwrap();
+        // Put follwing procedures in separate threads for real-time scheduling
         thread::Builder::new()
             .name("Cleaner sweeper".into())
             .spawn(move || {
                 while !stop_tag.load(Ordering::Relaxed) {
-                    debug!("Apply dead entry");
+                    trace!("Apply dead entry");
                     chunks.list.par_iter().for_each(|chunk| {
                         chunk.apply_dead_entry();
                     });
