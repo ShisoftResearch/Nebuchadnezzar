@@ -1,21 +1,23 @@
 use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
-use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
-use ram::cell::{Cell, WriteError};
-use ram::types::Id;
-use server::Peer;
+use bifrost::vector_clock::StandardVectorClock;
+use crate::ram::cell::{Cell, WriteError};
+use crate::ram::types::Id;
+use crate::server::Peer;
 use std::io;
 use std::sync::Arc;
 
 pub mod data_site;
 pub mod manager;
+#[cfg(test)]
+mod tests;
 
 pub type TxnId = StandardVectorClock;
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub enum TxnExecResult<A, E>
 where
-    A: Clone,
-    E: Clone,
+    A: Send + Clone,
+    E: Send + Clone,
 {
     Rejected,
     Wait,
@@ -26,8 +28,8 @@ where
 
 impl<A, E> TxnExecResult<A, E>
 where
-    A: Clone,
-    E: Clone,
+    A: Send + Clone,
+    E: Send + Clone,
 {
     pub fn unwrap(self) -> A {
         match self {
@@ -136,8 +138,8 @@ pub enum TMError {
     Other,
 }
 
-pub fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
-    let client = DEFAULT_CLIENT_POOL.get(address)?;
+pub async fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
+    let client = DEFAULT_CLIENT_POOL.get(address).await?;
     Ok(manager::AsyncServiceClient::new(
         manager::DEFAULT_SERVICE_ID,
         &client,

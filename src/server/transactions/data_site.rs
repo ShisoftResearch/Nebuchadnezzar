@@ -3,14 +3,17 @@ use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use linked_hash_map::LinkedHashMap;
-use parking_lot::{Mutex, MutexGuard};
-use ram::cell::{Cell, CellHeader, ReadError, WriteError};
-use ram::types::{Id, Value};
-use server::NebServer;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::thread;
-use utils::chashmap::{CHashMap, WriteGuard};
+use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::types::{Id, Value};
+use crate::server::NebServer;
+use std::collections::{BTreeMap, BTreeSet};
+use futures::stream::FuturesUnordered;
+use parking_lot::Mutex;
+use lightning::map::{HashMap as LFMap, ObjectMap};
+use futures::future::BoxFuture;
+use lightning::map::Map;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::time::Duration;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
@@ -49,17 +52,13 @@ impl CellHistory {
 }
 
 pub struct DataManager {
-    inner: Arc<DataManagerInner>,
-}
-
-struct DataManagerInner {
-    cells: Mutex<HashMap<Id, Arc<Mutex<CellMeta>>>>,
+    cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
-    txns: Mutex<HashMap<TxnId, Arc<Mutex<Transaction>>>>,
+    txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     tnxs_sorted: Mutex<BTreeSet<TxnId>>,
-    managers: CHashMap<u64, Arc<manager::AsyncServiceClient>>,
+    managers: ObjectMap<Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
-    cleanup_sender: Mutex<Sender<()>>,
+    cleanup_signal: Arc<AtomicBool>,
 }
 
 service! {
@@ -82,135 +81,41 @@ service! {
 dispatch_rpc_service_functions!(DataManager);
 
 impl DataManager {
-    pub fn new(server: &Arc<NebServer>) -> Arc<DataManager> {
-        Arc::new(DataManager {
-            inner: DataManagerInner::new(server),
-        })
-    }
-}
-
-impl Service for DataManager {
-    fn read(
-        &self,
-        server_id: u64,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        id: Id,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Cell, ReadError>>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::read(this, server_id, clock, tid, id)
-    }
-    fn read_selected(
-        &self,
-        server_id: u64,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        id: Id,
-        fields: Vec<u64>,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, Error = ()>>
-    {
-        let this = self.inner.clone();
-        DataManagerInner::read_selected(this, server_id, clock, tid, id, fields)
-    }
-    fn read_partial_raw(
-        &self,
-        server_id: u64,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        id: Id,
-        offset: usize,
-        len: usize,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::read_partial_raw(this, server_id, clock, tid, id, offset, len)
-    }
-    fn head(
-        &self,
-        server_id: u64,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        id: Id,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<CellHeader, ReadError>>, Error = ()>>
-    {
-        let this = self.inner.clone();
-        DataManagerInner::head(this, server_id, clock, tid, id)
-    }
-    fn prepare(
-        &self,
-        server_id: u64,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        cell_ids: Vec<Id>,
-    ) -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::prepare(this, server_id, clock, tid, cell_ids)
-    }
-    fn commit(
-        &self,
-        clock: StandardVectorClock,
-        tid: TxnId,
-        cells: Vec<CommitOp>,
-    ) -> Box<Future<Item = DataSiteResponse<DMCommitResult>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::commit(this, clock, tid, cells)
-    }
-    fn abort(
-        &self,
-        clock: StandardVectorClock,
-        tid: TxnId,
-    ) -> Box<Future<Item = DataSiteResponse<AbortResult>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::abort(this, clock, tid)
-    }
-    fn end(
-        &self,
-        clock: StandardVectorClock,
-        tid: TxnId,
-    ) -> Box<Future<Item = DataSiteResponse<EndResult>, Error = ()>> {
-        let this = self.inner.clone();
-        DataManagerInner::end(this, clock, tid)
-    }
-}
-
-impl DataManagerInner {
-    pub fn new(server: &Arc<NebServer>) -> Arc<DataManagerInner> {
-        let (cleaup_sender, cleaup_recv) = channel();
-        let manager = Arc::new(DataManagerInner {
-            cells: Mutex::new(HashMap::new()),
+    pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
+        let cleanup_signal = Arc::new(AtomicBool::new(false));
+        let manager = Arc::new(Self {
+            cells: LFMap::with_capacity(256),
             cell_lru: Mutex::new(LinkedHashMap::new()),
-            txns: Mutex::new(HashMap::new()),
+            txns: LFMap::with_capacity(128),
             tnxs_sorted: Mutex::new(BTreeSet::new()),
-            managers: CHashMap::new(),
+            managers: ObjectMap::with_capacity(16),
             server: server.clone(),
-            cleanup_sender: Mutex::new(cleaup_sender),
+            cleanup_signal: cleanup_signal.clone(),
         });
         let manager_clone = manager.clone();
-        thread::Builder::new()
-            .name("Txn Data Manager Cleaner".to_string())
-            .spawn(move || {
-                //TODO: give way to shutdown
-                loop {
-                    cleaup_recv.recv();
-                    manager_clone.cell_meta_cleanup();
+        tokio::spawn(async move {
+            loop {
+                if cleanup_signal.load(Relaxed) {
+                    manager_clone.cell_meta_cleanup().await;
+                    cleanup_signal.store(false, Relaxed);
                 }
-            });
+                tokio::time::delay_for(Duration::from_secs(1)).await;
+            } 
+        });
         return manager;
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
-        let mut txns = self.txns.lock();
-        txns.entry(tid.clone())
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(Transaction {
-                    state: TxnState::Started,
-                    affected_cells: Vec::new(),
-                    last_activity: get_time(),
-                    history: BTreeMap::new(),
-                }))
-            })
-            .clone()
+        self.txns.get_or_insert(tid, || {
+            Arc::new(Mutex::new(Transaction {
+                state: TxnState::Started,
+                affected_cells: Vec::new(),
+                last_activity: get_time(),
+                history: BTreeMap::new(),
+            }))
+        })
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
@@ -218,25 +123,20 @@ impl DataManagerInner {
             *lru.entry(id.clone()).or_insert(0) = get_time();
             lru.get_refresh(id);
         }
-        let mut cells = self.cells.lock();
-        cells
-            .entry(*id)
-            .or_insert_with(|| {
-                Arc::new(Mutex::new(CellMeta {
-                    read: TxnId::new(),
-                    write: TxnId::new(),
-                    owner: None,
-                    waiting: BTreeSet::new(),
-                }))
-            })
-            .clone()
+        self.cells.get_or_insert(id, || {
+            Arc::new(Mutex::new(CellMeta {
+                read: TxnId::new(),
+                write: TxnId::new(),
+                owner: None,
+                waiting: BTreeSet::new(),
+            }))
+        })
     }
-    fn response_with<T>(&self, data: T) -> Box<Future<Item = DataSiteResponse<T>, Error = ()>>
+    fn response_with<T: Send>(&self, data: T) -> BoxFuture<DataSiteResponse<T>>
     where
         T: 'static,
     {
-        let res = DataSiteResponse::new(&self.server.txn_peer, data);
-        box future::ok(res)
+        future::ready(DataSiteResponse::new(&self.server.txn_peer, data)).boxed()
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures: Vec<RollbackFailure> = Vec::new();
@@ -281,27 +181,29 @@ impl DataManagerInner {
         let mut meta = meta_ref.lock();
         meta.write = tid.clone();
     }
-    fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
-        if !self.managers.contains_key(&server_id) {
-            let client = self.server.get_member_by_server_id(server_id)?;
-            self.managers.upsert(
-                server_id,
-                || manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client),
-                |_| {},
-            );
+    async fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
+        let server_id_ref=  &(server_id as usize);
+        loop {
+            if !self.managers.contains(server_id_ref) {
+                let client = self.server.get_member_by_server_id(server_id).await?;
+                return Ok(self.managers.get_or_insert(server_id_ref, || manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)))
+            } else {
+                if let Some(manager) = self.managers.get(server_id_ref) {
+                    return Ok(manager.clone())
+                }
+            }
         }
-        Ok(self.managers.get(&server_id).unwrap().clone())
     }
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        self.txns.lock().remove(tid);
+        if let Some(txn) = self.txns.write(tid) {
+            txn.remove();
+        }
         self.tnxs_sorted.lock().remove(tid);
     }
-    fn cell_meta_cleanup(&self) {
+    async fn cell_meta_cleanup(&self) {
         let mut cell_lru = self.cell_lru.lock();
-        let mut cells = self.cells.lock();
         let oldest_transaction = {
-            let tnx_sorted = self.tnxs_sorted.lock();
-            tnx_sorted
+            self.tnxs_sorted.lock()
                 .iter()
                 .next()
                 .cloned()
@@ -311,7 +213,7 @@ impl DataManagerInner {
         let mut cell_to_evict = Vec::new();
         let mut need_break = false;
         for (cell_id, timestamp) in cell_lru.iter() {
-            if let Some(cell_meta) = cells.get(cell_id) {
+            if let Some(cell_meta) = self.cells.get(cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction
                     && meta.read < oldest_transaction
@@ -321,7 +223,7 @@ impl DataManagerInner {
                 } else {
                     need_break = true;
                 }
-            } else {
+            } else { 
                 cell_to_evict.push(*cell_id);
             }
             if need_break {
@@ -329,17 +231,17 @@ impl DataManagerInner {
             }
         }
         for evicted_cell in &cell_to_evict {
-            cells.remove(evicted_cell);
+            self.cells.remove(evicted_cell);
             cell_lru.remove(evicted_cell);
         }
     }
-    fn prepare_read<T>(
+    fn prepare_read<T: Send>(
         &self,
         server_id: &u64,
         clock: &StandardVectorClock,
         tid: &TxnId,
         id: &Id,
-    ) -> Result<(), Box<Future<Item = DataSiteResponse<TxnExecResult<T, ReadError>>, Error = ()>>>
+    ) -> Result<(), BoxFuture<DataSiteResponse<TxnExecResult<T, ReadError>>>>
     where
         T: 'static + Clone,
     {
@@ -369,103 +271,106 @@ impl DataManagerInner {
         }
         return Ok(());
     }
+}
 
+impl Service for DataManager {
     /////////////////////////////////////
     ///        Implement Services    ///
     ///////////////////////////////////
 
     fn read(
-        this: Arc<Self>,
+        &self,
         server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Cell, ReadError>>, Error = ()>> {
-        if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) {
-            return r;
-        }
-        match this.server.chunks.read_cell(&id) {
-            Ok(cell) => this.response_with(TxnExecResult::Accepted(cell)),
-            Err(read_error) => this.response_with(TxnExecResult::Error(read_error)),
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Cell, ReadError>>> {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
+            r
+        } else {
+            match self.server.chunks.read_cell(&id) {
+                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
+                Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
+            }
         }
     }
     fn read_selected(
-        this: Arc<Self>,
+        &self,
         server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>, Error = ()>>
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>>
     {
-        if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match this.server.chunks.read_selected(&id, &fields[..]) {
-            Ok(values) => this.response_with(TxnExecResult::Accepted(values)),
-            Err(read_error) => this.response_with(TxnExecResult::Error(read_error)),
+        match self.server.chunks.read_selected(&id, &fields[..]) {
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
     fn head(
-        this: Arc<Self>,
+        &self,
         server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<CellHeader, ReadError>>, Error = ()>>
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<CellHeader, ReadError>>>
     {
-        if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match this.server.chunks.head_cell(&id) {
-            Ok(head) => this.response_with(TxnExecResult::Accepted(head)),
-            Err(read_error) => this.response_with(TxnExecResult::Error(read_error)),
+        match self .server.chunks.head_cell(&id) {
+            Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
     // TODO: Link this function in transaction manager
     fn read_partial_raw(
-        this: Arc<Self>,
+        &self,
         server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
         offset: usize,
         len: usize,
-    ) -> Box<Future<Item = DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>, Error = ()>> {
-        if let Err(r) = this.prepare_read(&server_id, &clock, &tid, &id) {
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
+        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match this.server.chunks.read_partial_raw(&id, offset, len) {
-            Ok(values) => this.response_with(TxnExecResult::Accepted(values)),
-            Err(read_error) => this.response_with(TxnExecResult::Error(read_error)),
+        match self.server.chunks.read_partial_raw(&id, offset, len) {
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+            Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
     fn prepare(
-        this: Arc<Self>,
+        &self,
         _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         cell_ids: Vec<Id>,
-    ) -> Box<Future<Item = DataSiteResponse<DMPrepareResult>, Error = ()>> {
+    ) -> BoxFuture<DataSiteResponse<DMPrepareResult>> {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
-        this.update_clock(&clock);
-        let txn_lock = this.get_transaction(&tid);
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
-            return this.response_with(DMPrepareResult::StateError(txn.state));
+            return self.response_with(DMPrepareResult::StateError(txn.state));
         }
 
         let mut cell_mutices = Vec::with_capacity(cell_ids.len());
         let mut cell_guards = Vec::with_capacity(cell_ids.len());
 
         for cell_id in &cell_ids {
-            cell_mutices.push(this.cell_meta_mutex(cell_id));
+            cell_mutices.push(self.cell_meta_mutex(cell_id));
         }
         for cell_mutex in &cell_mutices {
-            let mut meta = cell_mutex.lock();
+            let meta = cell_mutex.lock();
             if tid < meta.read || tid < meta.write {
                 // write too late
                 break;
@@ -473,7 +378,7 @@ impl DataManagerInner {
             cell_guards.push(meta);
         }
         if cell_guards.len() != cell_ids.len() {
-            return this.response_with(DMPrepareResult::NotRealizable); // need retry
+            return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
             for mut meta in cell_guards {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
@@ -481,38 +386,37 @@ impl DataManagerInner {
             txn.state = TxnState::Prepared;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time(); // check if transaction timeout
-            return this.response_with(DMPrepareResult::Success);
+            return self.response_with(DMPrepareResult::Success);
         }
     }
     fn commit(
-        this: Arc<Self>,
+        &self,
         clock: StandardVectorClock,
         tid: TxnId,
         cells: Vec<CommitOp>,
-    ) -> Box<Future<Item = DataSiteResponse<DMCommitResult>, Error = ()>> {
-        this.update_clock(&clock);
-        let txn_lock = this.get_transaction(&tid);
+    ) -> BoxFuture<DataSiteResponse<DMCommitResult>> {
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
         // check state
         match txn.state {
             TxnState::Started => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted));
+                return self.response_with(DMCommitResult::CheckFailed(CheckError::NotCommitted));
             }
             TxnState::Aborted => {
-                return this.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
+                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
             }
             TxnState::Committed => {
-                return this
-                    .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
+                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
             TxnState::Prepared => {}
-        }
+        };
         // check cell list integrity
         let prepared_cells_num = txn.affected_cells.len();
         let arrived_cells_num = cells.len();
         if prepared_cells_num != arrived_cells_num {
-            return this.response_with(DMCommitResult::CheckFailed(
+            return self.response_with(DMCommitResult::CheckFailed(
                 CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
             ));
         }
@@ -524,12 +428,12 @@ impl DataManagerInner {
                     CommitOp::Read(_id, _version) => {}
                     CommitOp::Write(ref cell) => {
                         let mut cell = cell.clone();
-                        let write_result = this.server.chunks.write_cell(&mut cell);
+                        let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
                                 commit_history
                                     .insert(cell.id(), CellHistory::new(None, header.version));
-                                this.update_cell_write(&cell.id(), &tid);
+                                self.update_cell_write(&cell.id(), &tid);
                             }
                             Err(error) => {
                                 write_error = Some((cell.id(), error));
@@ -539,7 +443,7 @@ impl DataManagerInner {
                     }
                     CommitOp::Remove(ref cell_id) => {
                         let original_cell = {
-                            match this.server.chunks.read_cell(cell_id) {
+                            match self.server.chunks.read_cell(cell_id) {
                                 Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((*cell_id, WriteError::ReadError(re)));
@@ -547,7 +451,7 @@ impl DataManagerInner {
                                 }
                             }
                         };
-                        let write_result = this.server.chunks.remove_cell_by(cell_id, |cell| {
+                        let write_result = self.server.chunks.remove_cell_by(cell_id, |cell| {
                             let version = cell.header.version;
                             version == original_cell.header.version
                         });
@@ -555,7 +459,7 @@ impl DataManagerInner {
                             Ok(()) => {
                                 commit_history
                                     .insert(*cell_id, CellHistory::new(Some(original_cell), 0));
-                                this.update_cell_write(cell_id, &tid);
+                                self.update_cell_write(cell_id, &tid);
                             }
                             Err(error) => {
                                 write_error = Some((*cell_id, error));
@@ -566,7 +470,7 @@ impl DataManagerInner {
                     CommitOp::Update(ref cell) => {
                         let cell_id = cell.id();
                         let original_cell = {
-                            match this.server.chunks.read_cell(&cell_id) {
+                            match self.server.chunks.read_cell(&cell_id) {
                                 Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((cell_id, WriteError::ReadError(re)));
@@ -575,7 +479,7 @@ impl DataManagerInner {
                             }
                         };
                         let write_result =
-                            this.server
+                            self.server
                                 .chunks
                                 .update_cell_by(&cell_id, |cell_to_update| {
                                     if cell_to_update.header.version == original_cell.header.version
@@ -591,7 +495,7 @@ impl DataManagerInner {
                                     cell_id,
                                     CellHistory::new(Some(original_cell), cell.header.version),
                                 );
-                                this.update_cell_write(&cell_id, &tid);
+                                self.update_cell_write(&cell_id, &tid);
                             }
                             Err(error) => {
                                 write_error = Some((cell_id, error));
@@ -611,30 +515,30 @@ impl DataManagerInner {
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
                     // in this case, we can inform transaction manager to try again
-                    return this.response_with(DMCommitResult::CellChanged(id));
+                    return self.response_with(DMCommitResult::CellChanged(id));
                 }
                 _ => {
                     // other failure due to unfixable error should abort without retry
-                    return this.response_with(DMCommitResult::WriteError(id, error));
+                    return self.response_with(DMCommitResult::WriteError(id, error));
                 }
             }
         } else {
             // all set, able to commit
             txn.state = TxnState::Committed;
-            return this.response_with(DMCommitResult::Success);
+            return self.response_with(DMCommitResult::Success);
         }
     }
     fn abort(
-        this: Arc<Self>,
+        &self,
         clock: StandardVectorClock,
         tid: TxnId,
-    ) -> Box<Future<Item = DataSiteResponse<AbortResult>, Error = ()>> {
+    ) -> BoxFuture<DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
-        this.update_clock(&clock);
-        let txn_lock = this.get_transaction(&tid);
+        self.update_clock(&clock);
+        let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state == TxnState::Aborted {
-            return this.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
+            return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
         let rollback_failures = {
             debug!(
@@ -642,7 +546,7 @@ impl DataManagerInner {
                 txn.history.len(),
                 tid
             );
-            let failures = this.rollback(&txn.history);
+            let failures = self.rollback(&txn.history);
             if failures.len() == 0 {
                 None
             } else {
@@ -651,21 +555,23 @@ impl DataManagerInner {
         };
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
-        this.response_with(AbortResult::Success(rollback_failures))
+        self.response_with(AbortResult::Success(rollback_failures))
     }
     fn end(
-        this: Arc<Self>,
+        &self,
         clock: StandardVectorClock,
         tid: TxnId,
-    ) -> Box<Future<Item = DataSiteResponse<EndResult>, Error = ()>> {
+    ) -> BoxFuture<DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
-        let this_clone = this.clone();
-        let result = {
-            this.update_clock(&clock);
-            let txn_lock = this.get_transaction(&tid);
+        self.update_clock(&clock);
+        let wake_up_futures = FuturesUnordered::new();
+        let mut released_locks = 0;
+        let affected_cells;
+        {
+            let txn_lock = self.get_transaction(&tid);
             let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
-                return this.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
+                return self.response_with(EndResult::CheckFailed(CheckError::CannotEnd));
             }
             debug!(
                 "AFFECTED: {}, {:?}, {:?}",
@@ -673,15 +579,13 @@ impl DataManagerInner {
                 txn.state,
                 tid
             );
-            let affected_cells = txn.affected_cells.len();
-            let mut released_locks = 0;
+            affected_cells = txn.affected_cells.len();
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
             let mut cell_mutices = Vec::new();
             let mut cell_guards = Vec::new();
             {
-                let cells = this.cells.lock();
                 for cell_id in &txn.affected_cells {
-                    if let Some(meta) = cells.get(cell_id) {
+                    if let Some(meta) = self.cells.get(cell_id) {
                         cell_mutices.push(meta.clone());
                     }
                 }
@@ -690,7 +594,7 @@ impl DataManagerInner {
                 cell_guards.push(cell_mutex.lock()); // lock all affected cells on by on
             }
             for mut meta in cell_guards {
-                if meta.owner == Some(tid.clone()) {
+                if meta.owner.as_ref() == Some(&tid) {
                     // collect waiting transactions
                     for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
                         waiting_list
@@ -705,31 +609,33 @@ impl DataManagerInner {
                     warn!("affected txn does not own the cell");
                 }
             }
-            let mut wake_up_futures = Vec::with_capacity(waiting_list.len());
             debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
             for (server_id, transactions) in waiting_list {
                 // inform waiting servers to go on
-                if let Ok(client) = this.get_tnx_manager(server_id) {
-                    wake_up_futures.push(client.go_ahead(transactions, this.server.server_id));
-                } else {
-                    debug!(
-                        "cannot inform server {} to continue its transactions",
-                        server_id
-                    );
-                }
+                wake_up_futures.push(async move {
+                    if let Ok(client) = self.get_tnx_manager(server_id).await {
+                        debug!("WAKING UP {} for {:?}", server_id, transactions);
+                        client.go_ahead(transactions, self.server.server_id).await.unwrap();
+                    } else {
+                        debug!(
+                            "cannot inform server {} to continue its transactions",
+                            server_id
+                        );
+                    }
+                });
             }
-            future::join_all(wake_up_futures).then(move |_| {
-                if released_locks == affected_cells {
-                    this.response_with(EndResult::Success)
-                } else {
-                    this.response_with(EndResult::SomeLocksNotReleased)
-                }
-            })
-        };
-        box result.then(move |r| {
-            this_clone.wipe_out_transaction(&tid);
-            this_clone.cleanup_sender.lock().send(());
-            return r;
-        })
+        }
+        async move {
+            let _wake_up_res: Vec<_> = wake_up_futures.collect().await;
+            self.wipe_out_transaction(&tid);
+            self.cleanup_signal.store(true, Relaxed);
+            if released_locks == affected_cells {
+                debug!("ENDED: {:?} with all locks ({}) released", tid, released_locks);
+                self.response_with(EndResult::Success).await
+            } else {
+                warn!("ENDED: {:?} with SOME locks ({}/{}) NOT released", tid, released_locks, affected_cells);
+                self.response_with(EndResult::SomeLocksNotReleased).await
+            }
+        }.boxed()
     }
 }

@@ -1,11 +1,11 @@
-use index::btree::external::ExtNode;
-use index::btree::node::read_unchecked;
-use index::btree::node::NodeData;
-use index::btree::BPlusTree;
-use index::btree::NodeCellRef;
-use index::id_from_key;
-use index::EntryKey;
-use index::Slice;
+use crate::index::btree::external::ExtNode;
+use crate::index::btree::node::read_unchecked;
+use crate::index::btree::node::NodeData;
+use crate::index::btree::BPlusTree;
+use crate::index::btree::NodeCellRef;
+use crate::index::trees::id_from_key;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Slice;
 use itertools::Itertools;
 use serde_json;
 use std::fmt::Debug;
@@ -33,7 +33,7 @@ where
     let debug_root = cascading_dump_node::<KS, PS>(&tree.get_root());
     let json = serde_json::to_string_pretty(&debug_root).unwrap();
     let mut file = File::create(f).unwrap();
-    file.write_all(json.as_bytes());
+    file.write_all(json.as_bytes()).unwrap();
 }
 
 fn cascading_dump_node<KS, PS>(node: &NodeCellRef) -> DebugNode

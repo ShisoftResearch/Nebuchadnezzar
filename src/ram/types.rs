@@ -1,7 +1,11 @@
-use ram::cell::CellHeader;
-use utils::rand;
+use crate::ram::cell::CellHeader;
+use lightning::rand;
 
 pub use dovahkiin::types::*;
+
+lazy_static! {
+    static ref RAND_GEN: rand::XorRand = rand::XorRand::new(1024);
+}
 
 pub trait RandValue {
     fn rand() -> Self;
@@ -9,8 +13,7 @@ pub trait RandValue {
 
 impl RandValue for Id {
     fn rand() -> Self {
-        let (hi, lw) = rand::next_two();
-        Id::new(hi, lw)
+        Id::new(RAND_GEN.rand() as u64, RAND_GEN.rand() as u64)
     }
 }
 

@@ -1,7 +1,7 @@
 use itertools::Itertools;
-use ram::chunk::Chunk;
-use ram::entry::{Entry, EntryContent, EntryType};
-use ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use crate::ram::chunk::Chunk;
+use crate::ram::entry::EntryContent;
+use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE};
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -197,13 +197,13 @@ impl CombinedCleaner {
                 debug!("Putting new segment {}", segment.id);
                 let seg_ref = Arc::new(segment);
                 chunk.put_segment(seg_ref.clone());
-                seg_ref.archive();
+                seg_ref.archive().unwrap();
                 return cells;
             })
             .map(|(new, old, hash)| {
                 debug!("Reset cell {} ptr from {} to {}", hash, old, new);
                 let unstable_guard = chunk.unstable_cells.lock(hash);
-                if let Some(mut actual_addr) = chunk.index.get_mut(&hash) {
+                if let Some(mut actual_addr) = chunk.index.lock(&(hash as usize)) {
                     if *actual_addr == old {
                         *actual_addr = new
                     } else {

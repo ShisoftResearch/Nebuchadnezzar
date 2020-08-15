@@ -1,24 +1,16 @@
-use client::AsyncClient;
-use index::btree::NodeCellRef;
-use index::btree::{verification, LevelTree};
-use index::btree::{BPlusTree, RTCursor as BPlusTreeCursor};
-use index::key_with_id;
-use index::lsmtree::cursor::LSMTreeCursor;
-use index::lsmtree::placement::sm::InSplitStatus;
-use index::lsmtree::placement::sm::Placement;
-use index::lsmtree::split::check_and_split;
-use index::lsmtree::split::SplitStatus;
-use index::Cursor;
-use index::EntryKey;
-use index::Ordering;
-use index::*;
+use crate::client::AsyncClient;
+use crate::index::btree::NodeCellRef;
+use crate::index::btree::LevelTree;
+use crate::index::btree::BPlusTree;
+use crate::index::trees::*;
+use crate::index::lsmtree::cursor::LSMTreeCursor;
+use crate::index::lsmtree::placement::sm::InSplitStatus;
+use crate::index::lsmtree::placement::sm::Placement;
+use crate::index::lsmtree::split::SplitStatus;
 use itertools::Itertools;
 use parking_lot::Mutex;
-use parking_lot::RwLock;
-use ram::segs::MAX_SEGMENT_SIZE;
-use ram::types::Id;
-use rayon::iter::IntoParallelRefIterator;
-use std::collections::BTreeSet;
+use crate::ram::segs::MAX_SEGMENT_SIZE;
+use crate::ram::types::Id;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
@@ -35,7 +27,7 @@ pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-pub type LevelTrees = Vec<Box<LevelTree>>;
+pub type LevelTrees = Vec<Box<dyn LevelTree>>;
 pub type Ptr = NodeCellRef;
 pub type Key = EntryKey;
 pub type TreeLevels = (LevelTrees, Vec<usize>);
@@ -110,11 +102,25 @@ impl LSMTree {
         }
     }
 
-    pub fn insert(&self, mut key: EntryKey) -> bool {
+    pub fn new_with_level_ids(
+        range: KeyRange,
+        id: Id,
+        tree_ids: Vec<Id>,
+        neb: &AsyncClient,
+    ) -> Self {
+        let mut tree = Self::new(range, id);
+        debug_assert_eq!(tree.trees.len(), tree_ids.len());
+        tree.trees.iter_mut().zip(tree_ids).for_each(|(tree, id)| {
+            tree.from_tree_id(&id, neb);
+        });
+        tree
+    }
+
+    pub fn insert(&self, key: EntryKey) -> bool {
         self.trees[0].insert_into(&key)
     }
 
-    pub fn remove(&self, mut key: EntryKey, epoch: u64) -> bool {
+    pub fn remove(&self, key: EntryKey, _epoch: u64) -> bool {
         self.trees
             .iter()
             .map(|tree| tree.mark_key_deleted(&key))
@@ -124,7 +130,7 @@ impl LSMTree {
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
-        let mut cursors: Vec<Box<Cursor>> = vec![];
+        let mut cursors: Vec<Box<dyn Cursor>> = vec![];
         for tree in &self.trees {
             cursors.push(tree.seek_for(key, ordering));
         }
@@ -153,7 +159,7 @@ impl LSMTree {
             .spawn(move || loop {
                 this.check_and_merge();
                 thread::sleep(Duration::from_millis(500));
-            });
+            }).unwrap();
     }
 
     pub fn level_sizes(&self) -> Vec<usize> {

@@ -1,25 +1,14 @@
-use client::AsyncClient;
+use crate::client::AsyncClient;
 use dovahkiin::types::*;
-use futures::prelude::*;
-use index::btree::external::ExtNode;
-use index::btree::external::*;
-use index::btree::internal::InNode;
-use index::btree::node::{write_node, Node, NodeWriteGuard};
-use index::btree::remove::SubNodeStatus::InNodeEmpty;
-use index::btree::{external, max_entry_key, BPlusTree, DeletionSetInneer, NodeCellRef};
-use index::{EntryKey, Slice};
-use parking_lot::RwLock;
-use ram::cell::Cell;
+use crate::index::btree::external::ExtNode;
+use crate::index::btree::internal::InNode;
+use crate::index::btree::node::{write_node, Node, NodeWriteGuard};
+use crate::index::btree::{external, max_entry_key, BPlusTree, NodeCellRef};
+use crate::index::trees::{EntryKey, Slice};
 use std::cell::RefCell;
-use std::cmp::max;
-use std::collections::btree_set::BTreeSet;
 use std::fmt::Debug;
-use std::marker::PhantomData;
 use std::mem;
 use std::rc::Rc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
-use utils::chashmap::WriteGuard;
 
 pub struct TreeConstructor<KS, PS>
 where
@@ -57,7 +46,7 @@ where
             debug!("Creating new level {}", level);
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
             if level > 0 {
-                let mut left_node = left_node.unwrap();
+                let left_node = left_node.unwrap();
                 new_root_innode.ptrs.as_slice()[0] = left_node.node_ref().clone();
             } else {
                 new_tree = true;
@@ -128,7 +117,7 @@ where
     }
 }
 
-pub fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
+pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -139,7 +128,7 @@ where
     let mut id = head_id;
     let mut at_end = false;
     while !at_end {
-        let cell = neb.read_cell(id).wait().unwrap().unwrap();
+        let cell = neb.read_cell(id).await.unwrap().unwrap();
         let page = ExtNode::<KS, PS>::from_cell(&cell);
         let next_id = page.next_id;
         let prev_id = page.prev_id;

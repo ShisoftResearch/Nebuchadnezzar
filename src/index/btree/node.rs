@@ -1,12 +1,9 @@
 use super::*;
-use futures::future;
-use server;
+use crate::server;
 use std::any::TypeId;
-use std::collections::btree_set::BTreeSet;
-use std::sync::atomic::fence;
-use std::sync::atomic::Ordering::AcqRel;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
+use futures::FutureExt;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -332,9 +329,9 @@ pub trait AnyNode: Any + 'static {
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>>;
+        deletion: &DeletionSet,
+        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
+    ) -> BoxFuture<()>;
 }
 
 pub struct Node<KS, PS>
@@ -555,6 +552,20 @@ where
     }
 }
 
+unsafe impl <KS, PS> Send for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
+
+unsafe impl <KS, PS> Sync for NodeWriteGuard<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
+
 unsafe impl<KS, PS> Sync for Node<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -570,14 +581,26 @@ where
     fn persist(
         &self,
         node_ref: &NodeCellRef,
-        deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>> {
+        deletion: &DeletionSet,
+        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
+    ) -> BoxFuture<()> {
         let mut guard = write_node::<KS, PS>(node_ref);
-        match &mut *guard {
-            &mut NodeData::External(ref mut node) => node.persist(deletion, neb),
-            _ => box future::err(()),
-        }
+        let deletion = deletion.read();
+        let guard_ref = &mut *guard;
+        let cell = match guard_ref {
+            &mut NodeData::External(ref mut node) => {
+                node.prepare_persist(&*deletion)
+            },
+            _ => {
+                panic!("Cannot persist internal or other type of nodes")
+            },
+        };
+        let neb = neb.clone();
+        async move {
+            let _ = tokio::spawn(async move {
+                let _ = neb.upsert_cell(cell).await;
+            }).await;
+        }.boxed()
     }
 }
 

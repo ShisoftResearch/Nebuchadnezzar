@@ -1,14 +1,13 @@
-use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+ use byteorder::{ByteOrder, LittleEndian};
 use libc;
-use ram::cell::CellHeader;
-use ram::tombstone::Tombstone;
-use std::ptr;
+use crate::ram::cell::CellHeader;
+use crate::ram::tombstone::Tombstone;
 
 bitflags! {
     pub struct EntryType: u8 {
-        const Undecided =   0b0000_0000;
-        const Cell =        0b0001_0000;
-        const Tombstone =   0b0010_0000;
+        const UNDECIDED =   0b0000_0000;
+        const CELL =        0b0001_0000;
+        const TOMBSTONE =   0b0010_0000;
     }
 }
 

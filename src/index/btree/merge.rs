@@ -1,28 +1,16 @@
-use index::btree::external::ExtNode;
-use index::btree::insert::check_root_modification;
-use index::btree::internal::InNode;
-use index::btree::node::read_node;
-use index::btree::node::read_unchecked;
-use index::btree::node::write_node;
-use index::btree::node::write_non_empty;
-use index::btree::node::write_targeted;
-use index::btree::node::Node;
-use index::btree::node::NodeData;
-use index::btree::node::NodeReadHandler;
-use index::btree::search::mut_search;
-use index::btree::search::MutSearchResult;
-use index::btree::BPlusTree;
-use index::btree::NodeCellRef;
-use index::EntryKey;
-use index::Slice;
+use crate::index::btree::external::ExtNode;
+use crate::index::btree::node::read_unchecked;
+use crate::index::btree::node::write_node;
+use crate::index::btree::node::write_non_empty;
+use crate::index::btree::node::write_targeted;
+use crate::index::btree::search::mut_search;
+use crate::index::btree::search::MutSearchResult;
+use crate::index::btree::BPlusTree;
+use crate::index::btree::NodeCellRef;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Slice;
 use itertools::Itertools;
 use std::fmt::Debug;
-
-enum MergeSearch {
-    External,
-    Internal(NodeCellRef),
-    RightNode(NodeCellRef),
-}
 
 fn merge_into_internal<KS, PS>(
     node: &NodeCellRef,
@@ -93,7 +81,7 @@ where
                 let remain_slots = KS::slice_len() - current_guard.len();
                 ExtNode::<KS, PS>::make_changed(current_guard.node_ref(), tree);
                 if remain_slots > 0 {
-                    let mut ext_node = current_guard.extnode_mut();
+                    let ext_node = current_guard.extnode_mut();
                     ext_node.remove_contains(&mut *tree.deleted.write());
                     let selection = keys[merging_pos..keys_len]
                         .iter()

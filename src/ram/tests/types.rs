@@ -1,5 +1,4 @@
-use neb::ram::chunk;
-use neb::ram::types;
+use crate::ram::types;
 
 pub const CHUNK_SIZE: usize = 2048;
 
@@ -9,8 +8,8 @@ macro_rules! test_nums {
     ) => {
         mod $t {
             use super::CHUNK_SIZE;
-            use neb::ram::chunk::Chunks;
-            use neb::ram::types;
+            use crate::ram::chunk::Chunks;
+            use crate::ram::types;
             use rand;
             use std;
             #[test]
@@ -54,15 +53,13 @@ test_nums!(u16, u16_io);
 test_nums!(u32, u32_io);
 test_nums!(u64, u64_io);
 
-test_nums!(isize, isize_io);
-test_nums!(usize, usize_io);
 test_nums!(f32, f32_io);
 test_nums!(f64, f64_io);
 
 mod pos2d32 {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
     use rand;
     use std;
     #[test]
@@ -96,8 +93,8 @@ mod pos2d32 {
 
 mod pos2d64 {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
     use rand;
     use std;
     #[test]
@@ -131,8 +128,8 @@ mod pos2d64 {
 
 mod pos3d32 {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
     use rand;
     use std;
     #[test]
@@ -168,8 +165,8 @@ mod pos3d32 {
 
 mod pos3d64 {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
     use rand;
     use std;
     #[test]
@@ -205,9 +202,9 @@ mod pos3d64 {
 
 mod uuid {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
-    use neb::ram::types::Id;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
+    use crate::ram::types::Id;
     #[test]
     fn test() {
         let test_data = vec![Id {
@@ -233,8 +230,8 @@ mod uuid {
 
 mod string {
     use super::CHUNK_SIZE;
-    use neb::ram::chunk::Chunks;
-    use neb::ram::types;
+    use crate::ram::chunk::Chunks;
+    use crate::ram::types;
     use std::string::String;
     #[test]
     fn test() {
@@ -243,7 +240,7 @@ mod string {
             "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ",
             "中文测试文本",
             "Hello Test",
-            "💖",
+            "🏳️‍🌈",
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let mut addr = chunk.segments()[0].addr;

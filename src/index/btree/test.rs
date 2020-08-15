@@ -1,27 +1,18 @@
 use super::*;
-use bifrost::utils::fut_exec::wait;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
-use client;
 use dovahkiin::types::custom_types::id::Id;
-use futures::future::Future;
-use hermes::stm::TxnValRef;
-use index::btree::dump::dump_tree;
-use index::btree::node::*;
-use index::btree::reconstruct::TreeConstructor;
-use index::btree::NodeCellRef;
-use index::btree::NodeData;
-use index::Cursor;
-use index::EntryKey;
-use index::{id_from_key, key_with_id};
+use crate::index::btree::dump::dump_tree;
+use crate::index::btree::reconstruct::TreeConstructor;
+use crate::index::btree::NodeCellRef;
+use crate::index::trees::Cursor;
+use crate::index::trees::EntryKey;
+use crate::index::trees::{id_from_key, key_with_id};
 use itertools::Itertools;
-use ram::types::RandValue;
+use crate::ram::types::RandValue;
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rayon::prelude::*;
-use server;
-use server::NebServer;
-use server::ServerOptions;
 use smallvec::SmallVec;
 use std::env;
 use std::fs::File;
@@ -31,6 +22,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rand::seq::SliceRandom;
 
 extern crate env_logger;
 
@@ -55,7 +47,7 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
     {
         let mut cursor = StdCursor::new(&mut key_slice[..]);
-        cursor.write_u64::<BigEndian>(n);
+        cursor.write_u64::<BigEndian>(n).unwrap();
     };
     key_slice
 }
@@ -71,7 +63,7 @@ fn node_size() {
 
 #[test]
 fn init() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let id = Id::unit_id();
     let key = smallvec![1, 2, 3, 4, 5, 6];
@@ -101,11 +93,11 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 
 #[test]
 fn crd() {
-    use index::Cursor;
-    env_logger::init();
+    use crate::index::trees::Cursor;
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
-    ::std::fs::remove_dir_all("dumps");
-    ::std::fs::create_dir_all("dumps");
+    std::fs::remove_dir_all("dumps").unwrap();
+    std::fs::create_dir_all("dumps").unwrap();
     let num = env::var("BTREE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
         .parse::<u64>()
@@ -117,10 +109,10 @@ fn crd() {
     {
         info!("test insertion");
         let mut nums = (0..num).collect_vec();
-        thread_rng().shuffle(nums.as_mut_slice());
+        nums.as_mut_slice().shuffle(&mut rng);
         let json = serde_json::to_string(&nums).unwrap();
         let mut file = File::create("nums_dump.json").unwrap();
-        file.write_all(json.as_bytes());
+        file.write_all(json.as_bytes()).unwrap();
         let mut i = 0;
         for n in nums {
             let id = Id::new(0, n);
@@ -306,14 +298,14 @@ fn crd() {
     //
     //        tree.flush_all();
     //        assert_eq!(tree.len(), 0);
-    // assert_eq!(client.count().wait().unwrap(), 1);
+    // assert_eq!(client.count().await.unwrap(), 1);
     //    }
 }
 
 #[test]
 pub fn alternative_insertion_pattern() {
-    use index::Cursor;
-    env_logger::init();
+    use crate::index::trees::Cursor;
+    let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -333,7 +325,7 @@ pub fn alternative_insertion_pattern() {
 
     assert!(verification::is_tree_in_order(&tree, 0));
 
-    let mut rng = thread_rng();
+    let rng = thread_rng();
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
     for i in 0..num {
@@ -359,7 +351,7 @@ pub fn alternative_insertion_pattern() {
 
 #[test]
 fn parallel() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LevelBPlusTree::new());
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -379,9 +371,9 @@ fn parallel() {
             tree_len as f32 / num as f32 * 100.0
         );
     });
-
+    let mut rng = rand::thread_rng();
     let mut nums = (0..num).collect_vec();
-    thread_rng().shuffle(nums.as_mut_slice());
+    nums.as_mut_slice().shuffle(&mut rng);
     nums.par_iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);
@@ -396,8 +388,7 @@ fn parallel() {
 
     assert!(verification::is_tree_in_order(&*tree, 0));
 
-    thread_rng().shuffle(nums.as_mut_slice());
-    let mut rng = rand::rngs::OsRng::new().unwrap();
+    nums.as_mut_slice().shuffle(&mut rng);
     let die_range = Uniform::new_inclusive(1, 6);
     let roll_die = RwLock::new(rng.sample_iter(&die_range));
     (0..num).collect::<Vec<_>>().iter().for_each(|i| {
@@ -462,7 +453,7 @@ type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 
 #[test]
 fn level_merge() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let range = 1000;
     let tree_1 = Arc::new(TinyLevelBPlusTree::new());
     let tree_2 = Arc::new(LevelBPlusTree::new());
@@ -531,13 +522,13 @@ fn level_merge() {
 
 #[test]
 fn level_merge_insertion() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let range = 10000;
     let nums = range * 3;
     let tree = Arc::new(TinyLevelBPlusTree::new());
     let mut numbers = (0..nums).collect_vec();
     let mut rng = thread_rng();
-    rng.shuffle(numbers.as_mut());
+    numbers.as_mut_slice().shuffle(&mut rng);
     let tree_nums = numbers.as_slice()[0..range].iter().cloned().collect_vec();
     let merge_nums = numbers.as_slice()[range..range * 2]
         .iter()
@@ -587,8 +578,8 @@ fn level_merge_insertion() {
     let th2 = thread::spawn(move || {
         tree_3.merge_with_keys(merge_keys);
     });
-    th1.join();
-    th2.join();
+    th1.join().unwrap();
+    th2.join().unwrap();
 
     dump_tree(&tree, "lsm-tree_level_merge_insert_ins_dump.json");
     assert!(verification::is_tree_in_order(&*tree, 0));
@@ -607,19 +598,7 @@ fn level_merge_insertion() {
 
 #[test]
 fn reconstruct() {
-    env_logger::init();
-    let server_addr = String::from("127.0.0.1:5800");
-    let server = NebServer::new_from_opts(
-        &ServerOptions {
-            chunk_count: 1,
-            memory_size: 3 * 1024 * 1024 * 1024,
-            backup_storage: None,
-            wal_storage: None,
-            services: vec![server::Service::Cell, server::Service::LSMTreeIndex],
-        },
-        &server_addr,
-        "reconstruct_test",
-    );
+    let _ = env_logger::try_init();
     let num = env::var("BTREE_RECONSTRUCT_TEST")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -650,7 +629,7 @@ fn reconstruct() {
             .into_iter()
             .map(|n| NodeCellRef::new(Node::with_external(n)))
             .collect_vec();
-        nodes.iter().enumerate().for_each(|(i, nr)| {
+        nodes.iter().enumerate().for_each(|(i, _nr)| {
             if i == 0 {
                 return;
             }

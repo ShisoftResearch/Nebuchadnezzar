@@ -1,21 +1,12 @@
-use super::super::chunk::{Chunk, Chunks};
+use super::super::chunk::Chunk;
 use super::super::segs::Segment;
-use super::*;
-use dovahkiin::types::Id;
-use ram::cell::{Cell, CellHeader};
-use ram::entry::*;
-use ram::tombstone::Tombstone;
+use crate::ram::entry::*;
 
-use std::collections::BTreeSet;
-use std::collections::Bound::{Included, Unbounded};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use itertools::Itertools;
 use libc;
-use parking_lot::MutexGuard;
 
 pub struct CompactCleaner;
 
@@ -97,7 +88,7 @@ impl CompactCleaner {
                 cursor += entry_size;
                 return result;
             })
-            .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::Cell)
+            .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::CELL)
             .map(|(entry, new_addr)| {
                 let header = entry.content.as_cell_header();
                 debug!(
@@ -105,7 +96,7 @@ impl CompactCleaner {
                     header.id()
                 );
                 let unstable_guard = chunk.unstable_cells.lock(header.hash);
-                if let Some(mut cell_guard) = chunk.index.get_mut(&header.hash) {
+                if let Some(mut cell_guard) = chunk.index.lock(&(header.hash as usize)) {
                     let old_addr = entry.meta.entry_pos;
                     if *cell_guard == old_addr {
                         *cell_guard = new_addr;

@@ -1,56 +1,37 @@
-use bifrost::utils::fut_exec::wait;
-use bifrost_hasher::hash_bytes;
-use byteorder::{LittleEndian, WriteBytesExt};
-use client::AsyncClient;
-use dovahkiin::types;
+use crate::client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::{key_hash, Map, PrimitiveArray, ToValue, Value};
-use futures::Future;
-use hermes::stm::{Txn, TxnErr, TxnManager, TxnValRef};
-pub use index::btree::cursor::*;
-pub use index::btree::external::page_schema;
-use index::btree::external::*;
-use index::btree::insert::*;
-use index::btree::internal::*;
-use index::btree::merge::merge_into_tree_node;
-pub use index::btree::node::*;
-use index::btree::remove::*;
-use index::btree::search::*;
-use index::btree::split::remove_to_right;
-use index::Cursor;
-use index::EntryKey;
-use index::Slice;
-use index::KEY_SIZE;
-use index::MAX_KEY_SIZE;
-use index::{Cursor as IndexCursor, Ordering};
-use itertools::{chain, Itertools};
+use dovahkiin::types::{key_hash, PrimitiveArray, Value};
+pub use crate::index::btree::cursor::*;
+pub use crate::index::btree::external::page_schema;
+use crate::index::btree::external::*;
+use crate::index::btree::insert::*;
+use crate::index::btree::internal::*;
+use crate::index::btree::merge::merge_into_tree_node;
+pub use crate::index::btree::node::*;
+use crate::index::btree::remove::*;
+use crate::index::btree::search::*;
+use crate::index::btree::split::remove_to_right;
+use crate::index::trees::Cursor;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Slice;
+use crate::index::trees::MAX_KEY_SIZE;
+use crate::index::trees::{Cursor as IndexCursor, Ordering};
+use itertools::Itertools;
 use parking_lot::RwLock;
-use ram::cell::Cell;
-use ram::types::RandValue;
-use smallvec::SmallVec;
+use crate::ram::types::RandValue;
 use std::any::Any;
-use std::cell::Ref;
-use std::cell::RefCell;
-use std::cell::RefMut;
 use std::cell::UnsafeCell;
-use std::cmp::{max, min};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
-use std::fmt::Error;
-use std::fmt::Formatter;
-use std::io::Write;
 use std::iter;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ops::Range;
 use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
-use utils::lru_cache::LRUCache;
-use {server, std};
+use futures::future::BoxFuture;
 
 pub mod verification;
 
@@ -68,7 +49,6 @@ mod search;
 mod split;
 pub mod storage;
 
-const CACHE_SIZE: usize = 2048;
 pub type DeletionSetInneer = HashSet<EntryKey>;
 pub type DeletionSet = Arc<RwLock<DeletionSetInneer>>;
 
@@ -134,8 +114,8 @@ where
         return tree;
     }
 
-    pub fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb)
+    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
+        reconstruct::reconstruct_from_head_id(*head_id, neb).await
     }
 
     pub fn from_root(root: NodeCellRef, head_id: Id, len: usize) -> Self {
@@ -158,13 +138,19 @@ where
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
+        // check returning deleted key
+        if self.deleted.read().contains(key) {
+            let mut deleted = self.deleted.write();
+            deleted.remove(key);
+        }
+
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
                 let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
-                let mut old_root = self.get_root().clone();
+                let old_root = self.get_root().clone();
                 new_in_root.keys.as_slice()[0] = pivot;
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
@@ -265,10 +251,10 @@ where
 pub trait LevelTree {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to(&self, upper_level: &LevelTree) -> usize;
+    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<Cursor>;
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
@@ -276,6 +262,7 @@ pub trait LevelTree {
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
+    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient);
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -291,23 +278,23 @@ where
         self.len()
     }
 
-    fn merge_to(&self, upper_level: &LevelTree) -> usize {
+    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize {
         level::level_merge(self, upper_level)
     }
 
-    fn merge_with_keys(&self, keys: Box<Vec<SmallVec<[u8; 32]>>>) {
+    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
         self.merge_with_keys_(keys)
     }
 
-    fn insert_into(&self, key: &SmallVec<[u8; 32]>) -> bool {
+    fn insert_into(&self, key: &EntryKey) -> bool {
         self.insert(key)
     }
 
-    fn seek_for(&self, key: &SmallVec<[u8; 32]>, ordering: Ordering) -> Box<Cursor> {
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
         box self.seek(key, ordering)
     }
 
-    fn mark_key_deleted(&self, key: &SmallVec<[u8; 32]>) -> bool {
+    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
         if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
             if seek_key == key {
                 return self.deleted.write().insert(key.clone());
@@ -324,7 +311,7 @@ where
         split::mid_key::<KS, PS>(&self.get_root())
     }
 
-    fn remove_following_tombstones(&self, start: &SmallVec<[u8; 32]>) {
+    fn remove_following_tombstones(&self, start: &EntryKey) {
         let mut tombstones = self.deleted.write();
         let original_tombstones = mem::replace(&mut *tombstones, DeletionSetInneer::new());
         *tombstones = original_tombstones
@@ -333,7 +320,7 @@ where
             .collect();
     }
 
-    fn remove_to_right(&self, start_key: &SmallVec<[u8; 32]>) -> usize {
+    fn remove_to_right(&self, start_key: &EntryKey) -> usize {
         let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
         self.len.fetch_sub(removed, Relaxed);
         removed
@@ -346,20 +333,24 @@ where
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
     }
+
+    fn from_tree_id(&mut self, _head_id: &Id, _neb: &AsyncClient){
+        unimplemented!()
+    }
 }
 
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);
 impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
+#[allow(unused_macros)]
 macro_rules! impl_btree_level {
     ($items: expr) => {
         impl_slice_ops!([EntryKey; $items], EntryKey, $items);
         impl_slice_ops!([NodeCellRef; $items + 1], NodeCellRef, $items + 1);
     };
 }
-
 pub struct NodeCellRef {
-    inner: Arc<AnyNode>,
+    inner: Arc<dyn AnyNode>,
 }
 
 unsafe impl Send for NodeCellRef {}
@@ -427,9 +418,9 @@ impl NodeCellRef {
 
     pub fn persist(
         &self,
-        deletion: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>> {
+        deletion: &DeletionSet,
+        neb: &Arc<crate::server::cell_rpc::AsyncServiceClient>,
+    ) -> BoxFuture<()> {
         self.inner.persist(self, deletion, neb)
     }
 

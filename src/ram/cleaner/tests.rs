@@ -1,23 +1,15 @@
 use super::*;
 use env_logger;
-use neb::ram::cell;
-use neb::ram::cell::*;
-use neb::ram::chunk::Chunk;
-use neb::ram::chunk::Chunks;
-use neb::ram::cleaner::Cleaner;
-use neb::ram::cleaner::*;
-use neb::ram::entry::{EntryContent, EntryType};
-use neb::ram::io::writer;
-use neb::ram::schema::Field;
-use neb::ram::schema::*;
-use neb::ram::tombstone::Tombstone;
-use neb::ram::types;
-use neb::ram::types::*;
-use neb::server::ServerMeta;
+use crate::ram::cell::*;
+use crate::ram::chunk::Chunk;
+use crate::ram::chunk::Chunks;
+use crate::ram::entry::{EntryContent, EntryType};
+use crate::ram::schema::Field;
+use crate::ram::schema::*;
+use crate::ram::types::*;
+use crate::server::ServerMeta;
 use std;
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 pub const DATA_SIZE: usize = 1000 * 1024; // nearly 1MB
@@ -38,9 +30,10 @@ fn default_fields() -> Field {
         false,
         false,
         Some(vec![
-            Field::new("id", type_id_of(Type::I32), false, false, None),
-            Field::new("data", type_id_of(Type::U8), false, true, None),
+            Field::new("id", type_id_of(Type::I32), false, false, None, vec![]),
+            Field::new("data", type_id_of(Type::U8), false, true, None, vec![]),
         ]),
+        vec![],
     )
 }
 
@@ -55,9 +48,9 @@ fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
 
 #[test]
 pub fn full_clean_cycle() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let schema = Schema::new("cleaner_test", None, default_fields(), false);
-    let schemas = LocalSchemasCache::new("", None).unwrap();
+    let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema);
     let chunks = Chunks::new(
         1,                    // single chunk
@@ -83,10 +76,9 @@ pub fn full_clean_cycle() {
 
         println!("trying to delete cells");
 
-        let all_seg_positions = seg_positions(chunk);
-        let all_cell_addresses = chunk.cell_addresses();
+        let all_seg_positions = seg_positions(chunk);();
         assert_eq!(all_seg_positions.len(), 2);
-        assert_eq!(all_cell_addresses.len(), 16);
+        assert_eq!(chunk.cell_count(), 16);
 
         for i in 0..8 {
             chunks.remove_cell(&Id::new(0, i * 2)).unwrap();
@@ -100,18 +92,18 @@ pub fn full_clean_cycle() {
 
         // try to scan first segment expect no panic
         println!("Scanning first segment...");
-        chunk.live_entries(&chunk.segs.get(&0).unwrap());
+        chunk.live_entries(&chunk.segs.get(&0).unwrap()).for_each(|_|{});
 
         println!("Scanning second segment for tombstones...");
         let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
         let tombstones: Vec<_> = live_entries
-            .filter(|e| e.meta.entry_header.entry_type == EntryType::Tombstone)
+            .filter(|e| e.meta.entry_header.entry_type == EntryType::TOMBSTONE)
             .collect();
         assert_eq!(tombstones.len(), 8);
         for i in 0..tombstones.len() {
             let hash = (i * 2) as u64;
             let e = &tombstones[i];
-            assert_eq!(e.meta.entry_header.entry_type, EntryType::Tombstone);
+            assert_eq!(e.meta.entry_header.entry_type, EntryType::TOMBSTONE);
             if let EntryContent::Tombstone(ref t) = e.content {
                 assert_eq!(t.hash, hash);
                 assert_eq!(t.partition, 0);
@@ -120,16 +112,16 @@ pub fn full_clean_cycle() {
             }
         }
 
-        assert_eq!(chunk.cell_addresses().len(), 8);
+        assert_eq!(chunk.cell_count(), 8);
 
         chunk.apply_dead_entry();
     }
 
     // check integrity
-    chunk
+    let _ = chunk
         .live_entries(&chunk.segs.get(&0).unwrap())
         .collect::<Vec<_>>();
-    chunk
+    let _ = chunk
         .live_entries(&chunk.segs.get(&1).unwrap())
         .collect::<Vec<_>>();
 
@@ -140,10 +132,9 @@ pub fn full_clean_cycle() {
             compact::CompactCleaner::clean_segment(chunk, &seg);
         });
 
-        let compacted_seg_positions = seg_positions(chunk);
-        let compacted_cell_addresses = chunk.cell_addresses();
+        let compacted_seg_positions = seg_positions(chunk);();
         assert_eq!(compacted_seg_positions.len(), 2);
-        assert_eq!(compacted_cell_addresses.len(), 8);
+        assert_eq!(chunk.cell_count(), 8);
 
         // scan segments to check entries
         let seg0 = &chunk.segs.get(&0).unwrap();
@@ -161,7 +152,7 @@ pub fn full_clean_cycle() {
             .iter()
             .zip(compacted_segment_0_ids)
             .for_each(|(entry, hash)| {
-                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                 if let EntryContent::Cell(header) = entry.content {
                     assert_eq!(header.hash, hash)
                 } else {
@@ -178,7 +169,7 @@ pub fn full_clean_cycle() {
             .for_each(|(entry, hash)| {
                 if hash > 1 {
                     // cell
-                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                     if let EntryContent::Cell(header) = entry.content {
                         assert_eq!(header.hash, hash as u64)
                     } else {
@@ -186,7 +177,7 @@ pub fn full_clean_cycle() {
                     }
                 } else {
                     // tombstone
-                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::Tombstone);
+                    assert_eq!(entry.meta.entry_header.entry_type, EntryType::TOMBSTONE);
                     let tombstone = if let EntryContent::Tombstone(ref tombstone) = entry.content {
                         tombstone
                     } else {
@@ -206,7 +197,7 @@ pub fn full_clean_cycle() {
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
             .map(|entry| {
-                assert_eq!(entry.meta.entry_header.entry_type, EntryType::Cell);
+                assert_eq!(entry.meta.entry_header.entry_type, EntryType::CELL);
                 if let EntryContent::Cell(ref header) = entry.content {
                     return header.hash;
                 } else {

@@ -1,37 +1,19 @@
-use bifrost::utils::async_locks::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use bifrost::utils::fut_exec::wait;
-use client::AsyncClient;
-use core::borrow::BorrowMut;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
-use futures::future;
-use futures::Future;
-use index::btree::*;
-use index::EntryKey;
-use index::Slice;
+use crate::index::btree::*;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Slice;
 use itertools::Itertools;
-use owning_ref::{OwningHandle, OwningRef, RcRef};
-use ram::cell::Cell;
-use ram::schema::{Field, Schema};
-use ram::types::*;
-use server;
-use std::cell::Ref;
+use crate::ram::cell::Cell;
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::*;
 use std::cell::RefCell;
-use std::cell::RefMut;
-use std::cell::UnsafeCell;
-use std::collections::btree_set::BTreeSet;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::ops::Deref;
-use std::ops::DerefMut;
-use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::{mem, panic};
-use utils::lru_cache::LRUCache;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -70,15 +52,6 @@ where
     pub mark: PhantomData<PS>,
 }
 
-pub struct ExtNodeSplit<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    pub node_2: ExtNode<KS, PS>,
-    pub keys_1_len: usize,
-}
-
 impl<KS, PS> ExtNode<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -104,7 +77,7 @@ where
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
         let _keys_len = keys.len().unwrap();
-        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+        let keys_array = if let Value::PrimArray(PrimitiveArray::Bytes(ref array)) = keys {
             array
         } else {
             panic!()
@@ -280,6 +253,7 @@ where
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
         if self.len > pos && self.keys.as_slice_immute()[pos] == key {
+            debug!("inserting existing key");
             return None;
         }
         Some(if self.len == KS::slice_len() {
@@ -417,20 +391,15 @@ where
         });
     }
 
-    pub fn persist(
+    pub fn prepare_persist(
         &mut self,
-        deleted: &DeletionSetInneer,
-        neb: &server::cell_rpc::AsyncServiceClient,
-    ) -> Box<Future<Item = (), Error = ()>> {
+        deleted: &DeletionSetInneer
+    ) -> Cell {
         if self.is_dirty() {
             self.dirty = false; // TODO: unset dirty after upsert
-            let cell = self.to_cell(deleted);
-            box neb.upsert_cell(cell).map_err(|_| ()).map(|r| {
-                r.unwrap();
-                ()
-            })
+            self.to_cell(deleted)
         } else {
-            box future::err(())
+            panic!()
         }
     }
 }
@@ -458,10 +427,18 @@ pub fn page_schema() -> Schema {
             false,
             false,
             Some(vec![
-                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None),
-                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None),
-                Field::new(KEYS_FIELD, type_id_of(Type::SmallBytes), false, true, None),
+                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
+                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
+                Field::new(
+                    KEYS_FIELD,
+                    type_id_of(Type::SmallBytes),
+                    false,
+                    true,
+                    None,
+                    vec![],
+                ),
             ]),
+            vec![],
         ),
     }
 }

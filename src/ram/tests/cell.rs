@@ -1,12 +1,9 @@
-use neb::ram::cell;
-use neb::ram::cell::*;
-use neb::ram::chunk::Chunks;
-use neb::ram::io::writer;
-use neb::ram::schema::*;
-use neb::ram::types::*;
+use crate::ram::cell::*;
+use crate::ram::chunk::Chunks;
+use crate::ram::schema::*;
+use crate::ram::types::*;
 
 use super::*;
-use std::mem;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -34,7 +31,7 @@ pub fn cell_rw() {
         header: CellHeader::new(0, schema.id, &id1),
         data,
     };
-    let mut loc = cell.write_to_chunk(&chunk);
+    let mut loc = cell.write_to_chunk(&chunk, false);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
@@ -52,7 +49,7 @@ pub fn cell_rw() {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
-    loc = cell.write_to_chunk(&chunk);
+    loc = cell.write_to_chunk(&chunk, false);
     let cell_2_ptr = loc.unwrap();
 
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
@@ -96,7 +93,7 @@ pub fn dynamic() {
         header: CellHeader::new(0, schema.id, &id1),
         data,
     };
-    let mut loc = cell.write_to_chunk(&chunk);
+    let mut loc = cell.write_to_chunk(&chunk, false);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
@@ -118,7 +115,7 @@ pub fn dynamic() {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
-    loc = cell.write_to_chunk(&chunk);
+    loc = cell.write_to_chunk(&chunk, false);
     let cell_2_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();

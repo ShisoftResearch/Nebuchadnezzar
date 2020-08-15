@@ -7,8 +7,8 @@ where
 {
     capacity: usize,
     map: LinkedHashMap<K, V>,
-    fetch_fn: Box<Fn(&K) -> Option<V>>,
-    evict_fn: Box<Fn(K, V)>,
+    fetch_fn: Box<dyn Fn(&K) -> Option<V>>,
+    evict_fn: Box<dyn Fn(K, V)>,
 }
 
 impl<K, V> LRUCache<K, V>

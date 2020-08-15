@@ -1,15 +1,14 @@
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use ram::chunk::Chunk;
-use ram::clock;
-use ram::entry::*;
-use ram::io::{reader, writer};
-use ram::mem_cursor::*;
-use ram::schema::{Field, Schema};
-use ram::types::{Id, Map, RandValue, Value};
+use crate::ram::chunk::Chunk;
+use crate::ram::clock;
+use crate::ram::entry::*;
+use crate::ram::io::{reader, writer};
+use crate::ram::mem_cursor::*;
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::{Id, Map, RandValue, Value};
 use serde::Serialize;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor};
 use std::ops::{Index, IndexMut};
-use std::ptr;
 use std::sync::Arc;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
@@ -142,7 +141,7 @@ impl Cell {
             return Err(ReadError::CellIdIsUnitId);
         }
         let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
-            assert_eq!(entry_header.entry_type, EntryType::Cell);
+            assert_eq!(entry_header.entry_type, EntryType::CELL);
             let header = Self::cell_header_from_entry_content_addr(addr, &entry_header);
             (header, addr + CELL_HEADER_SIZE)
         });
@@ -156,7 +155,7 @@ impl Cell {
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             Ok(Cell {
                 header,
-                data: reader::read_by_schema(data_ptr, &schema),
+                data: reader::read_by_schema(data_ptr, &*schema),
             })
         } else {
             error!("Schema {} does not existed to read", schema_id);
@@ -171,19 +170,25 @@ impl Cell {
         let (header, data_ptr) = Cell::header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            Ok(reader::read_by_schema_selected(data_ptr, &schema, fields))
+            Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))
         } else {
             error!("Schema {} does not existed to read", schema_id);
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
+    
+    //TODO: optimize for update
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, _update: bool) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            return self.write_to_chunk_with_schema(chunk, &schema);
+            let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
+            if write_result.is_ok() {
+                // index::client::make_indices(self, &*schema, update);
+            }
+            write_result
         } else {
             error!("Schema {} does not existed to write", schema_id);
-            return Err(WriteError::SchemaDoesNotExisted(schema_id));
+            Err(WriteError::SchemaDoesNotExisted(schema_id))
         }
     }
     pub fn write_to_chunk_with_schema(
@@ -220,18 +225,18 @@ impl Cell {
                 let addr = pending_entry.addr;
                 Entry::encode_to(
                     addr,
-                    EntryType::Cell,
+                    EntryType::CELL,
                     entry_body_size as u32,
                     len_bytes,
                     move |content_addr| {
                         // write cell header
                         let header = &self.header;
                         let mut cursor = addr_to_header_cursor(content_addr);
-                        cursor.write_u64::<Endian>(header.version);
-                        cursor.write_u32::<Endian>(header.timestamp);
-                        cursor.write_u32::<Endian>(header.schema);
-                        cursor.write_u64::<Endian>(header.partition);
-                        cursor.write_u64::<Endian>(header.hash);
+                        cursor.write_u64::<Endian>(header.version).unwrap();
+                        cursor.write_u32::<Endian>(header.timestamp).unwrap();
+                        cursor.write_u32::<Endian>(header.schema).unwrap();
+                        cursor.write_u64::<Endian>(header.partition).unwrap();
+                        cursor.write_u64::<Endian>(header.hash).unwrap();
                         release_cursor(cursor);
                         writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
                     },

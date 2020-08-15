@@ -1,16 +1,11 @@
 use super::*;
 use env_logger;
-use neb::ram::cell;
-use neb::ram::cell::*;
-use neb::ram::chunk::Chunks;
-use neb::ram::cleaner::Cleaner;
-use neb::ram::io::writer;
-use neb::ram::schema::*;
-use neb::ram::types;
-use neb::ram::types::*;
-use neb::server::ServerMeta;
+use crate::ram::cell::*;
+use crate::ram::chunk::Chunks;
+use crate::ram::schema::*;
+use crate::ram::types::*;
+use crate::server::ServerMeta;
 use std;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -27,7 +22,7 @@ pub fn round_robin_segment() {
 
 #[test]
 pub fn cell_rw() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     info!("START");
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
@@ -38,7 +33,7 @@ pub fn cell_rw() {
     data_map.insert(&String::from("score"), Value::U64(70));
     data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
     let mut data = Value::Map(data_map);
-    let schemas = LocalSchemasCache::new("", None).unwrap();
+    let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),

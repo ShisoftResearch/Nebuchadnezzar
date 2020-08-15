@@ -1,13 +1,8 @@
-use bifrost::utils::async_locks::{RwLock, RwLockReadGuard};
 use libc;
 use parking_lot;
-use ram::cell;
-use ram::cell::Cell;
-use ram::chunk::Chunk;
-use ram::entry;
-use ram::entry::EntryMeta;
-use ram::tombstone::{Tombstone, TOMBSTONE_SIZE_U32};
-use std::collections::BTreeSet;
+use crate::ram::entry;
+use crate::ram::entry::EntryMeta;
+use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
 use std::io::prelude::*;
@@ -15,7 +10,6 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
-use super::cell::CellHeader;
 
 pub const MAX_SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const MAX_SEGMENT_SIZE: usize = MAX_SEGMENT_SIZE_U32 as usize;
@@ -48,7 +42,7 @@ impl Segment {
         let mut wal_file_name = None;
         let mut wal_file = None;
         if let Some(wal_storage) = wal_storage {
-            create_dir_all(wal_storage);
+            create_dir_all(wal_storage).unwrap();
             let file_name = format!("{}/{}.log", wal_storage, id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
@@ -176,8 +170,8 @@ impl Segment {
                     // this should be redundant but I don't want to take the chance
                     // obtain the writer lock before continue
                     let _ = file_mutex.lock();
-                    copy(wal_file, backup_file);
-                    remove_file(wal_file);
+                    copy(wal_file, backup_file)?;
+                    remove_file(wal_file)?;
                 } else {
                     panic!()
                 }

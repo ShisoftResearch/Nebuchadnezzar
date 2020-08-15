@@ -1,16 +1,18 @@
-use ram::cell::CellHeader;
-use ram::chunk::Chunks;
-use ram::tombstone::Tombstone;
+use crate::ram::chunk::Chunks;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use lightning::map::Map;
 
 pub mod combine;
 pub mod compact;
+#[cfg(test)]
+mod tests;
 
+#[allow(dead_code)]
 pub struct Cleaner {
     chunks: Arc<Chunks>,
     stopped: Arc<AtomicBool>,
@@ -31,17 +33,18 @@ impl Cleaner {
             .unwrap_or("100".to_string())
             .parse::<u64>()
             .unwrap();
+        // Put follwing procedures in separate threads for real-time scheduling
         thread::Builder::new()
             .name("Cleaner sweeper".into())
             .spawn(move || {
                 while !stop_tag.load(Ordering::Relaxed) {
-                    debug!("Apply dead entry");
+                    trace!("Apply dead entry");
                     chunks.list.par_iter().for_each(|chunk| {
                         chunk.apply_dead_entry();
                     });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
-            });
+            }).unwrap();
         thread::Builder::new()
             .name("Cleaner main".into())
             .spawn(move || {
@@ -103,7 +106,7 @@ impl Cleaner {
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");
-            });
+            }).unwrap();
         return cleaner;
     }
 }

@@ -1,30 +1,18 @@
-use super::*;
-use byteorder::BigEndian;
-use byteorder::WriteBytesExt;
-use client;
-use futures::prelude::*;
-use index::btree;
-use index::btree::min_entry_key;
-use index::btree::test::u64_to_slice;
-use index::key_with_id;
-use index::lsmtree::tree::KeyRange;
-use index::lsmtree::tree::LSMTree;
-use index::Cursor;
-use index::Ordering;
+use crate::index::btree::min_entry_key;
+use crate::index::btree::test::u64_to_slice;
+use crate::index::trees::*;
+use crate::index::lsmtree::tree::KeyRange;
+use crate::index::lsmtree::tree::LSMTree;
 use itertools::Itertools;
-use ram::types::Id;
-use rand::distributions::Uniform;
+use crate::ram::types::Id;
 use rand::thread_rng;
-use rand::Rng;
-use rayon::prelude::*;
-use server::NebServer;
-use server::ServerOptions;
 use smallvec::SmallVec;
 use std::env;
-use std::io::Cursor as StdCursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use rayon::prelude::*;
+use rand::seq::SliceRandom;
 
 fn dump_trees(lsm_tree: &LSMTree, name: &str) {
     for i in 0..lsm_tree.trees.len() {
@@ -38,7 +26,7 @@ fn default_key_range() -> KeyRange {
 
 #[test]
 pub fn insertions() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -104,7 +92,7 @@ pub fn insertions() {
 
 #[test]
 pub fn hybrid() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -128,7 +116,8 @@ pub fn hybrid() {
     });
 
     let mut test_data = (0..num).collect_vec();
-    thread_rng().shuffle(test_data.as_mut_slice());
+    let mut rng = thread_rng();
+    test_data.as_mut_slice().shuffle(&mut rng);
     test_data.par_iter().for_each(|i| {
         let i = *i;
         let id = Id::new(0, i);

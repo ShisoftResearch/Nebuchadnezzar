@@ -1,26 +1,20 @@
-use client::AsyncClient;
 use dovahkiin::types::custom_types::id::Id;
-use index;
-use index::lsmtree::cursor::LSMTreeCursor;
-use index::lsmtree::placement::sm::client::SMClient;
-use index::lsmtree::split::check_and_split;
-use index::lsmtree::tree::LSMTree;
-use index::lsmtree::tree::{KeyRange, LSMTreeResult};
-use index::Cursor;
-use index::EntryKey;
+use crate::index;
+use crate::index::lsmtree::cursor::LSMTreeCursor;
+use crate::index::lsmtree::placement::sm::client::SMClient;
+use crate::index::lsmtree::tree::LSMTree;
+use crate::index::lsmtree::tree::{KeyRange, LSMTreeResult};
+use crate::index::trees::Cursor;
+use crate::index::trees::EntryKey;
 use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use parking_lot::MutexGuard;
-use ram::clock;
-use server::NebServer;
+use crate::ram::clock;
+use crate::server::NebServer;
 use std::cell::RefCell;
-use std::cell::RefMut;
-use std::collections::btree_map::BTreeMap;
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 const CURSOR_DEFAULT_TTL: u32 = 5 * 60 * 1000;
@@ -49,8 +43,12 @@ impl DelegatedCursor {
 
 impl LSMTreeIns {
     pub fn new(range: KeyRange, id: Id) -> Self {
+        Self::new_from_tree(LSMTree::new(range, id))
+    }
+
+    pub fn new_from_tree(tree: LSMTree) -> Self {
         Self {
-            tree: LSMTree::new(range, id),
+            tree,
             counter: AtomicU64::new(0),
             cursors: Mutex::new(CursorMap::new()),
         }
@@ -77,7 +75,7 @@ impl LSMTreeIns {
         }
     }
 
-    pub fn seek(&self, key: &EntryKey, ordering: index::Ordering) -> u64 {
+    pub fn seek(&self, key: &EntryKey, ordering: index::trees::Ordering) -> u64 {
         let cursor = self.tree.seek(key, ordering);
         let mut map = self.cursors.lock();
         Self::pop_expired_cursors(&mut map);
@@ -86,8 +84,20 @@ impl LSMTreeIns {
         return id;
     }
 
-    pub fn next(&self, id: &u64) -> Option<bool> {
-        self.get(id).map(|mut c| c.borrow_mut().next())
+    // Fetch th
+    pub fn next_block(&self, id: &u64, block_size: usize) -> Option<Vec<Vec<u8>>> {
+        self.get(id).map(|c| {
+            let mut keys = Vec::with_capacity(block_size);
+            let mut cursor = c.borrow_mut();
+            let current = |cursor: &LSMTreeCursor| cursor.current().map(|k| k.as_slice().to_vec());
+            if let Some(first_key) = current(&*cursor) {
+                keys.push(first_key);
+                while cursor.next() && keys.len() < block_size {
+                    keys.push(current(&*cursor).unwrap());
+                }
+            }
+            keys
+        })
     }
 
     pub fn current(&self, id: &u64) -> Option<Option<Vec<u8>>> {
@@ -140,6 +150,7 @@ impl LSMTreeIns {
         self.tree.merge(keys)
     }
 
+    #[allow(dead_code)]
     pub fn remove_to_right(&self, start_key: &EntryKey) {
         self.tree.remove_to_right(start_key);
     }
@@ -148,8 +159,10 @@ impl LSMTreeIns {
         self.tree.set_epoch(epoch);
     }
 
-    pub fn check_and_split(&self, sm: &Arc<SMClient>, neb: &Arc<NebServer>) -> Option<usize> {
-        check_and_split(&self.tree, sm, neb)
+    #[allow(dead_code)]
+    pub fn check_and_split(&self, _sm: &Arc<SMClient>, _neb: &Arc<NebServer>) -> Option<usize> {
+        // self.tree.check_and_split(&self.tree, sm, neb)
+        unimplemented!();
     }
 }
 
