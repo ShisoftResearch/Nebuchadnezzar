@@ -26,7 +26,7 @@ fn default_key_range() -> KeyRange {
 
 #[test]
 pub fn insertions() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
@@ -92,7 +92,7 @@ pub fn insertions() {
 
 #[test]
 pub fn hybrid() {
-    env_logger::init();
+    let _ = env_logger::try_init();
     let tree = Arc::new(LSMTree::new(default_key_range(), Id::unit_id()));
     let num = env::var("LSM_TREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
