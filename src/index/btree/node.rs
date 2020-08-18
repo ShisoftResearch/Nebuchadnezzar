@@ -438,6 +438,7 @@ where
         handler.version = cc_num & (!LATCH_FLAG);
         let res = func(&handler);
         let new_cc_num = cc.load(SeqCst);
+        // Check the version. If not found need to retry
         if new_cc_num == cc_num {
             return res;
         }

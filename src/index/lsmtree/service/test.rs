@@ -37,6 +37,7 @@ with_levels! {
 }
 
 #[tokio::test(threaded_scheduler)]
+#[ignore]
 pub async fn split() {
     let _ = env_logger::try_init();
     let server_group = "lsm_service_split";

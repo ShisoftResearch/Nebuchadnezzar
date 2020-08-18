@@ -4,5 +4,5 @@ mod macros;
 pub mod btree;
 pub mod builder;
 pub mod hash;
-pub mod lsmtree;
+// pub mod lsmtree;
 mod trees;
