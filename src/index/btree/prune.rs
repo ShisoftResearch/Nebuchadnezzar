@@ -90,199 +90,7 @@ where
         "node not serial before checking corner cases"
     );
 
-    // dealing with corner cases
-    // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
-    debug!("Checking corner cases");
-    let mut index = 0;
-    let mut corner_case_handled = false;
-    let mut current_left_bound = min_entry_key();
-    while index < all_pages.len() {
-        let current_right_bound = all_pages[index].right_bound().clone();
-        if all_pages[index].len() == 0 {
-            // current page have one ptr and no keys
-            // need to merge to the right page
-            // if the right page is full, partial of the right page will be moved to the third page
-            // the emptying node will always been cleaned
-            // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
-            debug!("Dealing with emptying node {}", index);
-            corner_case_handled = true;
-            let mut next_from_ptr = if index + 1 >= all_pages.len() {
-                debug!("Acquiring node guard for last node right");
-                let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
-                debug_assert!(!ptr_right.is_empty_node());
-                Some(ptr_right)
-            } else {
-                None
-            };
-            // extract keys, ptrs from right that will merge to left
-            // new right key bound and right ref  from right (if right will be removed) also defines here
-            let has_new = {
-                let (remaining_key, remaining_ptr) = {
-                    let current_innode: &InNode<KS, PS> = all_pages[index].innode();
-                    let new_first_key = current_innode.right_bound.clone();
-                    let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
-                    debug_assert!(
-                        read_unchecked::<KS, PS>(&new_first_ptr).last_key() < &new_first_key
-                    );
-                    debug!("Using new first key as remaining key {:?}", new_first_key);
-                    (new_first_key, new_first_ptr)
-                };
-                let mut new_next_keys = KS::init();
-                let mut new_next_ptrs = PS::init();
-                let mut has_new = None;
-
-                let next = next_from_ptr
-                    .as_mut()
-                    .unwrap_or_else(|| &mut all_pages[index + 1]);
-                debug_assert!(
-                    is_node_serial(next),
-                    "node not serial before next updated - {}",
-                    level
-                );
-
-                {
-                    let mut next_innode = next.innode_mut();
-
-                    let keys_slice = new_next_keys.as_slice();
-                    let ptrs_slice = new_next_ptrs.as_slice();
-                    debug_assert!(current_right_bound < next_innode.right_bound);
-                    debug_assert!(current_right_bound <= next_innode.keys.as_slice_immute()[0],
-                                  "Bad boundary current right bound {:?} should less than or eq next first element {:?}",
-                                  current_right_bound, next_innode.keys.as_slice_immute()[0]);
-                    keys_slice[0] = remaining_key;
-                    ptrs_slice[0] = remaining_ptr;
-                    let next_len = next_innode.len;
-                    if next_len >= KS::slice_len() {
-                        // full node, need to be split and relocated
-                        debug!("Full node, will split");
-                        let mid = next_len / 2;
-                        for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
-                            keys_slice[i + 1] = k.clone();
-                        }
-                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid]
-                            .iter()
-                            .enumerate()
-                        {
-                            ptrs_slice[i + 1] = p.clone();
-                        }
-                        let mut third_node_keys = KS::init();
-                        let mut third_node_ptrs = PS::init();
-                        for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
-                            .iter()
-                            .enumerate()
-                        {
-                            third_node_keys.as_slice()[i] = k.clone();
-                        }
-                        for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
-                            .iter()
-                            .enumerate()
-                        {
-                            third_node_ptrs.as_slice()[i] = p.clone();
-                        }
-                        let third_len = next_len - mid - 1;
-                        let third_right_bound = next_innode.right_bound.clone();
-                        let third_right_ptr = next_innode.right.clone();
-                        let third_innode = InNode {
-                            keys: third_node_keys,
-                            ptrs: third_node_ptrs,
-                            len: third_len,
-                            right: third_right_ptr,
-                            right_bound: third_right_bound,
-                        };
-                        let third_node_ref =
-                            NodeCellRef::new(Node::new(NodeData::Internal(box third_innode)));
-                        let next_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
-                        next_innode.right = third_node_ref.clone();
-                        next_innode.right_bound = next_right_bound.clone();
-                        next_innode.keys = new_next_keys;
-                        next_innode.ptrs = new_next_ptrs;
-                        next_innode.len = mid + 1;
-                        // insert the third page
-                        level_page_altered
-                            .added
-                            .push((next_right_bound.clone(), third_node_ref.clone()));
-
-                        // return the locked third node to be inserted into the all_pages
-
-                        debug!("Acquiring for third node");
-                        let third_node = write_node::<KS, PS>(&third_node_ref);
-                        debug_assert!(
-                            is_node_serial(&third_node),
-                            "node not serial for third node - {}",
-                            level
-                        );
-                        debug_assert!(
-                            third_node.first_key()
-                                > read_unchecked::<KS, PS>(
-                                    &third_node.innode().ptrs.as_slice_immute()[0]
-                                )
-                                .last_key()
-                        );
-                        has_new = Some(third_node)
-                    } else {
-                        // not full node, can be relocated
-                        debug!("Not full node, wil relocated");
-                        for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
-                            .iter()
-                            .enumerate()
-                        {
-                            keys_slice[i + 1] = k.clone();
-                        }
-                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len]
-                            .iter()
-                            .enumerate()
-                        {
-                            ptrs_slice[i + 1] = p.clone();
-                        }
-                        next_innode.keys = new_next_keys;
-                        next_innode.ptrs = new_next_ptrs;
-                        next_innode.len = next_len + 1;
-                    }
-                }
-
-                debug_assert!(
-                    is_node_serial(next),
-                    "node not serial after next updated - {} - {:?}",
-                    level,
-                    &next.keys()
-                );
-                debug_assert!(&current_right_bound > &*MIN_ENTRY_KEY);
-                debug_assert!(
-                    next.first_key()
-                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0])
-                            .last_key()
-                );
-
-                if &current_left_bound != &*MIN_ENTRY_KEY {
-                    // modify next node key
-                    level_page_altered
-                        .key_modified
-                        .push((current_left_bound.clone(), next.node_ref().clone()));
-                } else {
-                    debug!("Skipped modify key for left bound is min key");
-                }
-
-                // make current node empty
-                level_page_altered.removed.push((
-                    current_right_bound.clone(),
-                    all_pages[index].node_ref().clone(),
-                ));
-                all_pages[index].make_empty_node(false);
-                has_new
-            };
-            index += if let Some(new_page) = has_new {
-                all_pages.insert(index + 1, new_page);
-                // because there have been a new inserted page, it have to been skipped with next node
-                2
-            } else {
-                1
-            };
-        }
-        current_left_bound = current_right_bound;
-        index += 1;
-    }
-
-    if corner_case_handled {
+    if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
         all_pages = update_right_nodes(all_pages);
     }
 
@@ -656,4 +464,216 @@ fn update_right_nodes<KS, PS>(
         .zip(right_refs.into_iter())
         .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
     return non_emptys;
+}
+
+
+// Return true if the case is handled
+fn merge_single_ref_pages<KS, PS>(
+    all_pages: &mut Vec<NodeWriteGuard<KS, PS>>, 
+    level_page_altered: &mut AlteredNodes,
+    level: usize
+) -> bool where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    // dealing with corner cases
+    // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
+    debug!("Checking corner cases");
+    let mut index = 0;
+    let mut corner_case_handled = false;
+    let mut current_left_bound = min_entry_key();
+    while index < all_pages.len() {
+        let current_right_bound = all_pages[index].right_bound().clone();
+        if all_pages[index].len() == 0 {
+            // current page have one ptr and no keys
+            // need to merge to the right page
+            // if the right page is full, partial of the right page will be moved to the third page
+            // the emptying node will always been cleaned
+            // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
+            debug!("Dealing with emptying node {}", index);
+            corner_case_handled = true;
+            let mut next_from_ptr = if index + 1 >= all_pages.len() {
+                debug!("Acquiring node guard for last node right");
+                let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
+                debug_assert!(!ptr_right.is_empty_node());
+                Some(ptr_right)
+            } else {
+                None
+            };
+            // extract keys, ptrs from right that will merge to left
+            // new right key bound and right ref  from right (if right will be removed) also defines here
+            let has_new = {
+                let (remaining_key, remaining_ptr) = {
+                    let current_innode: &InNode<KS, PS> = all_pages[index].innode();
+                    let new_first_key = current_innode.right_bound.clone();
+                    let new_first_ptr = current_innode.ptrs.as_slice_immute()[0].clone();
+                    debug_assert!(
+                        read_unchecked::<KS, PS>(&new_first_ptr).last_key() < &new_first_key
+                    );
+                    debug!("Using new first key as remaining key {:?}", new_first_key);
+                    (new_first_key, new_first_ptr)
+                };
+                let mut new_next_keys = KS::init();
+                let mut new_next_ptrs = PS::init();
+                let mut has_new = None;
+
+                let next = next_from_ptr
+                    .as_mut()
+                    .unwrap_or_else(|| &mut all_pages[index + 1]);
+                debug_assert!(
+                    is_node_serial(next),
+                    "node not serial before next updated - {}",
+                    level
+                );
+
+                {
+                    let mut next_innode = next.innode_mut();
+
+                    let keys_slice = new_next_keys.as_slice();
+                    let ptrs_slice = new_next_ptrs.as_slice();
+                    debug_assert!(current_right_bound < next_innode.right_bound);
+                    debug_assert!(current_right_bound <= next_innode.keys.as_slice_immute()[0],
+                                  "Bad boundary current right bound {:?} should less than or eq next first element {:?}",
+                                  current_right_bound, next_innode.keys.as_slice_immute()[0]);
+                    keys_slice[0] = remaining_key;
+                    ptrs_slice[0] = remaining_ptr;
+                    let next_len = next_innode.len;
+                    if next_len >= KS::slice_len() {
+                        // full node, need to be split and relocated
+                        debug!("Full node, will split");
+                        let mid = next_len / 2;
+                        // Moving keys
+                        for (i, k) in next_innode.keys.as_slice_immute()[..mid].iter().enumerate() {
+                            keys_slice[i + 1] = k.clone();
+                        }
+                        // Moving ptrs
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=mid]
+                            .iter()
+                            .enumerate()
+                        {
+                            ptrs_slice[i + 1] = p.clone();
+                        }
+
+                        // Work on the second pard of the split node
+                        let mut third_node_keys = KS::init();
+                        let mut third_node_ptrs = PS::init();
+                        // Moving keys
+                        // Note that the key at mid will be assigned as boundary
+                        for (i, k) in next_innode.keys.as_slice_immute()[mid + 1..next_len]
+                            .iter()
+                            .enumerate()
+                        {
+                            third_node_keys.as_slice()[i] = k.clone();
+                        }
+                        // Moving ptrs
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[mid + 1..next_len + 1]
+                            .iter()
+                            .enumerate()
+                        {
+                            third_node_ptrs.as_slice()[i] = p.clone();
+                        }
+                        let next_right_bound = next_innode.keys.as_slice_immute()[mid].clone();
+                        let third_len = next_len - mid - 1;
+                        // Use the mid key as boundary
+                        let third_right_bound = next_right_bound.clone();
+                        let third_right_ptr = next_innode.right.clone();
+                        let third_innode = InNode {
+                            keys: third_node_keys,
+                            ptrs: third_node_ptrs,
+                            len: third_len,
+                            right: third_right_ptr,
+                            right_bound: third_right_bound,
+                        };
+                        let third_node_ref =
+                            NodeCellRef::new(Node::new(NodeData::Internal(box third_innode)));
+                        next_innode.right = third_node_ref.clone();
+                        next_innode.right_bound = next_right_bound.clone();
+                        next_innode.keys = new_next_keys;
+                        next_innode.ptrs = new_next_ptrs;
+                        next_innode.len = mid + 1;
+                        // insert the third page
+                        level_page_altered
+                            .added
+                            .push((next_right_bound.clone(), third_node_ref.clone()));
+
+                        // return the locked third node to be inserted into the all_pages
+
+                        debug!("Acquiring for third node");
+                        let third_node = write_node::<KS, PS>(&third_node_ref);
+                        debug_assert!(
+                            is_node_serial(&third_node),
+                            "node not serial for third node - {}",
+                            level
+                        );
+                        debug_assert!(
+                            third_node.first_key()
+                                > read_unchecked::<KS, PS>(
+                                    &third_node.innode().ptrs.as_slice_immute()[0]
+                                )
+                                .last_key()
+                        );
+                        has_new = Some(third_node)
+                    } else {
+                        // not full node, can be relocated
+                        debug!("Not full node, wil relocated");
+                        for (i, k) in next_innode.keys.as_slice_immute()[..next_len]
+                            .iter()
+                            .enumerate()
+                        {
+                            keys_slice[i + 1] = k.clone();
+                        }
+                        for (i, p) in next_innode.ptrs.as_slice_immute()[..=next_len]
+                            .iter()
+                            .enumerate()
+                        {
+                            ptrs_slice[i + 1] = p.clone();
+                        }
+                        next_innode.keys = new_next_keys;
+                        next_innode.ptrs = new_next_ptrs;
+                        next_innode.len = next_len + 1;
+                    }
+                }
+
+                debug_assert!(
+                    is_node_serial(next),
+                    "node not serial after next updated - {} - {:?}",
+                    level,
+                    &next.keys()
+                );
+                debug_assert!(&current_right_bound > &*MIN_ENTRY_KEY);
+                debug_assert!(
+                    next.first_key()
+                        > read_unchecked::<KS, PS>(&next.innode().ptrs.as_slice_immute()[0])
+                            .last_key()
+                );
+
+                if &current_left_bound != &*MIN_ENTRY_KEY {
+                    // modify next node key
+                    level_page_altered
+                        .key_modified
+                        .push((current_left_bound.clone(), next.node_ref().clone()));
+                } else {
+                    debug!("Skipped modify key for left bound is min key");
+                }
+
+                // make current node empty
+                level_page_altered.removed.push((
+                    current_right_bound.clone(),
+                    all_pages[index].node_ref().clone(),
+                ));
+                all_pages[index].make_empty_node(false);
+                has_new
+            };
+            index += if let Some(new_page) = has_new {
+                all_pages.insert(index + 1, new_page);
+                // because there have been a new inserted page, it have to been skipped with next node
+                2
+            } else {
+                1
+            };
+        }
+        current_left_bound = current_right_bound;
+        index += 1;
+    }
+    return corner_case_handled;
 }
