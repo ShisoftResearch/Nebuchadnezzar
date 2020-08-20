@@ -238,7 +238,7 @@ fn ref_to_be_retained<'a, KS, PS>(
     PS: Slice<NodeCellRef> + 'static,
 {
     
-    let mut removed = removed_iter(&altered).peekable();
+    let mut removed = peek_removed_iter(&altered);
     let matching_refs = all_pages
         .iter()
         .map(|page| {
