@@ -182,6 +182,7 @@ mod test {
     use smallvec::SmallVec;
     use crate::index::trees::{key_with_id, Ordering};
     use crate::index::trees::Cursor;
+    use crate::rand::Rng;
 
     #[tokio::test(threaded_scheduler)]
     async fn tree_reconstruct_from_head_cell() {
@@ -236,9 +237,27 @@ mod test {
             client.write_cell(Cell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value)).await.unwrap().unwrap();
             last_id = new_id;
         }
-        let tree = LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await;
-        for key in &all_keys {
-            assert_eq!(tree.seek(key, Ordering::Forward).current().unwrap(), key);
+        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await);
+        let threads = all_keys.clone().into_iter().enumerate().map(|(i, key)| {
+            let tree = tree.clone();
+            let all_keys = all_keys.clone();
+            std::thread::spawn(move || {
+                trace!("Checking {:?}", key);
+                let mut cursor = tree.seek(&key, Ordering::Forward);
+                assert_eq!(cursor.current().unwrap(), &key);
+                let mut rng = rand::thread_rng();
+                if i > all_keys.len() / 2 && rng.gen_range(0, 50) == 1 {
+                    for j in i..all_keys.len() {
+                        assert_eq!(cursor.current().unwrap(), &all_keys[j]);
+                        cursor.next();
+                    }
+                    assert!(cursor.current().is_none());
+                }
+            })  
+        })
+        .collect_vec();
+        for t in threads {
+            t.join().unwrap();
         }
     }
 }
