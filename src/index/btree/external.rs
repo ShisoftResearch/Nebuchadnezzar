@@ -76,8 +76,7 @@ where
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
-        let _keys_len = keys.len().unwrap();
-        let keys_array = if let Value::PrimArray(PrimitiveArray::Bytes(ref array)) = keys {
+        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
             array
         } else {
             panic!()
@@ -431,6 +430,7 @@ pub fn page_schema() -> Schema {
                 Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
                 Field::new(
                     KEYS_FIELD,
+                    // The small bytes is for keys
                     type_id_of(Type::SmallBytes),
                     false,
                     true,

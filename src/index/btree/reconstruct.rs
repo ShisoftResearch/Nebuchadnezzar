@@ -1,10 +1,10 @@
 use crate::client::AsyncClient;
-use dovahkiin::types::*;
 use crate::index::btree::external::ExtNode;
 use crate::index::btree::internal::InNode;
 use crate::index::btree::node::{write_node, Node, NodeWriteGuard};
 use crate::index::btree::{external, max_entry_key, BPlusTree, NodeCellRef};
 use crate::index::trees::{EntryKey, Slice};
+use crate::ram::types::*;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::mem;
@@ -163,4 +163,82 @@ where
     }
     let root = constructor.root();
     BPlusTree::from_root(root, head_id, len)
+}
+
+
+#[cfg(test)]
+mod test {
+    use crate::server::*;
+    use crate::client;
+    use std::sync::Arc;
+    use crate::index::btree::external::*;
+    use dovahkiin::types::custom_types::id::Id;
+    use dovahkiin::types::custom_types::map::Map;
+    use dovahkiin::types::Value;
+    use crate::ram::types::*;
+    use crate::ram::cell::Cell;
+    use itertools::Itertools;
+    use crate::index::btree::test::*;
+    use smallvec::SmallVec;
+    use crate::index::trees::{key_with_id, Ordering};
+    use crate::index::trees::Cursor;
+
+    #[tokio::test(threaded_scheduler)]
+    async fn tree_reconstruct_from_head_cell() {
+        let _ = env_logger::try_init();
+        let server_group = "btree-reconstruct";
+        let server_addr = String::from("127.0.0.1:5600");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 16 * 12024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+                services: vec![Service::Cell]
+            }, 
+            &server_addr,
+            &server_group
+        ).await;
+        let client = 
+            Arc::new(
+                client::AsyncClient::new(
+                    &server.rpc, 
+                    &server.membership, 
+                    &vec![server_addr], 
+                    server_group)
+                    .await
+                    .unwrap()
+                );
+        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+        let mut last_id = Id::unit_id();
+        let cell_limit = 1000;
+        let mut counter = 0;
+        let mut all_keys = vec![];
+        for i in 1..=cell_limit {
+            let new_id = Id::new(i, i);
+            let mut value = Value::Map(Map::new());
+            value[*PREV_PAGE_KEY_HASH] = Value::Id(last_id);
+            value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit { 
+                Value::Id(Id::new(i + 1, i + 1)) 
+            } else {
+                Value::Id(Id::unit_id())
+            };
+            value[*KEYS_KEY_HASH] = (0..PAGE_SIZE).map(|_| {
+                counter += 1;
+                let key_slice = u64_to_slice(counter);
+                let mut key = SmallVec::from_slice(&key_slice);
+                key_with_id(&mut key, &new_id);
+                all_keys.push(key.clone());
+                SmallBytes::from_vec(key.as_slice().to_vec())
+            })
+            .collect_vec()
+            .value();
+            client.write_cell(Cell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value)).await.unwrap().unwrap();
+            last_id = new_id;
+        }
+        let tree = LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await;
+        for key in &all_keys {
+            assert_eq!(tree.seek(key, Ordering::Forward).current().unwrap(), key);
+        }
+    }
 }

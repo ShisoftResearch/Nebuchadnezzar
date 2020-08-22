@@ -37,11 +37,11 @@ struct DebugNode {
     is_external: bool,
 }
 
-const PAGE_SIZE: usize = 24;
+pub const PAGE_SIZE: usize = 24;
 impl_btree_level!(PAGE_SIZE);
-type KeySlice = [EntryKey; PAGE_SIZE];
-type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
-type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
+pub type KeySlice = [EntryKey; PAGE_SIZE];
+pub type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
+pub type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
 
 pub fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
