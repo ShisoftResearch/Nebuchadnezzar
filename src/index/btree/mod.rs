@@ -16,6 +16,7 @@ use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use crate::index::trees::MAX_KEY_SIZE;
 use crate::index::trees::{Cursor as IndexCursor, Ordering};
+use crate::server;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use crate::ram::types::RandValue;
@@ -32,6 +33,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use futures::future::BoxFuture;
+use futures::FutureExt;
 
 pub mod verification;
 
@@ -40,7 +42,7 @@ mod dump;
 mod external;
 mod insert;
 mod internal;
-mod level;
+pub mod level;
 mod merge;
 mod node;
 mod reconstruct;
@@ -105,7 +107,7 @@ where
             deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
             marker: PhantomData,
         };
-        let root_id = tree.new_page_id();
+        let root_id = Self::new_page_id();
         let max_key = max_entry_key();
         debug!("New External L1");
         let root_inner = Node::<KS, PS>::new_external(root_id, max_key);
@@ -113,6 +115,14 @@ where
         *tree.root.write() = NodeCellRef::new(root_inner);
         tree.head_page_id = root_id;
         return tree;
+    }
+
+    pub async fn persist_root(&self, neb: &Arc<server::NebServer>) {
+        let root = self.get_root();
+        let server_id = neb.get_server_id_by_id(&read_unchecked::<KS, PS>(&root).extnode().id).unwrap();
+        let rpc_client = neb.get_member_by_server_id_async(server_id).await.unwrap();
+        let neb = crate::client::client_by_rpc_client(&rpc_client);
+        root.persist(&self.deleted, &neb).await
     }
 
     pub async fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
@@ -243,7 +253,7 @@ where
         self.len.load(Relaxed)
     }
 
-    fn new_page_id(&self) -> Id {
+    fn new_page_id() -> Id {
         // TODO: achieve locality
         Id::rand()
     }
@@ -263,7 +273,6 @@ pub trait LevelTree {
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
-    fn from_tree_id(&mut self, head_id: &Id, neb: &AsyncClient);
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
@@ -334,9 +343,61 @@ where
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
     }
+}
 
-    fn from_tree_id(&mut self, _head_id: &Id, _neb: &AsyncClient){
-        unimplemented!()
+pub struct DummyLevelTree;
+
+impl LevelTree for DummyLevelTree {
+    fn size(&self) -> usize {
+        unreachable!()
+    }
+
+    fn count(&self) -> usize {
+        unreachable!()
+    }
+
+    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize {
+        unreachable!()
+    }
+
+    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
+        unreachable!()
+    }
+
+    fn insert_into(&self, key: &EntryKey) -> bool {
+        unreachable!()
+    }
+
+    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
+        unreachable!()
+    }
+
+    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
+        unreachable!()
+    }
+
+    fn dump(&self, f: &str) {
+        unreachable!()
+    }
+
+    fn mid_key(&self) -> Option<EntryKey> {
+        unreachable!()
+    }
+
+    fn remove_following_tombstones(&self, start: &EntryKey) {
+        unreachable!()
+    }
+
+    fn remove_to_right(&self, start_key: &EntryKey) -> usize {
+        unreachable!()
+    }
+
+    fn head_id(&self) -> Id {
+        unreachable!()
+    }
+
+    fn verify(&self, level: usize) -> bool {
+        unreachable!()
     }
 }
 

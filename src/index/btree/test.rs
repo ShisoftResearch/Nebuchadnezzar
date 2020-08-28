@@ -37,7 +37,7 @@ struct DebugNode {
     is_external: bool,
 }
 
-pub const PAGE_SIZE: usize = 24;
+pub const PAGE_SIZE: usize = 26;
 impl_btree_level!(PAGE_SIZE);
 pub type KeySlice = [EntryKey; PAGE_SIZE];
 pub type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
