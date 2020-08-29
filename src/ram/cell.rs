@@ -100,7 +100,7 @@ impl Cell {
         Id::from_obj(&(schema_id, value))
     }
 
-    pub fn new(schema: &Arc<Schema>, value: Value) -> Option<Cell> {
+    pub fn new(schema: &Schema, value: Value) -> Option<Cell> {
         let schema_id = schema.id;
         let id = if let Value::Map(ref data) = value {
             match schema.key_field {
