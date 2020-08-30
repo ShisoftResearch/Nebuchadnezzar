@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
+type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
+type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS];
 
 lazy_static! {
     pub static ref LSM_TREE_SCHEMA_ID: u32 = key_hash(LSM_TREE_SCHEMA_NAME) as u32;
@@ -21,7 +23,7 @@ lazy_static! {
 }
 
 pub struct LSMTree {
-    trees: [Box<dyn LevelTree>; NUM_LEVELS]
+    trees: LevelTrees
 }
 
 impl LSMTree {
@@ -85,8 +87,69 @@ impl LSMTree {
         false
     }
     
-    
+    pub fn seek(&self, entry: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
+        LSMTreeCursor::new(entry, &self.trees, ordering)
+    }
 }
+
+pub struct LSMTreeCursor {
+    cursors: LevelCusors,
+    current: Option<(usize, EntryKey)>,
+    ordering: Ordering
+}
+
+impl LSMTreeCursor {
+    fn new(key: &EntryKey, trees: &LevelTrees, ordering: Ordering) -> Self {
+        let cursors = [
+            trees[0].seek_for(key, ordering),
+            trees[1].seek_for(key, ordering),
+            trees[2].seek_for(key, ordering),
+            trees[3].seek_for(key, ordering),
+            trees[4].seek_for(key, ordering)
+        ];
+        let current = Self::leading_tree_key(&cursors, ordering);
+        Self { cursors, current, ordering }
+    }
+
+    fn leading_tree_key(cursors: &LevelCusors, ordering: Ordering) -> Option<(usize, EntryKey)> {
+        match ordering {
+            Ordering::Forward => {
+                cursors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| c.current().map(|c| (i, c)))
+                    .min_by(|(_, x), (_, y)| x.cmp(y))
+                    .map(|(i, k)| (i, k.clone()))
+            },
+            Ordering::Backward => {
+                cursors
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| c.current().map(|c| (i, c)))
+                    .max_by(|(_, x), (_, y)| x.cmp(y))
+                    .map(|(i, k)| (i, k.clone()))
+            }
+        }
+    }
+}
+
+impl Cursor for LSMTreeCursor {
+    fn current(&self) -> Option<&EntryKey> {
+        self.current.as_ref().map(|(_, k)| k)
+    }
+    fn next(&mut self) -> bool {
+        if let Some((tree_id, _)) = self.current {
+            self.cursors[tree_id].next();
+            let next_leading = Self::leading_tree_key(&self.cursors, self.ordering);
+            let has_next = next_leading.is_some();
+            self.current = next_leading;
+            has_next
+        } else {
+            return false;
+        }
+    }
+}
+
 fn lsm_treee_schema() -> Schema {
     Schema {
         id: *LSM_TREE_SCHEMA_ID,
