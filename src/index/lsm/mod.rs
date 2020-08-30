@@ -1,3 +1,5 @@
+// A machine-local concurrent LSM tree based on B-tree implementation
+
 use crate::index::btree::level::*;
 use crate::index::btree::*; 
 use crate::index::trees::*;
@@ -8,7 +10,6 @@ use crate::client::AsyncClient;
 use crate::ram::cell::Cell;
 use std::{mem, ptr};
 use std::sync::Arc;
-use futures::stream::futures_unordered::FuturesUnordered;
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
@@ -25,7 +26,6 @@ pub struct LSMTree {
 
 impl LSMTree {
     pub async fn create(neb: &Arc<server::NebServer>, neb_client: &Arc<AsyncClient>) -> Self {
-        let trees: [Box<dyn LevelTree>; NUM_LEVELS];
         let tree_m = LevelMTree::new();
         let tree_1 = Level1Tree::new();
         let tree_2 = Level2Tree::new();
@@ -41,20 +41,52 @@ impl LSMTree {
             tree_1.head_id(), 
             tree_2.head_id(), 
             tree_3.head_id(), 
-            tree_4.head_id()
+            tree_4.head_id()  
         ];
         let mut cell_map = Map::new();
         cell_map.insert_key_id(*LSM_TREE_LEVELS_HASH, Value::Array(level_ids.iter().map(|id| id.value()).collect()));
         let lsm_tree_cell = Cell::new(&*LSM_TREE_SCHEMA, Value::Map(cell_map)).unwrap();
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
-        trees = [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4];
         Self {
-            trees
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4]
         }
     }
+ 
+    pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: Id) -> Self {
+        let cell = neb_client.read_cell(lsm_tree_id).await.unwrap().unwrap();
+        let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
+        let trees_m_val = &trees[0usize];
+        let trees_1_val = &trees[1usize];
+        let trees_2_val = &trees[2usize];
+        let trees_3_val = &trees[3usize];
+        let trees_4_val = &trees[4usize];
+
+        let tree_m = LevelMTree::from_head_id(trees_m_val.Id().unwrap(), neb_client).await;
+        let tree_1 = Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client).await;
+        let tree_2 = Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client).await;
+        let tree_3 = Level3Tree::from_head_id(trees_3_val.Id().unwrap(), neb_client).await;
+        let tree_4 = Level4Tree::from_head_id(trees_4_val.Id().unwrap(), neb_client).await;
+
+        Self {
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4]
+        }
+    }
+   
+    pub fn insert(&self, entry: &EntryKey) -> bool {
+        self.trees[0].insert_into(entry)
+    }
+
+    pub fn delete(&self, entry: &EntryKey) -> bool {
+        for tree in &self.trees {
+            if tree.mark_key_deleted(entry) {
+                return true;
+            }
+        }
+        false
+    }
+    
     
 }
-
 fn lsm_treee_schema() -> Schema {
     Schema {
         id: *LSM_TREE_SCHEMA_ID,
