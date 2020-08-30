@@ -11,6 +11,7 @@ pub use crate::index::btree::node::*;
 use crate::index::btree::remove::*;
 use crate::index::btree::search::*;
 use crate::index::btree::split::remove_to_right;
+use crate::index::btree::level::LEVEL_PAGE_DIFF_MULTIPLIER;
 use crate::index::trees::Cursor;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
@@ -273,6 +274,12 @@ pub trait LevelTree {
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
+    fn ideal_capacity(&self) -> usize {
+        self.size() * LEVEL_PAGE_DIFF_MULTIPLIER
+    }
+    fn oversized(&self) -> bool {
+        self.count() > self.ideal_capacity()
+    }
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>

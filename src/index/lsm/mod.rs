@@ -90,6 +90,18 @@ impl LSMTree {
     pub fn seek(&self, entry: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
         LSMTreeCursor::new(entry, &self.trees, ordering)
     }
+
+    pub fn merge_levels(&self) {
+        for i in 0..self.trees.len() - 1 {
+            if self.trees[i].oversized() {
+                self.trees[i].merge_to(&*self.trees[i + 1]);
+            }
+        }
+    }
+
+    pub fn oversized(&self) -> bool {
+        self.trees[self.trees.len() - 1].oversized()
+    }
 }
 
 pub struct LSMTreeCursor {
