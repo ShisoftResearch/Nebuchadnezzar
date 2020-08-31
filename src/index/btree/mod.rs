@@ -8,7 +8,6 @@ use crate::index::btree::insert::*;
 use crate::index::btree::internal::*;
 use crate::index::btree::merge::merge_into_tree_node;
 pub use crate::index::btree::node::*;
-use crate::index::btree::remove::*;
 use crate::index::btree::search::*;
 use crate::index::btree::split::remove_to_right;
 use crate::index::btree::level::LEVEL_PAGE_DIFF_MULTIPLIER;
@@ -46,10 +45,12 @@ mod internal;
 mod merge;
 mod node;
 mod reconstruct;
-mod remove;
 mod search;
 mod split;
 mod prune;
+mod remove;
+
+const DEL_SET_CAP: usize = 16;
 
 pub type DeletionSetInneer = HashSet<EntryKey>;
 pub type DeletionSet = Arc<DeletionSetInneer>;
@@ -103,7 +104,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(12854)),
+            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
         };
         let root_id = Self::new_page_id();
@@ -134,7 +135,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(64)),
+            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
         }
     }
@@ -166,31 +167,6 @@ where
         self.len.fetch_add(1, Relaxed);
         self.deleted.remove(key);
         return true;
-    }
-
-    #[deprecated]
-    pub fn remove(&self, key: &EntryKey) -> bool {
-        let mut root = self.get_root();
-        let result = remove_from_node(self, &mut root, &mut key.clone(), &self.root_versioning, 0);
-        if let Some(rebalance) = result.rebalancing {
-            let root_node = rebalance.parent;
-            if read_unchecked::<KS, PS>(&(*self.root.read()))
-                .innode()
-                .keys
-                .as_slice_immute()[0]
-                == root_node.innode().keys.as_slice_immute()[0]
-            {
-                // Make sure root node does not changed during the process. If it did changed, ignore it
-                // When root is external and have no keys but one pointer will take the only sub level
-                // pointer node as the new root node.
-                let new_root = root_node.innode().ptrs.as_slice_immute()[0].clone();
-                *self.root.write() = new_root;
-            }
-        }
-        if result.removed {
-            self.len.fetch_sub(1, Relaxed);
-        }
-        result.removed
     }
 
     pub fn merge_with_keys_(&self, keys: Box<Vec<EntryKey>>) {
@@ -321,7 +297,7 @@ where
     }
 
     fn remove_to_right(&self, start_key: &EntryKey) -> usize {
-        let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key);
+        let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key, self);
         self.len.fetch_sub(removed, Relaxed);
         removed
     }

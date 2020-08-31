@@ -1,8 +1,8 @@
-use crate::index::btree::external::ExtNode;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::write_non_empty;
 use crate::index::btree::node::write_targeted;
+use crate::index::btree::external;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
 use crate::index::btree::BPlusTree;
@@ -79,9 +79,8 @@ where
                 debug!("Start merging with page at {:?}", start_key);
                 current_guard = write_targeted(current_guard, start_key);
                 let remain_slots = KS::slice_len() - current_guard.len();
-                ExtNode::<KS, PS>::make_changed(current_guard.node_ref(), tree);
                 if remain_slots > 0 {
-                    let ext_node = current_guard.extnode_mut();
+                    let ext_node = current_guard.extnode_mut(tree);
                     ext_node.remove_contains(&*tree.deleted);
                     let selection = keys[merging_pos..keys_len]
                         .iter()
@@ -95,7 +94,7 @@ where
                     let target_node_ref = current_guard.node_ref().clone();
                     let mut right_guard =
                         write_node::<KS, PS>(current_guard.right_ref_mut_no_empty().unwrap());
-                    let (new_node, pivot) = current_guard.extnode_mut().split_insert(
+                    let (new_node, pivot) = current_guard.extnode_mut(tree).split_insert(
                         start_key.clone(),
                         insert_pos,
                         &target_node_ref,
@@ -103,7 +102,7 @@ where
                         tree,
                     );
                     merging_pos += 1;
-                    ExtNode::<KS, PS>::make_changed(&new_node, tree);
+                    external::make_changed(&new_node, tree);
                     new_pages.push((pivot, new_node));
                 }
             }

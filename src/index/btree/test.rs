@@ -637,8 +637,8 @@ fn reconstruct() {
             let mut prev = write_node::<TinyKeySlice, TinyPtrSlice>(&nodes[i - 1]);
             let node_ref = node.node_ref().clone();
             let prev_ref = prev.node_ref().clone();
-            let mut node_extnode = node.extnode_mut();
-            let mut prev_extnode = prev.extnode_mut();
+            let mut node_extnode = node.extnode_mut_no_persist();
+            let mut prev_extnode = prev.extnode_mut_no_persist();
             node_extnode.prev = prev_ref;
             prev_extnode.next = node_ref;
         });

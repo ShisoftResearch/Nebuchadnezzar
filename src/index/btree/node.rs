@@ -131,15 +131,6 @@ where
         self.len() > KS::slice_len() / 2
     }
 
-    pub fn extnode_mut(&mut self) -> &mut ExtNode<KS, PS> {
-        match self {
-            &mut NodeData::External(ref mut node) => {
-                node.dirty = true;
-                node
-            }
-            _ => unreachable!(self.type_name()),
-        }
-    }
     pub fn innode_mut(&mut self) -> &mut InNode<KS, PS> {
         match self {
             &mut NodeData::Internal(ref mut n) => n,
@@ -551,6 +542,20 @@ where
         };
         *data = NodeData::Empty(box empty)
     }
+
+    pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
+        match self.deref_mut() {
+            &mut NodeData::External(ref mut node) => {
+                node
+            }
+            _ => unreachable!(self.type_name()),
+        }
+    }
+
+    pub fn extnode_mut(&mut self, tree: &BPlusTree<KS, PS>) -> &mut ExtNode<KS, PS> {
+        external::make_changed(&self.node_ref, tree);
+        self.extnode_mut_no_persist()
+    }
 }
 
 unsafe impl <KS, PS> Send for NodeWriteGuard<KS, PS>
@@ -589,7 +594,7 @@ where
         let guard_ref = &mut *guard;
         let cell = match guard_ref {
             &mut NodeData::External(ref mut node) => {
-                node.prepare_persist(&*deletion)
+                node.to_cell(&*deletion)
             },
             _ => {
                 panic!("Cannot persist internal or other type of nodes")

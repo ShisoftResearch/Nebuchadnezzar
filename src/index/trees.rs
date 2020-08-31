@@ -27,7 +27,6 @@ pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {
 }
 
 pub trait Slice<T: Default>: Send + Sync {
-    #[inline]
     fn as_slice(&mut self) -> &mut [T];
     #[inline]
     fn as_slice_immute(&self) -> &[T] {
@@ -36,11 +35,8 @@ pub trait Slice<T: Default>: Send + Sync {
             (*raw).as_slice()
         }
     }
-    #[inline]
     fn slice_len() -> usize;
-    #[inline]
     fn init() -> Self;
-    #[inline]
     fn item_default() -> T {
         T::default()
     }

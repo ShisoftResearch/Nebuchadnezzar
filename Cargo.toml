@@ -36,6 +36,7 @@ futures = {version = "0.3", features = ["executor", "thread-pool"] }
 futures-timer = "3"
 async-std = "1"
 tokio = "0.2"
+crossbeam = "0.7.3"
 
 [dev-dependencies]
 env_logger = "*"

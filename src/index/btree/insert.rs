@@ -1,4 +1,4 @@
-use crate::index::btree::external::ExtNode;
+use crate::index::btree::external;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::write_targeted;
@@ -74,14 +74,14 @@ where
         searched_guard.innode().keys
     );
     let mut split_result = searched_guard
-        .extnode_mut()
+        .extnode_mut(tree)
         .insert(key, tree, &self_ref, parent);
     if split_result.is_some() {
-        ExtNode::<KS, PS>::make_changed(node_ref, tree);
+        external::make_changed(node_ref, tree);
     }
     if let &mut Some(Some(ref mut split)) = &mut split_result {
         split.left_node_latch = searched_guard;
-        ExtNode::<KS, PS>::make_changed(&split.new_right_node, tree);
+        external::make_changed(&split.new_right_node, tree);
     }
     split_result
 }

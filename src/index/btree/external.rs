@@ -9,32 +9,28 @@ use itertools::Itertools;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{mem, panic};
+use crossbeam::queue::SegQueue;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
 pub const NEXT_FIELD: &'static str = "next";
 pub const PREV_FIELD: &'static str = "prev";
 
+#[derive(Clone)]
+pub struct ChangingNode {
+    pub node: NodeCellRef,
+    pub deletion: DeletionSet,
+}
+
 lazy_static! {
     pub static ref KEYS_KEY_HASH: u64 = key_hash(KEYS_FIELD);
     pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
     pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
-}
-
-thread_local! {
-    static CHANGED_NODES: RefCell<BTreeMap<Id, Option<ChangingNode>>> = RefCell::new(BTreeMap::new());
-}
-
-#[derive(Clone)]
-pub struct ChangingNode {
-    pub node: NodeCellRef,
-    pub deletion: DeletionSet,
+    pub static ref CHANGED_NODES: SegQueue<(Id, Option<ChangingNode>)> = SegQueue::new();
 }
 
 pub struct ExtNode<KS, PS>
@@ -223,7 +219,7 @@ where
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
         if !self_next.is_none() {
-            let mut self_next_node = self_next.extnode_mut();
+            let mut self_next_node = self_next.extnode_mut(tree);
             debug_assert!(
                 Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner),
                 "node next node's prev node is not self {:?}",
@@ -232,7 +228,7 @@ where
             self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
-        Self::make_changed(&node_2, tree);
+        make_changed(&node_2, tree);
         (node_2, pivot_key)
     }
 
@@ -353,7 +349,6 @@ where
             &self.keys.as_slice_immute()[..pos]
         );
         self.len = pos;
-        Self::make_changed(node_2, tree);
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
@@ -369,41 +364,24 @@ where
             debug!("{}\t- {:?}", i, self.keys.as_slice_immute()[i]);
         }
     }
-
-    pub fn make_changed(node: &NodeCellRef, tree: &BPlusTree<KS, PS>) {
-        CHANGED_NODES.with(|changes| {
-            let id = read_unchecked::<KS, PS>(node).ext_id();
-            changes.borrow_mut().insert(
-                id,
-                Some(ChangingNode {
-                    node: node.clone(),
-                    deletion: tree.deleted.clone(),
-                }),
-            );
-        });
-    }
-
-    pub fn prepare_persist(
-        &mut self,
-        deleted: &DeletionSetInneer
-    ) -> Cell {
-        if self.is_dirty() {
-            self.dirty = false; // TODO: unset dirty after upsert
-            self.to_cell(deleted)
-        } else {
-            panic!()
-        }
-    }
 }
 
-pub fn flush_changed() -> BTreeMap<Id, Option<ChangingNode>> {
-    CHANGED_NODES.with(|changes| mem::replace(&mut *changes.borrow_mut(), BTreeMap::new()))
+pub fn make_changed<KS, PS>(node: &NodeCellRef, tree: &BPlusTree<KS, PS>)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static
+{
+    let id = read_unchecked::<KS, PS>(node).ext_id();
+    CHANGED_NODES.push((
+        id,
+        Some(ChangingNode {
+            node: node.clone(),
+            deletion: tree.deleted.clone(),
+        })));
 }
 
 pub fn make_deleted(id: &Id) {
-    CHANGED_NODES.with(|changes| {
-        changes.borrow_mut().insert(*id, None);
-    });
+    CHANGED_NODES.push((*id, None));
 }
 
 pub fn page_schema() -> Schema {

@@ -259,9 +259,10 @@ where
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        left_node: &mut NodeData<KS, PS>,
-        right_node: &mut NodeData<KS, PS>,
-        right_node_next: &mut NodeData<KS, PS>,
+        left_node: &mut NodeWriteGuard<KS, PS>,
+        right_node: &mut NodeWriteGuard<KS, PS>,
+        right_node_next: &mut NodeWriteGuard<KS, PS>,
+        tree: &BPlusTree<KS, PS>
     ) {
         let left_node_ref = self.ptrs.as_slice()[left_ptr_pos].clone();
         let left_len = left_node.len();
@@ -281,18 +282,18 @@ where
                 merged_len = left_innode.len;
             }
         } else {
-            let mut right_extnode = right_node.extnode_mut();
-            let left_extnode = left_node.extnode_mut();
+            let mut right_extnode = right_node.extnode_mut(tree);
+            let left_extnode = left_node.extnode_mut(tree);
             {
                 left_extnode.merge_with(&mut right_extnode);
                 merged_len = left_extnode.len;
             }
             if !right_node_next.is_none() {
-                right_node_next.extnode_mut().prev = left_node_ref.clone()
+                right_node_next.extnode_mut(tree).prev = left_node_ref.clone()
             }
             left_extnode.next = right_extnode.next.clone();
         }
-        *right_node = NodeData::Empty(box EmptyNode {
+        **right_node = NodeData::Empty(box EmptyNode {
             left: Some(left_node_ref.clone()),
             right: left_node_ref.clone(),
         });
@@ -334,8 +335,9 @@ where
         &mut self,
         left_ptr_pos: usize,
         right_ptr_pos: usize,
-        left_node: &mut NodeData<KS, PS>,
-        right_node: &mut NodeData<KS, PS>,
+        left_node: &mut NodeWriteGuard<KS, PS>,
+        right_node: &mut NodeWriteGuard<KS, PS>,
+        tree: &BPlusTree<KS, PS>
     ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut new_right_node_key = Default::default();
@@ -420,8 +422,8 @@ where
         } else if left_node.is_ext() {
             // relocate external sub nodes
 
-            let left_extnode = left_node.extnode_mut();
-            let right_extnode = right_node.extnode_mut();
+            let left_extnode = left_node.extnode_mut(tree);
+            let right_extnode = right_node.extnode_mut(tree);
 
             debug!(
                 "Before relocation external children. left {}:{:?} right {}:{:?}",

@@ -1,5 +1,4 @@
 use crate::index::btree::dump::dump_tree;
-use crate::index::btree::external::ExtNode;
 use crate::index::btree::NodeCellRef;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
@@ -154,7 +153,7 @@ where
 
         debug!("Acquiring new first node");
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
-        let mut new_first_node_ext = new_first_node.extnode_mut();
+        let mut new_first_node_ext = new_first_node.extnode_mut(src_tree);
         debug!(
             "Right most original id is {:?}, now is {:?}",
             new_first_node_ext.id, src_tree.head_page_id
@@ -168,8 +167,6 @@ where
         new_first_node_ext.prev = left_left_most;
 
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
-
-        ExtNode::<KS, PS>::make_changed(&right_right_most, src_tree);
     }
 
     // cleanup upper level references

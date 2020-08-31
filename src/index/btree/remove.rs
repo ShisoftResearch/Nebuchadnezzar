@@ -220,14 +220,14 @@ where
                             "Remove {:?} sub level need relocation, level {}",
                             key, level
                         );
-                        let left_node = &mut *rebalancing.left_guard;
-                        let right_node = &mut *rebalancing.right_guard;
+                        let left_node = &mut rebalancing.left_guard;
+                        let right_node = &mut rebalancing.right_guard;
                         let left_pos = rebalancing.parent_pos;
                         let right_pos = left_pos + 1;
                         rebalancing
                             .parent
                             .innode_mut()
-                            .relocate_children(left_pos, right_pos, left_node, right_node);
+                            .relocate_children(left_pos, right_pos, left_node, right_node, tree);
                     }
                     None
                 } else if rebalancing.left_guard.len() + rebalancing.right_guard.len() + 1
@@ -246,9 +246,9 @@ where
                         removed,
                         level,
                         |rebalancing| {
-                            let left_node = &mut *rebalancing.left_guard;
-                            let right_node = &mut *rebalancing.right_guard;
-                            let right_node_next = &mut *rebalancing.right_right_guard;
+                            let left_node = &mut rebalancing.left_guard;
+                            let right_node = &mut rebalancing.right_guard;
+                            let right_node_next = &mut rebalancing.right_right_guard;
                             let left_pos = rebalancing.parent_pos;
                             let right_pos = left_pos + 1;
                             if left_node.is_empty() || right_node.is_empty() {
@@ -260,6 +260,7 @@ where
                                 left_node,
                                 right_node,
                                 right_node_next,
+                                tree
                             );
                         },
                     ))
@@ -303,7 +304,7 @@ where
             };
             {
                 let is_left_half_full = target_guard.is_half_full();
-                let node = target_guard.extnode_mut();
+                let node = target_guard.extnode_mut(tree);
                 let pos = node.search(key);
                 let mut right_guard = write_node(&node.next);
                 let _right_node_cannot_rebalance =

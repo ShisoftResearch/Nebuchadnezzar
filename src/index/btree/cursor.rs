@@ -150,7 +150,7 @@ where
             let has_candidate = self.next_candidate();
             if has_candidate {
                 // search in deleted set and skip if exists
-                if !self.deleted.read().contains(self.current().unwrap()) {
+                if !self.deleted.contains(self.current().unwrap()) {
                     return true;
                 }
             } else {

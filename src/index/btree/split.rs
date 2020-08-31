@@ -7,6 +7,7 @@ use crate::index::btree::remove::scatter_nodes;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
 use crate::index::btree::NodeCellRef;
+use crate::index::btree::BPlusTree;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use std::fmt::Debug;
@@ -40,7 +41,7 @@ where
     }
 }
 
-pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey) -> usize
+pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey, tree: &BPlusTree<KS, PS>) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -49,7 +50,7 @@ where
     match mut_search::<KS, PS>(node_ref, start_key) {
         MutSearchResult::Internal(ref next_level_node) => {
             {
-                removed_nodes = remove_to_right::<KS, PS>(next_level_node, start_key);
+                removed_nodes = remove_to_right::<KS, PS>(next_level_node, start_key, tree);
                 let mut pivot_node = write_targeted::<KS, PS>(write_node(node_ref), start_key);
                 if pivot_node.is_none() {
                     // terminate when at and of nodes of this level
@@ -83,7 +84,7 @@ where
             }
             debug_assert!(!pivot_node.is_empty_node());
             debug_assert!(pivot_node.is_ext());
-            let mut extnode = pivot_node.extnode_mut();
+            let mut extnode = pivot_node.extnode_mut(tree);
             let len = extnode.len;
             let new_len = extnode.keys.as_slice_immute()[..extnode.len]
                 .binary_search(start_key)
