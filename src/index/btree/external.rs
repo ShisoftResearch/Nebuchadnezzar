@@ -47,7 +47,6 @@ where
     pub next: NodeCellRef,
     pub prev: NodeCellRef,
     pub len: usize,
-    pub dirty: bool,
     pub right_bound: EntryKey,
     pub mark: PhantomData<PS>,
 }
@@ -64,7 +63,6 @@ where
             next: Node::<KS, PS>::none_ref(),
             prev: Node::<KS, PS>::none_ref(),
             len: 0,
-            dirty: true,
             right_bound,
             mark: PhantomData,
         }
@@ -93,7 +91,6 @@ where
             next: NodeCellRef::default(), // UNDETERMINED
             prev: NodeCellRef::default(), // UNDETERMINED
             len: key_count,
-            dirty: false,
             right_bound: max_entry_key(), // UNDETERMINED
             mark: PhantomData,
         };
@@ -185,7 +182,6 @@ where
             next: self.next.clone(),
             prev: self_ref.clone(),
             len: keys_2_len,
-            dirty: true,
             right_bound: self.right_bound.clone(),
             mark: PhantomData,
         };
@@ -236,7 +232,7 @@ where
             self_next_node.prev = node_2.clone();
         }
         self.next = node_2.clone();
-
+        Self::make_changed(&node_2, tree);
         (node_2, pivot_key)
     }
 
@@ -291,7 +287,7 @@ where
         self.len = new_len;
     }
 
-    pub fn remove_contains(&mut self, set: &mut DeletionSetInneer) {
+    pub fn remove_contains(&mut self, set: &DeletionSetInneer) {
         let remaining_keys = {
             let remaining = self.keys.as_slice()[..self.len]
                 .iter()
@@ -357,7 +353,7 @@ where
             &self.keys.as_slice_immute()[..pos]
         );
         self.len = pos;
-        self.dirty = true;
+        Self::make_changed(node_2, tree);
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
@@ -372,9 +368,6 @@ where
         for i in 0..KS::slice_len() {
             debug!("{}\t- {:?}", i, self.keys.as_slice_immute()[i]);
         }
-    }
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
     }
 
     pub fn make_changed(node: &NodeCellRef, tree: &BPlusTree<KS, PS>) {

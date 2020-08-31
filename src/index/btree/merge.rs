@@ -82,7 +82,7 @@ where
                 ExtNode::<KS, PS>::make_changed(current_guard.node_ref(), tree);
                 if remain_slots > 0 {
                     let ext_node = current_guard.extnode_mut();
-                    ext_node.remove_contains(&mut *tree.deleted.write());
+                    ext_node.remove_contains(&*tree.deleted);
                     let selection = keys[merging_pos..keys_len]
                         .iter()
                         .filter(|&k| k < &ext_node.right_bound)

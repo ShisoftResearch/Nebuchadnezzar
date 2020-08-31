@@ -92,7 +92,7 @@ where
 
     // merge to dest_tree
     {
-        let mut deleted_keys = src_tree.deleted.write();
+        let deleted_keys = &src_tree.deleted;
         let mut merged_deleted_keys = vec![];
         let keys: Vec<EntryKey> = left_most_leaf_guards
             .iter()

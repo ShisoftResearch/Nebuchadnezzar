@@ -23,7 +23,6 @@ use parking_lot::RwLock;
 use crate::ram::types::RandValue;
 use std::any::Any;
 use std::cell::UnsafeCell;
-use std::collections::HashSet;
 use std::fmt::Debug;
 use std::iter;
 use std::marker::PhantomData;
@@ -34,16 +33,16 @@ use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 use futures::future::BoxFuture;
-use futures::FutureExt;
+use lightning::map::HashSet;
 
 pub mod verification;
-
+pub mod level;
+pub mod storage;
 mod cursor;
 mod dump;
 mod external;
 mod insert;
 mod internal;
-pub mod level;
 mod merge;
 mod node;
 mod reconstruct;
@@ -51,10 +50,9 @@ mod remove;
 mod search;
 mod split;
 mod prune;
-pub mod storage;
 
 pub type DeletionSetInneer = HashSet<EntryKey>;
-pub type DeletionSet = Arc<RwLock<DeletionSetInneer>>;
+pub type DeletionSet = Arc<DeletionSetInneer>;
 
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
@@ -105,7 +103,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
-            deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
+            deleted: Arc::new(DeletionSetInneer::with_capacity(12854)),
             marker: PhantomData,
         };
         let root_id = Self::new_page_id();
@@ -136,7 +134,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
-            deleted: Arc::new(RwLock::new(DeletionSetInneer::new())),
+            deleted: Arc::new(DeletionSetInneer::with_capacity(64)),
             marker: PhantomData,
         }
     }
@@ -150,12 +148,6 @@ where
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
-        // check returning deleted key
-        if self.deleted.read().contains(key) {
-            let mut deleted = self.deleted.write();
-            deleted.remove(key);
-        }
-
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => {
                 debug!("split root with pivot key {:?}", split.pivot);
@@ -172,6 +164,7 @@ where
             None => return false,
         }
         self.len.fetch_add(1, Relaxed);
+        self.deleted.remove(key);
         return true;
     }
 
@@ -270,12 +263,11 @@ pub trait LevelTree {
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
-    fn remove_following_tombstones(&self, start: &EntryKey);
     fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
     fn ideal_capacity(&self) -> usize {
-        self.size() * LEVEL_PAGE_DIFF_MULTIPLIER
+        self.size() * LEVEL_PAGE_DIFF_MULTIPLIER * LEVEL_PAGE_DIFF_MULTIPLIER
     }
     fn oversized(&self) -> bool {
         self.count() > self.ideal_capacity()
@@ -314,7 +306,7 @@ where
     fn mark_key_deleted(&self, key: &EntryKey) -> bool {
         if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
             if seek_key == key {
-                return self.deleted.write().insert(key.clone());
+                return self.deleted.insert(key);
             }
         }
         false
@@ -326,15 +318,6 @@ where
 
     fn mid_key(&self) -> Option<EntryKey> {
         split::mid_key::<KS, PS>(&self.get_root())
-    }
-
-    fn remove_following_tombstones(&self, start: &EntryKey) {
-        let mut tombstones = self.deleted.write();
-        let original_tombstones = mem::replace(&mut *tombstones, DeletionSetInneer::new());
-        *tombstones = original_tombstones
-            .into_iter()
-            .filter(|k| k < start)
-            .collect();
     }
 
     fn remove_to_right(&self, start_key: &EntryKey) -> usize {
@@ -363,39 +346,35 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn merge_to(&self, upper_level: &dyn LevelTree) -> usize {
+    fn merge_to(&self, _upper_level: &dyn LevelTree) -> usize {
         unreachable!()
     }
 
-    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
+    fn merge_with_keys(&self, _keys: Box<Vec<EntryKey>>) {
         unreachable!()
     }
 
-    fn insert_into(&self, key: &EntryKey) -> bool {
+    fn insert_into(&self, _key: &EntryKey) -> bool {
         unreachable!()
     }
 
-    fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
+    fn seek_for(&self, _key: &EntryKey, _ordering: Ordering) -> Box<dyn Cursor> {
         unreachable!()
     }
 
-    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
+    fn mark_key_deleted(&self, _key: &EntryKey) -> bool {
         unreachable!()
     }
 
-    fn dump(&self, f: &str) {
+    fn dump(&self, _f: &str) {
         unreachable!()
     }
 
     fn mid_key(&self) -> Option<EntryKey> {
         unreachable!()
     }
-
-    fn remove_following_tombstones(&self, start: &EntryKey) {
-        unreachable!()
-    }
-
-    fn remove_to_right(&self, start_key: &EntryKey) -> usize {
+    
+    fn remove_to_right(&self, _start_key: &EntryKey) -> usize {
         unreachable!()
     }
 
@@ -403,7 +382,7 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn verify(&self, level: usize) -> bool {
+    fn verify(&self, _level: usize) -> bool {
         unreachable!()
     }
 }

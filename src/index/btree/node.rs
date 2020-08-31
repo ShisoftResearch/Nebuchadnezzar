@@ -586,7 +586,6 @@ where
         neb: &Arc<server::cell_rpc::AsyncServiceClient>,
     ) -> BoxFuture<()> {
         let mut guard = write_node::<KS, PS>(node_ref);
-        let deletion = deletion.read();
         let guard_ref = &mut *guard;
         let cell = match guard_ref {
             &mut NodeData::External(ref mut node) => {
