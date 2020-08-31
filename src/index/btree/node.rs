@@ -548,7 +548,7 @@ where
             &mut NodeData::External(ref mut node) => {
                 node
             }
-            _ => unreachable!(self.type_name()),
+            _ => unreachable!(),
         }
     }
 
