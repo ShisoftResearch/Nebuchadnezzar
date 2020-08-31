@@ -544,11 +544,13 @@ where
     }
 
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
-        match self.deref_mut() {
+        match {
+            unsafe { &mut *self.data }
+        } {
             &mut NodeData::External(ref mut node) => {
-                node
+                return node
             }
-            _ => unreachable!(),
+            _ => unreachable!(self.type_name().to_owned()),
         }
     }
 
