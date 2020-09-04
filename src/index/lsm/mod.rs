@@ -27,17 +27,17 @@ pub struct LSMTree {
 }
 
 impl LSMTree {
-    pub async fn create(neb: &Arc<server::NebServer>, neb_client: &Arc<AsyncClient>) -> Self {
+    pub async fn create(neb_client: &Arc<AsyncClient>) -> Self {
         let tree_m = LevelMTree::new();
         let tree_1 = Level1Tree::new();
         let tree_2 = Level2Tree::new();
         let tree_3 = Level3Tree::new();
         let tree_4 = Level4Tree::new();
-        tree_m.persist_root(neb).await;
-        tree_1.persist_root(neb).await;
-        tree_2.persist_root(neb).await;
-        tree_3.persist_root(neb).await;
-        tree_4.persist_root(neb).await;
+        tree_m.persist_root(neb_client).await;
+        tree_1.persist_root(neb_client).await;
+        tree_2.persist_root(neb_client).await;
+        tree_3.persist_root(neb_client).await;
+        tree_4.persist_root(neb_client).await;
         let level_ids = vec![
             tree_m.head_id(), 
             tree_1.head_id(), 

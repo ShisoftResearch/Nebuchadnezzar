@@ -321,7 +321,7 @@ pub trait AnyNode: Any + 'static {
         &self,
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
-        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
+        neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()>;
 }
 
@@ -590,7 +590,7 @@ where
         &self,
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
-        neb: &Arc<server::cell_rpc::AsyncServiceClient>,
+        neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
         let mut guard = write_node::<KS, PS>(node_ref);
         let guard_ref = &mut *guard;
@@ -604,9 +604,7 @@ where
         };
         let neb = neb.clone();
         async move {
-            let _ = tokio::spawn(async move {
-                let _ = neb.upsert_cell(cell).await;
-            }).await;
+            let _ = neb.upsert_cell(cell).await;
         }.boxed()
     }
 }

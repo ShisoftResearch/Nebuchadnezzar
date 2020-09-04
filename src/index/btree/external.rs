@@ -19,8 +19,12 @@ pub const KEYS_FIELD: &'static str = "keys";
 pub const NEXT_FIELD: &'static str = "next";
 pub const PREV_FIELD: &'static str = "prev";
 
-#[derive(Clone)]
-pub struct ChangingNode {
+pub enum ChangingNode {
+    Deleted(Id),
+    Modified(NodeModified)
+}
+
+pub struct NodeModified {
     pub node: NodeCellRef,
     pub deletion: DeletionSet,
 }
@@ -30,7 +34,7 @@ lazy_static! {
     pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
     pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
-    pub static ref CHANGED_NODES: SegQueue<(Id, Option<ChangingNode>)> = SegQueue::new();
+    pub static ref CHANGED_NODES: SegQueue<ChangingNode> = SegQueue::new();
 }
 
 pub struct ExtNode<KS, PS>
@@ -372,16 +376,14 @@ where
     PS: Slice<NodeCellRef> + 'static
 {
     let id = read_unchecked::<KS, PS>(node).ext_id();
-    CHANGED_NODES.push((
-        id,
-        Some(ChangingNode {
-            node: node.clone(),
-            deletion: tree.deleted.clone(),
-        })));
+    CHANGED_NODES.push(ChangingNode::Modified(NodeModified {
+        node: node.clone(),
+        deletion: tree.deleted.clone(),
+    }));
 }
 
 pub fn make_deleted(id: &Id) {
-    CHANGED_NODES.push((*id, None));
+    CHANGED_NODES.push(ChangingNode::Deleted(*id));
 }
 
 pub fn page_schema() -> Schema {

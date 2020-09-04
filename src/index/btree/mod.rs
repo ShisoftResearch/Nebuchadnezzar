@@ -117,11 +117,8 @@ where
         return tree;
     }
 
-    pub async fn persist_root(&self, neb: &Arc<server::NebServer>) {
+    pub async fn persist_root(&self, neb: &Arc<crate::client::AsyncClient>) {
         let root = self.get_root();
-        let server_id = neb.get_server_id_by_id(&read_unchecked::<KS, PS>(&root).extnode().id).unwrap();
-        let rpc_client = neb.get_member_by_server_id_async(server_id).await.unwrap();
-        let neb = crate::client::client_by_rpc_client(&rpc_client);
         root.persist(&self.deleted, &neb).await
     }
 
@@ -443,7 +440,7 @@ impl NodeCellRef {
     pub fn persist(
         &self,
         deletion: &DeletionSet,
-        neb: &Arc<crate::server::cell_rpc::AsyncServiceClient>,
+        neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
         self.inner.persist(self, deletion, neb)
     }
