@@ -1,17 +1,17 @@
 use super::*;
-use bifrost::vector_clock::StandardVectorClock;
-use bifrost_plugins::hash_ident;
 use crate::ram::cell::CellHeader;
 use crate::ram::cell::{Cell, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
+use bifrost::vector_clock::StandardVectorClock;
+use bifrost_plugins::hash_ident;
+use lightning::map::{HashMap as LFMap, Map, ObjectMap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use lightning::map::{ObjectMap, HashMap as LFMap, Map};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use tokio::sync::mpsc::{channel, Sender, Receiver};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
@@ -63,11 +63,11 @@ pub struct TransactionManager {
 impl TransactionManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
         Arc::new(Self {
-                server: server.clone(),
-                transactions: LFMap::with_capacity(128),
-                data_sites: ObjectMap::with_capacity(8),
-                await_manager: AwaitManager::new(),
-            })
+            server: server.clone(),
+            transactions: LFMap::with_capacity(128),
+            data_sites: ObjectMap::with_capacity(8),
+            await_manager: AwaitManager::new(),
+        })
     }
 }
 
@@ -93,14 +93,16 @@ impl Service for TransactionManager {
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
                     let awaits = self.await_manager.get_txn(&tid);
-                    self.read_from_site(server_id, &server, &tid, &id, &mut txn, &awaits).await
+                    self.read_from_site(server_id, &server, &tid, &id, &mut txn, &awaits)
+                        .await
                 }
                 Err(e) => {
                     error!("{:?}", e);
                     Err(TMError::CannotLocateCellServer)
                 }
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn head(
@@ -121,14 +123,16 @@ impl Service for TransactionManager {
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
                     let awaits = self.await_manager.get_txn(&tid);
-                    self.head_from_site(server_id, &server, &tid, &id, &txn, &awaits).await
+                    self.head_from_site(server_id, &server, &tid, &id, &txn, &awaits)
+                        .await
                 }
                 Err(e) => {
                     error!("{:?}", e);
                     Err(TMError::CannotLocateCellServer)
                 }
             }
-        }.boxed()
+        }
+        .boxed()
     }
     fn read_selected(
         &self,
@@ -150,7 +154,11 @@ impl Service for TransactionManager {
                                     result.push(map.get_by_key_id(field).clone())
                                 }
                             }
-                            _ => return Ok(TxnExecResult::Error(ReadError::CellTypeIsNotMapForSelect)),
+                            _ => {
+                                return Ok(TxnExecResult::Error(
+                                    ReadError::CellTypeIsNotMapForSelect,
+                                ))
+                            }
                         }
                         return Ok(TxnExecResult::Accepted(result));
                     } // read from cache
@@ -161,15 +169,17 @@ impl Service for TransactionManager {
                 Ok((server_id, server)) => {
                     let awaits = self.await_manager.get_txn(&tid);
                     self.read_selected_from_site(
-                        server_id, &server, &tid, &id, &fields, &txn, &awaits
-                    ).await
+                        server_id, &server, &tid, &id, &fields, &txn, &awaits,
+                    )
+                    .await
                 }
                 Err(e) => {
                     error!("{:?}", e);
                     Err(TMError::CannotLocateCellServer)
                 }
             }
-        }.boxed()
+        }
+        .boxed()
     }
 
     fn prepare(&self, tid: TxnId) -> BoxFuture<Result<TMPrepareResult, TMError>> {
@@ -182,17 +192,11 @@ impl Service for TransactionManager {
                     self.generate_affected_objs(&mut txn);
                     let affect_objs = &txn.affected_objects;
                     let data_sites = self.data_sites_for_objs(&affect_objs).await?;
-                    let sites_prepare_result = self.sites_prepare(
-                        &tid,
-                        affect_objs,
-                        &data_sites
-                    ).await?;
+                    let sites_prepare_result =
+                        self.sites_prepare(&tid, affect_objs, &data_sites).await?;
                     if sites_prepare_result == DMPrepareResult::Success {
-                        let sites_commit_result = self.sites_commit(
-                            &tid,
-                            affect_objs,
-                            &data_sites
-                        ).await?;
+                        let sites_commit_result =
+                            self.sites_commit(&tid, affect_objs, &data_sites).await?;
                         match sites_commit_result {
                             DMCommitResult::Success => TMPrepareResult::Success,
                             _ => TMPrepareResult::DMCommitError(sites_commit_result),
@@ -210,7 +214,8 @@ impl Service for TransactionManager {
                 result
             };
             return Ok(conclusion);
-        }.boxed()
+        }
+        .boxed()
     }
     fn commit(&self, tid: TxnId) -> BoxFuture<Result<EndResult, TMError>> {
         async move {
@@ -220,15 +225,12 @@ impl Service for TransactionManager {
                 self.ensure_txn_state(&txn, TxnState::Prepared)?;
                 let affected_objs = &txn.affected_objects;
                 let data_sites = self.data_sites_for_objs(&affected_objs).await?;
-                self.sites_end(
-                    &tid,
-                    affected_objs,
-                    &data_sites
-                ).await
+                self.sites_end(&tid, affected_objs, &data_sites).await
             };
             self.cleanup_transaction(&tid);
             return result;
-        }.boxed()
+        }
+        .boxed()
     }
     fn abort(&self, tid: TxnId) -> BoxFuture<Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
@@ -240,22 +242,21 @@ impl Service for TransactionManager {
                     let changed_objs = &txn.affected_objects;
                     let data_sites = self.data_sites_for_objs(&changed_objs).await?;
                     debug!("ABORT AFFECTED OBJS: {:?}", changed_objs);
-                    self.sites_abort(
-                        &tid,
-                        changed_objs,
-                        &data_sites
-                    ).await // with end
+                    self.sites_abort(&tid, changed_objs, &data_sites).await // with end
                 } else {
                     Ok(AbortResult::Success(None))
                 }
             };
             self.cleanup_transaction(&tid);
             return result;
-        }.boxed()
+        }
+        .boxed()
     }
     fn begin(&self) -> BoxFuture<Result<TxnId, TMError>> {
         let id = self.server.txn_peer.clock.inc();
-        if self.transactions.insert(
+        if self
+            .transactions
+            .insert(
                 &id,
                 Arc::new(Mutex::new(Transaction {
                     data: HashMap::new(),
@@ -270,8 +271,12 @@ impl Service for TransactionManager {
             future::ready(Ok(id)).boxed()
         }
     }
-    
-    fn write(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+
+    fn write(
+        &self,
+        tid: TxnId,
+        cell: Cell,
+    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -304,9 +309,14 @@ impl Service for TransactionManager {
                 }
                 None => Err(TMError::CannotLocateCellServer),
             }
-        }.boxed()
+        }
+        .boxed()
     }
-    fn update(&self, tid: TxnId, cell: Cell) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+    fn update(
+        &self,
+        tid: TxnId,
+        cell: Cell,
+    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -335,9 +345,14 @@ impl Service for TransactionManager {
                 }
                 None => Err(TMError::CannotLocateCellServer),
             }
-        }.boxed()
+        }
+        .boxed()
     }
-    fn remove(&self, tid: TxnId, id: Id) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+    fn remove(
+        &self,
+        tid: TxnId,
+        id: Id,
+    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_lock = self.get_transaction(&tid)?;
             let mut txn = txn_lock.lock().await;
@@ -377,10 +392,15 @@ impl Service for TransactionManager {
                 }
                 None => Err(TMError::CannotLocateCellServer),
             }
-        }.boxed()
+        }
+        .boxed()
     }
     fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<()> {
-        debug!("=> TM WAKE UP TXN from {} for {} txn", server_id, tids.len());
+        debug!(
+            "=> TM WAKE UP TXN from {} for {} txn",
+            server_id,
+            tids.len()
+        );
         let futures = FuturesUnordered::new();
         for tid in tids {
             let await_txn = self.await_manager.get_txn(&tid);
@@ -391,22 +411,22 @@ impl Service for TransactionManager {
         }
         async move {
             let _: Vec<_> = futures.collect().await;
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
 impl TransactionManager {
-    async fn get_data_site(&self, server_id: u64) -> io::Result<Arc<data_site::AsyncServiceClient>> {
+    async fn get_data_site(
+        &self,
+        server_id: u64,
+    ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         let server_id_usize = server_id as usize;
         if !self.data_sites.contains(&server_id_usize) {
             let client = self.server.get_member_by_server_id(server_id).await?;
-            return Ok(
-                self.data_sites.get_or_insert(
-                    &server_id_usize, 
-                    || data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client
-                    )
-                )
-            )
+            return Ok(self.data_sites.get_or_insert(&server_id_usize, || {
+                data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)
+            }));
         }
         Ok(self.data_sites.get(&server_id_usize).unwrap().clone())
     }
@@ -448,8 +468,9 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
-            let read_response =
-            server.read(self_server_id, self.get_clock(), tid.to_owned(), id.clone()).await;
+            let read_response = server
+                .read(self_server_id, self.get_clock(), tid.to_owned(), id.clone())
+                .await;
             match read_response {
                 Ok(dsr) => {
                     self.merge_clock(&dsr.clock);
@@ -474,16 +495,16 @@ impl TransactionManager {
                         }
                         _ => {}
                     }
-                    return Ok(payload_out)
+                    return Ok(payload_out);
                 }
                 Err(e) => {
                     error!("{:?}", e);
-                    return Err(TMError::RPCErrorFromCellServer)
+                    return Err(TMError::RPCErrorFromCellServer);
                 }
             }
         }
     }
-    
+
     async fn head_from_site<'a>(
         &self,
         server_id: u64,
@@ -495,7 +516,9 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
-            let head_response = server.head(self_server_id, self.get_clock(), tid.to_owned(), *id).await;
+            let head_response = server
+                .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
+                .await;
             match head_response {
                 Ok(dsr) => {
                     self.merge_clock(&dsr.clock);
@@ -528,13 +551,15 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
-            let read_response = server.read_selected(
-                self_server_id,
-                self.get_clock(),
-                tid.to_owned(),
-                id.clone(),
-                fields.to_owned()
-            ).await;
+            let read_response = server
+                .read_selected(
+                    self_server_id,
+                    self.get_clock(),
+                    tid.to_owned(),
+                    id.clone(),
+                    fields.to_owned(),
+                )
+                .await;
             match read_response {
                 Ok(dsr) => {
                     self.merge_clock(&dsr.clock);
@@ -566,7 +591,10 @@ impl TransactionManager {
         txn.data.clear(); // clean up data after transferred to changed
         txn.affected_objects = affected_objs;
     }
-    async fn data_sites_for_objs(&self, changed_objs: &AffectedObjs) -> Result<DataSitesMap, TMError> {
+    async fn data_sites_for_objs(
+        &self,
+        changed_objs: &AffectedObjs,
+    ) -> Result<DataSitesMap, TMError> {
         let mut data_sites = HashMap::new();
         for (server_id, _) in changed_objs {
             data_sites.insert(*server_id, self.get_data_site(*server_id).await);
@@ -574,7 +602,10 @@ impl TransactionManager {
         if data_sites.iter().any(|(_, data_site)| data_site.is_err()) {
             return Err(TMError::CannotLocateCellServer);
         }
-        Ok(data_sites.into_iter().map(|(id, client)| (id, client.unwrap())).collect())
+        Ok(data_sites
+            .into_iter()
+            .map(|(id, client)| (id, client.unwrap()))
+            .collect())
     }
     async fn site_prepare(
         server: &Arc<NebServer>,
@@ -592,7 +623,7 @@ impl TransactionManager {
                     self_server_id,
                     server.txn_peer.clock.to_clock(),
                     tid.clone(),
-                    cell_ids
+                    cell_ids,
                 )
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
@@ -617,7 +648,7 @@ impl TransactionManager {
             }
         }
     }
-    
+
     async fn sites_prepare(
         &self,
         tid: &TxnId,
@@ -626,25 +657,18 @@ impl TransactionManager {
     ) -> Result<DMPrepareResult, TMError> {
         let mut prepare_futures: FuturesUnordered<_> = affected_objs
             .into_iter()
-            .map(|(server, objs)| {
-                async move {
-                    let data_site = data_sites.get(server).unwrap().clone();
-                    let awaits = self.await_manager.get_txn(&tid);
-                    TransactionManager::site_prepare(
-                        &self.server,
-                        &awaits,
-                        &tid,
-                        &objs,
-                        &data_site,
-                    ).await
-                }
+            .map(|(server, objs)| async move {
+                let data_site = data_sites.get(server).unwrap().clone();
+                let awaits = self.await_manager.get_txn(&tid);
+                TransactionManager::site_prepare(&self.server, &awaits, &tid, &objs, &data_site)
+                    .await
             })
             .collect();
         while let Some(result) = prepare_futures.next().await {
             match result {
                 Ok(DMPrepareResult::Success) => {}
                 Ok(res) => return Ok(res),
-                Err(e) => return Err(e)
+                Err(e) => return Err(e),
             }
         }
         Ok(DMPrepareResult::Success)
@@ -677,7 +701,9 @@ impl TransactionManager {
                     })
                     .collect();
                 async move {
-                    data_site.commit(this_clone.get_clock(), tid.to_owned(), ops).await
+                    data_site
+                        .commit(this_clone.get_clock(), tid.to_owned(), ops)
+                        .await
                 }
             })
             .collect();
@@ -707,9 +733,7 @@ impl TransactionManager {
             .iter()
             .map(|(ref server_id, _)| {
                 let data_site = data_sites.get(*server_id).unwrap();
-                async move {
-                    data_site.abort(self.get_clock(), tid.clone()).await
-                }
+                async move { data_site.abort(self.get_clock(), tid.clone()).await }
             })
             .collect();
         let abort_results: Vec<_> = abort_futures.collect().await;
@@ -748,9 +772,7 @@ impl TransactionManager {
             .iter()
             .map(|(ref server_id, _)| {
                 let data_site = data_sites.get(*server_id).unwrap();
-                async move {
-                    data_site.end(self.get_clock(), tid.clone()).await
-                }
+                async move { data_site.end(self.get_clock(), tid.clone()).await }
             })
             .collect();
         let end_results: Vec<_> = end_futures.collect().await;
@@ -765,7 +787,7 @@ impl TransactionManager {
                             return Ok(payload);
                         }
                     }
-                },
+                }
                 Err(e) => {
                     debug!("Error on site end {:?}", e);
                     return Err(TMError::RPCErrorFromCellServer);
@@ -815,7 +837,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
-    map: ObjectMap<Arc<AwaitingServer>>
+    map: ObjectMap<Arc<AwaitingServer>>,
 }
 
 impl AwaitManager {
@@ -832,11 +854,12 @@ impl AwaitManager {
 impl TxnAwaits {
     pub fn new_ref() -> Arc<Self> {
         Arc::new(Self {
-            map: ObjectMap::with_capacity(8)
+            map: ObjectMap::with_capacity(8),
         })
     }
     pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {
-        self.map.get_or_insert(&(server_id as usize), || Arc::new(AwaitingServer::new()))  
+        self.map
+            .get_or_insert(&(server_id as usize), || Arc::new(AwaitingServer::new()))
     }
     pub async fn send(&self, server_id: u64) {
         debug!("Will sending to wakeup from {}", server_id);

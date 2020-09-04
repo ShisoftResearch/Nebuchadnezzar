@@ -1,25 +1,27 @@
 use crate::client::AsyncClient;
-use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use crate::index::btree::cursor::*;
 pub use crate::index::btree::external::page_schema;
 use crate::index::btree::external::*;
 use crate::index::btree::insert::*;
 use crate::index::btree::internal::*;
+use crate::index::btree::level::LEVEL_PAGE_DIFF_MULTIPLIER;
 use crate::index::btree::merge::merge_into_tree_node;
 pub use crate::index::btree::node::*;
 use crate::index::btree::search::*;
 use crate::index::btree::split::remove_to_right;
-use crate::index::btree::level::LEVEL_PAGE_DIFF_MULTIPLIER;
 use crate::index::trees::Cursor;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use crate::index::trees::MAX_KEY_SIZE;
 use crate::index::trees::{Cursor as IndexCursor, Ordering};
-use crate::server;
-use itertools::Itertools;
-use parking_lot::RwLock;
 use crate::ram::types::RandValue;
+use crate::server;
+use dovahkiin::types::custom_types::id::Id;
+use dovahkiin::types::{key_hash, PrimitiveArray, Value};
+use futures::future::BoxFuture;
+use itertools::Itertools;
+use lightning::map::HashSet;
+use parking_lot::RwLock;
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::fmt::Debug;
@@ -31,24 +33,22 @@ use std::ops::DerefMut;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
-use futures::future::BoxFuture;
-use lightning::map::HashSet;
 
-pub mod verification;
-pub mod level;
-pub mod storage;
 mod cursor;
 mod dump;
 mod external;
 mod insert;
 mod internal;
+pub mod level;
 mod merge;
 mod node;
+mod prune;
 mod reconstruct;
+mod remove;
 mod search;
 mod split;
-mod prune;
-mod remove;
+pub mod storage;
+pub mod verification;
 
 const DEL_SET_CAP: usize = 16;
 
@@ -346,7 +346,7 @@ impl LevelTree for DummyLevelTree {
     fn mid_key(&self) -> Option<EntryKey> {
         unreachable!()
     }
-    
+
     fn remove_to_right(&self, _start_key: &EntryKey) -> usize {
         unreachable!()
     }

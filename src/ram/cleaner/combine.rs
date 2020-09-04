@@ -1,7 +1,7 @@
-use itertools::Itertools;
 use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;

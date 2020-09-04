@@ -10,9 +10,9 @@ use core::borrow::Borrow;
 use std::string::String;
 use std::sync::Arc;
 
-use std::ops::Deref;
 use futures::prelude::*;
 use futures::FutureExt;
+use std::ops::Deref;
 
 pub mod sm;
 
@@ -138,7 +138,7 @@ impl LocalSchemasCache {
         let _ = sm
             .on_schema_deleted(move |schema| {
                 let mut m2 = m2.write();
-                m2.del_schema(&schema) .unwrap();
+                m2.del_schema(&schema).unwrap();
                 future::ready(()).boxed()
             })
             .await?;

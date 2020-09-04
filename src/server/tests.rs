@@ -1,12 +1,12 @@
+use crate::client;
+use crate::ram::cell::Cell;
+use crate::ram::schema::Field;
+use crate::ram::schema::Schema;
+use crate::ram::types::*;
+use crate::server::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
-use crate::client;
-use crate::ram::cell::Cell;
-use crate::ram::schema::Schema;
-use crate::ram::schema::Field;
-use crate::ram::types::*;
-use crate::server::*;
 use std::env;
 use std::sync::Arc;
 use test::Bencher;
@@ -30,7 +30,8 @@ async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
         },
         &server_addr,
         &server_group,
-    ).await;
+    )
+    .await;
     let schema_id = 123;
     let schema = Schema {
         id: schema_id,
@@ -56,7 +57,14 @@ async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
     };
 
     let client = Arc::new(
-        client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap(),
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            &server_group,
+        )
+        .await
+        .unwrap(),
     );
     client.new_schema_with_id(schema).await.unwrap().unwrap();
     (server, client, schema_id)
@@ -164,7 +172,8 @@ pub async fn init() {
         },
         &String::from("127.0.0.1:5100"),
         &String::from("test"),
-    ).await;
+    )
+    .await;
 }
 
 #[tokio::test(threaded_scheduler)]
@@ -187,7 +196,8 @@ pub async fn smoke_test() {
         },
         &server_addr,
         &server_group,
-    ).await;
+    )
+    .await;
     let schema_id = 123;
     let schema = Schema {
         id: schema_id,
@@ -212,8 +222,16 @@ pub async fn smoke_test() {
         ),
     };
 
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            &server_group,
+        )
+        .await
+        .unwrap(),
+    );
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..num {
@@ -267,7 +285,8 @@ pub async fn smoke_test_parallel() {
         },
         &server_addr,
         &server_group,
-    ).await;
+    )
+    .await;
     let schema_id = 123;
     let schema = Schema {
         id: schema_id,
@@ -292,8 +311,16 @@ pub async fn smoke_test_parallel() {
         ),
     };
 
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            &server_group,
+        )
+        .await
+        .unwrap(),
+    );
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     // // Create a background thread which checks for deadlocks every 10s
@@ -366,7 +393,8 @@ pub async fn txn() {
         },
         &server_addr,
         &server_group,
-    ).await;
+    )
+    .await;
     let schema_id = 123;
     let schema = Schema {
         id: schema_id,
@@ -391,8 +419,16 @@ pub async fn txn() {
         ),
     };
 
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], &server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            &server_group,
+        )
+        .await
+        .unwrap(),
+    );
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for _ in 0..num {
@@ -404,6 +440,7 @@ pub async fn txn() {
                 let cell = Cell::new_with_id(schema_id, &id, value);
                 txn.upsert(cell).await
             })
-            .await.unwrap();
+            .await
+            .unwrap();
     }
 }

@@ -1,16 +1,16 @@
 use bifrost::conshash::{CHError, ConsistentHashing};
+use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
-use bifrost::membership::client::ObserverClient;
+use futures::prelude::*;
+use futures::stream::FuturesUnordered;
+use futures::stream::StreamExt;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
-use futures::stream::FuturesUnordered;
-use futures::stream::StreamExt;
-use futures::prelude::*;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
@@ -23,9 +23,9 @@ use self::transaction::*;
 
 static TRANSACTION_MAX_RETRY: u32 = 1000;
 
-pub mod transaction;
 #[cfg(test)]
 mod tests;
+pub mod transaction;
 
 #[derive(Debug)]
 pub enum NebClientError {
@@ -54,14 +54,18 @@ impl AsyncClient {
             Ok(raft_client) => {
                 RaftClient::prepare_subscription(subscription_server).await;
                 assert!(RaftClient::can_callback().await);
-                match ConsistentHashing::new_client_with_id(CONS_HASH_ID, group, &raft_client, membership).await {
+                match ConsistentHashing::new_client_with_id(
+                    CONS_HASH_ID,
+                    group,
+                    &raft_client,
+                    membership,
+                )
+                .await
+                {
                     Ok(chash) => Ok(Self {
                         conshash: chash,
                         raft_client: raft_client.clone(),
-                        schema_client: SchemaClient::new(
-                            generate_sm_id(group),
-                            &raft_client,
-                        ),
+                        schema_client: SchemaClient::new(generate_sm_id(group), &raft_client),
                     }),
                     Err(err) => Err(NebClientError::ConsistentHashtableError(err)),
                 }
@@ -84,7 +88,8 @@ impl AsyncClient {
         server_id: u64,
     ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
         DEFAULT_CLIENT_POOL
-            .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid)).await
+            .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid))
+            .await
             .map_err(|e| RPCError::IOError(e))
             .map(|c| client_by_rpc_client(&c))
     }
@@ -101,10 +106,7 @@ impl AsyncClient {
         let client = self.locate_plain_server(id).await?;
         client.read_cell(id).await
     }
-    pub async fn write_cell(
-        &self,
-        cell: Cell,
-    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
+    pub async fn write_cell(&self, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
         client.write_cell(cell).await
     }
@@ -130,11 +132,9 @@ impl AsyncClient {
         let (members, _) = self.conshash.membership().all_members(true).await.unwrap();
         let mut member_futs: FuturesUnordered<_> = members
             .into_iter()
-            .map(|m| {
-                async move {
-                    let client = self.client_by_server_id(m.id).await?;
-                    Ok(client.count().await?)
-                }
+            .map(|m| async move {
+                let client = self.client_by_server_id(m.id).await?;
+                Ok(client.count().await?)
             })
             .collect();
         let mut sum = 0;
@@ -146,7 +146,7 @@ impl AsyncClient {
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
         TFN: Fn(Transaction) -> RF + 'a,
-        RF: Future<Output = Result<TR, TxnError>> + 'a
+        RF: Future<Output = Result<TR, TxnError>> + 'a,
     {
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,

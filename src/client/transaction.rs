@@ -48,7 +48,11 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
-    pub async fn read_selected(&self, id: Id, fields: Vec<u64>) -> Result<Option<Vec<Value>>, TxnError> {
+    pub async fn read_selected(
+        &self,
+        id: Id,
+        fields: Vec<u64>,
+    ) -> Result<Option<Vec<Value>>, TxnError> {
         match self
             .client
             .read_selected(self.tid.to_owned(), id, fields)

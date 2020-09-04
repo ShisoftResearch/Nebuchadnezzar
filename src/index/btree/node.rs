@@ -1,9 +1,9 @@
 use super::*;
 use crate::server;
+use futures::FutureExt;
 use std::any::TypeId;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
-use futures::FutureExt;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -544,12 +544,8 @@ where
     }
 
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
-        match {
-            unsafe { &mut *self.data }
-        } {
-            &mut NodeData::External(ref mut node) => {
-                return node
-            }
+        match { unsafe { &mut *self.data } } {
+            &mut NodeData::External(ref mut node) => return node,
             _ => unreachable!(self.type_name().to_owned()),
         }
     }
@@ -560,14 +556,14 @@ where
     }
 }
 
-unsafe impl <KS, PS> Send for NodeWriteGuard<KS, PS>
+unsafe impl<KS, PS> Send for NodeWriteGuard<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
 }
 
-unsafe impl <KS, PS> Sync for NodeWriteGuard<KS, PS>
+unsafe impl<KS, PS> Sync for NodeWriteGuard<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -595,17 +591,14 @@ where
         let mut guard = write_node::<KS, PS>(node_ref);
         let guard_ref = &mut *guard;
         let cell = match guard_ref {
-            &mut NodeData::External(ref mut node) => {
-                node.to_cell(&*deletion)
-            },
-            _ => {
-                panic!("Cannot persist internal or other type of nodes")
-            },
+            &mut NodeData::External(ref mut node) => node.to_cell(&*deletion),
+            _ => panic!("Cannot persist internal or other type of nodes"),
         };
         let neb = neb.clone();
         async move {
             let _ = neb.upsert_cell(cell).await;
-        }.boxed()
+        }
+        .boxed()
     }
 }
 

@@ -3,8 +3,8 @@ use super::*;
 use bifrost::raft::state_machine::callback::server::{NotifyError, SMCallback};
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
-use bifrost_hasher::hash_str;
 use bifrost::utils;
+use bifrost_hasher::hash_str;
 use std::sync::Arc;
 
 pub static SM_ID_PREFIX: &'static str = "NEB_SCHEMAS_SM";
@@ -37,23 +37,28 @@ impl StateMachineCmds for SchemasSM {
         future::ready(self.map.get(&id).map(|r| -> Schema {
             let borrow: &Schema = r.borrow();
             borrow.clone()
-        })).boxed()
+        }))
+        .boxed()
     }
     fn new_schema(&mut self, schema: Schema) -> BoxFuture<Result<(), NotifyError>> {
         self.map.new_schema(schema.clone());
         async move {
             self.callback
-            .notify(commands::on_schema_added::new(), schema).await?;
+                .notify(commands::on_schema_added::new(), schema)
+                .await?;
             Ok(())
-        }.boxed()
+        }
+        .boxed()
     }
     fn del_schema(&mut self, name: String) -> BoxFuture<Result<(), NotifyError>> {
         self.map.del_schema(&name).unwrap();
         async move {
             self.callback
-                .notify(commands::on_schema_deleted::new(), name).await?;
+                .notify(commands::on_schema_deleted::new(), name)
+                .await?;
             Ok(())
-        }.boxed()
+        }
+        .boxed()
     }
     fn next_id(&mut self) -> BoxFuture<u32> {
         future::ready(self.map.next_id()).boxed()

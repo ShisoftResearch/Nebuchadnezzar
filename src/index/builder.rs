@@ -1,9 +1,9 @@
-use bifrost_hasher::hash_str;
 use crate::index::builder::IndexComps::Vectorized;
 use crate::index::trees::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
+use bifrost_hasher::hash_str;
 use smallvec::SmallVec;
 
 type FieldName = String;
@@ -54,9 +54,7 @@ pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<Inde
         let field_id = hash_str(&index.fields);
         for meta in index.meta {
             match meta {
-                IndexMeta::Ranged(ranged) => {
-
-                }
+                IndexMeta::Ranged(ranged) => {}
                 IndexMeta::Hashed(_) => {}
                 IndexMeta::Vectorized(_) => {}
             }
@@ -128,9 +126,10 @@ fn probe_field_indices(
                 match index {
                     &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
                     &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
-                    &IndexType::Vectorized => {
-                        components.push(IndexComps::Vectorized(value.feature(), value.base_size() as u8))
-                    }
+                    &IndexType::Vectorized => components.push(IndexComps::Vectorized(
+                        value.feature(),
+                        value.base_size() as u8,
+                    )),
                 }
             }
         }

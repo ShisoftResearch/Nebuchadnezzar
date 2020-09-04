@@ -1,4 +1,3 @@
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use crate::ram::chunk::Chunk;
 use crate::ram::clock;
 use crate::ram::entry::*;
@@ -6,8 +5,9 @@ use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, RandValue, Value};
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
-use std::io::{Cursor};
+use std::io::Cursor;
 use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
@@ -176,7 +176,7 @@ impl Cell {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    
+
     //TODO: optimize for update
     pub fn write_to_chunk(&mut self, chunk: &Chunk, _update: bool) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;

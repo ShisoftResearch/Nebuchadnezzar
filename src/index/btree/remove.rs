@@ -1,7 +1,7 @@
+use crate::index::btree::external;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::NodeData;
 use crate::index::btree::NodeCellRef;
-use crate::index::btree::{external};
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use std::fmt::Debug;

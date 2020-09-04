@@ -1,5 +1,3 @@
-use bifrost::utils::time::get_time;
-use parking_lot::RwLock;
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
@@ -7,14 +5,16 @@ use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
+use crate::utils::raii_mutex_table::RAIIMutexTable;
+use crate::utils::ring_buffer::RingBuffer;
+use crate::utils::upper_power_of_2;
+use bifrost::utils::time::get_time;
+use lightning::map::*;
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use crate::utils::raii_mutex_table::RAIIMutexTable;
-use crate::utils::ring_buffer::RingBuffer;
-use crate::utils::upper_power_of_2;
-use lightning::map::*;
 
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -209,7 +209,11 @@ impl Chunk {
     fn write_cell_unchecked(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let loc = cell.write_to_chunk(self, false)?;
-        if self.index.insert(&(cell.header.hash as usize), loc).is_some() {
+        if self
+            .index
+            .insert(&(cell.header.hash as usize), loc)
+            .is_some()
+        {
             Err(WriteError::CellAlreadyExisted)
         } else {
             Ok(cell.header)
@@ -301,7 +305,7 @@ impl Chunk {
             Err(WriteError::CellDoesNotExisted)
         }
     }
-   
+
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
         P: Fn(Cell) -> bool,
@@ -309,24 +313,21 @@ impl Chunk {
         if let Some(guard) = self.index.lock(&(hash as usize)) {
             let cell_location = *guard;
             let cell = Cell::from_chunk_raw(cell_location, self);
-                match cell {
-                    Ok(cell) => {
-                        if predict(cell) {
-                            let put_tombstone_result =
-                                self.put_tombstone_by_cell_loc(cell_location);
-                            if put_tombstone_result.is_err() {
-                                put_tombstone_result
-                            } else {
-                                Ok(())
-                            }
+            match cell {
+                Ok(cell) => {
+                    if predict(cell) {
+                        let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
+                        if put_tombstone_result.is_err() {
+                            put_tombstone_result
                         } else {
-                            Err(WriteError::CellDoesNotExisted)
+                            Ok(())
                         }
-                    }
-                    Err(e) => {
-                        Err(WriteError::ReadError(e))
+                    } else {
+                        Err(WriteError::CellDoesNotExisted)
                     }
                 }
+                Err(e) => Err(WriteError::ReadError(e)),
+            }
         } else {
             Err(WriteError::CellDoesNotExisted)
         }

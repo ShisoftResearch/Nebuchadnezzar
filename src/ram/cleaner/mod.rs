@@ -1,11 +1,11 @@
 use crate::ram::chunk::Chunks;
+use lightning::map::Map;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use lightning::map::Map;
 
 pub mod combine;
 pub mod compact;
@@ -44,7 +44,8 @@ impl Cleaner {
                     });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
-            }).unwrap();
+            })
+            .unwrap();
         thread::Builder::new()
             .name("Cleaner main".into())
             .spawn(move || {
@@ -106,7 +107,8 @@ impl Cleaner {
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");
-            }).unwrap();
+            })
+            .unwrap();
         return cleaner;
     }
 }

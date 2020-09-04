@@ -262,7 +262,7 @@ where
         left_node: &mut NodeWriteGuard<KS, PS>,
         right_node: &mut NodeWriteGuard<KS, PS>,
         right_node_next: &mut NodeWriteGuard<KS, PS>,
-        tree: &BPlusTree<KS, PS>
+        tree: &BPlusTree<KS, PS>,
     ) {
         let left_node_ref = self.ptrs.as_slice()[left_ptr_pos].clone();
         let left_len = left_node.len();
@@ -337,7 +337,7 @@ where
         right_ptr_pos: usize,
         left_node: &mut NodeWriteGuard<KS, PS>,
         right_node: &mut NodeWriteGuard<KS, PS>,
-        tree: &BPlusTree<KS, PS>
+        tree: &BPlusTree<KS, PS>,
     ) {
         debug_assert_ne!(left_ptr_pos, right_ptr_pos);
         let mut new_right_node_key = Default::default();

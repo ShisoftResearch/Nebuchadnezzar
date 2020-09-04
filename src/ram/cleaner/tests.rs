@@ -1,5 +1,4 @@
 use super::*;
-use env_logger;
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunk;
 use crate::ram::chunk::Chunks;
@@ -8,6 +7,7 @@ use crate::ram::schema::Field;
 use crate::ram::schema::*;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
+use env_logger;
 use std;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -76,7 +76,8 @@ pub fn full_clean_cycle() {
 
         println!("trying to delete cells");
 
-        let all_seg_positions = seg_positions(chunk);();
+        let all_seg_positions = seg_positions(chunk);
+        ();
         assert_eq!(all_seg_positions.len(), 2);
         assert_eq!(chunk.cell_count(), 16);
 
@@ -92,7 +93,9 @@ pub fn full_clean_cycle() {
 
         // try to scan first segment expect no panic
         println!("Scanning first segment...");
-        chunk.live_entries(&chunk.segs.get(&0).unwrap()).for_each(|_|{});
+        chunk
+            .live_entries(&chunk.segs.get(&0).unwrap())
+            .for_each(|_| {});
 
         println!("Scanning second segment for tombstones...");
         let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
@@ -132,7 +135,8 @@ pub fn full_clean_cycle() {
             compact::CompactCleaner::clean_segment(chunk, &seg);
         });
 
-        let compacted_seg_positions = seg_positions(chunk);();
+        let compacted_seg_positions = seg_positions(chunk);
+        ();
         assert_eq!(compacted_seg_positions.len(), 2);
         assert_eq!(chunk.cell_count(), 8);
 

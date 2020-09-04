@@ -1,18 +1,18 @@
+use crate::index::btree::*;
+use crate::index::trees::EntryKey;
+use crate::index::trees::Slice;
+use crate::ram::cell::Cell;
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::*;
+use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
-use crate::index::btree::*;
-use crate::index::trees::EntryKey;
-use crate::index::trees::Slice;
 use itertools::Itertools;
-use crate::ram::cell::Cell;
-use crate::ram::schema::{Field, Schema};
-use crate::ram::types::*;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{mem, panic};
-use crossbeam::queue::SegQueue;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -21,7 +21,7 @@ pub const PREV_FIELD: &'static str = "prev";
 
 pub enum ChangingNode {
     Deleted(Id),
-    Modified(NodeModified)
+    Modified(NodeModified),
 }
 
 pub struct NodeModified {
@@ -373,7 +373,7 @@ where
 pub fn make_changed<KS, PS>(node: &NodeCellRef, tree: &BPlusTree<KS, PS>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static
+    PS: Slice<NodeCellRef> + 'static,
 {
     let id = read_unchecked::<KS, PS>(node).ext_id();
     CHANGED_NODES.push(ChangingNode::Modified(NodeModified {

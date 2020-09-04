@@ -1,17 +1,17 @@
-use std::borrow::Borrow;
 use crate::index::btree::internal::InNode;
 use crate::index::btree::node::read_node;
 use crate::index::btree::node::Node;
 use crate::index::btree::node::NodeData;
+use crate::index::btree::node::*;
+use crate::index::btree::verification::{is_node_list_serial, is_node_serial};
 use crate::index::btree::{min_entry_key, NodeCellRef};
 use crate::index::btree::{NodeReadHandler, MIN_ENTRY_KEY};
-use crate::index::btree::verification::{is_node_list_serial, is_node_serial};
 use crate::index::trees::EntryKey;
-use crate::index::btree::node::*;
 use crate::index::trees::Slice;
-use std::iter::{Peekable, Iterator};
-use std::fmt::Debug;
 use itertools::Itertools;
+use std::borrow::Borrow;
+use std::fmt::Debug;
+use std::iter::{Iterator, Peekable};
 
 type AlterPair = (EntryKey, NodeCellRef);
 
@@ -69,7 +69,12 @@ where
     // Locating refrences in the pages to be removed
     let page_children_to_be_retained = ref_to_be_retained(&mut all_pages, &altered, level);
     // make all the necessary changes in current level pages according to is living children
-    all_pages = filter_retained(all_pages, page_children_to_be_retained, &mut level_page_altered, level);
+    all_pages = filter_retained(
+        all_pages,
+        page_children_to_be_retained,
+        &mut level_page_altered,
+        level,
+    );
 
     // alter keys
     {
@@ -102,30 +107,36 @@ where
     (box level_page_altered, box all_pages)
 }
 
-fn removed_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> { 
-    altered_keys.removed.iter() 
+fn removed_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
+    altered_keys.removed.iter()
 }
-fn altered_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> { 
+fn altered_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
     altered_keys.key_modified.iter()
 }
-fn added_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> { 
-    altered_keys.added.iter() 
+fn added_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
+    altered_keys.added.iter()
 }
 
-fn peek_removed_iter<'a>(altered_keys: &Box<AlteredNodes>) -> Peekable<impl Iterator<Item = &AlterPair>> { 
+fn peek_removed_iter<'a>(
+    altered_keys: &Box<AlteredNodes>,
+) -> Peekable<impl Iterator<Item = &AlterPair>> {
     removed_iter(altered_keys).peekable()
 }
-fn peek_altered_iter<'a>(altered_keys: &Box<AlteredNodes>) -> Peekable<impl Iterator<Item = &AlterPair>> { 
+fn peek_altered_iter<'a>(
+    altered_keys: &Box<AlteredNodes>,
+) -> Peekable<impl Iterator<Item = &AlterPair>> {
     altered_iter(altered_keys).peekable()
 }
-fn peek_added_iter<'a>(altered_keys: &Box<AlteredNodes>) -> Peekable<impl Iterator<Item = &AlterPair>> { 
+fn peek_added_iter<'a>(
+    altered_keys: &Box<AlteredNodes>,
+) -> Peekable<impl Iterator<Item = &AlterPair>> {
     added_iter(altered_keys).peekable()
 }
 
 fn probe_key_range<KS, PS>(
-    node: &NodeCellRef, 
+    node: &NodeCellRef,
     altered: &Box<AlteredNodes>,
-    level: usize
+    level: usize,
 ) -> Vec<NodeWriteGuard<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -137,7 +148,7 @@ where
     let mut removed_ptrs = removed_iter(&altered).map(|(_, p)| p).peekable();
     let mut altered_ptrs = altered_iter(&altered).map(|(_, p)| p).peekable();
     let mut added_ptrs = added_iter(&altered).map(|(k, _)| k).peekable();
-    // This process will probe pages by all alter node types in this level to select the right pages 
+    // This process will probe pages by all alter node types in this level to select the right pages
     // which contains those entries to work with
     loop {
         let last_page = all_pages.last().unwrap().borrow();
@@ -178,8 +189,12 @@ where
         }
         debug!("Acquiring pruning node");
         let next = write_node::<KS, PS>(&last_innode.right);
-        debug_assert!(!next.is_none(), "ended at none without empty altered list, remains, removed {}; altered {}; added {}",
-                      removed_ptrs.count(), altered_ptrs.count(), added_ptrs.count()
+        debug_assert!(
+            !next.is_none(),
+            "ended at none without empty altered list, remains, removed {}; altered {}; added {}",
+            removed_ptrs.count(),
+            altered_ptrs.count(),
+            added_ptrs.count()
         );
         debug_assert!(!next.is_empty());
         // all_pages contains all of the entry keys we need to work for remove, add and modify
@@ -192,7 +207,7 @@ where
 fn insert_new_and_mark_altered_keys<KS, PS>(
     all_pages: &mut Vec<NodeWriteGuard<KS, PS>>,
     altered: &Box<AlteredNodes>,
-    next_level_altered: &mut AlteredNodes
+    next_level_altered: &mut AlteredNodes,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -204,7 +219,7 @@ fn insert_new_and_mark_altered_keys<KS, PS>(
     let mut current_page = pages.next().unwrap();
     while let Some(&(new_key, new_node)) = new_nodes.peek() {
         if new_key < current_page.right_bound() {
-            // First occurance of the page that have larger right bound than new node should be the 
+            // First occurance of the page that have larger right bound than new node should be the
             // page to insert into
             let innode = (*current_page).innode_mut();
             let new_key = new_key.clone();
@@ -212,8 +227,7 @@ fn insert_new_and_mark_altered_keys<KS, PS>(
             let pos = innode.search(&new_key);
             debug!("inserting new at {} with key {:?}", pos, new_key);
             if innode.len >= KS::slice_len() {
-                let (split_ref, split_key) =
-                innode.split_insert(new_key, new_node_ref, pos, true);
+                let (split_ref, split_key) = innode.split_insert(new_key, new_node_ref, pos, true);
                 next_level_altered.added.push((split_key, split_ref));
             } else {
                 innode.insert_in_place(new_key, new_node_ref, pos, true);
@@ -232,49 +246,48 @@ fn insert_new_and_mark_altered_keys<KS, PS>(
 fn ref_to_be_retained<'a, KS, PS>(
     all_pages: &mut Vec<NodeWriteGuard<KS, PS>>,
     altered: &Box<AlteredNodes>,
-    level: usize
-) -> Vec<Vec<(usize, NodeCellRef)>> where
+    level: usize,
+) -> Vec<Vec<(usize, NodeCellRef)>>
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    
     let mut removed = peek_removed_iter(&altered);
     let matching_refs = all_pages
         .iter()
         .map(|page| {
             // removed is a sequential external nodes that have been removed and have been set to empty
             // nodes are ordered so we can iterate them while scanning the reference in upper levels.
-                debug_assert!(
-                    is_node_serial(page),
-                        "node not serial before live selection - {}",
-                        level
-                );
-                page.innode().ptrs.as_slice_immute()[..page.len() + 1]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, sub_level)| {
-                        let mut found_removed = false;
-                        let current_removed = removed.peek();
-                        debug_assert_ne!(
-                            current_removed.map(|t: &&(EntryKey, NodeCellRef)| read_unchecked::<KS, PS>(
-                                &t.1
-                            )
-                            .is_empty()),
-                            Some(false)
-                        );
-                        if let Some((_removed_key, removed_ptr)) = current_removed {
-                            if sub_level.ptr_eq(removed_ptr) {
-                                found_removed = true;
-                            }
+            debug_assert!(
+                is_node_serial(page),
+                "node not serial before live selection - {}",
+                level
+            );
+            page.innode().ptrs.as_slice_immute()[..page.len() + 1]
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sub_level)| {
+                    let mut found_removed = false;
+                    let current_removed = removed.peek();
+                    debug_assert_ne!(
+                        current_removed.map(|t: &&(EntryKey, NodeCellRef)| {
+                            read_unchecked::<KS, PS>(&t.1).is_empty()
+                        }),
+                        Some(false)
+                    );
+                    if let Some((_removed_key, removed_ptr)) = current_removed {
+                        if sub_level.ptr_eq(removed_ptr) {
+                            found_removed = true;
                         }
-                        if !found_removed {
-                            Some((i, sub_level.clone()))
-                        } else {
-                            removed.next();
-                            None
-                        }
-                    })
-                    .collect_vec()
+                    }
+                    if !found_removed {
+                        Some((i, sub_level.clone()))
+                    } else {
+                        removed.next();
+                        None
+                    }
+                })
+                .collect_vec()
         })
         .collect_vec();
     debug_assert!(
@@ -288,12 +301,11 @@ fn ref_to_be_retained<'a, KS, PS>(
 }
 
 fn filter_retained<KS, PS>(
-    all_pages: Vec<NodeWriteGuard<KS, PS>>, 
+    all_pages: Vec<NodeWriteGuard<KS, PS>>,
     retained: Vec<Vec<(usize, NodeCellRef)>>,
     level_page_altered: &mut AlteredNodes,
-    level: usize
-)
-    -> Vec<NodeWriteGuard<KS, PS>>
+    level: usize,
+) -> Vec<NodeWriteGuard<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -302,18 +314,18 @@ where
         .into_iter()
         .zip(retained)
         .filter_map(|(mut page, retained_refs)| {
-                if retained_refs.len() == 0 {
-                    // check if all the children ptr in this page have been removed
-                    // if yes mark it and upper level will handel it
-                    level_page_altered
-                        .removed
-                        .push((page.right_bound().clone(), page.node_ref().clone()));
-                    // set length zero without do anything else
-                    // this will ease read hazard
-                    page.make_empty_node(false);
-                    debug!("Found empty node");
-                    None
-                } else {
+            if retained_refs.len() == 0 {
+                // check if all the children ptr in this page have been removed
+                // if yes mark it and upper level will handel it
+                level_page_altered
+                    .removed
+                    .push((page.right_bound().clone(), page.node_ref().clone()));
+                // set length zero without do anything else
+                // this will ease read hazard
+                page.make_empty_node(false);
+                debug!("Found empty node");
+                None
+            } else {
                 // extract all live child ptrs and construct a new page from them
                 let mut new_keys = KS::init();
                 let mut new_ptrs = PS::init();
@@ -351,12 +363,11 @@ where
         .collect_vec();
 }
 
-
 fn update_and_mark_altered_keys<'a, KS, PS>(
     page: &mut NodeWriteGuard<KS, PS>,
     current_altered: &mut Peekable<impl Iterator<Item = &'a AlterPair>>,
     next_level_altered: &mut AlteredNodes,
-    level: usize
+    level: usize,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -419,9 +430,8 @@ fn update_and_mark_altered_keys<'a, KS, PS>(
     );
 }
 
-fn update_right_nodes<KS, PS>(
-    all_pages: Vec<NodeWriteGuard<KS, PS>>, 
-) -> Vec<NodeWriteGuard<KS, PS>> where
+fn update_right_nodes<KS, PS>(all_pages: Vec<NodeWriteGuard<KS, PS>>) -> Vec<NodeWriteGuard<KS, PS>>
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
@@ -466,13 +476,13 @@ fn update_right_nodes<KS, PS>(
     return non_emptys;
 }
 
-
 // Return true if the case is handled
 fn merge_single_ref_pages<KS, PS>(
-    all_pages: &mut Vec<NodeWriteGuard<KS, PS>>, 
+    all_pages: &mut Vec<NodeWriteGuard<KS, PS>>,
     level_page_altered: &mut AlteredNodes,
-    level: usize
-) -> bool where
+    level: usize,
+) -> bool
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {

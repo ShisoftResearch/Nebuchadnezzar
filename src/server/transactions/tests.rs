@@ -1,11 +1,11 @@
 use super::*;
-use env_logger;
 use crate::ram::cell::*;
 use crate::ram::schema::*;
+use crate::ram::tests::default_fields;
 use crate::ram::types::*;
 use crate::server::transactions;
 use crate::server::*;
-use crate::ram::tests::default_fields;
+use env_logger;
 
 #[tokio::test(threaded_scheduler)]
 pub async fn workspace_wr() {
@@ -21,7 +21,8 @@ pub async fn workspace_wr() {
         },
         &server_addr,
         "test",
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -153,7 +154,8 @@ pub async fn data_site_wr() {
         },
         &server_addr,
         "test",
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -242,7 +244,8 @@ pub async fn multi_transaction() {
         },
         &server_addr,
         "test",
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -325,7 +328,6 @@ pub async fn multi_transaction() {
     );
 }
 
-
 #[tokio::test(threaded_scheduler)]
 pub async fn smoke_rw() {
     let _ = env_logger::try_init();
@@ -342,7 +344,8 @@ pub async fn smoke_rw() {
         },
         &server_addr,
         "test",
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -376,7 +379,10 @@ pub async fn smoke_rw() {
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), Value::U64(score));
                 cell.data = Value::Map(data);
-                txn.update(txn_id.to_owned(), cell.to_owned()).await.unwrap().unwrap();
+                txn.update(txn_id.to_owned(), cell.to_owned())
+                    .await
+                    .unwrap()
+                    .unwrap();
             } else {
                 // println!("Failed read, {:?}", read_result);
             }

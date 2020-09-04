@@ -1,17 +1,18 @@
 use super::*;
-use byteorder::BigEndian;
-use byteorder::WriteBytesExt;
-use dovahkiin::types::custom_types::id::Id;
 use crate::index::btree::dump::dump_tree;
 use crate::index::btree::reconstruct::TreeConstructor;
 use crate::index::btree::NodeCellRef;
 use crate::index::trees::Cursor;
 use crate::index::trees::EntryKey;
 use crate::index::trees::{id_from_key, key_with_id};
-use itertools::Itertools;
 use crate::ram::types::RandValue;
+use byteorder::BigEndian;
+use byteorder::WriteBytesExt;
+use dovahkiin::types::custom_types::id::Id;
+use itertools::Itertools;
 use rand::distributions::Uniform;
 use rand::prelude::*;
+use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::env;
@@ -22,7 +23,6 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use rand::seq::SliceRandom;
 
 extern crate env_logger;
 

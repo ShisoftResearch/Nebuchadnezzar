@@ -1,6 +1,6 @@
 use super::mem_cursor::*;
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use crate::ram::entry::*;
+use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Write};
 
 lazy_static! {

@@ -1,8 +1,8 @@
-use bifrost::rpc::RPCError;
 use crate::client::AsyncClient;
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
+use bifrost::rpc::RPCError;
 use std::sync::Arc;
 
 const HASH_SCHEMA: &'static str = "HASH_INDEX_SCHEMA";
@@ -25,17 +25,11 @@ impl HashIndexer {
         self.neb_client.write_cell(cell).await
     }
 
-    pub async fn remove_index(
-        &self,
-        index_id: Id,
-    ) -> Result<Result<(), WriteError>, RPCError> {
+    pub async fn remove_index(&self, index_id: Id) -> Result<Result<(), WriteError>, RPCError> {
         self.neb_client.remove_cell(index_id).await
     }
 
-    pub async fn query(
-        &self,
-        index_id: Id,
-    ) -> Result<Result<Id, ReadError>, RPCError> {
+    pub async fn query(&self, index_id: Id) -> Result<Result<Id, ReadError>, RPCError> {
         let res = self.neb_client.read_cell(index_id).await;
         res.map(|read| read.map(|cell| *cell.data.Id().unwrap()))
     }

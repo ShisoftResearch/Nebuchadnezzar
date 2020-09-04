@@ -1,8 +1,8 @@
+use crate::index::btree::external;
 use crate::index::btree::node::read_unchecked;
 use crate::index::btree::node::write_node;
 use crate::index::btree::node::write_non_empty;
 use crate::index::btree::node::write_targeted;
-use crate::index::btree::external;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
 use crate::index::btree::BPlusTree;

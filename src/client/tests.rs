@@ -2,10 +2,10 @@ use crate::client;
 use crate::client::transaction::TxnError;
 use crate::ram::cell::*;
 use crate::ram::schema::*;
+use crate::ram::tests::default_fields;
 use crate::ram::types;
 use crate::ram::types::*;
 use crate::server::*;
-use crate::ram::tests::default_fields;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
@@ -29,7 +29,8 @@ pub async fn general() {
         },
         &server_addr,
         &server_group,
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -38,8 +39,16 @@ pub async fn general() {
         fields: default_fields(),
         is_dynamic: false,
     };
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
     let schema_id = client.new_schema(schema).await.unwrap().0;
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
@@ -54,15 +63,13 @@ pub async fn general() {
         .unwrap();
     client
         .transaction(|ref mut _trans| {
-          future::ready(Ok(())) // empty transaction
+            future::ready(Ok(())) // empty transaction
         })
         .await
         .unwrap();
-    let should_aborted = client.transaction(|trans| {
-        async move {
-            trans.abort().await
-        }
-    }).await;
+    let should_aborted = client
+        .transaction(|trans| async move { trans.abort().await })
+        .await;
     match should_aborted {
         Err(TxnError::Aborted(_)) => {}
         _ => panic!("{:?}", should_aborted),
@@ -97,7 +104,8 @@ pub async fn general() {
                         .read_selected(
                             cell_1_id.to_owned(),
                             types::key_hashes(&vec![String::from("score")]),
-                        ).await?
+                        )
+                        .await?
                         .unwrap();
                     let mut score = *cell.data["score"].U64().unwrap();
                     assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
@@ -110,14 +118,15 @@ pub async fn general() {
                         .read_selected(
                             cell_1_id.to_owned(),
                             types::key_hashes(&vec![String::from("score")]),
-                        ).await?
+                        )
+                        .await?
                         .unwrap();
                     assert_eq!(selected[0].U64().unwrap(), &score);
-  
+
                     let header = txn.head(cell.id()).await?.unwrap();
                     assert_eq!(header.id(), cell.id());
                     assert!(header.version > 1);
-  
+
                     Ok(())
                 })
                 .await
@@ -146,7 +155,8 @@ pub async fn multi_cell_update() {
         },
         &server_addr,
         server_group,
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -155,8 +165,16 @@ pub async fn multi_cell_update() {
         fields: default_fields(),
         is_dynamic: false,
     };
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
     let thread_count = 100;
     let schema_id = schema.id;
     client.new_schema(schema).await.unwrap();
@@ -173,12 +191,11 @@ pub async fn multi_cell_update() {
     client.write_cell(cell_2.clone()).await.unwrap().unwrap();
     client.read_cell(cell_2.id()).await.unwrap().unwrap();
     let cell_2_id = cell_2.id();
-    let futs: FuturesUnordered<_> = FuturesUnordered::new(); 
+    let futs: FuturesUnordered<_> = FuturesUnordered::new();
     for _i in 0..thread_count {
         let client = client.clone();
-        futs.push(
-            async move {
-                client
+        futs.push(async move {
+            client
                 .transaction(async move |txn| {
                     let mut score_1;
                     let mut score_2;
@@ -200,8 +217,7 @@ pub async fn multi_cell_update() {
                 })
                 .await
                 .unwrap();
-            }
-        );
+        });
     }
     let _: Vec<_> = futs.collect().await;
     let cell_1_r = client.read_cell(cell_1_id).await.unwrap().unwrap();
@@ -225,7 +241,8 @@ pub async fn write_skew() {
         },
         &server_addr,
         server_group,
-    ).await;
+    )
+    .await;
     let schema = Schema {
         id: 1,
         name: String::from("test"),
@@ -234,8 +251,16 @@ pub async fn write_skew() {
         fields: default_fields(),
         is_dynamic: false,
     };
-    let client =
-        Arc::new(client::AsyncClient::new(&server.rpc, &server.membership, &vec![server_addr], server_group).await.unwrap());
+    let client = Arc::new(
+        client::AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr],
+            server_group,
+        )
+        .await
+        .unwrap(),
+    );
     let schema_id = client.new_schema(schema).await.unwrap().0;
     let mut data_map = Map::new();
     data_map.insert(&String::from("id"), Value::I64(100));
@@ -322,7 +347,8 @@ pub async fn server_isolation() {
         },
         server_address_1,
         server_1_group,
-    ).await;
+    )
+    .await;
     let client1 = Arc::new(
         client::AsyncClient::new(
             &server_1.rpc,
@@ -344,7 +370,8 @@ pub async fn server_isolation() {
         },
         server_address_2,
         server_2_group,
-    ).await;
+    )
+    .await;
     let client2 = Arc::new(
         client::AsyncClient::new(
             &server_2.rpc,

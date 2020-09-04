@@ -165,24 +165,23 @@ where
     BPlusTree::from_root(root, head_id, len)
 }
 
-
 #[cfg(test)]
 mod test {
-    use crate::server::*;
     use crate::client;
-    use std::sync::Arc;
     use crate::index::btree::external::*;
+    use crate::index::btree::test::*;
+    use crate::index::trees::Cursor;
+    use crate::index::trees::{key_with_id, Ordering};
+    use crate::ram::cell::Cell;
+    use crate::ram::types::*;
+    use crate::rand::Rng;
+    use crate::server::*;
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
-    use crate::ram::types::*;
-    use crate::ram::cell::Cell;
     use itertools::Itertools;
-    use crate::index::btree::test::*;
     use smallvec::SmallVec;
-    use crate::index::trees::{key_with_id, Ordering};
-    use crate::index::trees::Cursor;
-    use crate::rand::Rng;
+    use std::sync::Arc;
 
     #[tokio::test(threaded_scheduler)]
     async fn tree_reconstruct_from_head_cell() {
@@ -195,22 +194,27 @@ mod test {
                 memory_size: 16 * 12024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
-                services: vec![Service::Cell]
-            }, 
+                services: vec![Service::Cell],
+            },
             &server_addr,
-            &server_group
-        ).await;
-        let client = 
-            Arc::new(
-                client::AsyncClient::new(
-                    &server.rpc, 
-                    &server.membership, 
-                    &vec![server_addr], 
-                    server_group)
-                    .await
-                    .unwrap()
-                );
-        client.new_schema_with_id(page_schema()).await.unwrap().unwrap();
+            &server_group,
+        )
+        .await;
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client
+            .new_schema_with_id(page_schema())
+            .await
+            .unwrap()
+            .unwrap();
         let mut last_id = Id::unit_id();
         let cell_limit = 1000;
         let mut counter = 0;
@@ -219,43 +223,52 @@ mod test {
             let new_id = Id::new(i, i);
             let mut value = Value::Map(Map::new());
             value[*PREV_PAGE_KEY_HASH] = Value::Id(last_id);
-            value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit { 
-                Value::Id(Id::new(i + 1, i + 1)) 
+            value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit {
+                Value::Id(Id::new(i + 1, i + 1))
             } else {
                 Value::Id(Id::unit_id())
             };
-            value[*KEYS_KEY_HASH] = (0..PAGE_SIZE).map(|_| {
-                counter += 1;
-                let key_slice = u64_to_slice(counter);
-                let mut key = SmallVec::from_slice(&key_slice);
-                key_with_id(&mut key, &new_id);
-                all_keys.push(key.clone());
-                SmallBytes::from_vec(key.as_slice().to_vec())
-            })
-            .collect_vec()
-            .value();
-            client.write_cell(Cell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value)).await.unwrap().unwrap();
+            value[*KEYS_KEY_HASH] = (0..PAGE_SIZE)
+                .map(|_| {
+                    counter += 1;
+                    let key_slice = u64_to_slice(counter);
+                    let mut key = SmallVec::from_slice(&key_slice);
+                    key_with_id(&mut key, &new_id);
+                    all_keys.push(key.clone());
+                    SmallBytes::from_vec(key.as_slice().to_vec())
+                })
+                .collect_vec()
+                .value();
+            client
+                .write_cell(Cell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value))
+                .await
+                .unwrap()
+                .unwrap();
             last_id = new_id;
         }
         let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await);
-        let threads = all_keys.clone().into_iter().enumerate().map(|(i, key)| {
-            let tree = tree.clone();
-            let all_keys = all_keys.clone();
-            std::thread::spawn(move || {
-                trace!("Checking {:?}", key);
-                let mut cursor = tree.seek(&key, Ordering::Forward);
-                assert_eq!(cursor.current().unwrap(), &key);
-                let mut rng = rand::thread_rng();
-                if i > all_keys.len() / 2 && rng.gen_range(0, 50) == 1 {
-                    for j in i..all_keys.len() {
-                        assert_eq!(cursor.current().unwrap(), &all_keys[j]);
-                        cursor.next();
+        let threads = all_keys
+            .clone()
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| {
+                let tree = tree.clone();
+                let all_keys = all_keys.clone();
+                std::thread::spawn(move || {
+                    trace!("Checking {:?}", key);
+                    let mut cursor = tree.seek(&key, Ordering::Forward);
+                    assert_eq!(cursor.current().unwrap(), &key);
+                    let mut rng = rand::thread_rng();
+                    if i > all_keys.len() / 2 && rng.gen_range(0, 50) == 1 {
+                        for j in i..all_keys.len() {
+                            assert_eq!(cursor.current().unwrap(), &all_keys[j]);
+                            cursor.next();
+                        }
+                        assert!(cursor.current().is_none());
                     }
-                    assert!(cursor.current().is_none());
-                }
-            })  
-        })
-        .collect_vec();
+                })
+            })
+            .collect_vec();
         for t in threads {
             t.join().unwrap();
         }

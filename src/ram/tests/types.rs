@@ -235,13 +235,7 @@ mod string {
     use std::string::String;
     #[test]
     fn test() {
-        let test_data = vec![
-            "",
-            "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ",
-            "中文测试文本",
-            "Hello Test",
-            "🏳️‍🌈",
-        ];
+        let test_data = vec!["", "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ", "中文测试文本", "Hello Test", "🏳️‍🌈"];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
         let mut addr = chunk.segments()[0].addr;
         for d in test_data.clone() {

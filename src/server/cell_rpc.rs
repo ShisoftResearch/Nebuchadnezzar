@@ -1,9 +1,9 @@
-use bifrost::rpc::*;
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::types::Id;
 use crate::server::NebServer;
-use futures::prelude::*;
+use bifrost::rpc::*;
 use futures::future::BoxFuture;
+use futures::prelude::*;
 
 use bifrost_plugins::hash_ident;
 
@@ -26,25 +26,16 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<Result<Cell, ReadError>> {
         future::ready(self.server.chunks.read_cell(&key)).boxed()
     }
-    fn write_cell(
-        &self,
-        mut cell: Cell,
-    ) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn write_cell(&self, mut cell: Cell) -> BoxFuture<Result<CellHeader, WriteError>> {
         future::ready(self.server.chunks.write_cell(&mut cell)).boxed()
     }
-    fn update_cell(
-        &self,
-        mut cell: Cell,
-    ) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn update_cell(&self, mut cell: Cell) -> BoxFuture<Result<CellHeader, WriteError>> {
         future::ready(self.server.chunks.update_cell(&mut cell)).boxed()
     }
     fn remove_cell(&self, key: Id) -> BoxFuture<Result<(), WriteError>> {
         future::ready(self.server.chunks.remove_cell(&key)).boxed()
     }
-    fn upsert_cell(
-        &self,
-        mut cell: Cell,
-    ) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn upsert_cell(&self, mut cell: Cell) -> BoxFuture<Result<CellHeader, WriteError>> {
         future::ready(self.server.chunks.upsert_cell(&mut cell)).boxed()
     }
     fn count(&self) -> BoxFuture<u64> {

@@ -1,17 +1,17 @@
 use super::*;
-use bifrost::utils::time::get_time;
-use bifrost::vector_clock::StandardVectorClock;
-use bifrost_plugins::hash_ident;
-use linked_hash_map::LinkedHashMap;
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
-use std::collections::{BTreeMap, BTreeSet};
-use futures::stream::FuturesUnordered;
-use parking_lot::Mutex;
-use lightning::map::{HashMap as LFMap, ObjectMap};
+use bifrost::utils::time::get_time;
+use bifrost::vector_clock::StandardVectorClock;
+use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
+use futures::stream::FuturesUnordered;
 use lightning::map::Map;
+use lightning::map::{HashMap as LFMap, ObjectMap};
+use linked_hash_map::LinkedHashMap;
+use parking_lot::Mutex;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -100,7 +100,7 @@ impl DataManager {
                     cleanup_signal.store(false, Relaxed);
                 }
                 tokio::time::delay_for(Duration::from_secs(1)).await;
-            } 
+            }
         });
         return manager;
     }
@@ -181,15 +181,20 @@ impl DataManager {
         let mut meta = meta_ref.lock();
         meta.write = tid.clone();
     }
-    async fn get_tnx_manager(&self, server_id: u64) -> io::Result<Arc<manager::AsyncServiceClient>> {
-        let server_id_ref=  &(server_id as usize);
+    async fn get_tnx_manager(
+        &self,
+        server_id: u64,
+    ) -> io::Result<Arc<manager::AsyncServiceClient>> {
+        let server_id_ref = &(server_id as usize);
         loop {
             if !self.managers.contains(server_id_ref) {
                 let client = self.server.get_member_by_server_id(server_id).await?;
-                return Ok(self.managers.get_or_insert(server_id_ref, || manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)))
+                return Ok(self.managers.get_or_insert(server_id_ref, || {
+                    manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
+                }));
             } else {
                 if let Some(manager) = self.managers.get(server_id_ref) {
-                    return Ok(manager.clone())
+                    return Ok(manager.clone());
                 }
             }
         }
@@ -203,7 +208,8 @@ impl DataManager {
     async fn cell_meta_cleanup(&self) {
         let mut cell_lru = self.cell_lru.lock();
         let oldest_transaction = {
-            self.tnxs_sorted.lock()
+            self.tnxs_sorted
+                .lock()
                 .iter()
                 .next()
                 .cloned()
@@ -223,7 +229,7 @@ impl DataManager {
                 } else {
                     need_break = true;
                 }
-            } else { 
+            } else {
                 cell_to_evict.push(*cell_id);
             }
             if need_break {
@@ -301,8 +307,7 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>>
-    {
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
@@ -317,12 +322,11 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<CellHeader, ReadError>>>
-    {
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match self .server.chunks.head_cell(&id) {
+        match self.server.chunks.head_cell(&id) {
             Ok(head) => self.response_with(TxnExecResult::Accepted(head)),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
@@ -408,7 +412,8 @@ impl Service for DataManager {
                 return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyAborted));
             }
             TxnState::Committed => {
-                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
+                return self
+                    .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
             TxnState::Prepared => {}
         };
@@ -615,7 +620,10 @@ impl Service for DataManager {
                 wake_up_futures.push(async move {
                     if let Ok(client) = self.get_tnx_manager(server_id).await {
                         debug!("WAKING UP {} for {:?}", server_id, transactions);
-                        client.go_ahead(transactions, self.server.server_id).await.unwrap();
+                        client
+                            .go_ahead(transactions, self.server.server_id)
+                            .await
+                            .unwrap();
                     } else {
                         debug!(
                             "cannot inform server {} to continue its transactions",
@@ -630,12 +638,19 @@ impl Service for DataManager {
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);
             if released_locks == affected_cells {
-                debug!("ENDED: {:?} with all locks ({}) released", tid, released_locks);
+                debug!(
+                    "ENDED: {:?} with all locks ({}) released",
+                    tid, released_locks
+                );
                 self.response_with(EndResult::Success).await
             } else {
-                warn!("ENDED: {:?} with SOME locks ({}/{}) NOT released", tid, released_locks, affected_cells);
+                warn!(
+                    "ENDED: {:?} with SOME locks ({}/{}) NOT released",
+                    tid, released_locks, affected_cells
+                );
                 self.response_with(EndResult::SomeLocksNotReleased).await
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }

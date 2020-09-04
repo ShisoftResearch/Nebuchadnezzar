@@ -1,15 +1,15 @@
 // A machine-local concurrent LSM tree based on B-tree implementation
 
-use crate::index::btree::level::*;
-use crate::index::btree::*; 
-use crate::index::trees::*;
-use crate::ram::types::*;
-use crate::ram::schema::{Field, Schema};
-use crate::server;
 use crate::client::AsyncClient;
+use crate::index::btree::level::*;
+use crate::index::btree::*;
+use crate::index::trees::*;
 use crate::ram::cell::Cell;
-use std::{mem, ptr};
+use crate::ram::schema::{Field, Schema};
+use crate::ram::types::*;
+use crate::server;
 use std::sync::Arc;
+use std::{mem, ptr};
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
@@ -18,12 +18,12 @@ type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS];
 
 lazy_static! {
     pub static ref LSM_TREE_SCHEMA_ID: u32 = key_hash(LSM_TREE_SCHEMA_NAME) as u32;
-    pub static ref LSM_TREE_LEVELS_HASH: u64 = key_hash(LSM_TREE_LEVELS_NAME); 
+    pub static ref LSM_TREE_LEVELS_HASH: u64 = key_hash(LSM_TREE_LEVELS_NAME);
     pub static ref LSM_TREE_SCHEMA: Schema = lsm_treee_schema();
 }
 
 pub struct LSMTree {
-    trees: LevelTrees
+    trees: LevelTrees,
 }
 
 impl LSMTree {
@@ -39,21 +39,24 @@ impl LSMTree {
         tree_3.persist_root(neb_client).await;
         tree_4.persist_root(neb_client).await;
         let level_ids = vec![
-            tree_m.head_id(), 
-            tree_1.head_id(), 
-            tree_2.head_id(), 
-            tree_3.head_id(), 
-            tree_4.head_id()  
+            tree_m.head_id(),
+            tree_1.head_id(),
+            tree_2.head_id(),
+            tree_3.head_id(),
+            tree_4.head_id(),
         ];
         let mut cell_map = Map::new();
-        cell_map.insert_key_id(*LSM_TREE_LEVELS_HASH, Value::Array(level_ids.iter().map(|id| id.value()).collect()));
+        cell_map.insert_key_id(
+            *LSM_TREE_LEVELS_HASH,
+            Value::Array(level_ids.iter().map(|id| id.value()).collect()),
+        );
         let lsm_tree_cell = Cell::new(&*LSM_TREE_SCHEMA, Value::Map(cell_map)).unwrap();
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4]
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
         }
     }
- 
+
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: Id) -> Self {
         let cell = neb_client.read_cell(lsm_tree_id).await.unwrap().unwrap();
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
@@ -70,10 +73,10 @@ impl LSMTree {
         let tree_4 = Level4Tree::from_head_id(trees_4_val.Id().unwrap(), neb_client).await;
 
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4]
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
         }
     }
-   
+
     pub fn insert(&self, entry: &EntryKey) -> bool {
         self.trees[0].insert_into(entry)
     }
@@ -86,7 +89,7 @@ impl LSMTree {
         }
         false
     }
-    
+
     pub fn seek(&self, entry: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
         LSMTreeCursor::new(entry, &self.trees, ordering)
     }
@@ -107,7 +110,7 @@ impl LSMTree {
 pub struct LSMTreeCursor {
     cursors: LevelCusors,
     current: Option<(usize, EntryKey)>,
-    ordering: Ordering
+    ordering: Ordering,
 }
 
 impl LSMTreeCursor {
@@ -117,30 +120,30 @@ impl LSMTreeCursor {
             trees[1].seek_for(key, ordering),
             trees[2].seek_for(key, ordering),
             trees[3].seek_for(key, ordering),
-            trees[4].seek_for(key, ordering)
+            trees[4].seek_for(key, ordering),
         ];
         let current = Self::leading_tree_key(&cursors, ordering);
-        Self { cursors, current, ordering }
+        Self {
+            cursors,
+            current,
+            ordering,
+        }
     }
 
     fn leading_tree_key(cursors: &LevelCusors, ordering: Ordering) -> Option<(usize, EntryKey)> {
         match ordering {
-            Ordering::Forward => {
-                cursors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.current().map(|c| (i, c)))
-                    .min_by(|(_, x), (_, y)| x.cmp(y))
-                    .map(|(i, k)| (i, k.clone()))
-            },
-            Ordering::Backward => {
-                cursors
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, c)| c.current().map(|c| (i, c)))
-                    .max_by(|(_, x), (_, y)| x.cmp(y))
-                    .map(|(i, k)| (i, k.clone()))
-            }
+            Ordering::Forward => cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.current().map(|c| (i, c)))
+                .min_by(|(_, x), (_, y)| x.cmp(y))
+                .map(|(i, k)| (i, k.clone())),
+            Ordering::Backward => cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(i, c)| c.current().map(|c| (i, c)))
+                .max_by(|(_, x), (_, y)| x.cmp(y))
+                .map(|(i, k)| (i, k.clone())),
         }
     }
 }
@@ -174,16 +177,14 @@ fn lsm_treee_schema() -> Schema {
             0,
             false,
             false,
-            Some(vec![
-                Field::new(
-                    LSM_TREE_LEVELS_NAME,
-                    type_id_of(Type::Id),
-                    false,
-                    true,
-                    None,
-                    vec![],
-                ),
-            ]),
+            Some(vec![Field::new(
+                LSM_TREE_LEVELS_NAME,
+                type_id_of(Type::Id),
+                false,
+                true,
+                None,
+                vec![],
+            )]),
             vec![],
         ),
     }

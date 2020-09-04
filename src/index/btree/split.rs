@@ -6,8 +6,8 @@ use crate::index::btree::node::NodeReadHandler;
 use crate::index::btree::remove::scatter_nodes;
 use crate::index::btree::search::mut_search;
 use crate::index::btree::search::MutSearchResult;
-use crate::index::btree::NodeCellRef;
 use crate::index::btree::BPlusTree;
+use crate::index::btree::NodeCellRef;
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use std::fmt::Debug;
@@ -41,7 +41,11 @@ where
     }
 }
 
-pub fn remove_to_right<KS, PS>(node_ref: &NodeCellRef, start_key: &EntryKey, tree: &BPlusTree<KS, PS>) -> usize
+pub fn remove_to_right<KS, PS>(
+    node_ref: &NodeCellRef,
+    start_key: &EntryKey,
+    tree: &BPlusTree<KS, PS>,
+) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
