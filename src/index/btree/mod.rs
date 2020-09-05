@@ -15,7 +15,6 @@ use crate::index::trees::Slice;
 use crate::index::trees::MAX_KEY_SIZE;
 use crate::index::trees::{Cursor as IndexCursor, Ordering};
 use crate::ram::types::RandValue;
-use crate::server;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 use futures::future::BoxFuture;

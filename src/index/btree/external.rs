@@ -375,7 +375,6 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let id = read_unchecked::<KS, PS>(node).ext_id();
     CHANGED_NODES.push(ChangingNode::Modified(NodeModified {
         node: node.clone(),
         deletion: tree.deleted.clone(),
