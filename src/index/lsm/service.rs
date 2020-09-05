@@ -10,6 +10,7 @@ use serde::{Serialize, Deserialize};
 use lightning::map::{ObjectMap, HashMap};
 use lightning::map::Map;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::time::Duration;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 
@@ -59,7 +60,7 @@ pub struct LSMTreeService {
     client: Arc<AsyncClient>,
     cursor_counter: AtomicUsize,
     cursors: ObjectMap<Arc<RefCell<CursorMemo>>>,
-    trees: HashMap<Id, Arc<DistLSMTree>>
+    trees: Arc<HashMap<Id, Arc<DistLSMTree>>>
 }
 
 impl Service for LSMTreeService {
@@ -159,11 +160,21 @@ impl Service for LSMTreeService {
 
 impl LSMTreeService {
     pub fn new(client: &Arc<AsyncClient>) -> Self {
+        let trees_map = Arc::new(HashMap::with_capacity(32));
+        crate::index::btree::storage::start_external_nodes_write_back(client);
+        let trees_map_clone: Arc<HashMap<Id, Arc<DistLSMTree>>> = trees_map.clone();
+        tokio::spawn(async move {
+            for (_, dist_tree) in trees_map_clone.entries() {
+                dist_tree.tree.merge_levels();
+            }
+            // Sleep for a while to check for trees to be merge in levels
+            tokio::time::delay_for(Duration::from_secs(5)).await;
+        });
         Self {
             client: client.clone(),
             cursor_counter: AtomicUsize::new(0),
-            cursors: ObjectMap::with_capacity(32),
-            trees: HashMap::with_capacity(16)
+            cursors: ObjectMap::with_capacity(64),
+            trees: trees_map
         }
     }
 }
