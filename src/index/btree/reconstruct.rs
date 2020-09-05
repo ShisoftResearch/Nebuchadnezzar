@@ -165,6 +165,11 @@ where
     BPlusTree::from_root(root, head_id, len)
 }
 
+unsafe impl <KS, PS> Send for TreeConstructor<KS, PS> where 
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static, 
+{}
+
 #[cfg(test)]
 mod test {
     use crate::client;

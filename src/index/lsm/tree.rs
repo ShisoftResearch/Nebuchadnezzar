@@ -26,7 +26,7 @@ pub struct LSMTree {
 }
 
 impl LSMTree {
-    pub async fn create(neb_client: &Arc<AsyncClient>) -> Self {
+    pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
         let tree_m = LevelMTree::new();
         let tree_1 = Level1Tree::new();
         let tree_2 = Level2Tree::new();
@@ -49,15 +49,15 @@ impl LSMTree {
             *LSM_TREE_LEVELS_HASH,
             Value::Array(level_ids.iter().map(|id| id.value()).collect()),
         );
-        let lsm_tree_cell = Cell::new(&*LSM_TREE_SCHEMA, Value::Map(cell_map)).unwrap();
+        let lsm_tree_cell = Cell::new_with_id(*LSM_TREE_SCHEMA_ID, id, Value::Map(cell_map));
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
             trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
         }
     }
 
-    pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: Id) -> Self {
-        let cell = neb_client.read_cell(lsm_tree_id).await.unwrap().unwrap();
+    pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
+        let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
         let trees_m_val = &trees[0usize];
         let trees_1_val = &trees[1usize];

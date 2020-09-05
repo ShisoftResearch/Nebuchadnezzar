@@ -27,7 +27,7 @@ rand = "*"
 linked-hash-map = "*"
 bitflags = "*"
 itertools = "*"
-smallvec = "*"
+smallvec = { version = "*", features = ["serde", "union"] }
 owning_ref = "*"
 num_cpus = "*"
 static_assertions = "*"
