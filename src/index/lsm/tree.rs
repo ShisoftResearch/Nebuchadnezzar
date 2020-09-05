@@ -151,15 +151,14 @@ impl Cursor for LSMTreeCursor {
     fn current(&self) -> Option<&EntryKey> {
         self.current.as_ref().map(|(_, k)| k)
     }
-    fn next(&mut self) -> bool {
+    fn next(&mut self) -> Option<EntryKey> {
         if let Some((tree_id, _)) = self.current {
             self.cursors[tree_id].next();
-            let next_leading = Self::leading_tree_key(&self.cursors, self.ordering);
-            let has_next = next_leading.is_some();
-            self.current = next_leading;
-            has_next
+            let mut other_entry = Self::leading_tree_key(&self.cursors, self.ordering);
+            mem::swap(&mut other_entry, &mut self.current);
+            other_entry.map(|(_, key)| key)
         } else {
-            return false;
+            return None;
         }
     }
 }

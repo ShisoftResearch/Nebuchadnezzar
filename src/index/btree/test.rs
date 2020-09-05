@@ -78,7 +78,7 @@ fn init() {
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
     let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
     let mut last_key = cursor.current().unwrap().clone();
-    while cursor.next() {
+    while cursor.next().is_some() {
         let current = cursor.current().unwrap();
         if &last_key > current {
             dump_tree(tree, "error_insert_dump.json");
@@ -151,7 +151,7 @@ fn crd() {
                     Id::new(0, i).to_binary()
                 );
             }
-            assert_eq!(cursor.next(), i + 1 < num);
+            assert_eq!(cursor.next().is_some(), i + 1 < num);
         }
         debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
@@ -160,7 +160,7 @@ fn crd() {
             debug!("Expecting id {:?}", expected);
             let id = id_from_key(cursor.current().unwrap());
             assert_eq!(id, expected);
-            assert_eq!(cursor.next(), i + 1 < num);
+            assert_eq!(cursor.next().is_some(), i + 1 < num);
         }
         assert!(cursor.current().is_none());
     }
@@ -177,7 +177,7 @@ fn crd() {
             debug!("Expecting id {:?}", expected);
             let id = id_from_key(cursor.current().unwrap());
             assert_eq!(id, expected, "{}", i);
-            assert_eq!(cursor.next(), i > 0);
+            assert_eq!(cursor.next().is_some(), i > 0);
         }
         assert!(cursor.current().is_none());
     }
@@ -344,7 +344,7 @@ pub fn alternative_insertion_pattern() {
             let mut key = SmallVec::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key));
-            assert_eq!(cursor.next(), j != num - 1);
+            assert_eq!(cursor.next().is_some(), j != num - 1);
         }
     }
 }
@@ -409,7 +409,7 @@ fn parallel() {
                     let mut key = SmallVec::from_slice(&key_slice);
                     key_with_id(&mut key, &id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next(), j != num - 1, "{}/{}", i, j);
+                    assert_eq!(cursor.next().is_some(), j != num - 1, "{}/{}", i, j);
                 }
             }
         }
@@ -424,7 +424,7 @@ fn parallel() {
                     let mut key = SmallVec::from_slice(&key_slice);
                     key_with_id(&mut key, &id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
-                    assert_eq!(cursor.next(), j != 0, "{}/{}", i, j);
+                    assert_eq!(cursor.next().is_some(), j != 0, "{}/{}", i, j);
                 }
             }
         }
@@ -510,7 +510,7 @@ fn level_merge() {
             let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
             key_with_id(&mut key1, &id1);
             assert_eq!(key1_cur.current().unwrap(), &key1);
-            assert_eq!(key1_cur.next(), i as usize != merged);
+            assert_eq!(key1_cur.next().is_some(), i as usize != merged);
             assert_eq!(key1_cur.current().unwrap(), &key2);
             assert_ne!(tree_1.seek(&key1, Ordering::Forward).current(), Some(&key1));
         }

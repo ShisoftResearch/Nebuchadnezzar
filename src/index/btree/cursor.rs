@@ -60,11 +60,12 @@ where
         })
     }
 
-    fn next_candidate(&mut self) -> bool {
+    fn next_candidate(&mut self) -> Option<EntryKey> {
         loop {
             let search_result = if self.page.is_some() {
                 let current_page = self.page.clone().unwrap();
                 read_node(&current_page, |page: &NodeReadHandler<KS, PS>| {
+                    let mut other_current;
                     // let ext_page = page.extnode();
                     // debug!("Next id with index: {}, length: {}", self.index + 1, ext_page.len);
                     match self.ordering {
@@ -74,18 +75,19 @@ where
                                 return read_node(
                                     next_node_ref,
                                     |next_node: &NodeReadHandler<KS, PS>| {
+                                        let mut other_current;
                                         if next_node.is_none() {
                                             self.page = None;
                                             self.current = None;
-                                            return Some(false);
+                                            return Some(None);
                                         } else if next_node.is_empty() {
                                             return None;
                                         } else if next_node.is_ext() {
                                             self.index = 0;
                                             self.page = Some(next_node_ref.clone());
-                                            self.current =
-                                                Self::read_current(next_node_ref, self.index);
-                                            return Some(true);
+                                            other_current = Self::read_current(next_node_ref, self.index);
+                                            mem::swap(&mut self.current, &mut other_current);
+                                            return Some(other_current);
                                         } else {
                                             unreachable!()
                                         }
@@ -102,18 +104,20 @@ where
                                 return read_node(
                                     prev_node_ref,
                                     |prev_node: &NodeReadHandler<KS, PS>| {
+                                        let mut other_current;
                                         if prev_node.is_none() {
                                             self.page = None;
                                             self.current = None;
-                                            return Some(false);
+                                            return Some(None);
                                         } else if prev_node.is_empty() {
                                             return None;
                                         } else if prev_node.is_ext() {
                                             self.index = prev_node.len() - 1;
                                             self.page = Some(prev_node_ref.clone());
-                                            self.current =
+                                            other_current =
                                                 Self::read_current(prev_node_ref, self.index);
-                                            return Some(true);
+                                            mem::swap(&mut self.current, &mut other_current);
+                                               return Some(other_current);
                                         } else {
                                             unreachable!()
                                         }
@@ -125,11 +129,12 @@ where
                             }
                         }
                     }
-                    self.current = Self::read_current(&current_page, self.index);
-                    Some(true)
+                    other_current = Self::read_current(&current_page, self.index);
+                    mem::swap(&mut self.current, &mut other_current);
+                    Some(other_current)
                 })
             } else {
-                Some(false)
+                Some(None)
             };
 
             if let Some(res) = search_result {
@@ -145,16 +150,15 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // TODO: Copy current after next
-    fn next(&mut self) -> bool {
+    fn next(&mut self) -> Option<EntryKey> {
         loop {
-            let has_candidate = self.next_candidate();
-            if has_candidate {
+            if let Some(swapped_old_candidate) = self.next_candidate() {
                 // search in deleted set and skip if exists
                 if !self.deleted.contains(self.current().unwrap()) {
-                    return true;
+                    return Some(swapped_old_candidate);
                 }
             } else {
-                return false;
+                return None;
             }
         }
     }

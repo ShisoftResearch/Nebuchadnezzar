@@ -144,11 +144,8 @@ impl Service for LSMTreeService {
             let mut res = EntryKeyBlock::default();
             let mut cursor_memo = cursor.borrow_mut();
             for entry in res.iter_mut() {
-                if let Some(tree_entry) = cursor_memo.tree_cursor.current() {
+                if let Some(tree_entry) = cursor_memo.tree_cursor.next() {
                     *entry = tree_entry.clone();
-                    if !cursor_memo.tree_cursor.next() {
-                        break;
-                    }
                 } else {
                     break;
                 }
