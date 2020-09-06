@@ -12,12 +12,14 @@ use std::{mem, ptr};
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
+pub const LSM_TREE_MIGRATION_NAME: &'static str = "migration";
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
 type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS];
 
 lazy_static! {
     pub static ref LSM_TREE_SCHEMA_ID: u32 = key_hash(LSM_TREE_SCHEMA_NAME) as u32;
     pub static ref LSM_TREE_LEVELS_HASH: u64 = key_hash(LSM_TREE_LEVELS_NAME);
+    pub static ref LSM_TREE_MIGRATION_HASH: u64 = key_hash(LSM_TREE_MIGRATION_NAME);
     pub static ref LSM_TREE_SCHEMA: Schema = lsm_treee_schema();
 }
 
@@ -44,12 +46,7 @@ impl LSMTree {
             tree_3.head_id(),
             tree_4.head_id(),
         ];
-        let mut cell_map = Map::new();
-        cell_map.insert_key_id(
-            *LSM_TREE_LEVELS_HASH,
-            Value::Array(level_ids.iter().map(|id| id.value()).collect()),
-        );
-        let lsm_tree_cell = Cell::new_with_id(*LSM_TREE_SCHEMA_ID, id, Value::Map(cell_map));
+        let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
             trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
@@ -102,7 +99,31 @@ impl LSMTree {
     }
 
     pub fn oversized(&self) -> bool {
-        self.trees[self.trees.len() - 1].oversized()
+        self.last_level_tree().oversized()
+    }
+
+    pub fn mid_key(&self) -> Option<EntryKey> {
+        self.last_level_tree().mid_key()
+    } 
+
+    pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) {
+        let lsm_tree_cell = lsm_tree_cell(
+            &self.trees
+                .iter()
+                .map(|tree| tree.head_id())
+                .collect(), 
+            id, 
+            migration
+        );
+        client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
+    }
+
+    pub fn merge_keys(&self, keys: Box<Vec<EntryKey>>) {
+        self.last_level_tree().merge_with_keys(keys);
+    }
+
+    fn last_level_tree(&self) -> &Box<dyn LevelTree> {
+        self.trees.last().unwrap()
     }
 }
 
@@ -175,17 +196,32 @@ fn lsm_treee_schema() -> Schema {
             0,
             false,
             false,
-            Some(vec![Field::new(
-                LSM_TREE_LEVELS_NAME,
-                type_id_of(Type::Id),
-                false,
-                true,
-                None,
-                vec![],
-            )]),
+            Some(vec![
+                Field::new(
+                    LSM_TREE_LEVELS_NAME,
+                    type_id_of(Type::Id),
+                    false,
+                    true,
+                    None,
+                    vec![]),
+                Field::new(
+                    LSM_TREE_MIGRATION_NAME,
+                    type_id_of(Type::Id),
+                    true,
+                    false,
+                    None,
+                    vec![]),
+            ]),
             vec![],
         ),
     }
+}
+
+fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> Cell {
+    let mut cell_map = Map::new();
+    cell_map.insert_key_id(*LSM_TREE_LEVELS_HASH, Value::Array(level_ids.iter().map(|id| id.value()).collect()));
+    cell_map.insert_key_id(*LSM_TREE_MIGRATION_HASH, migration.map(|id| Value::Id(id)).unwrap_or(Value::Null));
+    Cell::new_with_id(*LSM_TREE_SCHEMA_ID, id, Value::Map(cell_map))
 }
 
 impl_btree_level!(LEVEL_M);

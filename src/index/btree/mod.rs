@@ -225,7 +225,7 @@ where
     }
 }
 
-pub trait LevelTree {
+pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
     fn merge_to(&self, upper_level: &dyn LevelTree) -> usize;

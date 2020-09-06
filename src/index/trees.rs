@@ -85,7 +85,7 @@ pub trait Slice<T: Default>: Send + Sync {
     }
 }
 
-pub trait Cursor {
+pub trait Cursor: Send {
     fn next(&mut self) -> Option<EntryKey>;
     fn current(&self) -> Option<&EntryKey>;
 }

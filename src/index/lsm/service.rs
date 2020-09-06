@@ -4,6 +4,8 @@ use super::tree::*;
 use crate::index::btree::level::LEVEL_M as BLOCK_SIZE;
 use crate::client::AsyncClient;
 use crate::index::trees::*;
+use crate::ram::types::RandValue;
+use parking_lot::RwLock;
 use std::cell::RefCell;
 use bifrost::utils::time::get_time;
 use serde::{Serialize, Deserialize};
@@ -36,8 +38,19 @@ pub struct ServCursor {
 }
 
 pub struct DistLSMTree {
+    id: Id,
     tree: LSMTree,
-    boundary: Boundary
+    prop: RwLock<DistProp>
+}
+
+struct DistProp {
+    boundary: Boundary,
+    migration: Option<Migration>
+}
+
+struct Migration {
+    pivot: EntryKey,
+    id: Id
 }
 
 pub struct CursorMemo {
@@ -67,14 +80,14 @@ impl Service for LSMTreeService {
     fn crate_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
             let tree = LSMTree::create(&self.client, &id).await;
-            self.trees.insert(&id, Arc::new(DistLSMTree::new(tree, boundary)));
+            self.trees.insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
         }.boxed()
     }
 
     fn load_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
             let tree = LSMTree::recover(&self.client, &id).await;
-            self.trees.insert(&id, Arc::new(DistLSMTree::new(tree, boundary)));
+            self.trees.insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
         }.boxed()
     }
 
@@ -162,14 +175,7 @@ impl LSMTreeService {
     pub fn new(client: &Arc<AsyncClient>) -> Self {
         let trees_map = Arc::new(HashMap::with_capacity(32));
         crate::index::btree::storage::start_external_nodes_write_back(client);
-        let trees_map_clone: Arc<HashMap<Id, Arc<DistLSMTree>>> = trees_map.clone();
-        tokio::spawn(async move {
-            for (_, dist_tree) in trees_map_clone.entries() {
-                dist_tree.tree.merge_levels();
-            }
-            // Sleep for a while to check for trees to be merge in levels
-            tokio::time::delay_for(Duration::from_secs(5)).await;
-        });
+        Self::start_tree_balancer(&trees_map, client);
         Self {
             client: client.clone(),
             cursor_counter: AtomicUsize::new(0),
@@ -177,16 +183,86 @@ impl LSMTreeService {
             trees: trees_map
         }
     }
+
+    pub fn start_tree_balancer(trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>, client: &Arc<AsyncClient>) {
+        let trees_map = trees_map.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            loop {
+                for (_, dist_tree) in trees_map.entries() {
+                    let tree = &dist_tree.tree;
+                    tree.merge_levels();
+                    if tree.oversized() {
+                        // Tree oversized, need to migrate
+                        let mid_key = tree.mid_key().unwrap();
+                        let migration_target_id = Id::rand();
+                        let target_boundary = Boundary {
+                            lower: mid_key.clone(),
+                            upper: dist_tree.prop.read().boundary.upper.clone()
+                        };
+                        let migration_tree = Self::create_migration_tree(&trees_map, migration_target_id, target_boundary, &client).await;
+                        {
+                            let mut dist_tree_prop = dist_tree.prop.write();
+                            dist_tree_prop.migration = Some(Migration {
+                                pivot: mid_key.clone(),
+                                id: migration_target_id
+                            });
+                        }
+                        tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client).await;
+                        let buffer_size = BLOCK_SIZE << 2;
+                        let mut cursor = tree.seek(&mid_key, Ordering::Forward);
+                        let mut entry_buffer = Vec::with_capacity(buffer_size);
+                        // Moving keys
+                        while cursor.current().is_some() {
+                            if let Some(entry) = cursor.next() {
+                                entry_buffer.push(entry);
+                                if entry_buffer.len() >= buffer_size {
+                                    migration_tree.tree.merge_keys(Box::new(entry_buffer));
+                                    entry_buffer = Vec::with_capacity(buffer_size);
+                                }
+                            }
+                        }
+                        // TODO: Inform the Raft state machine that the tree have splited with new boundary
+
+                        // Reset state on current tree
+                        tree.mark_migration(&dist_tree.id, None, &client).await;
+                        {
+                            let mut dist_prop = dist_tree.prop.write();
+                            dist_prop.boundary.upper = mid_key;
+                            dist_prop.migration = None;
+                        }
+                    }
+                }
+                // Sleep for a while to check for trees to be merge in levels
+                tokio::time::delay_for(Duration::from_secs(5)).await;
+            }
+        });
+    }
+
+    async fn create_migration_tree(
+        trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>, 
+        id: Id, 
+        boundary: Boundary,
+        client: &Arc<AsyncClient>
+    ) -> Arc<DistLSMTree> {
+        let tree = LSMTree::create(client, &id).await;
+        let dist = Arc::new(DistLSMTree::new(id, tree, boundary, None));
+        trees_map.insert(&id, dist.clone());
+        dist
+    }
 }
 
 impl DistLSMTree {
-    fn new(tree: LSMTree, boundary: Boundary) -> Self {
+    fn new(id: Id, tree: LSMTree, boundary: Boundary, migration: Option<Migration>) -> Self {
+        let prop = RwLock::new(DistProp {
+            boundary, migration
+        });
         Self {
-            tree, boundary
+            id, tree, prop
         }
     }
     fn key_in_boundary(&self, entry: &EntryKey) -> bool {
-        self.boundary.in_boundary(entry)
+        self.prop.read().boundary.in_boundary(entry)
     }
 }
 
@@ -197,3 +273,6 @@ impl Boundary {
 }
 
 dispatch_rpc_service_functions!(LSMTreeService);
+
+unsafe impl Send for DistLSMTree {}
+unsafe impl Sync for DistLSMTree {}
