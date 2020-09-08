@@ -15,9 +15,9 @@ use std::cmp::min;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 10;
+pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
 
-pub const LEVEL_M: usize = 24;
+pub const LEVEL_M: usize = 8;
 pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
