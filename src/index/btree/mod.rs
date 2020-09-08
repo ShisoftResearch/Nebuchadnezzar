@@ -4,7 +4,7 @@ pub use crate::index::btree::external::page_schema;
 use crate::index::btree::external::*;
 use crate::index::btree::insert::*;
 use crate::index::btree::internal::*;
-use crate::index::btree::level::LEVEL_PAGE_DIFF_MULTIPLIER;
+use crate::index::btree::level::LEVEL_TREE_DEPTH;
 use crate::index::btree::merge::merge_into_tree_node;
 pub use crate::index::btree::node::*;
 use crate::index::btree::search::*;
@@ -239,7 +239,7 @@ pub trait LevelTree: Sync + Send {
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
     fn ideal_capacity(&self) -> usize {
-        self.size() * LEVEL_PAGE_DIFF_MULTIPLIER * LEVEL_PAGE_DIFF_MULTIPLIER
+        self.size().pow(LEVEL_TREE_DEPTH)
     }
     fn oversized(&self) -> bool {
         self.count() > self.ideal_capacity()

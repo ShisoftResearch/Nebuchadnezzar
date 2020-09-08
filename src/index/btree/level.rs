@@ -16,14 +16,14 @@ use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
+pub const LEVEL_TREE_DEPTH: u32 = 3;
 
 pub const LEVEL_M: usize = 8;
 pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
-pub const LEVEL_4: usize = LEVEL_3 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-pub const NUM_LEVELS: usize = 5;
+pub const NUM_LEVELS: usize = 4;
 
 // Select left most leaf nodes and acquire their write guard
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>

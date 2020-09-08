@@ -33,23 +33,20 @@ impl LSMTree {
         let tree_1 = Level1Tree::new();
         let tree_2 = Level2Tree::new();
         let tree_3 = Level3Tree::new();
-        let tree_4 = Level4Tree::new();
         tree_m.persist_root(neb_client).await;
         tree_1.persist_root(neb_client).await;
         tree_2.persist_root(neb_client).await;
         tree_3.persist_root(neb_client).await;
-        tree_4.persist_root(neb_client).await;
         let level_ids = vec![
             tree_m.head_id(),
             tree_1.head_id(),
             tree_2.head_id(),
             tree_3.head_id(),
-            tree_4.head_id(),
         ];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3],
         }
     }
 
@@ -60,16 +57,14 @@ impl LSMTree {
         let trees_1_val = &trees[1usize];
         let trees_2_val = &trees[2usize];
         let trees_3_val = &trees[3usize];
-        let trees_4_val = &trees[4usize];
 
         let tree_m = LevelMTree::from_head_id(trees_m_val.Id().unwrap(), neb_client).await;
         let tree_1 = Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client).await;
         let tree_2 = Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client).await;
         let tree_3 = Level3Tree::from_head_id(trees_3_val.Id().unwrap(), neb_client).await;
-        let tree_4 = Level4Tree::from_head_id(trees_4_val.Id().unwrap(), neb_client).await;
 
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3, box tree_4],
+            trees: [box tree_m, box tree_1, box tree_2, box tree_3],
         }
     }
 
@@ -140,7 +135,6 @@ impl LSMTreeCursor {
             trees[1].seek_for(key, ordering),
             trees[2].seek_for(key, ordering),
             trees[3].seek_for(key, ordering),
-            trees[4].seek_for(key, ordering),
         ];
         let current = Self::leading_tree_key(&cursors, ordering);
         Self {
@@ -243,8 +237,3 @@ impl_btree_level!(LEVEL_3);
 type Level3TreeKeySlice = [EntryKey; LEVEL_3];
 type Level3TreePtrSlice = [NodeCellRef; LEVEL_3 + 1];
 type Level3Tree = BPlusTree<Level3TreeKeySlice, Level3TreePtrSlice>;
-
-impl_btree_level!(LEVEL_4);
-type Level4TreeKeySlice = [EntryKey; LEVEL_4];
-type Level4TreePtrSlice = [NodeCellRef; LEVEL_4 + 1];
-type Level4Tree = BPlusTree<Level4TreeKeySlice, Level4TreePtrSlice>;
