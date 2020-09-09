@@ -34,7 +34,8 @@ lazy_static! {
     pub static ref NEXT_PAGE_KEY_HASH: u64 = key_hash(NEXT_FIELD);
     pub static ref PREV_PAGE_KEY_HASH: u64 = key_hash(PREV_FIELD);
     pub static ref PAGE_SCHEMA_ID: u32 = key_hash(PAGE_SCHEMA) as u32;
-    pub static ref CHANGED_NODES: SegQueue<ChangingNode> = SegQueue::new();
+    pub static ref CHANGED_NODES: SegQueue<(usize, ChangingNode)> = SegQueue::new();
+    pub static ref CHANGE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 }
 
 pub struct ExtNode<KS, PS>
@@ -375,14 +376,20 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    CHANGED_NODES.push(ChangingNode::Modified(NodeModified {
-        node: node.clone(),
-        deletion: tree.deleted.clone(),
-    }));
+    CHANGED_NODES.push((
+        CHANGE_COUNTER.fetch_add(1, Relaxed),
+        ChangingNode::Modified(NodeModified {
+            node: node.clone(),
+            deletion: tree.deleted.clone(),
+        })
+    ));
 }
 
 pub fn make_deleted(id: &Id) {
-    CHANGED_NODES.push(ChangingNode::Deleted(*id));
+    CHANGED_NODES.push((
+        CHANGE_COUNTER.fetch_add(1, Relaxed),
+        ChangingNode::Deleted(*id)
+    ));
 }
 
 pub fn page_schema() -> Schema {

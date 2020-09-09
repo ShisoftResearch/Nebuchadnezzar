@@ -11,7 +11,6 @@ use crate::index::btree::{LevelTree, MIN_ENTRY_KEY};
 use crate::index::trees::EntryKey;
 use crate::index::trees::Slice;
 use itertools::Itertools;
-use std::cmp::min;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -21,9 +20,8 @@ pub const LEVEL_TREE_DEPTH: u32 = 3;
 pub const LEVEL_M: usize = 8;
 pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
-pub const LEVEL_3: usize = LEVEL_2 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
-pub const NUM_LEVELS: usize = 4;
+pub const NUM_LEVELS: usize = 3;
 
 // Select left most leaf nodes and acquire their write guard
 fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
@@ -39,7 +37,7 @@ where
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
             let mut collected_keys = first_node.len();
             let mut collected = vec![first_node];
-            let target_keys = min(KS::slice_len() * LEVEL_PAGE_DIFF_MULTIPLIER, LEVEL_3);
+            let target_keys = KS::slice_len();
             let target_guards = LEVEL_2;
             while collected_keys < target_keys && collected.len() < target_guards {
                 debug!("Acquiring select collection node");

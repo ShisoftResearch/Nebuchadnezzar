@@ -517,7 +517,7 @@ fn reconstruct() {
                 nodes.push(last_node);
                 last_node = new_node();
             }
-            last_node.keys.as_slice()[last_node.len] = key;
+            last_node.keys[last_node.len] = key;
             last_node.len += 1;
         }
         nodes.push(last_node);

@@ -32,21 +32,18 @@ impl LSMTree {
         let tree_m = LevelMTree::new();
         let tree_1 = Level1Tree::new();
         let tree_2 = Level2Tree::new();
-        let tree_3 = Level3Tree::new();
         tree_m.persist_root(neb_client).await;
         tree_1.persist_root(neb_client).await;
         tree_2.persist_root(neb_client).await;
-        tree_3.persist_root(neb_client).await;
         let level_ids = vec![
             tree_m.head_id(),
             tree_1.head_id(),
             tree_2.head_id(),
-            tree_3.head_id(),
         ];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3],
+            trees: [box tree_m, box tree_1, box tree_2],
         }
     }
 
@@ -61,10 +58,9 @@ impl LSMTree {
         let tree_m = LevelMTree::from_head_id(trees_m_val.Id().unwrap(), neb_client).await;
         let tree_1 = Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client).await;
         let tree_2 = Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client).await;
-        let tree_3 = Level3Tree::from_head_id(trees_3_val.Id().unwrap(), neb_client).await;
 
         Self {
-            trees: [box tree_m, box tree_1, box tree_2, box tree_3],
+            trees: [box tree_m, box tree_1, box tree_2],
         }
     }
 
@@ -110,7 +106,7 @@ impl LSMTree {
             id, 
             migration
         );
-        client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
+        client.update_cell(lsm_tree_cell).await.unwrap().unwrap();
     }
 
     pub fn merge_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -134,7 +130,6 @@ impl LSMTreeCursor {
             trees[0].seek_for(key, ordering),
             trees[1].seek_for(key, ordering),
             trees[2].seek_for(key, ordering),
-            trees[3].seek_for(key, ordering),
         ];
         let current = Self::leading_tree_key(&cursors, ordering);
         Self {
@@ -232,8 +227,3 @@ impl_btree_level!(LEVEL_2);
 type Level2TreeKeySlice = [EntryKey; LEVEL_2];
 type Level2TreePtrSlice = [NodeCellRef; LEVEL_2 + 1];
 type Level2Tree = BPlusTree<Level2TreeKeySlice, Level2TreePtrSlice>;
-
-impl_btree_level!(LEVEL_3);
-type Level3TreeKeySlice = [EntryKey; LEVEL_3];
-type Level3TreePtrSlice = [NodeCellRef; LEVEL_3 + 1];
-type Level3Tree = BPlusTree<Level3TreeKeySlice, Level3TreePtrSlice>;

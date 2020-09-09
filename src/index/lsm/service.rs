@@ -5,6 +5,7 @@ use crate::index::btree::level::LEVEL_M as BLOCK_SIZE;
 use crate::client::AsyncClient;
 use crate::index::trees::*;
 use crate::ram::types::RandValue;
+use crate::index::btree::storage;
 use parking_lot::RwLock;
 use std::cell::RefCell;
 use bifrost::utils::time::get_time;
@@ -29,7 +30,8 @@ pub enum OpResult<T> {
     Successful(T),
     Failed,
     NotFound,
-    OutOfBound
+    OutOfBound,
+    Migrating
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,7 +52,6 @@ struct DistProp {
 
 struct Migration {
     pivot: EntryKey,
-    id: Id
 }
 
 pub struct CursorMemo {
@@ -92,52 +93,43 @@ impl Service for LSMTreeService {
     }
 
     fn insert(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<()>> {
-        future::ready(if let Some(tree) = self.trees.get(&id) {
-            if tree.key_in_boundary(&entry) {
-                if tree.tree.insert(&entry) {
-                    OpResult::Successful(())
+        self.apply_in_ranged_tree(
+            id, entry, 
+            |entry, tree| {
+                if tree.insert(&entry) {
+                    OpResult::Successful(())  
                 } else {
                     OpResult::Failed
                 }
-            } else {
-                OpResult::OutOfBound
             }
-        } else {
-            OpResult::NotFound
-        }).boxed()
+        )
     }
 
     fn delete(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<()>> {
-        future::ready(if let Some(tree) = self.trees.get(&id) {
-            if tree.key_in_boundary(&entry) {
-                if tree.tree.delete(&entry) {
+        self.apply_in_ranged_tree(
+            id, entry, 
+            |entry, tree| {
+                if tree.delete(&entry) {
                     OpResult::Successful(())
                 } else {
                     OpResult::Failed
                 }
-            } else {
-                OpResult::OutOfBound
             }
-        } else {
-            OpResult::NotFound
-        }).boxed()
+        )
     }
 
     fn seek(&self, id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16) -> BoxFuture<OpResult<ServCursor>> {
-        future::ready(if let Some(tree) = self.trees.get(&id) {
-            if tree.key_in_boundary(&entry) {
-                let tree_cursor = tree.tree.seek(&entry, ordering);
+        self.apply_in_ranged_tree(
+            id, entry, 
+            |entry, tree| {
+                let tree_cursor = tree.seek(&entry, ordering);
                 let cursor_id = self.cursor_counter.fetch_add(1, Relaxed);
                 let expires = get_time() + cursor_lifetime as i64;
                 let cursor_memo = CursorMemo { tree_cursor, expires };
                 self.cursors.insert(&(cursor_id), Arc::new(RefCell::new(cursor_memo)));
                 OpResult::Successful(ServCursor { cursor_id: cursor_id as u64 })
-            } else {
-                OpResult::OutOfBound
-            }
-        } else {
-            OpResult::NotFound
-        }).boxed()
+            } 
+        )
     }
 
     fn renew_cursor(&self, cursor: ServCursor, time: u16) -> BoxFuture<bool> {
@@ -200,7 +192,7 @@ impl LSMTreeService {
                             lower: mid_key.clone(),
                             upper: dist_tree.prop.read().boundary.upper.clone()
                         };
-                        let migration_tree = Self::create_migration_tree(&trees_map, migration_target_id, target_boundary, &client).await;
+                        let migration_tree = LSMTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
@@ -217,11 +209,14 @@ impl LSMTreeService {
                             if let Some(entry) = cursor.next() {
                                 entry_buffer.push(entry);
                                 if entry_buffer.len() >= buffer_size {
-                                    migration_tree.tree.merge_keys(Box::new(entry_buffer));
+                                    migration_tree.merge_keys(Box::new(entry_buffer));
                                     entry_buffer = Vec::with_capacity(buffer_size);
                                 }
                             }
                         }
+                        storage::wait_until_updated().await;
+                        // Remove the tree from local first so no new keys will be inserted in the tree
+                        trees_map.remove(&migration_target_id);
                         // TODO: Inform the Raft state machine that the tree have splited with new boundary
 
                         // Reset state on current tree
@@ -239,16 +234,31 @@ impl LSMTreeService {
         });
     }
 
-    async fn create_migration_tree(
-        trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>, 
-        id: Id, 
-        boundary: Boundary,
-        client: &Arc<AsyncClient>
-    ) -> Arc<DistLSMTree> {
-        let tree = LSMTree::create(client, &id).await;
-        let dist = Arc::new(DistLSMTree::new(id, tree, boundary, None));
-        trees_map.insert(&id, dist.clone());
-        dist
+    fn apply_in_ranged_tree<F, R>(
+        &self, id: Id, entry: EntryKey, func: F
+    ) -> BoxFuture<OpResult<R>>
+        where F: Fn(&EntryKey, &LSMTree) -> OpResult<R>,
+              R: Send + 'static
+    {
+        future::ready(if let Some(tree) = self.trees.get(&id) {
+            let tree_prop = tree.prop.read();
+            if tree_prop.boundary.in_boundary(&entry) {
+                if let &Some(ref migration) = &tree_prop.migration {
+                    if entry < migration.pivot {
+                        // Entries lower than pivot should be safe to work on
+                        func(&entry, &tree.tree)
+                    } else {
+                        OpResult::Migrating
+                    }
+                } else {
+                    func(&entry, &tree.tree)
+                }
+            } else {
+                OpResult::OutOfBound
+            }
+        } else {
+            OpResult::NotFound
+        }).boxed()
     }
 }
 
@@ -260,9 +270,6 @@ impl DistLSMTree {
         Self {
             id, tree, prop
         }
-    }
-    fn key_in_boundary(&self, entry: &EntryKey) -> bool {
-        self.prop.read().boundary.in_boundary(entry)
     }
 }
 
