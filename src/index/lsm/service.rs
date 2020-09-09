@@ -188,16 +188,11 @@ impl LSMTreeService {
                         // Tree oversized, need to migrate
                         let mid_key = tree.mid_key().unwrap();
                         let migration_target_id = Id::rand();
-                        let target_boundary = Boundary {
-                            lower: mid_key.clone(),
-                            upper: dist_tree.prop.read().boundary.upper.clone()
-                        };
                         let migration_tree = LSMTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
                                 pivot: mid_key.clone(),
-                                id: migration_target_id
                             });
                         }
                         tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client).await;
