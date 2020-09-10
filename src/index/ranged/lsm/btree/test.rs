@@ -1,6 +1,6 @@
-use super::*;
 use super::dump::dump_tree;
-use super::reconstruct::TreeConstructor; 
+use super::reconstruct::TreeConstructor;
+use super::*;
 use crate::ram::types::RandValue;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;

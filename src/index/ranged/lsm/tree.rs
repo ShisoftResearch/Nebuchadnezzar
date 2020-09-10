@@ -1,13 +1,13 @@
 // A machine-local concurrent LSM tree based on B-tree implementation
 
-use crate::client::AsyncClient;
 use super::btree::level::*;
 use super::btree::*;
+use crate::client::AsyncClient;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use std::sync::Arc;
 use std::mem;
+use std::sync::Arc;
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
@@ -34,11 +34,7 @@ impl LSMTree {
         tree_m.persist_root(neb_client).await;
         tree_1.persist_root(neb_client).await;
         tree_2.persist_root(neb_client).await;
-        let level_ids = vec![
-            tree_m.head_id(),
-            tree_1.head_id(),
-            tree_2.head_id(),
-        ];
+        let level_ids = vec![tree_m.head_id(), tree_1.head_id(), tree_2.head_id()];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
@@ -94,16 +90,13 @@ impl LSMTree {
 
     pub fn mid_key(&self) -> Option<EntryKey> {
         self.last_level_tree().mid_key()
-    } 
+    }
 
     pub async fn mark_migration(&self, id: &Id, migration: Option<Id>, client: &Arc<AsyncClient>) {
         let lsm_tree_cell = lsm_tree_cell(
-            &self.trees
-                .iter()
-                .map(|tree| tree.head_id())
-                .collect(), 
-            id, 
-            migration
+            &self.trees.iter().map(|tree| tree.head_id()).collect(),
+            id,
+            migration,
         );
         client.update_cell(lsm_tree_cell).await.unwrap().unwrap();
     }
@@ -191,14 +184,16 @@ fn lsm_treee_schema() -> Schema {
                     false,
                     true,
                     None,
-                    vec![]),
+                    vec![],
+                ),
                 Field::new(
                     LSM_TREE_MIGRATION_NAME,
                     type_id_of(Type::Id),
                     true,
                     false,
                     None,
-                    vec![]),
+                    vec![],
+                ),
             ]),
             vec![],
         ),
@@ -207,8 +202,14 @@ fn lsm_treee_schema() -> Schema {
 
 fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> Cell {
     let mut cell_map = Map::new();
-    cell_map.insert_key_id(*LSM_TREE_LEVELS_HASH, Value::Array(level_ids.iter().map(|id| id.value()).collect()));
-    cell_map.insert_key_id(*LSM_TREE_MIGRATION_HASH, migration.map(|id| Value::Id(id)).unwrap_or(Value::Null));
+    cell_map.insert_key_id(
+        *LSM_TREE_LEVELS_HASH,
+        Value::Array(level_ids.iter().map(|id| id.value()).collect()),
+    );
+    cell_map.insert_key_id(
+        *LSM_TREE_MIGRATION_HASH,
+        migration.map(|id| Value::Id(id)).unwrap_or(Value::Null),
+    );
     Cell::new_with_id(*LSM_TREE_SCHEMA_ID, id, Value::Map(cell_map))
 }
 

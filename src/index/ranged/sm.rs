@@ -1,6 +1,5 @@
-use crate::ram::types::Id;
 use super::trees::*;
-
+use crate::ram::types::Id;
 
 raft_state_machine! {
     def qry locate_key(entry: EntryKey) -> Id;

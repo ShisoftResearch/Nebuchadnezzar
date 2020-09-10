@@ -85,7 +85,8 @@ where
                                         } else if next_node.is_ext() {
                                             self.index = 0;
                                             self.page = Some(next_node_ref.clone());
-                                            other_current = Self::read_current(next_node_ref, self.index);
+                                            other_current =
+                                                Self::read_current(next_node_ref, self.index);
                                             mem::swap(&mut self.current, &mut other_current);
                                             return Some(other_current);
                                         } else {
@@ -117,7 +118,7 @@ where
                                             other_current =
                                                 Self::read_current(prev_node_ref, self.index);
                                             mem::swap(&mut self.current, &mut other_current);
-                                               return Some(other_current);
+                                            return Some(other_current);
                                         } else {
                                             unreachable!()
                                         }

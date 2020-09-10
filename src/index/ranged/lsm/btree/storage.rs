@@ -1,8 +1,8 @@
-use crate::client;
 use super::external;
+use crate::client;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 lazy_static! {
     pub static ref CHANGE_PROGRESS: AtomicUsize = AtomicUsize::new(0);

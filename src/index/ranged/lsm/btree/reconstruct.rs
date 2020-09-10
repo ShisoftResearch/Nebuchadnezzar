@@ -1,9 +1,9 @@
-use crate::client::AsyncClient;
 use super::external::ExtNode;
 use super::internal::InNode;
 use super::node::{write_node, Node, NodeWriteGuard};
-use super::{external, max_entry_key, BPlusTree, NodeCellRef};
 use super::*;
+use super::{external, max_entry_key, BPlusTree, NodeCellRef};
+use crate::client::AsyncClient;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::mem;
@@ -164,16 +164,18 @@ where
     BPlusTree::from_root(root, head_id, len)
 }
 
-unsafe impl <KS, PS> Send for TreeConstructor<KS, PS> where 
+unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
+where
     KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static, 
-{}
+    PS: Slice<NodeCellRef> + 'static,
+{
+}
 
 #[cfg(test)]
 mod test {
-    use crate::client;
     use super::external::*;
-    use crate::index::ranged::lsm::btree::test::*; 
+    use crate::client;
+    use crate::index::ranged::lsm::btree::test::*;
     use crate::index::ranged::lsm::btree::*;
     use crate::ram::cell::Cell;
     use crate::ram::types::*;

@@ -379,14 +379,14 @@ where
         ChangingNode::Modified(NodeModified {
             node: node.clone(),
             deletion: tree.deleted.clone(),
-        })
+        }),
     ));
 }
 
 pub fn make_deleted(id: &Id) {
     CHANGED_NODES.push((
         CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::Deleted(*id)
+        ChangingNode::Deleted(*id),
     ));
 }
 
