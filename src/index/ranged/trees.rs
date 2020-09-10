@@ -1,5 +1,7 @@
 use std::fmt::Debug;
 use std::mem;
+use std::iter;
+use itertools::*;
 
 pub use crate::index::*;
 
@@ -71,4 +73,29 @@ pub trait Cursor: Send {
 pub enum Ordering {
     Forward,
     Backward,
+}
+
+lazy_static! {
+    pub static ref MAX_ENTRY_KEY: EntryKey = raw_max_entry_key();
+    pub static ref MIN_ENTRY_KEY: EntryKey = raw_min_entry_key();
+}
+
+#[inline]
+fn raw_max_entry_key() -> EntryKey {
+    EntryKey::from(iter::repeat(255u8).take(MAX_KEY_SIZE).collect_vec())
+}
+
+#[inline(always)]
+fn raw_min_entry_key() -> EntryKey {
+    smallvec!()
+}
+
+#[inline(always)]
+pub fn max_entry_key() -> EntryKey {
+    (*MAX_ENTRY_KEY).clone()
+}
+
+#[inline(always)]
+pub fn min_entry_key() -> EntryKey {
+    raw_min_entry_key()
 }

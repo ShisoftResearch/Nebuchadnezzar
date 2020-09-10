@@ -48,7 +48,6 @@ impl LSMTree {
         let trees_m_val = &trees[0usize];
         let trees_1_val = &trees[1usize];
         let trees_2_val = &trees[2usize];
-        let trees_3_val = &trees[3usize];
 
         let tree_m = LevelMTree::from_head_id(trees_m_val.Id().unwrap(), neb_client).await;
         let tree_1 = Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client).await;

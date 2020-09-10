@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
+use bifrost_plugins::hash_ident;
 
 pub type EntryKeyBlock = [EntryKey; BLOCK_SIZE];
+pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Boundary {
@@ -79,6 +81,9 @@ pub struct LSMTreeService {
 impl Service for LSMTreeService {
     fn crate_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
+            if self.trees.contains(&id) {
+                return;
+            }
             let tree = LSMTree::create(&self.client, &id).await;
             self.trees
                 .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
@@ -88,6 +93,9 @@ impl Service for LSMTreeService {
 
     fn load_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
+            if self.trees.contains(&id) {
+                return;
+            }
             let tree = LSMTree::recover(&self.client, &id).await;
             self.trees
                 .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
@@ -282,6 +290,11 @@ impl DistLSMTree {
 }
 
 impl Boundary {
+    pub fn new(lower: EntryKey, upper: EntryKey) -> Self {
+        Boundary {
+            lower, upper
+        }
+    } 
     fn in_boundary(&self, entry: &EntryKey) -> bool {
         return entry >= &self.lower && entry < &self.upper;
     }
