@@ -1,9 +1,7 @@
-use crate::index::btree::external;
-use crate::index::btree::node::write_node;
-use crate::index::btree::node::NodeData;
-use crate::index::btree::NodeCellRef;
-use crate::index::trees::EntryKey;
-use crate::index::trees::Slice;
+use super::external;
+use super::node::write_node;
+use super::node::NodeData;
+use super::*;
 use std::fmt::Debug;
 
 // scatter the node and its references to ensure garbage collection

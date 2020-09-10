@@ -1,10 +1,9 @@
 use crate::client::AsyncClient;
-use crate::index::btree::external::ExtNode;
-use crate::index::btree::internal::InNode;
-use crate::index::btree::node::{write_node, Node, NodeWriteGuard};
-use crate::index::btree::{external, max_entry_key, BPlusTree, NodeCellRef};
-use crate::index::trees::{EntryKey, Slice};
-use crate::ram::types::*;
+use super::external::ExtNode;
+use super::internal::InNode;
+use super::node::{write_node, Node, NodeWriteGuard};
+use super::{external, max_entry_key, BPlusTree, NodeCellRef};
+use super::*;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::mem;
@@ -173,10 +172,9 @@ unsafe impl <KS, PS> Send for TreeConstructor<KS, PS> where
 #[cfg(test)]
 mod test {
     use crate::client;
-    use crate::index::btree::external::*;
-    use crate::index::btree::test::*;
-    use crate::index::trees::Cursor;
-    use crate::index::trees::{key_with_id, Ordering};
+    use super::external::*;
+    use crate::index::ranged::lsm::btree::test::*; 
+    use crate::index::ranged::lsm::btree::*;
     use crate::ram::cell::Cell;
     use crate::ram::types::*;
     use crate::rand::Rng;

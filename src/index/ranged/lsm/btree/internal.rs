@@ -1,7 +1,6 @@
-use crate::index::btree::node::EmptyNode;
-use crate::index::btree::Slice;
-use crate::index::btree::*;
-use crate::index::trees::EntryKey;
+use super::node::EmptyNode;
+use super::Slice;
+use super::*;
 use itertools::free::chain;
 use std::any::Any;
 use std::{mem, panic};

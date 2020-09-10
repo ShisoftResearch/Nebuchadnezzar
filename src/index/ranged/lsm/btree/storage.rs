@@ -1,5 +1,5 @@
 use crate::client;
-use crate::index::btree::external;
+use super::external;
 use std::sync::Arc;
 use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};

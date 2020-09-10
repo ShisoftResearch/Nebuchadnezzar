@@ -1,11 +1,10 @@
-use crate::index::trees::EntryKey;
 use crate::ram::types::Id;
 use super::tree::*;
-use crate::index::btree::level::LEVEL_M as BLOCK_SIZE;
+use super::btree::level::LEVEL_M as BLOCK_SIZE;
 use crate::client::AsyncClient;
-use crate::index::trees::*;
+use super::super::trees::*;
 use crate::ram::types::RandValue;
-use crate::index::btree::storage;
+use super::btree::storage;
 use parking_lot::RwLock;
 use std::cell::RefCell;
 use bifrost::utils::time::get_time;
@@ -166,7 +165,7 @@ impl Service for LSMTreeService {
 impl LSMTreeService {
     pub fn new(client: &Arc<AsyncClient>) -> Self {
         let trees_map = Arc::new(HashMap::with_capacity(32));
-        crate::index::btree::storage::start_external_nodes_write_back(client);
+        super::btree::storage::start_external_nodes_write_back(client);
         Self::start_tree_balancer(&trees_map, client);
         Self {
             client: client.clone(),
@@ -210,10 +209,8 @@ impl LSMTreeService {
                             }
                         }
                         storage::wait_until_updated().await;
-                        // Remove the tree from local first so no new keys will be inserted in the tree
-                        trees_map.remove(&migration_target_id);
                         // TODO: Inform the Raft state machine that the tree have splited with new boundary
-
+                        
                         // Reset state on current tree
                         tree.mark_migration(&dist_tree.id, None, &client).await;
                         {

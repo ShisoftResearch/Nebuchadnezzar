@@ -1,10 +1,8 @@
-use crate::index::builder::IndexComps::Vectorized;
-use crate::index::trees::EntryKey;
+use super::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
 use bifrost_hasher::hash_str;
-use smallvec::SmallVec;
 
 type FieldName = String;
 pub type Feature = [u8; 8];

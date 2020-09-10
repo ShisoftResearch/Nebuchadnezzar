@@ -3,7 +3,7 @@ macro_rules! make_array {
         unsafe {
             let mut items: [_; $n] = mem::zeroed();
             for place in items.iter_mut() {
-                ptr::write(place, $constructor);
+                std::ptr::write(place, $constructor);
             }
             items
         }

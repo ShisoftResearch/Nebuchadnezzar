@@ -144,7 +144,7 @@ where
     }
 }
 
-impl<KS, PS> IndexCursor for RTCursor<KS, PS>
+impl<KS, PS> Cursor for RTCursor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

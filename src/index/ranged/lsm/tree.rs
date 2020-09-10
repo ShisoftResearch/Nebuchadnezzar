@@ -1,14 +1,13 @@
 // A machine-local concurrent LSM tree based on B-tree implementation
 
 use crate::client::AsyncClient;
-use crate::index::btree::level::*;
-use crate::index::btree::*;
-use crate::index::trees::*;
+use super::btree::level::*;
+use super::btree::*;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use std::sync::Arc;
-use std::{mem, ptr};
+use std::mem;
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";

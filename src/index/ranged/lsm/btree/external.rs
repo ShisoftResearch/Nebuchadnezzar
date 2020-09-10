@@ -1,6 +1,4 @@
-use crate::index::btree::*;
-use crate::index::trees::EntryKey;
-use crate::index::trees::Slice;
+use super::*;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;

@@ -1,19 +1,15 @@
 use crate::client::AsyncClient;
-pub use crate::index::btree::cursor::*;
-pub use crate::index::btree::external::page_schema;
-use crate::index::btree::external::*;
-use crate::index::btree::insert::*;
-use crate::index::btree::internal::*;
-use crate::index::btree::level::LEVEL_TREE_DEPTH;
-use crate::index::btree::merge::merge_into_tree_node;
-pub use crate::index::btree::node::*;
-use crate::index::btree::search::*;
-use crate::index::btree::split::remove_to_right;
-use crate::index::trees::Cursor;
-use crate::index::trees::EntryKey;
-use crate::index::trees::Slice;
-use crate::index::trees::MAX_KEY_SIZE;
-use crate::index::trees::{Cursor as IndexCursor, Ordering};
+pub use cursor::*;
+pub use external::page_schema;
+use external::*;
+use insert::*;
+use internal::*;
+use level::LEVEL_TREE_DEPTH;
+use merge::merge_into_tree_node;
+pub use node::*;
+use search::*;
+use split::remove_to_right;
+pub use crate::index::ranged::trees::*;
 use crate::ram::types::RandValue;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::{key_hash, PrimitiveArray, Value};
@@ -48,6 +44,8 @@ mod search;
 mod split;
 pub mod storage;
 pub mod verification;
+#[macro_use]
+pub mod marco;
 
 const DEL_SET_CAP: usize = 16;
 
@@ -362,13 +360,6 @@ impl LevelTree for DummyLevelTree {
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);
 impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
-#[allow(unused_macros)]
-macro_rules! impl_btree_level {
-    ($items: expr) => {
-        impl_slice_ops!([EntryKey; $items], EntryKey, $items);
-        impl_slice_ops!([NodeCellRef; $items + 1], NodeCellRef, $items + 1);
-    };
-}
 pub struct NodeCellRef {
     inner: Arc<dyn AnyNode>,
 }

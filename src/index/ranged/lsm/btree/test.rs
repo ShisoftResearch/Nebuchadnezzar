@@ -1,10 +1,6 @@
 use super::*;
-use crate::index::btree::dump::dump_tree;
-use crate::index::btree::reconstruct::TreeConstructor;
-use crate::index::btree::NodeCellRef;
-use crate::index::trees::Cursor;
-use crate::index::trees::EntryKey;
-use crate::index::trees::{id_from_key, key_with_id};
+use super::dump::dump_tree;
+use super::reconstruct::TreeConstructor; 
 use crate::ram::types::RandValue;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
@@ -93,7 +89,6 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 
 #[test]
 fn crd() {
-    use crate::index::trees::Cursor;
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     std::fs::remove_dir_all("dumps").unwrap();
@@ -200,7 +195,6 @@ fn crd() {
 
 #[test]
 pub fn alternative_insertion_pattern() {
-    use crate::index::trees::Cursor;
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let num = env::var("BTREE_TEST_ITEMS")
