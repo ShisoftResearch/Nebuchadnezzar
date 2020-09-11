@@ -1,3 +1,4 @@
+use super::lsm::service::AsyncServiceClient as LSMServiceClient;
 use super::lsm::service::*;
 use super::trees::*;
 use crate::ram::types::Id;
