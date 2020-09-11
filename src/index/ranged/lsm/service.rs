@@ -2,6 +2,7 @@ use super::super::trees::*;
 use super::btree::level::LEVEL_M as BLOCK_SIZE;
 use super::btree::storage;
 use super::tree::*;
+use super::super::sm::client::SMClient;
 use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
@@ -180,7 +181,7 @@ impl Service for LSMTreeService {
 }
 
 impl LSMTreeService {
-    pub fn new(client: &Arc<AsyncClient>) -> Self {
+    pub fn new(client: &Arc<AsyncClient>, sm_client: &Arc<SMClient>) -> Self {
         let trees_map = Arc::new(HashMap::with_capacity(32));
         super::btree::storage::start_external_nodes_write_back(client);
         Self::start_tree_balancer(&trees_map, client);
@@ -195,9 +196,11 @@ impl LSMTreeService {
     pub fn start_tree_balancer(
         trees_map: &Arc<HashMap<Id, Arc<DistLSMTree>>>,
         client: &Arc<AsyncClient>,
+        sm_client: &Arc<SMClient>,
     ) {
         let trees_map = trees_map.clone();
         let client = client.clone();
+        let sm_client = sm_client.clone();
         tokio::spawn(async move {
             loop {
                 for (_, dist_tree) in trees_map.entries() {
@@ -230,8 +233,7 @@ impl LSMTreeService {
                             }
                         }
                         storage::wait_until_updated().await;
-                        // TODO: Inform the Raft state machine that the tree have splited with new boundary
-
+                        sm_client.split(&migration_target_id, &mid_key).await.unwrap();
                         // Reset state on current tree
                         tree.mark_migration(&dist_tree.id, None, &client).await;
                         {

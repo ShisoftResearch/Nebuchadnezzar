@@ -6,7 +6,7 @@ use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
-use bifrost::rpc::{RPCClient, RPCError, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::RPCError;
 use bifrost::utils;
 use futures::prelude::*;
 use std::collections::BTreeMap;
