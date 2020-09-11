@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
 use bifrost_plugins::hash_ident;
+use bifrost::conshash::ConsistentHashing;
 
 pub type EntryKeyBlock = [EntryKey; BLOCK_SIZE];
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
@@ -311,3 +312,18 @@ dispatch_rpc_service_functions!(LSMTreeService);
 
 unsafe impl Send for DistLSMTree {}
 unsafe impl Sync for DistLSMTree {}
+
+
+
+pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
+    AsyncServiceClient::new(DEFAULT_SERVICE_ID, rpc)
+}
+
+pub async fn locate_tree_server_from_conshash(id: &Id, conshash: &Arc<ConsistentHashing>) -> Result<Arc<AsyncServiceClient>, RPCError> {
+    let server_id = conshash.get_server_id_by(id).unwrap();
+    DEFAULT_CLIENT_POOL
+        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+        .await
+        .map_err(|e| RPCError::IOError(e))
+        .map(|c| client_by_rpc_client(&c))
+}

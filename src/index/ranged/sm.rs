@@ -1,7 +1,7 @@
 use super::trees::*;
 use std::collections::BTreeMap;
 use crate::ram::types::Id;
-use super::lsm::service::{DEFAULT_SERVICE_ID, AsyncServiceClient as LSMServiceClient, Boundary};
+use super::lsm::service::*;
 use futures::prelude::*;
 use bifrost::raft::state_machine::StateMachineCtl;
 use std::sync::Arc;
@@ -19,19 +19,22 @@ pub struct MasterTreeSM {
 }
 
 raft_state_machine! {
-    def qry locate_key(entry: EntryKey) -> Id;
+    def qry locate_key(entry: EntryKey) -> (EntryKey, Id, EntryKey);
     def cmd split(new_tree: Id, pivot: EntryKey);
     // No subscription for clients
 }
 
 impl StateMachineCmds for MasterTreeSM {
-    fn locate_key(&self, entry: EntryKey) -> BoxFuture<Id> {
-        future::ready(
-            self.tree.range(entry..)
+    fn locate_key(&self, entry: EntryKey) -> BoxFuture<(EntryKey, Id, EntryKey)> {
+        let (lower, id) = self.tree.range(..entry.clone())
+            .last()
+            .map(|(key, id)| (key.clone(), *id))
+            .unwrap();
+        let upper = self.tree.range(entry..)
             .next()
-            .map(|(_, id)| *id)
-            .unwrap()
-        ).boxed()
+            .map(|(key, _)| key.clone())
+            .unwrap();
+        future::ready((lower, id, upper)).boxed()
     }
 
     fn split(&mut self, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
@@ -85,16 +88,4 @@ impl MasterTreeSM {
     async fn locate_tree_server(&self, id: &Id) -> Result<Arc<LSMServiceClient>, RPCError> {
         locate_tree_server_from_conshash(id, &self.conshash).await
     }
-}
-pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<LSMServiceClient> {
-    LSMServiceClient::new(DEFAULT_SERVICE_ID, rpc)
-}
-
-async fn locate_tree_server_from_conshash(id: &Id, conshash: &Arc<ConsistentHashing>) -> Result<Arc<LSMServiceClient>, RPCError> {
-    let server_id = conshash.get_server_id_by(id).unwrap();
-    DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
-        .await
-        .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
 }

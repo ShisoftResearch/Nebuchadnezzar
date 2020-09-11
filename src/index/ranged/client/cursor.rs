@@ -7,10 +7,10 @@ use std::mem;
 use std::sync::Arc;
 use crate::index::ranged::client::RangedQueryClient;
 
-pub struct ClientCursor {
+pub struct ClientCursor<'a> {
     entry: Option<EntryKey>,
     entry_block: Option<EntryKeyBlock>,
-    query_client: Arc<RangedQueryClient>,
+    query_client: &'a RangedQueryClient,
     tree_client: Arc<AsyncServiceClient>,
     remote_cursor: ServCursor,
     ordering: Ordering,
@@ -18,22 +18,22 @@ pub struct ClientCursor {
     pos: usize
 }
 
-impl ClientCursor {
+impl <'a>ClientCursor<'a> {
     pub fn new(
         remote: ServCursor,
         init_entry: EntryKey,
         ordering: Ordering,
-        tree_boundary: &EntryKey,
-        tree_client: &Arc<AsyncServiceClient>,
-        query_client: &Arc<RangedQueryClient>
+        tree_boundary: EntryKey,
+        tree_client: Arc<AsyncServiceClient>,
+        query_client: &'a RangedQueryClient
     ) -> Self {
         Self {
             entry: Some(init_entry),
             remote_cursor: remote,
-            tree_client: tree_client.clone(),
-            query_client: query_client.clone(),
+            tree_client,
+            query_client,
             entry_block: None,
-            tree_boundary: tree_boundary.clone(),
+            tree_boundary,
             ordering,
             pos: 0,
         }
@@ -62,7 +62,7 @@ impl ClientCursor {
                 res = Some(old_key);
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
-                if self.pos >= entries.len() || entries[self.pos] <=min_entry {
+                if self.pos >= entries.len() || entries[self.pos] <= min_entry {
                     let new_block = Self::refresh_block(&self.tree_client, self.remote_cursor).await;
                     *entries = new_block;
                     self.entry = res.clone();
