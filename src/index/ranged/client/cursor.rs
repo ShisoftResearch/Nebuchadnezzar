@@ -1,11 +1,10 @@
-
-use super::super::lsm::service::{EntryKeyBlock, ServCursor};
-use super::super::lsm::service::AsyncServiceClient;
 use super::super::lsm::btree::Ordering;
+use super::super::lsm::service::AsyncServiceClient;
+use super::super::lsm::service::{EntryKeyBlock, ServCursor};
+use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
 use std::mem;
 use std::sync::Arc;
-use crate::index::ranged::client::RangedQueryClient;
 
 pub struct ClientCursor<'a> {
     entry: Option<EntryKey>,
@@ -15,17 +14,17 @@ pub struct ClientCursor<'a> {
     remote_cursor: ServCursor,
     ordering: Ordering,
     tree_boundary: EntryKey,
-    pos: usize
+    pos: usize,
 }
 
-impl <'a>ClientCursor<'a> {
+impl<'a> ClientCursor<'a> {
     pub fn new(
         remote: ServCursor,
         init_entry: EntryKey,
         ordering: Ordering,
         tree_boundary: EntryKey,
         tree_client: Arc<AsyncServiceClient>,
-        query_client: &'a RangedQueryClient
+        query_client: &'a RangedQueryClient,
     ) -> Self {
         Self {
             entry: Some(init_entry),
@@ -44,13 +43,18 @@ impl <'a>ClientCursor<'a> {
             let res;
             if self.entry.is_some() && self.entry_block.is_none() {
                 res = mem::replace(&mut self.entry, None);
-                self.entry_block = Some(Self::refresh_block(&self.tree_client, self.remote_cursor).await);
+                self.entry_block =
+                    Some(Self::refresh_block(&self.tree_client, self.remote_cursor).await);
             } else if let &mut Some(ref mut entries) = &mut self.entry_block {
                 let min_entry: EntryKey = Default::default();
                 if entries[0] <= min_entry {
                     // have empty block will try to reload the cursor from the client for
                     // next key may been placed on another tree
-                    if let Some(new_cursor) = self.query_client.seek(&self.tree_boundary, self.ordering).await {
+                    if let Some(new_cursor) = self
+                        .query_client
+                        .seek(&self.tree_boundary, self.ordering)
+                        .await
+                    {
                         *self = new_cursor;
                         continue;
                     } else {
@@ -63,15 +67,15 @@ impl <'a>ClientCursor<'a> {
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
                 if self.pos >= entries.len() || entries[self.pos] <= min_entry {
-                    let new_block = Self::refresh_block(&self.tree_client, self.remote_cursor).await;
+                    let new_block =
+                        Self::refresh_block(&self.tree_client, self.remote_cursor).await;
                     *entries = new_block;
                     self.entry = res.clone();
                     self.pos = 0;
                 }
-
             } else {
                 unimplemented!();
-            }       
+            }
             return res;
         }
     }
@@ -85,12 +89,19 @@ impl <'a>ClientCursor<'a> {
             if block[self.pos] == min_entry {
                 return None;
             } else {
-                return Some(&block[self.pos])
+                return Some(&block[self.pos]);
             }
         }
     }
 
-    async fn refresh_block(tree_client: &Arc<AsyncServiceClient>, remote_cursor: ServCursor) -> EntryKeyBlock {
-        tree_client.cursor_next(remote_cursor).await.unwrap().unwrap()
+    async fn refresh_block(
+        tree_client: &Arc<AsyncServiceClient>,
+        remote_cursor: ServCursor,
+    ) -> EntryKeyBlock {
+        tree_client
+            .cursor_next(remote_cursor)
+            .await
+            .unwrap()
+            .unwrap()
     }
 }

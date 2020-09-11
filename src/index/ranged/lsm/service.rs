@@ -5,7 +5,9 @@ use super::tree::*;
 use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
+use bifrost::conshash::ConsistentHashing;
 use bifrost::utils::time::get_time;
+use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use lightning::map::Map;
@@ -15,8 +17,6 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Duration;
-use bifrost_plugins::hash_ident;
-use bifrost::conshash::ConsistentHashing;
 
 pub type EntryKeyBlock = [EntryKey; BLOCK_SIZE];
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
@@ -66,7 +66,7 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary);
     rpc insert(id: Id, entry: EntryKey) -> OpResult<()>;
     rpc delete(id: Id, entry: EntryKey) -> OpResult<()>;
-    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16) 
+    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16)
         -> OpResult<(ServCursor, Option<EntryKey>)>;
     rpc renew_cursor(cursor: ServCursor, time: u16) -> bool;
     rpc dispose_cursor(cursor: ServCursor) -> bool;
@@ -170,7 +170,7 @@ impl Service for LSMTreeService {
         future::ready(
             if let Some(cursor) = self.cursors.write(cursor.cursor_id as usize) {
                 let mut cursor_ref = cursor.borrow_mut();
-                Some(entry_block_from_cursor_memo(&mut*cursor_ref))
+                Some(entry_block_from_cursor_memo(&mut *cursor_ref))
             } else {
                 None
             },
@@ -299,10 +299,8 @@ impl DistLSMTree {
 
 impl Boundary {
     pub fn new(lower: EntryKey, upper: EntryKey) -> Self {
-        Boundary {
-            lower, upper
-        }
-    } 
+        Boundary { lower, upper }
+    }
     fn in_boundary(&self, entry: &EntryKey) -> bool {
         return entry >= &self.lower && entry < &self.upper;
     }
@@ -313,13 +311,14 @@ dispatch_rpc_service_functions!(LSMTreeService);
 unsafe impl Send for DistLSMTree {}
 unsafe impl Sync for DistLSMTree {}
 
-
-
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
     AsyncServiceClient::new(DEFAULT_SERVICE_ID, rpc)
 }
 
-pub async fn locate_tree_server_from_conshash(id: &Id, conshash: &Arc<ConsistentHashing>) -> Result<Arc<AsyncServiceClient>, RPCError> {
+pub async fn locate_tree_server_from_conshash(
+    id: &Id,
+    conshash: &Arc<ConsistentHashing>,
+) -> Result<Arc<AsyncServiceClient>, RPCError> {
     let server_id = conshash.get_server_id_by(id).unwrap();
     DEFAULT_CLIENT_POOL
         .get_by_id(server_id, move |sid| conshash.to_server_name(sid))

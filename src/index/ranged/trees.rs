@@ -1,7 +1,7 @@
-use std::fmt::Debug;
-use std::mem;
-use std::iter;
 use itertools::*;
+use std::fmt::Debug;
+use std::iter;
+use std::mem;
 
 pub use crate::index::*;
 
