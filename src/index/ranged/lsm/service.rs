@@ -35,7 +35,7 @@ pub enum OpResult<T> {
     Migrating,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 pub struct ServCursor {
     cursor_id: u64,
 }
@@ -135,7 +135,7 @@ impl Service for LSMTreeService {
             let mut tree_cursor = tree.seek(&entry, ordering);
             let cursor_id = self.cursor_counter.fetch_add(1, Relaxed);
             let expires = get_time() + cursor_lifetime as i64;
-            let entry = tree_cursor.next();
+            let first_entry = tree_cursor.next();
             let cursor_memo = CursorMemo {
                 tree_cursor,
                 expires,
@@ -145,7 +145,7 @@ impl Service for LSMTreeService {
             let cursor = ServCursor {
                 cursor_id: cursor_id as u64,
             };
-            OpResult::Successful((cursor, entry))
+            OpResult::Successful((cursor, first_entry))
         })
     }
 

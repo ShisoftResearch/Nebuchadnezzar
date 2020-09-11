@@ -76,7 +76,7 @@ impl MasterTreeSM {
     }
     async fn load_sub_tree(&self, id: Id, lower: EntryKey, upper: EntryKey) {
         if self.raft_svr.is_leader() {
-            // Only the leader can inisiate the request to load the sub tree
+            // Only the leader can initiate the request to load the sub tree
             let client = self.locate_tree_server(&id).await.unwrap();
             client.load_tree(id, Boundary::new(lower, upper)).await.unwrap()
         } 

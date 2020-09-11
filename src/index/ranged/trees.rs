@@ -87,7 +87,7 @@ fn raw_max_entry_key() -> EntryKey {
 
 #[inline(always)]
 fn raw_min_entry_key() -> EntryKey {
-    smallvec!()
+    Default::default()
 }
 
 #[inline(always)]
