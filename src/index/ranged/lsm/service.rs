@@ -184,7 +184,7 @@ impl LSMTreeService {
     pub fn new(client: &Arc<AsyncClient>, sm_client: &Arc<SMClient>) -> Self {
         let trees_map = Arc::new(HashMap::with_capacity(32));
         super::btree::storage::start_external_nodes_write_back(client);
-        Self::start_tree_balancer(&trees_map, client);
+        Self::start_tree_balancer(&trees_map, client, sm_client);
         Self {
             client: client.clone(),
             cursor_counter: AtomicUsize::new(0),
