@@ -65,7 +65,8 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary);
     rpc insert(id: Id, entry: EntryKey) -> OpResult<()>;
     rpc delete(id: Id, entry: EntryKey) -> OpResult<()>;
-    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16) -> OpResult<ServCursor>;
+    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16) 
+        -> OpResult<(ServCursor, Option<EntryKey>)>;
     rpc renew_cursor(cursor: ServCursor, time: u16) -> bool;
     rpc dispose_cursor(cursor: ServCursor) -> bool;
     rpc cursor_next(cursor: ServCursor) -> Option<EntryKeyBlock>;
@@ -129,20 +130,22 @@ impl Service for LSMTreeService {
         entry: EntryKey,
         ordering: Ordering,
         cursor_lifetime: u16,
-    ) -> BoxFuture<OpResult<ServCursor>> {
+    ) -> BoxFuture<OpResult<(ServCursor, Option<EntryKey>)>> {
         self.apply_in_ranged_tree(id, entry, |entry, tree| {
-            let tree_cursor = tree.seek(&entry, ordering);
+            let mut tree_cursor = tree.seek(&entry, ordering);
             let cursor_id = self.cursor_counter.fetch_add(1, Relaxed);
             let expires = get_time() + cursor_lifetime as i64;
+            let entry = tree_cursor.next();
             let cursor_memo = CursorMemo {
                 tree_cursor,
                 expires,
             };
             self.cursors
                 .insert(&(cursor_id), Arc::new(RefCell::new(cursor_memo)));
-            OpResult::Successful(ServCursor {
+            let cursor = ServCursor {
                 cursor_id: cursor_id as u64,
-            })
+            };
+            OpResult::Successful((cursor, entry))
         })
     }
 
@@ -165,16 +168,8 @@ impl Service for LSMTreeService {
     fn cursor_next(&self, cursor: ServCursor) -> BoxFuture<Option<EntryKeyBlock>> {
         future::ready(
             if let Some(cursor) = self.cursors.write(cursor.cursor_id as usize) {
-                let mut res = EntryKeyBlock::default();
-                let mut cursor_memo = cursor.borrow_mut();
-                for entry in res.iter_mut() {
-                    if let Some(tree_entry) = cursor_memo.tree_cursor.next() {
-                        *entry = tree_entry.clone();
-                    } else {
-                        break;
-                    }
-                }
-                Some(res)
+                let mut cursor_ref = cursor.borrow_mut();
+                Some(entry_block_from_cursor_memo(&mut*cursor_ref))
             } else {
                 None
             },
@@ -277,6 +272,18 @@ impl LSMTreeService {
         })
         .boxed()
     }
+}
+
+fn entry_block_from_cursor_memo(cursor_memo: &mut CursorMemo) -> EntryKeyBlock {
+    let mut res = EntryKeyBlock::default();
+    for entry in res.iter_mut() {
+        if let Some(tree_entry) = cursor_memo.tree_cursor.next() {
+            *entry = tree_entry.clone();
+        } else {
+            break;
+        }
+    }
+    res
 }
 
 impl DistLSMTree {
