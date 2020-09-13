@@ -53,7 +53,7 @@ impl<'a> ClientCursor<'a> {
                     // next key may been placed on another 
                     let replacement = self
                         .query_client
-                        .seek(&self.tree_boundary, self.ordering)
+                        .seek(self.tree_boundary.clone(), self.ordering)
                         .await?;
                     if let Some(new_cursor) = replacement
                     {

@@ -24,14 +24,14 @@ pub struct RangedQueryClient {
 impl RangedQueryClient {
     pub async fn seek<'a>(
         &'a self,
-        key: &'a EntryKey,
+        key: EntryKey,
         ordering: Ordering,
     ) -> Result<Option<cursor::ClientCursor<'a>>, RPCError> {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id| {
                 async move {
-                    client.seek(tree_id, key.clone(), ordering, 160).await
+                    client.seek(tree_id, key, ordering, 160).await
                 }.boxed()
             },
             |action_res, tree_client, lower,  upper| {
@@ -61,7 +61,7 @@ impl RangedQueryClient {
         ).await
     }
 
-    pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
+    pub async fn delete(&self, key: EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id| {
@@ -73,8 +73,8 @@ impl RangedQueryClient {
         ).await
     }
 
-    async fn run_on_destinated_tree<'a, AR, PR, A, P>(&'a self, key: &'a EntryKey, action: A, proc: P) -> Result<PR, RPCError>
-        where A: Fn(&'a EntryKey,  Arc<AsyncServiceClient>, Id) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
+    async fn run_on_destinated_tree<'a, AR, PR, A, P>(&'a self, key: EntryKey, action: A, proc: P) -> Result<PR, RPCError>
+        where A: Fn(EntryKey,  Arc<AsyncServiceClient>, Id) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
               P: Fn(Option<AR>, Arc<AsyncServiceClient>, EntryKey, EntryKey) -> BoxFuture<'a, Option<PR>>
     {
         let mut ensure_updated = false;
@@ -85,8 +85,8 @@ impl RangedQueryClient {
                 return Result::Err(RPCError::IOError(io::Error::new(io::ErrorKind::Other, "Too many retry")));
             }
             let (tree_id, tree_client, lower, upper) =
-                self.locate_key_server(key, ensure_updated).await?;
-            match action(key, tree_client.clone(), tree_id).await?
+                self.locate_key_server(&key, ensure_updated).await?;
+            match action(key.clone(), tree_client.clone(), tree_id).await?
             {
                 OpResult::Successful(res) => {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await {
