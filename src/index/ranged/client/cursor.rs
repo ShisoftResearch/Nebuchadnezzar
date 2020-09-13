@@ -5,6 +5,7 @@ use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
 use std::mem;
 use std::sync::Arc;
+use bifrost::rpc::RPCError;
 
 pub struct ClientCursor<'a> {
     entry: Option<EntryKey>,
@@ -38,27 +39,28 @@ impl<'a> ClientCursor<'a> {
         }
     }
 
-    pub async fn next(&mut self) -> Option<EntryKey> {
+    pub async fn next(&'a mut self) -> Result<Option<EntryKey>, RPCError> {
         loop {
             let res;
             if self.entry.is_some() && self.entry_block.is_none() {
                 res = mem::replace(&mut self.entry, None);
                 self.entry_block =
-                    Some(Self::refresh_block(&self.tree_client, self.remote_cursor).await);
+                    Some(Self::refresh_block(&self.tree_client, self.remote_cursor).await?);
             } else if let &mut Some(ref mut entries) = &mut self.entry_block {
                 let min_entry: EntryKey = Default::default();
                 if entries[0] <= min_entry {
                     // have empty block will try to reload the cursor from the client for
-                    // next key may been placed on another tree
-                    if let Some(new_cursor) = self
+                    // next key may been placed on another 
+                    let replacement = self
                         .query_client
                         .seek(&self.tree_boundary, self.ordering)
-                        .await
+                        .await?;
+                    if let Some(new_cursor) = replacement
                     {
                         *self = new_cursor;
                         continue;
                     } else {
-                        return None;
+                        return Ok(None);
                     }
                 }
                 let old_key = mem::replace(&mut entries[self.pos], smallvec![1]);
@@ -68,7 +70,7 @@ impl<'a> ClientCursor<'a> {
                 // Check if pos is in range and have value. If not, get next block.
                 if self.pos >= entries.len() || entries[self.pos] <= min_entry {
                     let new_block =
-                        Self::refresh_block(&self.tree_client, self.remote_cursor).await;
+                        Self::refresh_block(&self.tree_client, self.remote_cursor).await?;
                     *entries = new_block;
                     self.entry = res.clone();
                     self.pos = 0;
@@ -76,7 +78,7 @@ impl<'a> ClientCursor<'a> {
             } else {
                 unimplemented!();
             }
-            return res;
+            return Ok(res);
         }
     }
 
@@ -97,11 +99,22 @@ impl<'a> ClientCursor<'a> {
     async fn refresh_block(
         tree_client: &Arc<AsyncServiceClient>,
         remote_cursor: ServCursor,
-    ) -> EntryKeyBlock {
-        tree_client
+    ) -> Result<EntryKeyBlock, RPCError> {
+        Ok(
+            tree_client
             .cursor_next(remote_cursor)
-            .await
+            .await?
             .unwrap()
-            .unwrap()
+        )
+    }
+}
+
+impl <'a> Drop for ClientCursor<'a> {
+    fn drop(&mut self) {
+        let tree_client = self.tree_client.clone();
+        let remote_cursor = self.remote_cursor;
+        tokio::spawn( async move {
+            tree_client.dispose_cursor(remote_cursor).await
+        });
     }
 }

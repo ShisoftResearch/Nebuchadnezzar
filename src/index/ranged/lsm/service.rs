@@ -31,7 +31,6 @@ pub struct Boundary {
 #[derive(Clone, Serialize, Deserialize)]
 pub enum OpResult<T> {
     Successful(T),
-    Failed,
     NotFound,
     OutOfBound,
     Migrating,
@@ -65,8 +64,8 @@ pub struct CursorMemo {
 service! {
     rpc crate_tree(id: Id, boundary: Boundary);
     rpc load_tree(id: Id, boundary: Boundary);
-    rpc insert(id: Id, entry: EntryKey) -> OpResult<()>;
-    rpc delete(id: Id, entry: EntryKey) -> OpResult<()>;
+    rpc insert(id: Id, entry: EntryKey) -> OpResult<bool>;
+    rpc delete(id: Id, entry: EntryKey) -> OpResult<bool>;
     rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16)
         -> OpResult<(ServCursor, Option<EntryKey>)>;
     rpc renew_cursor(cursor: ServCursor, time: u16) -> bool;
@@ -106,22 +105,22 @@ impl Service for LSMTreeService {
         .boxed()
     }
 
-    fn insert(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<()>> {
+    fn insert(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<bool>> {
         self.apply_in_ranged_tree(id, entry, |entry, tree| {
             if tree.insert(&entry) {
-                OpResult::Successful(())
+                OpResult::Successful(true)
             } else {
-                OpResult::Failed
+                OpResult::Successful(false)
             }
         })
     }
 
-    fn delete(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<()>> {
+    fn delete(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<bool>> {
         self.apply_in_ranged_tree(id, entry, |entry, tree| {
             if tree.delete(&entry) {
-                OpResult::Successful(())
+                OpResult::Successful(true)
             } else {
-                OpResult::Failed
+                OpResult::Successful(false)
             }
         })
     }
