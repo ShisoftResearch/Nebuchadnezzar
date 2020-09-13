@@ -7,10 +7,10 @@ use std::mem;
 use std::sync::Arc;
 use bifrost::rpc::RPCError;
 
-pub struct ClientCursor<'a> {
+pub struct ClientCursor {
     entry: Option<EntryKey>,
     entry_block: Option<EntryKeyBlock>,
-    query_client: &'a RangedQueryClient,
+    query_client: Arc<RangedQueryClient>,
     tree_client: Arc<AsyncServiceClient>,
     remote_cursor: ServCursor,
     ordering: Ordering,
@@ -18,14 +18,14 @@ pub struct ClientCursor<'a> {
     pos: usize,
 }
 
-impl<'a> ClientCursor<'a> {
+impl ClientCursor {
     pub fn new(
         remote: ServCursor,
         init_entry: EntryKey,
         ordering: Ordering,
         tree_boundary: EntryKey,
         tree_client: Arc<AsyncServiceClient>,
-        query_client: &'a RangedQueryClient,
+        query_client: Arc<RangedQueryClient>,
     ) -> Self {
         Self {
             entry: Some(init_entry),
@@ -39,7 +39,7 @@ impl<'a> ClientCursor<'a> {
         }
     }
 
-    pub async fn next(&'a mut self) -> Result<Option<EntryKey>, RPCError> {
+    pub async fn next(&mut self) -> Result<Option<EntryKey>, RPCError> {
         loop {
             let res;
             if self.entry.is_some() && self.entry_block.is_none() {
@@ -51,10 +51,9 @@ impl<'a> ClientCursor<'a> {
                 if entries[0] <= min_entry {
                     // have empty block will try to reload the cursor from the client for
                     // next key may been placed on another 
-                    let replacement = self
-                        .query_client
-                        .seek(self.tree_boundary.clone(), self.ordering)
-                        .await?;
+                    let replacement = RangedQueryClient::seek(
+                        &self.query_client, &self.tree_boundary, self.ordering
+                    ).await?;
                     if let Some(new_cursor) = replacement
                     {
                         *self = new_cursor;
@@ -109,10 +108,10 @@ impl<'a> ClientCursor<'a> {
     }
 }
 
-impl <'a> Drop for ClientCursor<'a> {
+impl Drop for ClientCursor {
     fn drop(&mut self) {
-        let tree_client = self.tree_client.clone();
         let remote_cursor = self.remote_cursor;
+        let tree_client = self.tree_client.clone();
         tokio::spawn( async move {
             tree_client.dispose_cursor(remote_cursor).await
         });

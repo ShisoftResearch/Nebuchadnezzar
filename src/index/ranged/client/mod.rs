@@ -22,12 +22,12 @@ pub struct RangedQueryClient {
 }
 
 impl RangedQueryClient {
-    pub async fn seek<'a>(
-        &'a self,
-        key: EntryKey,
+    pub async fn seek(
+        self_ref: &Arc<Self>,
+        key: &EntryKey,
         ordering: Ordering,
-    ) -> Result<Option<cursor::ClientCursor<'a>>, RPCError> {
-        self.run_on_destinated_tree(
+    ) -> Result<Option<cursor::ClientCursor>, RPCError> {
+        self_ref.run_on_destinated_tree(
             key,
             |key, client, tree_id| {
                 async move {
@@ -48,7 +48,7 @@ impl RangedQueryClient {
                                 ordering,
                                 tree_boundary,
                                 tree_client,
-                                &self,
+                                self_ref.clone(),
                             )));
                         } else {
                             return Some(None);
@@ -61,7 +61,7 @@ impl RangedQueryClient {
         ).await
     }
 
-    pub async fn delete(&self, key: EntryKey) -> Result<bool, RPCError> {
+    pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id| {
@@ -73,7 +73,7 @@ impl RangedQueryClient {
         ).await
     }
 
-    async fn run_on_destinated_tree<'a, AR, PR, A, P>(&'a self, key: EntryKey, action: A, proc: P) -> Result<PR, RPCError>
+    async fn run_on_destinated_tree<'a, AR, PR, A, P>(&'a self, key: &EntryKey, action: A, proc: P) -> Result<PR, RPCError>
         where A: Fn(EntryKey,  Arc<AsyncServiceClient>, Id) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
               P: Fn(Option<AR>, Arc<AsyncServiceClient>, EntryKey, EntryKey) -> BoxFuture<'a, Option<PR>>
     {

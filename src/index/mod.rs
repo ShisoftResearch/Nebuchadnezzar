@@ -1,6 +1,6 @@
 use dovahkiin::types::custom_types::id::Id;
-use smallvec::SmallVec;
 use std::io::Cursor as StdCursor;
+use smallvec::SmallVec; 
 
 #[macro_use]
 mod macros;
