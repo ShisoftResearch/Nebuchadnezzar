@@ -3,9 +3,9 @@ use super::super::lsm::service::AsyncServiceClient;
 use super::super::lsm::service::{EntryKeyBlock, ServCursor};
 use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
+use bifrost::rpc::RPCError;
 use std::mem;
 use std::sync::Arc;
-use bifrost::rpc::RPCError;
 
 pub struct ClientCursor {
     entry: Option<EntryKey>,
@@ -50,12 +50,14 @@ impl ClientCursor {
                 let min_entry: EntryKey = Default::default();
                 if entries[0] <= min_entry {
                     // have empty block will try to reload the cursor from the client for
-                    // next key may been placed on another 
+                    // next key may been placed on another
                     let replacement = RangedQueryClient::seek(
-                        &self.query_client, &self.tree_boundary, self.ordering
-                    ).await?;
-                    if let Some(new_cursor) = replacement
-                    {
+                        &self.query_client,
+                        &self.tree_boundary,
+                        self.ordering,
+                    )
+                    .await?;
+                    if let Some(new_cursor) = replacement {
                         *self = new_cursor;
                         continue;
                     } else {
@@ -99,12 +101,7 @@ impl ClientCursor {
         tree_client: &Arc<AsyncServiceClient>,
         remote_cursor: ServCursor,
     ) -> Result<EntryKeyBlock, RPCError> {
-        Ok(
-            tree_client
-            .cursor_next(remote_cursor)
-            .await?
-            .unwrap()
-        )
+        Ok(tree_client.cursor_next(remote_cursor).await?.unwrap())
     }
 }
 
@@ -112,8 +109,6 @@ impl Drop for ClientCursor {
     fn drop(&mut self) {
         let remote_cursor = self.remote_cursor;
         let tree_client = self.tree_client.clone();
-        tokio::spawn( async move {
-            tree_client.dispose_cursor(remote_cursor).await
-        });
+        tokio::spawn(async move { tree_client.dispose_cursor(remote_cursor).await });
     }
 }

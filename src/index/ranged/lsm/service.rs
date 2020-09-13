@@ -1,8 +1,8 @@
+use super::super::sm::client::SMClient;
 use super::super::trees::*;
 use super::btree::level::LEVEL_M as BLOCK_SIZE;
 use super::btree::storage;
 use super::tree::*;
-use super::super::sm::client::SMClient;
 use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
@@ -232,7 +232,10 @@ impl LSMTreeService {
                             }
                         }
                         storage::wait_until_updated().await;
-                        sm_client.split(&migration_target_id, &mid_key).await.unwrap();
+                        sm_client
+                            .split(&migration_target_id, &mid_key)
+                            .await
+                            .unwrap();
                         // Reset state on current tree
                         tree.mark_migration(&dist_tree.id, None, &client).await;
                         {
