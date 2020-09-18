@@ -71,6 +71,7 @@ impl RangedQueryClient {
         .await
     }
 
+    #[inline(always)]
     async fn run_on_destinated_tree<'a, AR, PR, A, P>(
         &'a self,
         key: &EntryKey,

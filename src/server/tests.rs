@@ -15,8 +15,7 @@ extern crate test;
 
 const DATA: &'static str = "DATA";
 
-#[allow(dead_code)]
-async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
+pub async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
     let _ = env_logger::try_init();
     let server_addr = String::from(format!("127.0.0.1:{}", port));
     let server_group = String::from("bench_test");
@@ -26,7 +25,7 @@ async fn init_service(port: usize) -> (Arc<NebServer>, Arc<AsyncClient>, u32) {
             memory_size: 512 * 1024 * 1024,
             backup_storage: Some(format!("test-data/{}-bak", port)),
             wal_storage: Some(format!("test-data/{}-wal", port)),
-            services: vec![Service::Cell, Service::Transaction, Service::LSMTreeIndex],
+            services: vec![Service::Cell, Service::Transaction, Service::RangedIndexer],
         },
         &server_addr,
         &server_group,

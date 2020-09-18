@@ -8,9 +8,12 @@ use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost::rpc::RPCError;
 use bifrost::utils;
+use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
 
 pub struct MasterTreeSM {
     tree: BTreeMap<EntryKey, Id>,

@@ -19,6 +19,7 @@ use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
+use crate::index::ranged;
 use std::io;
 use std::sync::Arc;
 
@@ -54,7 +55,7 @@ pub struct ServerOptions {
 pub enum Service {
     Cell,
     Transaction,
-    LSMTreeIndex,
+    RangedIndexer,
 }
 
 pub struct ServerMeta {
@@ -150,7 +151,7 @@ impl NebServer {
             raft_service: raft_service.clone(),
             server_id: rpc_server.server_id,
         });
-        let _client = Arc::new(
+        let client = Arc::new(
             client::AsyncClient::new(&server.rpc, membership_client, &meta_members, group_name)
                 .await
                 .unwrap(),
@@ -159,16 +160,14 @@ impl NebServer {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
                 &Service::Transaction => init_txn_service(rpc_server, &server).await,
-                &Service::LSMTreeIndex => {
-                    unimplemented!()
-                    // init_lsm_tree_index_service(
-                    //     rpc_server,
-                    //     &server,
-                    //     &client,
-                    //     raft_service,
-                    //     raft_client,
-                    //     &conshasing,
-                    // ).await
+                &Service::RangedIndexer => {
+                    init_ranged_indexer_service(
+                        rpc_server,
+                        &client,
+                        raft_service,
+                        raft_client,
+                        &conshasing,
+                    ).await
                 }
             }
         }
@@ -333,21 +332,21 @@ pub async fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServ
         .await;
 }
 
-// pub async fn init_lsm_tree_index_service(
-//     rpc_server: &Arc<Server>,
-//     neb_server: &Arc<NebServer>,
-//     neb_client: &Arc<AsyncClient>,
-//     raft_svr: &Arc<raft::RaftService>,
-//     raft_client: &Arc<RaftClient>,
-//     cons_hash: &Arc<ConsistentHashing>,
-// ) {
-//     raft_svr.register_state_machine(box lsmtree::placement::sm::PlacementSM::new(cons_hash)).await;
-//     let sm_client = Arc::new(lsmtree::placement::sm::client::SMClient::new(
-//         lsmtree::placement::sm::SM_ID,
-//         raft_client,
-//     ));
-//     rpc_server.register_service(
-//         lsmtree::service::DEFAULT_SERVICE_ID,
-//         &lsmtree::service::LSMTreeService::new(neb_server, neb_client, &sm_client).await,
-//     ).await;
-// }
+pub async fn init_ranged_indexer_service(
+    rpc_server: &Arc<Server>,
+    neb_client: &Arc<AsyncClient>,
+    raft_svr: &Arc<raft::RaftService>,
+    raft_client: &Arc<RaftClient>,
+    cons_hash: &Arc<ConsistentHashing>,
+) {
+    let tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID).await;
+    raft_svr.register_state_machine(box tree_sm).await;
+    let sm_client = Arc::new(ranged::sm::client::SMClient::new(
+        ranged::sm::DEFAULT_SM_ID,
+        raft_client,
+    ));
+    rpc_server.register_service(
+        ranged::lsm::service::DEFAULT_SERVICE_ID,
+        &Arc::new(ranged::lsm::service::LSMTreeService::new(neb_client, &sm_client)),
+    ).await;
+}
