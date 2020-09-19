@@ -8,9 +8,12 @@ use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
+use itertools::Itertools;
 use std::cell::Cell as StdCell;
 use std::io;
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::mem;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
@@ -73,7 +76,10 @@ impl AsyncClient {
             Err(err) => Err(NebClientError::RaftClientError(err)),
         }
     }
-    pub async fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
+    pub fn locate_server_id(&self, id: &Id) -> Result<u64, RPCError> {
+        if id.is_unit_id() {
+            return Ok(0);
+        }
         match self.conshash.get_server_id(id.higher) {
             Some(n) => Ok(n),
             None => Err(RPCError::IOError(io::Error::new(
@@ -98,13 +104,48 @@ impl AsyncClient {
         &self,
         id: Id,
     ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        let server_id = self.locate_server_id(&id).await.unwrap();
+        let server_id = self.locate_server_id(&id).unwrap();
         self.client_by_server_id(server_id).await
     }
 
     pub async fn read_cell(&self, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         client.read_cell(id).await
+    }
+    pub async fn read_all_cells(&self, ids: Vec<Id>) -> Result<Vec<Result<Cell, ReadError>>, RPCError> {
+        let mut cells_by_client = ids
+            .iter()
+            .dedup()
+            .group_by(|id| self.locate_server_id(&id).unwrap())
+            .into_iter()
+            .map(|(server_id, ids)| (server_id, ids.map(|id| *id).collect_vec()))
+            .map(|(server_id, ids)| { 
+                async move {
+                    if server_id > 0 {
+                        let client = self.client_by_server_id(server_id).await.unwrap();
+                        (client.read_all_cells(ids.clone()).await, ids)
+                    } else {
+                        (Ok(vec![Err(ReadError::CellIdIsUnitId)]), vec![Id::unit_id()])
+                    }
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+        let mut id_cell_map = HashMap::new();
+        while let Some((cells, ids)) = cells_by_client.next().await {
+            let cells = cells?;
+            for (id, cell) in ids.into_iter().zip(cells) {
+                id_cell_map.insert(id, Some(cell));
+            }
+        }
+        Ok(
+            ids.iter()
+            .map(|id| {
+                // Use mem::replace to avoid additional cost when hash map shriking by remove
+                let id_ref = id_cell_map.get_mut(id).unwrap();
+                mem::replace(id_ref, None).unwrap()
+            })
+            .collect()
+        )
     }
     pub async fn write_cell(&self, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;

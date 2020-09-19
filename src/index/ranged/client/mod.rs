@@ -3,6 +3,7 @@ use super::lsm::service::*;
 use super::sm::client::SMClient;
 use crate::index::EntryKey;
 use crate::ram::types::Id;
+use crate::client::AsyncClient;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::RPCError;
 use futures::future::BoxFuture;
@@ -19,6 +20,7 @@ pub struct RangedQueryClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
     placement: RwLock<BTreeMap<EntryKey, (Id, EntryKey)>>,
+    neb_client: Arc<AsyncClient>
 }
 
 impl RangedQueryClient {
@@ -35,22 +37,23 @@ impl RangedQueryClient {
                 },
                 |action_res, tree_client, lower, upper| {
                     async move {
-                        if let Some((cursor, init_entry)) = action_res {
+                        if let Some((cursor, init_id)) = action_res {
                             let tree_boundary = match ordering {
                                 Ordering::Forward => upper,
                                 Ordering::Backward => lower,
                             };
-                            if let Some(init_entry) = init_entry {
-                                return Some(Some(cursor::ClientCursor::new(
+                            if let Some(init_id) = init_id {
+                                let init_cell = self_ref.neb_client.read_cell(init_id).await?.unwrap();
+                                return Ok(Some(Some(cursor::ClientCursor::new(
                                     cursor,
-                                    init_entry,
+                                    init_cell,
                                     ordering,
                                     tree_boundary,
                                     tree_client,
                                     self_ref.clone(),
-                                )));
+                                ))));
                             } else {
-                                return Some(None);
+                                return Ok(Some(None));
                             }
                         } else {
                             unreachable!()
@@ -66,7 +69,7 @@ impl RangedQueryClient {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id| async move { client.delete(tree_id, key.clone()).await }.boxed(),
-            |action_res, _, _, _| future::ready(action_res).boxed(),
+            |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
         .await
     }
@@ -84,7 +87,7 @@ impl RangedQueryClient {
             Arc<AsyncServiceClient>,
             Id,
         ) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
-        P: Fn(Option<AR>, Arc<AsyncServiceClient>, EntryKey, EntryKey) -> BoxFuture<'a, Option<PR>>,
+        P: Fn(Option<AR>, Arc<AsyncServiceClient>, EntryKey, EntryKey) -> BoxFuture<'a, Result<Option<PR>, RPCError>>,
     {
         let mut ensure_updated = false;
         let mut retried: i32 = 0;
@@ -100,7 +103,7 @@ impl RangedQueryClient {
                 self.locate_key_server(&key, ensure_updated).await?;
             match action(key.clone(), tree_client.clone(), tree_id).await? {
                 OpResult::Successful(res) => {
-                    if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await {
+                    if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
                     }
                 }

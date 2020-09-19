@@ -1,15 +1,25 @@
 use super::super::lsm::btree::Ordering;
-use super::super::lsm::service::AsyncServiceClient;
-use super::super::lsm::service::{EntryKeyBlock, ServCursor};
+use super::super::lsm::service::*;
 use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
+use crate::ram::cell::Cell;
+use crate::client::AsyncClient;
+use crate::ram::cell::ReadError;
 use bifrost::rpc::RPCError;
 use std::mem;
 use std::sync::Arc;
 
+type CellBlock = Vec<CellSlot>;
+
+enum CellSlot {
+    Some(Cell),
+    None,
+    Taken
+}
+
 pub struct ClientCursor {
-    entry: Option<EntryKey>,
-    entry_block: Option<EntryKeyBlock>,
+    cell: Option<Cell>,
+    cell_block: Option<CellBlock>,
     query_client: Arc<RangedQueryClient>,
     tree_client: Arc<AsyncServiceClient>,
     remote_cursor: ServCursor,
@@ -21,34 +31,33 @@ pub struct ClientCursor {
 impl ClientCursor {
     pub fn new(
         remote: ServCursor,
-        init_entry: EntryKey,
+        init_cell: Cell,
         ordering: Ordering,
         tree_boundary: EntryKey,
         tree_client: Arc<AsyncServiceClient>,
         query_client: Arc<RangedQueryClient>,
     ) -> Self {
         Self {
-            entry: Some(init_entry),
+            cell: Some(init_cell),
             remote_cursor: remote,
             tree_client,
             query_client,
-            entry_block: None,
+            cell_block: None,
             tree_boundary,
             ordering,
             pos: 0,
         }
     }
 
-    pub async fn next(&mut self) -> Result<Option<EntryKey>, RPCError> {
+    pub async fn next(&mut self) -> Result<Option<Cell>, RPCError> {
         loop {
             let res;
-            if self.entry.is_some() && self.entry_block.is_none() {
-                res = mem::replace(&mut self.entry, None);
-                self.entry_block =
-                    Some(Self::refresh_block(&self.tree_client, self.remote_cursor).await?);
-            } else if let &mut Some(ref mut entries) = &mut self.entry_block {
-                let min_entry: EntryKey = Default::default();
-                if entries[0] <= min_entry {
+            if self.cell.is_some() && self.cell_block.is_none() {
+                res = mem::replace(&mut self.cell, None);
+                let cells = Self::refresh_block(&self.tree_client, &self.query_client.neb_client, self.remote_cursor).await?;
+                self.cell_block = Some(cells);
+            } else if let &mut Some(ref mut cells) = &mut self.cell_block {
+                if cells[0].is_none() {
                     // have empty block will try to reload the cursor from the client for
                     // next key may been placed on another
                     let replacement = RangedQueryClient::seek(
@@ -64,16 +73,15 @@ impl ClientCursor {
                         return Ok(None);
                     }
                 }
-                let old_key = mem::replace(&mut entries[self.pos], smallvec![1]);
-                debug_assert!(old_key > min_entry);
-                res = Some(old_key);
+                let old_cell = mem::replace(&mut cells[self.pos], CellSlot::Taken);
+                res = Some(old_cell.get_in());
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
-                if self.pos >= entries.len() || entries[self.pos] <= min_entry {
-                    let new_block =
-                        Self::refresh_block(&self.tree_client, self.remote_cursor).await?;
-                    *entries = new_block;
-                    self.entry = res.clone();
+                if self.pos >= cells.len() || cells[self.pos].is_none() {
+                    let new_cells =
+                        Self::refresh_block(&self.tree_client, &self.query_client.neb_client, self.remote_cursor).await?;
+                    *cells = new_cells;
+                    self.cell = None;
                     self.pos = 0;
                 }
             } else {
@@ -83,25 +91,33 @@ impl ClientCursor {
         }
     }
 
-    pub fn current(&self) -> Option<&EntryKey> {
-        if self.entry.is_some() {
-            self.entry.as_ref()
+    pub fn current(&self) -> Option<&Cell> {
+        if self.cell.is_some() {
+            self.cell.as_ref()
         } else {
-            let min_entry: EntryKey = Default::default();
-            let block = self.entry_block.as_ref().unwrap();
-            if block[self.pos] == min_entry {
-                return None;
-            } else {
-                return Some(&block[self.pos]);
-            }
+            self.cell_block.as_ref().unwrap()[self.pos].borrow_into()
         }
     }
 
     async fn refresh_block(
         tree_client: &Arc<AsyncServiceClient>,
+        neb_client: &Arc<AsyncClient>,
         remote_cursor: ServCursor,
-    ) -> Result<EntryKeyBlock, RPCError> {
-        Ok(tree_client.cursor_next(remote_cursor).await?.unwrap())
+    ) -> Result<CellBlock, RPCError> {
+        let cell_ids = tree_client.cursor_next(remote_cursor).await?.unwrap();
+        let cells = neb_client
+            .read_all_cells(Vec::from(cell_ids))
+            .await?
+            .into_iter()
+            .map(|cell_res| {
+                match cell_res {
+                    Ok(cell) => CellSlot::Some(cell),
+                    Err(ReadError::CellIdIsUnitId) => CellSlot::None,
+                    Err(e) => panic!("{:?}", e),
+                }
+            })
+            .collect();
+        Ok(cells)
     }
 }
 
@@ -110,5 +126,27 @@ impl Drop for ClientCursor {
         let remote_cursor = self.remote_cursor;
         let tree_client = self.tree_client.clone();
         tokio::spawn(async move { tree_client.dispose_cursor(remote_cursor).await });
+    }
+}
+
+impl CellSlot {
+    fn is_none(&self) -> bool {
+        match self {
+            CellSlot::None => true,
+            _ => false,
+        }
+    }
+    fn get_in(self) -> Cell {
+        match self {
+            CellSlot::Some(cell) => cell,
+            _ => unreachable!(),
+        }
+    }
+    fn borrow_into(&self) -> Option<&Cell> {
+        match self {
+            CellSlot::Some(cell) => Some(cell),
+            CellSlot::None => None,
+            CellSlot::Taken => unreachable!(),
+        }
     }
 }
