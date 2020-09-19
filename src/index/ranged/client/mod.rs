@@ -1,9 +1,9 @@
 use super::lsm::btree::Ordering;
 use super::lsm::service::*;
 use super::sm::client::SMClient;
+use crate::client::AsyncClient;
 use crate::index::EntryKey;
 use crate::ram::types::Id;
-use crate::client::AsyncClient;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::RPCError;
 use futures::future::BoxFuture;
@@ -20,7 +20,7 @@ pub struct RangedQueryClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
     placement: RwLock<BTreeMap<EntryKey, (Id, EntryKey)>>,
-    neb_client: Arc<AsyncClient>
+    neb_client: Arc<AsyncClient>,
 }
 
 impl RangedQueryClient {
@@ -43,7 +43,8 @@ impl RangedQueryClient {
                                 Ordering::Backward => lower,
                             };
                             if let Some(init_id) = init_id {
-                                let init_cell = self_ref.neb_client.read_cell(init_id).await?.unwrap();
+                                let init_cell =
+                                    self_ref.neb_client.read_cell(init_id).await?.unwrap();
                                 return Ok(Some(Some(cursor::ClientCursor::new(
                                     cursor,
                                     init_cell,
@@ -87,7 +88,12 @@ impl RangedQueryClient {
             Arc<AsyncServiceClient>,
             Id,
         ) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
-        P: Fn(Option<AR>, Arc<AsyncServiceClient>, EntryKey, EntryKey) -> BoxFuture<'a, Result<Option<PR>, RPCError>>,
+        P: Fn(
+            Option<AR>,
+            Arc<AsyncServiceClient>,
+            EntryKey,
+            EntryKey,
+        ) -> BoxFuture<'a, Result<Option<PR>, RPCError>>,
     {
         let mut ensure_updated = false;
         let mut retried: i32 = 0;

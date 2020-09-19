@@ -10,10 +10,10 @@ use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
 use itertools::Itertools;
 use std::cell::Cell as StdCell;
-use std::io;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::io;
 use std::mem;
+use std::sync::Arc;
 
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
@@ -112,21 +112,25 @@ impl AsyncClient {
         let client = self.locate_plain_server(id).await?;
         client.read_cell(id).await
     }
-    pub async fn read_all_cells(&self, ids: Vec<Id>) -> Result<Vec<Result<Cell, ReadError>>, RPCError> {
+    pub async fn read_all_cells(
+        &self,
+        ids: Vec<Id>,
+    ) -> Result<Vec<Result<Cell, ReadError>>, RPCError> {
         let mut cells_by_client = ids
             .iter()
             .dedup()
             .group_by(|id| self.locate_server_id(&id).unwrap())
             .into_iter()
             .map(|(server_id, ids)| (server_id, ids.map(|id| *id).collect_vec()))
-            .map(|(server_id, ids)| { 
-                async move {
-                    if server_id > 0 {
-                        let client = self.client_by_server_id(server_id).await.unwrap();
-                        (client.read_all_cells(ids.clone()).await, ids)
-                    } else {
-                        (Ok(vec![Err(ReadError::CellIdIsUnitId)]), vec![Id::unit_id()])
-                    }
+            .map(|(server_id, ids)| async move {
+                if server_id > 0 {
+                    let client = self.client_by_server_id(server_id).await.unwrap();
+                    (client.read_all_cells(ids.clone()).await, ids)
+                } else {
+                    (
+                        Ok(vec![Err(ReadError::CellIdIsUnitId)]),
+                        vec![Id::unit_id()],
+                    )
                 }
             })
             .collect::<FuturesUnordered<_>>();
@@ -137,15 +141,14 @@ impl AsyncClient {
                 id_cell_map.insert(id, Some(cell));
             }
         }
-        Ok(
-            ids.iter()
+        Ok(ids
+            .iter()
             .map(|id| {
                 // Use mem::replace to avoid additional cost when hash map shriking by remove
                 let id_ref = id_cell_map.get_mut(id).unwrap();
                 mem::replace(id_ref, None).unwrap()
             })
-            .collect()
-        )
+            .collect())
     }
     pub async fn write_cell(&self, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;

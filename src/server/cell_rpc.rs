@@ -27,8 +27,13 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<Result<Cell, ReadError>> {
         future::ready(self.server.chunks.read_cell(&key)).boxed()
     }
-    fn read_all_cells(&self, keys: Vec<Id>) -> BoxFuture<Vec<Result<Cell, ReadError>>>{
-        future::ready(keys.into_iter().map(|id| self.server.chunks.read_cell(&id)).collect()).boxed()
+    fn read_all_cells(&self, keys: Vec<Id>) -> BoxFuture<Vec<Result<Cell, ReadError>>> {
+        future::ready(
+            keys.into_iter()
+                .map(|id| self.server.chunks.read_cell(&id))
+                .collect(),
+        )
+        .boxed()
     }
     fn write_cell(&self, mut cell: Cell) -> BoxFuture<Result<CellHeader, WriteError>> {
         future::ready(self.server.chunks.write_cell(&mut cell)).boxed()

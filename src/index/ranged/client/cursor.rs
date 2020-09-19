@@ -1,9 +1,9 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
+use crate::client::AsyncClient;
 use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
-use crate::client::AsyncClient;
 use crate::ram::cell::ReadError;
 use bifrost::rpc::RPCError;
 use std::mem;
@@ -14,7 +14,7 @@ type CellBlock = Vec<CellSlot>;
 enum CellSlot {
     Some(Cell),
     None,
-    Taken
+    Taken,
 }
 
 pub struct ClientCursor {
@@ -54,7 +54,12 @@ impl ClientCursor {
             let res;
             if self.cell.is_some() && self.cell_block.is_none() {
                 res = mem::replace(&mut self.cell, None);
-                let cells = Self::refresh_block(&self.tree_client, &self.query_client.neb_client, self.remote_cursor).await?;
+                let cells = Self::refresh_block(
+                    &self.tree_client,
+                    &self.query_client.neb_client,
+                    self.remote_cursor,
+                )
+                .await?;
                 self.cell_block = Some(cells);
             } else if let &mut Some(ref mut cells) = &mut self.cell_block {
                 if cells[0].is_none() {
@@ -78,9 +83,12 @@ impl ClientCursor {
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
                 if self.pos >= cells.len() || cells[self.pos].is_none() {
-                    let new_cells =
-                        Self::refresh_block(&self.tree_client, &self.query_client.neb_client, self.remote_cursor).await?;
-                    *cells = new_cells;
+                    *cells = Self::refresh_block(
+                        &self.tree_client,
+                        &self.query_client.neb_client,
+                        self.remote_cursor,
+                    )
+                    .await?;
                     self.cell = None;
                     self.pos = 0;
                 }
@@ -109,12 +117,10 @@ impl ClientCursor {
             .read_all_cells(Vec::from(cell_ids))
             .await?
             .into_iter()
-            .map(|cell_res| {
-                match cell_res {
-                    Ok(cell) => CellSlot::Some(cell),
-                    Err(ReadError::CellIdIsUnitId) => CellSlot::None,
-                    Err(e) => panic!("{:?}", e),
-                }
+            .map(|cell_res| match cell_res {
+                Ok(cell) => CellSlot::Some(cell),
+                Err(ReadError::CellIdIsUnitId) => CellSlot::None,
+                Err(e) => panic!("{:?}", e),
             })
             .collect();
         Ok(cells)

@@ -8,7 +8,5 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialization() {
-
-    }
+    fn initialization() {}
 }

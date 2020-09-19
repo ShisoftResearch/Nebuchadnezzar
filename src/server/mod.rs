@@ -14,12 +14,12 @@ use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
 // use crate::index::lsmtree;
+use crate::index::ranged;
 use crate::ram::chunk::Chunks;
 use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
-use crate::index::ranged;
 use std::io;
 use std::sync::Arc;
 
@@ -167,7 +167,8 @@ impl NebServer {
                         raft_service,
                         raft_client,
                         &conshasing,
-                    ).await
+                    )
+                    .await
                 }
             }
         }
@@ -339,14 +340,19 @@ pub async fn init_ranged_indexer_service(
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
 ) {
-    let tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID).await;
+    let tree_sm =
+        ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID).await;
     raft_svr.register_state_machine(box tree_sm).await;
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
         ranged::sm::DEFAULT_SM_ID,
         raft_client,
     ));
-    rpc_server.register_service(
-        ranged::lsm::service::DEFAULT_SERVICE_ID,
-        &Arc::new(ranged::lsm::service::LSMTreeService::new(neb_client, &sm_client)),
-    ).await;
+    rpc_server
+        .register_service(
+            ranged::lsm::service::DEFAULT_SERVICE_ID,
+            &Arc::new(ranged::lsm::service::LSMTreeService::new(
+                neb_client, &sm_client,
+            )),
+        )
+        .await;
 }
