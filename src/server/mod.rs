@@ -343,7 +343,10 @@ pub async fn init_ranged_indexer_service(
     cons_hash: &Arc<ConsistentHashing>,
 ) {
     // TODO: create the schema only when it does not exists
-    let _ = neb_client.new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone()).await.unwrap();
+    let _ = neb_client
+        .new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone())
+        .await
+        .unwrap();
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
         ranged::sm::DEFAULT_SM_ID,
         raft_client,
@@ -356,8 +359,7 @@ pub async fn init_ranged_indexer_service(
             )),
         )
         .await;
-        let mut tree_sm =
-            ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID);
-        tree_sm.try_initialize().await;
-        raft_svr.register_state_machine(box tree_sm).await;
+    let mut tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID);
+    tree_sm.try_initialize().await;
+    raft_svr.register_state_machine(box tree_sm).await;
 }

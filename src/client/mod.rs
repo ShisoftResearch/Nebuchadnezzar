@@ -94,9 +94,7 @@ impl AsyncClient {
         server_id: u64,
     ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
         DEFAULT_CLIENT_POOL
-            .get_by_id(server_id, move |sid| {
-                self.conshash.to_server_name(sid)
-            })
+            .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid))
             .await
             .map_err(|e| RPCError::IOError(e))
             .map(|c| client_by_rpc_client(&c))

@@ -6,9 +6,9 @@ mod trees;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::*;
     use crate::client::*;
     use crate::ram::schema::*;
+    use crate::server::*;
     use std::sync::Arc;
 
     #[tokio::test(threaded_scheduler)]
@@ -37,11 +37,8 @@ mod tests {
             .await
             .unwrap(),
         );
-        let index_client = client::RangedQueryClient::new(
-            &server.consh, 
-            &server.raft_client, 
-            &client
-        ).await;
+        let index_client =
+            client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await;
         // index_client.insert()
     }
 }

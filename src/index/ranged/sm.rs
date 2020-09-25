@@ -69,11 +69,7 @@ impl StateMachineCtl for MasterTreeSM {
 }
 
 impl MasterTreeSM {
-    pub fn new(
-        raft_svr: &Arc<RaftService>,
-        conshash: &Arc<ConsistentHashing>,
-        sm_id: u64,
-    ) -> Self {
+    pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>, sm_id: u64) -> Self {
         Self {
             tree: BTreeMap::new(),
             raft_svr: raft_svr.clone(),
