@@ -236,7 +236,7 @@ pub async fn smoke_test() {
     for i in 0..num {
         let client_clone = client.clone();
         // intense upsert, half delete
-        let id = Id::new(0, i / 2);
+        let id = Id::new(1, i / 2);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
@@ -252,7 +252,7 @@ pub async fn smoke_test() {
     }
 
     for i in 0..num {
-        let id = Id::new(0, i);
+        let id = Id::new(1, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
@@ -341,7 +341,7 @@ pub async fn smoke_test_parallel() {
     for i in 0..num {
         let client_clone = client.clone();
         // intense upsert, half delete
-        let id = Id::new(0, i);
+        let id = Id::new(1, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i);
         let cell = Cell::new_with_id(schema_id, &id, value);
@@ -360,7 +360,7 @@ pub async fn smoke_test_parallel() {
         if i % 2 == 0 {
             return;
         }
-        let id = Id::new(0, i);
+        let id = Id::new(1, i);
         let mut value = Value::Map(Map::new());
         value[DATA] = Value::U64(i * 2);
         let cell = Cell::new_with_id(schema_id, &id, value);
