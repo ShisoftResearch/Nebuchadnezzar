@@ -71,6 +71,7 @@ pub struct NebServer {
     pub member_pool: rpc::ClientPool,
     pub txn_peer: Peer,
     pub raft_service: Arc<raft::RaftService>,
+    pub raft_client: Arc<RaftClient>,
     pub server_id: u64,
     pub cleaner: Cleaner,
 }
@@ -149,6 +150,7 @@ impl NebServer {
             member_pool: rpc::ClientPool::new(),
             txn_peer: Peer::new(server_addr),
             raft_service: raft_service.clone(),
+            raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
         });
         let client = Arc::new(
@@ -340,9 +342,8 @@ pub async fn init_ranged_indexer_service(
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
 ) {
-    let tree_sm =
-        ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID).await;
-    raft_svr.register_state_machine(box tree_sm).await;
+    // TODO: create the schema only when it does not exists
+    let _ = neb_client.new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone()).await.unwrap();
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
         ranged::sm::DEFAULT_SM_ID,
         raft_client,
@@ -355,4 +356,8 @@ pub async fn init_ranged_indexer_service(
             )),
         )
         .await;
+        let mut tree_sm =
+            ranged::sm::MasterTreeSM::new(raft_svr, cons_hash, ranged::sm::DEFAULT_SM_ID);
+        tree_sm.try_initialize().await;
+        raft_svr.register_state_machine(box tree_sm).await;
 }

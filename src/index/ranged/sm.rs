@@ -69,26 +69,28 @@ impl StateMachineCtl for MasterTreeSM {
 }
 
 impl MasterTreeSM {
-    pub async fn new(
+    pub fn new(
         raft_svr: &Arc<RaftService>,
         conshash: &Arc<ConsistentHashing>,
         sm_id: u64,
     ) -> Self {
-        let mut tree = BTreeMap::new();
+        Self {
+            tree: BTreeMap::new(),
+            raft_svr: raft_svr.clone(),
+            conshash: conshash.clone(),
+            sm_id,
+        }
+    }
+    pub async fn try_initialize(&mut self) -> bool {
         let genesis_id = Id::rand();
-        tree.insert(min_entry_key(), genesis_id);
-        locate_tree_server_from_conshash(&genesis_id, conshash)
+        self.tree.insert(min_entry_key(), genesis_id);
+        locate_tree_server_from_conshash(&genesis_id, &self.conshash)
             .await
             .unwrap()
             .crate_tree(genesis_id, Boundary::new(min_entry_key(), max_entry_key()))
             .await
             .unwrap();
-        Self {
-            tree,
-            raft_svr: raft_svr.clone(),
-            conshash: conshash.clone(),
-            sm_id,
-        }
+        true
     }
     async fn load_sub_tree(&self, id: Id, lower: EntryKey, upper: EntryKey) {
         if self.raft_svr.is_leader() {

@@ -6,6 +6,7 @@ use crate::index::EntryKey;
 use crate::ram::types::Id;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::RPCError;
+use bifrost::raft::client::RaftClient;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use parking_lot::RwLock;
@@ -24,6 +25,20 @@ pub struct RangedQueryClient {
 }
 
 impl RangedQueryClient {
+    pub async fn new(
+        conshash: &Arc<ConsistentHashing>, 
+        raft_client: &Arc<RaftClient>,
+        neb_client: &Arc<AsyncClient>,
+    ) -> Self {
+        let sm = SMClient::new(DEFAULT_SERVICE_ID, raft_client);
+        Self {
+            conshash: conshash.clone(),
+            sm: Arc::new(sm),
+            neb_client: neb_client.clone(),
+            placement: RwLock::new(BTreeMap::new())
+        }
+    }
+
     pub async fn seek(
         self_ref: &Arc<Self>,
         key: &EntryKey,
@@ -71,6 +86,15 @@ impl RangedQueryClient {
             key,
             |key, client, tree_id| async move { client.delete(tree_id, key.clone()).await }.boxed(),
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
+        )
+        .await
+    }
+
+    pub async fn insert(&self, key: &EntryKey) -> Result<bool, RPCError> {
+        self.run_on_destinated_tree(
+            key,
+            |key, client,  tree_id, | async move { client.insert(tree_id, key.clone()).await }.boxed(),
+            |action_res, _, _, _| future::ready(Ok(action_res)).boxed()
         )
         .await
     }
