@@ -7,9 +7,11 @@ mod trees;
 mod tests {
     use super::*;
     use crate::client::*;
-    use crate::ram::schema::*;
     use crate::server::*;
     use std::sync::Arc;
+    use crate::index::EntryKey;
+    use crate::index::ranged::lsm::btree;
+    use crate::ram::types::Id;
 
     #[tokio::test(threaded_scheduler)]
     async fn general() {
@@ -39,6 +41,11 @@ mod tests {
         );
         let index_client =
             client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await;
-        // index_client.insert()
+        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * 8;
+        for i in 0..test_capacity {
+            let id = Id::new(1, i as u64);
+            let key = EntryKey::from_id(&id);
+            assert!(index_client.insert(&key).await.unwrap());
+        }
     }
 }

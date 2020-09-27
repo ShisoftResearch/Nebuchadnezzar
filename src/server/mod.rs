@@ -342,6 +342,7 @@ pub async fn init_ranged_indexer_service(
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
 ) {
+    info!("Initializing range indexer service");
     // TODO: create the schema only when it does not exists
     let _ = neb_client
         .new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone())

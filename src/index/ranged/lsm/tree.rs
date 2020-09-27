@@ -104,6 +104,10 @@ impl LSMTree {
         self.last_level_tree().merge_with_keys(keys);
     }
 
+    pub fn ideal_capacity(&self) -> usize {
+        self.last_level_tree().ideal_capacity()
+    }
+
     fn last_level_tree(&self) -> &Box<dyn LevelTree> {
         self.trees.last().unwrap()
     }

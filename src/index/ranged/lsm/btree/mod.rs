@@ -235,11 +235,15 @@ pub trait LevelTree: Sync + Send {
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
     fn ideal_capacity(&self) -> usize {
-        self.size().pow(LEVEL_TREE_DEPTH)
+        ideal_capacity_from_node_size(self.size())
     }
     fn oversized(&self) -> bool {
         self.count() > self.ideal_capacity()
     }
+}
+
+pub fn ideal_capacity_from_node_size(size: usize) -> usize {
+    size.pow(LEVEL_TREE_DEPTH)
 }
 
 impl<KS, PS> LevelTree for BPlusTree<KS, PS>
