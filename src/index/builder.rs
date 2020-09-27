@@ -146,12 +146,7 @@ fn probe_field_indices(
                         continue;
                     }
                     let field = hash_str(&fields_name);
-                    let key = EntryKey::from_props(
-                        &id, 
-                        &feat, 
-                        field, 
-                        schema_id
-                    );
+                    let key = EntryKey::from_props(&id, &feat, field, schema_id);
                     metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                 }
                 IndexComps::Vectorized(feat, size) => {

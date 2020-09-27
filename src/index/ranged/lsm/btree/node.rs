@@ -592,7 +592,10 @@ where
         let cell = match guard_ref {
             &mut NodeData::External(ref mut node) => Some(node.to_cell(&*deletion)),
             &mut NodeData::Empty(_) => None,
-            _ => panic!("Cannot persist internal or other type of nodes, type {}", guard_ref.type_name()),
+            _ => panic!(
+                "Cannot persist internal or other type of nodes, type {}",
+                guard_ref.type_name()
+            ),
         };
         let neb = neb.clone();
         async move {

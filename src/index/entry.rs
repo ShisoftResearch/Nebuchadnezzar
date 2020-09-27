@@ -1,17 +1,17 @@
-use super::{KEY_SIZE, Feature};
-use std::ops::{Index, IndexMut};
-use std::slice::SliceIndex;
-use std::slice::Iter;
-use std::cmp;
-use std::ptr;
-use std::io::Cursor;
+use super::{Feature, KEY_SIZE};
 use crate::ram::types::Id;
-use serde::{Serialize, Deserialize, Serializer, Deserializer};
-use serde::ser::SerializeSeq;
-use serde::de::{Visitor, SeqAccess};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::cmp;
 use std::fmt;
+use std::io::Cursor;
 use std::io::Write;
+use std::ops::{Index, IndexMut};
+use std::ptr;
+use std::slice::Iter;
+use std::slice::SliceIndex;
 
 type InnerSlice = [u8; KEY_SIZE];
 pub const ID_SIZE: usize = 16;
@@ -20,7 +20,6 @@ pub const ID_SIZE: usize = 16;
 pub struct EntryKey {
     slice: InnerSlice,
 }
-
 
 impl EntryKey {
     pub fn from_props(id: &Id, feature: &Feature, field: u64, schema_id: u32) -> Self {
@@ -57,7 +56,7 @@ impl EntryKey {
     #[inline(always)]
     pub fn max() -> Self {
         Self {
-            slice: [u8::MAX; KEY_SIZE]
+            slice: [u8::MAX; KEY_SIZE],
         }
     }
     pub fn from_slice(s: &[u8]) -> Self {
@@ -80,7 +79,11 @@ impl EntryKey {
     pub fn set_id(&mut self, id: &Id) {
         let id_data = id.to_binary();
         unsafe {
-            ptr::copy_nonoverlapping(id_data.as_ptr(), self.slice[KEY_SIZE - ID_SIZE..].as_mut_ptr(), ID_SIZE);
+            ptr::copy_nonoverlapping(
+                id_data.as_ptr(),
+                self.slice[KEY_SIZE - ID_SIZE..].as_mut_ptr(),
+                ID_SIZE,
+            );
         }
     }
     pub fn from_id(id: &Id) -> Self {
@@ -93,7 +96,7 @@ impl EntryKey {
 impl Default for EntryKey {
     fn default() -> Self {
         Self {
-             slice: [0u8; KEY_SIZE],
+            slice: [0u8; KEY_SIZE],
         }
     }
 }
@@ -111,7 +114,7 @@ impl<I: SliceIndex<[u8]>> IndexMut<I> for EntryKey {
     }
 }
 
-impl <'a> IntoIterator for &'a EntryKey {
+impl<'a> IntoIterator for &'a EntryKey {
     type Item = &'a u8;
     type IntoIter = Iter<'a, u8>;
     fn into_iter(self) -> Self::IntoIter {
