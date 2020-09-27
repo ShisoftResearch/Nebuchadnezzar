@@ -146,7 +146,7 @@ impl Service for LSMTreeService {
             let cursor = ServCursor {
                 cursor_id: cursor_id as u64,
             };
-            OpResult::Successful((cursor, first_entry.map(|entry| id_from_key(&entry))))
+            OpResult::Successful((cursor, first_entry.map(|entry| entry.id())))
         })
     }
 
@@ -283,7 +283,7 @@ fn id_block_from_cursor_memo(cursor_memo: &mut CursorMemo) -> IdBlock {
     let mut res = IdBlock::default();
     for entry in res.iter_mut() {
         if let Some(tree_entry) = cursor_memo.tree_cursor.next() {
-            *entry = id_from_key(&tree_entry);
+            *entry = tree_entry.id();
         } else {
             break;
         }

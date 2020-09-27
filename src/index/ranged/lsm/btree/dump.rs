@@ -56,7 +56,7 @@ where
             let keys = node.keys.as_slice_immute()[..node.len]
                 .iter()
                 .map(|key| {
-                    let id = id_from_key(key);
+                    let id = key.id();
                     format!("{}\t{:?}", id.lower, key)
                 })
                 .collect();

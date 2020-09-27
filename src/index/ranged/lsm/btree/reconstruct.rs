@@ -185,7 +185,6 @@ mod test {
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
     use itertools::Itertools;
-    use smallvec::SmallVec;
     use std::sync::Arc;
 
     #[tokio::test(threaded_scheduler)]
@@ -236,9 +235,9 @@ mod test {
             value[*KEYS_KEY_HASH] = (0..PAGE_SIZE)
                 .map(|_| {
                     counter += 1;
-                    let key_slice = u64_to_slice(counter);
-                    let mut key = EntryKey::from_slice(&key_slice);
-                    key_with_id(&mut key, &new_id);
+                    let mut id = new_id;
+                    id.lower = counter;
+                    let key = EntryKey::from_id(&id);
                     all_keys.push(key.clone());
                     SmallBytes::from_vec(key.as_slice().to_vec())
                 })

@@ -18,7 +18,7 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                         modified.node.persist(&modified.deletion, &client).await;
                     }
                     external::ChangingNode::Deleted(id) => {
-                        client.remove_cell(id).await.unwrap().unwrap();
+                        let _ = client.remove_cell(id).await.unwrap();
                     }
                 }
                 CHANGE_PROGRESS.store(id, Ordering::Relaxed);

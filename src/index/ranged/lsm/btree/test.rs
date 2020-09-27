@@ -10,7 +10,6 @@ use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
-use smallvec::SmallVec;
 use std::env;
 use std::fs::File;
 use std::io::Cursor as StdCursor;
@@ -61,14 +60,13 @@ fn node_size() {
 fn init() {
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
-    let id = Id::unit_id();
-    let key = EntryKey::from_slice(&[1, 2, 3, 4, 5, 6]);
+    let id = Id::new(1, 2);
+    let key = EntryKey::from_id(&id);
     info!("test insertion");
-    let mut entry_key = key.clone();
-    key_with_id(&mut entry_key, &id);
+    let entry_key = key.clone();
     tree.insert(&entry_key);
     let cursor = tree.seek(&key, Ordering::Forward);
-    assert_eq!(id_from_key(cursor.current().unwrap()), id);
+    assert_eq!(cursor.current().unwrap().id(), id);
 }
 
 fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
@@ -110,15 +108,12 @@ fn crd() {
         file.write_all(json.as_bytes()).unwrap();
         let mut i = 0;
         for n in nums {
-            let id = Id::new(0, n);
-            let key_slice = u64_to_slice(n);
-            let key = EntryKey::from_slice(&key_slice);
+            let id = Id::new(1, n);
+            let key = EntryKey::from_id(&id);
             debug!("{}. insert id: {}", i, n);
-            let mut entry_key = key.clone();
-            key_with_id(&mut entry_key, &id);
-            tree.insert(&entry_key);
+            tree.insert(&key);
             if roll_die.next().unwrap() == 6 {
-                check_ordering(&tree, &entry_key);
+                check_ordering(&tree, &key);
             }
             i += 1;
         }
@@ -131,7 +126,7 @@ fn crd() {
         debug!("Scanning for sequence");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
-            let id = id_from_key(cursor.current().unwrap());
+            let id = cursor.current().unwrap().id();
             let unmatched = i != id.lower;
             let check_msg = if unmatched {
                 "=-=-=-=-=-=-=-= NO =-=-=-=-=-=-="
@@ -143,7 +138,7 @@ fn crd() {
                 debug!(
                     "Expecting index {} encoded {:?}",
                     i,
-                    Id::new(0, i).to_binary()
+                    Id::new(1, i).to_binary()
                 );
             }
             assert_eq!(cursor.next().is_some(), i + 1 < num);
@@ -151,9 +146,9 @@ fn crd() {
         debug!("Forward scanning for sequence verification");
         let mut cursor = tree.seek(&*MIN_ENTRY_KEY, Ordering::Forward);
         for i in 0..num {
-            let expected = Id::new(0, i);
+            let expected = Id::new(1, i);
             debug!("Expecting id {:?}", expected);
-            let id = id_from_key(cursor.current().unwrap());
+            let id = cursor.current().unwrap().id();
             assert_eq!(id, expected);
             assert_eq!(cursor.next().is_some(), i + 1 < num);
         }
@@ -162,15 +157,13 @@ fn crd() {
 
     {
         debug!("Backward scanning for sequence verification");
-        let backward_start_key_slice = u64_to_slice(num - 1);
-        let mut entry_key = EntryKey::from_slice(&backward_start_key_slice);
         // search backward required max possible id
-        key_with_id(&mut entry_key, &Id::new(::std::u64::MAX, ::std::u64::MAX));
+        let entry_key = EntryKey::from_id(&Id::new(::std::u64::MAX, ::std::u64::MAX));
         let mut cursor = tree.seek(&entry_key, Ordering::Backward);
         for i in (0..num).rev() {
-            let expected = Id::new(0, i);
+            let expected = Id::new(1, i);
             debug!("Expecting id {:?}", expected);
-            let id = id_from_key(cursor.current().unwrap());
+            let id = cursor.current().unwrap().id();
             assert_eq!(id, expected, "{}", i);
             assert_eq!(cursor.next().is_some(), i > 0);
         }
@@ -180,11 +173,10 @@ fn crd() {
     {
         debug!("point search");
         for i in 0..num {
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let key = EntryKey::from_slice(&key_slice);
+            let id = Id::new(1, i);
+            let key = EntryKey::from_id(&id);
             assert_eq!(
-                id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
+                tree.seek(&key, Ordering::default()).current().unwrap().id(),
                 id,
                 "{}",
                 i
@@ -205,10 +197,8 @@ pub fn alternative_insertion_pattern() {
         .unwrap();
 
     for i in 0..num {
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, i);
+        let key = EntryKey::from_id(&id);
         debug!("insert {:?}", key);
         tree.insert(&key);
     }
@@ -219,20 +209,16 @@ pub fn alternative_insertion_pattern() {
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
     for i in 0..num {
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, i);
+        let key = EntryKey::from_id(&id);
         if roll_die.next().unwrap() != 6 {
             continue;
         }
         debug!("checking {:?}", &key);
         let mut cursor = tree.seek(&key, Ordering::Forward);
         for j in i..num {
-            let id = Id::new(0, j);
-            let key_slice = u64_to_slice(j);
-            let mut key = EntryKey::from_slice(&key_slice);
-            key_with_id(&mut key, &id);
+            let id = Id::new(1, j);
+            let key = EntryKey::from_id(&id);
             assert_eq!(cursor.current(), Some(&key));
             assert_eq!(cursor.next().is_some(), j != num - 1);
         }
@@ -266,10 +252,8 @@ fn parallel() {
     nums.as_mut_slice().shuffle(&mut rng);
     nums.par_iter().for_each(|i| {
         let i = *i;
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, i);
+        let key = EntryKey::from_id(&id);
         tree.insert(&key);
     });
 
@@ -283,10 +267,8 @@ fn parallel() {
     let roll_die = RwLock::new(rng.sample_iter(&die_range));
     (0..num).collect::<Vec<_>>().iter().for_each(|i| {
         let i = *i;
-        let id = Id::new(0, i);
-        let key_slice = u64_to_slice(i);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, i);
+        let key = EntryKey::from_id(&id);
         debug!("checking: {}", i);
         {
             let mut cursor = tree.seek(&key, Ordering::Forward);
@@ -294,10 +276,8 @@ fn parallel() {
             if roll_die.write().next().unwrap() == 6 {
                 debug!("Scanning {}", num);
                 for j in i..num {
-                    let id = Id::new(0, j);
-                    let key_slice = u64_to_slice(j);
-                    let mut key = EntryKey::from_slice(&key_slice);
-                    key_with_id(&mut key, &id);
+                    let id = Id::new(1, j);
+                    let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     assert_eq!(cursor.next().is_some(), j != num - 1, "{}/{}", i, j);
                 }
@@ -309,10 +289,8 @@ fn parallel() {
             if roll_die.write().next().unwrap() == 6 {
                 debug!("Scanning {}", num);
                 for j in (0..=i).rev() {
-                    let id = Id::new(0, j);
-                    let key_slice = u64_to_slice(j);
-                    let mut key = EntryKey::from_slice(&key_slice);
-                    key_with_id(&mut key, &id);
+                    let id = Id::new(1, j);
+                    let key = EntryKey::from_id(&id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     assert_eq!(cursor.next().is_some(), j != 0, "{}/{}", i, j);
                 }
@@ -349,24 +327,19 @@ fn level_merge() {
     let tree_2 = Arc::new(LevelBPlusTree::new());
     for i in 0..range {
         let n = i * 2;
-        let id = Id::new(0, n);
-        let key_slice = u64_to_slice(n);
-        let key = EntryKey::from_slice(&key_slice);
+        let id = Id::new(1, n);
+        let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
-        let mut entry_key = key.clone();
-        key_with_id(&mut entry_key, &id);
+        let entry_key = key.clone();
         tree_1.insert(&entry_key);
     }
 
     for i in 0..range {
         let n = i * 2 + 1;
-        let id = Id::new(0, n);
-        let key_slice = u64_to_slice(n);
-        let key = EntryKey::from_slice(&key_slice);
+        let id = Id::new(1, n);
+        let key = EntryKey::from_id(&id);
         debug!("insert id: {}", n);
-        let mut entry_key = key.clone();
-        key_with_id(&mut entry_key, &id);
-        tree_2.insert(&entry_key);
+        tree_2.insert(&key);
     }
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_before_dump.json");
@@ -387,18 +360,14 @@ fn level_merge() {
 
     for i in 0..range {
         let n2 = i * 2 + 1;
-        let id2 = Id::new(0, n2);
-        let mut key2 = EntryKey::from_slice(&u64_to_slice(n2));
+        let id2 = Id::new(1, n2);
+        let key2 = EntryKey::from_id(&id2);
         let key2_cur = tree_2.seek(&key2, Ordering::Forward);
-
-        key_with_id(&mut key2, &id2);
-
         if (i as usize) < merged {
             let n1 = i * 2;
-            let id1 = Id::new(0, n1);
-            let mut key1 = EntryKey::from_slice(&u64_to_slice(n1));
+            let id1 = Id::new(1, n1);
+            let key1 = EntryKey::from_id(&id1);
             let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
-            key_with_id(&mut key1, &id1);
             assert_eq!(key1_cur.current().unwrap(), &key1);
             assert_eq!(key1_cur.next().is_some(), i as usize != merged);
             assert_eq!(key1_cur.current().unwrap(), &key2);
@@ -430,10 +399,8 @@ fn level_merge_insertion() {
         .collect_vec();
     for i in tree_nums {
         let n = i as u64;
-        let id = Id::new(0, n);
-        let key_slice = u64_to_slice(n);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, n);
+        let key = EntryKey::from_id(&id);
         assert!(tree.insert(&key));
     }
 
@@ -444,10 +411,8 @@ fn level_merge_insertion() {
     let th1 = thread::spawn(move || {
         insert_nums.into_par_iter().for_each(|i| {
             let n = i as u64;
-            let id = Id::new(0, n);
-            let key_slice = u64_to_slice(n);
-            let mut key = EntryKey::from_slice(&key_slice);
-            key_with_id(&mut key, &id);
+            let id = Id::new(1, n);
+            let key = EntryKey::from_id(&id);
             assert!(tree_2.insert(&key));
         });
     });
@@ -457,10 +422,8 @@ fn level_merge_insertion() {
         .into_iter()
         .map(|i| {
             let n = i as u64;
-            let id = Id::new(0, n);
-            let key_slice = u64_to_slice(n);
-            let mut entry_key = EntryKey::from_slice(&key_slice);
-            key_with_id(&mut entry_key, &id);
+            let id = Id::new(1, n);
+            let entry_key = EntryKey::from_id(&id);
             entry_key
         })
         .sorted()
@@ -477,10 +440,8 @@ fn level_merge_insertion() {
     numbers.sort();
     for num in numbers {
         let n = num as u64;
-        let id = Id::new(0, n);
-        let key_slice = u64_to_slice(n);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, n);
+        let key = EntryKey::from_id(&id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());
     }
@@ -502,10 +463,8 @@ fn reconstruct() {
         let mut nodes = vec![];
         let mut last_node = new_node();
         for i in 0..num {
-            let id = Id::new(0, i);
-            let key_slice = u64_to_slice(i);
-            let mut key = EntryKey::from_slice(&key_slice);
-            key_with_id(&mut key, &id);
+            let id = Id::new(1, i);
+            let key = EntryKey::from_id(&id);
             if last_node.len == TINY_PAGE_SIZE {
                 last_node.right_bound = key.clone();
                 nodes.push(last_node);
@@ -547,10 +506,8 @@ fn reconstruct() {
     };
     dump_tree(&tree, "reconstruct_first_run_dump.json");
     for n in 0..num {
-        let id = Id::new(0, n);
-        let key_slice = u64_to_slice(n);
-        let mut key = EntryKey::from_slice(&key_slice);
-        key_with_id(&mut key, &id);
+        let id = Id::new(1, n);
+        let key = EntryKey::from_id(&id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());
     }

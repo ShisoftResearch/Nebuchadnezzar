@@ -187,7 +187,6 @@ impl Cell {
             }
             write_result
         } else {
-            error!("Schema {} does not existed to write", schema_id);
             Err(WriteError::SchemaDoesNotExisted(schema_id))
         }
     }

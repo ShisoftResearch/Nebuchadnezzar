@@ -14,6 +14,7 @@ use std::fmt;
 use std::io::Write;
 
 type InnerSlice = [u8; KEY_SIZE];
+pub const ID_SIZE: usize = 16;
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash)]
 pub struct EntryKey {
@@ -25,11 +26,11 @@ impl EntryKey {
     pub fn from_props(id: &Id, feature: &Feature, field: u64, schema_id: u32) -> Self {
         let mut key = Self::new();
         let mut cursor = Cursor::new(&mut key.slice[..]);
+        cursor.write(feature).unwrap();
+        cursor.write_u32::<BigEndian>(schema_id).unwrap();
+        cursor.write_u32::<BigEndian>(field as u32).unwrap();
         cursor.write_u64::<BigEndian>(id.higher).unwrap();
         cursor.write_u64::<BigEndian>(id.lower).unwrap();
-        cursor.write_u32::<BigEndian>(field as u32).unwrap();
-        cursor.write_u32::<BigEndian>(schema_id).unwrap();
-        cursor.write(feature).unwrap();
         key
     }
 
@@ -69,6 +70,23 @@ impl EntryKey {
         unsafe {
             ptr::copy_nonoverlapping(slice.as_ptr(), self.slice.as_mut_ptr(), len);
         }
+    }
+    pub fn id(&self) -> Id {
+        let mut id_cursor = Cursor::new(&self.slice[KEY_SIZE - ID_SIZE..]);
+        let id = Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
+        debug_assert!(!id.is_unit_id(), "id is unit id from key {:?}", self.slice);
+        id
+    }
+    pub fn set_id(&mut self, id: &Id) {
+        let id_data = id.to_binary();
+        unsafe {
+            ptr::copy_nonoverlapping(id_data.as_ptr(), self.slice[KEY_SIZE - ID_SIZE..].as_mut_ptr(), ID_SIZE);
+        }
+    }
+    pub fn from_id(id: &Id) -> Self {
+        let mut key = EntryKey::new();
+        key.set_id(id);
+        key
     }
 }
 
@@ -130,7 +148,6 @@ impl<'de> Visitor<'de> for EntryKeyVisitor {
     where
         B: SeqAccess<'de>,
     {
-        let len = seq.size_hint().unwrap_or(0);
         let mut values = EntryKey::new();
         let mut counter = 0;
         while let Some(value) = seq.next_element()? {

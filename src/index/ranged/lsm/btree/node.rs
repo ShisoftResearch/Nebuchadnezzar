@@ -590,12 +590,17 @@ where
         let mut guard = write_node::<KS, PS>(node_ref);
         let guard_ref = &mut *guard;
         let cell = match guard_ref {
-            &mut NodeData::External(ref mut node) => node.to_cell(&*deletion),
-            _ => panic!("Cannot persist internal or other type of nodes"),
+            &mut NodeData::External(ref mut node) => Some(node.to_cell(&*deletion)),
+            &mut NodeData::Empty(_) => None,
+            _ => panic!("Cannot persist internal or other type of nodes, type {}", guard_ref.type_name()),
         };
         let neb = neb.clone();
         async move {
-            let _ = neb.upsert_cell(cell).await;
+            if let Some(cell) = cell {
+                let _ = neb.upsert_cell(cell).await;
+            } else {
+                warn!("Found empty node to persist");
+            }
         }
         .boxed()
     }
