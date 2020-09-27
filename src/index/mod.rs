@@ -1,5 +1,4 @@
 use dovahkiin::types::custom_types::id::Id;
-use smallvec::SmallVec;
 use std::io::Cursor as StdCursor;
 
 #[macro_use]
@@ -8,11 +7,15 @@ mod macros;
 pub mod builder;
 pub mod hash;
 pub mod ranged;
+pub mod entry;
 
+pub const FEATURE_SIZE: usize = 8;
 pub const ID_SIZE: usize = 16;
-pub const KEY_SIZE: usize = ID_SIZE + 20; // 20 is the estimate length of: schema id u32 (4) + field id u64(8) and value u64(8)
+pub const KEY_SIZE: usize = ID_SIZE + FEATURE_SIZE + 8; // 8 is the estimate length of: schema id u32 (4) + field id u32(4, reduced from u64)
 pub const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
-pub type EntryKey = SmallVec<[u8; KEY_SIZE]>;
+
+pub use entry::EntryKey;
+pub type Feature = [u8; FEATURE_SIZE];
 
 pub fn id_from_key(key: &EntryKey) -> Id {
     if key.len() < ID_SIZE {
@@ -24,7 +27,7 @@ pub fn id_from_key(key: &EntryKey) -> Id {
 
 pub fn key_with_id(key: &mut EntryKey, id: &Id) {
     let id_bytes = id.to_binary();
-    key.extend_from_slice(&id_bytes);
+    key.copy_slice(&id_bytes);
 }
 
 pub fn key_prefixed(prefix: &EntryKey, x: &EntryKey) -> bool {

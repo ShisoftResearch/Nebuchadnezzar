@@ -62,7 +62,7 @@ fn init() {
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new();
     let id = Id::unit_id();
-    let key = smallvec![1, 2, 3, 4, 5, 6];
+    let key = EntryKey::from_slice(&[1, 2, 3, 4, 5, 6]);
     info!("test insertion");
     let mut entry_key = key.clone();
     key_with_id(&mut entry_key, &id);
@@ -112,7 +112,7 @@ fn crd() {
         for n in nums {
             let id = Id::new(0, n);
             let key_slice = u64_to_slice(n);
-            let key = SmallVec::from_slice(&key_slice);
+            let key = EntryKey::from_slice(&key_slice);
             debug!("{}. insert id: {}", i, n);
             let mut entry_key = key.clone();
             key_with_id(&mut entry_key, &id);
@@ -163,7 +163,7 @@ fn crd() {
     {
         debug!("Backward scanning for sequence verification");
         let backward_start_key_slice = u64_to_slice(num - 1);
-        let mut entry_key = SmallVec::from_slice(&backward_start_key_slice);
+        let mut entry_key = EntryKey::from_slice(&backward_start_key_slice);
         // search backward required max possible id
         key_with_id(&mut entry_key, &Id::new(::std::u64::MAX, ::std::u64::MAX));
         let mut cursor = tree.seek(&entry_key, Ordering::Backward);
@@ -182,7 +182,7 @@ fn crd() {
         for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
-            let key = SmallVec::from_slice(&key_slice);
+            let key = EntryKey::from_slice(&key_slice);
             assert_eq!(
                 id_from_key(tree.seek(&key, Ordering::default()).current().unwrap()),
                 id,
@@ -207,7 +207,7 @@ pub fn alternative_insertion_pattern() {
     for i in 0..num {
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         debug!("insert {:?}", key);
         tree.insert(&key);
@@ -221,7 +221,7 @@ pub fn alternative_insertion_pattern() {
     for i in 0..num {
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         if roll_die.next().unwrap() != 6 {
             continue;
@@ -231,7 +231,7 @@ pub fn alternative_insertion_pattern() {
         for j in i..num {
             let id = Id::new(0, j);
             let key_slice = u64_to_slice(j);
-            let mut key = SmallVec::from_slice(&key_slice);
+            let mut key = EntryKey::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             assert_eq!(cursor.current(), Some(&key));
             assert_eq!(cursor.next().is_some(), j != num - 1);
@@ -268,7 +268,7 @@ fn parallel() {
         let i = *i;
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         tree.insert(&key);
     });
@@ -285,7 +285,7 @@ fn parallel() {
         let i = *i;
         let id = Id::new(0, i);
         let key_slice = u64_to_slice(i);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         debug!("checking: {}", i);
         {
@@ -296,7 +296,7 @@ fn parallel() {
                 for j in i..num {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
-                    let mut key = SmallVec::from_slice(&key_slice);
+                    let mut key = EntryKey::from_slice(&key_slice);
                     key_with_id(&mut key, &id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     assert_eq!(cursor.next().is_some(), j != num - 1, "{}/{}", i, j);
@@ -311,7 +311,7 @@ fn parallel() {
                 for j in (0..=i).rev() {
                     let id = Id::new(0, j);
                     let key_slice = u64_to_slice(j);
-                    let mut key = SmallVec::from_slice(&key_slice);
+                    let mut key = EntryKey::from_slice(&key_slice);
                     key_with_id(&mut key, &id);
                     assert_eq!(cursor.current(), Some(&key), "{}/{}", i, j);
                     assert_eq!(cursor.next().is_some(), j != 0, "{}/{}", i, j);
@@ -351,7 +351,7 @@ fn level_merge() {
         let n = i * 2;
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
-        let key = SmallVec::from_slice(&key_slice);
+        let key = EntryKey::from_slice(&key_slice);
         debug!("insert id: {}", n);
         let mut entry_key = key.clone();
         key_with_id(&mut entry_key, &id);
@@ -362,7 +362,7 @@ fn level_merge() {
         let n = i * 2 + 1;
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
-        let key = SmallVec::from_slice(&key_slice);
+        let key = EntryKey::from_slice(&key_slice);
         debug!("insert id: {}", n);
         let mut entry_key = key.clone();
         key_with_id(&mut entry_key, &id);
@@ -388,7 +388,7 @@ fn level_merge() {
     for i in 0..range {
         let n2 = i * 2 + 1;
         let id2 = Id::new(0, n2);
-        let mut key2 = SmallVec::from_slice(&u64_to_slice(n2));
+        let mut key2 = EntryKey::from_slice(&u64_to_slice(n2));
         let key2_cur = tree_2.seek(&key2, Ordering::Forward);
 
         key_with_id(&mut key2, &id2);
@@ -396,7 +396,7 @@ fn level_merge() {
         if (i as usize) < merged {
             let n1 = i * 2;
             let id1 = Id::new(0, n1);
-            let mut key1 = SmallVec::from_slice(&u64_to_slice(n1));
+            let mut key1 = EntryKey::from_slice(&u64_to_slice(n1));
             let mut key1_cur = tree_2.seek(&key1, Ordering::Forward);
             key_with_id(&mut key1, &id1);
             assert_eq!(key1_cur.current().unwrap(), &key1);
@@ -432,7 +432,7 @@ fn level_merge_insertion() {
         let n = i as u64;
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         assert!(tree.insert(&key));
     }
@@ -446,7 +446,7 @@ fn level_merge_insertion() {
             let n = i as u64;
             let id = Id::new(0, n);
             let key_slice = u64_to_slice(n);
-            let mut key = SmallVec::from_slice(&key_slice);
+            let mut key = EntryKey::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             assert!(tree_2.insert(&key));
         });
@@ -459,7 +459,7 @@ fn level_merge_insertion() {
             let n = i as u64;
             let id = Id::new(0, n);
             let key_slice = u64_to_slice(n);
-            let mut entry_key = SmallVec::from_slice(&key_slice);
+            let mut entry_key = EntryKey::from_slice(&key_slice);
             key_with_id(&mut entry_key, &id);
             entry_key
         })
@@ -479,7 +479,7 @@ fn level_merge_insertion() {
         let n = num as u64;
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());
@@ -504,7 +504,7 @@ fn reconstruct() {
         for i in 0..num {
             let id = Id::new(0, i);
             let key_slice = u64_to_slice(i);
-            let mut key = SmallVec::from_slice(&key_slice);
+            let mut key = EntryKey::from_slice(&key_slice);
             key_with_id(&mut key, &id);
             if last_node.len == TINY_PAGE_SIZE {
                 last_node.right_bound = key.clone();
@@ -549,7 +549,7 @@ fn reconstruct() {
     for n in 0..num {
         let id = Id::new(0, n);
         let key_slice = u64_to_slice(n);
-        let mut key = SmallVec::from_slice(&key_slice);
+        let mut key = EntryKey::from_slice(&key_slice);
         key_with_id(&mut key, &id);
         let cursor = tree.seek(&key, Ordering::Forward);
         assert_eq!(&key, cursor.current().unwrap());

@@ -82,7 +82,7 @@ lazy_static! {
 
 #[inline]
 fn raw_max_entry_key() -> EntryKey {
-    EntryKey::from(iter::repeat(255u8).take(MAX_KEY_SIZE).collect_vec())
+    EntryKey::max()
 }
 
 #[inline(always)]

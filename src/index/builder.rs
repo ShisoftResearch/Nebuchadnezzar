@@ -1,11 +1,10 @@
-use super::EntryKey;
+use super::{EntryKey, Feature};
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
 use bifrost_hasher::hash_str;
 
 type FieldName = String;
-pub type Feature = [u8; 8];
 const UNSETTLED: Feature = [0u8; 8];
 
 // Define index rules
@@ -146,12 +145,13 @@ fn probe_field_indices(
                     if feat == UNSETTLED {
                         continue;
                     }
-                    let mut key = EntryKey::new();
                     let field = hash_str(&fields_name);
-                    key.extend_from_slice(&id.to_binary()); // Id
-                    key.extend_from_slice(&feat); // value
-                    key.extend_from_slice(&field.to_be_bytes()); // field
-                    key.extend_from_slice(&schema_id.to_be_bytes()); // schema id
+                    let key = EntryKey::from_props(
+                        &id, 
+                        &feat, 
+                        field, 
+                        schema_id
+                    );
                     metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                 }
                 IndexComps::Vectorized(feat, size) => {

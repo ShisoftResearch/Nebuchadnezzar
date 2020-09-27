@@ -237,7 +237,7 @@ mod test {
                 .map(|_| {
                     counter += 1;
                     let key_slice = u64_to_slice(counter);
-                    let mut key = SmallVec::from_slice(&key_slice);
+                    let mut key = EntryKey::from_slice(&key_slice);
                     key_with_id(&mut key, &new_id);
                     all_keys.push(key.clone());
                     SmallBytes::from_vec(key.as_slice().to_vec())

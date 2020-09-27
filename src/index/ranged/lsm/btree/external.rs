@@ -81,7 +81,7 @@ where
         let mut key_slice = KS::init();
         let mut key_count = 0;
         for (i, key_val) in keys_array.iter().enumerate() {
-            key_slice.as_slice()[i] = EntryKey::from(key_val.as_slice());
+            key_slice.as_slice()[i] = EntryKey::from_slice(key_val.as_slice());
             key_count += 1;
         }
         let ext_node = ExtNode {
@@ -190,7 +190,7 @@ where
             pivot_key,
             self.right_bound
         );
-        debug_assert!(pivot_key > smallvec!());
+        debug_assert!(pivot_key > Default::default());
         debug_assert!(
             &pivot_key > &keys_1.as_slice()[keys_1_len - 1],
             "{:?} / {:?} @ {}",
