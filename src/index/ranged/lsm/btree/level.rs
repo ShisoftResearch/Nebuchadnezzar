@@ -34,11 +34,10 @@ where
             trace!("Acquiring first node");
             let first_node = write_node(node);
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
-            let mut collected_keys = first_node.len();
+            debug!("This level has {:?} external nodes to select", num_pages(&first_node));
             let mut collected = vec![first_node];
-            let target_keys = KS::slice_len();
-            let target_guards = LEVEL_2;
-            while collected_keys < target_keys && collected.len() < target_guards {
+            let target_guards = 16; // pages to collect
+            while collected.len() < target_guards {
                 trace!("Acquiring select collection node");
                 let right = write_node(collected.last().unwrap().right_ref().unwrap());
                 if right.is_none() {
@@ -52,7 +51,6 @@ where
                     debug_assert!(
                         !read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node()
                     );
-                    collected_keys += right.len();
                     collected.push(right);
                 }
             }
@@ -60,6 +58,33 @@ where
         }
         MutSearchResult::Internal(node) => select::<KS, PS>(&node),
     }
+}
+
+
+fn num_pages<KS, PS>(head_page: &NodeWriteGuard<KS, PS>) -> (usize, usize)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut num = 0;
+    let mut non_empty = 0;
+    let mut node_ref = head_page.node_ref().clone();
+    loop {
+        let node = read_unchecked::<KS, PS>(&node_ref);
+        if node.is_none() {
+            break;
+        }
+        if !node.is_empty() {
+            non_empty += 1;
+        }
+        if let Some(node) = node.right_ref() {
+            node_ref = node.clone()
+        } else {
+            break;
+        }
+        num += 1;
+    }
+    (num, non_empty)
 }
 
 pub fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &dyn LevelTree) -> usize
@@ -73,7 +98,7 @@ where
     let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
 
-    trace!("Merge selected {} pages", left_most_leaf_guards.len());
+    debug!("Merge selected {} pages", left_most_leaf_guards.len());
     if cfg!(debug_assertions) {
         if left_most_id != src_tree.head_page_id {
             dump_tree(src_tree, "level_lsm_merge_failure_dump.json");
@@ -105,7 +130,7 @@ where
             .cloned()
             .collect_vec();
         num_keys_moved = keys.len();
-        trace!("Merge selected keys {:?}", keys.len());
+        debug!("Merging {} keys, have {}", num_keys_moved, src_tree.len.load(Relaxed));
         dest_tree.merge_with_keys(box keys);
         for rk in &merged_deleted_keys {
             deleted_keys.remove(rk);
