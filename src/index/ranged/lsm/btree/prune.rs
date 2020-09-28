@@ -29,6 +29,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    debug!("Start prune at level {}", level);
     let mut level_page_altered = AlteredNodes {
         removed: vec![],
         added: vec![],
@@ -54,6 +55,7 @@ where
     altered.added.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut all_pages = probe_key_range(node, &altered, level);
+    debug!("Prune had detected {} pages at level {}", all_pages.len(), level);
     if all_pages.is_empty() {
         trace!("No node to prune at this level - {}", level);
         return (box level_page_altered, box vec![]);
@@ -75,6 +77,8 @@ where
         level,
     );
 
+    debug!("Prune had detected {} living pages at level {}", all_pages.len(), level); 
+
     // alter keys
     {
         let mut current_altered = peek_altered_iter(&altered);
@@ -89,6 +93,9 @@ where
     }
 
     all_pages = update_right_nodes(all_pages);
+
+    debug!("Prune had updated right nodes for {} living pages at level {}", all_pages.len(), level);
+    
     debug_assert!(
         is_node_list_serial(&all_pages),
         "node not serial before checking corner cases"
@@ -97,6 +104,8 @@ where
     if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
         all_pages = update_right_nodes(all_pages);
     }
+
+    debug!("Prune had merged all single ref pages, now have {} living pages at level {}", all_pages.len(), level);
 
     debug_assert!(
         is_node_list_serial(&all_pages),
@@ -439,10 +448,6 @@ where
         trace!("No nodes available to update right node");
         return all_pages;
     }
-    let last_right_ref = all_pages.last().unwrap().right_ref().unwrap().clone();
-    debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_empty_node());
-    // none right node should be allowed
-    // debug_assert!(!read_unchecked::<KS, PS>(&last_right_ref).is_none());
     let mut non_emptys = all_pages
         .into_iter()
         .filter(|p| !p.is_empty_node())
@@ -452,7 +457,7 @@ where
         .enumerate()
         .map(|(i, p)| {
             let right_ref = if i == non_emptys.len() - 1 {
-                last_right_ref.clone()
+                NodeCellRef::new_none::<KS, PS>()
             } else {
                 non_emptys[i + 1].node_ref().clone()
             };
@@ -492,6 +497,57 @@ where
     let mut corner_case_handled = false;
     let mut current_left_bound = min_entry_key();
     while index < all_pages.len() {
+        if index < all_pages.len() - 1 {
+            let right_node_len = all_pages[index + 1].len();
+            if right_node_len == 0 {
+                // right node length is 0, should merge with current node
+                let keys_cap = KS::slice_len();
+                let current_node_len = all_pages[index].len();
+                if current_node_len < keys_cap {
+                    // current node is not full, can fit the only reference on the right
+                    let (right_node_ptr, right_node_bound) = {
+                        let right_node = all_pages[index + 1].innode();
+                        (
+                            right_node.ptrs.as_slice_immute()[0].clone(),
+                            right_node.right_bound.clone(),
+                        )
+                    };
+                    {
+                        let mut current_node = all_pages[index].innode_mut();
+                        current_node.keys.as_slice()[keys_cap - 1] = current_node.right_bound.clone();
+                        current_node.right_bound = right_node_bound;
+                        current_node.ptrs.as_slice()[keys_cap] = right_node_ptr;
+                        current_node.len += 1;
+                        debug_assert_eq!(current_node.len, keys_cap);
+                    }
+                    all_pages[index + 1].make_empty_node(false);
+                } else {
+                    // current node is full, will need to move part of currrent node to right node
+                    let (current_bound, current_ptr) = {
+                        let current_node = all_pages[index].innode_mut();
+                        debug_assert_eq!(current_node.len, keys_cap);
+                        mem::swap(&mut current_node.keys.as_slice()[keys_cap - 1], &mut current_node.right_bound);
+                        let current_right_bound = mem::replace(&mut current_node.keys.as_slice()[keys_cap - 1], EntryKey::new());
+                        let current_right_ptr = mem::replace(&mut current_node.ptrs.as_slice()[keys_cap], NodeCellRef::new_none::<KS, PS>());
+                        current_node.len -= 1;
+                        (current_right_bound, current_right_ptr)
+                    };
+                    {
+                        let right_node = all_pages[index + 1].innode_mut();
+                        right_node.keys.as_slice()[0] = current_bound;
+                        {
+                            let right_node_ptrs = right_node.ptrs.as_slice();
+                            right_node_ptrs[1] = right_node_ptrs[0].clone();
+                            right_node_ptrs[0] = current_ptr;
+                        }
+                        right_node.len += 1;
+                        debug_assert_eq!(right_node.len, 1);
+                    }
+                }
+                index += 2;
+                continue;
+            }
+        }
         let current_right_bound = all_pages[index].right_bound().clone();
         if all_pages[index].len() == 0 {
             // current page have one ptr and no keys
@@ -499,16 +555,8 @@ where
             // if the right page is full, partial of the right page will be moved to the third page
             // the emptying node will always been cleaned
             // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
-            trace!("Dealing with emptying node {}", index);
+            debug!("Dealing with single ptr node {}, has {} pages in level {}", index, all_pages.len(), level);
             corner_case_handled = true;
-            let mut next_from_ptr = if index + 1 >= all_pages.len() {
-                trace!("Acquiring node guard for last node right");
-                let ptr_right = write_node::<KS, PS>(all_pages[index].right_ref().unwrap());
-                debug_assert!(!ptr_right.is_empty_node());
-                Some(ptr_right)
-            } else {
-                None
-            };
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here
             let has_new = {
@@ -526,9 +574,7 @@ where
                 let mut new_next_ptrs = PS::init();
                 let mut has_new = None;
 
-                let next = next_from_ptr
-                    .as_mut()
-                    .unwrap_or_else(|| &mut all_pages[index + 1]);
+                let next = &mut all_pages[index + 1];
                 debug_assert!(
                     is_node_serial(next),
                     "node not serial before next updated - {}",
