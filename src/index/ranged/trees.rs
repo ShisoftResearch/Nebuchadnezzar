@@ -36,7 +36,7 @@ pub trait Slice<T: Default>: Send + Sync {
     }
     fn insert_at(&mut self, item: T, pos: usize, len: &mut usize) {
         debug_assert!(pos <= *len, "pos {} larger or equals to len {}", pos, len);
-        debug!("insert into slice, pos: {}, len {}", pos, len);
+        trace!("insert into slice, pos: {}, len {}", pos, len);
         let slice = self.as_slice();
         if *len > 0 {
             slice[*len] = T::default();
@@ -48,7 +48,7 @@ pub trait Slice<T: Default>: Send + Sync {
         slice[pos] = item;
     }
     fn remove_at(&mut self, pos: usize, len: &mut usize) {
-        debug!("remove at {} len {}", pos, len);
+        trace!("remove at {} len {}", pos, len);
         debug_assert!(pos < *len, "remove overflow, pos {}, len {}", pos, len);
         let slice = self.as_slice();
         let bound = *len - 1;

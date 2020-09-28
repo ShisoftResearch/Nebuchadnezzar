@@ -93,7 +93,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new() -> BPlusTree<KS, PS> {
-        debug!("Creating B+ Tree, with capacity {}", KS::slice_len());
+        trace!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let mut tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::with_none())),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::with_none()),
@@ -104,9 +104,9 @@ where
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
-        debug!("New External L1");
+        trace!("New External L1");
         let root_inner = Node::<KS, PS>::new_external(root_id, max_key);
-        debug!("B+ Tree created");
+        trace!("B+ Tree created");
         *tree.root.write() = NodeCellRef::new(root_inner);
         tree.head_page_id = root_id;
         return tree;
@@ -143,7 +143,7 @@ where
     pub fn insert(&self, key: &EntryKey) -> bool {
         match insert_to_tree_node(&self, &self.get_root(), &self.root_versioning, &key, 0) {
             Some(Some(split)) => {
-                debug!("split root with pivot key {:?}", split.pivot);
+                trace!("split root with pivot key {:?}", split.pivot);
                 let new_node = split.new_right_node;
                 let pivot = split.pivot;
                 let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(1, max_entry_key());
@@ -166,7 +166,7 @@ where
         let root = self.get_root();
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
         if root_new_pages.len() > 0 {
-            debug!("Merge have a root node split");
+            trace!("Merge have a root node split");
             debug_assert!(
                 verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),
                 "verification failed before merge root split"

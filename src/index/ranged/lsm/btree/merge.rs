@@ -65,7 +65,7 @@ where
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
-            debug!("Merge into internal with keys {:?}", &keys);
+            trace!("Merge into internal with keys {:?}", &keys);
             let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
@@ -73,7 +73,7 @@ where
             // merge by pages
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
-                debug!("Start merging with page at {:?}", start_key);
+                trace!("Start merging with page at {:?}", start_key);
                 current_guard = write_targeted(current_guard, start_key);
                 let remain_slots = KS::slice_len() - current_guard.len();
                 if remain_slots > 0 {

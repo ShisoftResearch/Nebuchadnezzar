@@ -31,7 +31,7 @@ where
     let search = mut_search::<KS, PS>(node, &*MIN_ENTRY_KEY);
     match search {
         MutSearchResult::External => {
-            debug!("Acquiring first node");
+            trace!("Acquiring first node");
             let first_node = write_node(node);
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
             let mut collected_keys = first_node.len();
@@ -39,7 +39,7 @@ where
             let target_keys = KS::slice_len();
             let target_guards = LEVEL_2;
             while collected_keys < target_keys && collected.len() < target_guards {
-                debug!("Acquiring select collection node");
+                trace!("Acquiring select collection node");
                 let right = write_node(collected.last().unwrap().right_ref().unwrap());
                 if right.is_none() {
                     // Early break for reach the end of the linked list
@@ -73,7 +73,7 @@ where
     let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
 
-    debug!("Merge selected {} pages", left_most_leaf_guards.len());
+    trace!("Merge selected {} pages", left_most_leaf_guards.len());
     if cfg!(debug_assertions) {
         if left_most_id != src_tree.head_page_id {
             dump_tree(src_tree, "level_lsm_merge_failure_dump.json");
@@ -105,7 +105,7 @@ where
             .cloned()
             .collect_vec();
         num_keys_moved = keys.len();
-        debug!("Merge selected keys {:?}", keys.len());
+        trace!("Merge selected keys {:?}", keys.len());
         dest_tree.merge_with_keys(box keys);
         for rk in &merged_deleted_keys {
             deleted_keys.remove(rk);
@@ -148,14 +148,14 @@ where
             g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
         }
 
-        debug!("Acquiring new first node");
+        trace!("Acquiring new first node");
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut(src_tree);
-        debug!(
+        trace!(
             "Right most original id is {:?}, now is {:?}",
             new_first_node_ext.id, src_tree.head_page_id
         );
-        debug!(
+        trace!(
             "New first node right is {:?}",
             read_unchecked::<KS, PS>(&new_first_node_ext.next).ext_id()
         );
@@ -171,7 +171,7 @@ where
 
     src_tree.len.fetch_sub(num_keys_moved, Relaxed);
 
-    debug!("Merge completed");
+    trace!("Merge completed");
 
     merge_page_len
 }

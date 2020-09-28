@@ -170,7 +170,7 @@ where
             if !right_node.is_none()
                 && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key)
             {
-                debug!(
+                trace!(
                     "found key to put to right page {:?}/{:?}",
                     key,
                     if right_node.is_empty() {
@@ -288,7 +288,7 @@ where
         if search_page.is_empty() || search_page.right_bound() <= key {
             let right_node = write_node(search_page.right_ref_mut_no_empty().unwrap());
             debug_assert!(!right_node.is_empty_node());
-            debug!(
+            trace!(
                 "Shifting to right {} node for {:?}, first key {:?}",
                 right_node.type_name(),
                 key,
@@ -376,7 +376,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    // debug!("acquiring node write lock");
+    // trace!("acquiring node write lock");
     let node_deref = node.deref();
     let cc = &node_deref.cc;
     loop {
@@ -422,7 +422,7 @@ where
     loop {
         let cc_num = cc.load(SeqCst);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
-            // debug!("read have a latch, retry {:b}", cc_num);
+            // trace!("read have a latch, retry {:b}", cc_num);
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
@@ -602,7 +602,7 @@ where
             if let Some(cell) = cell {
                 let _ = neb.upsert_cell(cell).await;
             } else {
-                warn!("Found empty node to persist");
+                trace!("Found empty node to persist");
             }
         }
         .boxed()
@@ -663,16 +663,16 @@ pub fn insert_into_split<T, S>(
     S: Slice<T>,
     T: Default,
 {
-    debug!(
+    trace!(
         "insert into split left len {}, right len {}, pos {}",
         xlen, ylen, pos
     );
     if pos < *xlen {
-        debug!("insert into left part, pos: {}", pos);
+        trace!("insert into left part, pos: {}", pos);
         x.insert_at(item, pos, xlen);
     } else {
         let right_pos = pos - *xlen;
-        debug!("insert into right part, pos: {}", right_pos);
+        trace!("insert into right part, pos: {}", right_pos);
         y.insert_at(item, right_pos, ylen);
     }
 }

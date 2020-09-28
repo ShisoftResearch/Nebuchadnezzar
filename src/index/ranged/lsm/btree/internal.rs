@@ -73,7 +73,7 @@ where
             let key_pos = self.key_pos_from_ptr_pos(ptr_pos);
             let n_key_len = &mut self.len;
             let mut n_ptr_len = *n_key_len + 1;
-            debug!(
+            trace!(
                 "Removing from internal node pos {}, len {}, key {:?}",
                 key_pos,
                 n_key_len,
@@ -96,11 +96,11 @@ where
         let ptr_len = self.len + 1;
         let pivot = node_len / 2; // pivot key will be removed
         let pivot_key;
-        debug!("Going to split at pivot {}", pivot);
+        trace!("Going to split at pivot {}", pivot);
         let keys_split = {
-            debug!("insert into keys");
+            trace!("insert into keys");
             if pivot == pos {
-                debug!("special key treatment when pivot == pos");
+                trace!("special key treatment when pivot == pos");
                 let keys_1 = &mut self.keys;
                 let keys_2 = keys_1.split_at_pivot(pivot, node_len);
                 let keys_1_len = pivot;
@@ -122,7 +122,7 @@ where
                     // pivot moved, need to compensate
                     key_pos -= 1;
                 }
-                debug!(
+                trace!(
                     "keys 1 len: {}, keys 2 len: {}, pos {}",
                     keys_1_len, keys_2_len, key_pos
                 );
@@ -147,7 +147,7 @@ where
         let ptr_padding = if padding_ptr_pos { 1 } else { 0 };
         let ptr_split = {
             if pivot == pos {
-                debug!("special ptr treatment when pivot == pos");
+                trace!("special ptr treatment when pivot == pos");
                 let ptrs_1 = &mut self.ptrs;
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let ptrs_1_len = pivot + 1;
@@ -157,7 +157,7 @@ where
                 debug_assert_eq!(ptrs_2_len, keys_split.keys_2_len + 1);
                 InNodePtrSplit { ptrs_2 }
             } else {
-                debug!("insert into ptrs");
+                trace!("insert into ptrs");
                 let ptrs_1 = &mut self.ptrs;
                 let mut ptrs_2 = ptrs_1.split_at_pivot(pivot + 1, ptr_len);
                 let mut ptrs_1_len = pivot + 1;
@@ -221,7 +221,7 @@ where
         let node_len = self.len;
         let _ptr_len = self.len + 1;
         let pos = self.search(&key);
-        debug!("Insert into internal node at {}, key: {:?}", pos, key);
+        trace!("Insert into internal node at {}, key: {:?}", pos, key);
         debug_assert!(node_len <= KS::slice_len());
         if node_len == KS::slice_len() {
             let parent_guard = write_node(parent);
@@ -239,7 +239,7 @@ where
     }
     pub fn rebalance_candidate(&self, pointer_pos: usize) -> usize {
         debug_assert!(pointer_pos <= self.len);
-        debug!(
+        trace!(
             "Searching for rebalance candidate, pos {}, len {}",
             pointer_pos, self.len
         );
@@ -268,7 +268,7 @@ where
         let right_len = right_node.len();
         let right_key_pos = self.key_pos_from_ptr_pos(right_ptr_pos);
         let merged_len;
-        debug!("Merge children, left len {}, right len {}, left_ptr_pos {}, right_ptr_pos {}, right_key_pos {}",
+        trace!("Merge children, left len {}, right len {}, left_ptr_pos {}, right_ptr_pos {}, right_key_pos {}",
                 left_len, right_len, left_ptr_pos, right_ptr_pos, right_key_pos);
         debug_assert_eq!(left_node.is_ext(), right_node.is_ext());
         if !left_node.is_ext() {
@@ -296,17 +296,17 @@ where
             left: Some(left_node_ref.clone()),
             right: left_node_ref.clone(),
         });
-        debug!(
+        trace!(
             "Removing merged node at {}, left {}, right {}, merged {}",
             right_ptr_pos, left_len, right_len, merged_len
         );
         self.remove_at(right_ptr_pos);
-        debug!("Merged parent level keys: {:?}", self.keys);
-        debug!("Merged level keys {:?}", left_node.keys());
+        trace!("Merged parent level keys: {:?}", self.keys);
+        trace!("Merged level keys {:?}", left_node.keys());
         self.debug_check_integrity();
     }
     pub fn merge_with(&mut self, right: &mut Self, right_key: EntryKey) {
-        debug!(
+        trace!(
             "Merge internal node, left len {}, right len {}, right_key {:?}",
             self.len, right.len, right_key
         );
@@ -349,7 +349,7 @@ where
                 let left_innode = left_node.innode_mut();
                 let right_innode = right_node.innode_mut();
 
-                debug!(
+                trace!(
                     "Before relocation internal children. left {}:{:?} right {}:{:?}",
                     left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
                 );
@@ -413,7 +413,7 @@ where
                 right_innode.ptrs = new_right_ptrs;
                 right_innode.len = new_right_keys_len;
 
-                debug!(
+                trace!(
                     "Relocated internal children. left {}:{:?} right {}:{:?}",
                     left_innode.len, left_innode.keys, right_innode.len, right_innode.keys
                 );
@@ -424,7 +424,7 @@ where
             let left_extnode = left_node.extnode_mut(tree);
             let right_extnode = right_node.extnode_mut(tree);
 
-            debug!(
+            trace!(
                 "Before relocation external children. left {}:{:?} right {}:{:?}",
                 left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
             );
@@ -459,14 +459,14 @@ where
             right_extnode.keys = new_right_keys;
             right_extnode.len = new_right_keys_len;
 
-            debug!(
+            trace!(
                 "Relocated external children. left {}:{:?} right {}:{:?}",
                 left_extnode.len, left_extnode.keys, right_extnode.len, right_extnode.keys
             );
         }
 
         let right_key_pos = right_ptr_pos - 1;
-        debug!(
+        trace!(
             "Setting key at pos {} to new key {:?}",
             right_key_pos, new_right_node_key
         );

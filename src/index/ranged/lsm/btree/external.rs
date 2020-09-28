@@ -141,7 +141,7 @@ where
     }
     pub fn remove_at(&mut self, pos: usize) {
         let cached_len = &mut self.len;
-        debug!(
+        trace!(
             "Removing from external pos {}, len {}, key {:?}",
             pos,
             cached_len,
@@ -200,7 +200,7 @@ where
         );
         self.len = keys_1_len;
         self.right_bound = pivot_key.clone();
-        debug!(
+        trace!(
             "Split to left len {}, right len {}, right prev id: {:?}",
             self.len,
             extnode_2.len,
@@ -247,12 +247,12 @@ where
         debug_assert!(self.len <= KS::slice_len());
         debug_assert!(pos <= self.len);
         if self.len > pos && self.keys.as_slice_immute()[pos] == key {
-            debug!("inserting existing key");
+            trace!("inserting existing key");
             return None;
         }
         Some(if self.len == KS::slice_len() {
             // need to split
-            debug!("insert to external with split, key {:?}, pos {}", key, pos);
+            trace!("insert to external with split, key {:?}, pos {}", key, pos);
             let mut self_next: NodeWriteGuard<KS, PS> = write_non_empty(write_node(&self.next));
             let parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
             let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
@@ -263,14 +263,14 @@ where
                 left_node_latch: NodeWriteGuard::default(),
             })
         } else {
-            debug!("insert to external without split at {}, key {:?}", pos, key);
+            trace!("insert to external without split at {}, key {:?}", pos, key);
             self.keys.insert_at(key, pos, &mut self.len);
             None
         })
     }
 
     pub fn merge_with(&mut self, right: &mut Self) {
-        debug!(
+        trace!(
             "Merge external node, left len {}:{:?}, right len {}:{:?}",
             self.len, self.keys, right.len, right.keys
         );
@@ -305,7 +305,7 @@ where
     }
 
     pub fn merge_sort(&mut self, right: &[&EntryKey]) {
-        debug!("Merge sort have right nodes {:?}", right);
+        trace!("Merge sort have right nodes {:?}", right);
         let self_len_before_merge = self.len;
         debug_assert!(self_len_before_merge + right.len() <= KS::slice_len());
         let mut pos = 0;
@@ -347,7 +347,7 @@ where
             }
             right_pos += 1;
         }
-        debug!(
+        trace!(
             "Merge sorted have keys {:?}",
             &self.keys.as_slice_immute()[..pos]
         );
@@ -355,16 +355,16 @@ where
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
         debug_assert_eq!(self.len, self_len_before_merge + right.len());
-        debug!(
+        trace!(
             "Merge sorted page have keys: {:?}",
             &self.keys.as_slice_immute()[..self.len]
         )
     }
 
     pub fn dump(&self) {
-        debug!("Dumping {:?}, keys {}", self.id, self.len);
+        trace!("Dumping {:?}, keys {}", self.id, self.len);
         for i in 0..KS::slice_len() {
-            debug!("{}\t- {:?}", i, self.keys.as_slice_immute()[i]);
+            trace!("{}\t- {:?}", i, self.keys.as_slice_immute()[i]);
         }
     }
 }

@@ -46,16 +46,18 @@ mod tests {
             Arc::new(client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await);
         let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * 8;
         let mut futs = FuturesUnordered::new();
+        info!("Testing ranged indexer preesure test with {} items", test_capacity);
         for i in 0..test_capacity { 
             let index_client = index_client.clone();
-            futs.push(async move {
+            futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);
                 let key = EntryKey::from_id(&id);
                 index_client.insert(&key).await
-            });
+            }));
         }
+        info!("All tasks queued, waiting for finish");
         while let Some(result) = futs.next().await {
-            assert!(result.unwrap());
+            assert!(result.unwrap().unwrap());
         }
     }
 }
