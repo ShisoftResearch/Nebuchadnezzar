@@ -348,6 +348,7 @@ pub async fn init_ranged_indexer_service(
         .new_schema_with_id(ranged::lsm::tree::LSM_TREE_SCHEMA.clone())
         .await
         .unwrap();
+    let _ = neb_client.new_schema_with_id(ranged::lsm::btree::page_schema()).await.unwrap();
     let sm_client = Arc::new(ranged::sm::client::SMClient::new(
         ranged::sm::DEFAULT_SM_ID,
         raft_client,

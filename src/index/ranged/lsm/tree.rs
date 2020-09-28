@@ -78,7 +78,9 @@ impl LSMTree {
     pub fn merge_levels(&self) {
         for i in 0..self.trees.len() - 1 {
             if self.trees[i].oversized() {
+                debug!("Level {} tree oversized, merging", i);
                 self.trees[i].merge_to(&*self.trees[i + 1]);
+                debug!("Level {} merge completed", i);
             }
         }
     }

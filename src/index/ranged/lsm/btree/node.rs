@@ -600,9 +600,17 @@ where
         let neb = neb.clone();
         async move {
             if let Some(cell) = cell {
-                let _ = neb.upsert_cell(cell).await;
-            } else {
-                trace!("Found empty node to persist");
+                debug!("Updating node cell {:?}", cell.header.id());
+                let cell_id = cell.id();
+                match neb.upsert_cell(cell).await {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(e)) => {
+                        warn!("Cell node update error for {:?}, error: {:?}", cell_id, e);
+                    },
+                    Err(e) => {
+                        error!("Cell node insertion error for {:?}, error: {:?}", cell_id, e);
+                    }
+                }
             }
         }
         .boxed()
