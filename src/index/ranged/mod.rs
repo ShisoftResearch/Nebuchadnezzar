@@ -12,9 +12,12 @@ mod tests {
     use crate::index::EntryKey;
     use crate::index::ranged::lsm::btree;
     use crate::ram::types::Id;
+    use futures::stream::FuturesUnordered;
+    use tokio::stream::StreamExt;
 
     #[tokio::test(threaded_scheduler)]
     async fn general() {
+        let _ = env_logger::try_init();
         let server_group = "ranged_index_test";
         let server_addr = String::from("127.0.0.1:5711");
         let server = NebServer::new_from_opts(
@@ -40,12 +43,19 @@ mod tests {
             .unwrap(),
         );
         let index_client =
-            client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await;
+            Arc::new(client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await);
         let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * 8;
-        for i in 0..test_capacity {
-            let id = Id::new(1, i as u64);
-            let key = EntryKey::from_id(&id);
-            assert!(index_client.insert(&key).await.unwrap());
+        let mut futs = FuturesUnordered::new();
+        for i in 0..test_capacity { 
+            let index_client = index_client.clone();
+            futs.push(async move {
+                let id = Id::new(1, i as u64);
+                let key = EntryKey::from_id(&id);
+                index_client.insert(&key).await
+            });
+        }
+        while let Some(result) = futs.next().await {
+            assert!(result.unwrap());
         }
     }
 }

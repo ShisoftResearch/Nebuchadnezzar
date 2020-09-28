@@ -197,6 +197,7 @@ impl LSMTreeService {
         client: &Arc<AsyncClient>,
         sm_client: &Arc<SMClient>,
     ) {
+        debug!("Starting range indexer tree balancer");
         let trees_map = trees_map.clone();
         let client = client.clone();
         let sm_client = sm_client.clone();
@@ -206,9 +207,11 @@ impl LSMTreeService {
                     let tree = &dist_tree.tree;
                     tree.merge_levels();
                     if tree.oversized() {
+                        debug!("Tree {:?} oversized, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
                         let mid_key = tree.mid_key().unwrap();
                         let migration_target_id = Id::rand();
+                        debug!("Creating migration target tree {:?} split at {:?}", migration_target_id, mid_key);
                         let migration_tree = LSMTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
@@ -216,27 +219,31 @@ impl LSMTreeService {
                                 pivot: mid_key.clone(),
                             });
                         }
+                        debug!("Marking migration for tree {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client)
                             .await;
                         let buffer_size = BLOCK_SIZE << 2;
                         let mut cursor = tree.seek(&mid_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
-                        // Moving keys
+                        debug!("Start moving keys for {:?}", dist_tree.id);
                         while cursor.current().is_some() {
                             if let Some(entry) = cursor.next() {
                                 entry_buffer.push(entry);
                                 if entry_buffer.len() >= buffer_size {
+                                    debug!("Merging entry buffer, size {}", entry_buffer.len());
                                     migration_tree.merge_keys(Box::new(entry_buffer));
                                     entry_buffer = Vec::with_capacity(buffer_size);
                                 }
                             }
                         }
+                        debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
                         sm_client
                             .split(&migration_target_id, &mid_key)
                             .await
                             .unwrap();
                         // Reset state on current tree
+                        debug!("Unmark migration {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, None, &client).await;
                         {
                             let mut dist_prop = dist_tree.prop.write();

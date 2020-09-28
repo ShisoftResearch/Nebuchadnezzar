@@ -19,7 +19,6 @@ pub struct MasterTreeSM {
     tree: BTreeMap<EntryKey, Id>,
     raft_svr: Arc<RaftService>,
     conshash: Arc<ConsistentHashing>,
-    sm_id: u64,
 }
 
 raft_state_machine! {
@@ -32,7 +31,7 @@ impl StateMachineCmds for MasterTreeSM {
     fn locate_key(&self, entry: EntryKey) -> BoxFuture<(EntryKey, Id, EntryKey)> {
         let (lower, id) = self
             .tree
-            .range(..entry.clone())
+            .range(..=entry.clone())
             .last()
             .map(|(key, id)| (key.clone(), *id))
             .unwrap();
@@ -41,7 +40,7 @@ impl StateMachineCmds for MasterTreeSM {
             .range(entry..)
             .next()
             .map(|(key, _)| key.clone())
-            .unwrap();
+            .unwrap_or_else(|| EntryKey::max());
         future::ready((lower, id, upper)).boxed()
     }
 
@@ -56,7 +55,7 @@ impl StateMachineCmds for MasterTreeSM {
 impl StateMachineCtl for MasterTreeSM {
     raft_sm_complete!();
     fn id(&self) -> u64 {
-        self.sm_id
+        DEFAULT_SM_ID
     }
     fn snapshot(&self) -> Option<Vec<u8>> {
         Some(utils::serde::serialize(&self.tree))
@@ -69,12 +68,11 @@ impl StateMachineCtl for MasterTreeSM {
 }
 
 impl MasterTreeSM {
-    pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>, sm_id: u64) -> Self {
+    pub fn new(raft_svr: &Arc<RaftService>, conshash: &Arc<ConsistentHashing>) -> Self {
         Self {
             tree: BTreeMap::new(),
             raft_svr: raft_svr.clone(),
             conshash: conshash.clone(),
-            sm_id,
         }
     }
     pub async fn try_initialize(&mut self) -> bool {

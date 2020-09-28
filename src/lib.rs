@@ -3,7 +3,6 @@
 #![feature(test)]
 #![feature(async_closure)]
 
-#[macro_use]
 extern crate static_assertions;
 #[macro_use]
 extern crate log;

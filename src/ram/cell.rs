@@ -9,7 +9,6 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
 use std::io::Cursor;
 use std::ops::{Index, IndexMut};
-use std::sync::Arc;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 

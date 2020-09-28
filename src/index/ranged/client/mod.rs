@@ -30,7 +30,7 @@ impl RangedQueryClient {
         raft_client: &Arc<RaftClient>,
         neb_client: &Arc<AsyncClient>,
     ) -> Self {
-        let sm = SMClient::new(DEFAULT_SERVICE_ID, raft_client);
+        let sm = SMClient::new(crate::index::ranged::sm::DEFAULT_SM_ID, raft_client);
         Self {
             conshash: conshash.clone(),
             sm: Arc::new(sm),
