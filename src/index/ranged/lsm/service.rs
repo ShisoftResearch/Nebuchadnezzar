@@ -253,7 +253,7 @@ impl LSMTreeService {
                     }
                 }
                 // Sleep for a while to check for trees to be merge in levels
-                tokio::time::delay_for(Duration::from_secs(5)).await;
+                tokio::time::delay_for(Duration::from_millis(500)).await;
             }
         });
     }

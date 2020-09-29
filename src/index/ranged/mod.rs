@@ -15,7 +15,7 @@ mod tests {
     use futures::stream::FuturesUnordered;
     use tokio::stream::StreamExt;
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(core_threads = 128, max_threads = 128)]
     async fn general() {
         let _ = env_logger::try_init();
         let server_group = "ranged_index_test";
