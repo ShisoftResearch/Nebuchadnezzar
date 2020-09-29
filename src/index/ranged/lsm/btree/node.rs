@@ -606,12 +606,15 @@ where
                 let cell_id = cell.id();
                 debug!("Updating node cell {:?}", cell_id);
                 match neb.upsert_cell(cell).await {
-                    Ok(Ok(_)) => {},
+                    Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         warn!("Cell node update error for {:?}, error: {:?}", cell_id, e);
-                    },
+                    }
                     Err(e) => {
-                        error!("Cell node insertion error for {:?}, error: {:?}", cell_id, e);
+                        error!(
+                            "Cell node insertion error for {:?}, error: {:?}",
+                            cell_id, e
+                        );
                     }
                 }
                 debug!("Cell {:?} updated", cell_id);
@@ -677,7 +680,9 @@ pub fn insert_into_split<T, S>(
 {
     trace!(
         "insert into split left len {}, right len {}, pos {}",
-        xlen, ylen, pos
+        xlen,
+        ylen,
+        pos
     );
     if pos < *xlen {
         trace!("insert into left part, pos: {}", pos);

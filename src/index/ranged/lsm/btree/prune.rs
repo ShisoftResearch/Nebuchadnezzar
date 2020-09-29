@@ -55,7 +55,11 @@ where
     altered.added.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut all_pages = probe_key_range(node, &altered, level);
-    debug!("Prune had detected {} pages at level {}", all_pages.len(), level);
+    debug!(
+        "Prune had detected {} pages at level {}",
+        all_pages.len(),
+        level
+    );
     if all_pages.is_empty() {
         trace!("No node to prune at this level - {}", level);
         return (box level_page_altered, box vec![]);
@@ -77,7 +81,11 @@ where
         level,
     );
 
-    debug!("Prune had detected {} living pages at level {}", all_pages.len(), level); 
+    debug!(
+        "Prune had detected {} living pages at level {}",
+        all_pages.len(),
+        level
+    );
 
     // alter keys
     {
@@ -94,8 +102,12 @@ where
 
     all_pages = update_right_nodes(all_pages);
 
-    debug!("Prune had updated right nodes for {} living pages at level {}", all_pages.len(), level);
-    
+    debug!(
+        "Prune had updated right nodes for {} living pages at level {}",
+        all_pages.len(),
+        level
+    );
+
     debug_assert!(
         is_node_list_serial(&all_pages),
         "node not serial before checking corner cases"
@@ -105,7 +117,11 @@ where
         all_pages = update_right_nodes(all_pages);
     }
 
-    debug!("Prune had merged all single ref pages, now have {} living pages at level {}", all_pages.len(), level);
+    debug!(
+        "Prune had merged all single ref pages, now have {} living pages at level {}",
+        all_pages.len(),
+        level
+    );
 
     debug_assert!(
         is_node_list_serial(&all_pages),
@@ -362,7 +378,8 @@ where
                     innode.ptrs = new_ptrs;
                     trace!(
                         "Found non-empty node, new ptr length {}, node len {}",
-                        ptr_len, innode.len
+                        ptr_len,
+                        innode.len
                     );
                 }
                 debug_assert!(
@@ -519,7 +536,8 @@ where
                     };
                     {
                         let mut current_node = all_pages[index].innode_mut();
-                        current_node.keys.as_slice()[keys_cap - 1] = current_node.right_bound.clone();
+                        current_node.keys.as_slice()[keys_cap - 1] =
+                            current_node.right_bound.clone();
                         current_node.right_bound = right_node_bound;
                         current_node.ptrs.as_slice()[keys_cap] = right_node_ptr;
                         current_node.len += 1;
@@ -531,9 +549,18 @@ where
                     let (current_bound, current_ptr) = {
                         let current_node = all_pages[index].innode_mut();
                         debug_assert_eq!(current_node.len, keys_cap);
-                        mem::swap(&mut current_node.keys.as_slice()[keys_cap - 1], &mut current_node.right_bound);
-                        let current_right_bound = mem::replace(&mut current_node.keys.as_slice()[keys_cap - 1], EntryKey::new());
-                        let current_right_ptr = mem::replace(&mut current_node.ptrs.as_slice()[keys_cap], NodeCellRef::new_none::<KS, PS>());
+                        mem::swap(
+                            &mut current_node.keys.as_slice()[keys_cap - 1],
+                            &mut current_node.right_bound,
+                        );
+                        let current_right_bound = mem::replace(
+                            &mut current_node.keys.as_slice()[keys_cap - 1],
+                            EntryKey::new(),
+                        );
+                        let current_right_ptr = mem::replace(
+                            &mut current_node.ptrs.as_slice()[keys_cap],
+                            NodeCellRef::new_none::<KS, PS>(),
+                        );
                         current_node.len -= 1;
                         (current_right_bound, current_right_ptr)
                     };
@@ -560,7 +587,12 @@ where
             // if the right page is full, partial of the right page will be moved to the third page
             // the emptying node will always been cleaned
             // It is not legit to move keys and ptrs from right to left, I have tried and there are errors
-            debug!("Dealing with single ptr node {}, has {} pages in level {}", index, all_pages.len(), level);
+            debug!(
+                "Dealing with single ptr node {}, has {} pages in level {}",
+                index,
+                all_pages.len(),
+                level
+            );
             corner_case_handled = true;
             // extract keys, ptrs from right that will merge to left
             // new right key bound and right ref  from right (if right will be removed) also defines here

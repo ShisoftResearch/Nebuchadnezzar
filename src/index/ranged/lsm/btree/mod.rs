@@ -5,9 +5,9 @@ pub use cursor::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use external::page_schema;
-use futures::FutureExt;
 use external::*;
 use futures::future::BoxFuture;
+use futures::FutureExt;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
@@ -225,7 +225,8 @@ where
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to<'a>(&'a self, level: usize, upper_level: &'a dyn LevelTree) -> BoxFuture<'a, usize>;
+    fn merge_to<'a>(&'a self, level: usize, upper_level: &'a dyn LevelTree)
+        -> BoxFuture<'a, usize>;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
@@ -260,10 +261,12 @@ where
         self.len()
     }
 
-    fn merge_to<'a>(&'a self, level: usize, upper_level: &'a dyn LevelTree) -> BoxFuture<'a, usize> {
-        async move {
-            level::level_merge(level, self, upper_level).await
-        }.boxed()
+    fn merge_to<'a>(
+        &'a self,
+        level: usize,
+        upper_level: &'a dyn LevelTree,
+    ) -> BoxFuture<'a, usize> {
+        async move { level::level_merge(level, self, upper_level).await }.boxed()
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -321,7 +324,11 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn merge_to<'a>(&'a self, _level: usize, _upper_level: &'a dyn LevelTree) -> BoxFuture<'a, usize> {
+    fn merge_to<'a>(
+        &'a self,
+        _level: usize,
+        _upper_level: &'a dyn LevelTree,
+    ) -> BoxFuture<'a, usize> {
         unreachable!()
     }
 

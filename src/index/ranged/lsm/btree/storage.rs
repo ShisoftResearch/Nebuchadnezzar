@@ -25,7 +25,7 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                 CHANGE_PROGRESS.store(id, Ordering::Relaxed);
             }
             tokio::time::delay_for(Duration::from_millis(500)).await;
-        } 
+        }
     });
     unsafe {
         WB_STARTED = true;

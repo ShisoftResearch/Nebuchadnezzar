@@ -216,7 +216,10 @@ impl Cell {
         self.header.version += 1;
         match addr_opt {
             None => {
-                error!("Cannot allocate new spaces in chunk, total cells {}", chunk.cell_count());
+                error!(
+                    "Cannot allocate new spaces in chunk, total cells {}",
+                    chunk.cell_count()
+                );
                 return Err(WriteError::CannotAllocateSpace);
             }
             Some(pending_entry) => {

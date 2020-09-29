@@ -5,16 +5,16 @@ mod trees;
 
 #[cfg(test)]
 mod tests {
+    use super::lsm::btree::storage;
     use super::*;
     use crate::client::*;
-    use crate::server::*;
-    use std::sync::Arc;
-    use crate::index::EntryKey;
     use crate::index::ranged::lsm::btree;
+    use crate::index::EntryKey;
     use crate::ram::types::Id;
-    use super::lsm::btree::storage;
-    use std::time::Duration;
+    use crate::server::*;
     use futures::stream::FuturesUnordered;
+    use std::sync::Arc;
+    use std::time::Duration;
     use tokio::stream::StreamExt;
 
     #[tokio::test(core_threads = 128, max_threads = 128)]
@@ -44,12 +44,16 @@ mod tests {
             .await
             .unwrap(),
         );
-        let index_client =
-            Arc::new(client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await);
+        let index_client = Arc::new(
+            client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
+        );
         let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * 8;
         let mut futs = FuturesUnordered::new();
-        info!("Testing ranged indexer preesure test with {} items", test_capacity);
-        for i in 0..test_capacity { 
+        info!(
+            "Testing ranged indexer preesure test with {} items",
+            test_capacity
+        );
+        for i in 0..test_capacity {
             let index_client = index_client.clone();
             futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);

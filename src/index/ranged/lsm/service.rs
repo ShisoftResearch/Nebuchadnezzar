@@ -212,7 +212,10 @@ impl LSMTreeService {
                         // Tree oversized, need to migrate
                         let mid_key = tree.mid_key().unwrap();
                         let migration_target_id = Id::rand();
-                        debug!("Creating migration target tree {:?} split at {:?}", migration_target_id, mid_key);
+                        debug!(
+                            "Creating migration target tree {:?} split at {:?}",
+                            migration_target_id, mid_key
+                        );
                         let migration_tree = LSMTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();

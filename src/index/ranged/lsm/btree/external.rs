@@ -1,4 +1,5 @@
 use super::*;
+use crate::index::ranged::lsm::btree::level::LEVEL_M;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
@@ -11,7 +12,6 @@ use itertools::Itertools;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{mem, panic};
-use crate::index::ranged::lsm::btree::level::LEVEL_M;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -273,7 +273,10 @@ where
     pub fn merge_with(&mut self, right: &mut Self) {
         trace!(
             "Merge external node, left len {}:{:?}, right len {}:{:?}",
-            self.len, self.keys, right.len, right.keys
+            self.len,
+            self.keys,
+            right.len,
+            right.keys
         );
         let self_len = self.len;
         let new_len = self.len + right.len;
@@ -388,9 +391,9 @@ where
 }
 
 pub fn make_deleted<KS, PS>(id: &Id)
-    where
-        KS: Slice<EntryKey> + Debug + 'static,
-        PS: Slice<NodeCellRef> + 'static,
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
 {
     // Only accept lower higher level trees
     if KS::slice_len() > LEVEL_M {

@@ -34,7 +34,11 @@ where
             trace!("Acquiring first node");
             let first_node = write_node(node);
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
-            debug!("This level {} has {:?} external nodes to select", level, num_pages(&first_node));
+            debug!(
+                "This level {} has {:?} external nodes to select",
+                level,
+                num_pages(&first_node)
+            );
             let mut collected = vec![first_node];
             let target_guards = if KS::slice_len() > LEVEL_M {
                 KS::slice_len()
@@ -64,7 +68,6 @@ where
     }
 }
 
-
 fn num_pages<KS, PS>(head_page: &NodeWriteGuard<KS, PS>) -> (usize, usize)
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -91,7 +94,11 @@ where
     (num, non_empty)
 }
 
-pub async fn level_merge<KS, PS>(level: usize, src_tree: &BPlusTree<KS, PS>, dest_tree: &dyn LevelTree) -> usize
+pub async fn level_merge<KS, PS>(
+    level: usize,
+    src_tree: &BPlusTree<KS, PS>,
+    dest_tree: &dyn LevelTree,
+) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -103,7 +110,10 @@ where
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
 
     debug!("Merge selected {} pages", left_most_leaf_guards.len());
-    debug!("Have {:?} pages after selection", num_pages(&left_most_leaf_guards[0]));
+    debug!(
+        "Have {:?} pages after selection",
+        num_pages(&left_most_leaf_guards[0])
+    );
     if cfg!(debug_assertions) {
         if left_most_id != src_tree.head_page_id {
             dump_tree(src_tree, "level_lsm_merge_failure_dump.json");
@@ -135,7 +145,11 @@ where
             .cloned()
             .collect_vec();
         num_keys_moved = keys.len();
-        debug!("Merging {} keys, have {}", num_keys_moved, src_tree.len.load(Relaxed));
+        debug!(
+            "Merging {} keys, have {}",
+            num_keys_moved,
+            src_tree.len.load(Relaxed)
+        );
         dest_tree.merge_with_keys(box keys);
         for rk in &merged_deleted_keys {
             deleted_keys.remove(rk);
@@ -177,7 +191,10 @@ where
             g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
             g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
         }
-        debug!("Have {:?} pages after removal", num_pages(&left_most_leaf_guards[0]));
+        debug!(
+            "Have {:?} pages after removal",
+            num_pages(&left_most_leaf_guards[0])
+        );
         trace!("Acquiring new first node");
         let mut new_first_node = write_node::<KS, PS>(&right_right_most);
         let mut new_first_node_ext = new_first_node.extnode_mut(src_tree);
