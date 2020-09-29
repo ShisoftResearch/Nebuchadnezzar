@@ -24,8 +24,8 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                 }
                 CHANGE_PROGRESS.store(id, Ordering::Relaxed);
             }
-            tokio::time::delay_for(Duration::from_millis(100)).await;
-        }
+            tokio::time::delay_for(Duration::from_millis(500)).await;
+        } 
     });
     unsafe {
         WB_STARTED = true;
@@ -38,7 +38,7 @@ pub async fn wait_until_updated() {
             return;
         }
     }
-    let newest = external::CHANGE_COUNTER.load(Ordering::Acquire);
+    let newest = external::CHANGE_COUNTER.load(Ordering::Acquire) - 1; // fetch add
     loop {
         let current = CHANGE_PROGRESS.load(Ordering::Relaxed);
         if current >= newest {

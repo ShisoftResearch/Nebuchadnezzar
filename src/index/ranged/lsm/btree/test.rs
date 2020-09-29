@@ -349,7 +349,7 @@ async fn level_merge() {
     assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     debug!("MERGING...");
-    let merged = tree_1.merge_to(&*tree_2).await;
+    let merged = tree_1.merge_to(999, &*tree_2).await;
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");

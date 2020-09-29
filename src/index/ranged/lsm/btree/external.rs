@@ -11,6 +11,7 @@ use itertools::Itertools;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::{mem, panic};
+use crate::index::ranged::lsm::btree::level::LEVEL_M;
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
 pub const KEYS_FIELD: &'static str = "keys";
@@ -374,20 +375,30 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    CHANGED_NODES.push((
-        CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::Modified(NodeModified {
-            node: node.clone(),
-            deletion: tree.deleted.clone(),
-        }),
-    ));
+    // Only accept lower higher level trees
+    if KS::slice_len() > LEVEL_M {
+        CHANGED_NODES.push((
+            CHANGE_COUNTER.fetch_add(1, Relaxed),
+            ChangingNode::Modified(NodeModified {
+                node: node.clone(),
+                deletion: tree.deleted.clone(),
+            }),
+        ));
+    }
 }
 
-pub fn make_deleted(id: &Id) {
-    CHANGED_NODES.push((
-        CHANGE_COUNTER.fetch_add(1, Relaxed),
-        ChangingNode::Deleted(*id),
-    ));
+pub fn make_deleted<KS, PS>(id: &Id)
+    where
+        KS: Slice<EntryKey> + Debug + 'static,
+        PS: Slice<NodeCellRef> + 'static,
+{
+    // Only accept lower higher level trees
+    if KS::slice_len() > LEVEL_M {
+        CHANGED_NODES.push((
+            CHANGE_COUNTER.fetch_add(1, Relaxed),
+            ChangingNode::Deleted(*id),
+        ));
+    }
 }
 
 pub fn page_schema() -> Schema {

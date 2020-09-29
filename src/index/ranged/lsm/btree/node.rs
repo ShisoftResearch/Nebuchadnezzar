@@ -536,7 +536,7 @@ where
             *right_guard.left_ref_mut().unwrap() = left_node.clone().unwrap();
         }
         if let NodeData::External(ex_node) = data {
-            make_deleted(&ex_node.id)
+            make_deleted::<KS, PS>(&ex_node.id)
         }
         let empty = EmptyNode {
             left: left_node,
@@ -603,8 +603,8 @@ where
         let neb = neb.clone();
         async move {
             if let Some(cell) = cell {
-                debug!("Updating node cell {:?}", cell.header.id());
                 let cell_id = cell.id();
+                debug!("Updating node cell {:?}", cell_id);
                 match neb.upsert_cell(cell).await {
                     Ok(Ok(_)) => {},
                     Ok(Err(e)) => {
@@ -614,6 +614,7 @@ where
                         error!("Cell node insertion error for {:?}, error: {:?}", cell_id, e);
                     }
                 }
+                debug!("Cell {:?} updated", cell_id);
             }
         }
         .boxed()

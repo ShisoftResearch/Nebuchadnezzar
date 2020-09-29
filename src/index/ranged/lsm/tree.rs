@@ -75,14 +75,17 @@ impl LSMTree {
         LSMTreeCursor::new(entry, &self.trees, ordering)
     }
 
-    pub fn merge_levels(&self) {
+    pub async fn merge_levels(&self) -> bool {
+        let mut merged = false;
         for i in 0..self.trees.len() - 1 {
             if self.trees[i].oversized() {
-                debug!("Level {} tree oversized, merging", i);
-                self.trees[i].merge_to(&*self.trees[i + 1]);
-                debug!("Level {} merge completed", i);
+                trace!("Level {} tree oversized, merging", i);
+                self.trees[i].merge_to(i, &*self.trees[i + 1]).await;
+                trace!("Level {} merge completed", i);
+                merged = true;
             }
         }
+        merged
     }
 
     pub fn oversized(&self) -> bool {

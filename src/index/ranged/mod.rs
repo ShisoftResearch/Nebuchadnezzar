@@ -12,6 +12,8 @@ mod tests {
     use crate::index::EntryKey;
     use crate::index::ranged::lsm::btree;
     use crate::ram::types::Id;
+    use super::lsm::btree::storage;
+    use std::time::Duration;
     use futures::stream::FuturesUnordered;
     use tokio::stream::StreamExt;
 
@@ -23,7 +25,7 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 8 * 1024 * 1024 * 1024, // 8G
+                memory_size: 1 * 1024 * 1024 * 1024, // 1G
                 backup_storage: None,
                 wal_storage: None,
                 services: vec![Service::Cell, Service::RangedIndexer],
@@ -59,6 +61,10 @@ mod tests {
         while let Some(result) = futs.next().await {
             assert!(result.unwrap().unwrap());
         }
+        info!("Waiting for 10 secs");
+        tokio::time::delay_for(Duration::from_secs(10)).await;
+        info!("Waiting tree storage");
+        storage::wait_until_updated().await;
         info!("Total cells {}", client.count().await.unwrap());
     }
 }

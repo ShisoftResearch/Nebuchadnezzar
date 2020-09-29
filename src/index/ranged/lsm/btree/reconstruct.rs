@@ -139,7 +139,7 @@ where
         let mut prev_lock = write_node::<KS, PS>(&prev_ref);
         if node.len == 0 {
             // skip this empty node and make it deleted
-            external::make_deleted(&node.id);
+            external::make_deleted::<KS, PS>(&node.id);
             if at_end {
                 // if the empty node is the last node, assign the right none node to previous node
                 *prev_lock.right_ref_mut().unwrap() = node.next.clone();

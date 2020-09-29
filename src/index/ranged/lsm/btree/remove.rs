@@ -19,7 +19,7 @@ where
         match &*node {
             &NodeData::None => return footprint,
             &NodeData::External(ref node) => {
-                external::make_deleted(&node.id);
+                external::make_deleted::<KS, PS>(&node.id);
             }
             _ => {}
         }

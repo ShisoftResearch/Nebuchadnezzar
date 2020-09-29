@@ -203,9 +203,10 @@ impl LSMTreeService {
         let sm_client = sm_client.clone();
         tokio::spawn(async move {
             loop {
+                let mut fast_mode = false;
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    tree.merge_levels();
+                    fast_mode = fast_mode | tree.merge_levels().await;
                     if tree.oversized() {
                         debug!("LSM Tree {:?} oversized, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
@@ -252,8 +253,10 @@ impl LSMTreeService {
                         }
                     }
                 }
-                // Sleep for a while to check for trees to be merge in levels
-                tokio::time::delay_for(Duration::from_millis(500)).await;
+                if !fast_mode {
+                    // Sleep for a while to check for trees to be merge in levels
+                    tokio::time::delay_for(Duration::from_millis(500)).await;
+                }
             }
         });
     }

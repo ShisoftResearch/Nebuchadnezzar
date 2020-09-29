@@ -16,14 +16,14 @@ use std::sync::atomic::Ordering::Relaxed;
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
 pub const LEVEL_TREE_DEPTH: u32 = 3;
 
-pub const LEVEL_M: usize = 8;
+pub const LEVEL_M: usize = 8; // Smaller can be faster but more fragmented
 pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
 pub const NUM_LEVELS: usize = 3;
 
 // Select left most leaf nodes and acquire their write guard
-fn select<KS, PS>(node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
+fn select<KS, PS>(level: usize, node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -34,9 +34,13 @@ where
             trace!("Acquiring first node");
             let first_node = write_node(node);
             assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
-            debug!("This level has {:?} external nodes to select", num_pages(&first_node));
+            debug!("This level {} has {:?} external nodes to select", level, num_pages(&first_node));
             let mut collected = vec![first_node];
-            let target_guards = KS::slice_len(); // pages to collect
+            let target_guards = if KS::slice_len() > LEVEL_M {
+                KS::slice_len()
+            } else {
+                KS::slice_len().pow(LEVEL_TREE_DEPTH - 1) >> 1 // merge half of the pages from memory
+            }; // pages to collect
             while collected.len() < target_guards {
                 trace!("Acquiring select collection node");
                 let right = write_node(collected.last().unwrap().right_ref().unwrap());
@@ -56,7 +60,7 @@ where
             }
             return collected;
         }
-        MutSearchResult::Internal(node) => select::<KS, PS>(&node),
+        MutSearchResult::Internal(node) => select::<KS, PS>(level, &node),
     }
 }
 
@@ -87,12 +91,12 @@ where
     (num, non_empty)
 }
 
-pub async fn level_merge<KS, PS>(src_tree: &BPlusTree<KS, PS>, dest_tree: &dyn LevelTree) -> usize
+pub async fn level_merge<KS, PS>(level: usize, src_tree: &BPlusTree<KS, PS>, dest_tree: &dyn LevelTree) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut left_most_leaf_guards = select::<KS, PS>(&src_tree.get_root());
+    let mut left_most_leaf_guards = select::<KS, PS>(level, &src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
     let num_keys_moved;
     let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
@@ -165,7 +169,7 @@ where
         debug_assert!(!right_right_most.ptr_eq(left_most_leaf_guards.last().unwrap().node_ref()));
 
         for g in &mut left_most_leaf_guards {
-            external::make_deleted(&g.ext_id());
+            external::make_deleted::<KS, PS>(&g.ext_id());
             removed_nodes
                 .removed
                 .push((g.right_bound().clone(), g.node_ref().clone()));
@@ -189,7 +193,9 @@ where
         new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = left_left_most;
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
+        debug!("Waiting storage to finish");
         storage::wait_until_updated().await;
+        debug!("Level {} merge completed", level);
     }
 
     // cleanup upper level references
