@@ -535,6 +535,9 @@ where
             let mut right_guard = write_node::<KS, PS>(&right_node);
             *right_guard.left_ref_mut().unwrap() = left_node.clone().unwrap();
         }
+        if let NodeData::External(ex_node) = data {
+            make_deleted(&ex_node.id)
+        }
         let empty = EmptyNode {
             left: left_node,
             right: right_node,

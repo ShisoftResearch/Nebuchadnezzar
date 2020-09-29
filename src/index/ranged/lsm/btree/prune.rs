@@ -208,6 +208,11 @@ where
         // all_pages contains all of the entry keys we need to work for remove, add and modify
         all_pages.push(next);
     }
+    if !all_pages.is_empty() {
+        // add one more page that does not involved in the changes for potential merging
+        let last_right = all_pages.last().unwrap().right_ref().unwrap().clone();
+        all_pages.push(write_node::<KS, PS>(&last_right));
+    }
     trace!("Prune selected level {}, {} pages", level, all_pages.len());
     return all_pages;
 }

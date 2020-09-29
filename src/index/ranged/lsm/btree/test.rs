@@ -319,8 +319,8 @@ type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
 type TinyPtrSlice = [NodeCellRef; TINY_PAGE_SIZE + 1];
 type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 
-#[test]
-fn level_merge() {
+#[tokio::test(threaded_scheduler)]
+async fn level_merge() {
     let _ = env_logger::try_init();
     let range = 1000;
     let tree_1 = Arc::new(TinyLevelBPlusTree::new());
@@ -349,7 +349,7 @@ fn level_merge() {
     assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     debug!("MERGING...");
-    let merged = tree_1.merge_to(&*tree_2);
+    let merged = tree_1.merge_to(&*tree_2).await;
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
