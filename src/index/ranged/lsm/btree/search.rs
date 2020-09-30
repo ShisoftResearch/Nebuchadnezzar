@@ -65,13 +65,6 @@ where
                 );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                 debug_assert!(pos <= n.len);
-                debug_assert!(
-                    !next_node_ref.is_default(),
-                    "default node at pos {}, len {}, keys {:?}",
-                    pos,
-                    n.len,
-                    &n.keys.as_slice_immute()[..pos]
-                );
                 Err(next_node_ref.clone())
             }
             &NodeData::Empty(ref n) => Err(n.right.clone()),

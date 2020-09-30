@@ -11,9 +11,6 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut footprint = 0;
-    if node_ref.is_default() {
-        return footprint;
-    }
     let mut node = write_node::<KS, PS>(node_ref);
     loop {
         match &*node {

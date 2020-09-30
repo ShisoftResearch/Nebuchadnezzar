@@ -10,7 +10,6 @@ use dovahkiin::types::type_id_of;
 use dovahkiin::types::value::ToValue;
 use itertools::Itertools;
 use std::marker::PhantomData;
-use std::sync::Arc;
 use std::{mem, panic};
 
 pub const PAGE_SCHEMA: &'static str = "NEB_BTREE_PAGE";
@@ -225,7 +224,7 @@ where
         if !self_next.is_none() {
             let mut self_next_node = self_next.extnode_mut(tree);
             debug_assert!(
-                Arc::ptr_eq(&self_next_node.prev.inner, &self_ref.inner),
+                self_next_node.prev.ptr_eq(&self_ref),
                 "node next node's prev node is not self {:?}",
                 self_next_node.keys.as_slice_immute()[0]
             );

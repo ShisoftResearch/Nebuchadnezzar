@@ -374,11 +374,5 @@ impl LevelTree for DummyLevelTree {
 impl_slice_ops!([EntryKey; 0], EntryKey, 0);
 impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
 
-
-
-type DefaultKeySliceType = [EntryKey; 0];
-type DefaultPtrSliceType = [NodeCellRef; 0];
-type DefaultNodeDataType = NodeData<DefaultKeySliceType, DefaultPtrSliceType>;
-
 #[cfg(test)]
 pub mod test;

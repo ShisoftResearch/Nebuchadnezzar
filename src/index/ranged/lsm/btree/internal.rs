@@ -512,25 +512,6 @@ where
                     &self.keys.as_slice_immute()[..self.len]
                 );
             }
-
-            for (i, ptr) in self.ptrs.as_slice_immute()[..self.len + 1]
-                .iter()
-                .enumerate()
-            {
-                debug_assert!(
-                    !ptr.is_default(),
-                    "{} ptrs {}/{}, len {}, keys: {:?}, default ptrs: {:?}",
-                    KS::slice_len(),
-                    i,
-                    self.len + 1,
-                    self.len,
-                    &self.keys.as_slice_immute()[..self.len],
-                    self.ptrs.as_slice_immute()[..self.len + 1]
-                        .iter()
-                        .map(|r| r.is_default())
-                        .collect_vec()
-                );
-            }
         }
     }
 }

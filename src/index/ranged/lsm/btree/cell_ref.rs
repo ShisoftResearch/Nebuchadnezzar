@@ -1,11 +1,31 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ptr;
+use futures::FutureExt;
+use futures::prelude::*;
+
+type DefaultKeySliceType = [EntryKey; 0];
+type DefaultPtrSliceType = [NodeCellRef; 0];
+type DefaultNodeDataType = NodeData<DefaultKeySliceType, DefaultPtrSliceType>;
+type DefaultNodeType = Node<DefaultKeySliceType, DefaultPtrSliceType>;
+
+lazy_static! {
+    static ref DEFAULT_NODE: DefaultNodeType = Node::default();
+}
 
 pub struct NodeCellRef {
-    pub inner: Arc<dyn AnyNode>,
+    inner: *mut NodeRefInner<dyn AnyNode>,
+}
+
+struct NodeRefInner<T: ?Sized> {
+    counter: AtomicUsize,
+    obj: T
 }
 
 unsafe impl Send for NodeCellRef {}
 unsafe impl Sync for NodeCellRef {}
+unsafe impl <T: ?Sized> Send for NodeRefInner<T> {}
+unsafe impl <T: ?Sized> Sync for NodeRefInner<T> {}
 
 impl NodeCellRef {
     pub fn new<KS, PS>(node: Node<KS, PS>) -> Self
@@ -13,8 +33,12 @@ impl NodeCellRef {
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
     {
-        NodeCellRef {
-            inner: Arc::new(node),
+        let node_ref: Box<NodeRefInner<dyn AnyNode>> = Box::new(NodeRefInner {
+            counter: AtomicUsize::new(1),
+            obj: node
+        });
+        Self {
+            inner: Box::into_raw(node_ref),
         }
     }
 
@@ -23,7 +47,7 @@ impl NodeCellRef {
         KS: Slice<EntryKey> + Debug + 'static,
         PS: Slice<NodeCellRef> + 'static,
     {
-        Node::<KS, PS>::none_ref()
+        Self::default()
     }
 
     #[inline]
@@ -35,17 +59,17 @@ impl NodeCellRef {
         // The only unmatched scenario is the NodeCellRef was constructed by default function
         // Because the size of different type of NodeData are the same, we can still cast them safely
         // for NodeData have a fixed size for all the time
-        debug_assert!(
-            self.inner.is_type::<Node<KS, PS>>(),
-            "Node ref type unmatched, is default: {}",
-            self.is_default()
-        );
-        unsafe { &*(self.inner.deref() as *const dyn AnyNode as *const Node<KS, PS>) }
+        unsafe {
+            if self.is_default() {
+                return ((&*DEFAULT_NODE) as *const DefaultNodeType as usize as *const Node<KS, PS>).as_ref().unwrap()
+            }
+            let inner = self.inner.as_ref().unwrap();
+            ((&inner.obj) as *const dyn AnyNode as *const Node<KS, PS>).as_ref().unwrap()
+        }
     }
 
     pub fn is_default(&self) -> bool {
-        self.inner
-            .is_type::<Node<DefaultKeySliceType, DefaultPtrSliceType>>()
+        self.inner as *const NodeRefInner<DefaultNodeType> as usize == 0
     }
 
     pub fn to_string<KS, PS>(&self) -> String
@@ -72,25 +96,52 @@ impl NodeCellRef {
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
-        self.inner.persist(self, deletion, neb)
+        if !self.is_default() {
+            unsafe {
+                return self.inner.as_ref().unwrap().obj.persist(self, deletion, neb).boxed();
+            }
+        }
+        future::ready(()).boxed()
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+        self.inner == other.inner
     }
 }
 
 impl Clone for NodeCellRef {
     fn clone(&self) -> Self {
-        NodeCellRef {
-            inner: self.inner.clone(),
+        if !self.is_default() {
+            unsafe {
+                let inner = self.inner.as_ref().unwrap();
+                inner.counter.fetch_add(1, Ordering::Relaxed);
+                return NodeCellRef {
+                    inner: self.inner
+                }
+            }
+        }
+        Self::default()
+    }
+}
+
+impl Drop for NodeCellRef {
+    fn drop(&mut self) {
+        if !self.is_default() {
+            unsafe {
+                let inner = self.inner.as_ref().unwrap();
+                let c = inner.counter.fetch_sub(1, Ordering::Relaxed);
+                if c == 1 {
+                    Box::from_raw(self.inner);
+                }
+            }
         }
     }
 }
 
 impl Default for NodeCellRef {
     fn default() -> Self {
-        let data: DefaultNodeDataType = NodeData::None;
-        Self::new(Node::new(data))
+        Self {
+            inner: 0usize as *mut NodeRefInner<DefaultNodeType>,
+        }
     }
 }

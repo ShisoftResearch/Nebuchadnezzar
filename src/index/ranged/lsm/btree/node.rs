@@ -315,7 +315,7 @@ where
 
 const LATCH_FLAG: usize = !(!0 >> 1);
 
-pub trait AnyNode: Any + 'static {
+pub trait AnyNode: Any + Send + Sync + 'static {
     fn persist(
         &self,
         node_ref: &NodeCellRef,
@@ -357,7 +357,7 @@ where
         Self::new(NodeData::None)
     }
     pub fn none_ref() -> NodeCellRef {
-        NodeCellRef::new(Node::<KS, PS>::with_none())
+        NodeCellRef::default()
     }
     pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
         Self::with_external(ExtNode::new(id, right_bound))
