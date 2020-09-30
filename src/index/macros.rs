@@ -1,11 +1,7 @@
 macro_rules! make_array {
-    ($n: expr, $constructor:expr) => {
+    ($n: expr) => {
         unsafe {
-            let mut items: [_; $n] = mem::zeroed();
-            for place in items.iter_mut() {
-                std::ptr::write(place, $constructor);
-            }
-            items
+            mem::zeroed()
         }
     };
 }
@@ -17,7 +13,7 @@ macro_rules! impl_slice_ops {
                 self
             }
             fn init() -> Self {
-                make_array!($n, Self::item_default())
+                make_array!($n)
             }
             fn slice_len() -> usize {
                 $n
