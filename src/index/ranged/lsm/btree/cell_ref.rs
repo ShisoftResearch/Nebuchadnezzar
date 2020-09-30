@@ -1,12 +1,10 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::ptr;
 use futures::FutureExt;
 use futures::prelude::*;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
-type DefaultNodeDataType = NodeData<DefaultKeySliceType, DefaultPtrSliceType>;
 type DefaultNodeType = Node<DefaultKeySliceType, DefaultPtrSliceType>;
 
 lazy_static! {
