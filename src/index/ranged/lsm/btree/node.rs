@@ -379,6 +379,7 @@ where
     // trace!("acquiring node write lock");
     let node_deref = node.deref();
     let cc = &node_deref.cc;
+    let backoff = crossbeam::utils::Backoff::new();
     loop {
         let cc_num = cc.load(Relaxed);
         let expected = cc_num & (!LATCH_FLAG);
@@ -394,6 +395,7 @@ where
             }
             _ => {}
         }
+        backoff.spin();
     }
 }
 
@@ -419,10 +421,12 @@ where
 {
     let mut handler = read_unchecked(node);
     let cc = &node.deref::<KS, PS>().cc;
+    let backoff = crossbeam::utils::Backoff::new();
     loop {
         let cc_num = cc.load(SeqCst);
         if cc_num & LATCH_FLAG == LATCH_FLAG {
             // trace!("read have a latch, retry {:b}", cc_num);
+            backoff.spin();
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);

@@ -56,7 +56,7 @@ where
 
     let mut all_pages = probe_key_range(node, &altered, level);
     debug!(
-        "Prune had detected {} pages at level {}",
+        "Prune had selected {} pages at level {}",
         all_pages.len(),
         level
     );
@@ -82,7 +82,7 @@ where
     );
 
     debug!(
-        "Prune had detected {} living pages at level {}",
+        "Prune had selected {} living pages at level {}",
         all_pages.len(),
         level
     );
@@ -227,7 +227,9 @@ where
     if !all_pages.is_empty() {
         // add one more page that does not involved in the changes for potential merging
         let last_right = all_pages.last().unwrap().right_ref().unwrap().clone();
-        all_pages.push(write_node::<KS, PS>(&last_right));
+        let last_right_guard = write_node::<KS, PS>(&last_right);
+        debug_assert!(!last_right_guard.is_none());
+        all_pages.push(last_right_guard);
     }
     trace!("Prune selected level {}, {} pages", level, all_pages.len());
     return all_pages;

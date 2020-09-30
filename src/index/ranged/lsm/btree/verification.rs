@@ -17,6 +17,9 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
+    if node.is_none() {
+        return true;
+    }
     if !are_keys_serial(node.keys()) {
         return false;
     }
