@@ -98,8 +98,8 @@ where
     pub fn new() -> BPlusTree<KS, PS> {
         trace!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let mut tree = BPlusTree {
-            root: RwLock::new(NodeCellRef::default()),
-            root_versioning: NodeCellRef::default(),
+            root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::new(NodeData::None))),
+            root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
             deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),

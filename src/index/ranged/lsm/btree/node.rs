@@ -329,8 +329,8 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    data: UnsafeCell<NodeData<KS, PS>>,
     cc: AtomicUsize,
+    data: UnsafeCell<NodeData<KS, PS>>,
 }
 
 impl<KS, PS> Node<KS, PS>
