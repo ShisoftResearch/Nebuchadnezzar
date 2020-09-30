@@ -207,7 +207,7 @@ where
             let mut guard = write_node::<KS, PS>(node_ref);
             guard
                 .left_ref_mut()
-                .map(|r| *r = NodeCellRef::new::<KS, PS>(Node::with_none()));
+                .map(|r| *r = NodeCellRef::default());
             guard.right_ref_mut().map(|r| *r = non_empty.clone());
             return non_empty;
         } else {
@@ -353,15 +353,14 @@ where
         Self::new(NodeData::External(extnode))
     }
 
-    pub fn with_none() -> Self {
-        Self::new(NodeData::None)
-    }
     pub fn none_ref() -> NodeCellRef {
         NodeCellRef::default()
     }
+
     pub fn new_external(id: Id, right_bound: EntryKey) -> Self {
         Self::with_external(ExtNode::new(id, right_bound))
     }
+
     pub fn version(&self) -> usize {
         node_version(self.cc.load(SeqCst))
     }
@@ -659,16 +658,6 @@ where
 pub struct RemoveStatus {
     pub item_found: bool,
     pub removed: bool,
-}
-
-impl<KS, PS> Default for Node<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    fn default() -> Self {
-        Node::with_none()
-    }
 }
 
 pub fn insert_into_split<T, S>(

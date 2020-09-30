@@ -43,7 +43,7 @@ where
         box InNode {
             keys: KS::init(),
             ptrs: PS::init(),
-            right: NodeCellRef::new(Node::<KS, PS>::with_none()),
+            right: NodeCellRef::default(),
             right_bound,
             len,
         }

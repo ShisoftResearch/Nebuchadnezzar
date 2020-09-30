@@ -8,7 +8,7 @@ type DefaultPtrSliceType = [NodeCellRef; 0];
 type DefaultNodeType = Node<DefaultKeySliceType, DefaultPtrSliceType>;
 
 lazy_static! {
-    static ref DEFAULT_NODE: DefaultNodeType = Node::default();
+    static ref DEFAULT_NODE: DefaultNodeType = Node::new(NodeData::None);
 }
 
 pub struct NodeCellRef {
