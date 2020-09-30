@@ -16,8 +16,9 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::stream::StreamExt;
+    use crate::index::ranged::lsm::tree::LAST_LEVEL_MULT_FACTOR;
 
-    #[tokio::test(core_threads = 128, max_threads = 128)]
+    #[tokio::test(threaded_scheduler)]
     async fn general() {
         let _ = env_logger::try_init();
         let server_group = "ranged_index_test";
@@ -47,7 +48,7 @@ mod tests {
         let index_client = Arc::new(
             client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
         );
-        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * 8;
+        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2) * LAST_LEVEL_MULT_FACTOR * 8;
         let mut futs = FuturesUnordered::new();
         info!(
             "Testing ranged indexer preesure test with {} items",

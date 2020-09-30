@@ -12,6 +12,8 @@ use std::sync::Arc;
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
 pub const LSM_TREE_MIGRATION_NAME: &'static str = "migration";
+pub const LAST_LEVEL_MULT_FACTOR: usize = 16;
+
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
 type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS];
 
@@ -89,7 +91,7 @@ impl LSMTree {
     }
 
     pub fn oversized(&self) -> bool {
-        self.last_level_tree().oversized()
+        self.last_level_tree().count() > self.ideal_capacity()
     }
 
     pub fn mid_key(&self) -> Option<EntryKey> {
@@ -110,7 +112,7 @@ impl LSMTree {
     }
 
     pub fn ideal_capacity(&self) -> usize {
-        self.last_level_tree().ideal_capacity()
+        self.last_level_tree().ideal_capacity() * LAST_LEVEL_MULT_FACTOR
     }
 
     fn last_level_tree(&self) -> &Box<dyn LevelTree> {
