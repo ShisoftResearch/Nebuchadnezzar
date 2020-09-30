@@ -419,6 +419,10 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut handler = read_unchecked(node);
+    if handler.is_none() {
+        // Will not wait for none node for no one change it
+        return func(&handler);
+    }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
