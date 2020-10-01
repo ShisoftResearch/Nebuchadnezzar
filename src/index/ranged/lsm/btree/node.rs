@@ -607,7 +607,7 @@ where
         async move {
             if let Some(cell) = cell {
                 let cell_id = cell.id();
-                debug!("Updating node cell {:?}", cell_id);
+                trace!("Updating node cell {:?}", cell_id);
                 match neb.upsert_cell(cell).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
@@ -620,7 +620,7 @@ where
                         );
                     }
                 }
-                debug!("Cell {:?} updated", cell_id);
+                trace!("Cell {:?} updated", cell_id);
             }
         }
         .boxed()
@@ -652,6 +652,16 @@ where
 
     fn deref(&self) -> &<Self as Deref>::Target {
         unsafe { &*self.node_ref.deref().data.get() }
+    }
+}
+
+impl <KS, PS> NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    pub fn node_ref(&self) -> &NodeCellRef {
+        &self.node_ref
     }
 }
 

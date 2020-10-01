@@ -102,3 +102,20 @@ where
     });
     res.unwrap_or_else(|e| mut_search::<KS, PS>(&e, key))
 }
+
+pub fn mut_first<KS, PS>(node_ref: &NodeCellRef) -> MutSearchResult
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+        &NodeData::Internal(ref n) => {
+            let sub_node = n.ptrs.as_slice_immute()[0].clone();
+            Ok(MutSearchResult::Internal(sub_node))
+        }
+        &NodeData::External(_) => Ok(MutSearchResult::External),
+        &NodeData::Empty(ref n) => Err(n.right.clone()),
+        &NodeData::None => unreachable!(),
+    });
+    res.unwrap_or_else(|e| mut_first::<KS, PS>(&e))
+}

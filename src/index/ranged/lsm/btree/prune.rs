@@ -42,6 +42,7 @@ where
         let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
         // first meet empty should be the removed external node
         if sub_node.is_empty_node() || sub_node.is_ext() {
+            debug!("Probe ended at level {}, found child node {}", level, sub_node.type_name());
             (altered, box vec![])
         } else {
             prune::<KS, PS>(&sub_node_ref, altered, level + 1)
@@ -100,33 +101,36 @@ where
         );
     }
 
-    all_pages = update_right_nodes(all_pages);
-
-    debug!(
-        "Prune had updated right nodes for {} living pages at level {}",
-        all_pages.len(),
-        level
-    );
-
-    debug_assert!(
-        is_node_list_serial(&all_pages),
-        "node not serial before checking corner cases"
-    );
-
-    if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
+    if level != 0 {
         all_pages = update_right_nodes(all_pages);
+
+        debug!(
+            "Prune had updated right nodes for {} living pages at level {}",
+            all_pages.len(),
+            level
+        );
+        if all_pages.len() > 2 {
+            debug_assert!(
+                is_node_list_serial(&all_pages),
+                "node not serial before checking corner cases"
+            );
+        
+            if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
+                all_pages = update_right_nodes(all_pages);
+            }
+        
+            debug!(
+                "Prune had merged all single ref pages, now have {} living pages at level {}",
+                all_pages.len(),
+                level
+            );
+        
+            debug_assert!(
+                is_node_list_serial(&all_pages),
+                "node not serial after checked corner cases"
+            );
+        }
     }
-
-    debug!(
-        "Prune had merged all single ref pages, now have {} living pages at level {}",
-        all_pages.len(),
-        level
-    );
-
-    debug_assert!(
-        is_node_list_serial(&all_pages),
-        "node not serial after checked corner cases"
-    );
 
     (box level_page_altered, box all_pages)
 }
@@ -169,68 +173,40 @@ where
     trace!("Acquiring first prune node");
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
-    let mut removed_ptrs = removed_iter(&altered).map(|(_, p)| p).peekable();
-    let mut altered_ptrs = altered_iter(&altered).map(|(_, p)| p).peekable();
-    let mut added_ptrs = added_iter(&altered).map(|(k, _)| k).peekable();
+    let max_key = {
+        let removed = removed_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
+        let alted = altered_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
+        let added = added_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
+        [removed, alted, added].iter().max().unwrap().clone()
+    };
     // This process will probe pages by all alter node types in this level to select the right pages
     // which contains those entries to work with
     loop {
-        let last_page = all_pages.last().unwrap().borrow();
-        let last_innode = last_page.innode();
-
-        debug_assert!(!last_page.is_none());
-        debug_assert!(!last_page.is_empty_node());
-        debug_assert!(
-            is_node_serial(last_page),
-            "node not serial on fetching pages {:?} - {}",
-            last_page.keys(),
-            level
-        );
-        for p in &last_innode.ptrs.as_slice_immute()[..=last_innode.len] {
-            if removed_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
-                removed_ptrs.next();
-                trace!("remove hit !!!");
-            }
-            if altered_ptrs.peek().map(|rp| rp.ptr_eq(p)) == Some(true) {
-                altered_ptrs.next();
-                trace!("key modified hit !!!");
-            }
-        }
-        while let Some(add_key) = added_ptrs.peek() {
-            if add_key < &&last_innode.right_bound {
-                added_ptrs.next();
-                trace!("add node page hit !!!")
-            } else {
-                // First encounter of the larger page item should be the place for insertion
+        let (next, ends) = {
+            let last_page = all_pages.last().unwrap().borrow();
+            if last_page.is_none() {
                 break;
             }
-        }
-        if removed_ptrs.peek().is_none()
-            && altered_ptrs.peek().is_none()
-            && added_ptrs.peek().is_none()
-        {
-            break;
-        }
-        trace!("Acquiring pruning node");
-        let next = write_node::<KS, PS>(&last_innode.right);
-        debug_assert!(
-            !next.is_none(),
-            "ended at none without empty altered list, remains, removed {}; altered {}; added {}",
-            removed_ptrs.count(),
-            altered_ptrs.count(),
-            added_ptrs.count()
-        );
-        debug_assert!(!next.is_empty());
+            debug_assert!(!last_page.is_empty_node());
+            let last_innode = last_page.innode();
+            debug_assert!(
+                is_node_serial(last_page),
+                "node not serial on fetching pages {:?} - {}",
+                last_page.keys(),
+                level
+            );
+            (
+                write_node::<KS, PS>(&last_innode.right),
+                &last_innode.right_bound > max_key
+            )
+        };
         // all_pages contains all of the entry keys we need to work for remove, add and modify
         all_pages.push(next);
+        if ends {
+            break;
+        }
     }
-    if !all_pages.is_empty() {
-        // add one more page that does not involved in the changes for potential merging
-        let last_right = all_pages.last().unwrap().right_ref().unwrap().clone();
-        let last_right_guard = write_node::<KS, PS>(&last_right);
-        all_pages.push(last_right_guard);
-    }
-    trace!("Prune selected level {}, {} pages", level, all_pages.len());
+    debug!("Prune selected at level {}, {} pages", level, all_pages.len());
     return all_pages;
 }
 
@@ -323,13 +299,6 @@ where
                 .collect_vec()
         })
         .collect_vec();
-    debug_assert!(
-        removed.next().is_none(),
-        "remaining removed {}, total {}, level {}",
-        removed.count() + 1,
-        altered.removed.len(),
-        level
-    );
     matching_refs
 }
 
@@ -486,10 +455,10 @@ where
         .enumerate()
         .map(|(i, p)| {
             if p.is_none() {
-                return p.node_ref().clone();
+                return NodeCellRef::default();
             }
             let right_ref = if i == non_emptys.len() - 1 {
-                NodeCellRef::new_none::<KS, PS>()
+                NodeCellRef::default()
             } else {
                 non_emptys[i + 1].node_ref().clone()
             };

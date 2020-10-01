@@ -66,8 +66,12 @@ impl NodeCellRef {
         }
     }
 
+    pub fn address(&self) -> usize {
+        self.inner as *const NodeRefInner<DefaultNodeType> as usize
+    }
+
     pub fn is_default(&self) -> bool {
-        self.inner as *const NodeRefInner<DefaultNodeType> as usize == 0
+        self.address() == 0
     }
 
     pub fn to_string<KS, PS>(&self) -> String

@@ -160,3 +160,52 @@ where
     }
     return true;
 }
+
+pub fn tree_has_no_empty_node<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool 
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static
+{
+    debug!("Asserting tree has no empty node");
+    let res = ensure_level_no_empty::<KS, PS>(&tree.get_root());
+    debug!("Asserting tree has no empty node...Success");
+    res
+}
+
+fn ensure_level_no_empty<KS, PS>(node: &NodeCellRef) -> bool
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let first_node = read_unchecked::<KS, PS>(&node);
+    let sub_ref = match &*first_node {
+        &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
+        &NodeData::External(_) => {
+            let mut node = first_node;
+            let mut counter = -1;
+            loop {
+                counter += 1;
+                if node.is_none() {
+                    break;
+                }
+                if node.is_empty() {
+                    panic!("Found empty at external page {}", counter);
+                }
+                if node.is_ext() {
+                    let next = read_unchecked::<KS, PS>(node.right_ref().unwrap());
+                    // debug!("Tracking down to address {}", next.node_ref().address());
+                    assert!(!next.node_ref().ptr_eq(node.node_ref()));
+                    node = next;
+                    continue;
+                }
+                unreachable!();
+            }
+            None
+        },
+        _ => panic!("Expecting external, got {}", first_node.type_name()),
+    };
+    if let Some(sub_level) = sub_ref {
+        return ensure_level_no_empty::<KS, PS>(&sub_level);
+    }
+    true
+}

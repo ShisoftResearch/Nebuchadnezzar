@@ -39,6 +39,7 @@ pub async fn wait_until_updated() {
         }
     }
     let newest = external::CHANGE_COUNTER.load(Ordering::Acquire) - 1; // fetch add
+    let ops = newest - CHANGE_PROGRESS.load(Ordering::Relaxed);
     loop {
         let current = CHANGE_PROGRESS.load(Ordering::Relaxed);
         if current >= newest {
@@ -46,5 +47,5 @@ pub async fn wait_until_updated() {
         }
         tokio::time::delay_for(Duration::from_millis(500)).await;
     }
-    debug!("Write back updated");
+    debug!("Write back updated, {} cells", ops);
 }

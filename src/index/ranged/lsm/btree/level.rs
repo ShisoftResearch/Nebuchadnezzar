@@ -3,12 +3,11 @@ use super::node::read_unchecked;
 use super::node::write_node;
 use super::node::NodeWriteGuard;
 use super::prune::*;
-use super::search::mut_search;
 use super::search::MutSearchResult;
 use super::NodeCellRef;
 use super::*;
 use super::{external, BPlusTree};
-use super::{LevelTree, MIN_ENTRY_KEY};
+use super::{LevelTree};
 use itertools::Itertools;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
@@ -28,17 +27,17 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let search = mut_search::<KS, PS>(node, &*MIN_ENTRY_KEY);
+    let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
             trace!("Acquiring first node");
             let first_node = write_node(node);
-            assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none());
             debug!(
                 "This level {} has {:?} external nodes to select",
                 level,
                 num_pages(&first_node)
             );
+            assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(), "Left most is not none, have {}", read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name());
             let mut collected = vec![first_node];
             let target_guards = if KS::slice_len() > LEVEL_M {
                 KS::slice_len()
@@ -103,6 +102,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    debug!("Merging level {}", level);
     let mut left_most_leaf_guards = select::<KS, PS>(level, &src_tree.get_root());
     let merge_page_len = left_most_leaf_guards.len();
     let num_keys_moved;
@@ -212,15 +212,17 @@ where
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
         debug!("Waiting storage to finish");
         storage::wait_until_updated().await;
-        debug!("Level {} merge completed", level);
+        debug!("Level {} merge completed, starting prune", level);
     }
 
     // cleanup upper level references
     prune::<KS, PS>(&src_tree.get_root(), box removed_nodes, 0);
 
+    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+
     src_tree.len.fetch_sub(num_keys_moved, Relaxed);
 
-    trace!("Merge completed");
+    debug!("Merge level {} completed, page len {}", level, merge_page_len);
 
     merge_page_len
 }
