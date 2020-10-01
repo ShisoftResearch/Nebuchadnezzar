@@ -49,6 +49,9 @@ where
 
     // check right ref
     for i in 0..nodes.len() - 1 {
+        if nodes[i + 1].is_none() {
+            break;
+        }
         let first_right_bound = nodes[i].right_bound();
         let second_first_node = nodes[i + 1].first_key();
         let second_right_bound = nodes[i + 1].right_bound();

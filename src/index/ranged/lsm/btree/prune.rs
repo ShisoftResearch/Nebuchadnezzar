@@ -228,7 +228,6 @@ where
         // add one more page that does not involved in the changes for potential merging
         let last_right = all_pages.last().unwrap().right_ref().unwrap().clone();
         let last_right_guard = write_node::<KS, PS>(&last_right);
-        debug_assert!(!last_right_guard.is_none());
         all_pages.push(last_right_guard);
     }
     trace!("Prune selected level {}, {} pages", level, all_pages.len());
@@ -294,6 +293,9 @@ where
                 "node not serial before live selection - {}",
                 level
             );
+            if page.is_none() {
+                return vec![];
+            }
             page.innode().ptrs.as_slice_immute()[..page.len() + 1]
                 .iter()
                 .enumerate()
@@ -345,7 +347,8 @@ where
         .into_iter()
         .zip(retained)
         .filter_map(|(mut page, retained_refs)| {
-            if retained_refs.len() == 0 {
+            let is_not_none = !page.is_none();
+            if is_not_none && retained_refs.len() == 0 {
                 // check if all the children ptr in this page have been removed
                 // if yes mark it and upper level will handel it
                 level_page_altered
@@ -357,38 +360,40 @@ where
                 trace!("Found empty node");
                 None
             } else {
-                // extract all live child ptrs and construct a new page from them
-                let mut new_keys = KS::init();
-                let mut new_ptrs = PS::init();
-                let ptr_len = retained_refs.len();
-                // Copy retained keys and refs to target page
-                for (i, &(oi, _)) in retained_refs.iter().skip(1).enumerate() {
-                    new_keys.as_slice()[i] = page.keys()[oi - 1].clone();
-                }
-                for (i, (_, ptr)) in retained_refs.into_iter().enumerate() {
-                    new_ptrs.as_slice()[i] = ptr;
-                }
-                {
+                if is_not_none {
+                    // extract all live child ptrs and construct a new page from them
+                    let mut new_keys = KS::init();
+                    let mut new_ptrs = PS::init();
+                    let ptr_len = retained_refs.len();
+                    // Copy retained keys and refs to target page
+                    for (i, &(oi, _)) in retained_refs.iter().skip(1).enumerate() {
+                        new_keys.as_slice()[i] = page.keys()[oi - 1].clone();
+                    }
+                    for (i, (_, ptr)) in retained_refs.into_iter().enumerate() {
+                        new_ptrs.as_slice()[i] = ptr;
+                    }
+                    {
+                        debug_assert!(
+                            is_node_serial(&page),
+                            "node not serial before update - {}",
+                            level
+                        );
+                        let mut innode = page.innode_mut();
+                        innode.len = ptr_len - 1;
+                        innode.keys = new_keys;
+                        innode.ptrs = new_ptrs;
+                        trace!(
+                            "Found non-empty node, new ptr length {}, node len {}",
+                            ptr_len,
+                            innode.len
+                        );
+                    }
                     debug_assert!(
                         is_node_serial(&page),
-                        "node not serial before update - {}",
+                        "node not serial after update - {}",
                         level
                     );
-                    let mut innode = page.innode_mut();
-                    innode.len = ptr_len - 1;
-                    innode.keys = new_keys;
-                    innode.ptrs = new_ptrs;
-                    trace!(
-                        "Found non-empty node, new ptr length {}, node len {}",
-                        ptr_len,
-                        innode.len
-                    );
                 }
-                debug_assert!(
-                    is_node_serial(&page),
-                    "node not serial after update - {}",
-                    level
-                );
                 Some(page)
             }
         })
@@ -404,12 +409,12 @@ fn update_and_mark_altered_keys<'a, KS, PS>(
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug_assert!(
-        is_node_serial(page),
-        "node not serial before update altered - {}",
-        level
-    );
-    {
+    if !page.is_none() {
+        debug_assert!(
+            is_node_serial(page),
+            "node not serial before update altered - {}",
+            level
+        );
         // update all nodes marked changed, not removed
         let page_ref = page.node_ref().clone();
         let innode = page.innode_mut();
@@ -453,13 +458,13 @@ fn update_and_mark_altered_keys<'a, KS, PS>(
                 innode.keys.as_slice()[i - 1] = new_key;
             }
         }
+        debug_assert!(
+            is_node_serial(page),
+            "node not serial after update altered - {}, keys {:?}",
+            level,
+            page.keys()
+        );
     }
-    debug_assert!(
-        is_node_serial(page),
-        "node not serial after update altered - {}, keys {:?}",
-        level,
-        page.keys()
-    );
 }
 
 fn update_right_nodes<KS, PS>(all_pages: Vec<NodeWriteGuard<KS, PS>>) -> Vec<NodeWriteGuard<KS, PS>>
@@ -480,6 +485,9 @@ where
         .iter()
         .enumerate()
         .map(|(i, p)| {
+            if p.is_none() {
+                return p.node_ref().clone();
+            }
             let right_ref = if i == non_emptys.len() - 1 {
                 NodeCellRef::new_none::<KS, PS>()
             } else {
@@ -500,7 +508,11 @@ where
     non_emptys
         .iter_mut()
         .zip(right_refs.into_iter())
-        .for_each(|(p, r)| *p.right_ref_mut().unwrap() = r);
+        .for_each(|(p, r)| {
+            if !p.is_none() {
+                *p.right_ref_mut().unwrap() = r
+            }
+        });
     return non_emptys;
 }
 
@@ -522,6 +534,9 @@ where
     let mut current_left_bound = min_entry_key();
     while index < all_pages.len() {
         if index < all_pages.len() - 1 {
+            if all_pages[index].is_none() || all_pages[index + 1].is_none() {
+                continue;
+            }
             let right_node_len = all_pages[index + 1].len();
             if right_node_len == 0 {
                 // right node length is 0, should merge with current node

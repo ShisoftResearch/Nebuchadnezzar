@@ -139,7 +139,7 @@ checksum = "cdb031dd78e28731d87d56cc8ffef4a8f36ca26c38fe2de700543e627f8a464a"
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#a0b7bbc2d10db5356e9f307f469219012d6d9f7c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#41cdaa4d890af9571ac723c8c4e287c8b4f6d310"
 dependencies = [
  "async-std",
  "bifrost_hasher",
@@ -167,7 +167,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#a0b7bbc2d10db5356e9f307f469219012d6d9f7c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#41cdaa4d890af9571ac723c8c4e287c8b4f6d310"
 dependencies = [
  "twox-hash",
 ]
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#a0b7bbc2d10db5356e9f307f469219012d6d9f7c"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#41cdaa4d890af9571ac723c8c4e287c8b4f6d310"
 dependencies = [
  "bifrost_hasher",
 ]
