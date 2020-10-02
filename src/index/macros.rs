@@ -1,8 +1,6 @@
 macro_rules! make_array {
     ($n: expr) => {
-        unsafe {
-            mem::zeroed()
-        }
+        unsafe { mem::zeroed() }
     };
 }
 

@@ -1,6 +1,7 @@
 use crate::client::AsyncClient;
 pub use crate::index::ranged::trees::*;
 use crate::ram::types::RandValue;
+pub use cell_ref::NodeCellRef;
 pub use cursor::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::{key_hash, PrimitiveArray, Value};
@@ -15,7 +16,6 @@ use level::LEVEL_TREE_DEPTH;
 use lightning::map::HashSet;
 use merge::merge_into_tree_node;
 pub use node::*;
-pub use cell_ref::NodeCellRef;
 use parking_lot::RwLock;
 use search::*;
 use split::remove_to_right;
@@ -29,6 +29,7 @@ use std::ops::DerefMut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::Arc;
 
+pub mod cell_ref;
 mod cursor;
 mod dump;
 mod external;
@@ -42,7 +43,6 @@ mod reconstruct;
 mod remove;
 mod search;
 mod split;
-pub mod cell_ref;
 pub mod storage;
 pub mod verification;
 #[macro_use]

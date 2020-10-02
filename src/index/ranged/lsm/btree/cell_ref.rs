@@ -1,7 +1,7 @@
 use super::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use futures::FutureExt;
 use futures::prelude::*;
+use futures::FutureExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
@@ -18,13 +18,13 @@ pub struct NodeCellRef {
 
 struct NodeRefInner<T: ?Sized> {
     counter: AtomicUsize,
-    obj: T
+    obj: T,
 }
 
 unsafe impl Send for NodeCellRef {}
 unsafe impl Sync for NodeCellRef {}
-unsafe impl <T: ?Sized> Send for NodeRefInner<T> {}
-unsafe impl <T: ?Sized> Sync for NodeRefInner<T> {}
+unsafe impl<T: ?Sized> Send for NodeRefInner<T> {}
+unsafe impl<T: ?Sized> Sync for NodeRefInner<T> {}
 
 impl NodeCellRef {
     pub fn new<KS, PS>(node: Node<KS, PS>) -> Self
@@ -34,7 +34,7 @@ impl NodeCellRef {
     {
         let node_ref: Box<NodeRefInner<dyn AnyNode>> = Box::new(NodeRefInner {
             counter: AtomicUsize::new(1),
-            obj: node
+            obj: node,
         });
         Self {
             inner: Box::into_raw(node_ref),
@@ -60,10 +60,14 @@ impl NodeCellRef {
         // for NodeData have a fixed size for all the time
         unsafe {
             if self.is_default() {
-                return ((&*DEFAULT_NODE) as *const DefaultNodeType as usize as *const Node<KS, PS>).as_ref().unwrap()
+                return ((&*DEFAULT_NODE) as *const DefaultNodeType as usize as *const Node<KS, PS>)
+                    .as_ref()
+                    .unwrap();
             }
             let inner = self.inner.as_ref().unwrap();
-            ((&inner.obj) as *const dyn AnyNode as *const Node<KS, PS>).as_ref().unwrap()
+            ((&inner.obj) as *const dyn AnyNode as *const Node<KS, PS>)
+                .as_ref()
+                .unwrap()
         }
     }
 
@@ -101,7 +105,13 @@ impl NodeCellRef {
     ) -> BoxFuture<()> {
         if !self.is_default() {
             unsafe {
-                return self.inner.as_ref().unwrap().obj.persist(self, deletion, neb).boxed();
+                return self
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .obj
+                    .persist(self, deletion, neb)
+                    .boxed();
             }
         }
         future::ready(()).boxed()
@@ -118,9 +128,7 @@ impl Clone for NodeCellRef {
             unsafe {
                 let inner = self.inner.as_ref().unwrap();
                 inner.counter.fetch_add(1, Ordering::Relaxed);
-                return NodeCellRef {
-                    inner: self.inner
-                }
+                return NodeCellRef { inner: self.inner };
             }
         }
         Self::default()

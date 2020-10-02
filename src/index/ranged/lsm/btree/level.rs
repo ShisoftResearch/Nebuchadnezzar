@@ -4,10 +4,10 @@ use super::node::write_node;
 use super::node::NodeWriteGuard;
 use super::prune::*;
 use super::search::MutSearchResult;
+use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use super::{external, BPlusTree};
-use super::{LevelTree};
 use itertools::Itertools;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering::Relaxed;
@@ -37,7 +37,11 @@ where
                 level,
                 num_pages(&first_node)
             );
-            assert!(read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(), "Left most is not none, have {}", read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name());
+            assert!(
+                read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(),
+                "Left most is not none, have {}",
+                read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name()
+            );
             let mut collected = vec![first_node];
             let target_guards = if KS::slice_len() > LEVEL_M {
                 KS::slice_len()
@@ -221,7 +225,10 @@ where
 
     src_tree.len.fetch_sub(num_keys_moved, Relaxed);
 
-    debug!("Merge level {} completed, page len {}", level, merge_page_len);
+    debug!(
+        "Merge level {} completed, page len {}",
+        level, merge_page_len
+    );
 
     merge_page_len
 }

@@ -205,9 +205,7 @@ where
         if node.is_empty_node() {
             let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
             let mut guard = write_node::<KS, PS>(node_ref);
-            guard
-                .left_ref_mut()
-                .map(|r| *r = NodeCellRef::default());
+            guard.left_ref_mut().map(|r| *r = NodeCellRef::default());
             guard.right_ref_mut().map(|r| *r = non_empty.clone());
             return non_empty;
         } else {
@@ -275,7 +273,9 @@ where
     return search_page;
 }
 
-pub fn unchecked_read_non_empty_node<KS, PS>(mut search_page: NodeReadHandler<KS, PS>) -> NodeReadHandler<KS, PS>
+pub fn unchecked_read_non_empty_node<KS, PS>(
+    mut search_page: NodeReadHandler<KS, PS>,
+) -> NodeReadHandler<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -666,7 +666,7 @@ where
     }
 }
 
-impl <KS, PS> NodeReadHandler<KS, PS>
+impl<KS, PS> NodeReadHandler<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

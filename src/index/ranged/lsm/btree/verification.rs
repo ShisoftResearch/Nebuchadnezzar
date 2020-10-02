@@ -161,10 +161,10 @@ where
     return true;
 }
 
-pub fn tree_has_no_empty_node<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool 
+pub fn tree_has_no_empty_node<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool
 where
     KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static
+    PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Asserting tree has no empty node");
     let res = ensure_level_no_empty::<KS, PS>(&tree.get_root());
@@ -201,7 +201,7 @@ where
                 unreachable!();
             }
             None
-        },
+        }
         _ => panic!("Expecting external, got {}", first_node.type_name()),
     };
     if let Some(sub_level) = sub_ref {

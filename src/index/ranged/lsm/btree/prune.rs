@@ -9,9 +9,9 @@ use super::{min_entry_key, NodeCellRef};
 use super::{NodeReadHandler, MIN_ENTRY_KEY};
 use itertools::Itertools;
 use std::borrow::Borrow;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::iter::{Iterator, Peekable};
-use std::collections::HashSet;
 
 type AlterPair = (EntryKey, NodeCellRef);
 
@@ -24,7 +24,12 @@ pub struct AlteredNodes {
 
 impl AlteredNodes {
     fn summary(&self) -> String {
-        format!("Removed {}, added {}, modified {}", self.removed.len(), self.added.len(), self.key_modified.len())
+        format!(
+            "Removed {}, added {}, modified {}",
+            self.removed.len(),
+            self.added.len(),
+            self.key_modified.len()
+        )
     }
     fn is_empty(&self) -> bool {
         self.removed.is_empty() && self.added.is_empty() && self.key_modified.is_empty()
@@ -52,7 +57,11 @@ where
         let sub_node = unchecked_read_non_empty_node(read_unchecked::<KS, PS>(&sub_node_ref));
         // first meet empty should be the removed external node
         if sub_node.is_ext() {
-            debug!("Probe ended at level {}, found child node {}", level, sub_node.type_name());
+            debug!(
+                "Probe ended at level {}, found child node {}",
+                level,
+                sub_node.type_name()
+            );
             (altered, box vec![])
         } else {
             prune::<KS, PS>(&sub_node_ref, altered, level + 1)
@@ -94,13 +103,22 @@ where
         debug!(
             "Prune retains pages {}, empty {}",
             page_children_to_be_retained.len(),
-            page_children_to_be_retained.iter().filter(|p| p.is_empty()).count()
+            page_children_to_be_retained
+                .iter()
+                .filter(|p| p.is_empty())
+                .count()
         );
         if cfg!(debug_assertions) {
             for (pid, page) in page_children_to_be_retained.iter().enumerate() {
                 for entry in page {
                     let node = read_unchecked::<KS, PS>(&entry.1);
-                    debug_assert!(!node.is_empty_node(), "{} - {:?}, {}", pid, entry, node.type_name());
+                    debug_assert!(
+                        !node.is_empty_node(),
+                        "{} - {:?}, {}",
+                        pid,
+                        entry,
+                        node.type_name()
+                    );
                 }
             }
         }
@@ -150,17 +168,17 @@ where
                 is_node_list_serial(&all_pages),
                 "node not serial before checking corner cases"
             );
-        
+
             if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
                 all_pages = update_right_nodes(all_pages);
             }
-        
+
             debug!(
                 "Prune had merged all single ref pages, now have {} living pages at level {}",
                 all_pages.len(),
                 level
             );
-        
+
             debug_assert!(
                 is_node_list_serial(&all_pages),
                 "node not serial after checked corner cases"
@@ -213,9 +231,18 @@ where
     let mut all_pages = vec![write_node::<KS, PS>(node)];
     // collect all pages in bound and in this level
     let max_key = {
-        let removed = removed_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
-        let alted = altered_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
-        let added = added_iter(&altered).map(|(e, _)| e).last().unwrap_or(&*MIN_ENTRY_KEY);
+        let removed = removed_iter(&altered)
+            .map(|(e, _)| e)
+            .last()
+            .unwrap_or(&*MIN_ENTRY_KEY);
+        let alted = altered_iter(&altered)
+            .map(|(e, _)| e)
+            .last()
+            .unwrap_or(&*MIN_ENTRY_KEY);
+        let added = added_iter(&altered)
+            .map(|(e, _)| e)
+            .last()
+            .unwrap_or(&*MIN_ENTRY_KEY);
         [removed, alted, added].iter().max().unwrap().clone()
     };
     // This process will probe pages by all alter node types in this level to select the right pages
@@ -236,7 +263,7 @@ where
             );
             (
                 write_node::<KS, PS>(&last_innode.right),
-                &last_innode.right_bound > max_key
+                &last_innode.right_bound > max_key,
             )
         };
         // all_pages contains all of the entry keys we need to work for remove, add and modify
@@ -245,7 +272,11 @@ where
             break;
         }
     }
-    debug!("Prune selected at level {}, {} pages", level, all_pages.len());
+    debug!(
+        "Prune selected at level {}, {} pages",
+        level,
+        all_pages.len()
+    );
     return all_pages;
 }
 
@@ -297,8 +328,17 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let removed = altered.removed.iter().map(|(_, r)| r.address()).collect::<HashSet<_>>();
-    debug!("Remove set is {:?}, size {} at level {}", removed, altered.removed.len(), level);
+    let removed = altered
+        .removed
+        .iter()
+        .map(|(_, r)| r.address())
+        .collect::<HashSet<_>>();
+    debug!(
+        "Remove set is {:?}, size {} at level {}",
+        removed,
+        altered.removed.len(),
+        level
+    );
     let mut remove_count = 0;
     let matching_refs = all_pages
         .iter()
@@ -326,7 +366,12 @@ where
                 .collect_vec()
         })
         .collect_vec();
-    debug!("Remove count is {}, should be {} at level {}", remove_count, removed.len(), level);
+    debug!(
+        "Remove count is {}, should be {} at level {}",
+        remove_count,
+        removed.len(),
+        level
+    );
     matching_refs
 }
 
