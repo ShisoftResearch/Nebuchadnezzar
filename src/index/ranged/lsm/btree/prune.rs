@@ -11,13 +11,24 @@ use itertools::Itertools;
 use std::borrow::Borrow;
 use std::fmt::Debug;
 use std::iter::{Iterator, Peekable};
+use std::collections::HashSet;
 
 type AlterPair = (EntryKey, NodeCellRef);
 
+#[derive(Debug)]
 pub struct AlteredNodes {
     pub removed: Vec<AlterPair>,
     pub added: Vec<AlterPair>,
     pub key_modified: Vec<AlterPair>,
+}
+
+impl AlteredNodes {
+    fn summary(&self) -> String {
+        format!("Removed {}, added {}, modified {}", self.removed.len(), self.added.len(), self.key_modified.len())
+    }
+    fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.added.is_empty() && self.key_modified.is_empty()
+    }
 }
 
 pub fn prune<'a, KS, PS>(
@@ -29,7 +40,6 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Start prune at level {}", level);
     let mut level_page_altered = AlteredNodes {
         removed: vec![],
         added: vec![],
@@ -39,16 +49,20 @@ where
         n.innode().ptrs.as_slice_immute()[0].clone()
     });
     let (mut altered, _sub_level_locks) = {
-        let sub_node = read_unchecked::<KS, PS>(&sub_node_ref);
+        let sub_node = unchecked_read_non_empty_node(read_unchecked::<KS, PS>(&sub_node_ref));
         // first meet empty should be the removed external node
-        if sub_node.is_empty_node() || sub_node.is_ext() {
+        if sub_node.is_ext() {
             debug!("Probe ended at level {}, found child node {}", level, sub_node.type_name());
             (altered, box vec![])
         } else {
             prune::<KS, PS>(&sub_node_ref, altered, level + 1)
         }
     };
-
+    if altered.is_empty() {
+        debug!("Nothing to do at level {}, skipped", level);
+        return (box level_page_altered, box vec![]);
+    }
+    debug!("Start prune at level {}", level);
     // Follwing procedures will scan the pages from left to right in key order, we need to sort it to
     // make sure the keys we are probing are also sorted
     altered.removed.sort_by(|a, b| a.0.cmp(&b.0));
@@ -69,18 +83,37 @@ where
         is_node_list_serial(&all_pages),
         "node list not serial after selection"
     );
+
     // insert new nodes
     insert_new_and_mark_altered_keys(&mut all_pages, &altered, &mut level_page_altered);
-
-    // Locating refrences in the pages to be removed
-    let page_children_to_be_retained = ref_to_be_retained(&mut all_pages, &altered, level);
-    // make all the necessary changes in current level pages according to is living children
-    all_pages = filter_retained(
-        all_pages,
-        page_children_to_be_retained,
-        &mut level_page_altered,
-        level,
-    );
+    debug!("Sub altred {}", altered.summary());
+    debug!("Cur altered {}", level_page_altered.summary());
+    if !altered.removed.is_empty() {
+        // Locating refrences in the pages to be removed
+        let page_children_to_be_retained = ref_to_be_retained(&mut all_pages, &altered, level);
+        debug!(
+            "Prune retains pages {}, empty {}",
+            page_children_to_be_retained.len(),
+            page_children_to_be_retained.iter().filter(|p| p.is_empty()).count()
+        );
+        if cfg!(debug_assertions) {
+            for (pid, page) in page_children_to_be_retained.iter().enumerate() {
+                for entry in page {
+                    let node = read_unchecked::<KS, PS>(&entry.1);
+                    debug_assert!(!node.is_empty_node(), "{} - {:?}, {}", pid, entry, node.type_name());
+                }
+            }
+        }
+        // make all the necessary changes in current level pages according to is living children
+        all_pages = filter_retained(
+            all_pages,
+            page_children_to_be_retained,
+            &mut level_page_altered,
+            level,
+        );
+        debug!("Sub altred {}", altered.summary());
+        debug!("Cur altered {}", level_page_altered.summary());
+    }
 
     debug!(
         "Prune had selected {} living pages at level {}",
@@ -100,6 +133,9 @@ where
             current_altered.count() + 1
         );
     }
+
+    debug!("Sub altred {}", altered.summary());
+    debug!("Cur altered {}", level_page_altered.summary());
 
     if level != 0 {
         all_pages = update_right_nodes(all_pages);
@@ -132,6 +168,9 @@ where
         }
     }
 
+    debug!("Sub altred {}", altered.summary());
+    debug!("Cur altered {}", level_page_altered.summary());
+    debug!("Prune completed at level {}", level);
     (box level_page_altered, box all_pages)
 }
 
@@ -258,7 +297,9 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut removed = peek_removed_iter(&altered);
+    let removed = altered.removed.iter().map(|(_, r)| r.address()).collect::<HashSet<_>>();
+    debug!("Remove set is {:?}, size {} at level {}", removed, altered.removed.len(), level);
+    let mut remove_count = 0;
     let matching_refs = all_pages
         .iter()
         .map(|page| {
@@ -276,29 +317,16 @@ where
                 .iter()
                 .enumerate()
                 .filter_map(|(i, sub_level)| {
-                    let mut found_removed = false;
-                    let current_removed = removed.peek();
-                    debug_assert_ne!(
-                        current_removed.map(|t: &&(EntryKey, NodeCellRef)| {
-                            read_unchecked::<KS, PS>(&t.1).is_empty()
-                        }),
-                        Some(false)
-                    );
-                    if let Some((_removed_key, removed_ptr)) = current_removed {
-                        if sub_level.ptr_eq(removed_ptr) {
-                            found_removed = true;
-                        }
+                    if removed.contains(&sub_level.address()) {
+                        remove_count += 1;
+                        return None;
                     }
-                    if !found_removed {
-                        Some((i, sub_level.clone()))
-                    } else {
-                        removed.next();
-                        None
-                    }
+                    Some((i, sub_level.clone()))
                 })
                 .collect_vec()
         })
         .collect_vec();
+    debug!("Remove count is {}, should be {} at level {}", remove_count, removed.len(), level);
     matching_refs
 }
 
@@ -326,7 +354,6 @@ where
                 // set length zero without do anything else
                 // this will ease read hazard
                 page.make_empty_node(false);
-                trace!("Found empty node");
                 None
             } else {
                 if is_not_none {

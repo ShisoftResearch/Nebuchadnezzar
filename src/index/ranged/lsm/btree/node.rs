@@ -275,6 +275,17 @@ where
     return search_page;
 }
 
+pub fn unchecked_read_non_empty_node<KS, PS>(mut search_page: NodeReadHandler<KS, PS>) -> NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    while search_page.is_empty_node() {
+        search_page = read_unchecked::<KS, PS>(search_page.right_ref().unwrap());
+    }
+    return search_page;
+}
+
 pub fn write_targeted<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,
     key: &EntryKey,

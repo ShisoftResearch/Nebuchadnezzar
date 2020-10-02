@@ -11,6 +11,7 @@ lazy_static! {
     static ref DEFAULT_NODE: DefaultNodeType = Node::new(NodeData::None);
 }
 
+#[derive(Debug)]
 pub struct NodeCellRef {
     inner: *mut NodeRefInner<dyn AnyNode>,
 }
