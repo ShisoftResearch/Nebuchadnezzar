@@ -187,11 +187,6 @@ fn added_iter<'a>(altered_keys: &AlteredNodes) -> impl Iterator<Item = &AlterPai
     altered_keys.added.iter()
 }
 
-fn peek_removed_iter<'a>(
-    altered_keys: &AlteredNodes,
-) -> Peekable<impl Iterator<Item = &AlterPair>> {
-    removed_iter(altered_keys).peekable()
-}
 fn peek_altered_iter<'a>(
     altered_keys: &AlteredNodes,
 ) -> Peekable<impl Iterator<Item = &AlterPair>> {
