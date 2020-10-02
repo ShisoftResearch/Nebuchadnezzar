@@ -101,8 +101,10 @@ where
         // Locating refrences in the pages to be removed
         let page_children_to_be_retained = ref_to_be_retained(&mut all_pages, &altered, level);
         debug!(
-            "Prune retains pages {}, empty {}",
+            "Prune retains {:?} pages {}, items {}, empty {}",
+            page_children_to_be_retained,
             page_children_to_be_retained.len(),
+            page_children_to_be_retained.iter().map(|p| p.len()).sum::<usize>(),
             page_children_to_be_retained
                 .iter()
                 .filter(|p| p.is_empty())

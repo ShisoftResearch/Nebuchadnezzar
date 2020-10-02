@@ -192,7 +192,7 @@ where
                 .removed
                 .push((g.right_bound().clone(), g.node_ref().clone()));
             g.make_empty_node(false);
-            g.left_ref_mut().map(|lr| *lr = left_left_most.clone());
+            g.left_ref_mut().map(|lr| *lr = NodeCellRef::default());
         }
         debug!(
             "Have {:?} pages after removal",
