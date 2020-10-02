@@ -23,8 +23,8 @@ pub const NUM_LEVELS: usize = 3;
 
 // Select left most leaf nodes and acquire their write guard
 fn merge_prune<KS, PS>(
-    level: usize, 
-    node: &NodeCellRef, 
+    level: usize,
+    node: &NodeCellRef,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
 ) -> (AlteredNodes, usize, Vec<NodeWriteGuard<KS, PS>>)
@@ -38,23 +38,25 @@ where
             debug!("Processing external level {}", level);
             let left_most_leaf_guards = select_ext_nodes(node);
             let num_guards = left_most_leaf_guards.len();
-            let (altered, num_keys) = merge_remove_empty_ext_nodes(left_most_leaf_guards, src_tree, dest_tree);
+            let (altered, num_keys) =
+                merge_remove_empty_ext_nodes(left_most_leaf_guards, src_tree, dest_tree);
             debug!("Merged {} keys, {} pages", num_keys, num_guards);
             (altered, num_keys, vec![])
         }
         MutSearchResult::Internal(sub_node) => {
-            let (lower_altered, num_keys, _lower_guards) = merge_prune(level + 1, &sub_node, src_tree, dest_tree);
+            let (lower_altered, num_keys, _lower_guards) =
+                merge_prune(level + 1, &sub_node, src_tree, dest_tree);
             debug!("Processing internal level {}, node {:?}", level, node);
             let (altered, guards) = prune(&node, lower_altered, level);
             (altered, num_keys, guards)
-        },
+        }
     }
 }
 
 fn merge_remove_empty_ext_nodes<KS, PS>(
-    mut left_most_leaf_guards: Vec<NodeWriteGuard<KS, PS>>, 
+    mut left_most_leaf_guards: Vec<NodeWriteGuard<KS, PS>>,
     src_tree: &BPlusTree<KS, PS>,
-    dest_tree: &dyn LevelTree
+    dest_tree: &dyn LevelTree,
 ) -> (AlteredNodes, usize)
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -193,14 +195,14 @@ where
         if right.is_none() {
             // Early break for reach the end of the linked list
             // Should not be possible, will warn
-            warn!("Searching node to move and reach the end, maybe this is not the right parameter");
+            warn!(
+                "Searching node to move and reach the end, maybe this is not the right parameter"
+            );
             break;
         } else {
             debug_assert!(!right.is_empty(), "found empty node on selection!!!");
             debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_none());
-            debug_assert!(
-                !read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node()
-            );
+            debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node());
             collected.push(right);
         }
     }

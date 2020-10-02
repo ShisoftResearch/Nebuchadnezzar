@@ -60,7 +60,8 @@ impl NodeCellRef {
         // for NodeData have a fixed size for all the time
         unsafe {
             if self.is_default() {
-                return ((&*DEFAULT_NODE) as *const DefaultNodeType as usize as *const Node<KS, PS>)
+                return ((&*DEFAULT_NODE) as *const DefaultNodeType as usize
+                    as *const Node<KS, PS>)
                     .as_ref()
                     .unwrap();
             }

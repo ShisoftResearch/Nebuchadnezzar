@@ -3,9 +3,9 @@ use super::node::Node;
 use super::node::NodeData;
 use super::node::*;
 use super::verification::{is_node_list_serial, is_node_serial};
+use super::MIN_ENTRY_KEY;
 use super::*;
 use super::{min_entry_key, NodeCellRef};
-use super::MIN_ENTRY_KEY;
 use itertools::Itertools;
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -87,7 +87,10 @@ where
             "Prune retains {:?} pages {}, items {}, empty {}",
             page_children_to_be_retained,
             page_children_to_be_retained.len(),
-            page_children_to_be_retained.iter().map(|p| p.len()).sum::<usize>(),
+            page_children_to_be_retained
+                .iter()
+                .map(|p| p.len())
+                .sum::<usize>(),
             page_children_to_be_retained
                 .iter()
                 .filter(|p| p.is_empty())
@@ -192,9 +195,7 @@ fn peek_altered_iter<'a>(
 ) -> Peekable<impl Iterator<Item = &AlterPair>> {
     altered_iter(altered_keys).peekable()
 }
-fn peek_added_iter<'a>(
-    altered_keys: &AlteredNodes,
-) -> Peekable<impl Iterator<Item = &AlterPair>> {
+fn peek_added_iter<'a>(altered_keys: &AlteredNodes) -> Peekable<impl Iterator<Item = &AlterPair>> {
     added_iter(altered_keys).peekable()
 }
 
