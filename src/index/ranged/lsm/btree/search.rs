@@ -17,7 +17,6 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("searching for {:?}", key);
     let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
         let node = &**node_handler;
         let gen_empty_cursor = || RTCursor {
@@ -32,7 +31,6 @@ where
             debug!("Search found a node at the right side");
             return Err(right_node.clone());
         }
-        debug!("search node have keys {:?}", node.keys());
         let mut pos = match node.search_unwindable(key) {
             Ok(pos) => pos,
             Err(_) => {

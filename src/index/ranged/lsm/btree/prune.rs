@@ -1,12 +1,11 @@
 use super::internal::InNode;
-use super::node::read_node;
 use super::node::Node;
 use super::node::NodeData;
 use super::node::*;
 use super::verification::{is_node_list_serial, is_node_serial};
 use super::*;
 use super::{min_entry_key, NodeCellRef};
-use super::{NodeReadHandler, MIN_ENTRY_KEY};
+use super::MIN_ENTRY_KEY;
 use itertools::Itertools;
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -38,9 +37,9 @@ impl AlteredNodes {
 
 pub fn prune<'a, KS, PS>(
     node: &NodeCellRef,
-    altered: Box<AlteredNodes>,
+    mut altered: AlteredNodes,
     level: usize,
-) -> (Box<AlteredNodes>, Box<Vec<NodeWriteGuard<KS, PS>>>)
+) -> (AlteredNodes, Vec<NodeWriteGuard<KS, PS>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -50,26 +49,10 @@ where
         added: vec![],
         key_modified: vec![],
     };
-    let sub_node_ref = read_node(node, |n: &NodeReadHandler<KS, PS>| {
-        n.innode().ptrs.as_slice_immute()[0].clone()
-    });
-    let (mut altered, _sub_level_locks) = {
-        let sub_node = unchecked_read_non_empty_node(read_unchecked::<KS, PS>(&sub_node_ref));
-        // first meet empty should be the removed external node
-        if sub_node.is_ext() {
-            debug!(
-                "Probe ended at level {}, found child node {}",
-                level,
-                sub_node.type_name()
-            );
-            (altered, box vec![])
-        } else {
-            prune::<KS, PS>(&sub_node_ref, altered, level + 1)
-        }
-    };
+
     if altered.is_empty() {
         debug!("Nothing to do at level {}, skipped", level);
-        return (box level_page_altered, box vec![]);
+        return (level_page_altered, vec![]);
     }
     debug!("Start prune at level {}", level);
     // Follwing procedures will scan the pages from left to right in key order, we need to sort it to
@@ -86,7 +69,7 @@ where
     );
     if all_pages.is_empty() {
         trace!("No node to prune at this level - {}", level);
-        return (box level_page_altered, box vec![]);
+        return (level_page_altered, vec![]);
     }
     debug_assert!(
         is_node_list_serial(&all_pages),
@@ -100,7 +83,7 @@ where
     if !altered.removed.is_empty() {
         // Locating refrences in the pages to be removed
         let page_children_to_be_retained = ref_to_be_retained(&mut all_pages, &altered, level);
-        debug!(
+        trace!(
             "Prune retains {:?} pages {}, items {}, empty {}",
             page_children_to_be_retained,
             page_children_to_be_retained.len(),
@@ -191,38 +174,38 @@ where
     debug!("Sub altred {}", altered.summary());
     debug!("Cur altered {}", level_page_altered.summary());
     debug!("Prune completed at level {}", level);
-    (box level_page_altered, box all_pages)
+    (level_page_altered, all_pages)
 }
 
-fn removed_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
+fn removed_iter<'a>(altered_keys: &AlteredNodes) -> impl Iterator<Item = &AlterPair> {
     altered_keys.removed.iter()
 }
-fn altered_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
+fn altered_iter<'a>(altered_keys: &AlteredNodes) -> impl Iterator<Item = &AlterPair> {
     altered_keys.key_modified.iter()
 }
-fn added_iter<'a>(altered_keys: &Box<AlteredNodes>) -> impl Iterator<Item = &AlterPair> {
+fn added_iter<'a>(altered_keys: &AlteredNodes) -> impl Iterator<Item = &AlterPair> {
     altered_keys.added.iter()
 }
 
 fn peek_removed_iter<'a>(
-    altered_keys: &Box<AlteredNodes>,
+    altered_keys: &AlteredNodes,
 ) -> Peekable<impl Iterator<Item = &AlterPair>> {
     removed_iter(altered_keys).peekable()
 }
 fn peek_altered_iter<'a>(
-    altered_keys: &Box<AlteredNodes>,
+    altered_keys: &AlteredNodes,
 ) -> Peekable<impl Iterator<Item = &AlterPair>> {
     altered_iter(altered_keys).peekable()
 }
 fn peek_added_iter<'a>(
-    altered_keys: &Box<AlteredNodes>,
+    altered_keys: &AlteredNodes,
 ) -> Peekable<impl Iterator<Item = &AlterPair>> {
     added_iter(altered_keys).peekable()
 }
 
 fn probe_key_range<KS, PS>(
     node: &NodeCellRef,
-    altered: &Box<AlteredNodes>,
+    altered: &AlteredNodes,
     level: usize,
 ) -> Vec<NodeWriteGuard<KS, PS>>
 where
@@ -247,6 +230,7 @@ where
             .unwrap_or(&*MIN_ENTRY_KEY);
         [removed, alted, added].iter().max().unwrap().clone()
     };
+    debug!("Max key to prune to is {:?}", max_key);
     // This process will probe pages by all alter node types in this level to select the right pages
     // which contains those entries to work with
     loop {
@@ -255,7 +239,7 @@ where
             if last_page.is_none() {
                 break;
             }
-            debug_assert!(!last_page.is_empty_node());
+            debug_assert!(!last_page.is_empty_node(), "at {:?}", last_page.node_ref());
             let last_innode = last_page.innode();
             debug_assert!(
                 is_node_serial(last_page),
@@ -284,7 +268,7 @@ where
 
 fn insert_new_and_mark_altered_keys<KS, PS>(
     all_pages: &mut Vec<NodeWriteGuard<KS, PS>>,
-    altered: &Box<AlteredNodes>,
+    altered: &AlteredNodes,
     next_level_altered: &mut AlteredNodes,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -323,7 +307,7 @@ fn insert_new_and_mark_altered_keys<KS, PS>(
 
 fn ref_to_be_retained<'a, KS, PS>(
     all_pages: &mut Vec<NodeWriteGuard<KS, PS>>,
-    altered: &Box<AlteredNodes>,
+    altered: &AlteredNodes,
     level: usize,
 ) -> Vec<Vec<(usize, NodeCellRef)>>
 where
@@ -341,6 +325,7 @@ where
         altered.removed.len(),
         level
     );
+    debug_assert!(all_pages.first().unwrap().first_key() <= &altered.removed.first().unwrap().0);
     let mut remove_count = 0;
     let matching_refs = all_pages
         .iter()
@@ -532,7 +517,7 @@ where
                 return NodeCellRef::default();
             }
             let right_ref = if i == non_emptys.len() - 1 {
-                NodeCellRef::default()
+                non_emptys[i].right_ref().unwrap().clone()
             } else {
                 non_emptys[i + 1].node_ref().clone()
             };

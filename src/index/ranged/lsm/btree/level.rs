@@ -22,7 +22,12 @@ pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const NUM_LEVELS: usize = 3;
 
 // Select left most leaf nodes and acquire their write guard
-fn select<KS, PS>(level: usize, node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
+fn merge_prune<KS, PS>(
+    level: usize, 
+    node: &NodeCellRef, 
+    src_tree: &BPlusTree<KS, PS>,
+    dest_tree: &dyn LevelTree,
+) -> (AlteredNodes, usize, Vec<NodeWriteGuard<KS, PS>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -30,85 +35,31 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            trace!("Acquiring first node");
-            let first_node = write_node(node);
-            debug!(
-                "This level {} has {:?} external nodes to select",
-                level,
-                num_pages(&first_node)
-            );
-            assert!(
-                read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(),
-                "Left most is not none, have {}",
-                read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name()
-            );
-            let mut collected = vec![first_node];
-            let target_guards = if KS::slice_len() > LEVEL_M {
-                KS::slice_len()
-            } else {
-                KS::slice_len().pow(LEVEL_TREE_DEPTH - 1) >> 1 // merge half of the pages from memory
-            }; // pages to collect
-            while collected.len() < target_guards {
-                trace!("Acquiring select collection node");
-                let right = write_node(collected.last().unwrap().right_ref().unwrap());
-                if right.is_none() {
-                    // Early break for reach the end of the linked list
-                    // Should not be possible, will warn
-                    warn!("Searching node to move and reach the end, maybe this is not the right parameter");
-                    break;
-                } else {
-                    debug_assert!(!right.is_empty(), "found empty node on selection!!!");
-                    debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_none());
-                    debug_assert!(
-                        !read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node()
-                    );
-                    collected.push(right);
-                }
-            }
-            return collected;
+            debug!("Processing external level {}", level);
+            let left_most_leaf_guards = select_ext_nodes(node);
+            let num_guards = left_most_leaf_guards.len();
+            let (altered, num_keys) = merge_remove_empty_ext_nodes(left_most_leaf_guards, src_tree, dest_tree);
+            debug!("Merged {} keys, {} pages", num_keys, num_guards);
+            (altered, num_keys, vec![])
         }
-        MutSearchResult::Internal(node) => select::<KS, PS>(level, &node),
+        MutSearchResult::Internal(sub_node) => {
+            let (lower_altered, num_keys, _lower_guards) = merge_prune(level + 1, &sub_node, src_tree, dest_tree);
+            debug!("Processing internal level {}, node {:?}", level, node);
+            let (altered, guards) = prune(&node, lower_altered, level);
+            (altered, num_keys, guards)
+        },
     }
 }
 
-fn num_pages<KS, PS>(head_page: &NodeWriteGuard<KS, PS>) -> (usize, usize)
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    let mut num = 0;
-    let mut non_empty = 0;
-    let mut node_ref = head_page.node_ref().clone();
-    loop {
-        let node = read_unchecked::<KS, PS>(&node_ref);
-        if node.is_none() {
-            break;
-        }
-        if !node.is_empty() {
-            non_empty += 1;
-        }
-        if let Some(node) = node.right_ref() {
-            node_ref = node.clone()
-        } else {
-            break;
-        }
-        num += 1;
-    }
-    (num, non_empty)
-}
-
-pub async fn level_merge<KS, PS>(
-    level: usize,
+fn merge_remove_empty_ext_nodes<KS, PS>(
+    mut left_most_leaf_guards: Vec<NodeWriteGuard<KS, PS>>, 
     src_tree: &BPlusTree<KS, PS>,
-    dest_tree: &dyn LevelTree,
-) -> usize
+    dest_tree: &dyn LevelTree
+) -> (AlteredNodes, usize)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Merging level {}", level);
-    let mut left_most_leaf_guards = select::<KS, PS>(level, &src_tree.get_root());
-    let merge_page_len = left_most_leaf_guards.len();
     let num_keys_moved;
     let left_most_id = left_most_leaf_guards.first().unwrap().ext_id();
     let prune_bound = left_most_leaf_guards.last().unwrap().right_bound().clone();
@@ -213,22 +164,92 @@ where
         new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = left_left_most;
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
-        debug!("Waiting storage to finish");
-        storage::wait_until_updated().await;
-        debug!("Level {} merge completed, starting prune", level);
+        src_tree.len.fetch_sub(num_keys_moved, Relaxed);
+        (removed_nodes, num_keys_moved)
     }
+}
 
-    // cleanup upper level references
-    prune::<KS, PS>(&src_tree.get_root(), box removed_nodes, 0);
-
-    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
-
-    src_tree.len.fetch_sub(num_keys_moved, Relaxed);
-
-    debug!(
-        "Merge level {} completed, page len {}",
-        level, merge_page_len
+fn select_ext_nodes<KS, PS>(first_node: &NodeCellRef) -> Vec<NodeWriteGuard<KS, PS>>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    trace!("Acquiring first node");
+    let first_node = write_node(first_node);
+    assert!(
+        read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(),
+        "Left most is not none, have {}",
+        read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name()
     );
+    let mut collected = vec![first_node];
+    let target_guards = if KS::slice_len() > LEVEL_M {
+        KS::slice_len()
+    } else {
+        KS::slice_len().pow(LEVEL_TREE_DEPTH - 1) >> 1 // merge half of the pages from memory
+    }; // pages to collect
+    while collected.len() < target_guards {
+        trace!("Acquiring select collection node");
+        let right = write_node(collected.last().unwrap().right_ref().unwrap());
+        if right.is_none() {
+            // Early break for reach the end of the linked list
+            // Should not be possible, will warn
+            warn!("Searching node to move and reach the end, maybe this is not the right parameter");
+            break;
+        } else {
+            debug_assert!(!right.is_empty(), "found empty node on selection!!!");
+            debug_assert!(!read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_none());
+            debug_assert!(
+                !read_unchecked::<KS, PS>(right.right_ref().unwrap()).is_empty_node()
+            );
+            collected.push(right);
+        }
+    }
+    return collected;
+}
 
-    merge_page_len
+fn num_pages<KS, PS>(head_page: &NodeWriteGuard<KS, PS>) -> (usize, usize)
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut num = 0;
+    let mut non_empty = 0;
+    let mut node_ref = head_page.node_ref().clone();
+    loop {
+        let node = read_unchecked::<KS, PS>(&node_ref);
+        if node.is_none() {
+            break;
+        }
+        if !node.is_empty() {
+            non_empty += 1;
+        }
+        if let Some(node) = node.right_ref() {
+            node_ref = node.clone()
+        } else {
+            break;
+        }
+        num += 1;
+    }
+    (num, non_empty)
+}
+
+pub async fn level_merge<KS, PS>(
+    level: usize,
+    src_tree: &BPlusTree<KS, PS>,
+    dest_tree: &dyn LevelTree,
+) -> usize
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    debug!("Merging LSM tree level {}", level);
+    let (_, num_keys, _) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree);
+    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+    debug!("Merge and pruned level {}, waiting for storage", level);
+    storage::wait_until_updated().await;
+    debug!("MERGE LEVEL {} COMPLETED", level);
+    // if cfg!(debug_assertions) {
+    //     dump_tree(src_tree, "level_tree_merge_src.json");
+    // }
+    return num_keys;
 }
