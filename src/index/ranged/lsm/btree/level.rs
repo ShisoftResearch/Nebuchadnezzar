@@ -246,9 +246,6 @@ where
 {
     debug!("Merging LSM tree level {}", level);
     let (_, num_keys, _) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree);
-    if cfg!(debug_assertions) {
-        dump_tree(src_tree, "level_tree_merge_src_dump.json");
-    }
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug!("Merge and pruned level {}, waiting for storage", level);
     storage::wait_until_updated().await;

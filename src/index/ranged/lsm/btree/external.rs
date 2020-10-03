@@ -253,7 +253,7 @@ where
         Some(if self.len == KS::slice_len() {
             // need to split
             trace!("insert to external with split, key {:?}, pos {}", key, pos);
-            let mut self_next: NodeWriteGuard<KS, PS> = write_non_empty(write_node(&self.next));
+            let mut self_next: NodeWriteGuard<KS, PS> = write_node(&self.next);
             let parent_latch: NodeWriteGuard<KS, PS> = write_node(parent);
             let (node_2, pivot_key) = self.split_insert(key, pos, self_ref, &mut self_next, tree);
             Some(NodeSplit {

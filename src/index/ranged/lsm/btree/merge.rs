@@ -1,7 +1,6 @@
 use super::external;
 use super::node::read_unchecked;
 use super::node::write_node;
-use super::node::write_non_empty;
 use super::node::write_targeted;
 use super::search::mut_search;
 use super::search::MutSearchResult;
@@ -19,7 +18,7 @@ fn merge_into_internal<KS, PS>(
 {
     let mut node_guard = write_node::<KS, PS>(node);
     for (pivot, node) in lower_level_new_pages.into_iter() {
-        let mut target_guard = write_non_empty(write_targeted(node_guard, &pivot));
+        let mut target_guard = write_targeted(node_guard, &pivot);
         {
             debug_assert!(!target_guard.is_none());
             let innode = target_guard.innode_mut();
@@ -90,7 +89,7 @@ where
                     let insert_pos = current_guard.search(&start_key);
                     let target_node_ref = current_guard.node_ref().clone();
                     let mut right_guard =
-                        write_node::<KS, PS>(current_guard.right_ref_mut_no_empty().unwrap());
+                        write_node::<KS, PS>(current_guard.right_ref_mut().unwrap());
                     let (new_node, pivot) = current_guard.extnode_mut(tree).split_insert(
                         start_key.clone(),
                         insert_pos,

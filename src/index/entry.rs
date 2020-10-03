@@ -73,7 +73,9 @@ impl EntryKey {
     pub fn id(&self) -> Id {
         let mut id_cursor = Cursor::new(&self.slice[KEY_SIZE - ID_SIZE..]);
         let id = Id::from_binary(&mut id_cursor).unwrap(); // read id from tailing 128 bits
-        debug_assert!(!id.is_unit_id(), "id is unit id from key {:?}", self.slice);
+        if cfg!(debug_assertions) && id.is_unit_id() {
+            warn!("id is unit id from key {:?}", self.slice)
+        }
         id
     }
     pub fn set_id(&mut self, id: &Id) {

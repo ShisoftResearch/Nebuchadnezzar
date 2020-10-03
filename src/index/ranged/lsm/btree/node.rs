@@ -200,20 +200,6 @@ where
         }
     }
 
-    pub fn get_non_empty_node(node_ref: &NodeCellRef) -> NodeCellRef {
-        let node = read_unchecked::<KS, PS>(node_ref);
-        if node.is_empty_node() {
-            let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
-            let mut guard = write_node::<KS, PS>(node_ref);
-            debug_assert!(!non_empty.ptr_eq(&guard.node_ref()));
-            guard.left_ref_mut().map(|r| *r = NodeCellRef::default());
-            guard.right_ref_mut().map(|r| *r = non_empty.clone());
-            return non_empty;
-        } else {
-            node_ref.clone()
-        }
-    }
-
     pub fn right_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.next),
@@ -221,18 +207,6 @@ where
             &mut NodeData::Empty(ref mut n) => Some(&mut n.right),
             &mut NodeData::None => None,
         }
-    }
-
-    pub fn right_ref_mut_no_empty(&mut self) -> Option<&mut NodeCellRef> {
-        self.right_ref_mut().map(|right_ref| {
-            let right_node_handler = read_unchecked::<KS, PS>(right_ref);
-            if right_node_handler.is_empty_node() {
-                let non_empty = Self::get_non_empty_node(right_node_handler.right_ref().unwrap());
-                debug_assert!(!non_empty.ptr_eq(right_ref));
-                *right_ref = non_empty
-            };
-            right_ref
-        })
     }
 
     pub fn right_ref(&self) -> Option<&NodeCellRef> {
@@ -265,29 +239,6 @@ where
     }
 }
 
-pub fn write_non_empty<KS, PS>(mut search_page: NodeWriteGuard<KS, PS>) -> NodeWriteGuard<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    if !search_page.is_none() && search_page.is_empty() {
-        return write_node(search_page.right_ref_mut_no_empty().unwrap());
-    }
-    return search_page;
-}
-
-pub fn unchecked_read_non_empty_node<KS, PS>(
-    mut search_page: NodeReadHandler<KS, PS>,
-) -> NodeReadHandler<KS, PS>
-where
-    KS: Slice<EntryKey> + Debug + 'static,
-    PS: Slice<NodeCellRef> + 'static,
-{
-    while search_page.is_empty_node() {
-        search_page = read_unchecked::<KS, PS>(search_page.right_ref().unwrap());
-    }
-    return search_page;
-}
 
 pub fn write_targeted<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,
@@ -300,8 +251,7 @@ where
     loop {
         // check if node empty or key out of bound
         if search_page.is_empty() || search_page.right_bound() <= key {
-            let right_node = write_node(search_page.right_ref_mut_no_empty().unwrap());
-            debug_assert!(!right_node.is_empty_node());
+            let right_node = write_node(search_page.right_ref().unwrap());
             trace!(
                 "Shifting to right {} node for {:?}, first key {:?}",
                 right_node.type_name(),
