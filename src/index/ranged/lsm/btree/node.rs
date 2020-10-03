@@ -205,6 +205,7 @@ where
         if node.is_empty_node() {
             let non_empty = Self::get_non_empty_node(node.right_ref().unwrap());
             let mut guard = write_node::<KS, PS>(node_ref);
+            debug_assert!(!non_empty.ptr_eq(&guard.node_ref()));
             guard.left_ref_mut().map(|r| *r = NodeCellRef::default());
             guard.right_ref_mut().map(|r| *r = non_empty.clone());
             return non_empty;
@@ -226,7 +227,9 @@ where
         self.right_ref_mut().map(|right_ref| {
             let right_node_handler = read_unchecked::<KS, PS>(right_ref);
             if right_node_handler.is_empty_node() {
-                *right_ref = Self::get_non_empty_node(right_node_handler.right_ref().unwrap())
+                let non_empty = Self::get_non_empty_node(right_node_handler.right_ref().unwrap());
+                debug_assert!(!non_empty.ptr_eq(right_ref));
+                *right_ref = non_empty
             };
             right_ref
         })

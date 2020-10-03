@@ -194,7 +194,7 @@ where
                 if node.is_ext() {
                     let next = read_unchecked::<KS, PS>(node.right_ref().unwrap());
                     // debug!("Tracking down to address {}", next.node_ref().address());
-                    assert!(!next.node_ref().ptr_eq(node.node_ref()));
+                    assert!(!next.node_ref().ptr_eq(node.node_ref()), "Next node is it self {:?}", node.ext_id());
                     node = next;
                     continue;
                 }

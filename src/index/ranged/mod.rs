@@ -17,7 +17,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::stream::StreamExt;
+    use itertools::Itertools;
+    use rand::seq::SliceRandom;
 
+    #[ignore]
     #[tokio::test(threaded_scheduler)]
     async fn general() {
         let _ = env_logger::try_init();
@@ -26,7 +29,7 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 1 * 1024 * 1024 * 1024, // 1G
+                memory_size: 32 * 1024 * 1024 * 1024, // 1G
                 backup_storage: None,
                 wal_storage: None,
                 services: vec![Service::Cell, Service::RangedIndexer],
@@ -56,7 +59,12 @@ mod tests {
             "Testing ranged indexer preesure test with {} items",
             test_capacity
         );
-        for i in 0..test_capacity {
+        debug!("Generating test set");
+        let mut rng = rand::thread_rng();
+        let mut nums = (0..test_capacity).collect_vec();
+        nums.as_mut_slice().shuffle(&mut rng);
+        debug!("Adding insertion tasks");
+        for i in nums {
             let index_client = index_client.clone();
             futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);
@@ -66,7 +74,7 @@ mod tests {
         }
         info!("All tasks queued, waiting for finish");
         while let Some(result) = futs.next().await {
-            assert!(result.unwrap().unwrap());
+            assert!(result.unwrap().unwrap(), "Insertion return false");
         }
         info!("Waiting for 10 secs");
         tokio::time::delay_for(Duration::from_secs(10)).await;

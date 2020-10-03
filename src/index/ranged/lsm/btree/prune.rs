@@ -534,6 +534,7 @@ where
         .zip(right_refs.into_iter())
         .for_each(|(p, r)| {
             if !p.is_none() {
+                debug_assert!(!p.node_ref().ptr_eq(&r));
                 *p.right_ref_mut().unwrap() = r
             }
         });
