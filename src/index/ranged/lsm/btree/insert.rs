@@ -30,12 +30,10 @@ where
         None => None,
         Some(split) => {
             trace!(
-                "Sub level node split, shall insert new node to current level, pivot {:?}",
-                split.pivot
+                "Sub level node split, shall insert new node to current level, pivot {:?}, node {:?}",
+                split.pivot, split.new_right_node
             );
             let pivot = split.pivot;
-            trace!("New pivot {:?}", pivot);
-            trace!("obtain latch for internal node split");
             let mut target_guard = write_targeted(split.parent_latch, &pivot);
             debug_assert!(read_unchecked::<KS, PS>(&split.new_right_node).first_key() >= &pivot);
             let mut split_result =
@@ -61,7 +59,6 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // latch nodes from left to right
-    trace!("Obtain latch for external node");
     let mut searched_guard = write_targeted(write_node(node_ref), key);
     let self_ref = searched_guard.node_ref().clone();
     debug_assert!(
