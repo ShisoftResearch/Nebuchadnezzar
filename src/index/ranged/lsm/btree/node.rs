@@ -79,6 +79,13 @@ where
             &NodeData::Internal(_) => false,
             &NodeData::None | &NodeData::Empty(_) => panic!(self.type_name()),
         }
+    }pub fn is_internal(&self) -> bool {
+        match self {
+            &NodeData::External(_) => false,
+            &NodeData::Internal(_) => true,
+            &NodeData::Empty(_) => false,
+            &NodeData::None => panic!(self.type_name()),
+        }
     }
     pub fn keys(&self) -> &[EntryKey] {
         if self.is_ext() {

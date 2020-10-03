@@ -146,6 +146,7 @@ where
                 .push((g.right_bound().clone(), g.node_ref().clone()));
             g.make_empty_node(false);
             g.left_ref_mut().map(|lr| *lr = NodeCellRef::default());
+            g.right_ref_mut().map(|rr| *rr = right_right_most.clone());
         }
         debug!(
             "Have {:?} pages after removal",
@@ -164,7 +165,7 @@ where
         );
 
         new_first_node_ext.id = src_tree.head_page_id;
-        new_first_node_ext.prev = left_left_most;
+        new_first_node_ext.prev = NodeCellRef::default();
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);
         src_tree.len.fetch_sub(num_keys_moved, Relaxed);
         (removed_nodes, num_keys_moved)

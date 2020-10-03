@@ -18,7 +18,6 @@ use merge::merge_into_tree_node;
 pub use node::*;
 use parking_lot::RwLock;
 use search::*;
-use split::remove_to_right;
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::fmt::Debug;
@@ -235,7 +234,6 @@ pub trait LevelTree: Sync + Send {
     fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
-    fn remove_to_right(&self, start_key: &EntryKey) -> usize;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
     fn ideal_capacity(&self) -> usize {
@@ -300,12 +298,6 @@ where
         split::mid_key::<KS, PS>(&self.get_root())
     }
 
-    fn remove_to_right(&self, start_key: &EntryKey) -> usize {
-        let removed = remove_to_right::<KS, PS>(&self.get_root(), start_key, self);
-        self.len.fetch_sub(removed, Relaxed);
-        removed
-    }
-
     fn head_id(&self) -> Id {
         self.head_page_id
     }
@@ -355,10 +347,6 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn mid_key(&self) -> Option<EntryKey> {
-        unreachable!()
-    }
-
-    fn remove_to_right(&self, _start_key: &EntryKey) -> usize {
         unreachable!()
     }
 

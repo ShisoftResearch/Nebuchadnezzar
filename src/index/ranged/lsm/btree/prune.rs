@@ -37,7 +37,7 @@ impl AlteredNodes {
 
 pub fn prune<'a, KS, PS>(
     node: &NodeCellRef,
-    mut altered: AlteredNodes,
+    altered: AlteredNodes,
     level: usize,
 ) -> (AlteredNodes, Vec<NodeWriteGuard<KS, PS>>)
 where
@@ -57,9 +57,9 @@ where
     debug!("Start prune at level {}", level);
     // Follwing procedures will scan the pages from left to right in key order, we need to sort it to
     // make sure the keys we are probing are also sorted
-    altered.removed.sort_by(|a, b| a.0.cmp(&b.0));
-    altered.key_modified.sort_by(|a, b| a.0.cmp(&b.0));
-    altered.added.sort_by(|a, b| a.0.cmp(&b.0));
+    // altered.removed.sort_by(|a, b| a.0.cmp(&b.0));
+    // altered.key_modified.sort_by(|a, b| a.0.cmp(&b.0));
+    // altered.added.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut all_pages = probe_key_range(node, &altered, level);
     debug!(
@@ -71,10 +71,20 @@ where
         trace!("No node to prune at this level - {}", level);
         return (level_page_altered, vec![]);
     }
-    debug_assert!(
-        is_node_list_serial(&all_pages),
-        "node list not serial after selection"
-    );
+
+    if cfg!(debug_assertions) && !is_node_list_serial(&all_pages) {
+        error!("Node list not serial after selection. Dumping");
+        for (i, page) in all_pages.iter().enumerate() {
+            println!(
+                "{}\t{}: {:?} - [{:?} keys] -> {:?}", i, 
+                page.type_name(), 
+                page.node_ref().address(), 
+                page.keys().len(),
+                page.right_bound()
+            );
+        }
+        panic!();
+    }
 
     // insert new nodes
     insert_new_and_mark_altered_keys(&mut all_pages, &altered, &mut level_page_altered);
@@ -151,27 +161,25 @@ where
             all_pages.len(),
             level
         );
-        if all_pages.len() > 2 {
-            debug_assert!(
-                is_node_list_serial(&all_pages),
-                "node not serial before checking corner cases"
-            );
+        debug_assert!(
+            is_node_list_serial(&all_pages),
+            "node not serial before checking corner cases"
+        );
 
-            if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
-                all_pages = update_right_nodes(all_pages);
-            }
-
-            debug!(
-                "Prune had merged all single ref pages, now have {} living pages at level {}",
-                all_pages.len(),
-                level
-            );
-
-            debug_assert!(
-                is_node_list_serial(&all_pages),
-                "node not serial after checked corner cases"
-            );
+        if merge_single_ref_pages(&mut all_pages, &mut level_page_altered, level) {
+            all_pages = update_right_nodes(all_pages);
         }
+
+        debug!(
+            "Prune had merged all single ref pages, now have {} living pages at level {}",
+            all_pages.len(),
+            level
+        );
+
+        debug_assert!(
+            is_node_list_serial(&all_pages),
+            "node not serial after checked corner cases"
+        );
     }
 
     debug!("Sub altred {}", altered.summary());
@@ -239,8 +247,9 @@ where
             let last_innode = last_page.innode();
             debug_assert!(
                 is_node_serial(last_page),
-                "node not serial on fetching pages {:?} - {}",
+                "node not serial on fetching pages {:?} - {:?} | {}",
                 last_page.keys(),
+                last_page.innode().ptrs.as_slice_immute(),
                 level
             );
             (
@@ -276,6 +285,7 @@ fn insert_new_and_mark_altered_keys<KS, PS>(
     let mut pages = all_pages.iter_mut();
     let mut current_page = pages.next().unwrap();
     while let Some(&(new_key, new_node)) = new_nodes.peek() {
+        debug!("Adding new key: {:?}", new_key);
         if new_key < current_page.right_bound() {
             // First occurance of the page that have larger right bound than new node should be the
             // page to insert into
@@ -355,6 +365,9 @@ where
         removed.len(),
         level
     );
+    if cfg!(debug_assertions) && remove_count != removed.len() {
+        warn!("Remove set and actual removed numner does not match");
+    }
     matching_refs
 }
 
@@ -553,7 +566,7 @@ where
 {
     // dealing with corner cases
     // here, a page may have one ptr and no keys, then the remaining ptr need to be merge with right page
-    trace!("Checking corner cases");
+    debug!("Checking single ptr node");
     let mut index = 0;
     let mut corner_case_handled = false;
     let mut current_left_bound = min_entry_key();
@@ -564,7 +577,7 @@ where
             }
             let right_node_len = all_pages[index + 1].len();
             if right_node_len == 0 {
-                // right node length is 0, should merge with current node
+                debug!("Right node length is 0, should merge with current node, bound {:?}", all_pages[index].right_bound());
                 let keys_cap = KS::slice_len();
                 let current_node_len = all_pages[index].len();
                 if current_node_len < keys_cap {
@@ -726,6 +739,7 @@ where
                         next_innode.ptrs = new_next_ptrs;
                         next_innode.len = mid + 1;
                         // insert the third page
+                        debug!("Put new page in added {:?} - {:?}", next_right_bound, third_node_ref);
                         level_page_altered
                             .added
                             .push((next_right_bound.clone(), third_node_ref.clone()));
@@ -809,5 +823,6 @@ where
         current_left_bound = current_right_bound;
         index += 1;
     }
+    debug!("Single ptr processed: {}", corner_case_handled);
     return corner_case_handled;
 }

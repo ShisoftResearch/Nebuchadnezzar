@@ -56,11 +56,17 @@ where
         let second_first_node = nodes[i + 1].first_key();
         let second_right_bound = nodes[i + 1].right_bound();
         if first_right_bound >= second_right_bound {
-            error!("right bound at {} larger than right right bound", i);
+            error!(
+                "right bound at {} larger than right right bound, first_right_bound {:?}, second_right_bound {:?}", 
+                i, first_right_bound, second_right_bound
+            );
             return false;
         }
         if first_right_bound > second_first_node {
-            error!("right bound at {} larger than right first node", i);
+            error!(
+                "right bound at {} larger than right first node, first_right_bound {:?}, second_first_node {:?}", 
+                i, first_right_bound, second_first_node
+            );
             return false;
         }
     }
