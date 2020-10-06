@@ -154,6 +154,9 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let first_node = write_node::<KS, PS>(&node);
+    first_node
+        .left_ref()
+        .map(|lr| debug_assert!(lr.is_default()));
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None,
@@ -200,7 +203,11 @@ where
                 if node.is_ext() {
                     let next = read_unchecked::<KS, PS>(node.right_ref().unwrap());
                     // debug!("Tracking down to address {}", next.node_ref().address());
-                    assert!(!next.node_ref().ptr_eq(node.node_ref()), "Next node is it self {:?}", node.ext_id());
+                    assert!(
+                        !next.node_ref().ptr_eq(node.node_ref()),
+                        "Next node is it self {:?}",
+                        node.ext_id()
+                    );
                     node = next;
                     continue;
                 }

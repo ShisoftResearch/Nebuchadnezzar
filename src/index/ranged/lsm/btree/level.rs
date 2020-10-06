@@ -116,7 +116,6 @@ where
     // adjust leaf left, right references
     let mut removed_nodes = AlteredNodes {
         removed: vec![],
-        added: vec![],
         key_modified: vec![],
     };
     {
@@ -248,6 +247,7 @@ where
     debug!("Merging LSM tree level {}", level);
     let (_, num_keys, _) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree);
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+    debug_assert!(verification::is_tree_in_order(&src_tree, level));
     debug!("Merge and pruned level {}, waiting for storage", level);
     storage::wait_until_updated().await;
     debug!("MERGE LEVEL {} COMPLETED", level);

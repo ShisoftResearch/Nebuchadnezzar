@@ -79,7 +79,8 @@ where
             &NodeData::Internal(_) => false,
             &NodeData::None | &NodeData::Empty(_) => panic!(self.type_name()),
         }
-    }pub fn is_internal(&self) -> bool {
+    }
+    pub fn is_internal(&self) -> bool {
         match self {
             &NodeData::External(_) => false,
             &NodeData::Internal(_) => true,
@@ -87,11 +88,20 @@ where
             &NodeData::None => panic!(self.type_name()),
         }
     }
+
     pub fn keys(&self) -> &[EntryKey] {
         if self.is_ext() {
             &self.extnode().keys.as_slice_immute()[..self.len()]
         } else {
             &self.innode().keys.as_slice_immute()[..self.len()]
+        }
+    }
+
+    pub fn ptrs(&self) -> &[NodeCellRef] {
+        if self.is_ext() {
+            unreachable!()
+        } else {
+            &self.innode().ptrs.as_slice_immute()[..self.len() + 1]
         }
     }
 
@@ -245,7 +255,6 @@ where
         }
     }
 }
-
 
 pub fn write_targeted<KS, PS>(
     mut search_page: NodeWriteGuard<KS, PS>,

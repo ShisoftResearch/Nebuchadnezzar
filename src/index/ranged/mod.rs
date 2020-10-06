@@ -14,11 +14,11 @@ mod tests {
     use crate::ram::types::Id;
     use crate::server::*;
     use futures::stream::FuturesUnordered;
+    use itertools::Itertools;
+    use rand::seq::SliceRandom;
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::stream::StreamExt;
-    use itertools::Itertools;
-    use rand::seq::SliceRandom;
 
     //#[ignore]
     #[tokio::test(threaded_scheduler)]
