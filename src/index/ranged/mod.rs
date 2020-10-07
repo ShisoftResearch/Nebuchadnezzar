@@ -20,7 +20,7 @@ mod tests {
     use std::time::Duration;
     use tokio::stream::StreamExt;
 
-    //#[ignore]
+    #[ignore]
     #[tokio::test(threaded_scheduler)]
     async fn general() {
         let _ = env_logger::try_init();

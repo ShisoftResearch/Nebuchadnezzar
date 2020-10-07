@@ -3,6 +3,8 @@ use futures::FutureExt;
 use std::any::TypeId;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
+use std::ptr;
+use super::cell_ref::DEFAULT_NODE_DATA;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -267,7 +269,13 @@ where
     loop {
         // check if node empty or key out of bound
         if search_page.is_empty() || search_page.right_bound() <= key {
-            let right_node = write_node(search_page.right_ref().unwrap());
+            let right_node_ref = search_page.right_ref().unwrap();
+            if right_node_ref.is_default() {
+                // right node is none, should pick current one if not empty node
+                debug_assert!(!search_page.is_empty_node());
+                return search_page;
+            }
+            let right_node = write_node(right_node_ref);
             trace!(
                 "Shifting to right {} node for {:?}, first key {:?}",
                 right_node.type_name(),
@@ -278,13 +286,7 @@ where
                     None
                 }
             );
-            if !right_node.is_none() {
-                search_page = right_node;
-            } else {
-                // right node is none, should pick current one if not empty node
-                debug_assert!(!search_page.is_empty_node());
-                return search_page;
-            }
+            search_page = right_node;
         } else {
             return search_page;
         }
@@ -355,6 +357,14 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    if node.is_default() {
+        return NodeWriteGuard {
+            data: ptr::null_mut(),
+            cc: ptr::null_mut(),
+            version: 0,
+            node_ref: NodeCellRef::default(),
+        }
+    }
     // trace!("acquiring node write lock");
     let node_deref = node.deref();
     let cc = &node_deref.cc;
@@ -399,6 +409,9 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut handler = read_unchecked(node);
+    if node.is_default() {
+        return func(&handler);
+    }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
@@ -449,7 +462,7 @@ where
     type Target = NodeData<KS, PS>;
 
     fn deref(&self) -> &<Self as Deref>::Target {
-        debug_assert_ne!(self.data as usize, 0);
+        assert!(!self.data.is_null());
         unsafe { &*self.data }
     }
 }
@@ -460,7 +473,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     fn deref_mut(&mut self) -> &mut <Self as Deref>::Target {
-        debug_assert_ne!(self.data as usize, 0);
+        assert!(!self.data.is_null());
         unsafe { &mut *self.data }
     }
 }
@@ -503,6 +516,10 @@ where
 {
     pub fn node_ref(&self) -> &NodeCellRef {
         &self.node_ref
+    }
+
+    pub fn is_ref_none(&self) -> bool {
+        self.node_ref.is_default()
     }
 
     // make an empty node as empty node, right node pointer covered

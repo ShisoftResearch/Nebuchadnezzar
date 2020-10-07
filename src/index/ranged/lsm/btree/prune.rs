@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::iter::{Iterator, Peekable};
 
 type AlterPair = (EntryKey, NodeCellRef);
-
+ 
 #[derive(Debug)]
 pub struct AlteredNodes {
     pub removed: Vec<AlterPair>,
@@ -207,7 +207,7 @@ where
     loop {
         let (next, ends) = {
             let last_page = all_pages.last().unwrap().borrow();
-            if last_page.is_none() {
+            if last_page.is_ref_none() {
                 break;
             }
             debug_assert!(!last_page.is_empty_node(), "at {:?}", last_page.node_ref());
@@ -219,10 +219,26 @@ where
                 last_page.innode().ptrs.as_slice_immute(),
                 level
             );
-            (
-                write_node::<KS, PS>(&last_innode.right),
-                &last_innode.right_bound > max_key,
-            )
+            let next_node_ref = &last_innode.right;
+            if cfg!(debug_assertions) {
+                let next_node = read_unchecked::<KS, PS>(next_node_ref);
+                // right refercing nodes are out of order, need to investigate
+                debug_assert!(!next_node.node_ref().ptr_eq(last_page.node_ref()));
+                for p in &all_pages {
+                    if p.node_ref().ptr_eq(next_node.node_ref()) {
+                        panic!("Duplicated unordered node from right referecing");
+                    }
+                    if !next_node.is_none() {
+                        assert!(p.right_bound() < next_node.right_bound());
+                    }
+                }
+            }
+            debug!("Obtain node lock for {:?}...", next_node_ref);
+            let next_node = write_node::<KS, PS>(next_node_ref);
+            debug!("Obtained node lock for {:?}", next_node_ref);
+            let ends = &last_innode.right_bound > max_key;
+            debug!("Collecting node {:?}", next_node.node_ref());
+            (next_node, ends)
         };
         // all_pages contains all of the entry keys we need to work for remove, add and modify
         all_pages.push(next);
@@ -270,7 +286,7 @@ where
                 "node not serial before live selection - {}",
                 level
             );
-            if page.is_none() {
+            if page.is_ref_none() {
                 return vec![];
             }
             page.innode().ptrs.as_slice_immute()[..page.len() + 1]
@@ -312,7 +328,7 @@ where
         .into_iter()
         .zip(retained)
         .filter_map(|(mut page, retained_refs)| {
-            let is_not_none = !page.is_none();
+            let is_not_none = !page.is_ref_none();
             if is_not_none && retained_refs.len() == 0 {
                 // check if all the children ptr in this page have been removed
                 // if yes mark it and upper level will handel it
@@ -411,13 +427,13 @@ where
     }
     let mut non_emptys = all_pages
         .into_iter()
-        .filter(|p| !p.is_empty_node())
+        .filter(|p| p.is_ref_none() || !p.is_empty_node())
         .collect_vec();
     let right_refs = non_emptys
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            if p.is_none() {
+            if p.is_ref_none() {
                 return NodeCellRef::default();
             }
             let right_ref = if i == non_emptys.len() - 1 {
@@ -441,7 +457,7 @@ where
         .iter_mut()
         .zip(right_refs.into_iter())
         .for_each(|(p, r)| {
-            if !p.is_none() {
+            if !p.is_ref_none() {
                 debug_assert!(!p.node_ref().ptr_eq(&r));
                 *p.right_ref_mut().unwrap() = r
             }
@@ -465,8 +481,8 @@ where
     let mut index = 0;
     let mut corner_case_handled = false;
     while index < num_pages - 1 {
-        if all_pages[index].is_none() || all_pages[index + 1].is_none() {
-            continue;
+        if all_pages[index].is_ref_none() || all_pages[index + 1].is_ref_none() {
+            break;
         }
         let left_node_len = all_pages[index].len();
         let right_node_len = all_pages[index + 1].len();

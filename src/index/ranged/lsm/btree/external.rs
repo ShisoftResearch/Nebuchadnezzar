@@ -221,7 +221,7 @@ where
             &extnode_2.keys.as_slice_immute()[..extnode_2.len]
         );
         let node_2 = NodeCellRef::new(Node::with_external(extnode_2));
-        if !self_next.is_none() {
+        if !self_next.is_ref_none() {
             let mut self_next_node = self_next.extnode_mut(tree);
             debug_assert!(
                 self_next_node.prev.ptr_eq(&self_ref),

@@ -17,7 +17,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     // check keys
-    if node.is_none() {
+    if node.is_ref_none() {
         return true;
     }
     if !are_keys_serial(node.keys()) {
@@ -49,7 +49,7 @@ where
 
     // check right ref
     for i in 0..nodes.len() - 1 {
-        if nodes[i + 1].is_none() {
+        if nodes[i + 1].is_ref_none() {
             break;
         }
         let first_right_bound = nodes[i].right_bound();
@@ -113,7 +113,7 @@ where
             &*MIN_ENTRY_KEY
         };
         let next = write_node(right_ref);
-        if next.is_none() {
+        if next.is_ref_none() {
             debug!(
                 "Node level check reached non node - {} - {}",
                 lsm_level, tree_level
