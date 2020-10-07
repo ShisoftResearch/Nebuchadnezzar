@@ -1,10 +1,10 @@
+use super::cell_ref::DEFAULT_NODE_DATA;
 use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
+use std::ptr;
 use std::sync::atomic::Ordering::Acquire;
 use std::sync::atomic::Ordering::Release;
-use std::ptr;
-use super::cell_ref::DEFAULT_NODE_DATA;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -363,7 +363,7 @@ where
             cc: ptr::null_mut(),
             version: 0,
             node_ref: NodeCellRef::default(),
-        }
+        };
     }
     // trace!("acquiring node write lock");
     let node_deref = node.deref();

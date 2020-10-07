@@ -1,16 +1,16 @@
 use super::node::*;
 use super::verification::{is_node_list_serial, is_node_serial};
+use super::NodeCellRef;
 use super::MIN_ENTRY_KEY;
 use super::*;
-use super::NodeCellRef;
 use itertools::Itertools;
 use std::borrow::Borrow;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::iter::{Iterator, Peekable};
 
 type AlterPair = (EntryKey, NodeCellRef);
- 
+
 #[derive(Debug)]
 pub struct AlteredNodes {
     pub removed: Vec<AlterPair>,
@@ -130,7 +130,7 @@ where
 
     // alter keys
     if altered.key_modified.len() > 0 {
-        update_and_mark_altered_keys(&mut all_pages , &altered, &mut level_page_altered);
+        update_and_mark_altered_keys(&mut all_pages, &altered, &mut level_page_altered);
     }
 
     debug!("Sub altred {}", altered.summary());
@@ -405,14 +405,20 @@ fn update_and_mark_altered_keys<'a, KS, PS>(
                     debug!("Modify key on boundary, postpone for {:?}", modify_to);
                     // This page have changed its boundary, should postpone modification to upper level
                     *page.right_bound_mut() = modify_to.clone();
-                    next_level_altered.key_modified.push((modify_to, page.node_ref().clone()));
+                    next_level_altered
+                        .key_modified
+                        .push((modify_to, page.node_ref().clone()));
                 }
                 modified += 1;
                 break;
             }
         }
     }
-    debug!("Done key modification, {}, expect {}", modified, modified_set.len());
+    debug!(
+        "Done key modification, {}, expect {}",
+        modified,
+        modified_set.len()
+    );
 }
 
 fn update_right_nodes<KS, PS>(all_pages: Vec<NodeWriteGuard<KS, PS>>) -> Vec<NodeWriteGuard<KS, PS>>
@@ -526,62 +532,64 @@ where
             debug_assert_eq!(num_keys + 1, ptrs.len());
             // Here we have two strategy to deal with single node problem
             // When both left and right node have no keys and one ptr, we should
-            // combine two nodes to right and remove the left node; 
+            // combine two nodes to right and remove the left node;
             // this can be hazardous for node search in only one direction
-            // When only one of the node has more than one keys and two ptrs, we can split the 
-            // combined vec in the half and distribute them 
-            let left_keys = if num_keys < 3 { num_keys } else { num_keys / 2 };                
+            // When only one of the node has more than one keys and two ptrs, we can split the
+            // combined vec in the half and distribute them
+            let left_keys = if num_keys < 3 { num_keys } else { num_keys / 2 };
             if num_keys >= KS::slice_len() {
                 debug!(
-                    "Merge single node by rebalancing with right, (l:{}, r{}) of {} at {}", 
-                    left_node_len, right_node_len, KS::slice_len(), index
+                    "Merge single node by rebalancing with right, (l:{}, r{}) of {} at {}",
+                    left_node_len,
+                    right_node_len,
+                    KS::slice_len(),
+                    index
                 );
                 // Move and setup left node
                 for i in 0..left_keys {
-                    all_pages[index].innode_mut().keys.as_slice()[i] =
-                        mem::take(&mut keys[i]);
-                    all_pages[index].innode_mut().ptrs.as_slice()[i] =
-                        mem::take(&mut ptrs[i]);
+                    all_pages[index].innode_mut().keys.as_slice()[i] = mem::take(&mut keys[i]);
+                    all_pages[index].innode_mut().ptrs.as_slice()[i] = mem::take(&mut ptrs[i]);
                 }
                 all_pages[index].innode_mut().ptrs.as_slice()[left_keys] =
                     mem::take(&mut ptrs[left_keys]);
                 all_pages[index].innode_mut().len = left_keys;
                 // Update the right boundary of the left node
-                let left_node_right_bound = 
-                    mem::take(&mut keys[left_keys]);
+                let left_node_right_bound = mem::take(&mut keys[left_keys]);
                 all_pages[index].innode_mut().right_bound = left_node_right_bound.clone();
                 // The right boundary of left node has been changed, put the left node to alter list
-                level_page_altered.key_modified.push((
-                    left_node_right_bound, 
-                    all_pages[index].node_ref().clone()
-                ));
+                level_page_altered
+                    .key_modified
+                    .push((left_node_right_bound, all_pages[index].node_ref().clone()));
                 // Move and setup right node
                 let right_keys_offset = left_keys + 1;
                 for i in right_keys_offset..num_keys {
                     let right_index = i - right_keys_offset;
-                    all_pages[index + 1].innode_mut().keys.as_slice()[right_index] = 
+                    all_pages[index + 1].innode_mut().keys.as_slice()[right_index] =
                         mem::take(&mut keys[i]);
-                    all_pages[index + 1].innode_mut().ptrs.as_slice()[right_index] = 
+                    all_pages[index + 1].innode_mut().ptrs.as_slice()[right_index] =
                         mem::take(&mut ptrs[i]);
                 }
-                all_pages[index + 1].innode_mut().ptrs.as_slice()[num_keys] = 
+                all_pages[index + 1].innode_mut().ptrs.as_slice()[num_keys] =
                     mem::take(&mut ptrs[num_keys]);
                 all_pages[index + 1].innode_mut().len = num_keys - right_keys_offset;
             } else {
-                debug!("Merge single node by eliminating left node with {} keys", num_keys);
+                debug!(
+                    "Merge single node by eliminating left node with {} keys",
+                    num_keys
+                );
                 let first_key = keys[0].clone();
                 for i in 0..num_keys {
-                    all_pages[index + 1].innode_mut().keys.as_slice()[i] =
-                        mem::take(&mut keys[i]);
-                    all_pages[index + 1].innode_mut().ptrs.as_slice()[i] =
-                        mem::take(&mut ptrs[i]);
+                    all_pages[index + 1].innode_mut().keys.as_slice()[i] = mem::take(&mut keys[i]);
+                    all_pages[index + 1].innode_mut().ptrs.as_slice()[i] = mem::take(&mut ptrs[i]);
                 }
                 all_pages[index + 1].innode_mut().ptrs.as_slice()[num_keys] =
                     mem::take(&mut ptrs[num_keys]);
                 all_pages[index + 1].innode_mut().len = num_keys;
                 // make left node empty
                 all_pages[index].make_empty_node(false);
-                level_page_altered.removed.push((first_key, all_pages[index].node_ref().clone()));
+                level_page_altered
+                    .removed
+                    .push((first_key, all_pages[index].node_ref().clone()));
             }
         }
         index += 1;

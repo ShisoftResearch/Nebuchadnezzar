@@ -7,10 +7,10 @@ type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
 type DefaultNodeType = Node<DefaultKeySliceType, DefaultPtrSliceType>;
 
-
 lazy_static! {
     pub static ref DEFAULT_NODE: DefaultNodeType = Node::new(NodeData::None);
-    pub static ref DEFAULT_NODE_DATA: NodeData<DefaultKeySliceType, DefaultPtrSliceType> = NodeData::None;
+    pub static ref DEFAULT_NODE_DATA: NodeData<DefaultKeySliceType, DefaultPtrSliceType> =
+        NodeData::None;
 }
 
 #[derive(Debug)]
