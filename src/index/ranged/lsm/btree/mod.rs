@@ -39,7 +39,6 @@ mod merge;
 mod node;
 mod prune;
 mod reconstruct;
-mod remove;
 mod search;
 mod split;
 pub mod storage;

@@ -7,7 +7,7 @@ use itertools::Itertools;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
-use std::iter::{Iterator, Peekable};
+use std::iter::Iterator;
 
 type AlterPair = (EntryKey, NodeCellRef);
 

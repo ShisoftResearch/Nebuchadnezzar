@@ -1,4 +1,3 @@
-use super::cell_ref::DEFAULT_NODE_DATA;
 use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
