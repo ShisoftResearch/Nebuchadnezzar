@@ -5,20 +5,22 @@ use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::cell::ReadError;
+use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
 use std::mem;
 use std::sync::Arc;
 
 type CellBlock = Vec<CellSlot>;
+pub type IndexedCell = (Id, Result<Cell, ReadError>);
 
 enum CellSlot {
-    Some(Cell),
+    Some(IndexedCell),
     None,
     Taken,
 }
 
 pub struct ClientCursor {
-    cell: Option<Cell>,
+    cell: CellSlot,
     cell_block: Option<CellBlock>,
     query_client: Arc<RangedQueryClient>,
     tree_client: Arc<AsyncServiceClient>,
@@ -31,14 +33,14 @@ pub struct ClientCursor {
 impl ClientCursor {
     pub fn new(
         remote: ServCursor,
-        init_cell: Cell,
+        init_cell: IndexedCell,
         ordering: Ordering,
         tree_boundary: EntryKey,
         tree_client: Arc<AsyncServiceClient>,
         query_client: Arc<RangedQueryClient>,
     ) -> Self {
         Self {
-            cell: Some(init_cell),
+            cell: CellSlot::Some(init_cell),
             remote_cursor: remote,
             tree_client,
             query_client,
@@ -49,11 +51,11 @@ impl ClientCursor {
         }
     }
 
-    pub async fn next(&mut self) -> Result<Option<Cell>, RPCError> {
+    pub async fn next(&mut self) -> Result<Option<IndexedCell>, RPCError> {
         loop {
-            let res;
+            let res: IndexedCell;
             if self.cell.is_some() && self.cell_block.is_none() {
-                res = mem::replace(&mut self.cell, None);
+                res = mem::take(&mut self.cell).get_in();
                 let cells = Self::refresh_block(
                     &self.tree_client,
                     &self.query_client.neb_client,
@@ -79,7 +81,7 @@ impl ClientCursor {
                     }
                 }
                 let old_cell = mem::replace(&mut cells[self.pos], CellSlot::Taken);
-                res = Some(old_cell.get_in());
+                res = old_cell.get_in();
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
                 if self.pos >= cells.len() || cells[self.pos].is_none() {
@@ -89,21 +91,25 @@ impl ClientCursor {
                         self.remote_cursor,
                     )
                     .await?;
-                    self.cell = None;
+                    self.cell = CellSlot::Taken;
                     self.pos = 0;
                 }
             } else {
                 unimplemented!();
             }
-            return Ok(res);
+            return Ok(Some(res));
         }
     }
 
-    pub fn current(&self) -> Option<&Cell> {
-        if self.cell.is_some() {
-            self.cell.as_ref()
-        } else {
-            self.cell_block.as_ref().unwrap()[self.pos].borrow_into()
+    pub fn current(&self) -> Option<&IndexedCell> {
+        match &self.cell {
+            CellSlot::Some(cell) => Some(cell),
+            _ => {
+                match  &self.cell_block.as_ref().unwrap()[self.pos] {
+                    CellSlot::Some(cell) => Some(cell),
+                    _ => None
+                }
+            }
         }
     }
 
@@ -113,15 +119,14 @@ impl ClientCursor {
         remote_cursor: ServCursor,
     ) -> Result<CellBlock, RPCError> {
         let cell_ids = tree_client.cursor_next(remote_cursor).await?.unwrap();
+        let id_vec = Vec::from(cell_ids);
+        let id_vec_copy = id_vec.clone();
         let cells = neb_client
-            .read_all_cells(Vec::from(cell_ids))
+            .read_all_cells(id_vec)
             .await?
             .into_iter()
-            .map(|cell_res| match cell_res {
-                Ok(cell) => CellSlot::Some(cell),
-                Err(ReadError::CellIdIsUnitId) => CellSlot::None,
-                Err(e) => panic!("{:?}", e),
-            })
+            .zip(id_vec_copy)
+            .map(|(cell_res, id)| CellSlot::Some((id, cell_res)))
             .collect();
         Ok(cells)
     }
@@ -142,17 +147,29 @@ impl CellSlot {
             _ => false,
         }
     }
-    fn get_in(self) -> Cell {
+    fn is_some(&self) -> bool {
+        match self {
+            CellSlot::Some(_) => true,
+            _ => false
+        }
+    }
+    fn get_in(self) -> IndexedCell {
         match self {
             CellSlot::Some(cell) => cell,
             _ => unreachable!(),
         }
     }
-    fn borrow_into(&self) -> Option<&Cell> {
+    fn borrow_into(&self) -> Option<&IndexedCell> {
         match self {
             CellSlot::Some(cell) => Some(cell),
             CellSlot::None => None,
             CellSlot::Taken => unreachable!(),
         }
+    }
+}
+
+impl Default for CellSlot {
+    fn default() -> Self {
+        CellSlot::None
     }
 }

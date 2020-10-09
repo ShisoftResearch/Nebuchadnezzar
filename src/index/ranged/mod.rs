@@ -93,7 +93,7 @@ mod tests {
             let id = Id::new(1, *num as u64);
             let key = EntryKey::from_id(&id);
             let rt_cursor = client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward).await.unwrap().unwrap();
-            assert_eq!(id, rt_cursor.current().unwrap().id());
+            assert_eq!(id, rt_cursor.current().unwrap().0);
             debug!("Id at {}, index {} have been checked", num, i);
         }
         tokio::time::delay_for(Duration::from_secs(10)).await;

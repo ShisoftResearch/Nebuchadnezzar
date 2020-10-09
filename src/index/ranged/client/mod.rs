@@ -58,8 +58,7 @@ impl RangedQueryClient {
                                 Ordering::Backward => lower,
                             };
                             if let Some(init_id) = init_id {
-                                let init_cell =
-                                    self_ref.neb_client.read_cell(init_id).await?.unwrap();
+                                let init_cell = (init_id, self_ref.neb_client.read_cell(init_id).await?);
                                 return Ok(Some(Some(cursor::ClientCursor::new(
                                     cursor,
                                     init_cell,
