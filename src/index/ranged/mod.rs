@@ -89,16 +89,22 @@ mod tests {
             assert!(result.unwrap().unwrap(), "Insertion return false");
         }
         info!("All keys inserted. The background task should merging trees. Doing searches.");
-        for (i, num) in nums_2.iter().enumerate() {
-            let id = Id::new(1, *num as u64);
-            let key = EntryKey::from_id(&id);
-            let rt_cursor = client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(id, rt_cursor.current().unwrap().0);
-            debug!("Id at {}, index {} have been checked", num, i);
+        let mut futs = FuturesUnordered::new();
+        for (i, num) in nums_2.into_iter().enumerate() {
+            let index_client = index_client.clone();
+            futs.push(tokio::spawn(async move {
+                let id = Id::new(1, num as u64);
+                let key = EntryKey::from_id(&id);
+                let rt_cursor = client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(id, rt_cursor.current().unwrap().0);
+                debug!("Id at {}, index {} have been checked", num, i);
+            }));
         }
+        while let Some(_) = futs.next().await {}
+        debug!("Selection check pased, waiting for 10 secs");
         tokio::time::delay_for(Duration::from_secs(10)).await;
         info!("Waiting tree storage");
         storage::wait_until_updated().await;
