@@ -12,11 +12,11 @@ mod tests {
     use crate::index::ranged::lsm::btree;
     use crate::index::ranged::lsm::tree::LAST_LEVEL_MULT_FACTOR;
     use crate::index::EntryKey;
-    use crate::ram::types::Id;
-    use crate::server::*;
     use crate::ram::cell::*;
-    use crate::ram::types::*;
     use crate::ram::schema::*;
+    use crate::ram::types::Id;
+    use crate::ram::types::*;
+    use crate::server::*;
     use futures::stream::FuturesUnordered;
     use itertools::Itertools;
     use rand::seq::SliceRandom;
@@ -92,7 +92,10 @@ mod tests {
         for (i, num) in nums_2.iter().enumerate() {
             let id = Id::new(1, *num as u64);
             let key = EntryKey::from_id(&id);
-            let rt_cursor = client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward).await.unwrap().unwrap();
+            let rt_cursor = client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(id, rt_cursor.current().unwrap().0);
             debug!("Id at {}, index {} have been checked", num, i);
         }
@@ -110,13 +113,11 @@ mod tests {
             str_key_field: None,
             fields: Field::new(
                 "*",
-                0, 
-                false, 
-                false, 
-                Some(vec![
-                    Field::new("data", 10, false, false, None, vec![])
-                ]),
-                vec![]
+                0,
+                false,
+                false,
+                Some(vec![Field::new("data", 10, false, false, None, vec![])]),
+                vec![],
             ),
             is_dynamic: false,
         }

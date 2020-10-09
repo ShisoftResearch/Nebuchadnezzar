@@ -104,12 +104,10 @@ impl ClientCursor {
     pub fn current(&self) -> Option<&IndexedCell> {
         match &self.cell {
             CellSlot::Some(cell) => Some(cell),
-            _ => {
-                match  &self.cell_block.as_ref().unwrap()[self.pos] {
-                    CellSlot::Some(cell) => Some(cell),
-                    _ => None
-                }
-            }
+            _ => match &self.cell_block.as_ref().unwrap()[self.pos] {
+                CellSlot::Some(cell) => Some(cell),
+                _ => None,
+            },
         }
     }
 
@@ -150,7 +148,7 @@ impl CellSlot {
     fn is_some(&self) -> bool {
         match self {
             CellSlot::Some(_) => true,
-            _ => false
+            _ => false,
         }
     }
     fn get_in(self) -> IndexedCell {
