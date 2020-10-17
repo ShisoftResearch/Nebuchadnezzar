@@ -5,6 +5,7 @@ use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, RandValue, Value};
+use lightning::map::WordMutexGuard;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
 use std::io::Cursor;
@@ -177,10 +178,10 @@ impl Cell {
     }
 
     //TODO: optimize for update
-    pub fn write_to_chunk(&mut self, chunk: &Chunk, _update: bool) -> Result<usize, WriteError> {
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, _guard: &WordMutexGuard) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
+            let write_result = self.write_to_chunk_with_schema(chunk, &*schema, _guard);
             if write_result.is_ok() {
                 // index::client::make_indices(self, &*schema, update);
             }
@@ -193,6 +194,7 @@ impl Cell {
         &mut self,
         chunk: &Chunk,
         schema: &Schema,
+        _guard: &WordMutexGuard
     ) -> Result<usize, WriteError> {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();

@@ -144,7 +144,7 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
-        match self.index.lock(&(hash as usize)) {
+        match self.index.lock(hash as usize) {
             Some(index) => {
                 if *index == 0 {
                     return Err(ReadError::CellDoesNotExisted);
@@ -162,7 +162,7 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
-        match self.index.lock(&(hash as usize)) {
+        match self.index.lock(hash as usize) {
             Some(index) => {
                 if *index == 0 {
                     return None;
@@ -206,26 +206,17 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
-    fn write_cell_unchecked(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
-        debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let loc = cell.write_to_chunk(self, false)?;
-        if self
-            .index
-            .insert(&(cell.header.hash as usize), loc)
-            .is_some()
-        {
-            Err(WriteError::CellAlreadyExisted)
-        } else {
-            Ok(cell.header)
-        }
-    }
-
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
-        let hash = cell.header.hash;
-        if self.location_for_read(hash).is_ok() {
-            return Err(WriteError::CellAlreadyExisted);
-        } else {
-            self.write_cell_unchecked(cell)
+        debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
+        match self.index.try_insert_locked(cell.header.hash as usize) {
+            Some(mut guard) => {
+                let loc = cell.write_to_chunk(self, &guard)?;
+                *guard = loc;
+                Ok(cell.header)
+            },
+            None => {
+                Err(WriteError::CellAlreadyExisted)
+            }
         }
     }
 
@@ -236,37 +227,42 @@ impl Chunk {
         guard: &mut CellWriteGuard,
     ) -> Result<CellHeader, WriteError> {
         let _old_location = **guard;
-        let new_location = cell.write_to_chunk(self, true)?;
+        let new_location = cell.write_to_chunk(self, guard)?;
         **guard = new_location;
         return Ok(cell.header);
     }
 
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        let (res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
-            (
-                self.update_cell_from_guard(cell, &mut cell_location),
-                *cell_location,
-            )
+        if let Some(mut guard) = self.location_for_write(hash) {
+            let cell_location = *guard;
+            let res = self.update_cell_from_guard(cell, &mut guard);
+            self.mark_dead_entry(cell_location);
+            res     
         } else {
-            return Err(WriteError::CellDoesNotExisted);
-        };
-        self.mark_dead_entry(loc);
-        return res;
+            Err(WriteError::CellDoesNotExisted)
+        }
     }
 
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
-        let (update_res, loc) = if let Some(mut cell_location) = self.location_for_write(hash) {
-            (
-                self.update_cell_from_guard(cell, &mut cell_location),
-                *cell_location,
-            )
-        } else {
-            return self.write_cell_unchecked(cell);
-        };
-        self.mark_dead_entry(loc);
-        return update_res;
+        loop {
+            if let Some(mut guard) = self.location_for_write(hash) {
+                let cell_location = *guard;
+                let res = self.update_cell_from_guard(cell, &mut guard);
+                self.mark_dead_entry(cell_location);
+                return res;     
+            } else {
+                if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
+                    // New cell
+                    let loc = cell.write_to_chunk(self, &guard)?;
+                    *guard = loc;
+                    return Ok(cell.header);
+                } else {
+                    continue
+                }
+            }
+        }
     }
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
@@ -280,7 +276,7 @@ impl Chunk {
                     let new_cell = update(cell);
                     if let Some(mut new_cell) = new_cell {
                         let old_location = *cell_location;
-                        let new_location = new_cell.write_to_chunk(self, true)?;
+                        let new_location = new_cell.write_to_chunk(self, &mut cell_location)?;
                         *cell_location = new_location;
                         (Ok(new_cell), old_location)
                     } else {
@@ -310,7 +306,7 @@ impl Chunk {
     where
         P: Fn(Cell) -> bool,
     {
-        if let Some(guard) = self.index.lock(&(hash as usize)) {
+        if let Some(guard) = self.index.lock(hash as usize) {
             let cell_location = *guard;
             let cell = Cell::from_chunk_raw(cell_location, self);
             match cell {
