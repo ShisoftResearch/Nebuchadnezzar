@@ -10,6 +10,11 @@ use dovahkiin::types::type_id_of;
 use std::env;
 use std::sync::Arc;
 use test::Bencher;
+use futures::stream::FuturesUnordered;
+use tokio::stream::StreamExt;
+use rand::{Rng, SeedableRng};
+use rand::rngs::SmallRng;
+use itertools::Itertools;
 
 #[bench]
 fn cell_construct(b: &mut Bencher) {
@@ -142,6 +147,7 @@ pub async fn smoke_test() {
 pub async fn smoke_test_parallel() {
     let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
+    const ARRAY: &'static str = "ARRAY";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
         .parse::<u64>()
@@ -172,14 +178,24 @@ pub async fn smoke_test_parallel() {
             0,
             false,
             false,
-            Some(vec![Field::new(
-                DATA,
-                type_id_of(Type::U64),
-                false,
-                false,
-                None,
-                vec![],
-            )]),
+            Some(vec![
+                Field::new(
+                    DATA,
+                    type_id_of(Type::U64),
+                    false,
+                    false,
+                    None,
+                    vec![],
+                ),
+                Field::new(
+                    ARRAY,
+                    type_id_of(Type::U64),
+                    false,
+                    true,
+                    None,
+                    vec![],
+                )
+            ]),
             vec![],
         ),
     };
@@ -196,54 +212,36 @@ pub async fn smoke_test_parallel() {
     );
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
-    // // Create a background thread which checks for deadlocks every 10s
-    // thread::Builder::new()
-    //     .name("deadlock checker".to_string())
-    //     .spawn(move || loop {
-    //         thread::sleep(Duration::from_secs(1));
-    //         error!("{} deadlocks detected", deadlocks.len());
-    //         for (i, threads) in deadlocks.iter().enumerate() {
-    //             error!("Deadlock #{}", i);
-    //             for t in threads {
-    //                 error!("Thread Id {:#?}", t.thread_id());
-    //                 error!("{:#?}", t.backtrace());
-    //             }
-    //         }
-    //         panic!();
-    //     });
+    let num_tasks = 1024;
+    let mut tasks: FuturesUnordered<_> = FuturesUnordered::new();
 
-    for i in 0..num {
+    for i in 0..num_tasks {
         let client_clone = client.clone();
-        // intense upsert, half delete
-        let id = Id::new(1, i);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(i);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).await.unwrap().unwrap();
-
-        // read
-        let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
-
-        if i % 2 == 0 {
+        tasks.push(tokio::spawn(async move {
+            let id = Id::new(1, i as u64);
+            for j in 0..num {
+                if j > 0 {
+                    let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
+                    assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j - 1);
+                }
+                let mut rng = SmallRng::from_entropy();
+                if rng.gen_range(0, 4) == 4 {
+                    client_clone.remove_cell(id).await.unwrap().unwrap();
+                }
+                let mut value = Value::Map(Map::new());
+                value[DATA] = Value::U64(j);
+                value[ARRAY] = (1..rng.gen_range(1, 1024)).collect::<Vec<u64>>().value();
+                let cell = Cell::new_with_id(schema_id, &id, value);
+                client_clone.upsert_cell(cell).await.unwrap().unwrap();
+                // read
+                let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
+                assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j);
+            }
             client_clone.remove_cell(id).await.unwrap().unwrap();
-        }
+        }));
     }
 
-    for i in 0..num {
-        if i % 2 == 0 {
-            return;
-        }
-        let id = Id::new(1, i);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(i * 2);
-        let cell = Cell::new_with_id(schema_id, &id, value);
-        client.upsert_cell(cell).await.unwrap().unwrap();
-
-        // verify
-        let read_cell = client.read_cell(id).await.unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
-    }
+    while let Some(_) = tasks.next().await {}
 }
 
 #[tokio::test(threaded_scheduler)]

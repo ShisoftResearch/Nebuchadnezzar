@@ -23,7 +23,7 @@ serde_derive = "*"
 bincode = "*"
 byteorder = "*"
 parking_lot = "*"
-rand = "*"
+rand = { version = "*", features = ["small_rng"] }
 linked-hash-map = "*"
 bitflags = "*"
 itertools = "*"
