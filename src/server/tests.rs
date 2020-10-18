@@ -220,6 +220,7 @@ pub async fn smoke_test_parallel() {
         tasks.push(tokio::spawn(async move {
             let id = Id::new(1, i as u64);
             for j in 0..num {
+                debug!("Smoke test i {}, k {}", i, j);
                 if j > 0 {
                     let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
                     assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j - 1);

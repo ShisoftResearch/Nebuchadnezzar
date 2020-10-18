@@ -15,7 +15,7 @@ impl CompactCleaner {
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
-            debug!(
+            trace!(
                 "Skip cleaning chunk {} segment {} for it have no dead spaces",
                 chunk.id, dead_space
             );

@@ -44,7 +44,7 @@ impl DummySegment {
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
         if segments.len() < 2 {
-            debug!(
+            trace!(
                 "too few segments to combine, chunk {}, segments {}",
                 chunk.id,
                 segments.len()

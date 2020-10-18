@@ -61,7 +61,7 @@ impl Cleaner {
                             // compact
                             let segments_for_compact = chunk.segs_for_compact_cleaner();
                             if !segments_for_compact.is_empty() {
-                                debug!(
+                                trace!(
                                     "Chunk {} have {} segments to compact, overflow {}",
                                     chunk.id,
                                     segments_for_compact.len(),
@@ -86,7 +86,7 @@ impl Cleaner {
                                 .take(segments_combine_per_turn)
                                 .collect();
                             if !segments_for_combine.is_empty() {
-                                debug!(
+                                trace!(
                                     "Chunk {} have {} segments to combine, overflow {}",
                                     chunk.id,
                                     segments_for_combine.len(),
