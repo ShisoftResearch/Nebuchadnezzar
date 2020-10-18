@@ -37,7 +37,13 @@ futures-timer = "3"
 async-std = "1"
 tokio = "0.2"
 crossbeam = "0.7.3"
+chashmap = { version = "2.2.2", optional = true }
 
 [dev-dependencies]
 env_logger = "*"
 rayon = "*"
+
+[features]
+default = ["fast_map"]
+slow_map = ["chashmap"]
+fast_map = []

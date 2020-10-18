@@ -1,4 +1,4 @@
-use crate::ram::chunk::Chunk;
+use crate::ram::chunk::{Chunk, CellWriteGuard};
 use crate::ram::clock;
 use crate::ram::entry::*;
 use crate::ram::io::{reader, writer};
@@ -178,7 +178,7 @@ impl Cell {
     }
 
     //TODO: optimize for update
-    pub fn write_to_chunk(&mut self, chunk: &Chunk, _guard: &WordMutexGuard) -> Result<usize, WriteError> {
+    pub fn write_to_chunk(&mut self, chunk: &Chunk, _guard: &CellWriteGuard) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
             let write_result = self.write_to_chunk_with_schema(chunk, &*schema, _guard);
@@ -194,7 +194,7 @@ impl Cell {
         &mut self,
         chunk: &Chunk,
         schema: &Schema,
-        _guard: &WordMutexGuard
+        _guard: &CellWriteGuard
     ) -> Result<usize, WriteError> {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();

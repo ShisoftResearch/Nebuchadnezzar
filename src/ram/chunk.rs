@@ -7,22 +7,39 @@ use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use crate::utils::raii_mutex_table::RAIIMutexTable;
 use crate::utils::ring_buffer::RingBuffer;
-use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
-use lightning::map::*;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use lightning::map::*;
+#[cfg(feature = "slow_map")]
+use chashmap::*;
+#[cfg(feature = "fast_map")]
+use crate::utils::upper_power_of_2;
 
+#[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
+#[cfg(feature = "fast_map")]
 pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
+
+#[cfg(feature = "slow_map")]
+pub type CellReadGuard<'a> = chashmap::ReadGuard<'a, u64, usize>;
+#[cfg(feature = "slow_map")]
+pub type CellWriteGuard<'a> = chashmap::WriteGuard<'a, u64, usize>;
+
 
 pub struct Chunk {
     pub id: usize,
+    #[cfg(feature = "fast_map")]
     pub index: Arc<WordMap>,
+    #[cfg(feature = "fast_map")]
     pub segs: Arc<ObjectMap<Arc<Segment>>>,
+    #[cfg(feature = "slow_map")]
+    pub index: Arc<CHashMap<u64, usize>>,
+    #[cfg(feature = "slow_map")]
+    pub segs: Arc<CHashMap<usize, Arc<Segment>>>,
     // Used only for locating segment for address
     // when putting tombstone, not normal data access
     pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
@@ -60,8 +77,18 @@ impl Chunk {
                 n + 1
             }
         };
-        let segs = Arc::new(ObjectMap::with_capacity(upper_power_of_2(num_segs)));
-        let index = Arc::new(WordMap::with_capacity(64));
+        #[cfg(feature = "fast_map")]
+        let segs = ObjectMap::with_capacity(upper_power_of_2(num_segs));
+        #[cfg(feature = "fast_map")]
+        let index = WordMap::with_capacity(64);
+        #[cfg(feature = "slow_map")]
+        let segs = CHashMap::new();
+        #[cfg(feature = "slow_map")]
+        let index = CHashMap::new();
+
+        let segs = Arc::new(segs);
+        let index = Arc::new(index);
+
         let chunk = Chunk {
             id,
             segs,
@@ -144,7 +171,11 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
-        match self.index.lock(hash as usize) {
+        #[cfg(feature = "fast_map")]
+        let guard = self.index.lock(hash as usize);
+        #[cfg(feature = "slow_map")]
+        let guard = self.index.get(&hash);
+        match guard {
             Some(index) => {
                 if *index == 0 {
                     return Err(ReadError::CellDoesNotExisted);
@@ -162,7 +193,12 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
-        match self.index.lock(hash as usize) {
+        #[cfg(feature = "fast_map")]
+        let guard = self.index.lock(hash as usize);
+        #[cfg(feature = "slow_map")]
+        let guard = self.index.get_mut(&hash);
+
+        match guard {
             Some(index) => {
                 if *index == 0 {
                     return None;
@@ -206,6 +242,7 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    #[cfg(feature = "fast_map")]
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         match self.index.try_insert_locked(cell.header.hash as usize) {
@@ -217,6 +254,28 @@ impl Chunk {
             None => {
                 Err(WriteError::CellAlreadyExisted)
             }
+        }
+    }
+
+    #[cfg(feature = "slow_map")]
+    fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+        debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
+        let header = cell.header;
+        let mut new = false;
+        self.index.alter(header.hash, |mut i| {
+            if i.is_none() {
+                i = Some(0);
+                new = true;
+            }
+            i
+        });
+        // This one have hazard, only use it in debug
+        if new {
+            let guard = self.index.get_mut(&header.hash).unwrap();
+            cell.write_to_chunk(self, &guard)?;
+            Ok(header)
+        } else {
+            Err(WriteError::CellAlreadyExisted)
         }
     }
 
@@ -244,6 +303,7 @@ impl Chunk {
         }
     }
 
+    #[cfg(feature = "fast_map")]
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         loop {
@@ -262,6 +322,20 @@ impl Chunk {
                     continue
                 }
             }
+        }
+    }
+
+    #[cfg(feature = "slow_map")]
+    fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+        // This one is also not safe, should only be used for specific tests
+        let header = cell.header;
+        let hash = header.hash;
+        if let Some(mut guard) = self.index.get_mut(&hash) {let cell_location = *guard;
+            let res = self.update_cell_from_guard(cell, &mut guard);
+            self.mark_dead_entry(cell_location);
+            res
+        } else {
+            self.write_cell(cell)
         }
     }
 
@@ -294,7 +368,11 @@ impl Chunk {
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         let _unstable_guard = self.unstable_cells.lock(hash);
         let hash_key = hash as usize;
-        if let Some(cell_location) = self.index.remove(&hash_key) {
+        #[cfg(feature = "fast_map")]
+        let res = self.index.remove(&hash_key);
+        #[cfg(feature = "slow_map")]
+        let res = self.index.remove(&hash);
+        if let Some(cell_location) = res {
             self.put_tombstone_by_cell_loc(cell_location)?;
             Ok(())
         } else {
@@ -306,7 +384,11 @@ impl Chunk {
     where
         P: Fn(Cell) -> bool,
     {
-        if let Some(guard) = self.index.lock(hash as usize) {
+        #[cfg(feature = "fast_map")]
+        let guard = self.index.lock(hash as usize);
+        #[cfg(feature = "slow_map")]
+        let guard = self.index.get(&hash);
+        if let Some(guard) = guard {
             let cell_location = *guard;
             let cell = Cell::from_chunk_raw(cell_location, self);
             match cell {
@@ -316,6 +398,8 @@ impl Chunk {
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
+                            #[cfg(feature = "fast_map")]
+                            guard.remove();
                             Ok(())
                         }
                     } else {
@@ -346,7 +430,10 @@ impl Chunk {
             }
             seg_index_guard.insert(segment_addr, segment_id);
         }
+        #[cfg(feature = "fast_map")]
         self.segs.insert(&segment_key, segment);
+        #[cfg(feature = "slow_map")]
+        self.segs.insert(segment_key, segment);
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
@@ -461,6 +548,17 @@ impl Chunk {
         addrs_guard.values().cloned().collect()
     }
 
+    #[cfg(feature = "slow_map")]
+    pub fn contains_seg(&self, seg_id: u64) -> bool {
+        self.segs.contains_key(&(seg_id as usize))
+    }
+
+    #[cfg(feature = "fast_map")]
+    pub fn contains_seg(&self, seg_id: u64) -> bool {
+        self.segs.contains(&(seg_id as usize))
+    }
+
+
     // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
     // and looking for those with entry type tombstone.
     // It is resource intensive so there will be some rules to skip the scan.
@@ -494,7 +592,7 @@ impl Chunk {
                     if entry_meta.entry_header.entry_type == EntryType::TOMBSTONE {
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if !self.segs.contains(&(tombstone.segment_id as usize)) {
+                        if !self.contains_seg(tombstone.segment_id) {
                             // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
                             death_count += 1;
                         }
@@ -577,7 +675,7 @@ impl Chunk {
         let seg_owned = seg.clone();
         let chunk_id = self.id;
         let chunk_index = self.index.clone();
-        let chunk_segs = self.segs.clone();
+        let chunk_segs =  self.segs.clone();
         seg.entry_iter()
             .filter_map(move |entry_meta| {
                 let seg = &seg_owned;
@@ -592,7 +690,14 @@ impl Chunk {
                             Cell::cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
                         debug!("Cell header read, id is {:?}", cell_header.id());
-                        if chunk_index.get(&(cell_header.hash as usize)) == Some(entry_meta.entry_pos) {
+
+                        #[cfg(feature = "slow_map")]
+                        let matches = chunk_index.get(&cell_header.hash).map(|g| *g) == Some(entry_meta.entry_pos);
+                            
+                        #[cfg(feature = "fast_map")]
+                        let matches = chunk_index.get(&(cell_header.hash as usize)) == Some(entry_meta.entry_pos);
+
+                        if matches {
                             debug!("Cell entry {:?} is valid", cell_header.id());
                             return Some(Entry {
                                 meta: entry_meta,
@@ -606,7 +711,13 @@ impl Chunk {
                         debug!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if chunk_segs.contains(&(tombstone.segment_id as usize)) {
+
+                        #[cfg(feature = "slow_map")]
+                        let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
+                        #[cfg(feature = "fast_map")]
+                        let contains_seg = chunk_segs.contains(&(tombstone.segment_id as usize));
+
+                        if contains_seg {
                             debug!("Tomestone entry {:?} - {:?} at {} is valid",
                                    tombstone.partition, tombstone.hash, tombstone.segment_id);
                             return Some(Entry {

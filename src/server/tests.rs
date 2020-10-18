@@ -14,7 +14,6 @@ use futures::stream::FuturesUnordered;
 use tokio::stream::StreamExt;
 use rand::{Rng, SeedableRng};
 use rand::rngs::SmallRng;
-use itertools::Itertools;
 
 #[bench]
 fn cell_construct(b: &mut Bencher) {

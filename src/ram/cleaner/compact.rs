@@ -96,7 +96,13 @@ impl CompactCleaner {
                     header.id()
                 );
                 let unstable_guard = chunk.unstable_cells.lock(header.hash);
-                if let Some(mut cell_guard) = chunk.index.lock(header.hash as usize) {
+
+                #[cfg(feature = "fast_map")]
+                let index = chunk.index.lock(header.hash as usize);
+                #[cfg(feature = "slow_map")]
+                let index = chunk.index.get_mut(&header.hash);
+
+                if let Some(mut cell_guard) = index {
                     let old_addr = entry.meta.entry_pos;
                     if *cell_guard == old_addr {
                         *cell_guard = new_addr;
