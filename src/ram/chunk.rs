@@ -262,19 +262,20 @@ impl Chunk {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let header = cell.header;
         let mut new = false;
-        self.index.alter(header.hash, |mut i| {
-            if i.is_none() {
-                i = Some(0);
-                new = true;
-            }
-            i
-        });
+        self.index.upsert(header.hash, || {
+            new = true;
+            0
+        }, |_| {});
         // This one have hazard, only use it in debug
         if new {
-            let guard = self.index.get_mut(&header.hash).unwrap();
-            cell.write_to_chunk(self, &guard)?;
+            debug!("Will insert cell {}", header.hash);
+            let mut guard = self.index.get_mut(&header.hash).unwrap();
+            let loc = cell.write_to_chunk(self, &guard).unwrap();
+            *guard = loc;
+            debug!("Cell inserted for {}", header.hash);
             Ok(header)
         } else {
+            debug!("Cell already existed {}", header.hash);
             Err(WriteError::CellAlreadyExisted)
         }
     }
@@ -330,11 +331,14 @@ impl Chunk {
         // This one is also not safe, should only be used for specific tests
         let header = cell.header;
         let hash = header.hash;
-        if let Some(mut guard) = self.index.get_mut(&hash) {let cell_location = *guard;
+        if let Some(mut guard) = self.index.get_mut(&hash) {
+            debug!("Upsert {} by update", header.hash);
+            let cell_location = *guard;
             let res = self.update_cell_from_guard(cell, &mut guard);
             self.mark_dead_entry(cell_location);
             res
         } else {
+            debug!("Upsert {} by write", header.hash);
             self.write_cell(cell)
         }
     }

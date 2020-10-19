@@ -222,10 +222,11 @@ pub async fn smoke_test_parallel() {
                 debug!("Smoke test i {}, k {}", i, j);
                 if j > 0 {
                     let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-                    assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j - 1);
+                    assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j - 1, "Parallel first read i {}, j {}", i, j);
                 }
                 let mut rng = SmallRng::from_entropy();
                 if rng.gen_range(0, 4) == 4 {
+                    debug!("Removing i {}, j {}", i, j);
                     client_clone.remove_cell(id).await.unwrap().unwrap();
                 }
                 let mut value = Value::Map(Map::new());
@@ -234,8 +235,17 @@ pub async fn smoke_test_parallel() {
                 let cell = Cell::new_with_id(schema_id, &id, value);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
                 // read
-                let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-                assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j);
+                let read_cell = match client_clone.read_cell(id).await.unwrap() {
+                    Ok(cell) => {
+                        debug!("Got cell for i {}, j {}", i, j);
+                        cell
+                    },
+                    Err(e) => {
+                        panic!("Cannot get cell for i {}, j {}, {:?}", i, j, e);
+                    }
+                };
+                assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j, "Parallel final read i {}, j {}", i, j);
+                debug!("Iteration i {}, j {} completed", i, j);
             }
             client_clone.remove_cell(id).await.unwrap().unwrap();
         }));

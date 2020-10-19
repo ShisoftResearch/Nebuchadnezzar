@@ -44,6 +44,6 @@ env_logger = "*"
 rayon = "*"
 
 [features]
-default = ["fast_map"]
+default = ["slow_map"]
 slow_map = ["chashmap"]
 fast_map = []
