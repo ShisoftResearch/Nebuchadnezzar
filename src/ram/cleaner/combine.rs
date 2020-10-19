@@ -208,7 +208,7 @@ impl CombinedCleaner {
                 let index = chunk.index.lock(hash as usize);
                 #[cfg(feature = "slow_map")]
                 let index = chunk.index.get_mut(&hash);
-                
+
                 if let Some(mut actual_addr) = index {
                     if *actual_addr == old {
                         *actual_addr = new

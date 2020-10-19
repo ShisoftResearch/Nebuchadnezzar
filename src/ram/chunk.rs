@@ -1,24 +1,24 @@
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
-use crate::ram::cleaner::Cleaner;
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use crate::utils::raii_mutex_table::RAIIMutexTable;
+#[cfg(feature = "fast_map")]
+use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
+#[cfg(feature = "slow_map")]
+use chashmap::*;
+use lightning::map::*;
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use lightning::map::*;
-#[cfg(feature = "slow_map")]
-use chashmap::*;
-#[cfg(feature = "fast_map")]
-use crate::utils::upper_power_of_2;
-use parking_lot::Mutex;
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -29,7 +29,6 @@ pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub type CellReadGuard<'a> = chashmap::ReadGuard<'a, u64, usize>;
 #[cfg(feature = "slow_map")]
 pub type CellWriteGuard<'a> = chashmap::WriteGuard<'a, u64, usize>;
-
 
 pub struct Chunk {
     pub id: usize,
@@ -52,7 +51,7 @@ pub struct Chunk {
     pub total_space: AtomicUsize,
     pub capacity: usize,
     pub unstable_cells: RAIIMutexTable<u64>,
-    pub gc_lock: Mutex<()>
+    pub gc_lock: Mutex<()>,
 }
 
 impl Chunk {
@@ -103,7 +102,7 @@ impl Chunk {
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
             unstable_cells: RAIIMutexTable::new(),
-            gc_lock: Mutex::new(())
+            gc_lock: Mutex::new(()),
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
@@ -128,10 +127,11 @@ impl Chunk {
                     });
                 }
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE
+                    {
                         // No space left
                         if tried_gc {
-                            return None
+                            return None;
                         } else {
                             debug!("No space left for chunk {}, emergency full GC", self.id);
                             Cleaner::clean(self, true);
@@ -257,10 +257,8 @@ impl Chunk {
                 let loc = cell.write_to_chunk(self, &guard)?;
                 *guard = loc;
                 Ok(cell.header)
-            },
-            None => {
-                Err(WriteError::CellAlreadyExisted)
             }
+            None => Err(WriteError::CellAlreadyExisted),
         }
     }
 
@@ -269,10 +267,14 @@ impl Chunk {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let header = cell.header;
         let mut new = false;
-        self.index.upsert(header.hash, || {
-            new = true;
-            0
-        }, |_| {});
+        self.index.upsert(
+            header.hash,
+            || {
+                new = true;
+                0
+            },
+            |_| {},
+        );
         // This one have hazard, only use it in debug
         if new {
             debug!("Will insert cell {}", header.hash);
@@ -305,7 +307,7 @@ impl Chunk {
             let cell_location = *guard;
             let res = self.update_cell_from_guard(cell, &mut guard);
             self.mark_dead_entry(cell_location);
-            res     
+            res
         } else {
             Err(WriteError::CellDoesNotExisted)
         }
@@ -319,7 +321,7 @@ impl Chunk {
                 let cell_location = *guard;
                 let res = self.update_cell_from_guard(cell, &mut guard);
                 self.mark_dead_entry(cell_location);
-                return res;     
+                return res;
             } else {
                 if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
                     // New cell
@@ -327,7 +329,7 @@ impl Chunk {
                     *guard = loc;
                     return Ok(cell.header);
                 } else {
-                    continue
+                    continue;
                 }
             }
         }
@@ -560,7 +562,6 @@ impl Chunk {
         self.segs.contains(&(seg_id as usize))
     }
 
-
     // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
     // and looking for those with entry type tombstone.
     // It is resource intensive so there will be some rules to skip the scan.
@@ -677,7 +678,7 @@ impl Chunk {
         let seg_owned = seg.clone();
         let chunk_id = self.id;
         let chunk_index = self.index.clone();
-        let chunk_segs =  self.segs.clone();
+        let chunk_segs = self.segs.clone();
         seg.entry_iter()
             .filter_map(move |entry_meta| {
                 let seg = &seg_owned;
@@ -695,7 +696,6 @@ impl Chunk {
 
                         #[cfg(feature = "slow_map")]
                         let matches = chunk_index.get(&cell_header.hash).map(|g| *g) == Some(entry_meta.entry_pos);
-                            
                         #[cfg(feature = "fast_map")]
                         let matches = chunk_index.get(&(cell_header.hash as usize)) == Some(entry_meta.entry_pos);
 

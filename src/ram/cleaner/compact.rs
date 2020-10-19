@@ -17,7 +17,8 @@ impl CompactCleaner {
         if dead_space == 0 {
             trace!(
                 "Skip cleaning chunk {} segment {} for it have no dead spaces",
-                chunk.id, dead_space
+                chunk.id,
+                dead_space
             );
             return 0;
         }

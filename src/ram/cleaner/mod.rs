@@ -1,4 +1,4 @@
-use crate::ram::chunk::{Chunks, Chunk};
+use crate::ram::chunk::{Chunk, Chunks};
 use lightning::map::Map;
 use rayon::prelude::*;
 use std::env;
@@ -70,17 +70,14 @@ impl Cleaner {
                 cleaned_space += segments_for_compact
                     .into_par_iter()
                     .take(segments_compact_per_turn) // limit max segment to clean per turn
-                    .map(|segment| {
-                        compact::CompactCleaner::clean_segment(chunk, &segment)
-                    })
+                    .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
                     .sum::<usize>();
             }
         }
-        
+
         {
             // combine
-            let segments_candidates_for_combine: Vec<_> =
-                chunk.segs_for_combine_cleaner();
+            let segments_candidates_for_combine: Vec<_> = chunk.segs_for_combine_cleaner();
             let segments_for_combine: Vec<_> = segments_candidates_for_combine
                 .into_iter()
                 .take(segments_combine_per_turn)
@@ -92,13 +89,11 @@ impl Cleaner {
                     segments_for_combine.len(),
                     segments_combine_per_turn
                 );
-                cleaned_space += combine::CombinedCleaner::combine_segments(
-                    chunk,
-                    &segments_for_combine,
-                );
+                cleaned_space +=
+                    combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
             }
         }
-        
+
         chunk
             .total_space
             .fetch_sub(cleaned_space, Ordering::Relaxed);

@@ -7,13 +7,13 @@ use crate::server::*;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
+use futures::stream::FuturesUnordered;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 use std::env;
 use std::sync::Arc;
 use test::Bencher;
-use futures::stream::FuturesUnordered;
 use tokio::stream::StreamExt;
-use rand::{Rng, SeedableRng};
-use rand::rngs::SmallRng;
 
 #[bench]
 fn cell_construct(b: &mut Bencher) {
@@ -178,22 +178,8 @@ pub async fn smoke_test_parallel() {
             false,
             false,
             Some(vec![
-                Field::new(
-                    DATA,
-                    type_id_of(Type::U64),
-                    false,
-                    false,
-                    None,
-                    vec![],
-                ),
-                Field::new(
-                    ARRAY,
-                    type_id_of(Type::U64),
-                    false,
-                    true,
-                    None,
-                    vec![],
-                )
+                Field::new(DATA, type_id_of(Type::U64), false, false, None, vec![]),
+                Field::new(ARRAY, type_id_of(Type::U64), false, true, None, vec![]),
             ]),
             vec![],
         ),
@@ -222,7 +208,13 @@ pub async fn smoke_test_parallel() {
                 debug!("Smoke test i {}, k {}", i, j);
                 if j > 0 {
                     let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-                    assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j - 1, "Parallel first read i {}, j {}", i, j);
+                    assert_eq!(
+                        *(read_cell.data[DATA].U64().unwrap()),
+                        j - 1,
+                        "Parallel first read i {}, j {}",
+                        i,
+                        j
+                    );
                 }
                 let mut rng = SmallRng::from_entropy();
                 if rng.gen_range(0, 4) == 4 {
@@ -239,12 +231,18 @@ pub async fn smoke_test_parallel() {
                     Ok(cell) => {
                         debug!("Got cell for i {}, j {}", i, j);
                         cell
-                    },
+                    }
                     Err(e) => {
                         panic!("Cannot get cell for i {}, j {}, {:?}", i, j, e);
                     }
                 };
-                assert_eq!(*(read_cell.data[DATA].U64().unwrap()), j, "Parallel final read i {}, j {}", i, j);
+                assert_eq!(
+                    *(read_cell.data[DATA].U64().unwrap()),
+                    j,
+                    "Parallel final read i {}, j {}",
+                    i,
+                    j
+                );
                 debug!("Iteration i {}, j {} completed", i, j);
             }
             client_clone.remove_cell(id).await.unwrap().unwrap();
