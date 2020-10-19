@@ -156,7 +156,7 @@ pub async fn smoke_test_parallel() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 512 * 1024 * 1024,
+            memory_size: 16 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
             services: vec![Service::Cell],

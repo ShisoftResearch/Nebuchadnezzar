@@ -2,11 +2,11 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
+use crate::ram::cleaner::Cleaner;
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use crate::utils::raii_mutex_table::RAIIMutexTable;
-use crate::utils::ring_buffer::RingBuffer;
 use bifrost::utils::time::get_time;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
@@ -18,6 +18,7 @@ use lightning::map::*;
 use chashmap::*;
 #[cfg(feature = "fast_map")]
 use crate::utils::upper_power_of_2;
+use parking_lot::Mutex;
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -49,9 +50,9 @@ pub struct Chunk {
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
     pub total_space: AtomicUsize,
-    pub dead_entries: RingBuffer,
     pub capacity: usize,
     pub unstable_cells: RAIIMutexTable<u64>,
+    pub gc_lock: Mutex<()>
 }
 
 impl Chunk {
@@ -101,15 +102,15 @@ impl Chunk {
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
             addrs_seg: RwLock::new(BTreeMap::new()),
-            dead_entries: RingBuffer::new((num_segs + 1) * 100),
             unstable_cells: RAIIMutexTable::new(),
+            gc_lock: Mutex::new(())
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
     }
 
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
-        let _retried = 0;
+        let mut tried_gc = false;
         loop {
             let head = self.head_seg.read().clone();
             let head_seg_id = head.id;
@@ -127,10 +128,16 @@ impl Chunk {
                     });
                 }
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE
-                    {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE {
                         // No space left
-                        return None;
+                        if tried_gc {
+                            return None
+                        } else {
+                            debug!("No space left for chunk {}, emergency full GC", self.id);
+                            Cleaner::clean(self, true);
+                            tried_gc = true;
+                            continue;
+                        }
                     }
                     let mut acquired_header = self.head_seg.write();
                     if head_seg_id == acquired_header.id {
@@ -517,8 +524,12 @@ impl Chunk {
     // make the changes in corresponding segments.
     // Because calculate segment from location is computation intensive, it have to be done lazily
     #[inline]
-    fn mark_dead_entry(&self, loc: usize) {
-        self.dead_entries.push(loc);
+    fn mark_dead_entry(&self, addr: usize) {
+        if let Some(seg) = self.locate_segment(addr) {
+            let (entry, _) = Entry::decode_from(addr, |_, _| {});
+            seg.dead_space
+                .fetch_add(entry.content_length, Ordering::Relaxed);
+        }
     }
 
     pub fn segments(&self) -> Vec<Arc<Segment>> {
@@ -531,19 +542,6 @@ impl Chunk {
             }
         }
         return list;
-    }
-
-    // this function should be invoked repeatedly to flush the queue
-    pub fn apply_dead_entry(&self) {
-        trace!("Applying dead entries in buffer");
-        let marks = self.dead_entries.iter();
-        for addr in marks {
-            if let Some(seg) = self.locate_segment(addr) {
-                let (entry, _) = Entry::decode_from(addr, |_, _| {});
-                seg.dead_space
-                    .fetch_add(entry.content_length, Ordering::Relaxed);
-            }
-        }
     }
 
     #[inline]

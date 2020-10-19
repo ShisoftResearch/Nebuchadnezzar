@@ -116,8 +116,6 @@ pub fn full_clean_cycle() {
         }
 
         assert_eq!(chunk.cell_count(), 8);
-
-        chunk.apply_dead_entry();
     }
 
     // check integrity
