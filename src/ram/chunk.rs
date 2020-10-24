@@ -125,6 +125,7 @@ impl Chunk {
                     });
                 }
                 None => {
+                    drop(head);
                     if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE
                     {
                         // No space left

@@ -268,7 +268,7 @@ impl Iterator for SegmentEntryIter {
         let (_, entry_meta) = entry::Entry::decode_from(cursor, |body_pos, header| {
             let entry_header_size = body_pos - cursor;
             let entry_size = entry_header_size + header.content_length as usize;
-            debug!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
+            trace!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
                        body_pos, header, entry_header_size, entry_size, cursor, header.content_length, self.bound);
             return EntryMeta {
                 body_pos,

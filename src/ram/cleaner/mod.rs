@@ -80,16 +80,16 @@ impl Cleaner {
         {
             debug!("Starting combine {}", chunk.id);
             let segments_candidates_for_combine: Vec<_> = chunk.segs_for_combine_cleaner();
+            let num_segments_candidates_for_combine = segments_candidates_for_combine.len();
             let segments_for_combine: Vec<_> = segments_candidates_for_combine
                 .into_iter()
                 .take(segments_combine_per_turn)
                 .collect();
             if !segments_for_combine.is_empty() {
-                trace!(
-                    "Chunk {} have {} segments to combine, overflow {}",
-                    chunk.id,
-                    segments_for_combine.len(),
-                    segments_combine_per_turn
+                debug!(
+                    "Have {} segments to combine, candidates {}", 
+                    segments_for_combine.len(), 
+                    num_segments_candidates_for_combine
                 );
                 cleaned_space +=
                     combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
@@ -99,6 +99,7 @@ impl Cleaner {
         chunk
             .total_space
             .fetch_sub(cleaned_space, Ordering::Relaxed);
+        debug!("Archiving segments");
         chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
     }
