@@ -41,7 +41,7 @@ pub struct Chunk {
     #[cfg(feature = "slow_map")]
     pub segs: Arc<CHashMap<usize, Arc<Segment>>>,
     pub seg_counter: AtomicU64,
-    pub head_seg: RwLock<Arc<Segment>>,
+    pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
@@ -49,7 +49,8 @@ pub struct Chunk {
     pub capacity: usize,
     pub unstable_cells: RAIIMutexTable<u64>,
     pub gc_lock: Mutex<()>,
-    pub allocator: SegmentAllocator
+    pub allocator: SegmentAllocator,
+    pub alloc_lock: Mutex<()>,
 }
 
 impl Chunk {
@@ -98,19 +99,24 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
-            head_seg: RwLock::new(bootstrap_segment_ref.clone()),
+            head_seg_id: AtomicU64::new(bootstrap_segment_ref.id),
             unstable_cells: RAIIMutexTable::new(),
             gc_lock: Mutex::new(()),
+            alloc_lock: Mutex::new(()),
         };
         chunk.put_segment(bootstrap_segment_ref);
         return chunk;
     }
 
+    fn get_head_seg_id(&self) -> u64 {
+        self.head_seg_id.load(Ordering::Relaxed)
+    }
+
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
         let mut tried_gc = false;
         loop {
-            let head = self.head_seg.read().clone();
-            let head_seg_id = head.id;
+            let head_seg_id = self.get_head_seg_id() as usize;
+            let head = self.segs.get(&head_seg_id).expect("Cannot get header");
             match head.try_acquire(size) {
                 Some(addr) => {
                     debug!(
@@ -138,8 +144,9 @@ impl Chunk {
                             continue;
                         }
                     }
-                    let mut acquired_header = self.head_seg.write();
-                    if head_seg_id == acquired_header.id {
+                    let _alloc_guard = self.alloc_lock.lock();
+                    let header_id = self.get_head_seg_id() as usize;
+                    if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.next_segment_id();
                         let new_seg_opt = SegmentAllocator::alloc(
@@ -154,17 +161,7 @@ impl Chunk {
                             .fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         self.put_segment(new_seg_ref.clone());
-                        debug!(
-                            "Dropping old header segment {}. Reference count: {}",
-                            acquired_header.id,
-                            Arc::strong_count(&*acquired_header)
-                        );
-                        *acquired_header = new_seg_ref;
-                        debug!(
-                            "Dropped old header segment, new {}. Reference count: {}",
-                            acquired_header.id,
-                            Arc::strong_count(&*acquired_header)
-                        );
+                        self.head_seg_id.store(new_seg_ref.id, Ordering::Relaxed);
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
@@ -592,16 +589,16 @@ impl Chunk {
                 (seg, rate)
             })
             .filter(|(_, utilization)| *utilization < 90f32);
-        let head_seg = self.head_seg.read();
+        let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
-            .filter(|(seg, _)| seg.id != head_seg.id && seg.no_references())
+            .filter(|(seg, _)| seg.id != head_seg_id && seg.no_references())
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
-        let head_seg = self.head_seg.read();
+        let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
             .into_iter()
@@ -611,7 +608,7 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 50f32 && head_seg.id != seg.id && seg.no_references()
+                *utilization < 50f32 && head_seg_id != seg.id && seg.no_references()
             })
             .collect();
         mapping.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -620,7 +617,7 @@ impl Chunk {
 
     pub fn check_and_archive_segments(&self) {
         let seg_ids = self.segment_ids();
-        let head_id = self.head_seg.read().id;
+        let head_id = self.get_head_seg_id();
         for seg_id in seg_ids {
             if seg_id as u64 == head_id {
                 continue;
@@ -718,7 +715,7 @@ impl Chunk {
 }
 
 pub struct PendingEntry {
-    pub seg: Arc<Segment>,
+    pub seg: MapNodeRef<Arc<Segment>>,
     pub addr: usize,
     pub size: u32,
 }
