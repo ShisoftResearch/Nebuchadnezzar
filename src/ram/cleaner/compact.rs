@@ -56,11 +56,12 @@ impl CompactCleaner {
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = Arc::new(chunk.allocator.alloc(
+        let new_seg = Arc::new(chunk.allocator.alloc_seg(
             seg.id,
             &chunk.backup_storage,
             &chunk.wal_storage,
-        ));
+        )
+        .expect("No space left during compact"));
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
         let _unstable_guards = entries

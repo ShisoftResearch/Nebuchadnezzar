@@ -1,4 +1,5 @@
 use crate::ram::entry;
+use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::EntryMeta;
 use crate::ram::chunk::Chunk;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
@@ -9,7 +10,7 @@ use std::io;
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::Relaxed};
 use lightning::list::WordList;
 use std::ptr;
 
@@ -59,6 +60,9 @@ impl Segment {
             "Creating new segment with id {}, size {}, address {}",
             id, size, buffer_ptr
         );
+        if size < SEGMENT_SIZE {
+            punch_hole(buffer_ptr, size);
+        }
         Segment {
             addr: buffer_ptr,
             id,
@@ -285,6 +289,7 @@ pub struct SegmentAllocator {
     base: usize,
     offset: AtomicUsize,
     limit: usize,
+    gc_threshold: usize,
     free: WordList
 }
 
@@ -309,25 +314,69 @@ impl SegmentAllocator {
             base: aligned_addr,
             offset: AtomicUsize::new(aligned_addr),
             limit: aligned_addr + chunk_size,
+            gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: WordList::with_capacity(chunk_size / SEGMENT_SIZE / 2)
         }
     }
 
     pub fn alloc(
-        &self,
+        chunk: &Chunk,
         id: u64,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
-    ) -> Segment {
-        let addr = self.free.pop().unwrap_or_else(|| {
-            let addr = self.offset.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
-            assert!(addr < self.limit);
-            addr
-        });
-        Segment::new(id, addr, SEGMENT_SIZE, backup_storage, wal_storage)
+    ) -> Option<Segment> {
+        let mut cleaned = false;
+        let this = &chunk.allocator;
+        if this.offset.load(Relaxed) > this.gc_threshold {
+            Cleaner::clean(chunk, false);
+        }
+        loop {
+            let seg_opt = chunk.allocator.alloc_seg(id, backup_storage, wal_storage);
+            if seg_opt.is_some() {
+                return seg_opt;
+            } else {
+                if !cleaned {
+                    Cleaner::clean(chunk, true);
+                    cleaned = true;
+                    continue;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+
+    pub fn alloc_seg(
+        &self, 
+        id: u64, 
+        backup_storage: &Option<String>, 
+        wal_storage: &Option<String>
+    ) -> Option<Segment> {
+        self.free.pop().or_else(|| {
+            loop {
+                let addr = self.offset.load(Relaxed);
+                let new_addr = addr + SEGMENT_SIZE;
+                if addr > self.limit {
+                    return None;
+                } else {
+                    if self.offset.compare_and_swap(addr, new_addr, Relaxed) == addr {
+                        return Some(new_addr);
+                    }
+                }
+            }
+        })
+        .map(|addr| Segment::new(
+            id, 
+            addr, 
+            SEGMENT_SIZE, 
+            backup_storage, 
+            wal_storage
+        ))
     }
 
     pub fn free(&self, seg_addr: usize) {
+        debug_assert!(seg_addr >= self.base);
+        debug_assert!(seg_addr < self.limit);
         self.free.push(seg_addr);
     }
 
@@ -335,5 +384,28 @@ impl SegmentAllocator {
         let offset = addr - self.base;
         let id = offset >> SEGMENT_BITS_SHIFT;
         id
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn madvise_free(addr: usize, size: usize) { 
+    madvise(addr as *mut c_void, size, MADV_REMOVE);
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn madvise_free(addr: usize, size: usize) {
+    madvise(addr as *mut c_void, size, MADV_DONTNEED);
+}
+
+fn punch_hole(addr: usize, seg_size: usize) {
+    let right_boundary = addr + seg_size;
+    let aligned_addr = (((right_boundary - 1) >> PAGE_SHIFT) + 1) << PAGE_SHIFT;
+    let hole_length = (addr + SEGMENT_SIZE) - aligned_addr;
+    if hole_length > PAGE_SIZE {
+        // Have pages to release
+        debug!("Partially free the segment by puching hole with size {}", hole_length);
+        unsafe {
+            madvise_free(addr, hole_length);
+        }
     }
 }

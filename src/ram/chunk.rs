@@ -62,11 +62,11 @@ impl Chunk {
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(allocator.alloc(
+        let bootstrap_segment_ref = Arc::new(allocator.alloc_seg(
             first_seg_id,
             &backup_storage,
             &wal_storage,
-        ));
+        ).unwrap());
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {
@@ -141,11 +141,13 @@ impl Chunk {
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.next_segment_id();
-                        let new_seg = self.allocator.alloc(
+                        let new_seg_opt = SegmentAllocator::alloc(
+                            self,
                             new_seg_id,
                             &self.backup_storage,
-                            &self.wal_storage,
+                            &self.wal_storage
                         );
+                        let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
                         self.total_space
                             .fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
