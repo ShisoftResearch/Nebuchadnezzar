@@ -37,15 +37,6 @@ fn default_fields() -> Field {
     )
 }
 
-fn seg_positions(chunk: &Chunk) -> Vec<(u64, usize)> {
-    chunk
-        .addrs_seg
-        .read()
-        .iter()
-        .map(|(pos, hash)| (*hash, *pos))
-        .collect()
-}
-
 #[test]
 pub fn full_clean_cycle() {
     let _ = env_logger::try_init();
@@ -76,9 +67,7 @@ pub fn full_clean_cycle() {
 
         println!("trying to delete cells");
 
-        let all_seg_positions = seg_positions(chunk);
-        ();
-        assert_eq!(all_seg_positions.len(), 2);
+        assert_eq!(chunk.seg_count(), 2);
         assert_eq!(chunk.cell_count(), 16);
 
         for i in 0..8 {
@@ -133,9 +122,7 @@ pub fn full_clean_cycle() {
             compact::CompactCleaner::clean_segment(chunk, &seg);
         });
 
-        let compacted_seg_positions = seg_positions(chunk);
-        ();
-        assert_eq!(compacted_seg_positions.len(), 2);
+        assert_eq!(chunk.seg_count(), 2);
         assert_eq!(chunk.cell_count(), 8);
 
         // scan segments to check entries

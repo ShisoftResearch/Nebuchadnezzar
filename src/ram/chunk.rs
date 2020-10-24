@@ -2,11 +2,12 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
-use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE, MAX_SEGMENT_SIZE_U32};
+use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use crate::utils::raii_mutex_table::RAIIMutexTable;
+
 #[cfg(feature = "fast_map")]
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
@@ -15,10 +16,9 @@ use chashmap::*;
 use lightning::map::*;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Included};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -35,15 +35,12 @@ pub struct Chunk {
     #[cfg(feature = "fast_map")]
     pub index: Arc<WordMap>,
     #[cfg(feature = "fast_map")]
-    pub segs: Arc<ObjectMap<Arc<Segment>>>,
+    pub segs: Arc<LinkedObjectMap<Arc<Segment>>>,
     #[cfg(feature = "slow_map")]
     pub index: Arc<CHashMap<u64, usize>>,
     #[cfg(feature = "slow_map")]
     pub segs: Arc<CHashMap<usize, Arc<Segment>>>,
-    // Used only for locating segment for address
-    // when putting tombstone, not normal data access
-    pub addrs_seg: RwLock<BTreeMap<usize, u64>>,
-    seg_counter: AtomicU64,
+    pub seg_counter: AtomicU64,
     pub head_seg: RwLock<Arc<Segment>>,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -52,6 +49,7 @@ pub struct Chunk {
     pub capacity: usize,
     pub unstable_cells: RAIIMutexTable<u64>,
     pub gc_lock: Mutex<()>,
+    pub allocator: SegmentAllocator
 }
 
 impl Chunk {
@@ -62,15 +60,15 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Chunk {
+        let allocator = SegmentAllocator::new(size);
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(Segment::new(
+        let bootstrap_segment_ref = Arc::new(allocator.alloc(
             first_seg_id,
-            MAX_SEGMENT_SIZE,
             &backup_storage,
             &wal_storage,
         ));
         let num_segs = {
-            let n = size / MAX_SEGMENT_SIZE;
+            let n = size / SEGMENT_SIZE;
             if n > 0 {
                 n
             } else {
@@ -78,7 +76,7 @@ impl Chunk {
             }
         };
         #[cfg(feature = "fast_map")]
-        let segs = ObjectMap::with_capacity(upper_power_of_2(num_segs));
+        let segs = LinkedObjectMap::with_capacity(upper_power_of_2(num_segs));
         #[cfg(feature = "fast_map")]
         let index = WordMap::with_capacity(64);
         #[cfg(feature = "slow_map")]
@@ -96,11 +94,11 @@ impl Chunk {
             meta,
             backup_storage,
             wal_storage,
+            allocator,
             capacity: size,
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
             head_seg: RwLock::new(bootstrap_segment_ref.clone()),
-            addrs_seg: RwLock::new(BTreeMap::new()),
             unstable_cells: RAIIMutexTable::new(),
             gc_lock: Mutex::new(()),
         };
@@ -127,7 +125,7 @@ impl Chunk {
                     });
                 }
                 None => {
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - MAX_SEGMENT_SIZE
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE
                     {
                         // No space left
                         if tried_gc {
@@ -143,15 +141,14 @@ impl Chunk {
                     if head_seg_id == acquired_header.id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_id = self.next_segment_id();
-                        let new_seg = Segment::new(
+                        let new_seg = self.allocator.alloc(
                             new_seg_id,
-                            MAX_SEGMENT_SIZE,
                             &self.backup_storage,
                             &self.wal_storage,
                         );
                         // for performance, won't CAS total_space
                         self.total_space
-                            .fetch_add(MAX_SEGMENT_SIZE, Ordering::Relaxed);
+                            .fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_ref = Arc::new(new_seg);
                         self.put_segment(new_seg_ref.clone());
                         debug!(
@@ -434,17 +431,8 @@ impl Chunk {
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
         let segment_addr = segment.addr;
-        let original_pos = self.segs.get(&segment_key).map(|seg| seg.addr);
-        {
-            let mut seg_index_guard = self.addrs_seg.write();
-            if let Some(seg_original_pos) = original_pos {
-                // remove old segment by it's position
-                seg_index_guard.remove(&seg_original_pos);
-            }
-            seg_index_guard.insert(segment_addr, segment_id);
-        }
         #[cfg(feature = "fast_map")]
-        self.segs.insert(&segment_key, segment);
+        self.segs.insert_back(&segment_key, segment);
         #[cfg(feature = "slow_map")]
         self.segs.insert(segment_key, segment);
     }
@@ -455,29 +443,13 @@ impl Chunk {
             self.id, segment_id
         );
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
-            self.addrs_seg.write().remove(&seg.addr).unwrap();
             seg.dispense();
         }
     }
 
-    fn locate_segment(&self, addr: usize) -> Option<Arc<Segment>> {
-        let segs_addr_range = self.addrs_seg.read();
-        debug!("locating segment addr {} in {:?}", addr, *segs_addr_range);
-        segs_addr_range
-            .range((Excluded(addr - MAX_SEGMENT_SIZE), Included(addr)))
-            .last()
-            .and_then(|(_, seg_id)| {
-                self.segs
-                    .get(&(*seg_id as usize))
-                    .map(|guard| guard.clone())
-                    .and_then(|seg| {
-                        if addr < seg.bound && addr >= seg.addr {
-                            return Some(seg);
-                        } else {
-                            return None;
-                        }
-                    })
-            })
+    fn locate_segment(&self, addr: usize) -> Option<MapNodeRef<Arc<Segment>>> {
+        let seg_id = self.allocator.id_by_addr(addr);
+        self.segs.get(&seg_id)
     }
 
     #[inline]
@@ -534,24 +506,6 @@ impl Chunk {
         }
     }
 
-    pub fn segments(&self) -> Vec<Arc<Segment>> {
-        let addr_segs = self.addrs_seg.read();
-        let segs = addr_segs.values();
-        let mut list = Vec::with_capacity(self.segs.len());
-        for seg_id in segs {
-            if let Some(segment) = self.segs.get(&(*seg_id as usize)) {
-                list.push(segment.clone());
-            }
-        }
-        return list;
-    }
-
-    #[inline]
-    pub fn segment_ids(&self) -> Vec<u64> {
-        let addrs_guard = self.addrs_seg.read();
-        addrs_guard.values().cloned().collect()
-    }
-
     #[cfg(feature = "slow_map")]
     pub fn contains_seg(&self, seg_id: u64) -> bool {
         self.segs.contains_key(&(seg_id as usize))
@@ -559,7 +513,15 @@ impl Chunk {
 
     #[cfg(feature = "fast_map")]
     pub fn contains_seg(&self, seg_id: u64) -> bool {
-        self.segs.contains(&(seg_id as usize))
+        self.segs.contains_key(&(seg_id as usize))
+    }
+
+    pub fn segment_ids(&self) -> Vec<usize> {
+        self.segs.all_keys()
+    }
+
+    pub fn segments(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
+        self.segs.all_values()
     }
 
     // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
@@ -579,7 +541,7 @@ impl Chunk {
                 let mut death_count = 0;
                 if
                 // have not much tombstones
-                (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (MAX_SEGMENT_SIZE as f64) * 0.2 ||
+                (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
                         // large partition have been scanned
                         (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
                         // have been scanned recently
@@ -618,7 +580,7 @@ impl Chunk {
         }
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -635,14 +597,14 @@ impl Chunk {
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<Arc<Segment>> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
         let head_seg = self.head_seg.read();
         let mut mapping: Vec<_> = self
             .segments()
             .into_iter()
             .map(|seg| {
                 let living = seg.living_space() as f32;
-                let segment_utilization = living / MAX_SEGMENT_SIZE_U32 as f32;
+                let segment_utilization = living / SEGMENT_SIZE_U32 as f32;
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
@@ -657,7 +619,7 @@ impl Chunk {
         let seg_ids = self.segment_ids();
         let head_id = self.head_seg.read().id;
         for seg_id in seg_ids {
-            if seg_id == head_id {
+            if seg_id as u64 == head_id {
                 continue;
             } // never archive head segments
             let seg_key = seg_id as usize;
@@ -717,7 +679,7 @@ impl Chunk {
                         #[cfg(feature = "slow_map")]
                         let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
                         #[cfg(feature = "fast_map")]
-                        let contains_seg = chunk_segs.contains(&(tombstone.segment_id as usize));
+                        let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
 
                         if contains_seg {
                             debug!("Tomestone entry {:?} - {:?} at {} is valid",
@@ -741,6 +703,10 @@ impl Chunk {
 
     pub fn cell_count(&self) -> usize {
         self.index.len()
+    }
+
+    pub fn seg_count(&self) -> usize {
+        self.segs.len()
     }
 
     pub fn count(&self) -> usize {

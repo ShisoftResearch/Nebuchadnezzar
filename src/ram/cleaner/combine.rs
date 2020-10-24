@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
-use crate::ram::segs::{Segment, MAX_SEGMENT_SIZE};
+use crate::ram::segs::{Segment, SEGMENT_SIZE};
+use lightning::linked_map::{NodeRef as MapNodeRef};
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashSet;
@@ -42,7 +43,7 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
+    pub fn combine_segments(chunk: &Chunk, segments: &Vec<MapNodeRef<Arc<Segment>>>) -> usize {
         if segments.len() < 2 {
             trace!(
                 "too few segments to combine, chunk {}, segments {}",
@@ -112,7 +113,7 @@ impl CombinedCleaner {
         let mut cursor = 0;
         pending_segments.push(DummySegment::new());
         while entries_to_claim > 0 {
-            let segment_space_remains = MAX_SEGMENT_SIZE - pending_segments.last().unwrap().head;
+            let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
             let index = cursor % entries_num;
             let entry_pair = entries.get_mut(index).unwrap();
             if entry_pair.1 {
@@ -162,9 +163,8 @@ impl CombinedCleaner {
             .par_iter()
             .map(|dummy_seg| {
                 let new_seg_id = chunk.next_segment_id();
-                let new_seg = Segment::new(
+                let new_seg = chunk.allocator.alloc(
                     new_seg_id,
-                    dummy_seg.head,
                     &chunk.backup_storage,
                     &chunk.wal_storage,
                 );
@@ -228,7 +228,7 @@ impl CombinedCleaner {
         debug!("Removing old segments");
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
-            old_seg.mem_drop();
+            old_seg.mem_drop(chunk);
         }
         let space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
         debug!(

@@ -83,7 +83,7 @@ pub struct LSMTreeService {
 impl Service for LSMTreeService {
     fn crate_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
-            if self.trees.contains(&id) {
+            if self.trees.contains_key(&id) {
                 return;
             }
             let tree = LSMTree::create(&self.client, &id).await;
@@ -95,7 +95,7 @@ impl Service for LSMTreeService {
 
     fn load_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
-            if self.trees.contains(&id) {
+            if self.trees.contains_key(&id) {
                 return;
             }
             let tree = LSMTree::recover(&self.client, &id).await;

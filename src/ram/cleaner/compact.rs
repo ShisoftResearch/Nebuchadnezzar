@@ -56,9 +56,8 @@ impl CompactCleaner {
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = Arc::new(Segment::new(
+        let new_seg = Arc::new(chunk.allocator.alloc(
             seg.id,
-            live_size,
             &chunk.backup_storage,
             &chunk.wal_storage,
         ));
@@ -123,7 +122,7 @@ impl CompactCleaner {
             .store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
-        seg.mem_drop();
+        seg.mem_drop(chunk);
 
         let space_cleaned = seg.used_spaces() as usize - live_size;
         debug!(
