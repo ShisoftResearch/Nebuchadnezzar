@@ -11,7 +11,7 @@ use libc;
 pub struct CompactCleaner;
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) -> usize {
+    pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
@@ -56,12 +56,12 @@ impl CompactCleaner {
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = Arc::new(chunk.allocator.alloc_seg(
+        let new_seg = chunk.allocator.alloc_seg(
             seg.id,
             &chunk.backup_storage,
             &chunk.wal_storage,
         )
-        .expect("No space left during compact"));
+        .expect("No space left during compact");
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
         let _unstable_guards = entries

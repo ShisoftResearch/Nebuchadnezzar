@@ -43,7 +43,7 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, segments: &Vec<MapNodeRef<Arc<Segment>>>) -> usize {
+    pub fn combine_segments(chunk: &Chunk, segments: &Vec<MapNodeRef<Segment>>) -> usize {
         if segments.len() < 2 {
             trace!(
                 "too few segments to combine, chunk {}, segments {}",
@@ -196,9 +196,8 @@ impl CombinedCleaner {
             })
             .flat_map(|(segment, cells)| {
                 debug!("Putting new segment {}", segment.id);
-                let seg_ref = Arc::new(segment);
-                chunk.put_segment(seg_ref.clone());
-                seg_ref.archive().unwrap();
+                segment.archive().unwrap();
+                chunk.put_segment(segment);
                 return cells;
             })
             .map(|(new, old, hash)| {

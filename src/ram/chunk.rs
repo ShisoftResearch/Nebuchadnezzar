@@ -35,11 +35,11 @@ pub struct Chunk {
     #[cfg(feature = "fast_map")]
     pub index: Arc<WordMap>,
     #[cfg(feature = "fast_map")]
-    pub segs: Arc<LinkedObjectMap<Arc<Segment>>>,
+    pub segs: Arc<LinkedObjectMap<Segment>>,
     #[cfg(feature = "slow_map")]
     pub index: Arc<CHashMap<u64, usize>>,
     #[cfg(feature = "slow_map")]
-    pub segs: Arc<CHashMap<usize, Arc<Segment>>>,
+    pub segs: Arc<CHashMap<usize, Segment>>,
     pub seg_counter: AtomicU64,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
@@ -63,11 +63,11 @@ impl Chunk {
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
         let first_seg_id = 0;
-        let bootstrap_segment_ref = Arc::new(allocator.alloc_seg(
+        let bootstrap_segment = allocator.alloc_seg(
             first_seg_id,
             &backup_storage,
             &wal_storage,
-        ).unwrap());
+        ).unwrap();
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {
@@ -99,12 +99,12 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             seg_counter: AtomicU64::new(0),
-            head_seg_id: AtomicU64::new(bootstrap_segment_ref.id),
+            head_seg_id: AtomicU64::new(bootstrap_segment.id),
             unstable_cells: RAIIMutexTable::new(),
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()),
         };
-        chunk.put_segment(bootstrap_segment_ref);
+        chunk.put_segment(bootstrap_segment);
         return chunk;
     }
 
@@ -132,8 +132,7 @@ impl Chunk {
                 }
                 None => {
                     drop(head);
-                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE
-                    {
+                    if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
                         // No space left
                         if tried_gc {
                             return None;
@@ -159,9 +158,9 @@ impl Chunk {
                         // for performance, won't CAS total_space
                         self.total_space
                             .fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
-                        let new_seg_ref = Arc::new(new_seg);
-                        self.put_segment(new_seg_ref.clone());
-                        self.head_seg_id.store(new_seg_ref.id, Ordering::Relaxed);
+                        let new_seg_id = new_seg.id;
+                        self.put_segment(new_seg);
+                        self.head_seg_id.store(new_seg_id, Ordering::Relaxed);
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
@@ -423,7 +422,7 @@ impl Chunk {
         }
     }
 
-    pub fn put_segment(&self, segment: Arc<Segment>) {
+    pub fn put_segment(&self, segment: Segment) {
         debug!(
             "Putting segment for chunk {} with id {}",
             self.id, segment.id
@@ -447,9 +446,17 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, addr: usize) -> Option<MapNodeRef<Arc<Segment>>> {
+    fn locate_segment(&self, addr: usize) -> Option<MapNodeRef<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
-        self.segs.get(&seg_id)
+        let res = self.segs.get(&seg_id);
+        if res.is_none() {
+            warn!(
+                "Cannot locate segment for {}, got id {}, chunk segs {:?}", 
+                addr, seg_id,
+                self.segs.all_keys()
+            );
+        }
+        return res;
     }
 
     #[inline]
@@ -520,7 +527,7 @@ impl Chunk {
         self.segs.all_keys()
     }
 
-    pub fn segments(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
+    pub fn segments(&self) -> Vec<MapNodeRef<Segment>> {
         self.segs.all_values()
     }
 
@@ -580,7 +587,7 @@ impl Chunk {
         }
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<MapNodeRef<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -597,7 +604,7 @@ impl Chunk {
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<MapNodeRef<Arc<Segment>>> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<MapNodeRef<Segment>> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -636,14 +643,12 @@ impl Chunk {
         }
     }
 
-    pub fn live_entries(&self, seg: &Arc<Segment>) -> impl Iterator<Item = Entry> {
-        let seg_owned = seg.clone();
-        let chunk_id = self.id;
-        let chunk_index = self.index.clone();
-        let chunk_segs = self.segs.clone();
+    pub fn live_entries<'a>(&'a self, seg: &'a Segment) -> impl Iterator<Item = Entry> + 'a {
         seg.entry_iter()
             .filter_map(move |entry_meta| {
-                let seg = &seg_owned;
+                let chunk_id = &self.id;
+                let chunk_index = &self.index;
+                let chunk_segs = &self.segs;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
                 debug!("Iterating live entries on chunk {} segment {}. Got {:?} at {} size {}",
@@ -715,7 +720,7 @@ impl Chunk {
 }
 
 pub struct PendingEntry {
-    pub seg: MapNodeRef<Arc<Segment>>,
+    pub seg: MapNodeRef<Segment>,
     pub addr: usize,
     pub size: u32,
 }

@@ -360,7 +360,7 @@ impl SegmentAllocator {
                     return None;
                 } else {
                     if self.offset.compare_and_swap(addr, new_addr, Relaxed) == addr {
-                        return Some(new_addr);
+                        return Some(addr);
                     }
                 }
             }

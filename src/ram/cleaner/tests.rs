@@ -87,7 +87,8 @@ pub fn full_clean_cycle() {
             .for_each(|_| {});
 
         println!("Scanning second segment for tombstones...");
-        let live_entries = chunk.live_entries(&chunk.segs.get(&1).unwrap());
+        let seg = &chunk.segs.get(&1).unwrap();
+        let live_entries = chunk.live_entries(seg);
         let tombstones: Vec<_> = live_entries
             .filter(|e| e.meta.entry_header.entry_type == EntryType::TOMBSTONE)
             .collect();

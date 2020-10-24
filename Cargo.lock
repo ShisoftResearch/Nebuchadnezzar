@@ -676,11 +676,11 @@ checksum = "3c1ad908cc71012b7bea4d0c53ba96a8cba9962f048fa68d143376143d863b7a"
 
 [[package]]
 name = "instant"
-version = "0.1.7"
+version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63312a18f7ea8760cdd0a7c5aac1a619752a246b833545e3e36d1f81f7cd9e66"
+checksum = "cb1fc4429a33e1f80d41dc9fea4d108a88bec1de8053878898ae448a0b52f613"
 dependencies = [
- "cfg-if 0.1.10",
+ "cfg-if 1.0.0",
 ]
 
 [[package]]
@@ -750,7 +750,7 @@ checksum = "2448f6066e80e3bfc792e9c98bf705b4b0fc6e8ef5b43e5889aff0eaa9c58743"
 [[package]]
 name = "lightning"
 version = "0.2.0"
-source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#9f19c192dc8e67255c5d46e443bd81942ac40463"
+source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#bc1fb86d2e0b54d7621b26ad73844834eb11dbcb"
 dependencies = [
  "crossbeam-epoch 0.9.0",
  "crossbeam-utils 0.8.0",
