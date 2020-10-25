@@ -209,7 +209,8 @@ impl CombinedCleaner {
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
-                    for (new, old, hash) in cells {
+                    cells.into_par_iter().for_each(|(new, old, hash)|
+                    {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         #[cfg(feature = "fast_map")]
                         let index = chunk.index.lock(hash as usize);
@@ -238,7 +239,7 @@ impl CombinedCleaner {
                             trace!("cell {} address {} have been removed on combine", hash, old);
                             let _ = chunk.put_tombstone_by_cell_loc(new);
                         }
-                    }
+                    });
                 });
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(
