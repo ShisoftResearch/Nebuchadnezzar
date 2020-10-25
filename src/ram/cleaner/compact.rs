@@ -115,7 +115,8 @@ impl CompactCleaner {
                     } else {
                         trace!(
                             "cell address {} have been changed to {} on relocating on compact",
-                            old_addr, *cell_guard
+                            old_addr,
+                            *cell_guard
                         );
                     }
                 }

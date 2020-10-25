@@ -228,7 +228,9 @@ impl CombinedCleaner {
                         } else {
                             trace!(
                                 "cell {} with address {}, have been changed to {} on combine",
-                                hash, old, *actual_addr
+                                hash,
+                                old,
+                                *actual_addr
                             );
                         }
                     } else {
