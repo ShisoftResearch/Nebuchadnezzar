@@ -172,7 +172,7 @@ impl CombinedCleaner {
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
-                    debug!(
+                    trace!(
                         "Combining segment to new one with id {} with {} cells",
                         new_seg_id, dummy_seg.entries.len()
                     );
@@ -186,7 +186,7 @@ impl CombinedCleaner {
                             );
                         }
                         if let Some(cell_hash) = entry.cell_hash {
-                            debug!(
+                            trace!(
                                 "Marked cell relocation hash {}, addr {} to segment {}",
                                 cell_hash, entry_addr, new_seg_id
                             );
@@ -199,13 +199,13 @@ impl CombinedCleaner {
                     return (new_seg, cell_mapping);
                 })
                 .flat_map(|(segment, cells)| {
-                    debug!("Putting new segment {}, cells {}", segment.id, cells.len());
+                    trace!("Putting new segment {}, cells {}", segment.id, cells.len());
                     segment.archive().unwrap();
                     chunk.put_segment(segment);
                     return cells;
                 })
                 .for_each(|(new, old, hash)| {
-                    debug!("Reset cell {} ptr from {} to {}", hash, old, new);
+                    trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                     #[cfg(feature = "fast_map")]
                         let index = chunk.index.lock(hash as usize);
                     #[cfg(feature = "slow_map")]
@@ -214,7 +214,7 @@ impl CombinedCleaner {
                     if let Some(mut actual_addr) = index {
                         if *actual_addr == old {
                             *actual_addr = new;
-                            debug!("Cell addr for hash {} set from {} to {} for combine", hash, old, new);
+                            trace!("Cell addr for hash {} set from {} to {} for combine", hash, old, new);
                         } else {
                             warn!(
                                 "cell {} with address {}, have been changed to {} on combine",

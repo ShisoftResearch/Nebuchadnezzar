@@ -1,5 +1,5 @@
 use super::super::chunk::Chunk;
-use super::super::segs::Segment;
+use super::super::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::entry::*;
 
 use std::sync::atomic::Ordering;
@@ -52,6 +52,12 @@ impl CompactCleaner {
                 entry
             })
             .collect_vec();
+        if entries.len() == 0 {
+            chunk.remove_segment(seg.id);
+            seg.mem_drop(chunk);
+            debug!("Compact segment {} leades to remove the segment for it is empty", seg.id);
+            return SEGMENT_SIZE;
+        }
         debug!(
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size

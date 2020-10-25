@@ -29,7 +29,6 @@ pub fn cell_rw() {
         name: String::from("Jack")
     };
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-    let dummy_map = WordMap::with_capacity(4);
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
@@ -85,7 +84,6 @@ pub fn dynamic() {
         fields,
         is_dynamic: true,
     };
-    let dummy_map = WordMap::with_capacity(4);
     let mut data_map = types::Map::new();
     data_map.insert("id", Value::I64(100));
     data_map.insert("score", Value::U64(70));
