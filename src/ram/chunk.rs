@@ -276,8 +276,7 @@ impl Chunk {
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
             *guard = new_cell_loc;
-            let seg = self.locate_segment_ensured(cell_location, &cell.header.id());
-            self.mark_dead_entry(cell_location, &seg);
+            self.mark_dead_entry_with_cell(cell_location, cell);
             Ok(cell.header)
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -293,8 +292,7 @@ impl Chunk {
             if let Some(mut guard) = self.location_for_write(hash) {
                 let cell_location = *guard;
                 *guard = new_cell_loc;
-                let seg = self.locate_segment_ensured(cell_location, &cell.header.id());
-                self.mark_dead_entry(cell_location, &seg);
+                self.mark_dead_entry_with_cell(cell_location, cell);
                 return Ok(cell.header);
             } else {
                 if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
@@ -350,14 +348,12 @@ impl Chunk {
                         let old_location = *cell_guard;
                         let new_location = new_cell.write_to_chunk(self)?;
                         *cell_guard = new_location;
-                        let seg = self.locate_segment_ensured(old_location, &new_cell.header.id());
-                        self.mark_dead_entry(old_location, &seg);
+                        self.mark_dead_entry_with_cell(old_location, &new_cell);
                         return Ok(new_cell);
                     }
                 }
                 // Failed on check, cleanup and try. This may produce a lot of garbage.
-                let seg = self.locate_segment_ensured(new_cell_loc, &new_cell.header.id());
-                self.mark_dead_entry(new_cell_loc, &seg);
+                self.mark_dead_entry_with_cell(new_cell_loc, &new_cell);
                 backoff.spin();
             } else {
                 return Err(WriteError::UserCanceledUpdate);
@@ -488,7 +484,7 @@ impl Chunk {
             .0;
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
         self.put_tombstone(&header, &cell_seg);
-        self.mark_dead_entry(cell_location, &cell_seg);
+        self.mark_dead_entry_with_seg(cell_location, &cell_seg);
         Ok(())
     }
 
@@ -506,10 +502,15 @@ impl Chunk {
     // make the changes in corresponding segments.
     // Because calculate segment from location is computation intensive, it have to be done lazily
     #[inline]
-    fn mark_dead_entry(&self, addr: usize, seg: &MapNodeRef<Segment>) {
+    fn mark_dead_entry_with_seg(&self, addr: usize, seg: &MapNodeRef<Segment>) {
         let (entry, _) = Entry::decode_from(addr, |_, _| {});
         seg.dead_space
             .fetch_add(entry.content_length, Ordering::Relaxed);
+    }
+
+    fn mark_dead_entry_with_cell(&self, addr: usize, cell: &Cell) {
+        let seg = self.locate_segment_ensured(addr, &cell.header.id());
+        self.mark_dead_entry_with_seg(addr, &seg)
     }
 
     #[cfg(feature = "slow_map")]
