@@ -750,7 +750,7 @@ checksum = "2448f6066e80e3bfc792e9c98bf705b4b0fc6e8ef5b43e5889aff0eaa9c58743"
 [[package]]
 name = "lightning"
 version = "0.2.0"
-source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#bc1fb86d2e0b54d7621b26ad73844834eb11dbcb"
+source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#610a46d4f714d43c6423e828767f5d84ea088c67"
 dependencies = [
  "crossbeam-epoch 0.9.0",
  "crossbeam-utils 0.8.0",
@@ -1387,9 +1387,9 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "syn"
-version = "1.0.46"
+version = "1.0.48"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ad5de3220ea04da322618ded2c42233d02baca219d6f160a3e9c87cda16c942"
+checksum = "cc371affeffc477f42a221a1e4297aedcea33d47d19b61455588bd9d8f6b19ac"
 dependencies = [
  "proc-macro2",
  "quote",

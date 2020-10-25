@@ -40,7 +40,6 @@ pub struct Chunk {
     pub index: Arc<CHashMap<u64, usize>>,
     #[cfg(feature = "slow_map")]
     pub segs: Arc<CHashMap<usize, Segment>>,
-    pub seg_counter: AtomicU64,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -62,9 +61,7 @@ impl Chunk {
         wal_storage: Option<String>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
-        let first_seg_id = 0;
         let bootstrap_segment = allocator.alloc_seg(
-            first_seg_id,
             &backup_storage,
             &wal_storage,
         ).unwrap();
@@ -98,7 +95,6 @@ impl Chunk {
             allocator,
             capacity: size,
             total_space: AtomicUsize::new(0),
-            seg_counter: AtomicU64::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             unstable_cells: RAIIMutexTable::new(),
             gc_lock: Mutex::new(()),
@@ -147,10 +143,8 @@ impl Chunk {
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_id = self.next_segment_id();
                         let new_seg_opt = SegmentAllocator::alloc(
                             self,
-                            new_seg_id,
                             &self.backup_storage,
                             &self.wal_storage
                         );
@@ -167,10 +161,6 @@ impl Chunk {
                 }
             }
         }
-    }
-
-    pub fn next_segment_id(&self) -> u64 {
-        self.seg_counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
@@ -448,13 +438,13 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, addr: usize) -> Option<MapNodeRef<Segment>> {
+    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<MapNodeRef<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
             warn!(
-                "Cannot locate segment for {}, got id {}, chunk segs {:?}", 
-                addr, seg_id,
+                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?}", 
+                cell_id, addr, seg_id,
                 self.segs.all_keys()
             );
         }
@@ -462,7 +452,7 @@ impl Chunk {
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_location: usize, cell_header: &CellHeader, cell_seg: &MapNodeRef<Segment>) {
+    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &MapNodeRef<Segment>) {
         let pending_entry = (|| loop {
             if let Some(pending_entry) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
                 return pending_entry;
@@ -491,13 +481,13 @@ impl Chunk {
             .map_err(|e| WriteError::ReadError(e))?
             .0;
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
-        self.put_tombstone(cell_location, &header, &cell_seg);
+        self.put_tombstone(&header, &cell_seg);
         self.mark_dead_entry(cell_location, &cell_seg);
         Ok(())
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> MapNodeRef<Segment> {
-        self.locate_segment(cell_location).expect(
+        self.locate_segment(cell_location, cell_id).expect(
             format!(
                 "cannot locate cell segment for tombstone. Cell id: {:?} at {}",
                 cell_id,
@@ -665,19 +655,25 @@ impl Chunk {
                                 entry_meta.body_pos, &entry_header);
                         trace!("Cell header read, id is {:?}", cell_header.id());
 
+                        let expect = Some(entry_meta.entry_pos);
                         #[cfg(feature = "slow_map")]
-                        let matches = chunk_index.get(&cell_header.hash).map(|g| *g) == Some(entry_meta.entry_pos);
+                        let actual = chunk_index.get(&cell_header.hash).map(|g| *g);
                         #[cfg(feature = "fast_map")]
-                        let matches = chunk_index.get(&(cell_header.hash as usize)) == Some(entry_meta.entry_pos);
+                        let actual = chunk_index.get_from_mutex(&(cell_header.hash as usize));
 
-                        if matches {
-                            trace!("Cell entry {:?} is valid", cell_header.id());
+                        if expect == actual {
+                            trace!(
+                                "Cell entry {:?} is valid", cell_header.id()
+                            );
                             return Some(Entry {
                                 meta: entry_meta,
                                 content: EntryContent::Cell(cell_header)
                             });
                         } else {
-                            trace!("Cell entry index mismatch for {:?}, will be ditched", cell_header.id());
+                            trace!(
+                                "Cell entry index mismatch for {:?}. Expect {:?}, actual {:?}, will be ditched", 
+                                cell_header.id(), expect, actual
+                            );
                         }
                     },
                     EntryType::TOMBSTONE => {

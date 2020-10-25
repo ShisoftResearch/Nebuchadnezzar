@@ -321,7 +321,6 @@ impl SegmentAllocator {
 
     pub fn alloc(
         chunk: &Chunk,
-        id: u64,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
     ) -> Option<Segment> {
@@ -331,7 +330,7 @@ impl SegmentAllocator {
             Cleaner::clean(chunk, false);
         }
         loop {
-            let seg_opt = chunk.allocator.alloc_seg(id, backup_storage, wal_storage);
+            let seg_opt = chunk.allocator.alloc_seg(backup_storage, wal_storage);
             if seg_opt.is_some() {
                 return seg_opt;
             } else {
@@ -348,7 +347,6 @@ impl SegmentAllocator {
 
     pub fn alloc_seg(
         &self, 
-        id: u64, 
         backup_storage: &Option<String>, 
         wal_storage: &Option<String>
     ) -> Option<Segment> {
@@ -365,18 +363,22 @@ impl SegmentAllocator {
                 }
             }
         })
-        .map(|addr| Segment::new(
-            id, 
-            addr, 
-            SEGMENT_SIZE, 
-            backup_storage, 
-            wal_storage
-        ))
+        .map(|addr| {
+            let id = self.id_by_addr(addr);
+            Segment::new(
+                id as u64, 
+                addr, 
+                SEGMENT_SIZE, 
+                backup_storage, 
+                wal_storage
+            )
+        })
     }
 
     pub fn free(&self, seg_addr: usize) {
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);
+        debug!("Segment {} freed", seg_addr);
         self.free.push(seg_addr);
     }
 

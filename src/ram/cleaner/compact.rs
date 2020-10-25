@@ -57,7 +57,6 @@ impl CompactCleaner {
             seg.id, chunk.id, live_size
         );
         let new_seg = chunk.allocator.alloc_seg(
-            seg.id,
             &chunk.backup_storage,
             &chunk.wal_storage,
         )
@@ -70,7 +69,7 @@ impl CompactCleaner {
                 let entry_size = e.meta.entry_size;
                 let entry_pos = e.meta.entry_pos;
                 let result = (e, cursor);
-                debug!(
+                trace!(
                     "memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {}",
                     entry_size,
                     entry_pos,
@@ -92,7 +91,7 @@ impl CompactCleaner {
             .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::CELL)
             .map(|(entry, new_addr)| {
                 let header = entry.content.as_cell_header();
-                debug!(
+                trace!(
                     "Acquiring cell guard for update on compact {:?}",
                     header.id()
                 );
@@ -123,6 +122,7 @@ impl CompactCleaner {
             .store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
+        chunk.remove_segment(seg.id);
         seg.mem_drop(chunk);
 
         let space_cleaned = seg.used_spaces() as usize - live_size;
