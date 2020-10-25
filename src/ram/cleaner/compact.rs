@@ -55,18 +55,20 @@ impl CompactCleaner {
         if entries.len() == 0 {
             chunk.remove_segment(seg.id);
             seg.mem_drop(chunk);
-            debug!("Compact segment {} leades to remove the segment for it is empty", seg.id);
+            debug!(
+                "Compact segment {} leades to remove the segment for it is empty",
+                seg.id
+            );
             return SEGMENT_SIZE;
         }
         debug!(
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = chunk.allocator.alloc_seg(
-            &chunk.backup_storage,
-            &chunk.wal_storage,
-        )
-        .expect("No space left during compact");
+        let new_seg = chunk
+            .allocator
+            .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
+            .expect("No space left during compact");
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
         entries

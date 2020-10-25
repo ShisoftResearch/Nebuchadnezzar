@@ -13,12 +13,12 @@ use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 #[cfg(feature = "slow_map")]
 use chashmap::*;
+use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -60,10 +60,7 @@ impl Chunk {
         wal_storage: Option<String>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
-        let bootstrap_segment = allocator.alloc_seg(
-            &backup_storage,
-            &wal_storage,
-        ).unwrap();
+        let bootstrap_segment = allocator.alloc_seg(&backup_storage, &wal_storage).unwrap();
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {
@@ -115,7 +112,10 @@ impl Chunk {
                 Some(addr) => {
                     trace!(
                         "Chunk {} acquired address {} for size {} in segment {}",
-                        self.id, addr, size, head.id
+                        self.id,
+                        addr,
+                        size,
+                        head.id
                     );
                     head.references.fetch_add(1, Ordering::Relaxed);
                     return Some(PendingEntry {
@@ -141,15 +141,11 @@ impl Chunk {
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_opt = SegmentAllocator::alloc(
-                            self,
-                            &self.backup_storage,
-                            &self.wal_storage
-                        );
+                        let new_seg_opt =
+                            SegmentAllocator::alloc(self, &self.backup_storage, &self.wal_storage);
                         let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
-                        self.total_space
-                            .fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
+                        self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_id = new_seg.id;
                         self.put_segment(new_seg);
                         self.head_seg_id.store(new_seg_id, Ordering::Relaxed);
@@ -236,7 +232,7 @@ impl Chunk {
     #[cfg(feature = "fast_map")]
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let cell_loc = cell.write_to_chunk(self,)?;
+        let cell_loc = cell.write_to_chunk(self)?;
         match self.index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
@@ -399,7 +395,8 @@ impl Chunk {
             match cell {
                 Ok(cell) => {
                     if predict(cell) {
-                        let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location, &guard);
+                        let put_tombstone_result =
+                            self.put_tombstone_by_cell_loc(cell_location, &guard);
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
@@ -446,8 +443,10 @@ impl Chunk {
         let res = self.segs.get(&seg_id);
         if res.is_none() {
             warn!(
-                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?}", 
-                cell_id, addr, seg_id,
+                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?}",
+                cell_id,
+                addr,
+                seg_id,
                 self.segs.all_keys()
             );
         }
@@ -475,7 +474,11 @@ impl Chunk {
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn put_tombstone_by_cell_loc(&self, cell_location: usize, _cell_guard: &WordMutexGuard) -> Result<(), WriteError> {
+    fn put_tombstone_by_cell_loc(
+        &self,
+        cell_location: usize,
+        _cell_guard: &WordMutexGuard,
+    ) -> Result<(), WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
@@ -493,8 +496,7 @@ impl Chunk {
         self.locate_segment(cell_location, cell_id).expect(
             format!(
                 "cannot locate cell segment for tombstone. Cell id: {:?} at {}",
-                cell_id,
-                cell_location
+                cell_id, cell_location
             )
             .as_str(),
         )

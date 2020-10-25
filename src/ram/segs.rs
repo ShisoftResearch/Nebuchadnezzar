@@ -1,18 +1,20 @@
-use crate::ram::entry;
-use crate::ram::cleaner::Cleaner;
-use crate::ram::entry::EntryMeta;
 use crate::ram::chunk::Chunk;
+use crate::ram::cleaner::Cleaner;
+use crate::ram::entry;
+use crate::ram::entry::EntryMeta;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use libc::*;
+use lightning::list::WordList;
 use parking_lot;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::Relaxed};
-use lightning::list::WordList;
 use std::ptr;
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::Relaxed,
+};
 
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
@@ -222,8 +224,9 @@ impl Segment {
 
     pub fn mem_drop(&self, chunk: &Chunk) {
         if !self
-        .dropped
-        .compare_and_swap(false, true, Ordering::Relaxed) {
+            .dropped
+            .compare_and_swap(false, true, Ordering::Relaxed)
+        {
             chunk.allocator.free(self.addr);
         }
     }
@@ -282,15 +285,15 @@ impl Iterator for SegmentEntryIter {
     }
 }
 
-pub const PAGE_SHIFT: usize = 12;  // 4K
-pub const PAGE_SIZE : usize = 1 << PAGE_SHIFT;
+pub const PAGE_SHIFT: usize = 12; // 4K
+pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
 pub struct SegmentAllocator {
     base: usize,
     offset: AtomicUsize,
     limit: usize,
     gc_threshold: usize,
-    free: WordList
+    free: WordList,
 }
 
 impl SegmentAllocator {
@@ -304,7 +307,7 @@ impl SegmentAllocator {
                 PROT_READ | PROT_WRITE,
                 MAP_ANONYMOUS | MAP_PRIVATE,
                 -1,
-                0
+                0,
             )
         };
         let addr = ptr as usize;
@@ -315,7 +318,7 @@ impl SegmentAllocator {
             offset: AtomicUsize::new(aligned_addr),
             limit: aligned_addr + chunk_size,
             gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
-            free: WordList::with_capacity(chunk_size / SEGMENT_SIZE / 2)
+            free: WordList::with_capacity(chunk_size / SEGMENT_SIZE / 2),
         }
     }
 
@@ -346,12 +349,13 @@ impl SegmentAllocator {
     }
 
     pub fn alloc_seg(
-        &self, 
-        backup_storage: &Option<String>, 
-        wal_storage: &Option<String>
+        &self,
+        backup_storage: &Option<String>,
+        wal_storage: &Option<String>,
     ) -> Option<Segment> {
-        self.free.pop().or_else(|| {
-            loop {
+        self.free
+            .pop()
+            .or_else(|| loop {
                 let addr = self.offset.load(Relaxed);
                 let new_addr = addr + SEGMENT_SIZE;
                 if addr > self.limit {
@@ -361,18 +365,11 @@ impl SegmentAllocator {
                         return Some(addr);
                     }
                 }
-            }
-        })
-        .map(|addr| {
-            let id = self.id_by_addr(addr);
-            Segment::new(
-                id as u64, 
-                addr, 
-                SEGMENT_SIZE, 
-                backup_storage, 
-                wal_storage
-            )
-        })
+            })
+            .map(|addr| {
+                let id = self.id_by_addr(addr);
+                Segment::new(id as u64, addr, SEGMENT_SIZE, backup_storage, wal_storage)
+            })
     }
 
     pub fn free(&self, seg_addr: usize) {
@@ -390,7 +387,7 @@ impl SegmentAllocator {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn madvise_free(addr: usize, size: usize) { 
+unsafe fn madvise_free(addr: usize, size: usize) {
     madvise(addr as *mut c_void, size, MADV_REMOVE);
 }
 
@@ -405,7 +402,10 @@ fn punch_hole(addr: usize, seg_size: usize) {
     let hole_length = (addr + SEGMENT_SIZE) - aligned_addr;
     if hole_length > PAGE_SIZE {
         // Have pages to release
-        debug!("Partially free the segment by puching hole with size {}", hole_length);
+        debug!(
+            "Partially free the segment by puching hole with size {}",
+            hole_length
+        );
         unsafe {
             madvise_free(addr, hole_length);
         }

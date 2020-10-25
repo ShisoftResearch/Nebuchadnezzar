@@ -52,7 +52,10 @@ impl Cleaner {
         debug!("Ready for clean {}, full {}", chunk.id, full);
         let _guard = chunk.gc_lock.lock();
         let num_segs = chunk.segs.len();
-        debug!("Cleaning chunk {}, full {}, segs {}", chunk.id, full, num_segs);
+        debug!(
+            "Cleaning chunk {}, full {}, segs {}",
+            chunk.id, full, num_segs
+        );
         let segments_compact_per_turn = if full { num_segs } else { num_segs / 10 + 1 };
         let segments_combine_per_turn = if full { num_segs } else { num_segs / 20 + 2 };
         // have to put it right here for cleaners will clear the tombstone death counter
@@ -61,7 +64,10 @@ impl Cleaner {
         {
             debug!("Starting compact {}", chunk.id);
             let segments_for_compact = chunk.segs_for_compact_cleaner();
-            debug!("Selected {} segments for compaction", segments_for_compact.len());
+            debug!(
+                "Selected {} segments for compaction",
+                segments_for_compact.len()
+            );
             if !segments_for_compact.is_empty() {
                 trace!(
                     "Chunk {} have {} segments to compact, overflow {}",
@@ -87,8 +93,8 @@ impl Cleaner {
                 .collect();
             if !segments_for_combine.is_empty() {
                 debug!(
-                    "Have {} segments to combine, candidates {}", 
-                    segments_for_combine.len(), 
+                    "Have {} segments to combine, candidates {}",
+                    segments_for_combine.len(),
                     num_segments_candidates_for_combine
                 );
                 cleaned_space +=

@@ -1,8 +1,8 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
-use lightning::linked_map::{NodeRef as MapNodeRef};
 use itertools::Itertools;
+use lightning::linked_map::NodeRef as MapNodeRef;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -160,21 +160,24 @@ impl CombinedCleaner {
                 );
             }
 
-            debug!("Updating cell reference, pending segments {}", pending_segments.len());
+            debug!(
+                "Updating cell reference, pending segments {}",
+                pending_segments.len()
+            );
             pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
-                    let new_seg = chunk.allocator.alloc_seg(
-                        &chunk.backup_storage,
-                        &chunk.wal_storage,
-                    )
-                    .expect("No space left during combine");
+                    let new_seg = chunk
+                        .allocator
+                        .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
+                        .expect("No space left during combine");
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
                     trace!(
                         "Combining segment to new one with id {} with {} cells",
-                        new_seg_id, dummy_seg.entries.len()
+                        new_seg_id,
+                        dummy_seg.entries.len()
                     );
                     for entry in &dummy_seg.entries {
                         let entry_addr = entry.addr;
@@ -188,7 +191,9 @@ impl CombinedCleaner {
                         if let Some(cell_hash) = entry.cell_hash {
                             trace!(
                                 "Marked cell relocation hash {}, addr {} to segment {}",
-                                cell_hash, entry_addr, new_seg_id
+                                cell_hash,
+                                entry_addr,
+                                new_seg_id
                             );
                             cell_mapping.push((seg_cursor, entry_addr, cell_hash));
                         }
@@ -207,14 +212,19 @@ impl CombinedCleaner {
                 .for_each(|(new, old, hash)| {
                     trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                     #[cfg(feature = "fast_map")]
-                        let index = chunk.index.lock(hash as usize);
+                    let index = chunk.index.lock(hash as usize);
                     #[cfg(feature = "slow_map")]
-                        let index = chunk.index.get_mut(&hash);
+                    let index = chunk.index.get_mut(&hash);
 
                     if let Some(mut actual_addr) = index {
                         if *actual_addr == old {
                             *actual_addr = new;
-                            trace!("Cell addr for hash {} set from {} to {} for combine", hash, old, new);
+                            trace!(
+                                "Cell addr for hash {} set from {} to {} for combine",
+                                hash,
+                                old,
+                                new
+                            );
                         } else {
                             warn!(
                                 "cell {} with address {}, have been changed to {} on combine",
