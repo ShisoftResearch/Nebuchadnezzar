@@ -200,6 +200,7 @@ impl CombinedCleaner {
                         seg_cursor += entry.size;
                     }
                     new_seg.append_header.store(seg_cursor, Ordering::Relaxed);
+                    new_seg.shrink(seg_cursor - new_seg.addr);
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
                     return (new_seg, cell_mapping);
                 })

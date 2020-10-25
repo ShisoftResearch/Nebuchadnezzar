@@ -42,12 +42,12 @@ impl Segment {
     pub fn new(
         id: u64,
         buffer_ptr: usize,
-        size: usize,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
     ) -> Segment {
         let mut wal_file_name = None;
         let mut wal_file = None;
+        let size = SEGMENT_SIZE;
         if let Some(wal_storage) = wal_storage {
             create_dir_all(wal_storage).unwrap();
             let file_name = format!("{}/{}.log", wal_storage, id);
@@ -62,9 +62,6 @@ impl Segment {
             "Creating new segment with id {}, size {}, address {}",
             id, size, buffer_ptr
         );
-        if size < SEGMENT_SIZE {
-            punch_hole(buffer_ptr, size);
-        }
         Segment {
             addr: buffer_ptr,
             id,
@@ -104,6 +101,11 @@ impl Segment {
                 }
             }
         }
+    }
+
+    pub fn shrink(&self, size: usize) {
+        debug_assert!(size < SEGMENT_SIZE);
+        punch_hole(self.addr, size);
     }
 
     fn append_header(&self) -> usize {
@@ -368,7 +370,7 @@ impl SegmentAllocator {
             })
             .map(|addr| {
                 let id = self.id_by_addr(addr);
-                Segment::new(id as u64, addr, SEGMENT_SIZE, backup_storage, wal_storage)
+                Segment::new(id as u64, addr, backup_storage, wal_storage)
             })
     }
 
@@ -396,10 +398,10 @@ unsafe fn madvise_free(addr: usize, size: usize) {
     madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
 
-fn punch_hole(addr: usize, seg_size: usize) {
-    let right_boundary = addr + seg_size;
+fn punch_hole(seg_addr: usize, seg_size: usize) {
+    let right_boundary = seg_addr + seg_size;
     let aligned_addr = (((right_boundary - 1) >> PAGE_SHIFT) + 1) << PAGE_SHIFT;
-    let hole_length = (addr + SEGMENT_SIZE) - aligned_addr;
+    let hole_length = (seg_addr + SEGMENT_SIZE) - aligned_addr;
     if hole_length > PAGE_SIZE {
         // Have pages to release
         debug!(
@@ -407,7 +409,7 @@ fn punch_hole(addr: usize, seg_size: usize) {
             hole_length
         );
         unsafe {
-            madvise_free(addr, hole_length);
+            madvise_free(aligned_addr, hole_length);
         }
     }
 }

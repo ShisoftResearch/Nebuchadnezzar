@@ -133,7 +133,7 @@ impl CompactCleaner {
                     let _ = chunk.put_tombstone_by_cell_loc(new_addr);
                 }
             });
-
+        new_seg.shrink(cursor - seg_addr);
         chunk.remove_segment(seg.id);
         seg.mem_drop(chunk);
 
