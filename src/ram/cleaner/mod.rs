@@ -49,17 +49,19 @@ impl Cleaner {
         return cleaner;
     }
     pub fn clean(chunk: &Chunk, full: bool) {
+        debug!("Ready for clean {}, full {}", chunk.id, full);
         let _guard = chunk.gc_lock.lock();
         let num_segs = chunk.segs.len();
+        debug!("Cleaning chunk {}, full {}, segs {}", chunk.id, full, num_segs);
         let segments_compact_per_turn = if full { num_segs } else { num_segs / 10 + 1 };
         let segments_combine_per_turn = if full { num_segs } else { num_segs / 20 + 2 };
         // have to put it right here for cleaners will clear the tombstone death counter
-        trace!("Cleaning chunk {}", chunk.id);
         chunk.scan_tombstone_survival();
         let mut cleaned_space: usize = 0;
         {
-            // compact
+            debug!("Starting compact {}", chunk.id);
             let segments_for_compact = chunk.segs_for_compact_cleaner();
+            debug!("Selected {} segments for compaction", segments_for_compact.len());
             if !segments_for_compact.is_empty() {
                 trace!(
                     "Chunk {} have {} segments to compact, overflow {}",
@@ -76,18 +78,18 @@ impl Cleaner {
         }
 
         {
-            // combine
+            debug!("Starting combine {}", chunk.id);
             let segments_candidates_for_combine: Vec<_> = chunk.segs_for_combine_cleaner();
+            let num_segments_candidates_for_combine = segments_candidates_for_combine.len();
             let segments_for_combine: Vec<_> = segments_candidates_for_combine
                 .into_iter()
                 .take(segments_combine_per_turn)
                 .collect();
             if !segments_for_combine.is_empty() {
-                trace!(
-                    "Chunk {} have {} segments to combine, overflow {}",
-                    chunk.id,
-                    segments_for_combine.len(),
-                    segments_combine_per_turn
+                debug!(
+                    "Have {} segments to combine, candidates {}", 
+                    segments_for_combine.len(), 
+                    num_segments_candidates_for_combine
                 );
                 cleaned_space +=
                     combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
@@ -97,6 +99,8 @@ impl Cleaner {
         chunk
             .total_space
             .fetch_sub(cleaned_space, Ordering::Relaxed);
+        debug!("Archiving segments");
         chunk.check_and_archive_segments();
+        debug!("Chunk Cleaned {}", chunk.id);
     }
 }

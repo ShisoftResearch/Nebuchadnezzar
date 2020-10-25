@@ -14,7 +14,7 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (Value, us
     }
     if field.is_array {
         let len = u32_io::read(ptr);
-        debug!("Got array length {}", len);
+        trace!("Got array length {}", len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
         ptr += u32_io::size(ptr);

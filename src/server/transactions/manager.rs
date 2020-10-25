@@ -422,7 +422,7 @@ impl TransactionManager {
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         let server_id_usize = server_id as usize;
-        if !self.data_sites.contains(&server_id_usize) {
+        if !self.data_sites.contains_key(&server_id_usize) {
             let client = self.server.get_member_by_server_id(server_id).await?;
             return Ok(self.data_sites.get_or_insert(&server_id_usize, || {
                 data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)

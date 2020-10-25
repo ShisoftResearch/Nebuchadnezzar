@@ -1,5 +1,5 @@
 use super::super::chunk::Chunk;
-use super::super::segs::Segment;
+use super::super::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::entry::*;
 
 use std::sync::atomic::Ordering;
@@ -11,7 +11,7 @@ use libc;
 pub struct CompactCleaner;
 
 impl CompactCleaner {
-    pub fn clean_segment(chunk: &Chunk, seg: &Arc<Segment>) -> usize {
+    pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
@@ -52,25 +52,30 @@ impl CompactCleaner {
                 entry
             })
             .collect_vec();
+        if entries.len() == 0 {
+            chunk.remove_segment(seg.id);
+            seg.mem_drop(chunk);
+            debug!("Compact segment {} leades to remove the segment for it is empty", seg.id);
+            return SEGMENT_SIZE;
+        }
         debug!(
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = Arc::new(Segment::new(
-            seg.id,
-            live_size,
+        let new_seg = chunk.allocator.alloc_seg(
             &chunk.backup_storage,
             &chunk.wal_storage,
-        ));
+        )
+        .expect("No space left during compact");
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
-        let _unstable_guards = entries
+        entries
             .into_iter()
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;
                 let entry_pos = e.meta.entry_pos;
                 let result = (e, cursor);
-                debug!(
+                trace!(
                     "memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {}",
                     entry_size,
                     entry_pos,
@@ -90,14 +95,12 @@ impl CompactCleaner {
                 return result;
             })
             .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::CELL)
-            .map(|(entry, new_addr)| {
+            .for_each(|(entry, new_addr)| {
                 let header = entry.content.as_cell_header();
-                debug!(
+                trace!(
                     "Acquiring cell guard for update on compact {:?}",
                     header.id()
                 );
-                let unstable_guard = chunk.unstable_cells.lock(header.hash);
-
                 #[cfg(feature = "fast_map")]
                 let index = chunk.index.lock(header.hash as usize);
                 #[cfg(feature = "slow_map")]
@@ -114,16 +117,15 @@ impl CompactCleaner {
                         );
                     }
                 }
-                unstable_guard
-            })
-            .collect_vec();
+            });
 
         new_seg
             .append_header
             .store(new_seg.addr + live_size, Ordering::Relaxed);
         // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
         chunk.put_segment(new_seg);
-        seg.mem_drop();
+        chunk.remove_segment(seg.id);
+        seg.mem_drop(chunk);
 
         let space_cleaned = seg.used_spaces() as usize - live_size;
         debug!(

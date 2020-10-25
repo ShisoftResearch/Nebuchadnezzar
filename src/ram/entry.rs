@@ -56,7 +56,7 @@ impl Entry {
         let mut len_bytes = [0u8; 4];
         encode_len(content_len, &mut len_bytes);
         let raw_len_bytes = Box::into_raw(box len_bytes);
-        debug!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
+        trace!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
                pos, flag_byte, entry_type_bit, len_bytes_count, content_len);
         unsafe {
             // write entry flags
@@ -84,7 +84,7 @@ impl Entry {
             let flag_byte = *(pos as *mut u8);
             pos += 1;
             let entry_type_bits = 0b1111_0000 & flag_byte;
-            debug!("Entry type bits are {:#b}", entry_type_bits);
+            trace!("Entry type bits are {:#b}", entry_type_bits);
             let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
             let entry_bytes_len = 0b0000_1111 & flag_byte;
             let entry_bytes_len_usize = entry_bytes_len as usize;
@@ -101,7 +101,7 @@ impl Entry {
                 content_length: entry_length,
             };
 
-            debug!("decode entry header {}, flag {:#010b}, type bit: {:#010b}, len bits {:#010b}, len {}",
+            trace!("decode entry header {}, flag {:#010b}, type bit: {:#010b}, len bits {:#010b}, len {}",
                    pos, flag_byte, entry_type_bits, entry_bytes_len, entry_length);
             pos += entry_bytes_len_usize;
             (entry, content_read(pos, entry))
@@ -121,7 +121,7 @@ impl Entry {
             x = x >> 8;
             n += 1;
         }
-        debug!("count len bytes {} -> {}", len, n);
+        trace!("count len bytes {} -> {}", len, n);
         return n;
     }
 }

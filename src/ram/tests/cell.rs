@@ -29,14 +29,12 @@ pub fn cell_rw() {
         name: String::from("Jack")
     };
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-    let dummy_map = WordMap::with_capacity(4);
-    let dummy_guard = dummy_map.try_insert_locked(1).unwrap();
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = Cell {
         header: CellHeader::new(0, schema.id, &id1),
         data,
     };
-    let mut loc = cell.write_to_chunk(&chunk, &dummy_guard);
+    let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
@@ -54,7 +52,7 @@ pub fn cell_rw() {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
-    loc = cell.write_to_chunk(&chunk, &dummy_guard);
+    loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
 
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
@@ -86,8 +84,6 @@ pub fn dynamic() {
         fields,
         is_dynamic: true,
     };
-    let dummy_map = WordMap::with_capacity(4);
-    let dummy_guard = dummy_map.try_insert_locked(1).unwrap();
     let mut data_map = types::Map::new();
     data_map.insert("id", Value::I64(100));
     data_map.insert("score", Value::U64(70));
@@ -101,7 +97,7 @@ pub fn dynamic() {
         header: CellHeader::new(0, schema.id, &id1),
         data,
     };
-    let mut loc = cell.write_to_chunk(&chunk, &dummy_guard);
+    let mut loc = cell.write_to_chunk(&chunk);
     let cell_1_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
@@ -123,7 +119,7 @@ pub fn dynamic() {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
-    loc = cell.write_to_chunk(&chunk, &dummy_guard);
+    loc = cell.write_to_chunk(&chunk);
     let cell_2_ptr = loc.unwrap();
     {
         let stored_cell = Cell::from_chunk_raw(cell_2_ptr, &chunk).unwrap();

@@ -187,7 +187,7 @@ impl DataManager {
     ) -> io::Result<Arc<manager::AsyncServiceClient>> {
         let server_id_ref = &(server_id as usize);
         loop {
-            if !self.managers.contains(server_id_ref) {
+            if !self.managers.contains_key(server_id_ref) {
                 let client = self.server.get_member_by_server_id(server_id).await?;
                 return Ok(self.managers.get_or_insert(server_id_ref, || {
                     manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
