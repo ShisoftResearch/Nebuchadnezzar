@@ -181,11 +181,10 @@ impl Cell {
     pub fn write_to_chunk(
         &mut self,
         chunk: &Chunk,
-        _guard: &CellWriteGuard,
     ) -> Result<usize, WriteError> {
         let schema_id = self.header.schema;
         if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            let write_result = self.write_to_chunk_with_schema(chunk, &*schema, _guard);
+            let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
             if write_result.is_ok() {
                 // index::client::make_indices(self, &*schema, update);
             }
@@ -198,7 +197,6 @@ impl Cell {
         &mut self,
         chunk: &Chunk,
         schema: &Schema,
-        _guard: &CellWriteGuard,
     ) -> Result<usize, WriteError> {
         let mut offset: usize = 0;
         let mut instructions = Vec::<writer::Instruction>::new();

@@ -46,7 +46,6 @@ pub struct Chunk {
     pub wal_storage: Option<String>,
     pub total_space: AtomicUsize,
     pub capacity: usize,
-    pub unstable_cells: RAIIMutexTable<u64>,
     pub gc_lock: Mutex<()>,
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
@@ -96,7 +95,6 @@ impl Chunk {
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
-            unstable_cells: RAIIMutexTable::new(),
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()),
         };
@@ -238,10 +236,10 @@ impl Chunk {
     #[cfg(feature = "fast_map")]
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
+        let cell_loc = cell.write_to_chunk(self,)?;
         match self.index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
-                let loc = cell.write_to_chunk(self, &guard)?;
-                *guard = loc;
+                *guard = cell_loc;
                 Ok(cell.header)
             }
             None => Err(WriteError::CellAlreadyExisted),
@@ -275,26 +273,16 @@ impl Chunk {
         }
     }
 
-    #[inline]
-    fn update_cell_from_guard(
-        &self,
-        cell: &mut Cell,
-        guard: &mut CellWriteGuard,
-    ) -> Result<CellHeader, WriteError> {
-        let _old_location = **guard;
-        let new_location = cell.write_to_chunk(self, guard)?;
-        **guard = new_location;
-        return Ok(cell.header);
-    }
-
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
+        // Write first, lock second to avoid deadlock with cleaner
+        let new_cell_loc = cell.write_to_chunk(self)?;
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
-            let res = self.update_cell_from_guard(cell, &mut guard);
+            *guard = new_cell_loc;
             let seg = self.locate_segment_ensured(cell_location, &cell.header.id());
             self.mark_dead_entry(cell_location, &seg);
-            res
+            Ok(cell.header)
         } else {
             Err(WriteError::CellDoesNotExisted)
         }
@@ -303,18 +291,19 @@ impl Chunk {
     #[cfg(feature = "fast_map")]
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
+        // Write first, lock second to avoid deadlock with cleaner
+        let new_cell_loc = cell.write_to_chunk(self)?;
         loop {
             if let Some(mut guard) = self.location_for_write(hash) {
                 let cell_location = *guard;
-                let res = self.update_cell_from_guard(cell, &mut guard);
+                *guard = new_cell_loc;
                 let seg = self.locate_segment_ensured(cell_location, &cell.header.id());
                 self.mark_dead_entry(cell_location, &seg);
-                return res;
+                return Ok(cell.header);
             } else {
                 if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
                     // New cell
-                    let loc = cell.write_to_chunk(self, &guard)?;
-                    *guard = loc;
+                    *guard = new_cell_loc;
                     return Ok(cell.header);
                 } else {
                     continue;
@@ -344,30 +333,43 @@ impl Chunk {
     where
         U: Fn(Cell) -> Option<Cell>,
     {
-        if let Some(mut cell_location) = self.location_for_write(hash) {
-            let cell = Cell::from_chunk_raw(*cell_location, self);
-            match cell {
-                Ok(cell) => {
-                    let new_cell = update(cell);
-                    if let Some(mut new_cell) = new_cell {
-                        let old_location = *cell_location;
-                        let new_location = new_cell.write_to_chunk(self, &mut cell_location)?;
-                        *cell_location = new_location;
+        let backoff = crossbeam::utils::Backoff::new();
+        loop {
+            let (cell, old_loc) = {
+                if let Some(cell_guard) = self.location_for_write(hash) {
+                    match Cell::from_chunk_raw(*cell_guard, self) {
+                        Ok(cell) => (cell, *cell_guard),
+                        Err(e) => return Err(WriteError::ReadError(e)),
+                    }
+                } else {
+                    return Err(WriteError::CellDoesNotExisted);
+                }
+            };
+            let new_cell = update(cell);
+            if let Some(mut new_cell) = new_cell {
+                let new_cell_loc = new_cell.write_to_chunk(self)?;
+                if let Some(mut cell_guard) = self.location_for_write(hash) {
+                    // Ensure location unchanged
+                    if *cell_guard == old_loc {
+                        let old_location = *cell_guard;
+                        let new_location = new_cell.write_to_chunk(self)?;
+                        *cell_guard = new_location;
                         let seg = self.locate_segment_ensured(old_location, &new_cell.header.id());
                         self.mark_dead_entry(old_location, &seg);
                         return Ok(new_cell);
-                    } else {
-                        return Err(WriteError::UserCanceledUpdate);
                     }
                 }
-                Err(e) => return Err(WriteError::ReadError(e)),
+                // Failed on check, cleanup and try. This may produce a lot of garbage.
+                let seg = self.locate_segment_ensured(new_cell_loc, &new_cell.header.id());
+                self.mark_dead_entry(new_cell_loc, &seg);
+                backoff.spin();
+            } else {
+                return Err(WriteError::UserCanceledUpdate);
             }
-        } else {
-            return Err(WriteError::CellDoesNotExisted);
         }
     }
+
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
-        let _unstable_guard = self.unstable_cells.lock(hash);
         let hash_key = hash as usize;
         #[cfg(feature = "fast_map")]
         let guard_opt = self.index.lock(hash_key);
@@ -376,6 +378,7 @@ impl Chunk {
         if let Some(guard) = guard_opt {
             let cell_location = *guard;
             self.put_tombstone_by_cell_loc(cell_location, &guard)?;
+            guard.remove();
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)

@@ -63,7 +63,7 @@ impl CompactCleaner {
         .expect("No space left during compact");
         let seg_addr = new_seg.addr;
         let mut cursor = seg_addr;
-        let _unstable_guards = entries
+        entries
             .into_iter()
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;
@@ -89,14 +89,12 @@ impl CompactCleaner {
                 return result;
             })
             .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::CELL)
-            .map(|(entry, new_addr)| {
+            .for_each(|(entry, new_addr)| {
                 let header = entry.content.as_cell_header();
                 trace!(
                     "Acquiring cell guard for update on compact {:?}",
                     header.id()
                 );
-                let unstable_guard = chunk.unstable_cells.lock(header.hash);
-
                 #[cfg(feature = "fast_map")]
                 let index = chunk.index.lock(header.hash as usize);
                 #[cfg(feature = "slow_map")]
@@ -113,9 +111,7 @@ impl CompactCleaner {
                         );
                     }
                 }
-                unstable_guard
-            })
-            .collect_vec();
+            });
 
         new_seg
             .append_header

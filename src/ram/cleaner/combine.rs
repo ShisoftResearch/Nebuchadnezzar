@@ -161,7 +161,7 @@ impl CombinedCleaner {
             }
 
             debug!("Updating cell reference, pending segments {}", pending_segments.len());
-            let _unstable_guards = pending_segments
+            pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
                     let new_seg = chunk.allocator.alloc_seg(
@@ -204,10 +204,8 @@ impl CombinedCleaner {
                     chunk.put_segment(segment);
                     return cells;
                 })
-                .map(|(new, old, hash)| {
+                .for_each(|(new, old, hash)| {
                     debug!("Reset cell {} ptr from {} to {}", hash, old, new);
-                    let unstable_guard = chunk.unstable_cells.lock(hash);
-
                     #[cfg(feature = "fast_map")]
                         let index = chunk.index.lock(hash as usize);
                     #[cfg(feature = "slow_map")]
@@ -226,9 +224,7 @@ impl CombinedCleaner {
                     } else {
                         warn!("cell {} address {} have been removed on combine", hash, old);
                     }
-                    unstable_guard
-                })
-                .collect::<Vec<_>>();
+                });
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(
                 "Combined {} segments to {}, total {} bytes",
