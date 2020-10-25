@@ -236,10 +236,11 @@ impl Chunk {
         match self.index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
-                Ok(cell.header)
             }
-            None => Err(WriteError::CellAlreadyExisted),
+            None => return Err(WriteError::CellAlreadyExisted),
         }
+        fence(SeqCst);
+        Ok(cell.header)
     }
 
     #[cfg(feature = "slow_map")]
@@ -276,11 +277,13 @@ impl Chunk {
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
             *guard = new_cell_loc;
+            drop(guard);
             self.mark_dead_entry_with_cell(cell_location, cell);
-            Ok(cell.header)
         } else {
-            Err(WriteError::CellDoesNotExisted)
+            return Err(WriteError::CellDoesNotExisted)
         }
+        fence(SeqCst);
+        Ok(cell.header)
     }
 
     #[cfg(feature = "fast_map")]
@@ -292,17 +295,18 @@ impl Chunk {
             if let Some(mut guard) = self.location_for_write(hash) {
                 let cell_location = *guard;
                 *guard = new_cell_loc;
+                drop(guard);
                 self.mark_dead_entry_with_cell(cell_location, cell);
-                return Ok(cell.header);
             } else {
                 if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
                     // New cell
                     *guard = new_cell_loc;
-                    return Ok(cell.header);
                 } else {
                     continue;
                 }
             }
+            fence(SeqCst);
+            return Ok(cell.header);
         }
     }
 
@@ -348,7 +352,9 @@ impl Chunk {
                         let old_location = *cell_guard;
                         let new_location = new_cell.write_to_chunk(self)?;
                         *cell_guard = new_location;
+                        drop(cell_guard);
                         self.mark_dead_entry_with_cell(old_location, &new_cell);
+                        fence(SeqCst);
                         return Ok(new_cell);
                     }
                 }
