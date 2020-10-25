@@ -280,7 +280,7 @@ impl Chunk {
             drop(guard);
             self.mark_dead_entry_with_cell(cell_location, cell);
         } else {
-            return Err(WriteError::CellDoesNotExisted)
+            return Err(WriteError::CellDoesNotExisted);
         }
         fence(SeqCst);
         Ok(cell.header)
@@ -305,7 +305,7 @@ impl Chunk {
                     continue;
                 }
             }
-            // fence(SeqCst); 
+            // fence(SeqCst);
             return Ok(cell.header);
         }
     }
@@ -397,8 +397,7 @@ impl Chunk {
             match cell {
                 Ok(cell) => {
                     if predict(cell) {
-                        let put_tombstone_result =
-                            self.put_tombstone_by_cell_loc(cell_location);
+                        let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
@@ -477,10 +476,7 @@ impl Chunk {
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn put_tombstone_by_cell_loc(
-        &self,
-        cell_location: usize,
-    ) -> Result<(), WriteError> {
+    pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location

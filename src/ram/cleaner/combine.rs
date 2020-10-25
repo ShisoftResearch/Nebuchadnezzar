@@ -209,8 +209,7 @@ impl CombinedCleaner {
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
-                    cells.into_par_iter().for_each(|(new, old, hash)|
-                    {
+                    cells.into_par_iter().for_each(|(new, old, hash)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         #[cfg(feature = "fast_map")]
                         let index = chunk.index.lock(hash as usize);
