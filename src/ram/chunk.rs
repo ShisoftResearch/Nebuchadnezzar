@@ -239,7 +239,7 @@ impl Chunk {
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
-        fence(SeqCst);
+        // fence(SeqCst);
         Ok(cell.header)
     }
 
@@ -305,7 +305,7 @@ impl Chunk {
                     continue;
                 }
             }
-            fence(SeqCst);
+            // fence(SeqCst); 
             return Ok(cell.header);
         }
     }
@@ -354,7 +354,7 @@ impl Chunk {
                         *cell_guard = new_location;
                         drop(cell_guard);
                         self.mark_dead_entry_with_cell(old_location, &new_cell);
-                        fence(SeqCst);
+                        // fence(SeqCst);
                         return Ok(new_cell);
                     }
                 }
@@ -375,7 +375,7 @@ impl Chunk {
         let guard_opt = self.index.lock(&hash);
         if let Some(guard) = guard_opt {
             let cell_location = *guard;
-            self.put_tombstone_by_cell_loc(cell_location, &guard)?;
+            self.put_tombstone_by_cell_loc(cell_location)?;
             guard.remove();
             Ok(())
         } else {
@@ -398,7 +398,7 @@ impl Chunk {
                 Ok(cell) => {
                     if predict(cell) {
                         let put_tombstone_result =
-                            self.put_tombstone_by_cell_loc(cell_location, &guard);
+                            self.put_tombstone_by_cell_loc(cell_location);
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
@@ -429,7 +429,6 @@ impl Chunk {
         self.segs.insert_back(&segment_key, segment);
         #[cfg(feature = "slow_map")]
         self.segs.insert(segment_key, segment);
-        fence(SeqCst);
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
@@ -478,10 +477,9 @@ impl Chunk {
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn put_tombstone_by_cell_loc(
+    pub fn put_tombstone_by_cell_loc(
         &self,
         cell_location: usize,
-        _cell_guard: &WordMutexGuard,
     ) -> Result<(), WriteError> {
         debug!(
             "Put tombstone for chunk {} for cell {}",
@@ -499,7 +497,7 @@ impl Chunk {
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> MapNodeRef<Segment> {
         self.locate_segment(cell_location, cell_id).expect(
             format!(
-                "cannot locate cell segment for tombstone. Cell id: {:?} at {}",
+                "Cannot locate cell segment for cell id: {:?} at {}",
                 cell_id, cell_location
             )
             .as_str(),
@@ -510,13 +508,13 @@ impl Chunk {
     // make the changes in corresponding segments.
     // Because calculate segment from location is computation intensive, it have to be done lazily
     #[inline]
-    fn mark_dead_entry_with_seg(&self, addr: usize, seg: &MapNodeRef<Segment>) {
+    pub fn mark_dead_entry_with_seg(&self, addr: usize, seg: &MapNodeRef<Segment>) {
         let (entry, _) = Entry::decode_from(addr, |_, _| {});
         seg.dead_space
             .fetch_add(entry.content_length, Ordering::Relaxed);
     }
 
-    fn mark_dead_entry_with_cell(&self, addr: usize, cell: &Cell) {
+    pub fn mark_dead_entry_with_cell(&self, addr: usize, cell: &Cell) {
         let seg = self.locate_segment_ensured(addr, &cell.header.id());
         self.mark_dead_entry_with_seg(addr, &seg)
     }

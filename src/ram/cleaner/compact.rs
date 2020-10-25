@@ -70,6 +70,13 @@ impl CompactCleaner {
             .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
             .expect("No space left during compact");
         let seg_addr = new_seg.addr;
+        new_seg
+            .append_header
+            .store(seg_addr + live_size, Ordering::Relaxed);
+        let new_seg_id = new_seg.id as usize;
+        // Put the segment into the chunk right after it was allocated *BEFORE* any cell have been moved on it.
+        chunk.put_segment(new_seg);
+        let new_seg = chunk.segs.get(&new_seg_id).unwrap();
         let mut cursor = seg_addr;
         entries
             .into_iter()
@@ -108,8 +115,8 @@ impl CompactCleaner {
                 #[cfg(feature = "slow_map")]
                 let index = chunk.index.get_mut(&header.hash);
 
+                let old_addr = entry.meta.entry_pos;
                 if let Some(mut cell_guard) = index {
-                    let old_addr = entry.meta.entry_pos;
                     if *cell_guard == old_addr {
                         *cell_guard = new_addr;
                     } else {
@@ -118,15 +125,15 @@ impl CompactCleaner {
                             old_addr,
                             *cell_guard
                         );
+                        drop(cell_guard);
+                        chunk.mark_dead_entry_with_seg(new_addr, &new_seg);
                     }
+                } else {
+                    trace!("cell address {} have been remove during compact", old_addr);
+                    let _ = chunk.put_tombstone_by_cell_loc(new_addr);
                 }
             });
-
-        new_seg
-            .append_header
-            .store(new_seg.addr + live_size, Ordering::Relaxed);
-        // put segment directly into the segment map after to resetting cell addresses as side logs to replace the old one
-        chunk.put_segment(new_seg);
+            
         chunk.remove_segment(seg.id);
         seg.mem_drop(chunk);
 

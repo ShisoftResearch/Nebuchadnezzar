@@ -203,38 +203,41 @@ impl CombinedCleaner {
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
                     return (new_seg, cell_mapping);
                 })
-                .flat_map(|(segment, cells)| {
+                .for_each(|(segment, cells)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
                     segment.archive().unwrap();
+                    let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
-                    return cells;
-                })
-                .for_each(|(new, old, hash)| {
-                    trace!("Reset cell {} ptr from {} to {}", hash, old, new);
-                    #[cfg(feature = "fast_map")]
-                    let index = chunk.index.lock(hash as usize);
-                    #[cfg(feature = "slow_map")]
-                    let index = chunk.index.get_mut(&hash);
+                    let new_seg = chunk.segs.get(&new_seg_id).unwrap();
+                    for (new, old, hash) in cells {
+                        trace!("Reset cell {} ptr from {} to {}", hash, old, new);
+                        #[cfg(feature = "fast_map")]
+                        let index = chunk.index.lock(hash as usize);
+                        #[cfg(feature = "slow_map")]
+                        let index = chunk.index.get_mut(&hash);
 
-                    if let Some(mut actual_addr) = index {
-                        if *actual_addr == old {
-                            *actual_addr = new;
-                            trace!(
-                                "Cell addr for hash {} set from {} to {} for combine",
-                                hash,
-                                old,
-                                new
-                            );
+                        if let Some(mut actual_addr) = index {
+                            if *actual_addr == old {
+                                *actual_addr = new;
+                                trace!(
+                                    "Cell addr for hash {} set from {} to {} for combine",
+                                    hash,
+                                    old,
+                                    new
+                                );
+                            } else {
+                                trace!(
+                                    "cell {} with address {}, have been changed to {} on combine",
+                                    hash,
+                                    old,
+                                    *actual_addr
+                                );
+                                chunk.mark_dead_entry_with_seg(new, &new_seg);
+                            }
                         } else {
-                            trace!(
-                                "cell {} with address {}, have been changed to {} on combine",
-                                hash,
-                                old,
-                                *actual_addr
-                            );
+                            trace!("cell {} address {} have been removed on combine", hash, old);
+                            let _ = chunk.put_tombstone_by_cell_loc(new);
                         }
-                    } else {
-                        trace!("cell {} address {} have been removed on combine", hash, old);
                     }
                 });
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
