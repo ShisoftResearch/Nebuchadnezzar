@@ -113,7 +113,7 @@ impl CompactCleaner {
                     if *cell_guard == old_addr {
                         *cell_guard = new_addr;
                     } else {
-                        warn!(
+                        trace!(
                             "cell address {} have been changed to {} on relocating on compact",
                             old_addr, *cell_guard
                         );

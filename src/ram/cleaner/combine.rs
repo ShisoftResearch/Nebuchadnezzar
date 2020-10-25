@@ -226,13 +226,13 @@ impl CombinedCleaner {
                                 new
                             );
                         } else {
-                            warn!(
+                            trace!(
                                 "cell {} with address {}, have been changed to {} on combine",
                                 hash, old, *actual_addr
                             );
                         }
                     } else {
-                        warn!("cell {} address {} have been removed on combine", hash, old);
+                        trace!("cell {} address {} have been removed on combine", hash, old);
                     }
                 });
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);

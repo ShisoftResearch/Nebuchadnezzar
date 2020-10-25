@@ -6,7 +6,6 @@ use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
-use crate::utils::raii_mutex_table::RAIIMutexTable;
 
 #[cfg(feature = "fast_map")]
 use crate::utils::upper_power_of_2;
@@ -16,9 +15,10 @@ use chashmap::*;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
 use parking_lot::Mutex;
-use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use std::sync::atomic::{fence, Ordering::SeqCst};
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -411,6 +411,7 @@ impl Chunk {
         }
     }
 
+    #[inline(always)]
     pub fn put_segment(&self, segment: Segment) {
         debug!(
             "Putting segment for chunk {} with id {}",
@@ -422,6 +423,7 @@ impl Chunk {
         self.segs.insert_back(&segment_key, segment);
         #[cfg(feature = "slow_map")]
         self.segs.insert(segment_key, segment);
+        fence(SeqCst);
     }
 
     pub fn remove_segment(&self, segment_id: u64) {

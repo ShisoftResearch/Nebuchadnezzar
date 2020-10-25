@@ -246,10 +246,13 @@ pub async fn smoke_test_parallel() {
                 debug!("Iteration i {}, j {} completed", i, j);
             }
             client_clone.remove_cell(id).await.unwrap().unwrap();
+            true
         }));
     }
 
-    while let Some(_) = tasks.next().await {}
+    while let Some(r) = tasks.next().await {
+        assert!(r.unwrap());
+    }
 }
 
 #[tokio::test(threaded_scheduler)]

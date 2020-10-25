@@ -750,7 +750,7 @@ checksum = "2448f6066e80e3bfc792e9c98bf705b4b0fc6e8ef5b43e5889aff0eaa9c58743"
 [[package]]
 name = "lightning"
 version = "0.2.0"
-source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#610a46d4f714d43c6423e828767f5d84ea088c67"
+source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#0b036500c44acb37a1425c5e8c7bb6ebf09da371"
 dependencies = [
  "crossbeam-epoch 0.9.0",
  "crossbeam-utils 0.8.0",
