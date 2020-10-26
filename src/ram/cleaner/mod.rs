@@ -50,7 +50,15 @@ impl Cleaner {
     }
     pub fn clean(chunk: &Chunk, full: bool) {
         debug!("Ready for clean {}, full {}", chunk.id, full);
-        let _guard = chunk.gc_lock.lock();
+        let guard = if full {
+            Some(chunk.gc_lock.lock())
+        } else {
+            chunk.gc_lock.try_lock()
+        };
+        if guard.is_none() {
+            debug!("GC in progress, will not wait it unless full GC");
+            return;
+        }
         let num_segs = chunk.segs.len();
         debug!(
             "Cleaning chunk {}, full {}, segs {}",

@@ -205,37 +205,20 @@ pub async fn smoke_test_parallel() {
         tasks.push(tokio::spawn(async move {
             let id = Id::new(1, i as u64);
             for j in 0..num {
-                debug!("Smoke test i {}, k {}", i, j);
-                if j > 0 {
-                    let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-                    assert_eq!(
-                        *(read_cell.data[DATA].U64().unwrap()),
-                        j - 1,
-                        "Parallel first read i {}, j {}",
-                        i,
-                        j
-                    );
-                }
+                debug!("Smoke test i {}, j {}", i, j);
                 let mut rng = SmallRng::from_entropy();
-                if rng.gen_range(0, 4) == 4 {
-                    debug!("Removing i {}, j {}", i, j);
-                    client_clone.remove_cell(id).await.unwrap().unwrap();
-                }
+                // if rng.gen_range(0, 0) == 4 {
+                //     debug!("Removing i {}, j {}", i, j);
+                //     client_clone.remove_cell(id).await.unwrap().unwrap();
+                // }
                 let mut value = Value::Map(Map::new());
                 value[DATA] = Value::U64(j);
                 value[ARRAY] = (1..rng.gen_range(1, 1024)).collect::<Vec<u64>>().value();
                 let cell = Cell::new_with_id(schema_id, &id, value);
+                debug!("Upsert {:?}, i {}, j {}", id, i, j);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
                 // read
-                let read_cell = match client_clone.read_cell(id).await.unwrap() {
-                    Ok(cell) => {
-                        debug!("Got cell for i {}, j {}", i, j);
-                        cell
-                    }
-                    Err(e) => {
-                        panic!("Cannot get cell for i {}, j {}, {:?}", i, j, e);
-                    }
-                };
+                let read_cell = client_clone.read_cell(id).await.unwrap().expect(&format!("Finally expecting {:?} at {}", id, j));
                 assert_eq!(
                     *(read_cell.data[DATA].U64().unwrap()),
                     j,
@@ -245,7 +228,6 @@ pub async fn smoke_test_parallel() {
                 );
                 debug!("Iteration i {}, j {} completed", i, j);
             }
-            client_clone.remove_cell(id).await.unwrap().unwrap();
             true
         }));
     }

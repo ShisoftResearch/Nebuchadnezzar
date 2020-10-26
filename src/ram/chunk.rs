@@ -137,12 +137,16 @@ impl Chunk {
                             continue;
                         }
                     }
+                    if self.allocator.meet_gc_threshold() {
+                        debug!("Allocator meed GC threshold, will try GC");
+                        Cleaner::clean(self, false);
+                    }
                     let _alloc_guard = self.alloc_lock.lock();
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
                         let new_seg_opt =
-                            SegmentAllocator::alloc(self, &self.backup_storage, &self.wal_storage);
+                            self.allocator.alloc_seg(&self.backup_storage, &self.wal_storage);
                         let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
@@ -165,6 +169,7 @@ impl Chunk {
         match guard {
             Some(index) => {
                 if *index == 0 {
+                    warn!("Cannot find cell with hash {} for index is zero", hash);
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 return Ok(index);
@@ -173,6 +178,7 @@ impl Chunk {
                 if hash == 0 {
                     Err(ReadError::CellIdIsUnitId)
                 } else {
+                    trace!("Cannot find cell with hash {} for it is not in the map", hash);
                     Err(ReadError::CellDoesNotExisted)
                 }
             }
@@ -293,6 +299,7 @@ impl Chunk {
         let new_cell_loc = cell.write_to_chunk(self)?;
         loop {
             if let Some(mut guard) = self.location_for_write(hash) {
+                trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
                 *guard = new_cell_loc;
                 drop(guard);
@@ -300,12 +307,14 @@ impl Chunk {
             } else {
                 if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
                     // New cell
+                    trace!("Cell {} does not exists, will insert for upsert", hash);
                     *guard = new_cell_loc;
                 } else {
+                    trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
                 }
             }
-            // fence(SeqCst);
+            fence(SeqCst);
             return Ok(cell.header);
         }
     }

@@ -324,30 +324,8 @@ impl SegmentAllocator {
         }
     }
 
-    pub fn alloc(
-        chunk: &Chunk,
-        backup_storage: &Option<String>,
-        wal_storage: &Option<String>,
-    ) -> Option<Segment> {
-        let mut cleaned = false;
-        let this = &chunk.allocator;
-        if this.offset.load(Relaxed) > this.gc_threshold {
-            Cleaner::clean(chunk, false);
-        }
-        loop {
-            let seg_opt = chunk.allocator.alloc_seg(backup_storage, wal_storage);
-            if seg_opt.is_some() {
-                return seg_opt;
-            } else {
-                if !cleaned {
-                    Cleaner::clean(chunk, true);
-                    cleaned = true;
-                    continue;
-                } else {
-                    return None;
-                }
-            }
-        }
+    pub fn meet_gc_threshold(&self) -> bool {
+        self.offset.load(Relaxed) > self.gc_threshold
     }
 
     pub fn alloc_seg(

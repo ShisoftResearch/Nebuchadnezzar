@@ -83,16 +83,17 @@ impl CompactCleaner {
             .map(|e: Entry| {
                 let entry_size = e.meta.entry_size;
                 let entry_pos = e.meta.entry_pos;
-                let result = (e, cursor);
                 trace!(
-                    "memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {}",
+                    "Memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
                     entry_size,
                     entry_pos,
                     cursor,
                     seg_addr + live_size,
                     seg_addr,
-                    live_size
+                    live_size,
+                    e.content
                 );
+                let result = (e, cursor);
                 unsafe {
                     libc::memcpy(
                         cursor as *mut libc::c_void,
@@ -121,7 +122,8 @@ impl CompactCleaner {
                         *cell_guard = new_addr;
                     } else {
                         trace!(
-                            "cell address {} have been changed to {} on relocating on compact",
+                            "Cell {:?} address {} have been changed to {} on relocating on compact",
+                            entry.content,
                             old_addr,
                             *cell_guard
                         );
@@ -129,7 +131,7 @@ impl CompactCleaner {
                         chunk.mark_dead_entry_with_seg(new_addr, &new_seg);
                     }
                 } else {
-                    trace!("cell address {} have been remove during compact", old_addr);
+                    trace!("Cell {:?} address {} have been remove during compact", entry.content, old_addr);
                     let _ = chunk.put_tombstone_by_cell_loc(new_addr);
                 }
             });

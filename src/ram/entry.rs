@@ -29,6 +29,7 @@ pub struct EntryMeta {
     pub entry_header: EntryHeader,
 }
 
+#[derive(Debug)]
 pub enum EntryContent {
     Cell(CellHeader),
     Tombstone(Tombstone),
