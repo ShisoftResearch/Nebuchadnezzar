@@ -99,7 +99,7 @@ impl DataManager {
                     manager_clone.cell_meta_cleanup().await;
                     cleanup_signal.store(false, Relaxed);
                 }
-                tokio::time::delay_for(Duration::from_secs(1)).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
         return manager;

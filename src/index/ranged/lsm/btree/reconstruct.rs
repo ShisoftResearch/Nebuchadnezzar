@@ -187,7 +187,7 @@ mod test {
     use itertools::Itertools;
     use std::sync::Arc;
 
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn tree_reconstruct_from_head_cell() {
         let _ = env_logger::try_init();
         let server_group = "btree-reconstruct";

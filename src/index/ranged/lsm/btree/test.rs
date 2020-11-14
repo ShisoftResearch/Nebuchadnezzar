@@ -319,7 +319,7 @@ type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
 type TinyPtrSlice = [NodeCellRef; TINY_PAGE_SIZE + 1];
 type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 async fn level_merge() {
     let _ = env_logger::try_init();
     let range = 1000;

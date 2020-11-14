@@ -7,7 +7,7 @@ use crate::server::transactions;
 use crate::server::*;
 use env_logger;
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn workspace_wr() {
     let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5200");
@@ -140,7 +140,7 @@ pub async fn workspace_wr() {
     // committed transaction should have been disposed
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn data_site_wr() {
     let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5201");
@@ -230,7 +230,7 @@ pub async fn data_site_wr() {
     assert_eq!(cell_r2.data["score"].U64().unwrap(), &90);
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn multi_transaction() {
     let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5202");
@@ -328,7 +328,7 @@ pub async fn multi_transaction() {
     );
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_rw() {
     let _ = env_logger::try_init();
     // this test is likely to have unrealizable transactions and

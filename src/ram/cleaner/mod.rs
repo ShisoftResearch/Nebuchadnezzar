@@ -64,8 +64,8 @@ impl Cleaner {
             "Cleaning chunk {}, full {}, segs {}",
             chunk.id, full, num_segs
         );
-        let segments_compact_per_turn = if full { num_segs } else { num_segs / 10 + 1 };
-        let segments_combine_per_turn = if full { num_segs } else { num_segs / 20 + 2 };
+        let segments_compact_per_turn = if full { num_segs } else { num_segs / 5 + 1 };
+        let segments_combine_per_turn = if full { num_segs } else { num_segs / 5 + 2 };
         // have to put it right here for cleaners will clear the tombstone death counter
         chunk.scan_tombstone_survival();
         let mut cleaned_space: usize = 0;

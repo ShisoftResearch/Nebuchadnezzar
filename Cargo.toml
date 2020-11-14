@@ -35,8 +35,8 @@ serde_json = "*"
 futures = {version = "0.3", features = ["executor", "thread-pool"] }
 futures-timer = "3"
 async-std = "1"
-tokio = "0.2"
-crossbeam = "0.7.3"
+tokio = { version = "0.3", features = ["full"] }
+crossbeam = "*"
 chashmap = { version = "2.2.2", optional = true }
 
 [dev-dependencies]

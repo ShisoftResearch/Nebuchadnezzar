@@ -138,7 +138,7 @@ impl Chunk {
                         }
                     }
                     if self.allocator.meet_gc_threshold() {
-                        debug!("Allocator meed GC threshold, will try GC");
+                        debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
                     }
                     let _alloc_guard = self.alloc_lock.lock();

@@ -25,7 +25,7 @@ mod tests {
     use tokio::stream::StreamExt;
 
     // #[ignore]
-    #[tokio::test(threaded_scheduler)]
+    #[tokio::test(flavor = "multi_thread")]
     async fn general() {
         let _ = env_logger::try_init();
         let server_group = "ranged_index_test";
@@ -107,7 +107,7 @@ mod tests {
         }
         while let Some(_) = futs.next().await {}
         debug!("Selection check pased, waiting for 10 secs");
-        tokio::time::delay_for(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
         info!("Waiting tree storage");
         storage::wait_until_updated().await;
         info!("Total cells {}", client.count().await.unwrap());

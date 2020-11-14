@@ -13,7 +13,7 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
     let client = client.clone();
     tokio::spawn(async move {
         loop {
-            while let Ok((id, changing)) = external::CHANGED_NODES.pop() {
+            while let Some((id, changing)) = external::CHANGED_NODES.pop() {
                 match changing {
                     external::ChangingNode::Modified(modified) => {
                         modified.node.persist(&modified.deletion, &client).await;
@@ -24,7 +24,7 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                 }
                 CHANGE_PROGRESS.store(id, Ordering::Relaxed);
             }
-            tokio::time::delay_for(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
     unsafe {
@@ -45,7 +45,7 @@ pub async fn wait_until_updated() {
         if current >= newest {
             break;
         }
-        tokio::time::delay_for(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     debug!("Write back updated, {} cells", ops);
 }

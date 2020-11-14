@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::*;
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn general() {
     let _ = env_logger::try_init();
     let server_group = "general_test";
@@ -141,7 +141,7 @@ pub async fn general() {
     );
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn multi_cell_update() {
     let server_group = "multi_cell_update_test";
     let server_addr = String::from("127.0.0.1:5401");
@@ -227,7 +227,7 @@ pub async fn multi_cell_update() {
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn write_skew() {
     let server_group = "write_skew_test";
     let server_addr = String::from("127.0.0.1:5402");
@@ -302,7 +302,7 @@ pub async fn write_skew() {
             .transaction(|txn| {
                 *normal_tried_c.lock() += 1;
                 async move {
-                    tokio::time::delay_for(Duration::from_secs(1)).await;
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
                     let mut score_1 = *cell_1.data["score"].U64().unwrap();
                     score_1 += 1;
@@ -330,7 +330,7 @@ pub async fn write_skew() {
     );
 }
 
-#[tokio::test(threaded_scheduler)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn server_isolation() {
     let server_1_group = "server_isolation_test_1";
     let server_2_group = "server_isolation_test_2";
