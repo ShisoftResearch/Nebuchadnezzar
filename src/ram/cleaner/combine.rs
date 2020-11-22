@@ -168,8 +168,7 @@ impl CombinedCleaner {
                 .par_iter()
                 .map(|dummy_seg| {
                     let new_seg = chunk
-                        .allocator
-                        .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
+                        .alloc_seg()
                         .expect("No space left during combine");
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());

@@ -66,8 +66,7 @@ impl CompactCleaner {
             seg.id, chunk.id, live_size
         );
         let new_seg = chunk
-            .allocator
-            .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
+            .alloc_seg()
             .expect("No space left during compact");
         let seg_addr = new_seg.addr;
         new_seg

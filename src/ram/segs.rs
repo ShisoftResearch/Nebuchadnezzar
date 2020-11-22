@@ -1,17 +1,15 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::cleaner::Cleaner;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
+use crate::utils::{PAGE_SHIFT, PAGE_SIZE};
 use libc::*;
-use lightning::list::WordList;
 use parking_lot;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
-use std::ptr;
 use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::Relaxed,
 };
@@ -229,7 +227,7 @@ impl Segment {
             .dropped
             .compare_and_swap(false, true, Ordering::Relaxed)
         {
-            chunk.allocator.free(self.addr);
+            chunk.free_seg(self.addr);
         }
     }
 
@@ -285,86 +283,7 @@ impl Iterator for SegmentEntryIter {
         self.cursor += entry_meta.entry_size;
         Some(entry_meta)
     }
-}
-
-pub const PAGE_SHIFT: usize = 12; // 4K
-pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
-
-pub struct SegmentAllocator {
-    base: usize,
-    offset: AtomicUsize,
-    limit: usize,
-    gc_threshold: usize,
-    free: WordList,
-}
-
-impl SegmentAllocator {
-    pub fn new(chunk_size: usize) -> Self {
-        let overflow = SEGMENT_SIZE - PAGE_SIZE;
-        let aligned_size = chunk_size + overflow;
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                aligned_size,
-                PROT_READ | PROT_WRITE,
-                MAP_ANONYMOUS | MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        let addr = ptr as usize;
-        let start = addr + overflow;
-        let aligned_addr = start & SEGMENT_MASK;
-        Self {
-            base: aligned_addr,
-            offset: AtomicUsize::new(aligned_addr),
-            limit: aligned_addr + chunk_size,
-            gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
-            free: WordList::with_capacity(chunk_size / SEGMENT_SIZE / 2),
-        }
-    }
-
-    pub fn meet_gc_threshold(&self) -> bool {
-        self.offset.load(Relaxed) > self.gc_threshold
-    }
-
-    pub fn alloc_seg(
-        &self,
-        backup_storage: &Option<String>,
-        wal_storage: &Option<String>,
-    ) -> Option<Segment> {
-        self.free
-            .pop()
-            .or_else(|| loop {
-                let addr = self.offset.load(Relaxed);
-                let new_addr = addr + SEGMENT_SIZE;
-                if addr > self.limit {
-                    return None;
-                } else {
-                    if self.offset.compare_and_swap(addr, new_addr, Relaxed) == addr {
-                        return Some(addr);
-                    }
-                }
-            })
-            .map(|addr| {
-                let id = self.id_by_addr(addr);
-                Segment::new(id as u64, addr, backup_storage, wal_storage)
-            })
-    }
-
-    pub fn free(&self, seg_addr: usize) {
-        debug_assert!(seg_addr >= self.base);
-        debug_assert!(seg_addr < self.limit);
-        debug!("Segment {} freed", seg_addr);
-        self.free.push(seg_addr);
-    }
-
-    pub fn id_by_addr(&self, addr: usize) -> usize {
-        let offset = addr - self.base;
-        let id = offset >> SEGMENT_BITS_SHIFT;
-        id
-    }
-}
+} 
 
 #[cfg(target_os = "linux")]
 unsafe fn madvise_free(addr: usize, size: usize) {
