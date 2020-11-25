@@ -155,8 +155,8 @@ pub async fn smoke_test_parallel() {
     let server_group = String::from("smoke_parallel_test");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 1,
-            memory_size: 2 * 1024 * 1024 * 1024,
+            chunk_count: 4,
+            memory_size: 4 * 1024 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
             services: vec![Service::Cell],
