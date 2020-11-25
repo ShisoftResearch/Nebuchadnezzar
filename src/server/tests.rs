@@ -142,7 +142,7 @@ pub async fn smoke_test() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 128)]
 pub async fn smoke_test_parallel() {
     let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
@@ -205,7 +205,7 @@ pub async fn smoke_test_parallel() {
     for i in 0..num_tasks {
         let client_clone = client.clone();
         info!("Schduling test task {}", i);
-        tasks.push(async move {
+        tasks.push(tokio::spawn(async move {
             let id = Id::new(1, i as u64);
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
@@ -232,11 +232,11 @@ pub async fn smoke_test_parallel() {
                 debug!("Iteration i {}, j {} completed", i, j);
             }
             true
-        });
+        }));
     }
     info!("Waiting for all tasks to finish");
     while let Some(r) = tasks.next().await {
-        assert!(r);
+        assert!(r.unwrap());
     }
 }
 

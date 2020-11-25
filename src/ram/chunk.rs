@@ -2,14 +2,10 @@ use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
-use crate::ram::segs::{Segment, SEGMENT_SIZE, SEGMENT_SIZE_U32, SEGMENT_MASK, SEGMENT_BITS_SHIFT};
+use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
-use crate::utils::{PAGE_SHIFT, PAGE_SIZE};
-use std::collections::VecDeque;
-use std::ptr;
-use libc::*;
 
 #[cfg(feature = "fast_map")]
 use crate::utils::upper_power_of_2;
@@ -51,15 +47,8 @@ pub struct Chunk {
     pub total_space: AtomicUsize,
     pub capacity: usize,
     pub gc_lock: Mutex<()>,
-    base: usize,
-    limit: usize,
-    gc_threshold: usize,
-    alloc_data: parking_lot::Mutex<ChunkSegAllocData>
-}
-
-struct ChunkSegAllocData {
-    offset: usize,
-    free: VecDeque<usize>
+    pub allocator: SegmentAllocator,
+    pub alloc_lock: Mutex<()>,
 }
 
 impl Chunk {
@@ -70,26 +59,8 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Chunk {
-        let overflow = SEGMENT_SIZE - PAGE_SIZE;
-        let aligned_size = size + overflow;
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                aligned_size,
-                PROT_READ | PROT_WRITE,
-                MAP_ANONYMOUS | MAP_PRIVATE,
-                -1,
-                0,
-            )
-        };
-        let addr = ptr as usize;
-        let start = addr + overflow;
-        let base = start & SEGMENT_MASK;
-        let offset = base + SEGMENT_SIZE;
-        let limit = base + size;
-        let gc_threshold = base + (size as f64 * 0.9) as usize - SEGMENT_SIZE;
-
-        let bootstrap_segment = Segment::new(0, base, &backup_storage, &wal_storage);
+        let allocator = SegmentAllocator::new(size);
+        let bootstrap_segment = allocator.alloc_seg(&backup_storage, &wal_storage).unwrap();
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {
@@ -117,18 +88,12 @@ impl Chunk {
             meta,
             backup_storage,
             wal_storage,
+            allocator,
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
-            
-            base,
-            limit,
-            gc_threshold,
-            alloc_data: parking_lot::Mutex::new(ChunkSegAllocData {
-                offset,
-                free: VecDeque::new()
-            })
+            alloc_lock: Mutex::new(()),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -172,17 +137,16 @@ impl Chunk {
                             continue;
                         }
                     }
-                    let mut alloc_guard = self.alloc_data.lock();
-                    if alloc_guard.offset > self.gc_threshold {
-                        drop(alloc_guard);
+                    if self.allocator.meet_gc_threshold() {
                         debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
-                        continue;
                     }
+                    let _alloc_guard = self.alloc_lock.lock();
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_opt = self.alloc_seg_guarded(&mut alloc_guard);
+                        let new_seg_opt =
+                            self.allocator.alloc_seg(&self.backup_storage, &self.wal_storage);
                         let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
@@ -197,38 +161,6 @@ impl Chunk {
         }
     }
 
-    pub fn seg_id_by_addr(&self, addr: usize) -> usize {
-        debug_assert!(addr >= self.base, "addr {} with base {}", addr, self.base);
-        (addr - self.base) >> SEGMENT_BITS_SHIFT
-    }
-
-    pub fn alloc_seg(&self) -> Option<Segment> {
-        self.alloc_seg_guarded(&mut self.alloc_data.lock())
-    }
-
-    fn alloc_seg_guarded(&self, alloc_guard: &mut parking_lot::MutexGuard<ChunkSegAllocData>) -> Option<Segment> {
-        let mut usable_addr = alloc_guard.free.pop_front();
-        if usable_addr.is_none() {
-            let addr = alloc_guard.offset;
-            let new_addr = addr + SEGMENT_SIZE;
-             if addr <= self.limit {
-                alloc_guard.offset = new_addr;
-                usable_addr = Some(addr);
-            }
-        };
-        usable_addr.map(|addr| {
-            let id = self.seg_id_by_addr(addr);
-            Segment::new(id as u64, addr, &self.backup_storage, &self.wal_storage)
-        })
-    }
-
-    pub fn free_seg(&self, seg_addr: usize) {
-        debug_assert!(seg_addr >= self.base);
-        debug_assert!(seg_addr < self.limit);
-        debug!("Segment {} freed", seg_addr);
-        self.alloc_data.lock().free.push_front(seg_addr);
-    }
- 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
         #[cfg(feature = "fast_map")]
         let guard = self.index.lock(hash as usize);
@@ -518,7 +450,7 @@ impl Chunk {
     }
 
     fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<MapNodeRef<Segment>> {
-        let seg_id = self.seg_id_by_addr(addr);
+        let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
             warn!(
