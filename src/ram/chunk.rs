@@ -135,7 +135,7 @@ impl Chunk {
     }
 
     fn get_head_seg_id(&self) -> u64 {
-        self.head_seg_id.load(Ordering::Relaxed)
+        self.head_seg_id.load(Ordering::Acquire)
     }
 
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
@@ -188,7 +188,7 @@ impl Chunk {
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_id = new_seg.id;
                         self.put_segment(new_seg);
-                        self.head_seg_id.store(new_seg_id, Ordering::Relaxed);
+                        self.head_seg_id.store(new_seg_id, Ordering::Release);
                     }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
