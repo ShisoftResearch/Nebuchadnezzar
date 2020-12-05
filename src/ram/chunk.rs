@@ -7,7 +7,6 @@ use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 
-#[cfg(feature = "fast_map")]
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 #[cfg(feature = "slow_map")]
@@ -34,12 +33,9 @@ pub struct Chunk {
     pub id: usize,
     #[cfg(feature = "fast_map")]
     pub index: Arc<WordMap>,
-    #[cfg(feature = "fast_map")]
     pub segs: Arc<LinkedObjectMap<Segment>>,
     #[cfg(feature = "slow_map")]
     pub index: Arc<CHashMap<u64, usize>>,
-    #[cfg(feature = "slow_map")]
-    pub segs: Arc<CHashMap<usize, Segment>>,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -69,12 +65,9 @@ impl Chunk {
                 n + 1
             }
         };
-        #[cfg(feature = "fast_map")]
         let segs = LinkedObjectMap::with_capacity(upper_power_of_2(num_segs));
         #[cfg(feature = "fast_map")]
         let index = WordMap::with_capacity(64);
-        #[cfg(feature = "slow_map")]
-        let segs = CHashMap::new();
         #[cfg(feature = "slow_map")]
         let index = CHashMap::new();
 
@@ -266,7 +259,7 @@ impl Chunk {
         if new {
             debug!("Will insert cell {}", header.hash);
             let mut guard = self.index.get_mut(&header.hash).unwrap();
-            let loc = cell.write_to_chunk(self, &guard).unwrap();
+            let loc = cell.write_to_chunk(self).unwrap();
             *guard = loc;
             debug!("Cell inserted for {}", header.hash);
             Ok(header)
@@ -292,7 +285,6 @@ impl Chunk {
         Ok(cell.header)
     }
 
-    #[cfg(feature = "fast_map")]
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
@@ -305,10 +297,17 @@ impl Chunk {
                 drop(guard);
                 self.mark_dead_entry_with_cell(cell_location, cell);
             } else {
-                if let Some(mut guard) = self.index.try_insert_locked(hash as usize) {
+                #[cfg(feature = "fast_map")]
+                let reservation = self.index.try_insert_locked(hash as usize);
+                #[cfg(feature = "slow_map")]
+                let reservation = self.index.insert(hash, new_cell_loc);
+                if let Some(mut guard) = reservation {
                     // New cell
-                    trace!("Cell {} does not exists, will insert for upsert", hash);
-                    *guard = new_cell_loc;
+                    #[cfg(feature = "fast_map")]
+                    {
+                        trace!("Cell {} does not exists, will insert for upsert", hash);
+                        *guard = new_cell_loc;
+                    }
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -316,23 +315,6 @@ impl Chunk {
             }
             fence(SeqCst);
             return Ok(cell.header);
-        }
-    }
-
-    #[cfg(feature = "slow_map")]
-    fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
-        // This one is also not safe, should only be used for specific tests
-        let header = cell.header;
-        let hash = header.hash;
-        if let Some(mut guard) = self.index.get_mut(&hash) {
-            debug!("Upsert {} by update", header.hash);
-            let cell_location = *guard;
-            let res = self.update_cell_from_guard(cell, &mut guard);
-            self.mark_dead_entry(cell_location);
-            res
-        } else {
-            debug!("Upsert {} by write", header.hash);
-            self.write_cell(cell)
         }
     }
 
@@ -381,11 +363,14 @@ impl Chunk {
         #[cfg(feature = "fast_map")]
         let guard_opt = self.index.lock(hash_key);
         #[cfg(feature = "slow_map")]
-        let guard_opt = self.index.lock(&hash);
+        let guard_opt = self.index.remove(&hash);
         if let Some(guard) = guard_opt {
-            let cell_location = *guard;
-            self.put_tombstone_by_cell_loc(cell_location)?;
-            guard.remove();
+            #[cfg(feature = "fast_map")]
+            {
+                let cell_location = *guard;
+                self.put_tombstone_by_cell_loc(cell_location)?;
+                guard.remove();
+            }
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -433,10 +418,7 @@ impl Chunk {
         );
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
-        #[cfg(feature = "fast_map")]
         self.segs.insert_back(&segment_key, segment);
-        #[cfg(feature = "slow_map")]
-        self.segs.insert(segment_key, segment);
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
