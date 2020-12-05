@@ -148,7 +148,7 @@ pub async fn smoke_test_parallel() {
     const DATA: &'static str = "DATA";
     const ARRAY: &'static str = "ARRAY";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
-        .unwrap_or("4096".to_string())
+        .unwrap_or("1024".to_string())
         .parse::<u64>()
         .unwrap();
     let server_addr = String::from("127.0.0.1:5301");
@@ -156,7 +156,7 @@ pub async fn smoke_test_parallel() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 4,
-            memory_size: 4 * 1024 * 1024 * 1024,
+            memory_size: 16 * 1024 * 1024 * 1024,
             backup_storage: None,
             wal_storage: None,
             services: vec![Service::Cell],
