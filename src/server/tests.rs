@@ -142,7 +142,7 @@ pub async fn smoke_test() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 128)]
+#[tokio::test(flavor = "multi_thread")]
 pub async fn smoke_test_parallel() {
     let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
@@ -207,13 +207,13 @@ pub async fn smoke_test_parallel() {
         info!("Schduling test task {}", i);
         tasks.push(tokio::spawn(async move {
             let id = Id::new(1, i as u64);
+            let mut rng = SmallRng::from_entropy();
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
-                let mut rng = SmallRng::from_entropy();
-                // if rng.gen_range(0, 0) == 4 {
-                //     debug!("Removing i {}, j {}", i, j);
-                //     client_clone.remove_cell(id).await.unwrap().unwrap();
-                // }
+                if j > 1 && rng.gen_range(0, 8) == 4 {
+                    debug!("Removing i {}, j {}", i, j);
+                    client_clone.remove_cell(id).await.unwrap().unwrap();
+                }
                 let mut value = Value::Map(Map::new());
                 value[DATA] = Value::U64(j);
                 value[ARRAY] = (1..rng.gen_range(1, 1024)).collect::<Vec<u64>>().value();
