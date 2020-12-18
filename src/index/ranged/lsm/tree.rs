@@ -25,7 +25,7 @@ lazy_static! {
 }
 
 pub struct LSMTree {
-    trees: LevelTrees,
+    pub trees: LevelTrees,
 }
 
 impl LSMTree {
@@ -81,10 +81,12 @@ impl LSMTree {
         let mut merged = false;
         for i in 0..self.trees.len() - 1 {
             if self.trees[i].oversized() {
-                trace!("Level {} tree oversized, merging", i);
+                info!("Level {} tree oversized, merging", i);
                 self.trees[i].merge_to(i, &*self.trees[i + 1]).await;
-                trace!("Level {} merge completed", i);
+                info!("Level {} merge completed", i);
                 merged = true;
+            } else {
+                debug!("Level {} tree not oversized", i);
             }
         }
         merged

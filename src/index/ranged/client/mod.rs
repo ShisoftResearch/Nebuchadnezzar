@@ -99,6 +99,20 @@ impl RangedQueryClient {
         .await
     }
 
+    pub async fn tree_stats(&self) -> Result<Vec<LSMTreeStat>, RPCError> {
+        let mut res = vec![];
+        for tree_id in self.placement.read().values().map(|(id, _)| id) {
+            let tree_client = locate_tree_server_from_conshash(tree_id, &self.conshash).await?;
+            match tree_client.stat(*tree_id).await? {
+                OpResult::Successful(stat_res) => {
+                    res.push(stat_res);
+                },
+                _ => unreachable!(),
+            }
+        }
+        Ok(res)
+    }
+
     #[inline(always)]
     async fn run_on_destinated_tree<'a, AR, PR, A, P>(
         &'a self,

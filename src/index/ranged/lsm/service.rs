@@ -1,6 +1,7 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
 pub use super::btree::level::LEVEL_M as BLOCK_SIZE;
+use super::btree::level::NUM_LEVELS;
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
@@ -22,7 +23,7 @@ use std::time::Duration;
 pub type IdBlock = [Id; BLOCK_SIZE];
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(LSM_TREE_RPC_SERVICE) as u64;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Boundary {
     upper: EntryKey,
     lower: EntryKey,
@@ -47,18 +48,37 @@ pub struct DistLSMTree {
     prop: RwLock<DistProp>,
 }
 
-struct DistProp {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistProp {
     boundary: Boundary,
     migration: Option<Migration>,
 }
 
-struct Migration {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Migration {
     pivot: EntryKey,
 }
 
 pub struct CursorMemo {
     tree_cursor: LSMTreeCursor,
     expires: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BTreeStat {
+    pub size: usize,
+    pub count: usize, 
+    pub mid_key: Option<EntryKey>,
+    pub head: Id,
+    pub ideal_cap: usize,
+    pub oversized: bool
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LSMTreeStat {
+    pub id: Id,
+    pub prop: DistProp,
+    pub trees: Vec<BTreeStat>,
 }
 
 service! {
@@ -71,6 +91,7 @@ service! {
     rpc renew_cursor(cursor: ServCursor, time: u16) -> bool;
     rpc dispose_cursor(cursor: ServCursor) -> bool;
     rpc cursor_next(cursor: ServCursor) -> Option<IdBlock>;
+    rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
 
 pub struct LSMTreeService {
@@ -177,10 +198,34 @@ impl Service for LSMTreeService {
         )
         .boxed()
     }
+
+    fn stat(&self, id: Id) -> BoxFuture<OpResult<LSMTreeStat>> {
+        future::ready(
+            if let Some(tree) = self.trees.get(&id) {
+                OpResult::Successful(LSMTreeStat {
+                    id,
+                    prop: tree.prop.read().clone(),
+                    trees: tree.tree.trees.iter().map(|t| {
+                        BTreeStat {
+                            size: t.size(),
+                            count: t.count(), 
+                            mid_key: t.mid_key(),
+                            head: t.head_id(), 
+                            ideal_cap: t.ideal_capacity(),
+                            oversized: t.oversized()
+                        }
+                    }).collect(),
+                })
+            } else {
+                OpResult::NotFound
+            }
+        ).boxed()
+    }
 }
 
 impl LSMTreeService {
     pub fn new(client: &Arc<AsyncClient>, sm_client: &Arc<SMClient>) -> Self {
+        info!("Initializing LSM tree service");
         let trees_map = Arc::new(HashMap::with_capacity(32));
         super::btree::storage::start_external_nodes_write_back(client);
         Self::start_tree_balancer(&trees_map, client, sm_client);
@@ -208,7 +253,7 @@ impl LSMTreeService {
                     let tree = &dist_tree.tree;
                     fast_mode = fast_mode | tree.merge_levels().await;
                     if tree.oversized() {
-                        debug!("LSM Tree {:?} oversized, start migration", dist_tree.id);
+                        info!("LSM Tree {:?} oversized, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
                         let mid_key = tree.mid_key().unwrap();
                         let migration_target_id = Id::rand();

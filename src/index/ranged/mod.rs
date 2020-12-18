@@ -110,7 +110,7 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         info!("Waiting tree storage");
         storage::wait_until_updated().await;
-        info!("Total cells {}", client.count().await.unwrap());
+        info!("Total cells {}, Tree stat {:?}", client.count().await.unwrap(), index_client.tree_stats().await.unwrap());
     }
 
     fn schema() -> Schema {
