@@ -4,7 +4,7 @@ use std::fmt::Debug;
 pub fn are_keys_serial(keys: &[EntryKey]) -> bool {
     for i in 1..keys.len() {
         if keys[i - 1] >= keys[i] {
-            error!("serial check failed for key ordering");
+            error!("serial check failed for key ordering: {:?}", std::backtrace::Backtrace::capture()); 
             return false;
         }
     }

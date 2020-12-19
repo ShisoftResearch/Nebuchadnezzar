@@ -569,9 +569,9 @@ where
                     all_pages[index + 1].innode_mut().ptrs.as_slice()[right_index] =
                         mem::take(&mut ptrs[i]);
                 }
+                all_pages[index + 1].innode_mut().len = num_keys - right_keys_offset;
                 all_pages[index + 1].innode_mut().ptrs.as_slice()[num_keys] =
                     mem::take(&mut ptrs[num_keys]);
-                all_pages[index + 1].innode_mut().len = num_keys - right_keys_offset;
             } else {
                 debug!(
                     "Merge single node by eliminating left node with {} keys",

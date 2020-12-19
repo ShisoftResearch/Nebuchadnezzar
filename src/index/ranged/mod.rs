@@ -33,7 +33,7 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 32 * 1024 * 1024 * 1024, // 1G
+                memory_size: 32 * 1024 * 1024 * 1024, // G
                 backup_storage: None,
                 wal_storage: None,
                 services: vec![Service::Cell, Service::RangedIndexer],
@@ -93,7 +93,7 @@ mod tests {
         for (i, num) in nums_2.into_iter().enumerate() {
             let index_client = index_client.clone();
             futs.push(tokio::spawn(async move {
-                debug!("Seeking Id at {}, index {}", num, i);
+                trace!("Seeking Id at {}, index {}", num, i);
                 let id = Id::new(1, num as u64);
                 let key = EntryKey::from_id(&id);
                 let rt_cursor =
@@ -102,7 +102,7 @@ mod tests {
                         .unwrap()
                         .unwrap();
                 assert_eq!(id, rt_cursor.current().unwrap().0);
-                debug!("Id at {}, index {} have been checked", num, i);
+                trace!("Id at {}, index {} have been checked", num, i);
             }));
         }
         while let Some(_) = futs.next().await {}
@@ -111,6 +111,22 @@ mod tests {
         info!("Waiting tree storage");
         storage::wait_until_updated().await;
         info!("Total cells {}, Tree stat {:?}", client.count().await.unwrap(), index_client.tree_stats().await.unwrap());
+        
+        info!("Scanning forward...");
+        let mut rt_cursor =
+        client::RangedQueryClient::seek(&index_client, &EntryKey::from_id(&Id::new(1, 0)), Ordering::Forward)
+            .await
+            .unwrap()
+            .unwrap();
+        for num in 0..test_capacity {
+            let id = Id::new(1, num as u64);
+            let current = rt_cursor.current().unwrap().0;
+            assert_eq!(id, current);
+            let _ = rt_cursor.next().await.unwrap();
+        }
+        assert!(rt_cursor.next().await.unwrap().is_none());
+        info!("Total cells {}, Tree stat {:?}", client.count().await.unwrap(), index_client.tree_stats().await.unwrap());
+
     }
 
     fn schema() -> Schema {

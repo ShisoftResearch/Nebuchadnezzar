@@ -28,7 +28,7 @@ where
             current: None,
         };
         if let Some(right_node) = node.key_at_right_node(key) {
-            debug!("Search found a node at the right side");
+            trace!("Search found a node at the right side");
             return Err(right_node.clone());
         }
         let mut pos = match node.search_unwindable(key) {
@@ -40,7 +40,7 @@ where
         };
         match node {
             &NodeData::External(ref n) => {
-                debug!(
+                trace!(
                     "search in external for {:?}, len {}, ordering {:?}, content: {:?}",
                     key,
                     n.len,
@@ -48,16 +48,16 @@ where
                     &n.keys.as_slice_immute()[..n.len]
                 );
                 if ordering == Ordering::Backward {
-                    debug!("found cursor pos {} for backwards, will be corrected", pos);
+                    trace!("found cursor pos {} for backwards, will be corrected", pos);
                     if pos > 0 && (pos >= n.len || &n.keys.as_slice_immute()[pos] != key) {
                         pos -= 1;
                     }
-                    debug!("cursor pos have been corrected to {}", pos);
+                    trace!("cursor pos have been corrected to {}", pos);
                 }
                 Ok(RTCursor::new(pos, node_ref, ordering, deleted))
             }
             &NodeData::Internal(ref n) => {
-                debug!(
+                trace!(
                     "search in internal node for {:?}, len {}, pos {}",
                     key, n.len, pos
                 );

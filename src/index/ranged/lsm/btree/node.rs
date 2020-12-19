@@ -183,10 +183,10 @@ where
         }
     }
     pub fn key_at_right_node(&self, key: &EntryKey) -> Option<&NodeCellRef> {
-        if self.is_empty() || self.len() > 0 && self.right_bound() <= key {
+        if self.is_empty() || (self.len() > 0 && self.right_bound() <= key) {
             let right_node = read_unchecked::<KS, PS>(self.right_ref().unwrap());
             if !right_node.is_none()
-                && (self.is_empty() || right_node.len() > 0 && right_node.first_key() <= key)
+                && (self.is_empty() || (right_node.len() > 0 && right_node.first_key() <= key))
             {
                 trace!(
                     "found key to put to right page {:?}/{:?}",

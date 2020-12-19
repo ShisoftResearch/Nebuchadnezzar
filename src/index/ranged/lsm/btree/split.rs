@@ -9,7 +9,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Searching for mid key for split");
+    trace!("Searching for mid key for split");
     enum R {
         Result(Option<EntryKey>),
         SubSearch(NodeCellRef),

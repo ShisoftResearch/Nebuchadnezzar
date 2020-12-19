@@ -41,7 +41,7 @@ where
                 cursor.current = Self::read_current(page, pos);
             }
         }
-        debug!(
+        trace!(
             "Created cursor with pos {}, current {:?}, ordering: {:?}",
             cursor.index, cursor.current, cursor.ordering
         );

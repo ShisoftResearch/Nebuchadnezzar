@@ -77,6 +77,7 @@ impl ClientCursor {
                         *self = new_cursor;
                         continue;
                     } else {
+                        // No replacement, set self empty
                         return Ok(None);
                     }
                 }

@@ -86,7 +86,7 @@ impl LSMTree {
                 info!("Level {} merge completed", i);
                 merged = true;
             } else {
-                debug!("Level {} tree not oversized", i);
+               trace!("Level {} tree not oversized", i);
             }
         }
         merged

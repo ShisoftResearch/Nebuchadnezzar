@@ -2,6 +2,7 @@
 #![feature(box_syntax)]
 #![feature(test)]
 #![feature(async_closure)]
+#![feature(backtrace)]
 
 extern crate static_assertions;
 #[macro_use]
