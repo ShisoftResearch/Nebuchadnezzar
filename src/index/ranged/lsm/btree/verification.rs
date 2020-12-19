@@ -156,7 +156,13 @@ where
     let first_node = write_node::<KS, PS>(&node);
     first_node
         .left_ref()
-        .map(|lr| debug_assert!(lr.is_default()));
+        .map(|lr| debug_assert!(
+            lr.is_default(), 
+            "Left node of first node is not default, {:?}, left node type {:?}, ref {:?}", 
+            first_node.ext_id(),
+            read_unchecked::<KS, PS>(lr).type_name(), 
+            lr
+        ));
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None,

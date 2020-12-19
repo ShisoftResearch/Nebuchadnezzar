@@ -82,7 +82,10 @@ where
         "{}",
         left_most_leaf_guards.first().unwrap().type_name()
     );
-
+    debug_assert!(
+        read_unchecked::<KS, PS>(left_most_leaf_guards.first().unwrap().left_ref().unwrap()).is_none(),
+        "Left node of the first node must be NONE before merge"
+    );
     // merge to dest_tree
     {
         let deleted_keys = &src_tree.deleted;
@@ -162,7 +165,7 @@ where
             "New first node right is {:?}",
             read_unchecked::<KS, PS>(&new_first_node_ext.next).ext_id()
         );
-
+        debug!("Reset left most id to {:?}", new_first_node_ext.id);
         new_first_node_ext.id = src_tree.head_page_id;
         new_first_node_ext.prev = NodeCellRef::default();
         debug_assert!(&new_first_node_ext.right_bound > &prune_bound);

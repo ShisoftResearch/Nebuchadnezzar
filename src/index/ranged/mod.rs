@@ -101,7 +101,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                assert_eq!(id, rt_cursor.current().unwrap().0);
+                assert_eq!(id, rt_cursor.current().unwrap().0, "at {}", i );
                 trace!("Id at {}, index {} have been checked", num, i);
             }));
         }
