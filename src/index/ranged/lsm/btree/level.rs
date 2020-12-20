@@ -32,7 +32,7 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            let nodes = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            let (mut nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary);
             // Collect keys to merge
             let all_keys = nodes.iter().map(|n| n.keys()).flatten().cloned().collect_vec();
             let mut deleted_keys = Vec::with_capacity(all_keys.len());
@@ -51,18 +51,18 @@ where
             for dk in deleted_keys { src_tree.deleted.remove(dk); }
             let first_node_id = nodes[0].extnode().id;
             // Cut tree in external level
-            let mut new_first_node = clear_nodes(nodes);
+            clear_nodes(&mut nodes);
             // Reset first node. We don't want to update the tree head id so we will reuse the id
-            let ext_node = new_first_node.extnode_mut(src_tree);
-            ext_node.prev = Default::default();
+            let ext_node = new_first.extnode_mut(src_tree);
             ext_node.id = first_node_id;
+            ext_node.prev = Default::default();
             return num_keys_merging;
         }
         MutSearchResult::Internal(sub_node) => {
             let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
             if level > 0 {
-                let nodes = select_nodes_in_boundary::<KS, PS>(node, boundary);
-                clear_nodes(nodes);
+                let (mut nodes, _) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+                clear_nodes(&mut nodes);
             } else {
                 let mut node = write_node::<KS, PS>(node);
                 debug_assert!(node.right_ref().unwrap().is_default()); // Ensure the root is still the root, not splitted
@@ -88,34 +88,23 @@ where
     }
 }
 
-fn clear_nodes<KS, PS>(nodes: Vec<NodeWriteGuard<KS, PS>>) -> NodeWriteGuard<KS, PS> 
+fn clear_nodes<KS, PS>(nodes: &mut Vec<NodeWriteGuard<KS, PS>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let num_nodes = nodes.len();
-    let mut right_node = None;
-    for (i, mut node) in nodes.into_iter().enumerate() {
-        if i == num_nodes {
-            right_node = Some(write_node(node.right_ref().unwrap()));
-        };
+    for node in nodes.iter_mut() {
         node.make_empty_node(false);
     }
-    right_node.unwrap()
 }
 
-fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &EntryKey) -> Vec<NodeWriteGuard<KS, PS>>
+fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &EntryKey) -> (Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>)
  where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     trace!("Acquiring first node");
     let first_node = write_node(first_node);
-    assert!(
-        read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).is_none(),
-        "Left most is not none, have {}",
-        read_unchecked::<KS, PS>(first_node.left_ref().unwrap()).type_name()
-    );
     let mut next_node = write_node(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
@@ -124,11 +113,10 @@ fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &E
         let next_right = write_node(next_node.right_ref().unwrap());
         collected.push(next_node);
         next_node = next_right;
-        if next_node.first_key() < right_boundary {
-            break;
+        if next_node.first_key() >= right_boundary {
+            return (collected, next_node)
         }
     }
-    collected
 }
 
 fn select_boundary_from_root<KS, PS>(root: &NodeCellRef) -> EntryKey 
@@ -160,6 +148,8 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Merging LSM tree level {}", level);
+    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+    debug_assert!(verification::is_tree_in_order(&src_tree, level));
     let root = src_tree.get_root();
     let key_boundary = select_boundary_from_root::<KS, PS>(&root);
     let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
