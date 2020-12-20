@@ -1,4 +1,3 @@
-use super::dump::dump_tree;
 use super::node::read_unchecked;
 use super::node::write_node;
 use super::node::NodeWriteGuard;
@@ -6,10 +5,9 @@ use super::search::MutSearchResult;
 use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
-use super::{external, BPlusTree};
+use super::BPlusTree;
 use itertools::Itertools;
 use std::fmt::Debug;
-use std::sync::atomic::Ordering::Relaxed;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
 pub const LEVEL_TREE_DEPTH: u32 = 2;
