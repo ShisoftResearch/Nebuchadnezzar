@@ -190,7 +190,10 @@ where
             let new_root_len = root_new_pages.len();
             debug_assert!(
                 new_root_len + 1 < KS::slice_len(),
-                "Radical merge split, cannot handle this for now (need to split more than once)"
+                "Radical merge split, cannot handle this for now (need to split more than once), {} to {}, num keys {}", 
+                new_root_len + 1,
+                KS::slice_len(),
+                keys_len
             );
             let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(new_root_len, max_entry_key());
             new_in_root.ptrs.as_slice()[0] = root.clone();
