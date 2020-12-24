@@ -131,7 +131,11 @@ impl CompactCleaner {
                         chunk.mark_dead_entry_with_seg(new_addr, &new_seg);
                     }
                 } else {
-                    trace!("Cell {:?} address {} have been remove during compact", entry.content, old_addr);
+                    trace!(
+                        "Cell {:?} address {} have been remove during compact",
+                        entry.content,
+                        old_addr
+                    );
                     let _ = chunk.put_tombstone_by_cell_loc(new_addr);
                 }
             });

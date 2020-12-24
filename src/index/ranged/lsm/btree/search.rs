@@ -59,7 +59,9 @@ where
             &NodeData::Internal(ref n) => {
                 trace!(
                     "search in internal node for {:?}, len {}, pos {}",
-                    key, n.len, pos
+                    key,
+                    n.len,
+                    pos
                 );
                 let next_node_ref = &n.ptrs.as_slice_immute()[pos];
                 debug_assert!(pos <= n.len);
@@ -77,10 +79,7 @@ pub enum MutSearchResult {
     Internal(NodeCellRef),
 }
 
-pub fn mut_search<KS, PS>(
-    node_ref: &NodeCellRef, 
-    key: &EntryKey
-) -> MutSearchResult
+pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> MutSearchResult
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

@@ -4,7 +4,10 @@ use std::fmt::Debug;
 pub fn are_keys_serial(keys: &[EntryKey]) -> bool {
     for i in 1..keys.len() {
         if keys[i - 1] >= keys[i] {
-            error!("serial check failed for key ordering: {:?}", std::backtrace::Backtrace::capture()); 
+            error!(
+                "serial check failed for key ordering: {:?}",
+                std::backtrace::Backtrace::capture()
+            );
             return false;
         }
     }
@@ -154,15 +157,15 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let first_node = write_node::<KS, PS>(&node);
-    first_node
-        .left_ref()
-        .map(|lr| debug_assert!(
-            lr.is_default(), 
-            "Left node of first node is not default, {:?}, left node type {:?}, ref {:?}", 
+    first_node.left_ref().map(|lr| {
+        debug_assert!(
+            lr.is_default(),
+            "Left node of first node is not default, {:?}, left node type {:?}, ref {:?}",
             first_node.ext_id(),
-            read_unchecked::<KS, PS>(lr).type_name(), 
+            read_unchecked::<KS, PS>(lr).type_name(),
             lr
-        ));
+        )
+    });
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None,

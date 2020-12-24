@@ -47,8 +47,11 @@ pub fn merge_into_internal_guard<KS, PS>(
     }
 }
 
-pub fn new_internal_node<KS, PS>(left_most: &NodeCellRef, new_pages: &mut Box<Vec<(EntryKey, NodeCellRef)>>) -> NodeCellRef
- where
+pub fn new_internal_node<KS, PS>(
+    left_most: &NodeCellRef,
+    new_pages: &mut Box<Vec<(EntryKey, NodeCellRef)>>,
+) -> NodeCellRef
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {

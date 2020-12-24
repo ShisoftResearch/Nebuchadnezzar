@@ -138,8 +138,9 @@ impl Chunk {
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_opt =
-                            self.allocator.alloc_seg(&self.backup_storage, &self.wal_storage);
+                        let new_seg_opt = self
+                            .allocator
+                            .alloc_seg(&self.backup_storage, &self.wal_storage);
                         let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
@@ -171,7 +172,10 @@ impl Chunk {
                 if hash == 0 {
                     Err(ReadError::CellIdIsUnitId)
                 } else {
-                    trace!("Cannot find cell with hash {} for it is not in the map", hash);
+                    trace!(
+                        "Cannot find cell with hash {} for it is not in the map",
+                        hash
+                    );
                     Err(ReadError::CellDoesNotExisted)
                 }
             }

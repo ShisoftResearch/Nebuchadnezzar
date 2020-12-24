@@ -101,7 +101,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                assert_eq!(id, rt_cursor.current().unwrap().0, "at {}", i );
+                assert_eq!(id, rt_cursor.current().unwrap().0, "at {}", i);
                 trace!("Id at {}, index {} have been checked", num, i);
             }));
         }
@@ -110,14 +110,21 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(10)).await;
         info!("Waiting tree storage");
         storage::wait_until_updated().await;
-        info!("Total cells {}, Tree stat {:?}", client.count().await.unwrap(), index_client.tree_stats().await.unwrap());
-        
+        info!(
+            "Total cells {}, Tree stat {:?}",
+            client.count().await.unwrap(),
+            index_client.tree_stats().await.unwrap()
+        );
+
         info!("Scanning forward...");
-        let mut rt_cursor =
-        client::RangedQueryClient::seek(&index_client, &EntryKey::from_id(&Id::new(1, 0)), Ordering::Forward)
-            .await
-            .unwrap()
-            .unwrap();
+        let mut rt_cursor = client::RangedQueryClient::seek(
+            &index_client,
+            &EntryKey::from_id(&Id::new(1, 0)),
+            Ordering::Forward,
+        )
+        .await
+        .unwrap()
+        .unwrap();
         for num in 0..test_capacity {
             let id = Id::new(1, num as u64);
             let current = rt_cursor.current().unwrap().0;
@@ -125,8 +132,11 @@ mod tests {
             let _ = rt_cursor.next().await.unwrap();
         }
         assert!(rt_cursor.next().await.unwrap().is_none());
-        info!("Total cells {}, Tree stat {:?}", client.count().await.unwrap(), index_client.tree_stats().await.unwrap());
-
+        info!(
+            "Total cells {}, Tree stat {:?}",
+            client.count().await.unwrap(),
+            index_client.tree_stats().await.unwrap()
+        );
     }
 
     fn schema() -> Schema {

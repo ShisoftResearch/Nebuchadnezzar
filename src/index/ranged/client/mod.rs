@@ -106,7 +106,7 @@ impl RangedQueryClient {
             match tree_client.stat(*tree_id).await? {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
-                },
+                }
                 _ => unreachable!(),
             }
         }

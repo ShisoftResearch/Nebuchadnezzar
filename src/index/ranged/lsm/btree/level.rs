@@ -2,10 +2,10 @@ use super::node::read_unchecked;
 use super::node::write_node;
 use super::node::NodeWriteGuard;
 use super::search::MutSearchResult;
+use super::BPlusTree;
 use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
-use super::BPlusTree;
 use itertools::Itertools;
 use std::fmt::Debug;
 
@@ -23,7 +23,7 @@ fn merge_prune<KS, PS>(
     node: &NodeCellRef,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
-    boundary: &EntryKey
+    boundary: &EntryKey,
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -33,9 +33,18 @@ where
     match search {
         MutSearchResult::External => {
             let (mut nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary);
-            debug_assert!(!nodes.is_empty(), "Cannot find any keys in range in external with boundary {:?}", boundary);
+            debug_assert!(
+                !nodes.is_empty(),
+                "Cannot find any keys in range in external with boundary {:?}",
+                boundary
+            );
             // Collect keys to merge
-            let all_keys = nodes.iter().map(|n| n.keys()).flatten().cloned().collect_vec();
+            let all_keys = nodes
+                .iter()
+                .map(|n| n.keys())
+                .flatten()
+                .cloned()
+                .collect_vec();
             let mut deleted_keys = Vec::with_capacity(all_keys.len());
             let mut merging_keys = Vec::with_capacity(all_keys.len());
             all_keys.iter().for_each(|k| {
@@ -49,7 +58,9 @@ where
             // Merging with destination tree
             dest_tree.merge_with_keys(box merging_keys);
             // Update delete set in source
-            for dk in deleted_keys { src_tree.deleted.remove(dk); }
+            for dk in deleted_keys {
+                src_tree.deleted.remove(dk);
+            }
             let first_node_id = nodes[0].extnode().id;
             // Cut tree in external level
             clear_nodes(&mut nodes, new_first.node_ref());
@@ -63,7 +74,7 @@ where
             let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
             let (mut nodes, right_node) = select_nodes_in_boundary::<KS, PS>(node, boundary);
             if !nodes.is_empty() {
-                clear_nodes(&mut nodes, right_node.node_ref()); 
+                clear_nodes(&mut nodes, right_node.node_ref());
             } else {
                 // The boundary does nott covered the first node in this level
                 // Need to partially remove the node keys and ptrs
@@ -85,7 +96,7 @@ where
                         root_innode.keys = new_keys;
                         root_innode.ptrs = new_ptrs;
                         root_innode.len = num_keys;
-                    },
+                    }
                     Err(id) => {
                         assert_eq!(id, 0);
                     }
@@ -107,8 +118,11 @@ where
     }
 }
 
-fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &EntryKey) -> (Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>)
- where
+fn select_nodes_in_boundary<KS, PS>(
+    first_node: &NodeCellRef,
+    right_boundary: &EntryKey,
+) -> (Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>)
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
@@ -126,12 +140,12 @@ fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &E
         collected.push(next_node);
         next_node = next_right;
         if next_node.first_key() >= right_boundary {
-            return (collected, next_node)
+            return (collected, next_node);
         }
     }
 }
 
-fn select_boundary<KS, PS>(node: &NodeCellRef) -> EntryKey 
+fn select_boundary<KS, PS>(node: &NodeCellRef) -> EntryKey
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -143,13 +157,13 @@ where
             return select_boundary::<KS, PS>(&node.ptrs()[0]);
         }
         // Pick half of the keys in the root
-        // Genreally, higher level sub tree in LSM tree will select more keys to merged 
+        // Genreally, higher level sub tree in LSM tree will select more keys to merged
         // into next level
         let mid_idx = node_len / 2;
         // Return the mid key as the boundary for selection (cut)
         node_keys[mid_idx].clone()
     })
-} 
+}
 
 pub async fn level_merge<KS, PS>(
     level: usize,
@@ -165,7 +179,10 @@ where
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     let root = src_tree.get_root();
     let key_boundary = select_boundary::<KS, PS>(&root);
-    debug!("Level merge level {} with boundary {:?}", level, key_boundary);
+    debug!(
+        "Level merge level {} with boundary {:?}",
+        level, key_boundary
+    );
     let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));

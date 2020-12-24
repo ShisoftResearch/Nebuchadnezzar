@@ -204,7 +204,7 @@ where
                 // The root is still intact and does not need to be splitted
                 // Nothing need to do here
             } else {
-                // In the current root level we have more than one root, should generate new levels 
+                // In the current root level we have more than one root, should generate new levels
                 loop {
                     // Need generate and rearrange new pages
                     // First, generate a innode with one key and two pointers
@@ -212,7 +212,11 @@ where
                     let new_node_ref = new_internal_node::<KS, PS>(&left_most_page, &mut new_pages);
                     let mut this_level_new_pages = vec![];
                     if !new_pages.is_empty() {
-                        merge_into_internal::<KS, PS>(&new_node_ref, new_pages, &mut this_level_new_pages);
+                        merge_into_internal::<KS, PS>(
+                            &new_node_ref,
+                            new_pages,
+                            &mut this_level_new_pages,
+                        );
                     }
                     if this_level_new_pages.is_empty() {
                         // All sub pages merged into the new page, should set the page as root and break
