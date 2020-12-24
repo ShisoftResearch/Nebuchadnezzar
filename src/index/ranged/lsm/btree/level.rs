@@ -52,7 +52,7 @@ where
             for dk in deleted_keys { src_tree.deleted.remove(dk); }
             let first_node_id = nodes[0].extnode().id;
             // Cut tree in external level
-            clear_nodes(&mut nodes);
+            clear_nodes(&mut nodes, new_first.node_ref());
             // Reset first node. We don't want to update the tree head id so we will reuse the id
             let ext_node = new_first.extnode_mut(src_tree);
             ext_node.id = first_node_id;
@@ -63,7 +63,7 @@ where
             let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
             let (mut nodes, right_node) = select_nodes_in_boundary::<KS, PS>(node, boundary);
             if !nodes.is_empty() {
-                clear_nodes(&mut nodes);
+                clear_nodes(&mut nodes, right_node.node_ref()); 
             } else {
                 // The boundary does nott covered the first node in this level
                 // Need to partially remove the node keys and ptrs
@@ -96,13 +96,14 @@ where
     }
 }
 
-fn clear_nodes<KS, PS>(nodes: &mut Vec<NodeWriteGuard<KS, PS>>)
+fn clear_nodes<KS, PS>(nodes: &mut Vec<NodeWriteGuard<KS, PS>>, right_ref: &NodeCellRef)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     for node in nodes.iter_mut() {
         node.make_empty_node(false);
+        *node.right_ref_mut().unwrap() = right_ref.clone()
     }
 }
 

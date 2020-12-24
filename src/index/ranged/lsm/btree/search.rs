@@ -77,28 +77,40 @@ pub enum MutSearchResult {
     Internal(NodeCellRef),
 }
 
-pub fn mut_search<KS, PS>(node_ref: &NodeCellRef, key: &EntryKey) -> MutSearchResult
+pub fn mut_search<KS, PS>(
+    node_ref: &NodeCellRef, 
+    key: &EntryKey
+) -> MutSearchResult
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let res = read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
-        &NodeData::Internal(ref n) => {
-            let pos = match n.search_unwindable(key) {
-                Ok(pos) => pos,
-                Err(_) => {
-                    warn!("Search paniced in mut_search, expecting retry");
-                    return Err(node_ref.clone());
-                }
-            };
-            let sub_node = n.ptrs.as_slice_immute()[pos].clone();
-            Ok(MutSearchResult::Internal(sub_node))
+    let mut other_ref;
+    let mut node_ref = node_ref;
+    loop {
+        match read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
+            &NodeData::Internal(ref n) => {
+                let pos = match n.search_unwindable(key) {
+                    Ok(pos) => pos,
+                    Err(_) => {
+                        warn!("Search paniced in mut_search, expecting retry");
+                        return Err(node_ref.clone());
+                    }
+                };
+                let sub_node = n.ptrs.as_slice_immute()[pos].clone();
+                Ok(MutSearchResult::Internal(sub_node))
+            }
+            &NodeData::External(_) => Ok(MutSearchResult::External),
+            &NodeData::Empty(ref n) => Err(n.right.clone()),
+            &NodeData::None => unreachable!(),
+        }) {
+            Ok(res) => return res,
+            Err(e) => {
+                other_ref = e;
+                node_ref = &other_ref;
+            }
         }
-        &NodeData::External(_) => Ok(MutSearchResult::External),
-        &NodeData::Empty(ref n) => Err(n.right.clone()),
-        &NodeData::None => unreachable!(),
-    });
-    res.unwrap_or_else(|e| mut_search::<KS, PS>(&e, key))
+    }
 }
 
 pub fn mut_first<KS, PS>(node_ref: &NodeCellRef) -> MutSearchResult
