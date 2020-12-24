@@ -8,7 +8,7 @@ use super::*;
 use itertools::Itertools;
 use std::fmt::Debug;
 
-fn merge_into_internal<KS, PS>(
+pub fn merge_into_internal<KS, PS>(
     node: &NodeCellRef,
     lower_level_new_pages: Box<Vec<(EntryKey, NodeCellRef)>>,
     new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
@@ -16,7 +16,18 @@ fn merge_into_internal<KS, PS>(
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let mut node_guard = write_node::<KS, PS>(node);
+    let node_guard = write_node::<KS, PS>(node);
+    merge_into_internal_guard(node_guard, lower_level_new_pages, new_pages)
+}
+
+pub fn merge_into_internal_guard<KS, PS>(
+    mut node_guard: NodeWriteGuard<KS, PS>,
+    lower_level_new_pages: Box<Vec<(EntryKey, NodeCellRef)>>,
+    new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
+) where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
     for (pivot, node) in lower_level_new_pages.into_iter() {
         let mut target_guard = write_targeted(node_guard, &pivot);
         {
@@ -34,6 +45,23 @@ fn merge_into_internal<KS, PS>(
         }
         node_guard = target_guard;
     }
+}
+
+pub fn new_internal_node<KS, PS>(left_most: &NodeCellRef, new_pages: &mut Box<Vec<(EntryKey, NodeCellRef)>>) -> NodeCellRef
+ where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    let mut new_keys = KS::init();
+    let mut new_ptrs = PS::init();
+    let (first_key, first_ptr) = new_pages.remove(0);
+    new_ptrs.as_slice()[0] = left_most.clone();
+    new_ptrs.as_slice()[1] = first_ptr;
+    new_keys.as_slice()[0] = first_key;
+    let mut new_innode = InNode::<KS, PS>::new(1, EntryKey::max());
+    new_innode.keys = new_keys;
+    new_innode.ptrs = new_ptrs;
+    NodeCellRef::new(Node::with_internal(new_innode))
 }
 
 fn debug_check_serialized(keys: &Vec<EntryKey>) {

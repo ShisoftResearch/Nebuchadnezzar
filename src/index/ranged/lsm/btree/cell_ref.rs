@@ -159,3 +159,9 @@ impl Default for NodeCellRef {
         }
     }
 }
+
+impl PartialEq for NodeCellRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.address() == other.address()
+    }
+}

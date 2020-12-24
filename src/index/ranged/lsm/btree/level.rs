@@ -33,6 +33,7 @@ where
     match search {
         MutSearchResult::External => {
             let (mut nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            debug_assert!(!nodes.is_empty(), "Cannot find any keys in range in external with boundary {:?}", boundary);
             // Collect keys to merge
             let all_keys = nodes.iter().map(|n| n.keys()).flatten().cloned().collect_vec();
             let mut deleted_keys = Vec::with_capacity(all_keys.len());
@@ -60,28 +61,35 @@ where
         }
         MutSearchResult::Internal(sub_node) => {
             let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
-            if level > 0 {
-                let (mut nodes, _) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            let (mut nodes, right_node) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            if !nodes.is_empty() {
                 clear_nodes(&mut nodes);
             } else {
-                let mut node = write_node::<KS, PS>(node);
-                debug_assert!(node.right_ref().unwrap().is_default()); // Ensure the root is still the root, not splitted
-                // Find the boundary in the root and remove all keys and ptrs to there
-                let bound_id = node.keys().binary_search(boundary).unwrap();
-                let mut new_keys = KS::init();
-                let mut new_ptrs = PS::init();
-                let mut num_keys = 0;
-                for (i, k) in node.keys()[bound_id + 1..].iter().enumerate() {
-                    new_keys.as_slice()[i] = k.clone();
-                    num_keys += 1;
+                // The boundary does nott covered the first node in this level
+                // Need to partially remove the node keys and ptrs
+                let mut node = right_node;
+                // Find the boundary in the node and remove all keys and ptrs to there
+                match node.keys().binary_search(boundary) {
+                    Ok(bound_id) => {
+                        let mut new_keys = KS::init();
+                        let mut new_ptrs = PS::init();
+                        let mut num_keys = 0;
+                        for (i, k) in node.keys()[bound_id + 1..].iter().enumerate() {
+                            new_keys.as_slice()[i] = k.clone();
+                            num_keys += 1;
+                        }
+                        for (i, p) in node.ptrs()[bound_id + 1..].iter().enumerate() {
+                            new_ptrs.as_slice()[i] = p.clone();
+                        }
+                        let root_innode = node.innode_mut();
+                        root_innode.keys = new_keys;
+                        root_innode.ptrs = new_ptrs;
+                        root_innode.len = num_keys;
+                    },
+                    Err(id) => {
+                        assert_eq!(id, 0);
+                    }
                 }
-                for (i, p) in node.ptrs()[bound_id + 1..].iter().enumerate() {
-                    new_ptrs.as_slice()[i] = p.clone();
-                }
-                let root_innode = node.innode_mut();
-                root_innode.keys = new_keys;
-                root_innode.ptrs = new_ptrs;
-                root_innode.len = num_keys;
             }
             return num_keys_merged;
         }
@@ -103,8 +111,11 @@ fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &E
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    let first_node = write_node::<KS, PS>(first_node);
+    if first_node.right_bound() > right_boundary {
+        return (vec![], first_node);
+    }
     trace!("Acquiring first node");
-    let first_node = write_node(first_node);
     let mut next_node = write_node(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
@@ -119,16 +130,17 @@ fn select_nodes_in_boundary<KS, PS>(first_node: &NodeCellRef, right_boundary: &E
     }
 }
 
-fn select_boundary_from_root<KS, PS>(root: &NodeCellRef) -> EntryKey 
+fn select_boundary<KS, PS>(node: &NodeCellRef) -> EntryKey 
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    read_node(root, |root_node: &NodeReadHandler<KS, PS>| {
-        debug_assert!(root_node.is_internal()); // It should be but not mandatory
-        let node_keys = root_node.keys();
+    read_node(node, |node: &NodeReadHandler<KS, PS>| {
+        let node_keys = node.keys();
         let node_len = node_keys.len();
-        debug_assert!(node_len > 2); // Must have enough keys in the root
+        if node.len() < 2 {
+            return select_boundary::<KS, PS>(&node.ptrs()[0]);
+        }
         // Pick half of the keys in the root
         // Genreally, higher level sub tree in LSM tree will select more keys to merged 
         // into next level
@@ -151,7 +163,8 @@ where
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     let root = src_tree.get_root();
-    let key_boundary = select_boundary_from_root::<KS, PS>(&root);
+    let key_boundary = select_boundary::<KS, PS>(&root);
+    debug!("Level merge level {} with boundary {:?}", level, key_boundary);
     let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
