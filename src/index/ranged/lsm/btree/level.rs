@@ -1,4 +1,4 @@
-use super::node::read_unchecked;
+use super::cell_ref::{perform_lazy_free, prepare_lazy_free};
 use super::node::write_node;
 use super::node::NodeWriteGuard;
 use super::search::MutSearchResult;
@@ -18,6 +18,8 @@ pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
 pub const NUM_LEVELS: usize = 3;
 
+
+// NEVER MAKE THIS ASYNC
 fn merge_prune<KS, PS>(
     level: usize,
     node: &NodeCellRef,
@@ -183,7 +185,9 @@ where
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
+    prepare_lazy_free();
     let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
+    perform_lazy_free();
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     debug!("Merge and pruned level {}, waiting for storage", level);

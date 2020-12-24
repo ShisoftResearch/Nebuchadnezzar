@@ -2,6 +2,7 @@ use super::*;
 use futures::prelude::*;
 use futures::FutureExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::RefCell;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
@@ -11,6 +12,10 @@ lazy_static! {
     pub static ref DEFAULT_NODE: DefaultNodeType = Node::new(NodeData::None);
     pub static ref DEFAULT_NODE_DATA: NodeData<DefaultKeySliceType, DefaultPtrSliceType> =
         NodeData::None;
+}
+
+thread_local! {
+    static LAZY_FREE_LIST: RefCell<Option<Vec<Box<NodeRefInner<dyn AnyNode>>>>> = RefCell::new(None);
 }
 
 #[derive(Debug)]
@@ -123,6 +128,25 @@ impl NodeCellRef {
     pub fn ptr_eq(&self, other: &Self) -> bool {
         self.inner == other.inner
     }
+
+    pub fn num_references(&self) -> usize {
+        unsafe {
+            self.inner.as_ref().unwrap().counter.load(Ordering::Acquire)
+        }
+    }
+}
+
+pub fn prepare_lazy_free() {
+    LAZY_FREE_LIST.with(|list| {
+        *list.borrow_mut() = Some(vec![]);
+    })
+}
+
+pub fn perform_lazy_free() {
+    LAZY_FREE_LIST.with(|list| {
+        // This will drop everyhing in the list and free them
+        *list.borrow_mut() = None;
+    })
 }
 
 impl Clone for NodeCellRef {
@@ -130,7 +154,7 @@ impl Clone for NodeCellRef {
         if !self.is_default() {
             unsafe {
                 let inner = self.inner.as_ref().unwrap();
-                inner.counter.fetch_add(1, Ordering::Relaxed);
+                inner.counter.fetch_add(1, Ordering::AcqRel);
                 return NodeCellRef { inner: self.inner };
             }
         }
@@ -143,9 +167,14 @@ impl Drop for NodeCellRef {
         if !self.is_default() {
             unsafe {
                 let inner = self.inner.as_ref().unwrap();
-                let c = inner.counter.fetch_sub(1, Ordering::Relaxed);
+                let c = inner.counter.fetch_sub(1, Ordering::AcqRel);
                 if c == 1 {
-                    Box::from_raw(self.inner);
+                    let content = Box::from_raw(self.inner);
+                    LAZY_FREE_LIST.with(|list| {
+                        if let Some(lazy_free_container) = &mut*list.borrow_mut() {
+                            lazy_free_container.push(content);
+                        }
+                    });
                 }
             }
         }
