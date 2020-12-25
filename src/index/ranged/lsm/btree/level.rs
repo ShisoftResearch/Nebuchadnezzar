@@ -1,4 +1,3 @@
-use super::cell_ref::{perform_lazy_free, prepare_lazy_free};
 use super::node::write_node;
 use super::node::NodeWriteGuard;
 use super::search::MutSearchResult;
@@ -116,7 +115,8 @@ where
 {
     for node in nodes.iter_mut() {
         node.make_empty_node(false);
-        *node.right_ref_mut().unwrap() = right_ref.clone()
+        *node.right_ref_mut().unwrap() = right_ref.clone();
+        node.left_ref_mut().map(|r| *r = Default::default());
     }
 }
 
@@ -185,9 +185,7 @@ where
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
-    prepare_lazy_free();
     let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
-    perform_lazy_free();
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     debug!("Merge and pruned level {}, waiting for storage", level);

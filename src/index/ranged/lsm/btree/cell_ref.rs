@@ -14,10 +14,6 @@ lazy_static! {
         NodeData::None;
 }
 
-thread_local! {
-    static LAZY_FREE_LIST: RefCell<Option<Vec<Box<NodeRefInner<dyn AnyNode>>>>> = RefCell::new(None);
-}
-
 #[derive(Debug)]
 pub struct NodeCellRef {
     inner: *mut NodeRefInner<dyn AnyNode>,
@@ -136,19 +132,6 @@ impl NodeCellRef {
     }
 }
 
-pub fn prepare_lazy_free() {
-    LAZY_FREE_LIST.with(|list| {
-        *list.borrow_mut() = Some(vec![]);
-    })
-}
-
-pub fn perform_lazy_free() {
-    LAZY_FREE_LIST.with(|list| {
-        // This will drop everyhing in the list and free them
-        *list.borrow_mut() = None;
-    })
-}
-
 impl Clone for NodeCellRef {
     fn clone(&self) -> Self {
         if !self.is_default() {
@@ -169,12 +152,7 @@ impl Drop for NodeCellRef {
                 let inner = self.inner.as_ref().unwrap();
                 let c = inner.counter.fetch_sub(1, Ordering::AcqRel);
                 if c == 1 {
-                    let content = Box::from_raw(self.inner);
-                    LAZY_FREE_LIST.with(|list| {
-                        if let Some(lazy_free_container) = &mut*list.borrow_mut() {
-                            lazy_free_container.push(content);
-                        }
-                    });
+                    Box::from_raw(self.inner);
                 }
             }
         }
