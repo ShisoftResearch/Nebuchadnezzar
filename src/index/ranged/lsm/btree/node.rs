@@ -2,8 +2,7 @@ use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
 use std::ptr;
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::Ordering::Release;
+use std::sync::atomic::Ordering::{Release, Acquire, AcqRel};
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -353,7 +352,7 @@ where
     }
 
     pub fn version(&self) -> usize {
-        node_version(self.cc.load(SeqCst))
+        node_version(self.cc.load(Acquire))
     }
 }
 
@@ -379,19 +378,16 @@ where
     let cc = &node_deref.cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
-        let cc_num = cc.load(Relaxed);
+        let cc_num = cc.load(Acquire);
         let expected = cc_num & (!LATCH_FLAG);
         debug_assert_eq!(expected & LATCH_FLAG, 0);
-        match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
-            Ok(num) if num == expected => {
-                return NodeWriteGuard {
-                    data: node_deref.data.get(),
-                    cc: &node_deref.cc as *const AtomicUsize,
-                    version: node_version(cc_num),
-                    node_ref: node.clone(),
-                };
-            }
-            _ => {}
+        if cc.compare_and_swap(expected, cc_num | LATCH_FLAG, AcqRel) == expected {
+            return NodeWriteGuard {
+                data: node_deref.data.get(),
+                cc: &node_deref.cc as *const AtomicUsize,
+                version: node_version(cc_num),
+                node_ref: node.clone(),
+            };
         }
         backoff.spin();
     }
@@ -404,7 +400,7 @@ where
 {
     let node_deref = node.deref::<KS, PS>();
     let cc = &node_deref.cc;
-    let cc_num = cc.load(Relaxed);
+    let cc_num = cc.load(Acquire);
     let expected = cc_num & (!LATCH_FLAG);
     cc_num == expected
 }
@@ -418,21 +414,21 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut handler = read_unchecked(node);
-    if node.is_default() {
+    if node.is_default() || handler.is_none() {
         return func(&handler);
     }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
-        let cc_num = cc.load(SeqCst);
-        if cc_num & LATCH_FLAG == LATCH_FLAG && !handler.is_none() {
+        let cc_num = cc.load(Acquire);
+        if cc_num & LATCH_FLAG == LATCH_FLAG {
             // trace!("read have a latch, retry {:b}", cc_num);
             backoff.spin();
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
         let res = func(&handler);
-        let new_cc_num = cc.load(SeqCst);
+        let new_cc_num = cc.load(Acquire);
         // Check the version. If not found need to retry
         if new_cc_num == cc_num {
             return res;
@@ -496,7 +492,7 @@ where
         // cope with null pointer
         if self.cc as usize != 0 {
             let cc = unsafe { &*self.cc };
-            let cc_num = cc.load(SeqCst);
+            let cc_num = cc.load(Acquire);
             debug_assert_eq!(cc_num & LATCH_FLAG, LATCH_FLAG);
             cc.store((cc_num & (!LATCH_FLAG)) + 1, Release);
         }

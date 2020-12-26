@@ -5,7 +5,6 @@ use super::node::NodeReadHandler;
 use super::*;
 use std::fmt::Debug;
 use std::marker::PhantomData;
-use std::panic;
 
 pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
@@ -19,6 +18,7 @@ where
 {
     let mut node;
     let mut node_ref = node_ref;
+    let backoff = crossbeam::utils::Backoff::new();
     loop {
         let r = read_node(node_ref, |node_handler: &NodeReadHandler<KS, PS>| {
             let node = &**node_handler;
@@ -79,6 +79,7 @@ where
             Err(e) => {
                 node = e;
                 node_ref = &node;
+                backoff.spin();
             }
         }
     }
@@ -96,6 +97,7 @@ where
 {
     let mut other_ref;
     let mut node_ref = node_ref;
+    let backoff = crossbeam::utils::Backoff::new();
     loop {
         match read_node(node_ref, |node: &NodeReadHandler<KS, PS>| match &**node {
             &NodeData::Internal(ref n) => {
@@ -117,6 +119,7 @@ where
             Err(e) => {
                 other_ref = e;
                 node_ref = &other_ref;
+                backoff.spin();
             }
         }
     }

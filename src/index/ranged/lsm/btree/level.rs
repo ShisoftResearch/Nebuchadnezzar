@@ -116,7 +116,7 @@ where
     for node in nodes.iter_mut() {
         node.make_empty_node(false);
         *node.right_ref_mut().unwrap() = right_ref.clone();
-        node.left_ref_mut().map(|r| *r = Default::default());
+        node.left_ref_mut().map(|r| *r = right_ref.clone());
     }
 }
 
