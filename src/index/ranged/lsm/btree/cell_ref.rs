@@ -1,8 +1,9 @@
 use super::*;
 use futures::prelude::*;
 use futures::FutureExt;
+use mem::forget;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::cell::RefCell;
+use std::collections::LinkedList;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
@@ -152,7 +153,24 @@ impl Drop for NodeCellRef {
                 let inner = self.inner.as_ref().unwrap();
                 let c = inner.counter.fetch_sub(1, Ordering::AcqRel);
                 if c == 1 {
-                    Box::from_raw(self.inner);
+                    let mut stack = LinkedList::new();
+                    stack.push_front(Box::from_raw(self.inner));
+                    let mut freed_ref_count = 0;
+                    while let Some(node) = stack.pop_front() {
+                        freed_ref_count += 1;
+                        let all_sub_refs = node.obj.take_all_refs();
+                        trace!("Reference {:?} have {} sub refrences", node.as_ref() as *const _, all_sub_refs.len());
+                        for r in all_sub_refs.into_iter() {
+                            let sub_ref_rc = r.inner.as_ref().unwrap().counter.fetch_sub(1, Ordering::AcqRel);
+                            trace!("Sub ref {:?} have rc {}", r.inner, sub_ref_rc);
+                            if sub_ref_rc <= 1 {
+                                // Can be eager-dropped
+                                stack.push_front(Box::from_raw(r.inner));
+                            }
+                            forget(r);
+                        }
+                    }
+                    trace!("Freed {} objects with reference counting", freed_ref_count);
                 }
             }
         }

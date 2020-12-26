@@ -106,6 +106,14 @@ where
         }
     }
 
+    pub fn ptrs_mut(&mut self) -> &mut [NodeCellRef] {
+        if self.is_ext() {
+            unreachable!()
+        } else {
+            &mut self.innode_mut().ptrs.as_slice()[..]
+        }
+    }
+
     pub fn first_key(&self) -> &EntryKey {
         if self.is_empty() && !self.is_empty_node() {
             &*MIN_ENTRY_KEY
@@ -206,6 +214,7 @@ where
     pub fn left_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.prev),
+            &mut NodeData::Empty(ref mut n) => n.left.as_mut(),
             _ => None,
         }
     }
@@ -303,6 +312,7 @@ pub trait AnyNode: Any + Send + Sync + 'static {
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()>;
+    unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 
 pub struct Node<KS, PS>
@@ -620,6 +630,25 @@ where
             }
         }
         .boxed()
+    }
+
+    unsafe fn take_all_refs(&self) -> Vec<NodeCellRef> {
+        let node = self.data.get().as_mut().unwrap();
+        let mut res = vec![];
+        if !node.is_none() && !node.is_empty() && node.is_internal() {
+            for ptr in node.ptrs_mut() {
+                if !ptr.is_default() {
+                    res.push(mem::take(ptr));
+                }
+            }
+        }
+        node.left_ref_mut().map(|l| if !l.is_default() {
+            res.push(mem::take(l))
+        });
+        node.right_ref_mut().map(|r| if !r.is_default() {
+            res.push(mem::take(r))
+        });
+        res
     }
 }
 
