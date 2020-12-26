@@ -282,6 +282,7 @@ where
                 debug_assert!(!search_page.is_empty_node());
                 return search_page;
             }
+            assert!(!right_node_ref.ptr_eq(search_page.node_ref()));
             let right_node = write_node(right_node_ref);
             trace!(
                 "Shifting to right {} node for {:?}, first key {:?}",
