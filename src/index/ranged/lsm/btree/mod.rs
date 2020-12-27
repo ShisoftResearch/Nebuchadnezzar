@@ -14,7 +14,7 @@ use internal::*;
 use itertools::Itertools;
 use level::LEVEL_TREE_DEPTH;
 use lightning::map::HashSet;
-use merge::merge_into_tree_node;
+use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
 use search::*;
@@ -37,7 +37,7 @@ mod internal;
 pub mod level;
 mod merge;
 mod node;
-mod prune;
+// mod prune;
 mod reconstruct;
 mod search;
 mod split;
@@ -164,10 +164,15 @@ where
 
     pub fn merge_with_keys_(&self, keys: Box<Vec<EntryKey>>) {
         let keys_len = keys.len();
+        if keys.len() == 0 {
+            warn!("Merge attempt with no keys");
+            return;
+        }
         let root = self.get_root();
+        debug!("Performing merging in sub levels with {} keys", keys.len());
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
+        debug!("Sub level merge completed, have {} new pages for root", root_new_pages.len());
         if root_new_pages.len() > 0 {
-            trace!("Merge have a root node split");
             debug_assert!(
                 verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),
                 "verification failed before merge root split"
@@ -186,20 +191,45 @@ where
                 root.ptr_eq(&self.get_root()),
                 "Merge target tree should always have a persistent root unless merge split"
             );
-            let _root_guard = write_node::<KS, PS>(&root);
-            let new_root_len = root_new_pages.len();
-            debug_assert!(
-                new_root_len + 1 < KS::slice_len(),
-                "Radical merge split, cannot handle this for now (need to split more than once)"
+            let root_guard = write_node::<KS, PS>(&root);
+            debug_assert!(*root_guard.node_ref() == self.get_root());
+            info!(
+                "Radical merge split for root (may need to split more than once), {} to {}, num keys {}", 
+                root_new_pages.len() + 1,
+                KS::slice_len(),
+                keys_len
             );
-            let mut new_in_root: Box<InNode<KS, PS>> = InNode::new(new_root_len, max_entry_key());
-            new_in_root.ptrs.as_slice()[0] = root.clone();
-            for (i, (key, node)) in root_new_pages.into_iter().enumerate() {
-                new_in_root.keys.as_slice()[i] = key;
-                new_in_root.ptrs.as_slice()[i + 1] = node;
+            let mut new_pages = root_new_pages;
+            let mut left_most_page = root;
+            if new_pages.is_empty() {
+                // The root is still intact and does not need to be splitted
+                // Nothing need to do here
+            } else {
+                // In the current root level we have more than one root, should generate new levels
+                loop {
+                    // Need generate and rearrange new pages
+                    // First, generate a innode with one key and two pointers
+                    // The first pointer of the innode is original node (can be the root)
+                    let new_node_ref = new_internal_node::<KS, PS>(&left_most_page, &mut new_pages);
+                    let mut this_level_new_pages = vec![];
+                    if !new_pages.is_empty() {
+                        merge_into_internal::<KS, PS>(
+                            &new_node_ref,
+                            new_pages,
+                            &mut this_level_new_pages,
+                        );
+                    }
+                    if this_level_new_pages.is_empty() {
+                        // All sub pages merged into the new page, should set the page as root and break
+                        *self.root.write() = new_node_ref;
+                        break;
+                    } else {
+                        // Have new pages to generate a new level
+                        new_pages = box this_level_new_pages;
+                        left_most_page = new_node_ref;
+                    }
+                }
             }
-            // new_in_root.debug_check_integrity();
-            *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
             debug_assert!(
                 verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),
                 "verification failed after merge root split"

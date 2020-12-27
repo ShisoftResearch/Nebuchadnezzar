@@ -67,11 +67,11 @@ pub struct CursorMemo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BTreeStat {
     pub size: usize,
-    pub count: usize, 
+    pub count: usize,
     pub mid_key: Option<EntryKey>,
     pub head: Id,
     pub ideal_cap: usize,
-    pub oversized: bool
+    pub oversized: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,26 +200,28 @@ impl Service for LSMTreeService {
     }
 
     fn stat(&self, id: Id) -> BoxFuture<OpResult<LSMTreeStat>> {
-        future::ready(
-            if let Some(tree) = self.trees.get(&id) {
-                OpResult::Successful(LSMTreeStat {
-                    id,
-                    prop: tree.prop.read().clone(),
-                    trees: tree.tree.trees.iter().map(|t| {
-                        BTreeStat {
-                            size: t.size(),
-                            count: t.count(), 
-                            mid_key: t.mid_key(),
-                            head: t.head_id(), 
-                            ideal_cap: t.ideal_capacity(),
-                            oversized: t.oversized()
-                        }
-                    }).collect(),
-                })
-            } else {
-                OpResult::NotFound
-            }
-        ).boxed()
+        future::ready(if let Some(tree) = self.trees.get(&id) {
+            OpResult::Successful(LSMTreeStat {
+                id,
+                prop: tree.prop.read().clone(),
+                trees: tree
+                    .tree
+                    .trees
+                    .iter()
+                    .map(|t| BTreeStat {
+                        size: t.size(),
+                        count: t.count(),
+                        mid_key: t.mid_key(),
+                        head: t.head_id(),
+                        ideal_cap: t.ideal_capacity(),
+                        oversized: t.oversized(),
+                    })
+                    .collect(),
+            })
+        } else {
+            OpResult::NotFound
+        })
+        .boxed()
     }
 }
 

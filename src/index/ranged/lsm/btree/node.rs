@@ -2,8 +2,8 @@ use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
 use std::ptr;
-use std::sync::atomic::Ordering::Acquire;
-use std::sync::atomic::Ordering::Release;
+use std::sync::atomic::Ordering::{Release, Acquire, AcqRel};
+use std::backtrace;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -98,11 +98,28 @@ where
         }
     }
 
+    pub fn keys_mut(&mut self) -> &mut [EntryKey] {
+        let len = self.len();
+        if self.is_ext() {
+            &mut self.extnode_mut().keys.as_slice()[..len]
+        } else {
+            &mut self.innode_mut().keys.as_slice()[..len]
+        } 
+    }
+
     pub fn ptrs(&self) -> &[NodeCellRef] {
         if self.is_ext() {
             unreachable!()
         } else {
             &self.innode().ptrs.as_slice_immute()[..self.len() + 1]
+        }
+    }
+
+    pub fn ptrs_mut(&mut self) -> &mut [NodeCellRef] {
+        if self.is_ext() {
+            unreachable!()
+        } else {
+            &mut self.innode_mut().ptrs.as_slice()[..]
         }
     }
 
@@ -160,6 +177,12 @@ where
             _ => unreachable!(self.type_name()),
         }
     }
+    pub fn extnode_mut(&mut self) -> &mut ExtNode<KS, PS> {
+        match self {
+            &mut NodeData::External(ref mut node) => node,
+            _ => unreachable!(self.type_name()),
+        }
+    }
     pub fn ext_id(&self) -> Id {
         match self {
             &NodeData::External(ref node) => node.id,
@@ -206,6 +229,7 @@ where
     pub fn left_ref_mut(&mut self) -> Option<&mut NodeCellRef> {
         match self {
             &mut NodeData::External(ref mut n) => Some(&mut n.prev),
+            &mut NodeData::Empty(ref mut n) => n.left.as_mut(),
             _ => None,
         }
     }
@@ -274,6 +298,7 @@ where
                 debug_assert!(!search_page.is_empty_node());
                 return search_page;
             }
+            assert!(!right_node_ref.ptr_eq(search_page.node_ref()));
             let right_node = write_node(right_node_ref);
             trace!(
                 "Shifting to right {} node for {:?}, first key {:?}",
@@ -303,6 +328,7 @@ pub trait AnyNode: Any + Send + Sync + 'static {
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()>;
+    unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 
 pub struct Node<KS, PS>
@@ -343,7 +369,7 @@ where
     }
 
     pub fn version(&self) -> usize {
-        node_version(self.cc.load(SeqCst))
+        node_version(self.cc.load(Acquire))
     }
 }
 
@@ -364,24 +390,25 @@ where
             node_ref: NodeCellRef::default(),
         };
     }
-    // trace!("acquiring node write lock");
+    trace!("Acquiring node write lock on {:?}", node);
     let node_deref = node.deref();
     let cc = &node_deref.cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
-        let cc_num = cc.load(Relaxed);
+        let cc_num = cc.load(Acquire);
         let expected = cc_num & (!LATCH_FLAG);
         debug_assert_eq!(expected & LATCH_FLAG, 0);
-        match cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, Acquire, Relaxed) {
-            Ok(num) if num == expected => {
-                return NodeWriteGuard {
-                    data: node_deref.data.get(),
-                    cc: &node_deref.cc as *const AtomicUsize,
-                    version: node_version(cc_num),
-                    node_ref: node.clone(),
-                };
+        if cc.compare_and_swap(expected, cc_num | LATCH_FLAG, AcqRel) == expected {
+            #[cfg(debug_assertions)]
+            unsafe {
+                node.capture_backtrace();
             }
-            _ => {}
+            return NodeWriteGuard {
+                data: node_deref.data.get(),
+                cc: &node_deref.cc as *const AtomicUsize,
+                version: node_version(cc_num),
+                node_ref: node.clone(),
+            };
         }
         backoff.spin();
     }
@@ -394,9 +421,9 @@ where
 {
     let node_deref = node.deref::<KS, PS>();
     let cc = &node_deref.cc;
-    let cc_num = cc.load(Relaxed);
+    let cc_num = cc.load(Acquire);
     let expected = cc_num & (!LATCH_FLAG);
-    cc_num == expected
+    cc_num != expected
 }
 
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
@@ -408,21 +435,21 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     let mut handler = read_unchecked(node);
-    if node.is_default() {
+    if node.is_default() || handler.is_none() {
         return func(&handler);
     }
     let cc = &node.deref::<KS, PS>().cc;
     let backoff = crossbeam::utils::Backoff::new();
     loop {
-        let cc_num = cc.load(SeqCst);
-        if cc_num & LATCH_FLAG == LATCH_FLAG && !handler.is_none() {
+        let cc_num = cc.load(Acquire);
+        if cc_num & LATCH_FLAG == LATCH_FLAG {
             // trace!("read have a latch, retry {:b}", cc_num);
             backoff.spin();
             continue;
         }
         handler.version = cc_num & (!LATCH_FLAG);
         let res = func(&handler);
-        let new_cc_num = cc.load(SeqCst);
+        let new_cc_num = cc.load(Acquire);
         // Check the version. If not found need to retry
         if new_cc_num == cc_num {
             return res;
@@ -485,8 +512,9 @@ where
     fn drop(&mut self) {
         // cope with null pointer
         if self.cc as usize != 0 {
+            trace!("Release node write lock on {:?}", &self.node_ref);
             let cc = unsafe { &*self.cc };
-            let cc_num = cc.load(SeqCst);
+            let cc_num = cc.load(Acquire);
             debug_assert_eq!(cc_num & LATCH_FLAG, LATCH_FLAG);
             cc.store((cc_num & (!LATCH_FLAG)) + 1, Release);
         }
@@ -533,9 +561,6 @@ where
         if update_right && left_node.is_some() {
             let mut right_guard = write_node::<KS, PS>(&right_node);
             *right_guard.left_ref_mut().unwrap() = left_node.clone().unwrap();
-        }
-        if let NodeData::External(ex_node) = data {
-            make_deleted::<KS, PS>(&ex_node.id)
         }
         let empty = EmptyNode {
             left: left_node,
@@ -620,6 +645,25 @@ where
             }
         }
         .boxed()
+    }
+
+    unsafe fn take_all_refs(&self) -> Vec<NodeCellRef> {
+        let node = self.data.get().as_mut().unwrap();
+        let mut res = vec![];
+        if !node.is_none() && !node.is_empty() && node.is_internal() {
+            for ptr in node.ptrs_mut() {
+                if !ptr.is_default() {
+                    res.push(mem::take(ptr));
+                }
+            }
+        }
+        node.left_ref_mut().map(|l| if !l.is_default() {
+            res.push(mem::take(l))
+        });
+        node.right_ref_mut().map(|r| if !r.is_default() {
+            res.push(mem::take(r))
+        });
+        res
     }
 }
 

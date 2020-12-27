@@ -102,13 +102,14 @@ where
 
     pub fn to_cell(&self, deleted: &DeletionSetInneer) -> Cell {
         let mut value = Value::Map(Map::new());
-        let prev_id = read_node(&self.prev, |node: &NodeReadHandler<KS, PS>| {
+        let prev_id = {
+            let node = read_unchecked::<KS, PS>(&self.prev);
             if node.is_none() {
                 Id::unit_id()
             } else {
                 node.extnode().id
             }
-        });
+        };
         let next_id = read_node(&self.next, |node: &NodeReadHandler<KS, PS>| {
             if node.is_none() {
                 Id::unit_id()

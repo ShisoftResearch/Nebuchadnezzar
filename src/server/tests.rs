@@ -221,7 +221,11 @@ pub async fn smoke_test_parallel() {
                 debug!("Upsert {:?}, i {}, j {}", id, i, j);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
                 // read
-                let read_cell = client_clone.read_cell(id).await.unwrap().expect(&format!("Finally expecting {:?} at {}", id, j));
+                let read_cell = client_clone
+                    .read_cell(id)
+                    .await
+                    .unwrap()
+                    .expect(&format!("Finally expecting {:?} at {}", id, j));
                 assert_eq!(
                     *(read_cell.data[DATA].U64().unwrap()),
                     j,

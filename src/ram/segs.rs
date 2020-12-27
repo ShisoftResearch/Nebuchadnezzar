@@ -249,14 +249,6 @@ impl Segment {
     }
 }
 
-impl Drop for Segment {
-    fn drop(&mut self) {
-        debug!("Memory dropping segment {}", self.id);
-        assert_eq!(self.references.load(Ordering::Relaxed), 0);
-        assert!(self.dropped.load(Ordering::Relaxed));
-    }
-}
-
 pub struct SegmentEntryIter {
     bound: usize,
     cursor: usize,
