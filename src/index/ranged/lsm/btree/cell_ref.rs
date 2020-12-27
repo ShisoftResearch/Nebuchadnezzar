@@ -4,7 +4,6 @@ use futures::FutureExt;
 use mem::forget;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::VecDeque;
-use std::backtrace::Backtrace;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];

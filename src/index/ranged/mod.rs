@@ -143,6 +143,7 @@ mod tests {
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
+        panic!("Explicit panic for error discovery");
     }
 
     fn schema() -> Schema {

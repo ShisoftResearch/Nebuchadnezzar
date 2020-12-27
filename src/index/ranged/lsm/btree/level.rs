@@ -7,6 +7,7 @@ use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
 use std::fmt::Debug;
+use std::sync::atomic::Ordering;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
 pub const LEVEL_TREE_DEPTH: u32 = 2;
@@ -76,6 +77,7 @@ where
                 if node_id != head_id {
                     external::make_deleted::<KS, PS>(&node_id);
                 }
+                src_tree.len.fetch_sub(num_merging_keys, Ordering::Relaxed);
             }
             debug!("Merge prune completed in external level");
             return num_keys_merged;
@@ -147,8 +149,8 @@ where
     loop {
         let first_key = next_node.first_key();
         let node_right = next_node.right_bound();
-        debug_assert!(first_key < right_boundary, "First key {:?} out of bound {:?}", first_key, right_boundary);
-        debug_assert!(node_right <= right_boundary, "Node right {:?} out of bound {:?}", node_right, right_boundary);
+        debug_assert!(first_key < right_boundary, "First key {:?} out of bound {:?}, collected {}", first_key, right_boundary, collected.len());
+        debug_assert!(node_right <= right_boundary, "Node right {:?} out of bound {:?}, collected {}", node_right, right_boundary, collected.len());
         let next_right = write_node(next_node.right_ref().unwrap());
         collected.push(next_node);
         next_node = next_right;
