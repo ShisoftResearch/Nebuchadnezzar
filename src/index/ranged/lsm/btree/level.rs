@@ -33,52 +33,59 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            let (mut nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            let (nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary, level);
+            let new_first_ref = new_first.node_ref().clone();
+            let head_id = nodes[0].ext_id();
+            new_first.extnode_mut(src_tree).id = head_id;
+            new_first.left_ref_mut().map(|lr| *lr = Default::default());
+            drop(new_first);
             debug_assert!(
                 !nodes.is_empty(),
                 "Cannot find any keys in range in external with boundary {:?}",
                 boundary
             );
-            // Collect keys to merge
-            let all_keys = nodes
-                .iter()
-                .map(|n| n.keys())
-                .flatten()
-                .cloned()
-                .collect_vec();
-            let mut deleted_keys = Vec::with_capacity(all_keys.len());
-            let mut merging_keys = Vec::with_capacity(all_keys.len());
-            all_keys.iter().for_each(|k| {
-                if src_tree.deleted.contains(k) {
-                    deleted_keys.push(k);
-                } else {
-                    merging_keys.push(k.clone());
+            let mut num_keys_merged = 0;
+            for mut node in nodes {
+                let node_id = node.ext_id();
+                let node_len = node.len();
+                let deleted_keys = node
+                    .keys()
+                    .iter()
+                    .filter(|k| src_tree.deleted.contains(k))
+                    .cloned()
+                    .collect_vec();
+                let merging_keys = node
+                    .extnode_mut_no_persist()
+                    .keys
+                    .as_slice()[..node_len]
+                    .iter_mut()
+                    .filter(|k| !src_tree.deleted.contains(k))
+                    .map(|k| mem::take(k))
+                    .collect_vec();
+                let num_merging_keys = merging_keys.len();
+                num_keys_merged += num_merging_keys;
+                trace!("Collected {} keys, merging to destination tree", num_merging_keys);
+                dest_tree.merge_with_keys(box merging_keys);
+                trace!("Merge completed, cleanup");
+                // Update delete set in source
+                for dk in deleted_keys {
+                    src_tree.deleted.remove(&dk);
                 }
-            });
-            let num_keys_merging = merging_keys.len();
-            debug!("Collected {} keys, merging to destination tree", num_keys_merging);
-            // Merging with destination tree
-            dest_tree.merge_with_keys(box merging_keys);
-            debug!("Merged into destination tree, cutting external {} nodes", nodes.len());
-            // Update delete set in source
-            for dk in deleted_keys {
-                src_tree.deleted.remove(dk);
+                clear_node(node, &new_first_ref);
+                if node_id != head_id {
+                    external::make_deleted::<KS, PS>(&node_id);
+                }
             }
-            let first_node_id = nodes[0].extnode().id;
-            // Cut tree in external level
-            clear_nodes(nodes, new_first.node_ref());
-            // Reset first node. We don't want to update the tree head id so we will reuse the id
-            let ext_node = new_first.extnode_mut(src_tree);
-            ext_node.id = first_node_id;
-            ext_node.prev = Default::default();
             debug!("Merge prune completed in external level");
-            return num_keys_merging;
+            return num_keys_merged;
         }
         MutSearchResult::Internal(sub_node) => {
             let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
-            let (nodes, right_node) = select_nodes_in_boundary::<KS, PS>(node, boundary);
+            let (nodes, right_node) = select_nodes_in_boundary::<KS, PS>(node, boundary, level);
             if !nodes.is_empty() {
-                clear_nodes(nodes, right_node.node_ref());
+                for node in nodes {
+                    clear_node(node, right_node.node_ref());
+                }
             } else {
                 // The boundary does nott covered the first node in this level
                 // Need to partially remove the node keys and ptrs
@@ -111,21 +118,20 @@ where
     }
 }
 
-fn clear_nodes<KS, PS>(nodes: Vec<NodeWriteGuard<KS, PS>>, right_ref: &NodeCellRef)
+fn clear_node<KS, PS>(mut node: NodeWriteGuard<KS, PS>, right_ref: &NodeCellRef)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    for mut node in nodes.into_iter() {
-        node.make_empty_node(false);
-        *node.right_ref_mut().unwrap() = right_ref.clone();
-        node.left_ref_mut().map(|r| *r = right_ref.clone());
-    }
+    node.make_empty_node(false);
+    *node.right_ref_mut().unwrap() = right_ref.clone();
+    node.left_ref_mut().map(|r| *r = right_ref.clone());
 }
 
 fn select_nodes_in_boundary<KS, PS>(
     first_node: &NodeCellRef,
     right_boundary: &EntryKey,
+    level: usize,
 ) -> (Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -135,7 +141,6 @@ where
     if first_node.right_bound() > right_boundary {
         return (vec![], first_node);
     }
-    trace!("Acquiring first node");
     let mut next_node = write_node(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
@@ -145,6 +150,7 @@ where
         collected.push(next_node);
         next_node = next_right;
         if next_node.first_key() >= right_boundary {
+            trace!("Collected {} nodes at level {}", collected.len(), level);
             return (collected, next_node);
         }
     }

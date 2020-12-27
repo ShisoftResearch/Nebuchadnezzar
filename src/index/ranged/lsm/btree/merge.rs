@@ -95,17 +95,19 @@ where
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
-            trace!("Merge into internal with keys {:?}", &keys);
+            trace!("Merge into external at level {}", level);
             let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
             let mut new_pages = vec![];
+            trace!("Start external merging by pages");
             // merge by pages
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
-                trace!("Start merging with page at {:?}", start_key);
+                trace!("Locking on target starts from {:?} for {:?}", current_guard.node_ref(), start_key);
                 current_guard = write_targeted(current_guard, start_key);
                 let remain_slots = KS::slice_len() - current_guard.len();
+                trace!("Locked on targed with {:?}, remaining slots {}",  current_guard.node_ref(), remain_slots);
                 if remain_slots > 0 {
                     let ext_node = current_guard.extnode_mut(tree);
                     ext_node.remove_contains(&*tree.deleted);
@@ -114,13 +116,17 @@ where
                         .filter(|&k| k < &ext_node.right_bound)
                         .take(remain_slots)
                         .collect_vec();
+                    trace!("Merge by merge sort with {:?}", ext_node.id);
                     ext_node.merge_sort(selection.as_slice());
                     merging_pos += selection.len();
                 } else if remain_slots == 0 {
                     let insert_pos = current_guard.search(&start_key);
                     let target_node_ref = current_guard.node_ref().clone();
+                    let right_node_ref = current_guard.right_ref().unwrap();
+                    trace!("Merge with node split at {:?}, locking on right node {:?}", target_node_ref, right_node_ref);
                     let mut right_guard =
-                        write_node::<KS, PS>(current_guard.right_ref_mut().unwrap());
+                        write_node::<KS, PS>(right_node_ref);
+                    trace!("Split insert into {:?}", target_node_ref);
                     let (new_node, pivot) = current_guard.extnode_mut(tree).split_insert(
                         start_key.clone(),
                         insert_pos,
@@ -132,7 +138,9 @@ where
                     external::make_changed(&new_node, tree);
                     new_pages.push((pivot, new_node));
                 }
+                trace!("Key {:?} merged", start_key);
             }
+            trace!("External merge completed at leve l {}", level);
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {

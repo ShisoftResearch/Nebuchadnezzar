@@ -97,6 +97,15 @@ where
         }
     }
 
+    pub fn keys_mut(&mut self) -> &mut [EntryKey] {
+        let len = self.len();
+        if self.is_ext() {
+            &mut self.extnode_mut().keys.as_slice()[..len]
+        } else {
+            &mut self.innode_mut().keys.as_slice()[..len]
+        } 
+    }
+
     pub fn ptrs(&self) -> &[NodeCellRef] {
         if self.is_ext() {
             unreachable!()
@@ -164,6 +173,12 @@ where
     pub fn extnode(&self) -> &ExtNode<KS, PS> {
         match self {
             &NodeData::External(ref node) => node,
+            _ => unreachable!(self.type_name()),
+        }
+    }
+    pub fn extnode_mut(&mut self) -> &mut ExtNode<KS, PS> {
+        match self {
+            &mut NodeData::External(ref mut node) => node,
             _ => unreachable!(self.type_name()),
         }
     }
@@ -540,9 +555,6 @@ where
         if update_right && left_node.is_some() {
             let mut right_guard = write_node::<KS, PS>(&right_node);
             *right_guard.left_ref_mut().unwrap() = left_node.clone().unwrap();
-        }
-        if let NodeData::External(ex_node) = data {
-            make_deleted::<KS, PS>(&ex_node.id)
         }
         let empty = EmptyNode {
             left: left_node,
