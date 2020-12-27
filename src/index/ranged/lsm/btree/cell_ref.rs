@@ -4,6 +4,7 @@ use futures::FutureExt;
 use mem::forget;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::VecDeque;
+use std::backtrace::Backtrace;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
@@ -21,6 +22,8 @@ pub struct NodeCellRef {
 }
 
 struct NodeRefInner<T: ?Sized> {
+    #[cfg(debug_assertions)]
+    backtrace: String,
     counter: AtomicUsize,
     obj: T,
 }
@@ -37,6 +40,8 @@ impl NodeCellRef {
         PS: Slice<NodeCellRef> + 'static,
     {
         let node_ref: Box<NodeRefInner<dyn AnyNode>> = Box::new(NodeRefInner {
+            #[cfg(debug_assertions)]
+            backtrace: String::from(""),
             counter: AtomicUsize::new(1),
             obj: node,
         });
@@ -130,6 +135,16 @@ impl NodeCellRef {
         unsafe {
             self.inner.as_ref().unwrap().counter.load(Ordering::Acquire)
         }
+    }
+    
+    #[cfg(debug_assertions)]
+    pub unsafe fn capture_backtrace(&self) {
+        self.inner.as_mut().unwrap().backtrace = format!("{:?}", std::thread::current().id());
+    }
+
+    #[cfg(debug_assertions)]
+    pub unsafe fn get_backtrace(&self) -> &String {
+        &self.inner.as_ref().unwrap().backtrace
     }
 }
 

@@ -45,6 +45,7 @@ where
                 boundary
             );
             let mut num_keys_merged = 0;
+            debug!("Selected {} pages to merge", nodes.len());            
             for mut node in nodes {
                 let node_id = node.ext_id();
                 let node_len = node.len();
@@ -64,9 +65,9 @@ where
                     .collect_vec();
                 let num_merging_keys = merging_keys.len();
                 num_keys_merged += num_merging_keys;
-                trace!("Collected {} keys, merging to destination tree", num_merging_keys);
+                debug!("Collected {} keys, merging to destination tree", num_merging_keys);
                 dest_tree.merge_with_keys(box merging_keys);
-                trace!("Merge completed, cleanup");
+                debug!("Merge completed, cleanup");
                 // Update delete set in source
                 for dk in deleted_keys {
                     src_tree.deleted.remove(&dk);
@@ -144,8 +145,10 @@ where
     let mut next_node = write_node(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
-        debug_assert!(next_node.first_key() < right_boundary);
-        debug_assert!(next_node.right_bound() <= right_boundary);
+        let first_key = next_node.first_key();
+        let node_right = next_node.right_bound();
+        debug_assert!(first_key < right_boundary, "First key {:?} out of bound {:?}", first_key, right_boundary);
+        debug_assert!(node_right <= right_boundary, "Node right {:?} out of bound {:?}", node_right, right_boundary);
         let next_right = write_node(next_node.right_ref().unwrap());
         collected.push(next_node);
         next_node = next_right;

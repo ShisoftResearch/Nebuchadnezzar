@@ -130,8 +130,14 @@ mod tests {
             let current = rt_cursor.current().unwrap().0;
             assert_eq!(id, current);
             let _ = rt_cursor.next().await.unwrap();
+            if num % (test_capacity / 128) == 0 {
+                debug!("Scanned {} of {}", num, test_capacity);
+            }
         }
-        assert!(rt_cursor.next().await.unwrap().is_none());
+        info!("Scan finished");
+        let end_of_list = rt_cursor.next().await.unwrap();
+        assert!(end_of_list.is_none(), "End of the list have id {:?}", end_of_list.unwrap().0);
+        assert!(end_of_list.is_none(), "After end of the list have id {:?}", end_of_list.unwrap().0);
         info!(
             "Total cells {}, Tree stat {:?}",
             client.count().await.unwrap(),

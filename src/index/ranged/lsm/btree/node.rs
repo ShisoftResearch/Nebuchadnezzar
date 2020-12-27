@@ -3,6 +3,7 @@ use futures::FutureExt;
 use std::any::TypeId;
 use std::ptr;
 use std::sync::atomic::Ordering::{Release, Acquire, AcqRel};
+use std::backtrace;
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -389,7 +390,7 @@ where
             node_ref: NodeCellRef::default(),
         };
     }
-    // trace!("acquiring node write lock");
+    trace!("Acquiring node write lock on {:?}", node);
     let node_deref = node.deref();
     let cc = &node_deref.cc;
     let backoff = crossbeam::utils::Backoff::new();
@@ -398,6 +399,10 @@ where
         let expected = cc_num & (!LATCH_FLAG);
         debug_assert_eq!(expected & LATCH_FLAG, 0);
         if cc.compare_and_swap(expected, cc_num | LATCH_FLAG, AcqRel) == expected {
+            #[cfg(debug_assertions)]
+            unsafe {
+                node.capture_backtrace();
+            }
             return NodeWriteGuard {
                 data: node_deref.data.get(),
                 cc: &node_deref.cc as *const AtomicUsize,
@@ -418,7 +423,7 @@ where
     let cc = &node_deref.cc;
     let cc_num = cc.load(Acquire);
     let expected = cc_num & (!LATCH_FLAG);
-    cc_num == expected
+    cc_num != expected
 }
 
 pub fn read_node<'a, KS, PS, F: FnMut(&NodeReadHandler<KS, PS>) -> R + 'a, R: 'a>(
@@ -507,6 +512,7 @@ where
     fn drop(&mut self) {
         // cope with null pointer
         if self.cc as usize != 0 {
+            trace!("Release node write lock on {:?}", &self.node_ref);
             let cc = unsafe { &*self.cc };
             let cc_num = cc.load(Acquire);
             debug_assert_eq!(cc_num & LATCH_FLAG, LATCH_FLAG);

@@ -1,7 +1,5 @@
 use super::external;
-use super::node::read_unchecked;
-use super::node::write_node;
-use super::node::write_targeted;
+use super::node::*;
 use super::search::mut_search;
 use super::search::MutSearchResult;
 use super::*;
@@ -124,6 +122,17 @@ where
                     let target_node_ref = current_guard.node_ref().clone();
                     let right_node_ref = current_guard.right_ref().unwrap();
                     trace!("Merge with node split at {:?}, locking on right node {:?}", target_node_ref, right_node_ref);
+                    #[cfg(debug_assertions)]
+                    if is_node_locked::<KS, PS>(right_node_ref) {
+                        unsafe {
+                            warn!(
+                                "Right node {:?} is LOCKED!!! current id {:?} lock thread id {}", 
+                                &right_node_ref, 
+                                std::thread::current().id(),
+                                right_node_ref.get_backtrace()
+                            );
+                        }
+                    }
                     let mut right_guard =
                         write_node::<KS, PS>(right_node_ref);
                     trace!("Split insert into {:?}", target_node_ref);
@@ -134,6 +143,7 @@ where
                         &mut right_guard,
                         tree,
                     );
+                    drop(right_guard);
                     merging_pos += 1;
                     external::make_changed(&new_node, tree);
                     new_pages.push((pivot, new_node));

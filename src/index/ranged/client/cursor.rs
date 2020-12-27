@@ -62,7 +62,7 @@ impl ClientCursor {
                     self.remote_cursor,
                 )
                 .await?;
-                self.cell_block = Some(cells);
+                self.cell_block = cells;
             } else if let &mut Some(ref mut cells) = &mut self.cell_block {
                 if cells[0].is_none() {
                     // have empty block will try to reload the cursor from the client for
@@ -86,7 +86,7 @@ impl ClientCursor {
                 self.pos += 1;
                 // Check if pos is in range and have value. If not, get next block.
                 if self.pos >= cells.len() || cells[self.pos].is_none() {
-                    *cells = Self::refresh_block(
+                    self.cell_block = Self::refresh_block(
                         &self.tree_client,
                         &self.query_client.neb_client,
                         self.remote_cursor,
@@ -96,9 +96,15 @@ impl ClientCursor {
                     self.pos = 0;
                 }
             } else {
-                unimplemented!();
+                return Ok(None);
             }
-            return Ok(Some(res));
+            return if res.0.is_unit_id() {
+                self.cell = CellSlot::None;
+                self.cell_block = None;
+                Ok(None)
+            } else {
+                Ok(Some(res))
+            }
         }
     }
 
@@ -116,8 +122,11 @@ impl ClientCursor {
         tree_client: &Arc<AsyncServiceClient>,
         neb_client: &Arc<AsyncClient>,
         remote_cursor: ServCursor,
-    ) -> Result<CellBlock, RPCError> {
+    ) -> Result<Option<CellBlock>, RPCError> {
         let cell_ids = tree_client.cursor_next(remote_cursor).await?.unwrap();
+        if cell_ids[0].is_unit_id() {
+            return Ok(None)
+        }
         let id_vec = Vec::from(cell_ids);
         let id_vec_copy = id_vec.clone();
         let cells = neb_client
@@ -127,7 +136,7 @@ impl ClientCursor {
             .zip(id_vec_copy)
             .map(|(cell_res, id)| CellSlot::Some((id, cell_res)))
             .collect();
-        Ok(cells)
+        Ok(Some(cells))
     }
 }
 
