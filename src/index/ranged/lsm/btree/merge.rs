@@ -140,7 +140,7 @@ where
                 }
                 trace!("Key {:?} merged", start_key);
             }
-            trace!("External merge completed at leve l {}", level);
+            trace!("External merge completed at level {}", level);
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {

@@ -3,7 +3,7 @@ use futures::prelude::*;
 use futures::FutureExt;
 use mem::forget;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::collections::LinkedList;
+use std::collections::VecDeque;
 
 type DefaultKeySliceType = [EntryKey; 0];
 type DefaultPtrSliceType = [NodeCellRef; 0];
@@ -153,7 +153,7 @@ impl Drop for NodeCellRef {
                 let inner = self.inner.as_ref().unwrap();
                 let c = inner.counter.fetch_sub(1, Ordering::AcqRel);
                 if c == 1 {
-                    let mut stack = LinkedList::new();
+                    let mut stack = VecDeque::new();
                     stack.push_front(Box::from_raw(self.inner));
                     let mut freed_ref_count = 0;
                     while let Some(node) = stack.pop_front() {
