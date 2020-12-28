@@ -102,10 +102,18 @@ where
             // merge by pages
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
-                trace!("Locking on target starts from {:?} for {:?}", current_guard.node_ref(), start_key);
+                trace!(
+                    "Locking on target starts from {:?} for {:?}",
+                    current_guard.node_ref(),
+                    start_key
+                );
                 current_guard = write_targeted(current_guard, start_key);
                 let remain_slots = KS::slice_len() - current_guard.len();
-                trace!("Locked on targed with {:?}, remaining slots {}",  current_guard.node_ref(), remain_slots);
+                trace!(
+                    "Locked on targed with {:?}, remaining slots {}",
+                    current_guard.node_ref(),
+                    remain_slots
+                );
                 if remain_slots > 0 {
                     let ext_node = current_guard.extnode_mut(tree);
                     ext_node.remove_contains(&*tree.deleted);
@@ -121,20 +129,23 @@ where
                     let insert_pos = current_guard.search(&start_key);
                     let target_node_ref = current_guard.node_ref().clone();
                     let right_node_ref = current_guard.right_ref().unwrap();
-                    trace!("Merge with node split at {:?}, locking on right node {:?}", target_node_ref, right_node_ref);
+                    trace!(
+                        "Merge with node split at {:?}, locking on right node {:?}",
+                        target_node_ref,
+                        right_node_ref
+                    );
                     #[cfg(debug_assertions)]
                     if is_node_locked::<KS, PS>(right_node_ref) {
                         unsafe {
                             warn!(
-                                "Right node {:?} is LOCKED!!! current id {:?} lock thread id {}", 
-                                &right_node_ref, 
+                                "Right node {:?} is LOCKED!!! current id {:?} lock thread id {}",
+                                &right_node_ref,
                                 std::thread::current().id(),
                                 right_node_ref.get_backtrace()
                             );
                         }
                     }
-                    let mut right_guard =
-                        write_node::<KS, PS>(right_node_ref);
+                    let mut right_guard = write_node::<KS, PS>(right_node_ref);
                     trace!("Split insert into {:?}", target_node_ref);
                     let (new_node, pivot) = current_guard.extnode_mut(tree).split_insert(
                         start_key.clone(),

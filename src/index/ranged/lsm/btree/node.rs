@@ -1,9 +1,9 @@
 use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
-use std::ptr;
-use std::sync::atomic::Ordering::{Release, Acquire, AcqRel};
 use std::backtrace;
+use std::ptr;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 
 pub struct EmptyNode {
     pub left: Option<NodeCellRef>,
@@ -104,7 +104,7 @@ where
             &mut self.extnode_mut().keys.as_slice()[..len]
         } else {
             &mut self.innode_mut().keys.as_slice()[..len]
-        } 
+        }
     }
 
     pub fn ptrs(&self) -> &[NodeCellRef] {
@@ -657,11 +657,15 @@ where
                 }
             }
         }
-        node.left_ref_mut().map(|l| if !l.is_default() {
-            res.push(mem::take(l))
+        node.left_ref_mut().map(|l| {
+            if !l.is_default() {
+                res.push(mem::take(l))
+            }
         });
-        node.right_ref_mut().map(|r| if !r.is_default() {
-            res.push(mem::take(r))
+        node.right_ref_mut().map(|r| {
+            if !r.is_default() {
+                res.push(mem::take(r))
+            }
         });
         res
     }

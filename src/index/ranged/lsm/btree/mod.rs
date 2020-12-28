@@ -171,7 +171,10 @@ where
         let root = self.get_root();
         debug!("Performing merging in sub levels with {} keys", keys.len());
         let root_new_pages = merge_into_tree_node(self, &root, &self.root_versioning, keys, 0);
-        debug!("Sub level merge completed, have {} new pages for root", root_new_pages.len());
+        debug!(
+            "Sub level merge completed, have {} new pages for root",
+            root_new_pages.len()
+        );
         if root_new_pages.len() > 0 {
             debug_assert!(
                 verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),

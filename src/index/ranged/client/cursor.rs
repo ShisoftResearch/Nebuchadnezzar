@@ -104,7 +104,7 @@ impl ClientCursor {
                 Ok(None)
             } else {
                 Ok(Some(res))
-            }
+            };
         }
     }
 
@@ -125,7 +125,7 @@ impl ClientCursor {
     ) -> Result<Option<CellBlock>, RPCError> {
         let cell_ids = tree_client.cursor_next(remote_cursor).await?.unwrap();
         if cell_ids[0].is_unit_id() {
-            return Ok(None)
+            return Ok(None);
         }
         let id_vec = Vec::from(cell_ids);
         let id_vec_copy = id_vec.clone();

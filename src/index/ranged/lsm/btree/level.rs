@@ -19,12 +19,12 @@ pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const NUM_LEVELS: usize = 3;
 
 enum NodeSelection<KS, PS>
-  where
+where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     WholePage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>),
-    PartialPage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>)
+    PartialPage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>),
 }
 
 // NEVER MAKE THIS ASYNC
@@ -42,7 +42,9 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            if let NodeSelection::WholePage(nodes, mut new_first) = select_nodes_in_boundary::<KS, PS>(node, boundary, level) {
+            if let NodeSelection::WholePage(nodes, mut new_first) =
+                select_nodes_in_boundary::<KS, PS>(node, boundary, level)
+            {
                 let new_first_ref = new_first.node_ref().clone();
                 let head_id = nodes[0].ext_id();
                 new_first.extnode_mut(src_tree).id = head_id;
@@ -54,7 +56,7 @@ where
                     boundary
                 );
                 let mut num_keys_merged = 0;
-                debug!("Selected {} pages to merge", nodes.len());            
+                debug!("Selected {} pages to merge", nodes.len());
                 for mut node in nodes {
                     let node_id = node.ext_id();
                     let node_len = node.len();
@@ -64,17 +66,17 @@ where
                         .filter(|k| src_tree.deleted.contains(k))
                         .cloned()
                         .collect_vec();
-                    let merging_keys = node
-                        .extnode_mut_no_persist()
-                        .keys
-                        .as_slice()[..node_len]
+                    let merging_keys = node.extnode_mut_no_persist().keys.as_slice()[..node_len]
                         .iter_mut()
                         .filter(|k| !src_tree.deleted.contains(k))
                         .map(|k| mem::take(k))
                         .collect_vec();
                     let num_merging_keys = merging_keys.len();
                     num_keys_merged += num_merging_keys;
-                    debug!("Collected {} keys, merging to destination tree", num_merging_keys);
+                    debug!(
+                        "Collected {} keys, merging to destination tree",
+                        num_merging_keys
+                    );
                     dest_tree.merge_with_keys(box merging_keys);
                     debug!("Merge completed, cleanup");
                     // Update delete set in source
@@ -100,7 +102,7 @@ where
                     let right_ref = right_node.node_ref().clone();
                     drop(right_node);
                     clear_nodes(nodes, &right_ref);
-                },
+                }
                 NodeSelection::PartialPage(nodes, mut terminal_node) => {
                     clear_nodes(nodes, terminal_node.node_ref());
                     match terminal_node.keys().binary_search(boundary) {
@@ -170,7 +172,13 @@ where
     loop {
         let first_key = next_node.first_key();
         let node_right = next_node.right_bound();
-        debug_assert!(first_key < right_boundary, "First key {:?} out of bound {:?}, collected {}", first_key, right_boundary, collected.len());
+        debug_assert!(
+            first_key < right_boundary,
+            "First key {:?} out of bound {:?}, collected {}",
+            first_key,
+            right_boundary,
+            collected.len()
+        );
         if node_right <= right_boundary {
             let next_right = write_node(next_node.right_ref().unwrap());
             collected.push(next_node);

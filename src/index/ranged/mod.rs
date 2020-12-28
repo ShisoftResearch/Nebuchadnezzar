@@ -136,8 +136,16 @@ mod tests {
         }
         info!("Scan finished");
         let end_of_list = rt_cursor.next().await.unwrap();
-        assert!(end_of_list.is_none(), "End of the list have id {:?}", end_of_list.unwrap().0);
-        assert!(end_of_list.is_none(), "After end of the list have id {:?}", end_of_list.unwrap().0);
+        assert!(
+            end_of_list.is_none(),
+            "End of the list have id {:?}",
+            end_of_list.unwrap().0
+        );
+        assert!(
+            end_of_list.is_none(),
+            "After end of the list have id {:?}",
+            end_of_list.unwrap().0
+        );
         info!(
             "Total cells {}, Tree stat {:?}",
             client.count().await.unwrap(),
