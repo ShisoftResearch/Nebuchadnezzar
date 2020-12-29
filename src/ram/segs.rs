@@ -104,7 +104,7 @@ impl Segment {
     }
 
     pub fn shrink(&self, size: usize) {
-        debug_assert!(size < SEGMENT_SIZE);
+        debug_assert!(size < SEGMENT_SIZE, "Shrink to {} max {}", size, SEGMENT_SIZE);
         punch_hole(self.addr, size);
     }
 

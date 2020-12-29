@@ -1,7 +1,6 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
 pub use super::btree::level::LEVEL_M as BLOCK_SIZE;
-use super::btree::level::NUM_LEVELS;
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;

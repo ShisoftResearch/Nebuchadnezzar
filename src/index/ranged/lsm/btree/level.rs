@@ -7,6 +7,7 @@ use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
 use std::fmt::Debug;
+use std::cmp::{min, max};
 use std::sync::atomic::Ordering;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
@@ -34,6 +35,7 @@ fn merge_prune<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
+    lsm: usize
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -43,7 +45,7 @@ where
     match search {
         MutSearchResult::External => {
             if let NodeSelection::WholePage(nodes, mut new_first) =
-                select_nodes_in_boundary::<KS, PS>(node, boundary, level)
+                select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm)
             {
                 let new_first_ref = new_first.node_ref().clone();
                 let head_id = nodes[0].ext_id();
@@ -96,14 +98,15 @@ where
             }
         }
         MutSearchResult::Internal(sub_node) => {
-            let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary);
-            match select_nodes_in_boundary::<KS, PS>(node, boundary, level) {
+            let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, lsm);
+            match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
                 NodeSelection::WholePage(nodes, right_node) => {
                     let right_ref = right_node.node_ref().clone();
                     drop(right_node);
                     clear_nodes(nodes, &right_ref);
                 }
                 NodeSelection::PartialPage(nodes, mut terminal_node) => {
+                    let num_nodes = nodes.len();
                     clear_nodes(nodes, terminal_node.node_ref());
                     match terminal_node.keys().binary_search(boundary) {
                         Ok(bound_id) => {
@@ -123,7 +126,17 @@ where
                             root_innode.len = num_keys;
                         }
                         Err(id) => {
-                            assert_eq!(id, 0);
+                            assert_eq!(
+                                id, 0, 
+                                "cannot find node to trim at lsm {} level {}, left pages {}, len {}, boundary {:?}, node bound {:?} all keys {:?}", 
+                                lsm,
+                                level,
+                                num_nodes,
+                                terminal_node.len(), 
+                                boundary,
+                                terminal_node.right_bound(), 
+                                terminal_node.keys()
+                            );
                         }
                     }
                 }
@@ -157,13 +170,13 @@ fn select_nodes_in_boundary<KS, PS>(
     first_node: &NodeCellRef,
     right_boundary: &EntryKey,
     level: usize,
+    lsm: usize,
 ) -> NodeSelection<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     let first_node = write_node::<KS, PS>(first_node);
-    debug_assert!(first_node.is_internal());
     if first_node.right_bound() > right_boundary {
         return NodeSelection::PartialPage(vec![], first_node);
     }
@@ -174,10 +187,12 @@ where
         let node_right = next_node.right_bound();
         debug_assert!(
             first_key < right_boundary,
-            "First key {:?} out of bound {:?}, collected {}",
+            "First key {:?} out of bound {:?}, collected {}. Level {}, LSM {}",
             first_key,
             right_boundary,
-            collected.len()
+            collected.len(),
+            level,
+            lsm
         );
         if node_right <= right_boundary {
             let next_right = write_node(next_node.right_ref().unwrap());
@@ -198,19 +213,23 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    read_node(node, |node: &NodeReadHandler<KS, PS>| {
+    let res = read_node(node, |node: &NodeReadHandler<KS, PS>| {
         let node_keys = node.keys();
         let node_len = node_keys.len();
-        if node.len() < 2 {
-            return select_boundary::<KS, PS>(&node.ptrs()[0]);
+        if node.right_ref().unwrap().is_default() || node.len() < 4 {
+            return Err(node.ptrs()[0].clone());
         }
         // Pick half of the keys in the root
         // Genreally, higher level sub tree in LSM tree will select more keys to merged
         // into next level
-        let mid_idx = node_len / 2;
+        let mid_idx = min(node_len / 2, 8);
         // Return the mid key as the boundary for selection (cut)
-        node_keys[mid_idx].clone()
-    })
+        Ok(node_keys[mid_idx].clone())
+    });
+    match res {
+        Ok(key) => key.clone(),
+        Err(r) => select_boundary::<KS, PS>(&r)
+    }
 }
 
 pub async fn level_merge<KS, PS>(
@@ -231,7 +250,7 @@ where
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
-    let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary);
+    let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, level);
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     debug!("Merge and pruned level {}, waiting for storage", level);
