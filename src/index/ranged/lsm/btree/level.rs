@@ -106,39 +106,26 @@ where
                     clear_nodes(nodes, &right_ref);
                 }
                 NodeSelection::PartialPage(nodes, mut terminal_node) => {
-                    let num_nodes = nodes.len();
                     clear_nodes(nodes, terminal_node.node_ref());
-                    match terminal_node.keys().binary_search(boundary) {
-                        Ok(bound_id) => {
-                            let mut new_keys = KS::init();
-                            let mut new_ptrs = PS::init();
-                            let mut num_keys = 0;
-                            for (i, k) in terminal_node.keys()[bound_id + 1..].iter().enumerate() {
-                                new_keys.as_slice()[i] = k.clone();
-                                num_keys += 1;
-                            }
-                            for (i, p) in terminal_node.ptrs()[bound_id + 1..].iter().enumerate() {
-                                new_ptrs.as_slice()[i] = p.clone();
-                            }
-                            let root_innode = terminal_node.innode_mut();
-                            root_innode.keys = new_keys;
-                            root_innode.ptrs = new_ptrs;
-                            root_innode.len = num_keys;
-                        }
-                        Err(id) => {
-                            assert_eq!(
-                                id, 0, 
-                                "cannot find node to trim at lsm {} level {}, left pages {}, len {}, boundary {:?}, node bound {:?} all keys {:?}", 
-                                lsm,
-                                level,
-                                num_nodes,
-                                terminal_node.len(), 
-                                boundary,
-                                terminal_node.right_bound(), 
-                                terminal_node.keys()
-                            );
-                        }
+                    let search_pos = terminal_node.keys().binary_search(boundary);
+                    let pos = match search_pos {
+                        Ok(n) => n + 1,
+                        Err(n) => n
+                    };
+                    let mut new_keys = KS::init();
+                    let mut new_ptrs = PS::init();
+                    let mut num_keys = 0;
+                    for (i, k) in terminal_node.keys()[pos..].iter().enumerate() {
+                        new_keys.as_slice()[i] = k.clone();
+                        num_keys += 1;
                     }
+                    for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
+                        new_ptrs.as_slice()[i] = p.clone();
+                    }
+                    let root_innode = terminal_node.innode_mut();
+                    root_innode.keys = new_keys;
+                    root_innode.ptrs = new_ptrs;
+                    root_innode.len = num_keys;
                 }
             }
             return num_keys_merged;
@@ -216,7 +203,7 @@ where
     let res = read_node(node, |node: &NodeReadHandler<KS, PS>| {
         let node_keys = node.keys();
         let node_len = node_keys.len();
-        if node.right_ref().unwrap().is_default() || node.len() < 4 {
+        if node.len() < 2 {
             return Err(node.ptrs()[0].clone());
         }
         // Pick half of the keys in the root
