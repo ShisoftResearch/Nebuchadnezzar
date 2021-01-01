@@ -36,7 +36,7 @@ fn merge_prune<KS, PS>(
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
     lsm: usize
-) -> usize
+) -> (usize, Option<NodeWriteGuard<KS, PS>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -92,18 +92,42 @@ where
                     src_tree.len.fetch_sub(num_merging_keys, Ordering::Relaxed);
                 }
                 debug!("Merge prune completed in external level");
-                return num_keys_merged;
+                return (num_keys_merged, None);
             } else {
                 unreachable!();
             }
         }
         MutSearchResult::Internal(sub_node) => {
-            let num_keys_merged = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, lsm);
-            match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
+            enum RightCheck<KS, PS> 
+              where
+                KS: Slice<EntryKey> + Debug + 'static,
+                PS: Slice<NodeCellRef> + 'static,
+            {
+                SinglePtr,
+                LevelTerminal(NodeWriteGuard<KS, PS>),
+                Normal
+            }
+            let check_right = |node: NodeWriteGuard<KS, PS>| {
+                if node.right_ref().unwrap().is_default() {
+                    debug_assert_eq!(node.right_bound(), &EntryKey::max());
+                    if node.len() == 0 {
+                        RightCheck::SinglePtr
+                    } else {
+                        RightCheck::LevelTerminal(node)
+                    }
+                } else {
+                    debug_assert_ne!(node.right_bound(), &EntryKey::max());
+                    debug_assert!(node.len() > 0);
+                    RightCheck::Normal
+                }
+            };
+            let (num_keys_merged, sub_level_new_root) = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, lsm);
+            let right_node = match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
                 NodeSelection::WholePage(nodes, right_node) => {
                     let right_ref = right_node.node_ref().clone();
-                    drop(right_node);
+                    let right_checks = check_right(right_node);
                     clear_nodes(nodes, &right_ref);
+                    right_checks
                 }
                 NodeSelection::PartialPage(nodes, mut terminal_node) => {
                     clear_nodes(nodes, terminal_node.node_ref());
@@ -111,7 +135,7 @@ where
                     let pos = match search_pos {
                         Ok(n) => n + 1,
                         Err(n) => n
-                    };
+                    }; 
                     let mut new_keys = KS::init();
                     let mut new_ptrs = PS::init();
                     let mut num_keys = 0;
@@ -122,13 +146,33 @@ where
                     for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
                         new_ptrs.as_slice()[i] = p.clone();
                     }
-                    let root_innode = terminal_node.innode_mut();
-                    root_innode.keys = new_keys;
-                    root_innode.ptrs = new_ptrs;
-                    root_innode.len = num_keys;
+                    {
+                        let innode = terminal_node.innode_mut();
+                        innode.keys = new_keys;
+                        innode.ptrs = new_ptrs;
+                        innode.len = num_keys;
+                    }
+                    check_right(terminal_node)
                 }
-            }
-            return num_keys_merged;
+            };
+            let new_root = {
+                if let Some(sub_level_new_root) = sub_level_new_root {
+                    if cfg!(debug_assertions) {
+                        match right_node {
+                            RightCheck::SinglePtr => {},
+                            _ => panic!("Unexpected node status")
+                        }
+                    }
+                    Some(sub_level_new_root)
+                } else {
+                    match right_node {
+                        RightCheck::Normal => None,
+                        RightCheck::LevelTerminal(node) => Some(node),
+                        RightCheck::SinglePtr => unreachable!(),
+                    }
+                }
+            };
+            return (num_keys_merged, new_root);
         }
     }
 }
@@ -237,7 +281,12 @@ where
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
-    let num_keys = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, level);
+    let (num_keys, new_root) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, level);
+    if let Some(new_root) = new_root {
+        let new_root_ref = new_root.node_ref().clone();
+        debug!("Level merge update source root {:?}", &new_root_ref);
+        *src_tree.root.write() = new_root_ref;
+    }
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
     debug!("Merge and pruned level {}, waiting for storage", level);
