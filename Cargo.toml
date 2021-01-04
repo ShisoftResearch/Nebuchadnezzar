@@ -36,6 +36,7 @@ futures = {version = "0.3", features = ["executor", "thread-pool"] }
 futures-timer = "3"
 async-std = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 crossbeam = "*"
 chashmap = { version = "2.2.2", optional = true }
 

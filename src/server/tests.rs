@@ -13,7 +13,7 @@ use rand::{Rng, SeedableRng};
 use std::env;
 use std::sync::Arc;
 use test::Bencher;
-use tokio::stream::StreamExt;
+use tokio_stream::StreamExt;
 
 #[bench]
 fn cell_construct(b: &mut Bencher) {
@@ -210,13 +210,13 @@ pub async fn smoke_test_parallel() {
             let mut rng = SmallRng::from_entropy();
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
-                if j > 1 && rng.gen_range(0, 8) == 4 {
+                if j > 1 && rng.gen_range(0..8) == 4 {
                     debug!("Removing i {}, j {}", i, j);
                     client_clone.remove_cell(id).await.unwrap().unwrap();
                 }
                 let mut value = Value::Map(Map::new());
                 value[DATA] = Value::U64(j);
-                value[ARRAY] = (1..rng.gen_range(1, 1024)).collect::<Vec<u64>>().value();
+                value[ARRAY] = (1..rng.gen_range(1..1024)).collect::<Vec<u64>>().value();
                 let cell = Cell::new_with_id(schema_id, &id, value);
                 debug!("Upsert {:?}, i {}, j {}", id, i, j);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();

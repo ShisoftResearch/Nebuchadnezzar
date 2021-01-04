@@ -809,6 +809,7 @@ dependencies = [
  "smallvec 1.6.0",
  "static_assertions",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]

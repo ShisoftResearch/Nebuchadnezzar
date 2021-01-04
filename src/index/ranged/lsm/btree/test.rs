@@ -102,6 +102,7 @@ fn crd() {
     {
         info!("test insertion");
         let mut nums = (0..num).collect_vec();
+        let mut rng = thread_rng();
         nums.as_mut_slice().shuffle(&mut rng);
         let json = serde_json::to_string(&nums).unwrap();
         let mut file = File::create("nums_dump.json").unwrap();
