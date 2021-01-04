@@ -2,11 +2,11 @@ use super::dump::dump_tree;
 use super::reconstruct::TreeConstructor;
 use super::*;
 use crate::ram::types::RandValue;
-use lightning::map::HashSet;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
 use dovahkiin::types::custom_types::id::Id;
 use itertools::Itertools;
+use lightning::map::HashSet;
 use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
@@ -509,7 +509,7 @@ fn reconstruct() {
             reconstructor.root(),
             Id::rand(),
             num as usize,
-            &deletion_set()
+            &deletion_set(),
         )
     };
     dump_tree(&tree, "reconstruct_first_run_dump.json");

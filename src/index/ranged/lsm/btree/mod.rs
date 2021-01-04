@@ -1,4 +1,5 @@
 use crate::client::AsyncClient;
+use crate::index::ranged::lsm::tree::DeletionSet;
 pub use crate::index::ranged::trees::*;
 use crate::ram::types::RandValue;
 pub use cell_ref::NodeCellRef;
@@ -13,7 +14,6 @@ use insert::*;
 use internal::*;
 use itertools::Itertools;
 use level::LEVEL_TREE_DEPTH;
-use crate::index::ranged::lsm::tree::DeletionSet;
 use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
@@ -96,7 +96,7 @@ where
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
             marker: PhantomData,
-            deletion: deletion.clone()
+            deletion: deletion.clone(),
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
@@ -113,18 +113,27 @@ where
         root.persist(&self.deletion, &neb).await
     }
 
-    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient, deletion: &Arc<DeletionSet>) -> Self {
+    pub async fn from_head_id(
+        head_id: &Id,
+        neb: &AsyncClient,
+        deletion: &Arc<DeletionSet>,
+    ) -> Self {
         reconstruct::reconstruct_from_head_id(*head_id, neb, deletion).await
     }
 
-    pub fn from_root(root: NodeCellRef, head_id: Id, len: usize, deletion: &Arc<DeletionSet>) -> Self {
+    pub fn from_root(
+        root: NodeCellRef,
+        head_id: Id,
+        len: usize,
+        deletion: &Arc<DeletionSet>,
+    ) -> Self {
         BPlusTree {
             root: RwLock::new(root),
             root_versioning: NodeCellRef::default(),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
             marker: PhantomData,
-            deletion: deletion.clone()
+            deletion: deletion.clone(),
         }
     }
 
@@ -252,10 +261,18 @@ where
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to<'a>(&'a self, level: usize, target: &'a dyn LevelTree, prune: bool)
-        -> BoxFuture<'a, usize>;
-    fn merge_all_to<'a>(&'a self, level: usize, target: &'a dyn LevelTree, prune: bool)
-        -> BoxFuture<'a, usize>;
+    fn merge_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> BoxFuture<'a, usize>;
+    fn merge_all_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> BoxFuture<'a, usize>;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
@@ -292,7 +309,7 @@ where
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
-        prune: bool
+        prune: bool,
     ) -> BoxFuture<'a, usize> {
         async move { level::level_merge(level, self, target, prune).await }.boxed()
     }
@@ -301,9 +318,10 @@ where
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
-        prune: bool
+        prune: bool,
     ) -> BoxFuture<'a, usize> {
-        async move { level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune).await }.boxed()
+        async move { level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune).await }
+            .boxed()
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -350,7 +368,7 @@ impl LevelTree for DummyLevelTree {
         &'a self,
         _level: usize,
         _target: &'a dyn LevelTree,
-        _prune: bool
+        _prune: bool,
     ) -> BoxFuture<'a, usize> {
         unreachable!()
     }
@@ -359,7 +377,7 @@ impl LevelTree for DummyLevelTree {
         &'a self,
         _level: usize,
         _target: &'a dyn LevelTree,
-        _prune: bool
+        _prune: bool,
     ) -> BoxFuture<'a, usize> {
         unreachable!()
     }

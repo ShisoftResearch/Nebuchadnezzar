@@ -6,10 +6,10 @@ use crate::client::AsyncClient;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use lightning::map::HashSet;
-use std::sync::atomic::Ordering::{Acquire, Release};
 use crossbeam_epoch::*;
+use lightning::map::HashSet;
 use std::mem;
+use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::Arc;
 
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
@@ -32,7 +32,7 @@ pub struct LSMTree {
     pub mem_tree: Atomic<Box<dyn LevelTree>>,
     pub trans_mem_tree: Atomic<Box<dyn LevelTree>>,
     pub disk_trees: LevelTrees,
-    pub deletion: Arc<DeletionSet>
+    pub deletion: Arc<DeletionSet>,
 }
 
 impl LSMTree {
@@ -52,7 +52,7 @@ impl LSMTree {
             mem_tree: Atomic::new(box tree_m),
             trans_mem_tree: Atomic::null(),
             disk_trees: [box tree_0, box tree_1, box tree_2],
-            deletion: deletion_ref
+            deletion: deletion_ref,
         }
     }
 
@@ -64,15 +64,18 @@ impl LSMTree {
         let trees_1_val = &trees[1usize];
         let trees_2_val = &trees[2usize];
 
-        let tree_0 = Level0Tree::from_head_id(trees_0_val.Id().unwrap(), neb_client, &deletion_ref).await;
-        let tree_1 = Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client, &deletion_ref).await;
-        let tree_2 = Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client, &deletion_ref).await;
+        let tree_0 =
+            Level0Tree::from_head_id(trees_0_val.Id().unwrap(), neb_client, &deletion_ref).await;
+        let tree_1 =
+            Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client, &deletion_ref).await;
+        let tree_2 =
+            Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client, &deletion_ref).await;
 
         Self {
             mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
             trans_mem_tree: Atomic::null(),
             disk_trees: [box tree_0, box tree_1, box tree_2],
-            deletion: deletion_ref
+            deletion: deletion_ref,
         }
     }
 
@@ -91,7 +94,7 @@ impl LSMTree {
             }
         }
         return false;
-    } 
+    }
 
     pub fn seek(&self, entry: &EntryKey, ordering: Ordering) -> LSMTreeCursor {
         LSMTreeCursor::new(entry, self, ordering)
@@ -126,7 +129,9 @@ impl LSMTree {
             let level = i + 1;
             if self.disk_trees[i].oversized() {
                 info!("Level {} tree oversized, merging", level);
-                self.disk_trees[i].merge_to(level, &*self.disk_trees[i + 1], true).await;
+                self.disk_trees[i]
+                    .merge_to(level, &*self.disk_trees[i + 1], true)
+                    .await;
                 info!("Level {} merge completed", level);
                 merged = true;
             } else {
@@ -170,7 +175,7 @@ pub struct LSMTreeCursor {
     cursors: LevelCusors,
     current: Option<(usize, EntryKey)>,
     ordering: Ordering,
-    deletion: Arc<DeletionSet>
+    deletion: Arc<DeletionSet>,
 }
 
 impl LSMTreeCursor {
@@ -196,7 +201,7 @@ impl LSMTreeCursor {
             cursors,
             current,
             ordering,
-            deletion
+            deletion,
         }
     }
 
@@ -233,7 +238,7 @@ impl Cursor for LSMTreeCursor {
                     if self.deletion.contains(k) {
                         // Skip keys in deletion set
                         continue;
-                    }   
+                    }
                 }
                 return res;
             } else {

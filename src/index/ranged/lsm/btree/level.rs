@@ -6,8 +6,8 @@ use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
+use std::cmp::min;
 use std::fmt::Debug;
-use std::cmp::{min};
 use std::sync::atomic::Ordering;
 
 pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 8;
@@ -37,7 +37,7 @@ fn merge_prune<KS, PS>(
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
     prune: bool,
-    lsm: usize
+    lsm: usize,
 ) -> (usize, Option<NodeWriteGuard<KS, PS>>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -98,14 +98,14 @@ where
             }
         }
         MutSearchResult::Internal(sub_node) => {
-            enum RightCheck<KS, PS> 
-              where
+            enum RightCheck<KS, PS>
+            where
                 KS: Slice<EntryKey> + Debug + 'static,
                 PS: Slice<NodeCellRef> + 'static,
             {
                 SinglePtr,
                 LevelTerminal(NodeWriteGuard<KS, PS>),
-                Normal
+                Normal,
             }
             let check_right = |node: NodeWriteGuard<KS, PS>| {
                 if node.right_ref().unwrap().is_default() {
@@ -121,48 +121,57 @@ where
                     RightCheck::Normal
                 }
             };
-            let (num_keys_merged, sub_level_new_root) = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, prune, lsm);
+            let (num_keys_merged, sub_level_new_root) = merge_prune(
+                level + 1,
+                &sub_node,
+                src_tree,
+                dest_tree,
+                boundary,
+                prune,
+                lsm,
+            );
             let mut new_root = None;
             if prune {
-                let right_node = match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
-                    NodeSelection::WholePage(nodes, right_node) => {
-                        let right_ref = right_node.node_ref().clone();
-                        let right_checks = check_right(right_node);
-                        clear_nodes(nodes, &right_ref);
-                        right_checks
-                    }
-                    NodeSelection::PartialPage(nodes, mut terminal_node) => {
-                        clear_nodes(nodes, terminal_node.node_ref());
-                        let search_pos = terminal_node.keys().binary_search(boundary);
-                        let pos = match search_pos {
-                            Ok(n) => n + 1,
-                            Err(n) => n
-                        }; 
-                        let mut new_keys = KS::init();
-                        let mut new_ptrs = PS::init();
-                        let mut num_keys = 0;
-                        for (i, k) in terminal_node.keys()[pos..].iter().enumerate() {
-                            new_keys.as_slice()[i] = k.clone();
-                            num_keys += 1;
+                let right_node =
+                    match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
+                        NodeSelection::WholePage(nodes, right_node) => {
+                            let right_ref = right_node.node_ref().clone();
+                            let right_checks = check_right(right_node);
+                            clear_nodes(nodes, &right_ref);
+                            right_checks
                         }
-                        for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
-                            new_ptrs.as_slice()[i] = p.clone();
+                        NodeSelection::PartialPage(nodes, mut terminal_node) => {
+                            clear_nodes(nodes, terminal_node.node_ref());
+                            let search_pos = terminal_node.keys().binary_search(boundary);
+                            let pos = match search_pos {
+                                Ok(n) => n + 1,
+                                Err(n) => n,
+                            };
+                            let mut new_keys = KS::init();
+                            let mut new_ptrs = PS::init();
+                            let mut num_keys = 0;
+                            for (i, k) in terminal_node.keys()[pos..].iter().enumerate() {
+                                new_keys.as_slice()[i] = k.clone();
+                                num_keys += 1;
+                            }
+                            for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
+                                new_ptrs.as_slice()[i] = p.clone();
+                            }
+                            {
+                                let innode = terminal_node.innode_mut();
+                                innode.keys = new_keys;
+                                innode.ptrs = new_ptrs;
+                                innode.len = num_keys;
+                            }
+                            check_right(terminal_node)
                         }
-                        {
-                            let innode = terminal_node.innode_mut();
-                            innode.keys = new_keys;
-                            innode.ptrs = new_ptrs;
-                            innode.len = num_keys;
-                        }
-                        check_right(terminal_node)
-                    }
-                };
+                    };
                 new_root = {
                     if let Some(sub_level_new_root) = sub_level_new_root {
                         if cfg!(debug_assertions) {
                             match right_node {
-                                RightCheck::SinglePtr => {},
-                                _ => panic!("Unexpected node status")
+                                RightCheck::SinglePtr => {}
+                                _ => panic!("Unexpected node status"),
                             }
                         }
                         Some(sub_level_new_root)
@@ -262,7 +271,7 @@ where
     });
     match res {
         Ok(key) => key.clone(),
-        Err(r) => select_boundary::<KS, PS>(&r)
+        Err(r) => select_boundary::<KS, PS>(&r),
     }
 }
 
@@ -270,7 +279,7 @@ pub async fn level_merge<KS, PS>(
     level: usize,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
-    prune: bool
+    prune: bool,
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -287,7 +296,7 @@ pub async fn merge_with_boundary<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     key_boundary: &EntryKey,
-    prune: bool
+    prune: bool,
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -299,7 +308,15 @@ where
     );
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
-    let (num_keys, new_root) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, prune, level);
+    let (num_keys, new_root) = merge_prune(
+        0,
+        &src_tree.get_root(),
+        src_tree,
+        dest_tree,
+        &key_boundary,
+        prune,
+        level,
+    );
     if let Some(new_root) = new_root {
         let new_root_ref = new_root.node_ref().clone();
         debug!("Level merge update source root {:?}", &new_root_ref);

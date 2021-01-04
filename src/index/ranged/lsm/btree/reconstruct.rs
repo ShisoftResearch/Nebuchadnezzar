@@ -116,7 +116,11 @@ where
     }
 }
 
-pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient, deletion: &Arc<DeletionSet>) -> BPlusTree<KS, PS>
+pub async fn reconstruct_from_head_id<KS, PS>(
+    head_id: Id,
+    neb: &AsyncClient,
+    deletion: &Arc<DeletionSet>,
+) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -181,11 +185,11 @@ mod test {
     use crate::ram::types::*;
     use crate::rand::Rng;
     use crate::server::*;
-    use lightning::map::HashSet;
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
     use itertools::Itertools;
+    use lightning::map::HashSet;
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]

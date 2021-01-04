@@ -1,9 +1,9 @@
 use super::*;
 use crate::index::ranged::lsm::btree::level::LEVEL_M;
+use crate::index::ranged::lsm::tree::DeletionSet;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
-use crate::index::ranged::lsm::tree::DeletionSet;
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
