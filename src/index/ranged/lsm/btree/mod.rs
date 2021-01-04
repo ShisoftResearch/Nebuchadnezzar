@@ -13,7 +13,7 @@ use insert::*;
 use internal::*;
 use itertools::Itertools;
 use level::LEVEL_TREE_DEPTH;
-use lightning::map::HashSet;
+use crate::index::ranged::lsm::tree::DeletionSet;
 use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 pub mod cell_ref;
@@ -46,11 +46,6 @@ pub mod verification;
 #[macro_use]
 pub mod marco;
 
-const DEL_SET_CAP: usize = 16;
-
-pub type DeletionSetInneer = HashSet<EntryKey>;
-pub type DeletionSet = Arc<DeletionSetInneer>;
-
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
@@ -64,7 +59,7 @@ where
     root_versioning: NodeCellRef,
     head_page_id: Id,
     len: AtomicUsize,
-    deleted: DeletionSet,
+    pub deletion: Arc<DeletionSet>,
     marker: PhantomData<(KS, PS)>,
 }
 
@@ -93,15 +88,15 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new() -> BPlusTree<KS, PS> {
+    pub fn new(deletion: &Arc<DeletionSet>) -> BPlusTree<KS, PS> {
         trace!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let mut tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::new(NodeData::None))),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
+            deletion: deletion.clone()
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
@@ -115,21 +110,21 @@ where
 
     pub async fn persist_root(&self, neb: &Arc<crate::client::AsyncClient>) {
         let root = self.get_root();
-        root.persist(&self.deleted, &neb).await
+        root.persist(&self.deletion, &neb).await
     }
 
-    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb).await
+    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient, deletion: &Arc<DeletionSet>) -> Self {
+        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion).await
     }
 
-    pub fn from_root(root: NodeCellRef, head_id: Id, len: usize) -> Self {
+    pub fn from_root(root: NodeCellRef, head_id: Id, len: usize, deletion: &Arc<DeletionSet>) -> Self {
         BPlusTree {
             root: RwLock::new(root),
             root_versioning: NodeCellRef::default(),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
+            deletion: deletion.clone()
         }
     }
 
@@ -138,7 +133,7 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
-        search_node(&self.get_root(), key, ordering, &self.deleted)
+        search_node(&self.get_root(), key, ordering)
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
@@ -158,7 +153,6 @@ where
             None => return false,
         }
         self.len.fetch_add(1, Relaxed);
-        self.deleted.remove(key);
         return true;
     }
 
@@ -258,12 +252,13 @@ where
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to<'a>(&'a self, level: usize, upper_level: &'a dyn LevelTree)
+    fn merge_to<'a>(&'a self, level: usize, target: &'a dyn LevelTree, prune: bool)
+        -> BoxFuture<'a, usize>;
+    fn merge_all_to<'a>(&'a self, level: usize, target: &'a dyn LevelTree, prune: bool)
         -> BoxFuture<'a, usize>;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
-    fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
     fn head_id(&self) -> Id;
@@ -296,9 +291,19 @@ where
     fn merge_to<'a>(
         &'a self,
         level: usize,
-        upper_level: &'a dyn LevelTree,
+        target: &'a dyn LevelTree,
+        prune: bool
     ) -> BoxFuture<'a, usize> {
-        async move { level::level_merge(level, self, upper_level).await }.boxed()
+        async move { level::level_merge(level, self, target, prune).await }.boxed()
+    }
+
+    fn merge_all_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool
+    ) -> BoxFuture<'a, usize> {
+        async move { level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune).await }.boxed()
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -311,15 +316,6 @@ where
 
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
         box self.seek(key, ordering)
-    }
-
-    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
-        if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
-            if seek_key == key {
-                return self.deleted.insert(key);
-            }
-        }
-        false
     }
 
     fn dump(&self, f: &str) {
@@ -353,7 +349,17 @@ impl LevelTree for DummyLevelTree {
     fn merge_to<'a>(
         &'a self,
         _level: usize,
-        _upper_level: &'a dyn LevelTree,
+        _target: &'a dyn LevelTree,
+        _prune: bool
+    ) -> BoxFuture<'a, usize> {
+        unreachable!()
+    }
+
+    fn merge_all_to<'a>(
+        &'a self,
+        _level: usize,
+        _target: &'a dyn LevelTree,
+        _prune: bool
     ) -> BoxFuture<'a, usize> {
         unreachable!()
     }
@@ -367,10 +373,6 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn seek_for(&self, _key: &EntryKey, _ordering: Ordering) -> Box<dyn Cursor> {
-        unreachable!()
-    }
-
-    fn mark_key_deleted(&self, _key: &EntryKey) -> bool {
         unreachable!()
     }
 

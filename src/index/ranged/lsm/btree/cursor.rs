@@ -12,7 +12,6 @@ where
     pub index: usize,
     pub ordering: Ordering,
     pub page: Option<NodeCellRef>,
-    pub deleted: DeletionSet,
     pub marker: PhantomData<(KS, PS)>,
     pub current: Option<EntryKey>,
 }
@@ -22,12 +21,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering, deleted: &DeletionSet) -> Self {
+    pub fn new(pos: usize, page: &NodeCellRef, ordering: Ordering) -> Self {
         let mut cursor = RTCursor {
             index: pos,
             ordering,
             page: Some(page.clone()),
-            deleted: deleted.clone(),
             marker: PhantomData,
             current: None,
         };
@@ -154,15 +152,10 @@ where
 {
     // TODO: Copy current after next
     fn next(&mut self) -> Option<EntryKey> {
-        loop {
-            if let Some(swapped_old_candidate) = self.next_candidate() {
-                // search in deleted set and skip if exists
-                if !self.deleted.contains(self.current().unwrap()) {
-                    return Some(swapped_old_candidate);
-                }
-            } else {
-                return None;
-            }
+        if let Some(swapped_old_candidate) = self.next_candidate() {
+            return Some(swapped_old_candidate);
+        } else {
+            return None;
         }
     }
 

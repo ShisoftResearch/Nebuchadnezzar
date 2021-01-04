@@ -7,14 +7,15 @@ use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
 use std::fmt::Debug;
-use std::cmp::{min, max};
+use std::cmp::{min};
 use std::sync::atomic::Ordering;
 
-pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
+pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 8;
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
-pub const LEVEL_M: usize = 16; // Smaller can be faster but more fragmented
-pub const LEVEL_1: usize = LEVEL_M * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_M: usize = 8;
+pub const LEVEL_0: usize = LEVEL_M * LEVEL_M; // Smaller can be faster but more fragmented
+pub const LEVEL_1: usize = LEVEL_0 * LEVEL_PAGE_DIFF_MULTIPLIER;
 pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
 
 pub const NUM_LEVELS: usize = 3;
@@ -28,13 +29,14 @@ where
     PartialPage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>),
 }
 
-// NEVER MAKE THIS ASYNC
+// Both src and dest tree MUST be immutable
 fn merge_prune<KS, PS>(
     level: usize,
     node: &NodeCellRef,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
+    prune: bool,
     lsm: usize
 ) -> (usize, Option<NodeWriteGuard<KS, PS>>)
 where
@@ -65,12 +67,12 @@ where
                     let deleted_keys = node
                         .keys()
                         .iter()
-                        .filter(|k| src_tree.deleted.contains(k))
+                        .filter(|k| src_tree.deletion.contains(k))
                         .cloned()
                         .collect_vec();
                     let merging_keys = node.extnode_mut_no_persist().keys.as_slice()[..node_len]
                         .iter_mut()
-                        .filter(|k| !src_tree.deleted.contains(k))
+                        .filter(|k| !src_tree.deletion.contains(k))
                         .map(|k| mem::take(k))
                         .collect_vec();
                     let num_merging_keys = merging_keys.len();
@@ -80,16 +82,14 @@ where
                         num_merging_keys
                     );
                     dest_tree.merge_with_keys(box merging_keys);
-                    debug!("Merge completed, cleanup");
-                    // Update delete set in source
-                    for dk in deleted_keys {
-                        src_tree.deleted.remove(&dk);
+                    if prune {
+                        debug!("Merge completed, cleanup");
+                        clear_node(node, &new_first_ref);
+                        if node_id != head_id {
+                            external::make_deleted::<KS, PS>(&node_id);
+                        }
+                        src_tree.len.fetch_sub(num_merging_keys, Ordering::Relaxed);
                     }
-                    clear_node(node, &new_first_ref);
-                    if node_id != head_id {
-                        external::make_deleted::<KS, PS>(&node_id);
-                    }
-                    src_tree.len.fetch_sub(num_merging_keys, Ordering::Relaxed);
                 }
                 debug!("Merge prune completed in external level");
                 return (num_keys_merged, None);
@@ -121,57 +121,60 @@ where
                     RightCheck::Normal
                 }
             };
-            let (num_keys_merged, sub_level_new_root) = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, lsm);
-            let right_node = match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
-                NodeSelection::WholePage(nodes, right_node) => {
-                    let right_ref = right_node.node_ref().clone();
-                    let right_checks = check_right(right_node);
-                    clear_nodes(nodes, &right_ref);
-                    right_checks
-                }
-                NodeSelection::PartialPage(nodes, mut terminal_node) => {
-                    clear_nodes(nodes, terminal_node.node_ref());
-                    let search_pos = terminal_node.keys().binary_search(boundary);
-                    let pos = match search_pos {
-                        Ok(n) => n + 1,
-                        Err(n) => n
-                    }; 
-                    let mut new_keys = KS::init();
-                    let mut new_ptrs = PS::init();
-                    let mut num_keys = 0;
-                    for (i, k) in terminal_node.keys()[pos..].iter().enumerate() {
-                        new_keys.as_slice()[i] = k.clone();
-                        num_keys += 1;
+            let (num_keys_merged, sub_level_new_root) = merge_prune(level + 1, &sub_node, src_tree, dest_tree, boundary, prune, lsm);
+            let mut new_root = None;
+            if prune {
+                let right_node = match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
+                    NodeSelection::WholePage(nodes, right_node) => {
+                        let right_ref = right_node.node_ref().clone();
+                        let right_checks = check_right(right_node);
+                        clear_nodes(nodes, &right_ref);
+                        right_checks
                     }
-                    for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
-                        new_ptrs.as_slice()[i] = p.clone();
+                    NodeSelection::PartialPage(nodes, mut terminal_node) => {
+                        clear_nodes(nodes, terminal_node.node_ref());
+                        let search_pos = terminal_node.keys().binary_search(boundary);
+                        let pos = match search_pos {
+                            Ok(n) => n + 1,
+                            Err(n) => n
+                        }; 
+                        let mut new_keys = KS::init();
+                        let mut new_ptrs = PS::init();
+                        let mut num_keys = 0;
+                        for (i, k) in terminal_node.keys()[pos..].iter().enumerate() {
+                            new_keys.as_slice()[i] = k.clone();
+                            num_keys += 1;
+                        }
+                        for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
+                            new_ptrs.as_slice()[i] = p.clone();
+                        }
+                        {
+                            let innode = terminal_node.innode_mut();
+                            innode.keys = new_keys;
+                            innode.ptrs = new_ptrs;
+                            innode.len = num_keys;
+                        }
+                        check_right(terminal_node)
                     }
-                    {
-                        let innode = terminal_node.innode_mut();
-                        innode.keys = new_keys;
-                        innode.ptrs = new_ptrs;
-                        innode.len = num_keys;
-                    }
-                    check_right(terminal_node)
-                }
-            };
-            let new_root = {
-                if let Some(sub_level_new_root) = sub_level_new_root {
-                    if cfg!(debug_assertions) {
+                };
+                new_root = {
+                    if let Some(sub_level_new_root) = sub_level_new_root {
+                        if cfg!(debug_assertions) {
+                            match right_node {
+                                RightCheck::SinglePtr => {},
+                                _ => panic!("Unexpected node status")
+                            }
+                        }
+                        Some(sub_level_new_root)
+                    } else {
                         match right_node {
-                            RightCheck::SinglePtr => {},
-                            _ => panic!("Unexpected node status")
+                            RightCheck::Normal => None,
+                            RightCheck::LevelTerminal(node) => Some(node),
+                            RightCheck::SinglePtr => unreachable!(),
                         }
                     }
-                    Some(sub_level_new_root)
-                } else {
-                    match right_node {
-                        RightCheck::Normal => None,
-                        RightCheck::LevelTerminal(node) => Some(node),
-                        RightCheck::SinglePtr => unreachable!(),
-                    }
-                }
-            };
+                };
+            }
             return (num_keys_merged, new_root);
         }
     }
@@ -247,7 +250,7 @@ where
     let res = read_node(node, |node: &NodeReadHandler<KS, PS>| {
         let node_keys = node.keys();
         let node_len = node_keys.len();
-        if node.len() < 2 {
+        if node.len() < 1 {
             return Err(node.ptrs()[0].clone());
         }
         // Pick half of the keys in the root
@@ -267,21 +270,36 @@ pub async fn level_merge<KS, PS>(
     level: usize,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
+    prune: bool
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!("Merging LSM tree level {}", level);
-    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
-    debug_assert!(verification::is_tree_in_order(&src_tree, level));
     let root = src_tree.get_root();
     let key_boundary = select_boundary::<KS, PS>(&root);
+    merge_with_boundary(level, src_tree, dest_tree, &key_boundary, prune).await
+}
+
+pub async fn merge_with_boundary<KS, PS>(
+    level: usize,
+    src_tree: &BPlusTree<KS, PS>,
+    dest_tree: &dyn LevelTree,
+    key_boundary: &EntryKey,
+    prune: bool
+) -> usize
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
     debug!(
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
-    let (num_keys, new_root) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, level);
+    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+    debug_assert!(verification::is_tree_in_order(&src_tree, level));
+    let (num_keys, new_root) = merge_prune(0, &src_tree.get_root(), src_tree, dest_tree, &key_boundary, prune, level);
     if let Some(new_root) = new_root {
         let new_root_ref = new_root.node_ref().clone();
         debug!("Level merge update source root {:?}", &new_root_ref);

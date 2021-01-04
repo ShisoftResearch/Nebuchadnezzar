@@ -109,7 +109,7 @@ impl NodeCellRef {
 
     pub fn persist(
         &self,
-        deletion: &DeletionSet,
+        deletion: &Arc<DeletionSet>,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
         if !self.is_default() {

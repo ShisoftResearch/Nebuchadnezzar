@@ -3,6 +3,7 @@ use crate::index::ranged::lsm::btree::level::LEVEL_M;
 use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
+use crate::index::ranged::lsm::tree::DeletionSet;
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::custom_types::map::Map;
@@ -24,7 +25,7 @@ pub enum ChangingNode {
 
 pub struct NodeModified {
     pub node: NodeCellRef,
-    pub deletion: DeletionSet,
+    pub deletion: Arc<DeletionSet>,
 }
 
 lazy_static! {
@@ -100,7 +101,7 @@ where
         }
     }
 
-    pub fn to_cell(&self, deleted: &DeletionSetInneer) -> Cell {
+    pub fn to_cell(&self, deleted: &DeletionSet) -> Cell {
         let mut value = Value::Map(Map::new());
         let prev_id = {
             let node = read_unchecked::<KS, PS>(&self.prev);
@@ -290,11 +291,11 @@ where
         self.len = new_len;
     }
 
-    pub fn remove_contains(&mut self, set: &DeletionSetInneer) {
+    pub fn remove_contains(&mut self, set: &DeletionSet) {
         let remaining_keys = {
             let remaining = self.keys.as_slice()[..self.len]
                 .iter()
-                .filter(|&k| !set.remove(k))
+                .filter(|&k| !set.contains(k))
                 .collect_vec();
             if remaining.len() == self.len {
                 return;
@@ -384,7 +385,7 @@ where
             CHANGE_COUNTER.fetch_add(1, Relaxed),
             ChangingNode::Modified(NodeModified {
                 node: node.clone(),
-                deletion: tree.deleted.clone(),
+                deletion: tree.deletion.clone(),
             }),
         ));
     }

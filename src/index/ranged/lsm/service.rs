@@ -205,7 +205,7 @@ impl Service for LSMTreeService {
                 prop: tree.prop.read().clone(),
                 trees: tree
                     .tree
-                    .trees
+                    .disk_trees
                     .iter()
                     .map(|t| BTreeStat {
                         size: t.size(),

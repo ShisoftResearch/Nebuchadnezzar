@@ -2,6 +2,7 @@ use super::dump::dump_tree;
 use super::reconstruct::TreeConstructor;
 use super::*;
 use crate::ram::types::RandValue;
+use lightning::map::HashSet;
 use byteorder::BigEndian;
 use byteorder::WriteBytesExt;
 use dovahkiin::types::custom_types::id::Id;
@@ -56,10 +57,14 @@ fn node_size() {
     );
 }
 
+fn deletion_set() -> Arc<DeletionSet> {
+    Arc::new(HashSet::with_capacity(16))
+}
+
 #[test]
 fn init() {
     let _ = env_logger::try_init();
-    let tree = LevelBPlusTree::new();
+    let tree = LevelBPlusTree::new(&deletion_set());
     let id = Id::new(1, 2);
     let key = EntryKey::from_id(&id);
     info!("test insertion");
@@ -88,7 +93,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 #[test]
 fn crd() {
     let _ = env_logger::try_init();
-    let tree = LevelBPlusTree::new();
+    let tree = LevelBPlusTree::new(&deletion_set());
     std::fs::remove_dir_all("dumps").unwrap();
     std::fs::create_dir_all("dumps").unwrap();
     let num = env::var("BTREE_TEST_ITEMS")
@@ -189,7 +194,7 @@ fn crd() {
 #[test]
 pub fn alternative_insertion_pattern() {
     let _ = env_logger::try_init();
-    let tree = LevelBPlusTree::new();
+    let tree = LevelBPlusTree::new(&deletion_set());
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -229,7 +234,7 @@ pub fn alternative_insertion_pattern() {
 #[test]
 fn parallel() {
     let _ = env_logger::try_init();
-    let tree = Arc::new(LevelBPlusTree::new());
+    let tree = Arc::new(LevelBPlusTree::new(&deletion_set()));
     let num = env::var("BTREE_TEST_ITEMS")
         // this value cannot do anything useful to the test
         // must arrange a long-term test to cover every levels
@@ -324,8 +329,9 @@ type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
 async fn level_merge() {
     let _ = env_logger::try_init();
     let range = 1000;
-    let tree_1 = Arc::new(TinyLevelBPlusTree::new());
-    let tree_2 = Arc::new(LevelBPlusTree::new());
+    let deletion = deletion_set();
+    let tree_1 = Arc::new(TinyLevelBPlusTree::new(&deletion));
+    let tree_2 = Arc::new(LevelBPlusTree::new(&deletion));
     for i in 0..range {
         let n = i * 2;
         let id = Id::new(1, n);
@@ -350,7 +356,7 @@ async fn level_merge() {
     assert!(verification::is_tree_in_order(&*tree_2, 0));
 
     debug!("MERGING...");
-    let merged = tree_1.merge_to(999, &*tree_2).await;
+    let merged = tree_1.merge_to(999, &*tree_2, true).await;
     assert!(merged > 0);
 
     dump_tree(&tree_1, "lsm-tree_level_merge_1_after_dump.json");
@@ -385,7 +391,7 @@ fn level_merge_insertion() {
     let _ = env_logger::try_init();
     let range = 10000;
     let nums = range * 3;
-    let tree = Arc::new(TinyLevelBPlusTree::new());
+    let tree = Arc::new(TinyLevelBPlusTree::new(&deletion_set()));
     let mut numbers = (0..nums).collect_vec();
     let mut rng = thread_rng();
     numbers.as_mut_slice().shuffle(&mut rng);
@@ -503,6 +509,7 @@ fn reconstruct() {
             reconstructor.root(),
             Id::rand(),
             num as usize,
+            &deletion_set()
         )
     };
     dump_tree(&tree, "reconstruct_first_run_dump.json");

@@ -116,7 +116,7 @@ where
                 );
                 if remain_slots > 0 {
                     let ext_node = current_guard.extnode_mut(tree);
-                    ext_node.remove_contains(&*tree.deleted);
+                    ext_node.remove_contains(&*tree.deletion);
                     let selection = keys[merging_pos..keys_len]
                         .iter()
                         .filter(|&k| k < &ext_node.right_bound)

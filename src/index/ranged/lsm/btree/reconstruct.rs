@@ -116,7 +116,7 @@ where
     }
 }
 
-pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
+pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient, deletion: &Arc<DeletionSet>) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -161,7 +161,7 @@ where
         id = next_id;
     }
     let root = constructor.root();
-    BPlusTree::from_root(root, head_id, len)
+    BPlusTree::from_root(root, head_id, len, deletion)
 }
 
 unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
@@ -181,6 +181,7 @@ mod test {
     use crate::ram::types::*;
     use crate::rand::Rng;
     use crate::server::*;
+    use lightning::map::HashSet;
     use dovahkiin::types::custom_types::id::Id;
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
@@ -250,7 +251,8 @@ mod test {
                 .unwrap();
             last_id = new_id;
         }
-        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await);
+        let deletion = Arc::new(HashSet::with_capacity(8));
+        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion).await);
         let threads = all_keys
             .clone()
             .into_iter()
