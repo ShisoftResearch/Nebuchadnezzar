@@ -18,7 +18,7 @@ pub const LSM_TREE_MIGRATION_NAME: &'static str = "migration";
 pub const LAST_LEVEL_MULT_FACTOR: usize = 16;
 
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
-type LevelCusors = Vec<Box<dyn Cursor>>;
+type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS + 2]; // 2 for mem and trans mem
 pub type DeletionSet = HashSet<EntryKey>;
 
 lazy_static! {
@@ -185,15 +185,16 @@ impl LSMTreeCursor {
         let mem_tree_ptr = lsm_tree.mem_tree.load(Acquire, &guard);
         let trans_mem_tree_ptr = lsm_tree.trans_mem_tree.load(Acquire, &guard);
         let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
-        let mut cursors = vec![
+        let mut cursors = [
             mem_tree.seek_for(key, ordering),
             disk_trees[0].seek_for(key, ordering),
             disk_trees[1].seek_for(key, ordering),
             disk_trees[2].seek_for(key, ordering),
+            box DummyCursor // for trans mem
         ];
         if !trans_mem_tree_ptr.is_null() && trans_mem_tree_ptr != mem_tree_ptr {
             let trans_mem_tree = unsafe { trans_mem_tree_ptr.as_ref().unwrap() };
-            cursors.push(trans_mem_tree.seek_for(key, ordering));
+            *cursors.last_mut().unwrap() = trans_mem_tree.seek_for(key, ordering);
         }
         let current = Self::leading_tree_key(&cursors, ordering);
         let deletion = lsm_tree.deletion.clone();
@@ -318,3 +319,10 @@ type Level2Tree = BPlusTree<Level2TreeKeySlice, Level2TreePtrSlice>;
 
 unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}
+
+struct DummyCursor;
+
+impl Cursor for DummyCursor {
+    fn next(&mut self) -> Option<EntryKey> { None }
+    fn current(&self) -> Option<&EntryKey> { None }
+}
