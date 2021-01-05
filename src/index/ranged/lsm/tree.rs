@@ -117,7 +117,8 @@ impl LSMTree {
                 self.mem_tree.store(new_mem_tree_ptr, Release);
                 info!("Starting moving memory tree...");
                 mem_tree.merge_all_to(0, &*self.disk_trees[0], false);
-                self.trans_mem_tree.store(Shared::null(), Acquire);
+                info!("Memory tree merge completed, reset trans tree and destory old tree");
+                self.trans_mem_tree.store(Shared::null(), Release);
                 unsafe {
                     guard.defer_destroy(mem_tree_ptr);
                 }
