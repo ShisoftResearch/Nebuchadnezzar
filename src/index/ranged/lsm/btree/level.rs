@@ -245,8 +245,13 @@ where
             lsm
         );
         if node_right <= right_boundary {
-            let next_right = read_unchecked(next_node.right_ref().unwrap());
-            debug!("Selection collected page {:?}", next_node.node_ref());
+            let next_right_ref = next_node.right_ref().unwrap();
+            if next_right_ref.is_default() {
+                debug!("Collected all {} whole pages at level {}", collected.len(), level);
+                return NodeSelection::WholePage(collected, next_node);
+            }
+            let next_right = read_unchecked(next_right_ref);
+            trace!("Selection collected page {:?}", next_node.node_ref());
             collected.push(next_node);
             next_node = next_right;
             if next_node.first_key() >= right_boundary {
@@ -315,8 +320,10 @@ where
         "Level merge level {} with boundary {:?}",
         level, key_boundary
     );
-    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
-    debug_assert!(verification::is_tree_in_order(&src_tree, level));
+    if cfg!(debug_assertions) {
+        verification::tree_has_no_empty_node(&src_tree);
+        verification::is_tree_in_order(&src_tree, level);
+    }
     debug!("Start merge prune level {}", level);
     let (num_keys, new_root) = merge_prune(
         0,
@@ -327,12 +334,15 @@ where
         prune,
         level,
     ); 
+    debug!("Merged {} keys, pruning: {}", num_keys, prune);
     if let Some(new_root_ref) = new_root {
         debug!("Level merge update source root {:?}", &new_root_ref);
         *src_tree.root.write() = new_root_ref;
     }
-    debug_assert!(verification::tree_has_no_empty_node(&src_tree));
-    debug_assert!(verification::is_tree_in_order(&src_tree, level));
+    if prune {
+        debug_assert!(verification::tree_has_no_empty_node(&src_tree));
+        debug_assert!(verification::is_tree_in_order(&src_tree, level));
+    }
     debug!("MERGE LEVEL {} COMPLETED", level);
     return num_keys;
 }
