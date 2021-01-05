@@ -275,7 +275,7 @@ where
     }
 }
 
-pub async fn level_merge<KS, PS>(
+pub fn level_merge<KS, PS>(
     level: usize,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
@@ -288,10 +288,10 @@ where
     debug!("Merging LSM tree level {}", level);
     let root = src_tree.get_root();
     let key_boundary = select_boundary::<KS, PS>(&root);
-    merge_with_boundary(level, src_tree, dest_tree, &key_boundary, prune).await
+    merge_with_boundary(level, src_tree, dest_tree, &key_boundary, prune)
 }
 
-pub async fn merge_with_boundary<KS, PS>(
+pub fn merge_with_boundary<KS, PS>(
     level: usize,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
@@ -324,8 +324,6 @@ where
     }
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
-    debug!("Merge and pruned level {}, waiting for storage", level);
-    storage::wait_until_updated().await;
     debug!("MERGE LEVEL {} COMPLETED", level);
     return num_keys;
 }

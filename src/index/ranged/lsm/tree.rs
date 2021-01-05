@@ -115,23 +115,26 @@ impl LSMTree {
                 let new_mem_tree_ptr = Owned::new(new_mem_tree).into_shared(&guard);
                 self.trans_mem_tree.store(mem_tree_ptr, Release);
                 self.mem_tree.store(new_mem_tree_ptr, Release);
+                info!("Starting moving memory tree...");
                 mem_tree.merge_all_to(0, &*self.disk_trees[0], false);
                 self.trans_mem_tree.store(Shared::null(), Acquire);
                 unsafe {
                     guard.defer_destroy(mem_tree_ptr);
                 }
+                merged = true;
                 info!("Memory tree merging completed");
             } else {
                 trace!("Memory tree not oversized");
             }
         }
+        storage::wait_until_updated().await;
         for i in 0..self.disk_trees.len() - 1 {
             let level = i + 1;
             if self.disk_trees[i].oversized() {
                 info!("Level {} tree oversized, merging", level);
                 self.disk_trees[i]
-                    .merge_to(level, &*self.disk_trees[i + 1], true)
-                    .await;
+                    .merge_to(level, &*self.disk_trees[i + 1], true);
+                storage::wait_until_updated().await;
                 info!("Level {} merge completed", level);
                 merged = true;
             } else {

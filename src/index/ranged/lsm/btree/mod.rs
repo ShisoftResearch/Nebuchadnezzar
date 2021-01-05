@@ -266,13 +266,13 @@ pub trait LevelTree: Sync + Send {
         level: usize,
         target: &'a dyn LevelTree,
         prune: bool,
-    ) -> BoxFuture<'a, usize>;
+    ) -> usize;
     fn merge_all_to<'a>(
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
         prune: bool,
-    ) -> BoxFuture<'a, usize>;
+    ) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
@@ -310,8 +310,8 @@ where
         level: usize,
         target: &'a dyn LevelTree,
         prune: bool,
-    ) -> BoxFuture<'a, usize> {
-        async move { level::level_merge(level, self, target, prune).await }.boxed()
+    ) -> usize {
+        level::level_merge(level, self, target, prune)
     }
 
     fn merge_all_to<'a>(
@@ -319,9 +319,8 @@ where
         level: usize,
         target: &'a dyn LevelTree,
         prune: bool,
-    ) -> BoxFuture<'a, usize> {
-        async move { level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune).await }
-            .boxed()
+    ) -> usize {
+        level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune)
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -369,7 +368,7 @@ impl LevelTree for DummyLevelTree {
         _level: usize,
         _target: &'a dyn LevelTree,
         _prune: bool,
-    ) -> BoxFuture<'a, usize> {
+    ) -> usize {
         unreachable!()
     }
 
@@ -378,7 +377,7 @@ impl LevelTree for DummyLevelTree {
         _level: usize,
         _target: &'a dyn LevelTree,
         _prune: bool,
-    ) -> BoxFuture<'a, usize> {
+    ) -> usize {
         unreachable!()
     }
 
