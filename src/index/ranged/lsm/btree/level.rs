@@ -25,20 +25,19 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    WholePage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>),
-    PartialPage(Vec<NodeWriteGuard<KS, PS>>, NodeWriteGuard<KS, PS>),
+    WholePage(Vec<NodeReadHandler<KS, PS>>, NodeReadHandler<KS, PS>),
+    PartialPage(Vec<NodeReadHandler<KS, PS>>, NodeReadHandler<KS, PS>),
 }
 
-// Both src and dest tree MUST be immutable
 fn merge_prune<KS, PS>(
     level: usize,
     node: &NodeCellRef,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
-    prune: bool,
+    prune_src: bool,
     lsm: usize,
-) -> (usize, Option<NodeWriteGuard<KS, PS>>)
+) -> (usize, Option<NodeCellRef>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -46,74 +45,78 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            if let NodeSelection::WholePage(nodes, mut new_first) =
+            debug!("Selecting external nodes in boundary {:?}, tree level {}, lsm {}", boundary, level, lsm);
+            if let NodeSelection::WholePage(nodes, new_first) =
                 select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm)
             {
-                let new_first_ref = new_first.node_ref().clone();
                 let head_id = nodes[0].ext_id();
-                new_first.extnode_mut(src_tree).id = head_id;
-                new_first.left_ref_mut().map(|lr| *lr = Default::default());
-                drop(new_first);
                 debug_assert!(
                     !nodes.is_empty(),
                     "Cannot find any keys in range in external with boundary {:?}",
                     boundary
                 );
-                let mut num_keys_merged = 0;
                 debug!("Selected {} pages to merge", nodes.len());
-                for mut node in nodes {
-                    let node_id = node.ext_id();
-                    let node_len = node.len();
-                    let deleted_keys = node
+                let deleted_keys = nodes
+                    .iter()
+                    .map(|node| {
+                        node
                         .keys()
                         .iter()
                         .filter(|k| src_tree.deletion.contains(k))
                         .cloned()
-                        .collect_vec();
-                    let merging_keys = node.extnode_mut_no_persist().keys.as_slice()[..node_len]
-                        .iter_mut()
+                    })
+                    .flatten();
+                let merging_keys = nodes
+                    .iter()
+                    .map(|node| {
+                        node.keys()
+                        .iter()
                         .filter(|k| !src_tree.deletion.contains(k))
-                        .map(|k| mem::take(k))
-                        .collect_vec();
-                    let num_merging_keys = merging_keys.len();
-                    num_keys_merged += num_merging_keys;
-                    debug!(
-                        "Collected {} keys, merging to destination tree",
-                        num_merging_keys
-                    );
-                    dest_tree.merge_with_keys(box merging_keys);
-                    if prune {
-                        debug!("Merge completed, cleanup");
-                        clear_node(node, &new_first_ref);
-                        if node_id != head_id {
-                            external::make_deleted::<KS, PS>(&node_id);
-                        }
-                        src_tree.len.fetch_sub(num_merging_keys, Ordering::Relaxed);
+                        .map(|k| k.clone())
+                    })
+                    .flatten()
+                    .collect_vec();
+                let num_keys_merged = merging_keys.len();
+                debug!(
+                    "Collected {} keys at level {}, merging to destination tree",
+                    num_keys_merged, level
+                );
+                dest_tree.merge_with_keys(box merging_keys);
+                debug!("Merge completed in external level");
+                if prune_src {
+                    debug!("Pruning source tree for {} external pages", nodes.len());
+                    for node in nodes.into_iter() {
+                        let node_ref = node.node_ref().clone();
+                        drop(node); // unlock read
+                        let node = write_node::<KS, PS>(&node_ref);
+                        clear_node(node, new_first.node_ref());
                     }
+                    let new_first_ref = new_first.node_ref().clone();
+                    drop(new_first);
+                    let mut new_first = write_node::<KS, PS>(&new_first_ref);
+                    new_first.extnode_mut(src_tree).id = head_id;
+                    debug!("Source tree external nodes pruned");
                 }
-                debug!("Merge prune completed in external level");
                 return (num_keys_merged, None);
             } else {
+                error!("Found partial external node in selection");
                 unreachable!();
             }
         }
         MutSearchResult::Internal(sub_node) => {
-            enum RightCheck<KS, PS>
-            where
-                KS: Slice<EntryKey> + Debug + 'static,
-                PS: Slice<NodeCellRef> + 'static,
+            enum RightCheck
             {
                 SinglePtr,
-                LevelTerminal(NodeWriteGuard<KS, PS>),
+                LevelTerminal(NodeCellRef),
                 Normal,
             }
-            let check_right = |node: NodeWriteGuard<KS, PS>| {
+            let check_right = |node: NodeReadHandler<KS, PS>| {
                 if node.right_ref().unwrap().is_default() {
                     debug_assert_eq!(node.right_bound(), &EntryKey::max());
                     if node.len() == 0 {
                         RightCheck::SinglePtr
                     } else {
-                        RightCheck::LevelTerminal(node)
+                        RightCheck::LevelTerminal(node.right_ref().unwrap().clone())
                     }
                 } else {
                     debug_assert_ne!(node.right_bound(), &EntryKey::max());
@@ -127,18 +130,16 @@ where
                 src_tree,
                 dest_tree,
                 boundary,
-                prune,
+                prune_src,
                 lsm,
             );
             let mut new_root = None;
-            if prune {
+            if prune_src {
                 let right_node =
                     match select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm) {
                         NodeSelection::WholePage(nodes, right_node) => {
-                            let right_ref = right_node.node_ref().clone();
-                            let right_checks = check_right(right_node);
-                            clear_nodes(nodes, &right_ref);
-                            right_checks
+                            clear_nodes(nodes, right_node.node_ref());
+                            check_right(right_node)
                         }
                         NodeSelection::PartialPage(nodes, mut terminal_node) => {
                             clear_nodes(nodes, terminal_node.node_ref());
@@ -157,13 +158,16 @@ where
                             for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
                                 new_ptrs.as_slice()[i] = p.clone();
                             }
+                            let terminal_ref = terminal_node.node_ref().clone();
+                            let right_stat = check_right(terminal_node);
                             {
+                                let mut terminal_node = write_node(&terminal_ref);
                                 let innode = terminal_node.innode_mut();
                                 innode.keys = new_keys;
                                 innode.ptrs = new_ptrs;
                                 innode.len = num_keys;
                             }
-                            check_right(terminal_node)
+                            right_stat
                         }
                     };
                 new_root = {
@@ -199,12 +203,15 @@ where
     node.left_ref_mut().map(|r| *r = right_ref.clone());
 }
 
-fn clear_nodes<KS, PS>(nodes: Vec<NodeWriteGuard<KS, PS>>, right_ref: &NodeCellRef)
+fn clear_nodes<KS, PS>(nodes: Vec<NodeReadHandler<KS, PS>>, right_ref: &NodeCellRef)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    for node in nodes {
+    for node in nodes.into_iter() {
+        let node_ref = node.node_ref().clone();
+        drop(node);
+        let node = write_node::<KS, PS>(&node_ref);
         clear_node(node, right_ref);
     }
 }
@@ -219,11 +226,11 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let first_node = write_node::<KS, PS>(first_node);
+    let first_node = read_unchecked(first_node);
     if first_node.right_bound() > right_boundary {
         return NodeSelection::PartialPage(vec![], first_node);
     }
-    let mut next_node = write_node(first_node.right_ref().unwrap());
+    let mut next_node = read_unchecked(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
         let first_key = next_node.first_key();
@@ -238,14 +245,16 @@ where
             lsm
         );
         if node_right <= right_boundary {
-            let next_right = write_node(next_node.right_ref().unwrap());
+            let next_right = read_unchecked(next_node.right_ref().unwrap());
+            debug!("Selection collected page {:?}", next_node.node_ref());
             collected.push(next_node);
             next_node = next_right;
             if next_node.first_key() >= right_boundary {
-                trace!("Collected {} nodes at level {}", collected.len(), level);
+                debug!("Collected {} whole pages at level {}", collected.len(), level);
                 return NodeSelection::WholePage(collected, next_node);
             }
         } else {
+            debug!("Collected {} pages and partial at level {}", collected.len(), level);
             return NodeSelection::PartialPage(collected, next_node);
         }
     }
@@ -308,6 +317,7 @@ where
     );
     debug_assert!(verification::tree_has_no_empty_node(&src_tree));
     debug_assert!(verification::is_tree_in_order(&src_tree, level));
+    debug!("Start merge prune level {}", level);
     let (num_keys, new_root) = merge_prune(
         0,
         &src_tree.get_root(),
@@ -316,9 +326,8 @@ where
         &key_boundary,
         prune,
         level,
-    );
-    if let Some(new_root) = new_root {
-        let new_root_ref = new_root.node_ref().clone();
+    ); 
+    if let Some(new_root_ref) = new_root {
         debug!("Level merge update source root {:?}", &new_root_ref);
         *src_tree.root.write() = new_root_ref;
     }
