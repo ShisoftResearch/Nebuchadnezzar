@@ -93,12 +93,12 @@ where
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
-            trace!("Merge into external at level {}", level);
+            debug!("Merge into external at level {} with {} keys", level, keys.len());
             let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
             let mut new_pages = vec![];
-            trace!("Start external merging by pages");
+            debug!("Start external merging by pages");
             // merge by pages
             while merging_pos < keys_len {
                 let start_key = &keys[merging_pos];
@@ -161,7 +161,7 @@ where
                 }
                 trace!("Key {:?} merged", start_key);
             }
-            trace!("External merge completed at level {}", level);
+            debug!("External merge completed at level {}", level);
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {

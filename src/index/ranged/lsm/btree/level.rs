@@ -95,6 +95,7 @@ where
                     drop(new_first);
                     let mut new_first = write_node::<KS, PS>(&new_first_ref);
                     new_first.extnode_mut(src_tree).id = head_id;
+                    *new_first.left_ref_mut().unwrap() = NodeCellRef::default();
                     debug!("Source tree external nodes pruned");
                 }
                 return (num_keys_merged, None);
@@ -116,7 +117,7 @@ where
                     if node.len() == 0 {
                         RightCheck::SinglePtr
                     } else {
-                        RightCheck::LevelTerminal(node.right_ref().unwrap().clone())
+                        RightCheck::LevelTerminal(node.node_ref().clone())
                     }
                 } else {
                     debug_assert_ne!(node.right_bound(), &EntryKey::max());
@@ -321,27 +322,34 @@ where
         level, key_boundary
     );
     if cfg!(debug_assertions) {
+        debug!("Pre-merge verification at level {}", level);
         verification::tree_has_no_empty_node(&src_tree);
         verification::is_tree_in_order(&src_tree, level);
+        debug!("Pre-merge verification for source at level {} completed", level);
     }
-    debug!("Start merge prune level {}", level);
-    let (num_keys, new_root) = merge_prune(
-        0,
-        &src_tree.get_root(),
-        src_tree,
-        dest_tree,
-        &key_boundary,
-        prune,
-        level,
-    ); 
-    debug!("Merged {} keys, pruning: {}", num_keys, prune);
-    if let Some(new_root_ref) = new_root {
-        debug!("Level merge update source root {:?}", &new_root_ref);
-        *src_tree.root.write() = new_root_ref;
-    }
+    let num_keys = {
+        debug!("Start merge prune level {}", level);
+        let (num_keys, new_root) = merge_prune(
+            0,
+            &src_tree.get_root(),
+            src_tree,
+            dest_tree,
+            &key_boundary,
+            prune,
+            level,
+        ); 
+        debug!("Merged {} keys, pruning: {}", num_keys, prune);
+        if let Some(new_root_ref) = new_root {
+            debug!("Level merge update source root {:?}", &new_root_ref);
+            *src_tree.root.write() = new_root_ref;
+        }
+        num_keys
+    };
     if prune {
+        debug!("Post-merge verification at level {}", level);
         debug_assert!(verification::tree_has_no_empty_node(&src_tree));
         debug_assert!(verification::is_tree_in_order(&src_tree, level));
+        debug!("Post-merge verification for pruned source at level {} completed", level);
     }
     debug!("MERGE LEVEL {} COMPLETED", level);
     return num_keys;
