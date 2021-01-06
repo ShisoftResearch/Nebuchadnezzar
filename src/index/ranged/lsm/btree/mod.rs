@@ -191,7 +191,7 @@ where
                     .collect_vec();
                 let page_keys_serial = verification::are_keys_serial(page_keys.as_slice());
                 if !page_keys_serial {
-                    error!("Page first keys are not serial before merge root split {:?}", page_keys);
+                    error!("Page keys are not serial before merge root split {:?}", page_keys);
                     unreachable!();
                 }
             }

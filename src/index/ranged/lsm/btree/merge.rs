@@ -162,6 +162,15 @@ where
                 trace!("Key {:?} merged", start_key);
             }
             debug!("External merge completed at level {}", level);
+            if cfg!(debug_assertions) {
+                let page_keys = new_pages
+                    .iter()
+                    .map(|t| t.0.clone())
+                    .collect_vec();
+                if !verification::are_keys_serial(page_keys.as_slice()) {
+                    error!("External produced page keys not serial {:?}", page_keys);
+                }
+            }
             new_pages
         }
         MutSearchResult::Internal(sub_node) => {
@@ -170,6 +179,15 @@ where
             let mut new_pages = vec![];
             if lower_level_new_pages.len() > 0 {
                 merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
+            }
+            if cfg!(debug_assertions) {
+                let page_keys = new_pages
+                    .iter()
+                    .map(|t| t.0.clone())
+                    .collect_vec();
+                if !verification::are_keys_serial(page_keys.as_slice()) {
+                    error!("Internal produced page keys not serial {:?}", page_keys);
+                }
             }
             new_pages
         }
