@@ -15,7 +15,7 @@ use std::sync::Arc;
 pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
 pub const LSM_TREE_MIGRATION_NAME: &'static str = "migration";
-pub const LAST_LEVEL_MULT_FACTOR: usize = 16;
+pub const LAST_LEVEL_MULT_FACTOR: usize = 2;
 
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
 type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS + 2]; // 2 for mem and trans mem
@@ -41,17 +41,15 @@ impl LSMTree {
         let tree_m = LevelMTree::new(&deletion_ref);
         let tree_0 = Level0Tree::new(&deletion_ref);
         let tree_1 = Level1Tree::new(&deletion_ref);
-        let tree_2 = Level2Tree::new(&deletion_ref);
         tree_0.persist_root(neb_client).await;
         tree_1.persist_root(neb_client).await;
-        tree_2.persist_root(neb_client).await;
-        let level_ids = vec![tree_m.head_id(), tree_1.head_id(), tree_2.head_id()];
+        let level_ids = vec![tree_m.head_id(), tree_1.head_id()];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
             mem_tree: Atomic::new(box tree_m),
             trans_mem_tree: Atomic::null(),
-            disk_trees: [box tree_0, box tree_1, box tree_2],
+            disk_trees: [box tree_0, box tree_1],
             deletion: deletion_ref,
         }
     }
@@ -62,19 +60,16 @@ impl LSMTree {
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
         let trees_0_val = &trees[0usize];
         let trees_1_val = &trees[1usize];
-        let trees_2_val = &trees[2usize];
 
         let tree_0 =
             Level0Tree::from_head_id(trees_0_val.Id().unwrap(), neb_client, &deletion_ref).await;
         let tree_1 =
             Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client, &deletion_ref).await;
-        let tree_2 =
-            Level2Tree::from_head_id(trees_2_val.Id().unwrap(), neb_client, &deletion_ref).await;
 
         Self {
             mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
             trans_mem_tree: Atomic::null(),
-            disk_trees: [box tree_0, box tree_1, box tree_2],
+            disk_trees: [box tree_0, box tree_1],
             deletion: deletion_ref,
         }
     }
@@ -193,7 +188,6 @@ impl LSMTreeCursor {
             mem_tree.seek_for(key, ordering),
             disk_trees[0].seek_for(key, ordering),
             disk_trees[1].seek_for(key, ordering),
-            disk_trees[2].seek_for(key, ordering),
             box DummyCursor // for trans mem
         ];
         if !trans_mem_tree_ptr.is_null() && trans_mem_tree_ptr != mem_tree_ptr {
@@ -315,11 +309,6 @@ impl_btree_level!(LEVEL_1);
 type Level1TreeKeySlice = [EntryKey; LEVEL_1];
 type Level1TreePtrSlice = [NodeCellRef; LEVEL_1 + 1];
 type Level1Tree = BPlusTree<Level1TreeKeySlice, Level1TreePtrSlice>;
-
-impl_btree_level!(LEVEL_2);
-type Level2TreeKeySlice = [EntryKey; LEVEL_2];
-type Level2TreePtrSlice = [NodeCellRef; LEVEL_2 + 1];
-type Level2Tree = BPlusTree<Level2TreeKeySlice, Level2TreePtrSlice>;
 
 unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}

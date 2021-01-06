@@ -138,7 +138,7 @@ where
                     if is_node_locked::<KS, PS>(right_node_ref) {
                         unsafe {
                             warn!(
-                                "Right node {:?} is LOCKED!!! current id {:?} lock thread id {}",
+                                "Right node {:?} is LOCKED!!! current id {:?} lock thread id {:?}",
                                 &right_node_ref,
                                 std::thread::current().id(),
                                 right_node_ref.get_backtrace()

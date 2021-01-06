@@ -179,20 +179,22 @@ where
             root_new_pages.len()
         );
         if root_new_pages.len() > 0 {
-            debug_assert!(
-                verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),
-                "verification failed before merge root split"
-            );
-            debug_assert!(
-                verification::are_keys_serial(
-                    root_new_pages
-                        .iter()
-                        .map(|t| t.0.clone())
-                        .collect_vec()
-                        .as_slice()
-                ),
-                "verification failed before merge root split"
-            );
+            if cfg!(debug_assertions) {
+                let root_serial = verification::is_node_serial(&write_node::<KS, PS>(&self.get_root()));
+                if !root_serial { 
+                    error!("root serial verification failed before merge root split");
+                    unreachable!();
+                }
+                let page_keys = root_new_pages
+                    .iter()
+                    .map(|t| t.0.clone())
+                    .collect_vec();
+                let page_keys_serial = verification::are_keys_serial(page_keys.as_slice());
+                if !page_keys_serial {
+                    error!("Page first keys are not serial before merge root split {:?}", page_keys);
+                    unreachable!();
+                }
+            }
             debug_assert!(
                 root.ptr_eq(&self.get_root()),
                 "Merge target tree should always have a persistent root unless merge split"

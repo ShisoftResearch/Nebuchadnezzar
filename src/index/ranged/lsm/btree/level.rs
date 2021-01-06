@@ -8,17 +8,14 @@ use super::*;
 use itertools::Itertools;
 use std::cmp::min;
 use std::fmt::Debug;
-use std::sync::atomic::Ordering;
 
-pub const LEVEL_PAGE_DIFF_MULTIPLIER: usize = 4;
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
-pub const LEVEL_M: usize = 4;
+pub const LEVEL_M: usize = 8;
 pub const LEVEL_0: usize = LEVEL_M * LEVEL_M; // Smaller can be faster but more fragmented
-pub const LEVEL_1: usize = LEVEL_0 * LEVEL_PAGE_DIFF_MULTIPLIER;
-pub const LEVEL_2: usize = LEVEL_1 * LEVEL_PAGE_DIFF_MULTIPLIER;
+pub const LEVEL_1: usize = LEVEL_0 * LEVEL_M;
 
-pub const NUM_LEVELS: usize = 3;
+pub const NUM_LEVELS: usize = 2;
 
 enum NodeSelection<KS, PS>
 where

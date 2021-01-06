@@ -56,9 +56,7 @@ mod tests {
             client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
         );
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
-        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2)
-            * LAST_LEVEL_MULT_FACTOR
-            * 8;
+        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_1) * 8;
         let mut futs = FuturesUnordered::new();
         info!(
             "Testing ranged indexer preesure test with {} items",
