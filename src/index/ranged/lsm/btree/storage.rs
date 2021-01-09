@@ -38,8 +38,13 @@ pub async fn wait_until_updated() {
             return;
         }
     }
-    let newest = external::CHANGE_COUNTER.load(Ordering::Acquire) - 1; // fetch add
+    let counter = external::CHANGE_COUNTER.load(Ordering::Acquire);
+    if counter == 0 {
+        return;
+    }
+    let newest = counter - 1; // fetch add
     let ops = newest - CHANGE_PROGRESS.load(Ordering::Relaxed);
+    debug!("Waiting storage, {} ops to go", ops);
     loop {
         let current = CHANGE_PROGRESS.load(Ordering::Relaxed);
         if current >= newest {

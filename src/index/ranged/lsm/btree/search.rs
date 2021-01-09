@@ -10,7 +10,6 @@ pub fn search_node<KS, PS>(
     node_ref: &NodeCellRef,
     key: &EntryKey,
     ordering: Ordering,
-    deleted: &DeletionSet,
 ) -> RTCursor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -27,7 +26,6 @@ where
                 ordering,
                 page: None,
                 marker: PhantomData,
-                deleted: deleted.clone(),
                 current: None,
             };
             if let Some(right_node) = node.key_at_right_node(key) {
@@ -57,7 +55,7 @@ where
                         }
                         trace!("cursor pos have been corrected to {}", pos);
                     }
-                    Ok(RTCursor::new(pos, node_ref, ordering, deleted))
+                    Ok(RTCursor::new(pos, node_ref, ordering))
                 }
                 &NodeData::Internal(ref n) => {
                     trace!(

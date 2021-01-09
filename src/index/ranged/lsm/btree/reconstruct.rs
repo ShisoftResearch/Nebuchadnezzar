@@ -116,7 +116,11 @@ where
     }
 }
 
-pub async fn reconstruct_from_head_id<KS, PS>(head_id: Id, neb: &AsyncClient) -> BPlusTree<KS, PS>
+pub async fn reconstruct_from_head_id<KS, PS>(
+    head_id: Id,
+    neb: &AsyncClient,
+    deletion: &Arc<DeletionSet>,
+) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -161,7 +165,7 @@ where
         id = next_id;
     }
     let root = constructor.root();
-    BPlusTree::from_root(root, head_id, len)
+    BPlusTree::from_root(root, head_id, len, deletion)
 }
 
 unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
@@ -185,6 +189,7 @@ mod test {
     use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
     use itertools::Itertools;
+    use lightning::map::HashSet;
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -250,7 +255,8 @@ mod test {
                 .unwrap();
             last_id = new_id;
         }
-        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client).await);
+        let deletion = Arc::new(HashSet::with_capacity(8));
+        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion).await);
         let threads = all_keys
             .clone()
             .into_iter()
@@ -263,7 +269,7 @@ mod test {
                     let mut cursor = tree.seek(&key, Ordering::Forward);
                     assert_eq!(cursor.current().unwrap(), &key);
                     let mut rng = rand::thread_rng();
-                    if i > all_keys.len() / 2 && rng.gen_range(0, 50) == 1 {
+                    if i > all_keys.len() / 2 && rng.gen_range(0..50) == 1 {
                         for j in i..all_keys.len() {
                             assert_eq!(cursor.current().unwrap(), &all_keys[j]);
                             cursor.next();

@@ -1,4 +1,5 @@
 use crate::client::AsyncClient;
+use crate::index::ranged::lsm::tree::DeletionSet;
 pub use crate::index::ranged::trees::*;
 use crate::ram::types::RandValue;
 pub use cell_ref::NodeCellRef;
@@ -8,12 +9,11 @@ use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use external::page_schema;
 use external::*;
 use futures::future::BoxFuture;
-use futures::FutureExt;
+use std::collections::BTreeMap;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
 use level::LEVEL_TREE_DEPTH;
-use lightning::map::HashSet;
 use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
@@ -25,7 +25,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
 
 pub mod cell_ref;
@@ -46,11 +46,6 @@ pub mod verification;
 #[macro_use]
 pub mod marco;
 
-const DEL_SET_CAP: usize = 16;
-
-pub type DeletionSetInneer = HashSet<EntryKey>;
-pub type DeletionSet = Arc<DeletionSetInneer>;
-
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
@@ -64,7 +59,7 @@ where
     root_versioning: NodeCellRef,
     head_page_id: Id,
     len: AtomicUsize,
-    deleted: DeletionSet,
+    pub deletion: Arc<DeletionSet>,
     marker: PhantomData<(KS, PS)>,
 }
 
@@ -93,15 +88,15 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new() -> BPlusTree<KS, PS> {
+    pub fn new(deletion: &Arc<DeletionSet>) -> BPlusTree<KS, PS> {
         trace!("Creating B+ Tree, with capacity {}", KS::slice_len());
         let mut tree = BPlusTree {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::new(NodeData::None))),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
+            deletion: deletion.clone(),
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
@@ -115,21 +110,30 @@ where
 
     pub async fn persist_root(&self, neb: &Arc<crate::client::AsyncClient>) {
         let root = self.get_root();
-        root.persist(&self.deleted, &neb).await
+        root.persist(&self.deletion, &neb).await
     }
 
-    pub async fn from_head_id(head_id: &Id, neb: &AsyncClient) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb).await
+    pub async fn from_head_id(
+        head_id: &Id,
+        neb: &AsyncClient,
+        deletion: &Arc<DeletionSet>,
+    ) -> Self {
+        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion).await
     }
 
-    pub fn from_root(root: NodeCellRef, head_id: Id, len: usize) -> Self {
+    pub fn from_root(
+        root: NodeCellRef,
+        head_id: Id,
+        len: usize,
+        deletion: &Arc<DeletionSet>,
+    ) -> Self {
         BPlusTree {
             root: RwLock::new(root),
             root_versioning: NodeCellRef::default(),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
-            deleted: Arc::new(DeletionSetInneer::with_capacity(DEL_SET_CAP)),
             marker: PhantomData,
+            deletion: deletion.clone(),
         }
     }
 
@@ -138,7 +142,7 @@ where
     }
 
     pub fn seek(&self, key: &EntryKey, ordering: Ordering) -> RTCursor<KS, PS> {
-        search_node(&self.get_root(), key, ordering, &self.deleted)
+        search_node(&self.get_root(), key, ordering)
     }
 
     pub fn insert(&self, key: &EntryKey) -> bool {
@@ -158,7 +162,6 @@ where
             None => return false,
         }
         self.len.fetch_add(1, Relaxed);
-        self.deleted.remove(key);
         return true;
     }
 
@@ -176,20 +179,22 @@ where
             root_new_pages.len()
         );
         if root_new_pages.len() > 0 {
-            debug_assert!(
-                verification::is_node_serial(&write_node::<KS, PS>(&self.get_root())),
-                "verification failed before merge root split"
-            );
-            debug_assert!(
-                verification::are_keys_serial(
-                    root_new_pages
-                        .iter()
-                        .map(|t| t.0.clone())
-                        .collect_vec()
-                        .as_slice()
-                ),
-                "verification failed before merge root split"
-            );
+            if cfg!(debug_assertions) {
+                let root_serial = verification::is_node_serial(&write_node::<KS, PS>(&self.get_root()));
+                if !root_serial { 
+                    error!("root serial verification failed before merge root split");
+                    unreachable!();
+                }
+                let page_keys = root_new_pages
+                    .iter()
+                    .map(|t| t.0.clone())
+                    .collect_vec();
+                let page_keys_serial = verification::are_keys_serial(page_keys.as_slice());
+                if !page_keys_serial {
+                    error!("Page keys are not serial before merge root split {:?}", page_keys);
+                    unreachable!();
+                }
+            }
             debug_assert!(
                 root.ptr_eq(&self.get_root()),
                 "Merge target tree should always have a persistent root unless merge split"
@@ -214,7 +219,7 @@ where
                     // First, generate a innode with one key and two pointers
                     // The first pointer of the innode is original node (can be the root)
                     let new_node_ref = new_internal_node::<KS, PS>(&left_most_page, &mut new_pages);
-                    let mut this_level_new_pages = vec![];
+                    let mut this_level_new_pages = BTreeMap::new();
                     if !new_pages.is_empty() {
                         merge_into_internal::<KS, PS>(
                             &new_node_ref,
@@ -228,7 +233,7 @@ where
                         break;
                     } else {
                         // Have new pages to generate a new level
-                        new_pages = box this_level_new_pages;
+                        new_pages = this_level_new_pages;
                         left_most_page = new_node_ref;
                     }
                 }
@@ -258,12 +263,21 @@ where
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
-    fn merge_to<'a>(&'a self, level: usize, upper_level: &'a dyn LevelTree)
-        -> BoxFuture<'a, usize>;
+    fn merge_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> usize;
+    fn merge_all_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
-    fn mark_key_deleted(&self, key: &EntryKey) -> bool;
     fn dump(&self, f: &str);
     fn mid_key(&self) -> Option<EntryKey>;
     fn head_id(&self) -> Id;
@@ -296,9 +310,19 @@ where
     fn merge_to<'a>(
         &'a self,
         level: usize,
-        upper_level: &'a dyn LevelTree,
-    ) -> BoxFuture<'a, usize> {
-        async move { level::level_merge(level, self, upper_level).await }.boxed()
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> usize {
+        level::level_merge(level, self, target, prune)
+    }
+
+    fn merge_all_to<'a>(
+        &'a self,
+        level: usize,
+        target: &'a dyn LevelTree,
+        prune: bool,
+    ) -> usize {
+        level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune)
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -311,15 +335,6 @@ where
 
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
         box self.seek(key, ordering)
-    }
-
-    fn mark_key_deleted(&self, key: &EntryKey) -> bool {
-        if let Some(seek_key) = self.seek(key, Ordering::Forward).current() {
-            if seek_key == key {
-                return self.deleted.insert(key);
-            }
-        }
-        false
     }
 
     fn dump(&self, f: &str) {
@@ -353,8 +368,18 @@ impl LevelTree for DummyLevelTree {
     fn merge_to<'a>(
         &'a self,
         _level: usize,
-        _upper_level: &'a dyn LevelTree,
-    ) -> BoxFuture<'a, usize> {
+        _target: &'a dyn LevelTree,
+        _prune: bool,
+    ) -> usize {
+        unreachable!()
+    }
+
+    fn merge_all_to<'a>(
+        &'a self,
+        _level: usize,
+        _target: &'a dyn LevelTree,
+        _prune: bool,
+    ) -> usize {
         unreachable!()
     }
 
@@ -367,10 +392,6 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn seek_for(&self, _key: &EntryKey, _ordering: Ordering) -> Box<dyn Cursor> {
-        unreachable!()
-    }
-
-    fn mark_key_deleted(&self, _key: &EntryKey) -> bool {
         unreachable!()
     }
 

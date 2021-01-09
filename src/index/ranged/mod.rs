@@ -10,7 +10,6 @@ mod tests {
     use super::*;
     use crate::client::*;
     use crate::index::ranged::lsm::btree;
-    use crate::index::ranged::lsm::tree::LAST_LEVEL_MULT_FACTOR;
     use crate::index::EntryKey;
     use crate::ram::cell::*;
     use crate::ram::schema::*;
@@ -22,7 +21,7 @@ mod tests {
     use rand::seq::SliceRandom;
     use std::sync::Arc;
     use std::time::Duration;
-    use tokio::stream::StreamExt;
+    use tokio_stream::StreamExt;
 
     // #[ignore]
     #[tokio::test(flavor = "multi_thread")]
@@ -56,9 +55,7 @@ mod tests {
             client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
         );
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
-        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_2)
-            * LAST_LEVEL_MULT_FACTOR
-            * 8;
+        let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_1) * 3;
         let mut futs = FuturesUnordered::new();
         info!(
             "Testing ranged indexer preesure test with {} items",

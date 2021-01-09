@@ -85,6 +85,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    debug!("Checking node serial, lsm {} - level {}", lsm_level, tree_level);
     loop {
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
@@ -118,7 +119,7 @@ where
         let next = write_node(right_ref);
         if next.is_ref_none() {
             debug!(
-                "Node level check reached non node - {} - {}",
+                "Node level check reached non node - lsm {} - level {}",
                 lsm_level, tree_level
             );
             return true;
@@ -147,8 +148,10 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Checking tree {} in order...", level);
-    return ensure_level_in_order::<KS, PS>(&tree.get_root(), level, 0);
+    debug!("Checking tree level {} in order...", level);
+    let res = ensure_level_in_order::<KS, PS>(&tree.get_root(), level, 0);
+    debug!("Tree level {} ordering check result is {}", level, res);
+    return res;
 }
 
 fn ensure_level_in_order<KS, PS>(node: &NodeCellRef, lsm_level: usize, tree_level: usize) -> bool
@@ -156,25 +159,41 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    let first_node = write_node::<KS, PS>(&node);
+    debug!(
+        "Checking tree level in order, lsm {}, level {}, type {}, locking first node", 
+        lsm_level, tree_level, read_unchecked::<KS, PS>(node).type_name()
+    );
+    let first_node = write_node::<KS, PS>(node);
+    debug!("First node locked, lsm {}, level {}", lsm_level, tree_level);
     first_node.left_ref().map(|lr| {
-        debug_assert!(
-            lr.is_default(),
-            "Left node of first node is not default, {:?}, left node type {:?}, ref {:?}",
-            first_node.ext_id(),
-            read_unchecked::<KS, PS>(lr).type_name(),
-            lr
-        )
+        debug!("First node have a left ref {:?} check it is default", lr);
+        if !lr.is_default() {
+            error!(
+                "Left node of first node is not default, ref {:?}, first ref {:?}, id {:?}, left node type {:?}, ref {:?}",
+                lr,
+                first_node.node_ref(),
+                first_node.ext_id(),
+                read_unchecked::<KS, PS>(lr).type_name(),
+                lr
+            );
+            unreachable!();
+        }
     });
+    debug!("Checked first node left ref, lsm {}, level {}", lsm_level, tree_level);
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None,
     };
+    debug!("Checking node in serial, lsm {}, level {}", lsm_level, tree_level);
     if !is_node_level_serial(first_node, lsm_level, tree_level) {
+        debug!("Tree level not serial lsm {}, level {}", lsm_level, tree_level);
         return false;
     }
     if let Some(sub_level) = sub_ref {
-        return ensure_level_in_order::<KS, PS>(&sub_level, lsm_level, tree_level + 1);
+        debug!("Check level in order lsm {}, level {}", lsm_level, tree_level);
+        let res = ensure_level_in_order::<KS, PS>(&sub_level, lsm_level, tree_level + 1);
+        debug!("Level in ordering check result is {}, lsm {}, level {}", res, lsm_level, tree_level);
+        return res;
     }
     return true;
 }

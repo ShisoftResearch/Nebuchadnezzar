@@ -614,15 +614,18 @@ where
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
-        let mut guard = write_node::<KS, PS>(node_ref);
-        let guard_ref = &mut *guard;
+        let guard = read_unchecked::<KS, PS>(node_ref);
+        let guard_ref = &*guard;
         let cell = match guard_ref {
-            &mut NodeData::External(ref mut node) => Some(node.to_cell(&*deletion)),
-            &mut NodeData::Empty(_) => None,
-            _ => panic!(
-                "Cannot persist internal or other type of nodes, type {}",
-                guard_ref.type_name()
-            ),
+            &NodeData::External(ref node) => Some(node.to_cell(&*deletion)),
+            &NodeData::Empty(_) => None,
+            _ => {
+                error!(
+                    "Cannot persist internal or other type of nodes, type {}",
+                    guard_ref.type_name()
+                );
+                unreachable!();
+            },
         };
         let neb = neb.clone();
         async move {
@@ -706,6 +709,20 @@ where
 {
     pub fn node_ref(&self) -> &NodeCellRef {
         &self.node_ref
+    }
+}
+
+impl<KS, PS> Default for NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn default() -> Self {
+        Self {
+            version: 0,
+            node_ref: Default::default(),
+            mark: PhantomData
+        }
     }
 }
 
