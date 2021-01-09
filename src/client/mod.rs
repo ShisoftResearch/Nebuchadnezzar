@@ -147,6 +147,11 @@ impl AsyncClient {
             .map(|id| {
                 // Use mem::replace to avoid additional cost when hash map shriking by remove
                 let id_ref = id_cell_map.get_mut(id).unwrap();
+                if cfg!(debug_assertions) && id_ref.is_none() {
+                    let msg = format!("Cannot find {:?} for read_all_cells", id);
+                    error!("{}", msg);
+                    panic!(msg);
+                }
                 mem::replace(id_ref, None).unwrap()
             })
             .collect())
