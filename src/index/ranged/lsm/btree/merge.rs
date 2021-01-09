@@ -8,8 +8,8 @@ use std::fmt::Debug;
 
 pub fn merge_into_internal<KS, PS>(
     node: &NodeCellRef,
-    lower_level_new_pages: Box<Vec<(EntryKey, NodeCellRef)>>,
-    new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
+    lower_level_new_pages: BTreeMap<EntryKey, NodeCellRef>,
+    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -20,8 +20,8 @@ pub fn merge_into_internal<KS, PS>(
 
 pub fn merge_into_internal_guard<KS, PS>(
     mut node_guard: NodeWriteGuard<KS, PS>,
-    lower_level_new_pages: Box<Vec<(EntryKey, NodeCellRef)>>,
-    new_pages: &mut Vec<(EntryKey, NodeCellRef)>,
+    lower_level_new_pages: BTreeMap<EntryKey, NodeCellRef>,
+    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -36,7 +36,7 @@ pub fn merge_into_internal_guard<KS, PS>(
                 // TODO: check boundary
                 // full node, going to split
                 let (node_ref, key) = innode.split_insert(pivot, node, pos, true);
-                new_pages.push((key, node_ref));
+                new_pages.insert(key, node_ref);
             } else {
                 innode.insert_in_place(pivot, node, pos, true);
             }
@@ -47,7 +47,7 @@ pub fn merge_into_internal_guard<KS, PS>(
 
 pub fn new_internal_node<KS, PS>(
     left_most: &NodeCellRef,
-    new_pages: &mut Box<Vec<(EntryKey, NodeCellRef)>>,
+    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>
 ) -> NodeCellRef
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -55,7 +55,8 @@ where
 {
     let mut new_keys = KS::init();
     let mut new_ptrs = PS::init();
-    let (first_key, first_ptr) = new_pages.remove(0);
+    let first_key = new_pages.keys().next().unwrap().clone();
+    let first_ptr = new_pages.remove(&first_key).unwrap();
     new_ptrs.as_slice()[0] = left_most.clone();
     new_ptrs.as_slice()[1] = first_ptr;
     new_keys.as_slice()[0] = first_key;
@@ -81,7 +82,7 @@ pub fn merge_into_tree_node<KS, PS>(
     _parent: &NodeCellRef,
     keys: Box<Vec<EntryKey>>,
     level: usize,
-) -> Box<Vec<(EntryKey, NodeCellRef)>>
+) -> BTreeMap<EntryKey, NodeCellRef>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -97,7 +98,7 @@ where
             let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
-            let mut new_pages = vec![];
+            let mut new_pages = BTreeMap::new();
             debug!("Start external merging by pages");
             // merge by pages
             while merging_pos < keys_len {
@@ -157,7 +158,7 @@ where
                     drop(right_guard);
                     merging_pos += 1;
                     external::make_changed(&new_node, tree);
-                    new_pages.push((pivot, new_node));
+                    new_pages.insert(pivot, new_node);
                 }
                 trace!("Key {:?} merged", start_key);
             }
@@ -176,7 +177,7 @@ where
         MutSearchResult::Internal(sub_node) => {
             let lower_level_new_pages =
                 merge_into_tree_node(tree, &sub_node, node, keys, level + 1);
-            let mut new_pages = vec![];
+            let mut new_pages = BTreeMap::new();
             if lower_level_new_pages.len() > 0 {
                 merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
             }
@@ -199,5 +200,5 @@ where
             read_unchecked::<KS, PS>(&node).first_key()
         )
     }
-    return box new_pages;
+    return new_pages;
 }

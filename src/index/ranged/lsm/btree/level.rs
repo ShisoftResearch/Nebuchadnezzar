@@ -102,6 +102,7 @@ where
             }
         }
         MutSearchResult::Internal(sub_node) => {
+            #[derive(Debug)]
             enum RightCheck
             {
                 SinglePtr,
@@ -173,7 +174,7 @@ where
                         if cfg!(debug_assertions) {
                             match right_node {
                                 RightCheck::SinglePtr => {}
-                                _ => panic!("Unexpected node status"),
+                                _ => panic!("Unexpected node status {:?}", right_node),
                             }
                         }
                         Some(sub_level_new_root)
@@ -231,18 +232,9 @@ where
     let mut next_node = read_unchecked(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
-        let first_key = next_node.first_key();
         let node_right = next_node.right_bound();
-        debug_assert!(
-            first_key < right_boundary,
-            "First key {:?} out of bound {:?}, collected {}. Level {}, LSM {}",
-            first_key,
-            right_boundary,
-            collected.len(),
-            level,
-            lsm
-        );
         if node_right <= right_boundary {
+            let on_boundary = node_right == right_boundary;
             let next_right_ref = next_node.right_ref().unwrap();
             if next_right_ref.is_default() {
                 debug!("Collected all {} whole pages at level {}", collected.len(), level);
@@ -252,7 +244,7 @@ where
             trace!("Selection collected page {:?}", next_node.node_ref());
             collected.push(next_node);
             next_node = next_right;
-            if next_node.first_key() >= right_boundary {
+            if on_boundary || next_node.first_key() > right_boundary {
                 debug!("Collected {} whole pages at level {}", collected.len(), level);
                 return NodeSelection::WholePage(collected, next_node);
             }

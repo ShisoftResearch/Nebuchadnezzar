@@ -9,7 +9,7 @@ use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use external::page_schema;
 use external::*;
 use futures::future::BoxFuture;
-use futures::FutureExt;
+use std::collections::BTreeMap;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
@@ -219,7 +219,7 @@ where
                     // First, generate a innode with one key and two pointers
                     // The first pointer of the innode is original node (can be the root)
                     let new_node_ref = new_internal_node::<KS, PS>(&left_most_page, &mut new_pages);
-                    let mut this_level_new_pages = vec![];
+                    let mut this_level_new_pages = BTreeMap::new();
                     if !new_pages.is_empty() {
                         merge_into_internal::<KS, PS>(
                             &new_node_ref,
@@ -233,7 +233,7 @@ where
                         break;
                     } else {
                         // Have new pages to generate a new level
-                        new_pages = box this_level_new_pages;
+                        new_pages = this_level_new_pages;
                         left_most_page = new_node_ref;
                     }
                 }
