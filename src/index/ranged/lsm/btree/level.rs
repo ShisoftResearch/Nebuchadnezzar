@@ -6,7 +6,7 @@ use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
-use std::cmp::min;
+use std::{char::MAX, cmp::min};
 use std::fmt::Debug;
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
@@ -82,6 +82,7 @@ where
                 debug!("Merge completed in external level");
                 if prune_src {
                     debug!("Pruning source tree for {} external pages", nodes.len());
+                    debug_assert!(!new_first.node_ref().is_default());
                     for node in nodes.into_iter() {
                         let node_ref = node.node_ref().clone();
                         drop(node); // unlock read
@@ -113,13 +114,16 @@ where
                 if node.right_ref().unwrap().is_default() {
                     debug_assert_eq!(node.right_bound(), &EntryKey::max());
                     if node.len() == 0 {
+                        // This level should be canceled
                         RightCheck::SinglePtr
                     } else {
+                        // This level and the tree should be the new root
                         RightCheck::LevelTerminal(node.node_ref().clone())
                     }
                 } else {
                     debug_assert_ne!(node.right_bound(), &EntryKey::max());
                     debug_assert!(node.len() > 0);
+                    // General cases
                     RightCheck::Normal
                 }
             };
@@ -232,25 +236,30 @@ where
     let mut next_node = read_unchecked(first_node.right_ref().unwrap());
     let mut collected = vec![first_node];
     loop {
-        let node_right = next_node.right_bound();
-        if node_right <= right_boundary {
-            let on_boundary = node_right == right_boundary;
-            let next_right_ref = next_node.right_ref().unwrap();
-            if next_right_ref.is_default() {
-                debug!("Collected all {} whole pages at level {}", collected.len(), level);
+        {
+            let last_collected = &collected[collected.len() - 1];
+            if last_collected.right_bound() == right_boundary {
                 return NodeSelection::WholePage(collected, next_node);
             }
-            let next_right = read_unchecked(next_right_ref);
-            trace!("Selection collected page {:?}", next_node.node_ref());
+            if next_node.right_bound() > right_boundary {
+                // For partial page, next node is the node need to remove 
+                // partial of the nodes
+                return NodeSelection::PartialPage(collected, next_node);
+            }
+            if last_collected.right_bound() > right_boundary {
+                // We don't expect this
+                unreachable!();
+            }
+            if next_node.right_ref().unwrap().is_default() && right_boundary == &*MAX_ENTRY_KEY {
+                // Special case, there will be no next node
+                collected.push(next_node);
+                return NodeSelection::WholePage(collected, NodeReadHandler::default());
+            }
+            debug_assert!(!next_node.right_ref().unwrap().is_default());
+            debug_assert_ne!(next_node.right_bound(), &*MAX_ENTRY_KEY);
+            let new_next = read_unchecked(next_node.right_ref().unwrap());
             collected.push(next_node);
-            next_node = next_right;
-            if on_boundary || next_node.first_key() > right_boundary {
-                debug!("Collected {} whole pages at level {}", collected.len(), level);
-                return NodeSelection::WholePage(collected, next_node);
-            }
-        } else {
-            debug!("Collected {} pages and partial at level {}", collected.len(), level);
-            return NodeSelection::PartialPage(collected, next_node);
+            next_node = new_next;
         }
     }
 }

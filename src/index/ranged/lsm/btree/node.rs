@@ -712,6 +712,20 @@ where
     }
 }
 
+impl<KS, PS> Default for NodeReadHandler<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn default() -> Self {
+        Self {
+            version: 0,
+            node_ref: Default::default(),
+            mark: PhantomData
+        }
+    }
+}
+
 pub struct RemoveStatus {
     pub item_found: bool,
     pub removed: bool,
