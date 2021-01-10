@@ -21,7 +21,7 @@ pub fn merge_into_internal<KS, PS>(
 pub fn merge_into_internal_guard<KS, PS>(
     mut node_guard: NodeWriteGuard<KS, PS>,
     lower_level_new_pages: BTreeMap<EntryKey, NodeCellRef>,
-    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>
+    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>,
 ) where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -47,7 +47,7 @@ pub fn merge_into_internal_guard<KS, PS>(
 
 pub fn new_internal_node<KS, PS>(
     left_most: &NodeCellRef,
-    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>
+    new_pages: &mut BTreeMap<EntryKey, NodeCellRef>,
 ) -> NodeCellRef
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -94,7 +94,11 @@ where
             // merge keys into internal pages
             // this is a oneshot action.
             // after the merge, it will return all new inserted new pages to upper level
-            debug!("Merge into external at level {} with {} keys", level, keys.len());
+            debug!(
+                "Merge into external at level {} with {} keys",
+                level,
+                keys.len()
+            );
             let keys_len = keys.len();
             let mut merging_pos = 0;
             let mut current_guard = write_node::<KS, PS>(&node);
@@ -164,10 +168,7 @@ where
             }
             debug!("External merge completed at level {}", level);
             if cfg!(debug_assertions) {
-                let page_keys = new_pages
-                    .iter()
-                    .map(|t| t.0.clone())
-                    .collect_vec();
+                let page_keys = new_pages.iter().map(|t| t.0.clone()).collect_vec();
                 if !verification::are_keys_serial(page_keys.as_slice()) {
                     error!("External produced page keys not serial {:?}", page_keys);
                 }
@@ -182,10 +183,7 @@ where
                 merge_into_internal::<KS, PS>(node, lower_level_new_pages, &mut new_pages);
             }
             if cfg!(debug_assertions) {
-                let page_keys = new_pages
-                    .iter()
-                    .map(|t| t.0.clone())
-                    .collect_vec();
+                let page_keys = new_pages.iter().map(|t| t.0.clone()).collect_vec();
                 if !verification::are_keys_serial(page_keys.as_slice()) {
                     error!("Internal produced page keys not serial {:?}", page_keys);
                 }

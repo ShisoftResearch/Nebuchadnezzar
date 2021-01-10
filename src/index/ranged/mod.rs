@@ -94,7 +94,7 @@ mod tests {
             match cell_res {
                 Ok(cell) => {
                     assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
-                },
+                }
                 Err(e) => {
                     panic!("Expecting cell, found error {:?}", e);
                 }
@@ -134,7 +134,7 @@ mod tests {
             match cell_res {
                 Ok(cell) => {
                     assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
-                },
+                }
                 Err(e) => {
                     panic!("Expecting cell at round 2, found error {:?}", e);
                 }

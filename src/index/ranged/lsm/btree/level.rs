@@ -6,9 +6,9 @@ use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
-use std::{char::MAX, cmp::min};
-use std::fmt::Debug;
 use std::collections::HashSet;
+use std::fmt::Debug;
+use std::{char::MAX, cmp::min};
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
@@ -44,7 +44,10 @@ where
     let search = mut_first::<KS, PS>(node);
     match search {
         MutSearchResult::External => {
-            debug!("Selecting external nodes in boundary {:?}, tree level {}, lsm {}", boundary, level, lsm);
+            debug!(
+                "Selecting external nodes in boundary {:?}, tree level {}, lsm {}",
+                boundary, level, lsm
+            );
             if let NodeSelection::WholePage(nodes, new_first) =
                 select_nodes_in_boundary::<KS, PS>(node, boundary, level, lsm)
             {
@@ -59,11 +62,10 @@ where
                 nodes
                     .iter()
                     .map(|node| {
-                        node
-                        .keys()
-                        .iter()
-                        .filter(|k| src_tree.deletion.contains(k))
-                        .cloned()
+                        node.keys()
+                            .iter()
+                            .filter(|k| src_tree.deletion.contains(k))
+                            .cloned()
                     })
                     .flatten()
                     .for_each(|k| {
@@ -74,9 +76,9 @@ where
                     .iter()
                     .map(|node| {
                         node.keys()
-                        .iter()
-                        .filter(|k| !src_tree.deletion.contains(k))
-                        .map(|k| k.clone())
+                            .iter()
+                            .filter(|k| !src_tree.deletion.contains(k))
+                            .map(|k| k.clone())
                     })
                     .flatten()
                     .collect_vec();
@@ -111,8 +113,7 @@ where
         }
         MutSearchResult::Internal(sub_node) => {
             #[derive(Debug)]
-            enum RightCheck
-            {
+            enum RightCheck {
                 SinglePtr,
                 LevelTerminal(NodeCellRef),
                 Normal,
@@ -250,13 +251,16 @@ where
                 return NodeSelection::WholePage(collected, next_node);
             }
             if next_node.right_bound() > right_boundary {
-                // For partial page, next node is the node need to remove 
+                // For partial page, next node is the node need to remove
                 // partial of the nodes
                 return NodeSelection::PartialPage(collected, next_node);
             }
             if last_collected.right_bound() > right_boundary {
                 // We don't expect this
-                error!("Node selection enters unordered state, level {}, lsm {}", level, lsm);
+                error!(
+                    "Node selection enters unordered state, level {}, lsm {}",
+                    level, lsm
+                );
                 unreachable!();
             }
             if next_node.right_ref().unwrap().is_default() {
@@ -265,7 +269,10 @@ where
                     collected.push(next_node);
                     return NodeSelection::WholePage(collected, NodeReadHandler::default());
                 } else {
-                    error!("Node selection reaches to end without matching, level {}, lsm {}", level, lsm);
+                    error!(
+                        "Node selection reaches to end without matching, level {}, lsm {}",
+                        level, lsm
+                    );
                     unreachable!();
                 }
             }
@@ -339,7 +346,10 @@ where
         debug!("Pre-merge verification at level {}", level);
         verification::tree_has_no_empty_node(&src_tree);
         verification::is_tree_in_order(&src_tree, level);
-        debug!("Pre-merge verification for source at level {} completed", level);
+        debug!(
+            "Pre-merge verification for source at level {} completed",
+            level
+        );
     }
     let num_keys = {
         debug!("Start merge prune level {}", level);
@@ -352,7 +362,7 @@ where
             deleted,
             prune,
             level,
-        ); 
+        );
         debug!("Merged {} keys, pruning: {}", num_keys, prune);
         if let Some(new_root_ref) = new_root {
             debug!("Level merge update source root {:?}", &new_root_ref);
@@ -364,7 +374,10 @@ where
         debug!("Post-merge verification at level {}", level);
         debug_assert!(verification::tree_has_no_empty_node(&src_tree));
         debug_assert!(verification::is_tree_in_order(&src_tree, level));
-        debug!("Post-merge verification for pruned source at level {} completed", level);
+        debug!(
+            "Post-merge verification for pruned source at level {} completed",
+            level
+        );
     }
     debug!("MERGE LEVEL {} COMPLETED", level);
     return num_keys;

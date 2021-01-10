@@ -85,7 +85,10 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Checking node serial, lsm {} - level {}", lsm_level, tree_level);
+    debug!(
+        "Checking node serial, lsm {} - level {}",
+        lsm_level, tree_level
+    );
     loop {
         let right_ref = node.right_ref().unwrap();
         let right_bound = if !node.is_empty_node() {
@@ -160,8 +163,10 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     debug!(
-        "Checking tree level in order, lsm {}, level {}, type {}, locking first node", 
-        lsm_level, tree_level, read_unchecked::<KS, PS>(node).type_name()
+        "Checking tree level in order, lsm {}, level {}, type {}, locking first node",
+        lsm_level,
+        tree_level,
+        read_unchecked::<KS, PS>(node).type_name()
     );
     let first_node = write_node::<KS, PS>(node);
     debug!("First node locked, lsm {}, level {}", lsm_level, tree_level);
@@ -179,20 +184,35 @@ where
             unreachable!();
         }
     });
-    debug!("Checked first node left ref, lsm {}, level {}", lsm_level, tree_level);
+    debug!(
+        "Checked first node left ref, lsm {}, level {}",
+        lsm_level, tree_level
+    );
     let sub_ref = match &*first_node {
         &NodeData::Internal(ref n) => Some(n.ptrs.as_slice_immute()[0].clone()),
         _ => None,
     };
-    debug!("Checking node in serial, lsm {}, level {}", lsm_level, tree_level);
+    debug!(
+        "Checking node in serial, lsm {}, level {}",
+        lsm_level, tree_level
+    );
     if !is_node_level_serial(first_node, lsm_level, tree_level) {
-        debug!("Tree level not serial lsm {}, level {}", lsm_level, tree_level);
+        debug!(
+            "Tree level not serial lsm {}, level {}",
+            lsm_level, tree_level
+        );
         return false;
     }
     if let Some(sub_level) = sub_ref {
-        debug!("Check level in order lsm {}, level {}", lsm_level, tree_level);
+        debug!(
+            "Check level in order lsm {}, level {}",
+            lsm_level, tree_level
+        );
         let res = ensure_level_in_order::<KS, PS>(&sub_level, lsm_level, tree_level + 1);
-        debug!("Level in ordering check result is {}, lsm {}, level {}", res, lsm_level, tree_level);
+        debug!(
+            "Level in ordering check result is {}, lsm {}, level {}",
+            res, lsm_level, tree_level
+        );
         return res;
     }
     return true;

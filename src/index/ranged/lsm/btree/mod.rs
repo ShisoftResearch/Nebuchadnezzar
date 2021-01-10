@@ -9,7 +9,6 @@ use dovahkiin::types::{key_hash, PrimitiveArray, Value};
 pub use external::page_schema;
 use external::*;
 use futures::future::BoxFuture;
-use std::collections::BTreeMap;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
@@ -20,6 +19,8 @@ use parking_lot::RwLock;
 use search::*;
 use std::any::Any;
 use std::cell::UnsafeCell;
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::mem;
@@ -27,7 +28,6 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
-use std::collections::HashSet;
 
 pub mod cell_ref;
 mod cursor;
@@ -181,18 +181,19 @@ where
         );
         if root_new_pages.len() > 0 {
             if cfg!(debug_assertions) {
-                let root_serial = verification::is_node_serial(&write_node::<KS, PS>(&self.get_root()));
-                if !root_serial { 
+                let root_serial =
+                    verification::is_node_serial(&write_node::<KS, PS>(&self.get_root()));
+                if !root_serial {
                     error!("root serial verification failed before merge root split");
                     unreachable!();
                 }
-                let page_keys = root_new_pages
-                    .iter()
-                    .map(|t| t.0.clone())
-                    .collect_vec();
+                let page_keys = root_new_pages.iter().map(|t| t.0.clone()).collect_vec();
                 let page_keys_serial = verification::are_keys_serial(page_keys.as_slice());
                 if !page_keys_serial {
-                    error!("Page keys are not serial before merge root split {:?}", page_keys);
+                    error!(
+                        "Page keys are not serial before merge root split {:?}",
+                        page_keys
+                    );
                     unreachable!();
                 }
             }

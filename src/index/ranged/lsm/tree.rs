@@ -130,8 +130,7 @@ impl LSMTree {
             let level = i + 1;
             if self.disk_trees[i].oversized() {
                 info!("Level {} tree oversized, merging", level);
-                self.disk_trees[i]
-                    .merge_to(level, &*self.disk_trees[i + 1], &mut deleted, true);
+                self.disk_trees[i].merge_to(level, &*self.disk_trees[i + 1], &mut deleted, true);
                 storage::wait_until_updated().await;
                 info!("Level {} merge completed", level);
                 merged = true;
@@ -140,7 +139,10 @@ impl LSMTree {
             }
         }
         if !deleted.is_empty() {
-            debug!("LSM merges collected {} deleted keys, remove them from deletion set", deleted.len());
+            debug!(
+                "LSM merges collected {} deleted keys, remove them from deletion set",
+                deleted.len()
+            );
             for dk in deleted {
                 self.deletion.remove(&dk);
             }
@@ -196,7 +198,7 @@ impl LSMTreeCursor {
             mem_tree.seek_for(key, ordering),
             disk_trees[0].seek_for(key, ordering),
             disk_trees[1].seek_for(key, ordering),
-            box DummyCursor // for trans mem
+            box DummyCursor, // for trans mem
         ];
         if !trans_mem_tree_ptr.is_null() && trans_mem_tree_ptr != mem_tree_ptr {
             let trans_mem_tree = unsafe { trans_mem_tree_ptr.as_ref().unwrap() };
@@ -324,6 +326,10 @@ unsafe impl Sync for LSMTree {}
 struct DummyCursor;
 
 impl Cursor for DummyCursor {
-    fn next(&mut self) -> Option<EntryKey> { None }
-    fn current(&self) -> Option<&EntryKey> { None }
+    fn next(&mut self) -> Option<EntryKey> {
+        None
+    }
+    fn current(&self) -> Option<&EntryKey> {
+        None
+    }
 }

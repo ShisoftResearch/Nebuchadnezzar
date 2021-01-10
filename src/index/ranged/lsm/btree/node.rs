@@ -625,7 +625,7 @@ where
                     guard_ref.type_name()
                 );
                 unreachable!();
-            },
+            }
         };
         let neb = neb.clone();
         async move {
@@ -721,7 +721,7 @@ where
         Self {
             version: 0,
             node_ref: Default::default(),
-            mark: PhantomData
+            mark: PhantomData,
         }
     }
 }

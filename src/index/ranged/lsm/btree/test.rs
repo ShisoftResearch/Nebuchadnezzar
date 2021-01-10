@@ -11,6 +11,7 @@ use rand::distributions::Uniform;
 use rand::prelude::*;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
+use std::collections::HashSet as StdHashSet;
 use std::env;
 use std::fs::File;
 use std::io::Cursor as StdCursor;
@@ -19,7 +20,6 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::collections::HashSet as StdHashSet;
 
 extern crate env_logger;
 
