@@ -254,7 +254,7 @@ impl LSMTreeService {
                     let tree = &dist_tree.tree;
                     fast_mode = fast_mode | tree.merge_levels().await;
                     if tree.oversized() {
-                        info!("LSM Tree {:?} oversized, start migration", dist_tree.id);
+                        info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
                         let mid_key = tree.mid_key().unwrap();
                         let migration_target_id = Id::rand();
