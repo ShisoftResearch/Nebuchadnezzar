@@ -61,14 +61,16 @@ mod tests {
             "Testing ranged indexer preesure test with {} items",
             test_capacity
         );
-        debug!("Generating test set");
+        info!("Generating test set");
         let mut rng = rand::thread_rng();
         let mut nums = (0..test_capacity).collect_vec();
         let mut nums_2 = nums.clone();
+        let mut nums_3 = nums.clone();
         nums.as_mut_slice().shuffle(&mut rng);
         nums_2.as_mut_slice().shuffle(&mut rng);
-        debug!("Adding insertion tasks");
-        for i in nums {
+        nums_3.as_mut_slice().shuffle(&mut rng);
+        info!("Adding insertion tasks");
+        for i in nums_2 {
             let index_client = index_client.clone();
             let client = client.clone();
             futs.push(tokio::spawn(async move {
@@ -85,9 +87,22 @@ mod tests {
         while let Some(result) = futs.next().await {
             assert!(result.unwrap().unwrap(), "Insertion return false");
         }
+        info!("Verifiying insertion");
+        for i in &nums {
+            let id = Id::new(1, *i as u64);
+            let cell_res = client.read_cell(id).await.unwrap();
+            match cell_res {
+                Ok(cell) => {
+                    assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
+                },
+                Err(e) => {
+                    panic!("Expecting cell, found error {:?}", e);
+                }
+            }
+        }
         info!("All keys inserted. The background task should merging trees. Doing searches.");
         let mut futs = FuturesUnordered::new();
-        for (i, num) in nums_2.into_iter().enumerate() {
+        for (i, num) in nums_3.into_iter().enumerate() {
             let index_client = index_client.clone();
             futs.push(tokio::spawn(async move {
                 trace!("Seeking Id at {}, index {}", num, i);
@@ -112,7 +127,19 @@ mod tests {
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
-
+        info!("Verifiying insertion round 2");
+        for i in &nums {
+            let id = Id::new(1, *i as u64);
+            let cell_res = client.read_cell(id).await.unwrap();
+            match cell_res {
+                Ok(cell) => {
+                    assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
+                },
+                Err(e) => {
+                    panic!("Expecting cell at round 2, found error {:?}", e);
+                }
+            }
+        }
         info!("Scanning forward...");
         let mut rt_cursor = client::RangedQueryClient::seek(
             &index_client,
@@ -122,8 +149,8 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        for num in 0..test_capacity {
-            let id = Id::new(1, num as u64);
+        for num in &nums {
+            let id = Id::new(1, *num as u64);
             let current = rt_cursor.current().unwrap().0;
             assert_eq!(id, current);
             let _ = rt_cursor.next().await.unwrap();
