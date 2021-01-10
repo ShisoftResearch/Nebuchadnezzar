@@ -248,12 +248,18 @@ where
             }
             if last_collected.right_bound() > right_boundary {
                 // We don't expect this
+                error!("Node selection enters unordered state, level {}, lsm {}", level, lsm);
                 unreachable!();
             }
-            if next_node.right_ref().unwrap().is_default() && right_boundary == &*MAX_ENTRY_KEY {
-                // Special case, there will be no next node
-                collected.push(next_node);
-                return NodeSelection::WholePage(collected, NodeReadHandler::default());
+            if next_node.right_ref().unwrap().is_default() {
+                if right_boundary == &*MAX_ENTRY_KEY {
+                    // Special case, there will be no next node
+                    collected.push(next_node);
+                    return NodeSelection::WholePage(collected, NodeReadHandler::default());
+                } else {
+                    error!("Node selection reaches to end without matching, level {}, lsm {}", level, lsm);
+                    unreachable!();
+                }
             }
             debug_assert!(!next_node.right_ref().unwrap().is_default());
             debug_assert_ne!(next_node.right_bound(), &*MAX_ENTRY_KEY);
