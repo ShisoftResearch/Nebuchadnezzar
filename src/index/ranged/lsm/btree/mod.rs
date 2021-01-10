@@ -27,6 +27,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Arc;
+use std::collections::HashSet;
 
 pub mod cell_ref;
 mod cursor;
@@ -267,12 +268,14 @@ pub trait LevelTree: Sync + Send {
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
+        deleted: &mut HashSet<EntryKey>,
         prune: bool,
     ) -> usize;
     fn merge_all_to<'a>(
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
+        deleted: &mut HashSet<EntryKey>,
         prune: bool,
     ) -> usize;
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
@@ -311,18 +314,20 @@ where
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
+        deleted: &mut HashSet<EntryKey>,
         prune: bool,
     ) -> usize {
-        level::level_merge(level, self, target, prune)
+        level::level_merge(level, self, target, deleted, prune)
     }
 
     fn merge_all_to<'a>(
         &'a self,
         level: usize,
         target: &'a dyn LevelTree,
+        deleted: &mut HashSet<EntryKey>,
         prune: bool,
     ) -> usize {
-        level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, prune)
+        level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, deleted, prune)
     }
 
     fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
@@ -369,6 +374,7 @@ impl LevelTree for DummyLevelTree {
         &'a self,
         _level: usize,
         _target: &'a dyn LevelTree,
+        _deleted: &mut HashSet<EntryKey>,
         _prune: bool,
     ) -> usize {
         unreachable!()
@@ -378,6 +384,7 @@ impl LevelTree for DummyLevelTree {
         &'a self,
         _level: usize,
         _target: &'a dyn LevelTree,
+        _deleted: &mut HashSet<EntryKey>,
         _prune: bool,
     ) -> usize {
         unreachable!()

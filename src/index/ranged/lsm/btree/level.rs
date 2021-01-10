@@ -8,6 +8,7 @@ use super::*;
 use itertools::Itertools;
 use std::{char::MAX, cmp::min};
 use std::fmt::Debug;
+use std::collections::HashSet;
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
@@ -32,6 +33,7 @@ fn merge_prune<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
+    deleted: &mut HashSet<EntryKey>,
     prune_src: bool,
     lsm: usize,
 ) -> (usize, Option<NodeCellRef>)
@@ -53,7 +55,8 @@ where
                     boundary
                 );
                 debug!("Selected {} pages to merge", nodes.len());
-                let deleted_keys = nodes
+                // Update deleted key set
+                nodes
                     .iter()
                     .map(|node| {
                         node
@@ -62,7 +65,11 @@ where
                         .filter(|k| src_tree.deletion.contains(k))
                         .cloned()
                     })
-                    .flatten();
+                    .flatten()
+                    .for_each(|k| {
+                        deleted.insert(k);
+                    });
+                // Collect keys to merge to next level
                 let merging_keys = nodes
                     .iter()
                     .map(|node| {
@@ -133,6 +140,7 @@ where
                 src_tree,
                 dest_tree,
                 boundary,
+                deleted,
                 prune_src,
                 lsm,
             );
@@ -298,6 +306,7 @@ pub fn level_merge<KS, PS>(
     level: usize,
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
+    deleted: &mut HashSet<EntryKey>,
     prune: bool,
 ) -> usize
 where
@@ -307,7 +316,7 @@ where
     debug!("Merging LSM tree level {}", level);
     let root = src_tree.get_root();
     let key_boundary = select_boundary::<KS, PS>(&root);
-    merge_with_boundary(level, src_tree, dest_tree, &key_boundary, prune)
+    merge_with_boundary(level, src_tree, dest_tree, &key_boundary, deleted, prune)
 }
 
 pub fn merge_with_boundary<KS, PS>(
@@ -315,6 +324,7 @@ pub fn merge_with_boundary<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     key_boundary: &EntryKey,
+    deleted: &mut HashSet<EntryKey>,
     prune: bool,
 ) -> usize
 where
@@ -339,6 +349,7 @@ where
             src_tree,
             dest_tree,
             &key_boundary,
+            deleted,
             prune,
             level,
         ); 

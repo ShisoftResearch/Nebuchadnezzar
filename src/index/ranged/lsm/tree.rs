@@ -7,7 +7,8 @@ use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crossbeam_epoch::*;
-use lightning::map::HashSet;
+use lightning::map::HashSet as LFHashSet;
+use std::collections::HashSet as StdHashSet;
 use std::mem;
 use std::sync::atomic::Ordering::{Acquire, Release};
 use std::sync::Arc;
@@ -19,7 +20,7 @@ pub const LAST_LEVEL_MULT_FACTOR: usize = 2;
 
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
 type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS + 2]; // 2 for mem and trans mem
-pub type DeletionSet = HashSet<EntryKey>;
+pub type DeletionSet = LFHashSet<EntryKey>;
 
 lazy_static! {
     pub static ref LSM_TREE_SCHEMA_ID: u32 = key_hash(LSM_TREE_SCHEMA_NAME) as u32;
@@ -37,7 +38,7 @@ pub struct LSMTree {
 
 impl LSMTree {
     pub async fn create(neb_client: &Arc<AsyncClient>, id: &Id) -> Self {
-        let deletion_ref = Arc::new(HashSet::with_capacity(16));
+        let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
         let tree_m = LevelMTree::new(&deletion_ref);
         let tree_0 = Level0Tree::new(&deletion_ref);
         let tree_1 = Level1Tree::new(&deletion_ref);
@@ -55,7 +56,7 @@ impl LSMTree {
     }
 
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
-        let deletion_ref = Arc::new(HashSet::with_capacity(16));
+        let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
         let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
         let trees_0_val = &trees[0usize];
@@ -97,6 +98,7 @@ impl LSMTree {
 
     pub async fn merge_levels(&self) -> bool {
         let mut merged = false;
+        let mut deleted = StdHashSet::new();
         {
             let guard = crossbeam_epoch::pin();
             let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
@@ -111,7 +113,7 @@ impl LSMTree {
                 self.trans_mem_tree.store(mem_tree_ptr, Release);
                 self.mem_tree.store(new_mem_tree_ptr, Release);
                 info!("Starting moving memory tree...");
-                mem_tree.merge_all_to(0, &*self.disk_trees[0], false);
+                mem_tree.merge_all_to(0, &*self.disk_trees[0], &mut deleted, false);
                 info!("Memory tree merge completed, reset trans tree and destory old tree");
                 self.trans_mem_tree.store(Shared::null(), Release);
                 unsafe {
@@ -129,12 +131,18 @@ impl LSMTree {
             if self.disk_trees[i].oversized() {
                 info!("Level {} tree oversized, merging", level);
                 self.disk_trees[i]
-                    .merge_to(level, &*self.disk_trees[i + 1], true);
+                    .merge_to(level, &*self.disk_trees[i + 1], &mut deleted, true);
                 storage::wait_until_updated().await;
                 info!("Level {} merge completed", level);
                 merged = true;
             } else {
                 trace!("Level {} tree not oversized", level);
+            }
+        }
+        if !deleted.is_empty() {
+            debug!("LSM merges collected {} deleted keys, remove them from deletion set", deleted.len());
+            for dk in deleted {
+                self.deletion.remove(&dk);
             }
         }
         merged
