@@ -40,7 +40,7 @@ where
         left_bound: EntryKey,
     ) {
         let mut new_tree = false;
-        debug!("Push node at {}", level);
+        trace!("Push node at {}", level);
         if self.level_guards.len() < level + 1 {
             debug!("Creating new level {}", level);
             let mut new_root_innode = InNode::<KS, PS>::new(0, max_entry_key());
@@ -120,6 +120,7 @@ pub async fn reconstruct_from_head_id<KS, PS>(
     head_id: Id,
     neb: &AsyncClient,
     deletion: &Arc<DeletionSet>,
+    level: usize
 ) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -127,47 +128,46 @@ where
 {
     info!("Reconstructing level tree from head {:?}", head_id);
     let mut len = 0;
-    let mut constructor = TreeConstructor::<KS, PS>::new();
-    let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
-    let mut id = head_id;
-    let mut at_end = false;
-    while !at_end {
-        let cell = neb.read_cell(id).await.unwrap().unwrap();
-        let page = ExtNode::<KS, PS>::from_cell(&cell);
-        let next_id = page.next_id;
-        let prev_id = page.prev_id;
-        let mut node = page.node;
-        at_end = next_id.is_unit_id();
-        if at_end {
-            node.next = NodeCellRef::new_none::<KS, PS>();
-        }
-        let mut prev_lock = write_node::<KS, PS>(&prev_ref);
-        if node.len == 0 {
-            // skip this empty node and make it deleted
-            external::make_deleted::<KS, PS>(&node.id);
+    let root = {
+        let mut constructor = TreeConstructor::<KS, PS>::new();
+        let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
+        let mut id = head_id;
+        let mut at_end = false;
+        while !at_end {
+            let cell = neb.read_cell(id).await.unwrap().unwrap();
+            let page = ExtNode::<KS, PS>::from_cell(&cell);
+            let next_id = page.next_id;
+            let prev_id = page.prev_id;
+            let mut node = page.node;
+            at_end = next_id.is_unit_id();
             if at_end {
-                // if the empty node is the last node, assign the right none node to previous node
-                *prev_lock.right_ref_mut().unwrap() = node.next.clone();
+                node.next = NodeCellRef::new_none::<KS, PS>();
             }
-            continue;
+            let mut prev_lock = write_node::<KS, PS>(&prev_ref);
+            debug_assert!(prev_ref.is_default() || node.len != 0);
+            let first_key = node.keys.as_slice_immute()[0].clone();
+            len += node.len;
+            node.prev = prev_ref.clone();
+            let node_ref = NodeCellRef::new(Node::with_external(box node));
+            if !prev_lock.is_ref_none() {
+                *prev_lock.right_bound_mut() = first_key.clone();
+                *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
+            } else {
+                assert_eq!(prev_id, Id::unit_id());
+            }
+            constructor.push_extnode(&node_ref, first_key);
+            prev_ref = node_ref;
+            id = next_id;
         }
-        let first_key = node.keys.as_slice_immute()[0].clone();
-        len += node.len;
-        node.prev = prev_ref.clone();
-        let node_ref = NodeCellRef::new(Node::with_external(box node));
-        if !prev_lock.is_ref_none() {
-            *prev_lock.right_bound_mut() = first_key.clone();
-            *prev_lock.right_ref_mut().unwrap() = node_ref.clone();
-        } else {
-            assert_eq!(prev_id, Id::unit_id());
-        }
-        constructor.push_extnode(&node_ref, first_key);
-        prev_ref = node_ref;
-        id = next_id;
-    }
-    let root = constructor.root();
+        constructor.root()
+    };
     info!("Reconstruct tree {:?} completed", head_id);
-    BPlusTree::from_root(root, head_id, len, deletion)
+    let tree = BPlusTree::from_root(root, head_id, len, deletion);
+    debug!("Verifying reconstruction at {}", level);
+    // debug_assert!(verification::tree_has_no_empty_node(&tree));
+    debug_assert!(verification::is_tree_in_order(&tree, level));
+    debug!("Reconstruction verification completed at {}", level);
+    tree
 }
 
 unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
@@ -258,7 +258,7 @@ mod test {
             last_id = new_id;
         }
         let deletion = Arc::new(HashSet::with_capacity(8));
-        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion).await);
+        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0).await);
         let threads = all_keys
             .clone()
             .into_iter()

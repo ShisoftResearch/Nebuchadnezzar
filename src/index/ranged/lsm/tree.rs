@@ -65,10 +65,10 @@ impl LSMTree {
         info!("Record shows trees {:?}", trees);
         debug!("Recovering level 0 tree {:?}", tree_0_id);
         let tree_0 =
-            Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref).await;
+            Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref, 0).await;
         debug!("Recovering level 1 tree {:?}", tree_1_id);
         let tree_1 =
-            Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref).await;
+            Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref, 1).await;
         Self {
             mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
             trans_mem_tree: Atomic::null(),
@@ -131,7 +131,7 @@ impl LSMTree {
         for i in 0..self.disk_trees.len() - 1 {
             let level = i + 1;
             if self.disk_trees[i].oversized() {
-                info!("Level {} tree oversized, merging", level);
+                info!("Level {}, {:?} tree oversized, merging", level, self.disk_trees[i].head_id());
                 self.disk_trees[i].merge_to(level, &*self.disk_trees[i + 1], &mut deleted, true);
                 storage::wait_until_updated().await;
                 info!("Level {} merge completed", level);

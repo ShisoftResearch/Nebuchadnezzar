@@ -118,8 +118,9 @@ where
         head_id: &Id,
         neb: &AsyncClient,
         deletion: &Arc<DeletionSet>,
+        level: usize
     ) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion).await
+        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
     }
 
     pub fn from_root(

@@ -123,9 +123,11 @@ where
                     debug_assert_eq!(node.right_bound(), &EntryKey::max());
                     if node.len() == 0 {
                         // This level should be canceled
+                        debug_assert!(node.keys().len() == 0);
                         RightCheck::SinglePtr
                     } else {
                         // This level and the tree should be the new root
+                        debug_assert!(node.keys().len() > 0);
                         RightCheck::LevelTerminal(node.node_ref().clone())
                     }
                 } else {
@@ -187,7 +189,14 @@ where
                         if cfg!(debug_assertions) {
                             match right_node {
                                 RightCheck::SinglePtr => {}
-                                _ => panic!("Unexpected node status {:?}", right_node),
+                                RightCheck::LevelTerminal(ref r) => panic!(
+                                    "Unexpected internal level terminal {:?}, tree level {}, lsm {}, {:?}, keys {:?}", 
+                                    r, level, lsm, src_tree.head_id(), read_unchecked::<KS, PS>(r).keys()
+                                ),
+                                _ => panic!(
+                                    "Unexpected internal node status {:?}, tree level {}, lsm {}, {:?}", 
+                                    &right_node, level, lsm, src_tree.head_id()
+                                ),
                             }
                         }
                         Some(sub_level_new_root)

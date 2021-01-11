@@ -119,8 +119,8 @@ where
             }
         });
 
-        value[*NEXT_PAGE_KEY_HASH] = Value::Id(prev_id);
-        value[*PREV_PAGE_KEY_HASH] = Value::Id(next_id);
+        value[*NEXT_PAGE_KEY_HASH] = Value::Id(next_id);
+        value[*PREV_PAGE_KEY_HASH] = Value::Id(prev_id);
         value[*KEYS_KEY_HASH] = self.keys.as_slice_immute()[..self.len]
             .iter()
             .filter(|&key| !deleted.contains(key))
