@@ -124,10 +124,12 @@ where
                     if node.len() == 0 {
                         // This level should be canceled
                         debug_assert!(node.keys().len() == 0);
+                        debug!("The node is a single pointer node {:?}", node.node_ref());
                         RightCheck::SinglePtr
                     } else {
                         // This level and the tree should be the new root
                         debug_assert!(node.keys().len() > 0);
+                        debug!("The node is a level terminal {:?} with length {}", node.node_ref(), node.len());
                         RightCheck::LevelTerminal(node.node_ref().clone())
                     }
                 } else {
@@ -173,7 +175,6 @@ where
                                 new_ptrs.as_slice()[i] = p.clone();
                             }
                             let terminal_ref = terminal_node.node_ref().clone();
-                            let right_stat = check_right(terminal_node);
                             {
                                 let mut terminal_node = write_node(&terminal_ref);
                                 let innode = terminal_node.innode_mut();
@@ -181,7 +182,7 @@ where
                                 innode.ptrs = new_ptrs;
                                 innode.len = num_keys;
                             }
-                            right_stat
+                            check_right(terminal_node)
                         }
                     };
                 new_root = {
