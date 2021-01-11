@@ -59,14 +59,16 @@ impl LSMTree {
         info!("Recovering LSM tree {:?}", lsm_tree_id);
         let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
         let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
-        let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
-        let trees_0_val = &trees[0usize];
-        let trees_1_val = &trees[1usize];
+        let trees = &cell.data[*LSM_TREE_LEVELS_HASH].prim_array().unwrap().Id().unwrap();
+        let tree_0_id = &trees[0usize];
+        let tree_1_id = &trees[1usize];
         info!("Record shows trees {:?}", trees);
+        debug!("Recovering level 0 tree {:?}", tree_0_id);
         let tree_0 =
-            Level0Tree::from_head_id(trees_0_val.Id().unwrap(), neb_client, &deletion_ref).await;
+            Level0Tree::from_head_id(tree_0_id, neb_client, &deletion_ref).await;
+        debug!("Recovering level 1 tree {:?}", tree_1_id);
         let tree_1 =
-            Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client, &deletion_ref).await;
+            Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref).await;
         Self {
             mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
             trans_mem_tree: Atomic::null(),
