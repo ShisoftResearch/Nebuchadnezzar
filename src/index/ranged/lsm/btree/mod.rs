@@ -166,7 +166,7 @@ where
         return true;
     }
 
-    pub fn merge_with_keys_(&self, keys: Box<Vec<EntryKey>>) {
+    pub fn merge_with_keys_(&self, keys: Vec<EntryKey>) {
         let keys_len = keys.len();
         if keys.len() == 0 {
             warn!("Merge attempt with no keys");
@@ -279,7 +279,7 @@ pub trait LevelTree: Sync + Send {
         deleted: &mut HashSet<EntryKey>,
         prune: bool,
     ) -> usize;
-    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>);
+    fn merge_with_keys(&self, keys: Vec<EntryKey>);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn dump(&self, f: &str);
@@ -331,7 +331,7 @@ where
         level::merge_with_boundary(level, self, target, &*MAX_ENTRY_KEY, deleted, prune)
     }
 
-    fn merge_with_keys(&self, keys: Box<Vec<EntryKey>>) {
+    fn merge_with_keys(&self, keys: Vec<EntryKey>) {
         self.merge_with_keys_(keys)
     }
 
@@ -391,7 +391,7 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn merge_with_keys(&self, _keys: Box<Vec<EntryKey>>) {
+    fn merge_with_keys(&self, _keys: Vec<EntryKey>) {
         unreachable!()
     }
 

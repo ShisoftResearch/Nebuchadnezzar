@@ -1,6 +1,6 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
-pub use super::btree::level::LEVEL_M as BLOCK_SIZE;
+pub use super::btree::level::{LEVEL_M as BLOCK_SIZE, LEVEL_1 as MIGRATE_SIZE};
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
@@ -272,7 +272,7 @@ impl LSMTreeService {
                         debug!("Marking migration for tree {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client)
                             .await;
-                        let buffer_size = BLOCK_SIZE << 2;
+                        let buffer_size = MIGRATE_SIZE << 2;
                         let mut cursor = tree.seek(&mid_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
                         debug!("Start moving keys for {:?}", dist_tree.id);
@@ -281,7 +281,7 @@ impl LSMTreeService {
                                 entry_buffer.push(entry);
                                 if entry_buffer.len() >= buffer_size {
                                     debug!("Merging entry buffer, size {}", entry_buffer.len());
-                                    migration_tree.merge_keys(Box::new(entry_buffer));
+                                    migration_tree.merge_keys(entry_buffer);
                                     entry_buffer = Vec::with_capacity(buffer_size);
                                 }
                             }

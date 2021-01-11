@@ -426,7 +426,7 @@ fn level_merge_insertion() {
     });
 
     let tree_3 = tree.clone();
-    let merge_keys = box merge_nums
+    let merge_keys = merge_nums
         .into_iter()
         .map(|i| {
             let n = i as u64;

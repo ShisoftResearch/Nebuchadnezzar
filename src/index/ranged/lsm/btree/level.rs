@@ -87,7 +87,7 @@ where
                     "Collected {} keys at level {}, merging to destination tree",
                     num_keys_merged, level
                 );
-                dest_tree.merge_with_keys(box merging_keys);
+                dest_tree.merge_with_keys(merging_keys);
                 debug!("Merge completed in external level");
                 if prune_src {
                     debug!("Pruning source tree for {} external pages", nodes.len());

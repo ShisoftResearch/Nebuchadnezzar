@@ -80,14 +80,14 @@ pub fn merge_into_tree_node<KS, PS>(
     tree: &BPlusTree<KS, PS>,
     node: &NodeCellRef,
     _parent: &NodeCellRef,
-    keys: Box<Vec<EntryKey>>,
+    keys: Vec<EntryKey>,
     level: usize,
 ) -> BTreeMap<EntryKey, NodeCellRef>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug_check_serialized(&*keys);
+    debug_check_serialized(&keys);
     let search = mut_search::<KS, PS>(node, &keys[0]);
     let new_pages = match search {
         MutSearchResult::External => {

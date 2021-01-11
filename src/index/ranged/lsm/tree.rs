@@ -167,7 +167,7 @@ impl LSMTree {
         client.update_cell(lsm_tree_cell).await.unwrap().unwrap();
     }
 
-    pub fn merge_keys(&self, keys: Box<Vec<EntryKey>>) {
+    pub fn merge_keys(&self, keys: Vec<EntryKey>) {
         self.last_level_tree().merge_with_keys(keys);
     }
 
