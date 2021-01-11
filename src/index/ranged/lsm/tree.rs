@@ -56,17 +56,17 @@ impl LSMTree {
     }
 
     pub async fn recover(neb_client: &Arc<AsyncClient>, lsm_tree_id: &Id) -> Self {
+        info!("Recovering LSM tree {:?}", lsm_tree_id);
         let deletion_ref = Arc::new(LFHashSet::with_capacity(16));
         let cell = neb_client.read_cell(*lsm_tree_id).await.unwrap().unwrap();
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH];
         let trees_0_val = &trees[0usize];
         let trees_1_val = &trees[1usize];
-
+        info!("Record shows trees {:?}", trees);
         let tree_0 =
             Level0Tree::from_head_id(trees_0_val.Id().unwrap(), neb_client, &deletion_ref).await;
         let tree_1 =
             Level1Tree::from_head_id(trees_1_val.Id().unwrap(), neb_client, &deletion_ref).await;
-
         Self {
             mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
             trans_mem_tree: Atomic::null(),
@@ -173,6 +173,11 @@ impl LSMTree {
 
     pub fn ideal_capacity(&self) -> usize {
         self.last_level_tree().ideal_capacity() * LAST_LEVEL_MULT_FACTOR
+    }
+
+    pub fn count(&self) -> usize {
+        // Only count keys in disk trees
+        self.disk_trees.iter().map(|t| t.count()).sum()
     }
 
     fn last_level_tree(&self) -> &Box<dyn LevelTree> {

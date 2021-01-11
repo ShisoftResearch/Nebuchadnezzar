@@ -116,9 +116,12 @@ impl Service for LSMTreeService {
     fn load_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
         async move {
             if self.trees.contains_key(&id) {
+                debug!("Tree loaded, skip {:?}", id);
                 return;
             }
+            info!("Called to load tree {:?}, boundary {:?}", id, boundary);
             let tree = LSMTree::recover(&self.client, &id).await;
+            debug!("LSM tree loaded with {} keys, capacity {}.", tree.count(), tree.ideal_capacity());
             self.trees
                 .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
         }
@@ -272,10 +275,10 @@ impl LSMTreeService {
                         debug!("Marking migration for tree {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client)
                             .await;
-                        let buffer_size = MIGRATE_SIZE << 2;
+                        let buffer_size = MIGRATE_SIZE << 4;
                         let mut cursor = tree.seek(&mid_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
-                        debug!("Start moving keys for {:?}", dist_tree.id);
+                        debug!("Start moving keys from {:?} to {:?}", dist_tree.id, migration_target_id);
                         while cursor.current().is_some() {
                             if let Some(entry) = cursor.next() {
                                 entry_buffer.push(entry);
@@ -288,6 +291,7 @@ impl LSMTreeService {
                         }
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
+                        debug!("Calling placement for split to {:?}", migration_target_id);
                         sm_client
                             .split(&migration_target_id, &mid_key)
                             .await

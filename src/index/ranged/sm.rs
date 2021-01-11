@@ -46,7 +46,11 @@ impl StateMachineCmds for MasterTreeSM {
 
     fn split(&mut self, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
         // Call this after the tree have been split and persisted
-        let upper_bound = self.tree.range(pivot.clone()..).next().unwrap().0.clone();
+        let upper_bound = match self.tree.range(pivot.clone()..).next() {
+            Some((k, _id)) => k.clone(),
+            None => max_entry_key()
+        };
+        debug!("Splitted to new tree {:?}, starts at {:?}, ends at {:?}", new_tree, pivot, upper_bound);
         self.tree.insert(pivot.clone(), new_tree);
         self.load_sub_tree(new_tree, pivot, upper_bound).boxed()
     }
@@ -89,11 +93,14 @@ impl MasterTreeSM {
     async fn load_sub_tree(&self, id: Id, lower: EntryKey, upper: EntryKey) {
         if self.raft_svr.is_leader() {
             // Only the leader can initiate the request to load the sub tree
+            info!("Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}", id, lower, upper);
             let client = self.locate_tree_server(&id).await.unwrap();
+            debug!("Located {:?} at server {:?}", id, client.server_id());
             client
                 .load_tree(id, Boundary::new(lower, upper))
                 .await
-                .unwrap()
+                .unwrap();
+            debug!("Tree loaded for {:?}", id);
         }
     }
 
