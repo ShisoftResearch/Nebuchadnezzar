@@ -101,7 +101,7 @@ where
         };
         let root_id = Self::new_page_id();
         let max_key = max_entry_key();
-        trace!("New External L1");
+        debug!("Created B-tree with {:?}", root_id);
         let root_inner = Node::<KS, PS>::new_external(root_id, max_key);
         trace!("B+ Tree created");
         *tree.root.write() = NodeCellRef::new(root_inner);

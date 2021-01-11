@@ -44,7 +44,7 @@ impl LSMTree {
         let tree_1 = Level1Tree::new(&deletion_ref);
         tree_0.persist_root(neb_client).await;
         tree_1.persist_root(neb_client).await;
-        let level_ids = vec![tree_m.head_id(), tree_1.head_id()];
+        let level_ids = vec![tree_0.head_id(), tree_1.head_id()];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {

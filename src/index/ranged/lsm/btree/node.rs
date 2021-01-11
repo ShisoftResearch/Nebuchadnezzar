@@ -614,7 +614,7 @@ where
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
     ) -> BoxFuture<()> {
-        let guard = read_unchecked::<KS, PS>(node_ref);
+        let guard = write_node::<KS, PS>(node_ref);
         let guard_ref = &*guard;
         let cell = match guard_ref {
             &NodeData::External(ref node) => Some(node.to_cell(&*deletion)),

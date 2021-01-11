@@ -125,6 +125,7 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
+    info!("Reconstructing level tree from head {:?}", head_id);
     let mut len = 0;
     let mut constructor = TreeConstructor::<KS, PS>::new();
     let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
@@ -165,6 +166,7 @@ where
         id = next_id;
     }
     let root = constructor.root();
+    info!("Reconstruct tree {:?} completed", head_id);
     BPlusTree::from_root(root, head_id, len, deletion)
 }
 
