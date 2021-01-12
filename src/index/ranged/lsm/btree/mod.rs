@@ -41,7 +41,6 @@ mod node;
 // mod prune;
 mod reconstruct;
 mod search;
-mod split;
 pub mod storage;
 pub mod verification;
 #[macro_use]
@@ -293,6 +292,7 @@ pub trait LevelTree: Sync + Send {
     fn oversized(&self) -> bool {
         self.count() > self.ideal_capacity()
     }
+    fn root(&self) -> NodeCellRef;
 }
 
 pub fn ideal_capacity_from_node_size(size: usize) -> usize {
@@ -349,7 +349,7 @@ where
     }
 
     fn mid_key(&self) -> Option<EntryKey> {
-        split::mid_key::<KS, PS>(&self.get_root())
+        level::select_boundary::<KS, PS>(&self.get_root())
     }
 
     fn head_id(&self) -> Id {
@@ -358,6 +358,9 @@ where
 
     fn verify(&self, level: usize) -> bool {
         verification::is_tree_in_order(self, level)
+    }
+    fn root(&self) -> NodeCellRef {
+        self.get_root()
     }
 }
 
@@ -417,6 +420,10 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn verify(&self, _level: usize) -> bool {
+        unreachable!()
+    }
+
+    fn root(&self) -> NodeCellRef { 
         unreachable!()
     }
 }

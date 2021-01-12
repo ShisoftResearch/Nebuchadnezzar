@@ -295,7 +295,7 @@ where
     }
 }
 
-fn select_boundary<KS, PS>(node: &NodeCellRef) -> EntryKey
+pub fn select_boundary<KS, PS>(node: &NodeCellRef) -> Option<EntryKey>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -304,17 +304,21 @@ where
         let node_keys = node.keys();
         let node_len = node_keys.len();
         if node.len() < 1 {
-            return Err(node.ptrs()[0].clone());
+            if node.is_ext() {
+                return Ok(None);
+            } else {
+                return Err(node.ptrs()[0].clone());
+            }
         }
         // Pick half of the keys in the root
         // Genreally, higher level sub tree in LSM tree will select more keys to merged
         // into next level
         let mid_idx = min(node_len / 2, 8);
         // Return the mid key as the boundary for selection (cut)
-        Ok(node_keys[mid_idx].clone())
+        Ok(Some(node_keys[mid_idx].clone()))
     });
     match res {
-        Ok(key) => key.clone(),
+        Ok(key) => key,
         Err(r) => select_boundary::<KS, PS>(&r),
     }
 }
@@ -332,7 +336,7 @@ where
 {
     debug!("Merging LSM tree level {}", level);
     let root = src_tree.get_root();
-    let key_boundary = select_boundary::<KS, PS>(&root);
+    let key_boundary = select_boundary::<KS, PS>(&root).unwrap();
     merge_with_boundary(level, src_tree, dest_tree, &key_boundary, deleted, prune)
 }
 

@@ -50,6 +50,7 @@ impl StateMachineCmds for MasterTreeSM {
             Some((k, _id)) => k.clone(),
             None => max_entry_key()
         };
+        debug_assert!(pivot < upper_bound);
         debug!("Splitted to new tree {:?}, starts at {:?}, ends at {:?}", new_tree, pivot, upper_bound);
         self.tree.insert(pivot.clone(), new_tree);
         self.load_sub_tree(new_tree, pivot, upper_bound).boxed()
