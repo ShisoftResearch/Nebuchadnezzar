@@ -6,7 +6,6 @@ use super::tree::*;
 use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
-use crate::index::ranged::lsm::btree::level::select_boundary;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::utils::time::get_time;
 use bifrost_plugins::hash_ident;

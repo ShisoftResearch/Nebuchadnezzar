@@ -295,7 +295,7 @@ where
     }
 }
 
-pub fn select_boundary<KS, PS>(node: &NodeCellRef) -> Option<EntryKey>
+pub fn select_merge_boundary<KS, PS>(node: &NodeCellRef) -> Option<EntryKey>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -319,7 +319,7 @@ where
     });
     match res {
         Ok(key) => key,
-        Err(r) => select_boundary::<KS, PS>(&r),
+        Err(r) => select_merge_boundary::<KS, PS>(&r),
     }
 }
 
@@ -328,7 +328,7 @@ pub fn level_merge<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     deleted: &mut HashSet<EntryKey>,
-    prune: bool,
+    prune: bool, 
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -336,7 +336,7 @@ where
 {
     debug!("Merging LSM tree level {}", level);
     let root = src_tree.get_root();
-    let key_boundary = select_boundary::<KS, PS>(&root).unwrap();
+    let key_boundary = select_merge_boundary::<KS, PS>(&root).unwrap();
     merge_with_boundary(level, src_tree, dest_tree, &key_boundary, deleted, prune)
 }
 

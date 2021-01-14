@@ -43,6 +43,7 @@ mod reconstruct;
 mod search;
 pub mod storage;
 pub mod verification;
+mod split;
 #[macro_use]
 pub mod marco;
 
@@ -349,7 +350,7 @@ where
     }
 
     fn mid_key(&self) -> Option<EntryKey> {
-        level::select_boundary::<KS, PS>(&self.get_root())
+        split::mid_key::<KS, PS>(&self.get_root())
     }
 
     fn head_id(&self) -> Id {
