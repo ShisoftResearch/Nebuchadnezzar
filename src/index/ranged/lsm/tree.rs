@@ -152,6 +152,54 @@ impl LSMTree {
         merged
     }
 
+    pub fn retain(&self, pivot: &EntryKey) {
+        info!("Retaining tree keys to {:?} for LSM tree split", pivot);
+        let guard = crossbeam_epoch::pin();
+        let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
+        let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
+        let new_mem_tree: Box<dyn LevelTree> = box LevelMTree::new(&self.deletion);
+        let new_mem_tree_ptr = Owned::new(new_mem_tree).into_shared(&guard);
+        self.trans_mem_tree.store(mem_tree_ptr, Release);
+        self.mem_tree.store(new_mem_tree_ptr, Release);
+        info!("Start memory tree retaining by merging all retained keys to disk tree");
+        let mut retained_keys = vec![];
+        let mut deleted_keys = vec![];
+        {
+            let mut mem_cursor = mem_tree.seek_for(&*MIN_ENTRY_KEY, Ordering::Forward);
+            while let Some(key) = mem_cursor.next() {
+                if &key >= pivot {
+                    break;
+                }
+                if !self.deletion.contains(&key) {
+                    retained_keys.push(key);
+                } else {
+                    deleted_keys.push(key);
+                }
+            }
+        }
+        let num_keys_retained = retained_keys.len();
+        self.disk_trees[0].merge_with_keys(retained_keys);
+        info!("Memory tree retained {} keys", num_keys_retained);
+        self.trans_mem_tree.store(Shared::null(), Release);
+        unsafe {
+            guard.defer_destroy(mem_tree_ptr);
+        }
+        for i in 0..self.disk_trees.len() - 1 {
+            let level = i + 1;
+            info!("Start reraining keys for level {}", level);
+            self.disk_trees[i].retain_by_key(pivot);
+            info!("Key retained for level {}", level);
+        }
+        for dk in deleted_keys {
+            self.deletion.remove(&dk);
+        }
+        for dk in self.deletion.items() {
+            if &dk >= pivot { 
+                self.deletion.remove(&dk);
+            }
+        }
+    }
+
     pub fn oversized(&self) -> bool {
         self.last_level_tree().count() > self.ideal_capacity()
     }

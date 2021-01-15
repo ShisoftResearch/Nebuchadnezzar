@@ -281,6 +281,7 @@ pub trait LevelTree: Sync + Send {
         prune: bool,
     ) -> usize;
     fn merge_with_keys(&self, keys: Vec<EntryKey>);
+    fn retain_by_key(&self, key: &EntryKey);
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn dump(&self, f: &str);
@@ -363,6 +364,9 @@ where
     fn root(&self) -> NodeCellRef {
         self.get_root()
     }
+    fn retain_by_key(&self, key: &EntryKey) {
+        split::retain(self, key);
+    }
 }
 
 pub struct DummyLevelTree;
@@ -425,6 +429,9 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn root(&self) -> NodeCellRef { 
+        unreachable!()
+    }
+    fn retain_by_key(&self, _key: &EntryKey) {
         unreachable!()
     }
 }

@@ -255,7 +255,7 @@ impl LSMTreeService {
                 let mut fast_mode = false;
                 for (_, dist_tree) in trees_map.entries() {
                     let tree = &dist_tree.tree;
-                    fast_mode = fast_mode | tree.merge_levels().await;
+                    fast_mode = tree.merge_levels().await | fast_mode;
                     if tree.oversized() {
                         info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
@@ -289,6 +289,7 @@ impl LSMTreeService {
                                 }
                             }
                         }
+                        tree.retain(&mid_key);
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
                         debug!("Calling placement for split to {:?}", migration_target_id);
