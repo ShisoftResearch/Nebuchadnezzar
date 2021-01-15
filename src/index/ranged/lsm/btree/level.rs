@@ -9,6 +9,7 @@ use itertools::Itertools;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::{char::MAX, cmp::min};
+use std::sync::atomic::Ordering::*;
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
@@ -103,6 +104,7 @@ where
                     let mut new_first = write_node::<KS, PS>(&new_first_ref);
                     new_first.extnode_mut(src_tree).id = head_id;
                     *new_first.left_ref_mut().unwrap() = NodeCellRef::default();
+                    src_tree.len.fetch_sub(num_keys_merged, Release);
                     debug!("Source tree external nodes pruned with head {:?}", head_id);
                 }
                 return (num_keys_merged, None);

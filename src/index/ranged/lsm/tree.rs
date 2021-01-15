@@ -186,7 +186,7 @@ impl LSMTree {
         }
         for i in 0..self.disk_trees.len() - 1 {
             let level = i + 1;
-            info!("Start reraining keys for level {}", level);
+            info!("Start retaining keys for level {}", level);
             self.disk_trees[i].retain_by_key(pivot);
             info!("Key retained for level {}", level);
         }

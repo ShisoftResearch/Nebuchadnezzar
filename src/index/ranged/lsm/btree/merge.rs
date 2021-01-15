@@ -142,7 +142,7 @@ where
                     #[cfg(debug_assertions)]
                     if is_node_locked::<KS, PS>(right_node_ref) {
                         unsafe {
-                            warn!(
+                            trace!(
                                 "Right node {:?} is LOCKED!!! current id {:?} lock thread id {:?}",
                                 &right_node_ref,
                                 std::thread::current().id(),
