@@ -53,6 +53,7 @@ fn retain_by_node<KS, PS>(tree: &BPlusTree<KS, PS>, node_ref: &NodeCellRef, mid_
             let n = node.extnode_mut(tree);
             let key_index = n.search(mid_key);
             let selected_key = &n.keys.as_slice_immute()[key_index];
+            let origin_node_len = n.len;
             debug_assert!(selected_key >= mid_key);
             n.len = key_index; // All others will be ignored
             debug_assert_ne!(
@@ -62,7 +63,7 @@ fn retain_by_node<KS, PS>(tree: &BPlusTree<KS, PS>, node_ref: &NodeCellRef, mid_
             ); // Assert no empty node after cut
             // Cut out the right half of the node in this tree
             let mut right_node_ref = mem::take(&mut n.next);
-            let mut num_removed_keys = node.len();
+            let mut num_removed_keys = origin_node_len - key_index;
             drop(node);
             while !right_node_ref.is_default() {
                 let mut node = write_node::<KS, PS>(&right_node_ref);
