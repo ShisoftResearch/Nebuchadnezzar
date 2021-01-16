@@ -26,7 +26,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::sync::Arc;
 
 pub mod cell_ref;
@@ -38,7 +38,7 @@ mod internal;
 pub mod level;
 mod merge;
 mod node;
-// mod prune;
+mod clear;
 mod reconstruct;
 mod search;
 pub mod storage;
@@ -107,6 +107,14 @@ where
         *tree.root.write() = NodeCellRef::new(root_inner);
         tree.head_page_id = root_id;
         return tree;
+    }
+
+    // Non-atomic
+    pub fn clear(&self) {
+        let new_node = NodeCellRef::new(Node::<KS, PS>::new_external(self.head_page_id, max_entry_key()));
+        let old_node = mem::replace(&mut*self.root.write(), new_node);
+        self.len.store(0, Release);
+        clear::clear_by_node::<KS, PS>(&old_node);
     }
 
     pub async fn persist_root(&self, neb: &Arc<crate::client::AsyncClient>) {
@@ -263,6 +271,16 @@ where
     }
 }
 
+impl <KS, PS> Drop for BPlusTree<KS, PS>
+where
+    KS: Slice<EntryKey> + Debug + 'static,
+    PS: Slice<NodeCellRef> + 'static,
+{
+    fn drop(&mut self) { 
+        clear::clear_by_node::<KS, PS>(&*self.root.read());
+    }
+}
+
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
@@ -295,6 +313,7 @@ pub trait LevelTree: Sync + Send {
         self.count() > self.ideal_capacity()
     }
     fn root(&self) -> NodeCellRef;
+    fn clear_tree(&self);
 }
 
 pub fn ideal_capacity_from_node_size(size: usize) -> usize {
@@ -367,6 +386,9 @@ where
     fn retain_by_key(&self, key: &EntryKey) {
         split::retain(self, key);
     }
+    fn clear_tree(&self) {
+        self.clear()
+    }
 }
 
 pub struct DummyLevelTree;
@@ -432,6 +454,9 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
     fn retain_by_key(&self, _key: &EntryKey) {
+        unreachable!()
+    }
+    fn clear_tree(&self) {
         unreachable!()
     }
 }

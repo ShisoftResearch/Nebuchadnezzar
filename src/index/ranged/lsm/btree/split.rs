@@ -69,7 +69,7 @@ fn retain_by_node<KS, PS>(tree: &BPlusTree<KS, PS>, node_ref: &NodeCellRef, mid_
                 let node_id = node.ext_id();
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
-                *node = NodeData::Empty(box EmptyNode { left: Default::default(), right: Default::default() });
+                *node = NodeData::Empty(box Default::default());
                 make_deleted::<KS, PS>(&node_id);
             }
             tree.len.fetch_sub(num_removed_keys, Release);
@@ -94,7 +94,7 @@ fn retain_by_node<KS, PS>(tree: &BPlusTree<KS, PS>, node_ref: &NodeCellRef, mid_
             while !right_node_ref.is_default() {
                 let mut node = write_node::<KS, PS>(&right_node_ref);
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
-                *node = NodeData::Empty(box EmptyNode { left: Default::default(), right: Default::default() });
+                *node = NodeData::Empty(box Default::default());
             }
         },
         &NodeData::Empty(ref n) => {

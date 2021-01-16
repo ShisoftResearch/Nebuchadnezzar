@@ -161,12 +161,18 @@ impl LSMTree {
         let new_mem_tree_ptr = Owned::new(new_mem_tree).into_shared(&guard);
         self.trans_mem_tree.store(mem_tree_ptr, Release);
         self.mem_tree.store(new_mem_tree_ptr, Release);
-        info!("Start memory tree retaining by merging all retained keys to disk tree");
+        info!("Tree retaining by merging all retained keys to disk tree");
+        let mut working_trees = vec![mem_tree];
         let mut retained_keys = vec![];
         let mut deleted_keys = vec![];
-        {
-            let mut mem_cursor = mem_tree.seek_for(&*MIN_ENTRY_KEY, Ordering::Forward);
-            while let Some(key) = mem_cursor.next() {
+        let last_tree_index = self.disk_trees.len() - 1;
+        let last_tree = &self.disk_trees[last_tree_index];
+        for i in 0..last_tree_index {
+            working_trees.push(&self.disk_trees[i]);
+        }
+        for tree in working_trees {
+            let mut cursor = tree.seek_for(&*MIN_ENTRY_KEY, Ordering::Forward);
+            while let Some(key) = cursor.next() {
                 if &key >= pivot {
                     break;
                 }
@@ -176,20 +182,19 @@ impl LSMTree {
                     deleted_keys.push(key);
                 }
             }
+            // Cleanup tree
+            tree.clear_tree();
         }
         let num_keys_retained = retained_keys.len();
-        self.disk_trees[0].merge_with_keys(retained_keys);
-        info!("Memory tree retained {} keys", num_keys_retained);
+        // Merge memory tree to last tree
+        last_tree.merge_with_keys(retained_keys);
+        info!("Tree retained {} keys", num_keys_retained);
         self.trans_mem_tree.store(Shared::null(), Release);
         unsafe {
             guard.defer_destroy(mem_tree_ptr);
         }
-        for i in 0..self.disk_trees.len() - 1 {
-            let level = i + 1;
-            info!("Start retaining keys for level {}", level);
-            self.disk_trees[i].retain_by_key(pivot);
-            info!("Key retained for level {}", level);
-        }
+        // Use retain by key only for the last disk tree
+        self.disk_trees[last_tree_index].retain_by_key(pivot);
         for dk in deleted_keys {
             self.deletion.remove(&dk);
         }

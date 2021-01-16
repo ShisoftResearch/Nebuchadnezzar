@@ -10,6 +10,12 @@ pub struct EmptyNode {
     pub right: NodeCellRef,
 }
 
+impl Default for EmptyNode {
+    fn default() -> Self {
+        EmptyNode { left: Default::default(), right: Default::default() }
+    }
+}
+
 pub enum NodeData<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
