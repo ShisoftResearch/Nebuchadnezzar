@@ -91,14 +91,14 @@ impl MasterTreeSM {
             .unwrap();
         true
     }
-    async fn load_sub_tree(&self, id: Id, lower: EntryKey, upper: EntryKey) {
+    async fn load_sub_tree(&mut self, id: Id, lower: EntryKey, upper: EntryKey) {
         if self.raft_svr.is_leader() {
             // Only the leader can initiate the request to load the sub tree
             info!("Placement leader calling to load sub tree {:?} with lower key {:?}, upper key {:?}", id, lower, upper);
             let client = self.locate_tree_server(&id).await.unwrap();
             debug!("Located {:?} at server {:?}", id, client.server_id());
             client
-                .load_tree(id, Boundary::new(lower, upper))
+                .load_tree(id, Boundary::new(lower.clone(), upper))
                 .await
                 .unwrap();
             debug!("Tree loaded for {:?}", id);

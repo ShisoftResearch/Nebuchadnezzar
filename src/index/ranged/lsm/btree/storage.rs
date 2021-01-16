@@ -22,7 +22,7 @@ pub fn start_external_nodes_write_back(client: &Arc<client::AsyncClient>) {
                         let _ = client.remove_cell(id).await.unwrap();
                     }
                 }
-                CHANGE_PROGRESS.store(id, Ordering::Relaxed);
+                CHANGE_PROGRESS.store(id, Ordering::Release);
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -43,10 +43,13 @@ pub async fn wait_until_updated() {
         return;
     }
     let newest = counter - 1; // fetch add
-    let ops = newest - CHANGE_PROGRESS.load(Ordering::Relaxed);
+    let ops = newest - CHANGE_PROGRESS.load(Ordering::Acquire);
+    if ops == 0 {
+        return;
+    }
     debug!("Waiting storage, {} ops to go", ops);
     loop {
-        let current = CHANGE_PROGRESS.load(Ordering::Relaxed);
+        let current = CHANGE_PROGRESS.load(Ordering::Acquire);
         if current >= newest {
             break;
         }
