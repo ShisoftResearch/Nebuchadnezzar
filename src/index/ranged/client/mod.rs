@@ -1,4 +1,4 @@
-use super::lsm::btree::Ordering;
+use super::{lsm::btree::Ordering, sm::TreePlacement};
 use super::lsm::service::*;
 use super::sm::client::SMClient;
 use crate::client::AsyncClient;
@@ -20,7 +20,7 @@ pub mod cursor;
 pub struct RangedQueryClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
-    placement: RwLock<BTreeMap<EntryKey, (Id, EntryKey)>>,
+    placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
     neb_client: Arc<AsyncClient>,
 }
 
@@ -96,9 +96,10 @@ impl RangedQueryClient {
 
     pub async fn tree_stats(&self) -> Result<Vec<LSMTreeStat>, RPCError> {
         let mut res = vec![];
-        for tree_id in self.placement.read().values().map(|(id, _)| id) {
-            let tree_client = locate_tree_server_from_conshash(tree_id, &self.conshash).await?;
-            match tree_client.stat(*tree_id).await? {
+        for tree_placement in self.placement.read().values().map(|(id, _)| id) {
+            let tree_id = tree_placement.id;
+            let tree_client = locate_tree_server_from_conshash(&tree_id, &self.conshash).await?;
+            match tree_client.stat(tree_id).await? {
                 OpResult::Successful(stat_res) => {
                     res.push(stat_res);
                 }
@@ -138,9 +139,9 @@ impl RangedQueryClient {
                     "Too many retry",
                 )));
             }
-            let (tree_id, tree_client, lower, upper) =
+            let (placmenet, tree_client, lower, upper) =
                 self.locate_key_server(&key, ensure_updated).await?;
-            match action(key.clone(), tree_client.clone(), tree_id).await? {
+            match action(key.clone(), tree_client.clone(), placement).await? {
                 OpResult::Successful(res) => {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
@@ -161,7 +162,7 @@ impl RangedQueryClient {
         &self,
         key: &EntryKey,
         ensure_updated: bool,
-    ) -> Result<(Id, Arc<AsyncServiceClient>, EntryKey, EntryKey), RPCError> {
+    ) -> Result<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey), RPCError> {
         let mut tree_prop = None;
         if !ensure_updated {
             if let Some((lower, (id, upper))) = self.placement.read().range(..key.clone()).last() {
@@ -173,17 +174,17 @@ impl RangedQueryClient {
         if tree_prop.is_none() {
             tree_prop = Some(self.refresh_key_mapping(key).await.expect("Cannot locate key"));
         }
-        let (lower, tree_id, upper) = tree_prop.unwrap();
-        let tree_client = locate_tree_server_from_conshash(&tree_id, &self.conshash).await?;
-        Ok((tree_id, tree_client, lower, upper))
+        let (lower, tree_placement, upper) = tree_prop.unwrap();
+        let tree_client = locate_tree_server_from_conshash(&tree_placement.id, &self.conshash).await?;
+        Ok((tree_placement, tree_client, lower, upper))
     }
     
-    async fn refresh_key_mapping(&self, key: &EntryKey) -> Result<(EntryKey, Id, EntryKey), ExecError> {
-        let (lower, id, upper) = self.sm.locate_key(key).await?;
+    async fn refresh_key_mapping(&self, key: &EntryKey) -> Result<(EntryKey, TreePlacement, EntryKey), ExecError> {
+        let (lower, placement, upper) = self.sm.locate_key(key).await?;
         debug_assert!(key >= &lower && key < &upper, "Key {:?}, lower {:?}, upper {:?}", key, lower, upper);
         self.placement
             .write()
-            .insert(lower.clone(), (id, upper.clone()));
-        return Ok((lower, id, upper));
+            .insert(lower.clone(), (placement, upper.clone()));
+        return Ok((lower, placement, upper));
     }
 }

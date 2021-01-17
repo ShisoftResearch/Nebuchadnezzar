@@ -31,6 +31,7 @@ pub enum OpResult<T> {
     Successful(T),
     NotFound,
     OutOfBound,
+    EpochMissMatch(u64, u64),
     Migrating,
 }
 
@@ -50,6 +51,7 @@ pub struct DistLSMTree {
 pub struct DistProp {
     boundary: Boundary,
     migration: Option<Migration>,
+    epoch: u64
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,11 +77,11 @@ pub struct LSMTreeStat {
 }
 
 service! {
-    rpc crate_tree(id: Id, boundary: Boundary);
-    rpc load_tree(id: Id, boundary: Boundary);
-    rpc insert(id: Id, entry: EntryKey) -> OpResult<bool>;
-    rpc delete(id: Id, entry: EntryKey) -> OpResult<bool>;
-    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, buffer_size: u16)
+    rpc crate_tree(id: Id, boundary: Boundary, epoch: u64);
+    rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
+    rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
+    rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>; 
+    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
@@ -90,19 +92,19 @@ pub struct LSMTreeService {
 }
 
 impl Service for LSMTreeService {
-    fn crate_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
+    fn crate_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<()> {
         async move {
             if self.trees.contains_key(&id) {
                 return;
             }
             let tree = LSMTree::create(&self.client, &id).await;
             self.trees
-                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
+                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)));
         }
         .boxed()
     }
 
-    fn load_tree(&self, id: Id, boundary: Boundary) -> BoxFuture<()> {
+    fn load_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<()> {
         async move {
             if self.trees.contains_key(&id) {
                 debug!("Tree loaded, skip {:?}", id);
@@ -112,13 +114,13 @@ impl Service for LSMTreeService {
             let tree = LSMTree::recover(&self.client, &id).await;
             debug!("LSM tree loaded with {} keys, capacity {}.", tree.count(), tree.ideal_capacity());
             self.trees
-                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None)));
+                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)));
         }
         .boxed()
     }
 
-    fn insert(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<bool>> {
-        self.apply_in_ranged_tree(id, entry, |entry, tree| {
+    fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
+        self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
             if tree.insert(&entry) {
                 OpResult::Successful(true)
             } else {
@@ -127,8 +129,8 @@ impl Service for LSMTreeService {
         })
     }
 
-    fn delete(&self, id: Id, entry: EntryKey) -> BoxFuture<OpResult<bool>> {
-        self.apply_in_ranged_tree(id, entry, |entry, tree| {
+    fn delete(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
+        self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
             if tree.delete(&entry) {
                 OpResult::Successful(true)
             } else {
@@ -143,8 +145,9 @@ impl Service for LSMTreeService {
         entry: EntryKey,
         ordering: Ordering,
         buffer_size: u16,
+        epoch: u64
     ) -> BoxFuture<OpResult<ServBlock>> {
-        self.apply_in_ranged_tree(id, entry, |entry, tree| {
+        self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
             let buffer_size = buffer_size as usize;
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
@@ -254,7 +257,7 @@ impl LSMTreeService {
                         storage::wait_until_updated().await;
                         debug!("Calling placement for split to {:?}", migration_target_id);
                         sm_client
-                            .split(&migration_target_id, &mid_key)
+                            .split(&dist_tree.id, &migration_target_id, &mid_key)
                             .await
                             .unwrap();
                         // Reset state on current tree
@@ -275,14 +278,16 @@ impl LSMTreeService {
         });
     }
 
-    fn apply_in_ranged_tree<F, R>(&self, id: Id, entry: EntryKey, func: F) -> BoxFuture<OpResult<R>>
+    fn apply_in_ranged_tree<F, R>(&self, id: Id, entry: EntryKey, epoch: u64, func: F) -> BoxFuture<OpResult<R>>
     where
         F: Fn(&EntryKey, &LSMTree) -> OpResult<R>,
         R: Send + 'static,
     {
         future::ready(if let Some(tree) = self.trees.get(&id) {
             let tree_prop = tree.prop.read();
-            if tree_prop.boundary.in_boundary(&entry) {
+            if epoch != tree_prop.epoch {
+                OpResult::EpochMissMatch(tree_prop.epoch, epoch)
+            } else if tree_prop.boundary.in_boundary(&entry) {
                 if let &Some(ref migration) = &tree_prop.migration {
                     if entry < migration.pivot {
                         // Entries lower than pivot should be safe to work on
@@ -304,10 +309,11 @@ impl LSMTreeService {
 }
 
 impl DistLSMTree {
-    fn new(id: Id, tree: LSMTree, boundary: Boundary, migration: Option<Migration>) -> Self {
+    fn new(id: Id, tree: LSMTree, boundary: Boundary, migration: Option<Migration>, epoch: u64) -> Self {
         let prop = RwLock::new(DistProp {
             boundary,
             migration,
+            epoch
         });
         Self { id, tree, prop }
     }

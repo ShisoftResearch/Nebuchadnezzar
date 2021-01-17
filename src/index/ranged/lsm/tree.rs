@@ -17,6 +17,7 @@ pub const LSM_TREE_SCHEMA_NAME: &'static str = "NEB_LSM_TREE";
 pub const LSM_TREE_LEVELS_NAME: &'static str = "levels";
 pub const LSM_TREE_MIGRATION_NAME: &'static str = "migration";
 pub const LAST_LEVEL_MULT_FACTOR: usize = 2;
+pub const INITIAL_TREE_EPOCH: u64 = 0;
 
 type LevelTrees = [Box<dyn LevelTree>; NUM_LEVELS];
 type LevelCusors = [Box<dyn Cursor>; NUM_LEVELS + 2]; // 2 for mem and trans mem
