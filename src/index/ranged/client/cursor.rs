@@ -30,7 +30,7 @@ impl ClientCursor {
         query_client: Arc<RangedQueryClient>,
         buffer_size: u16
     ) -> Result<Self, RPCError> {
-        debug!("Client cursor created with buffer next {:?}, bound {:?}", block.next, tree_boundary);
+        trace!("Client cursor created with buffer next {:?}, bound {:?}", block.next, tree_boundary);
         let next = block.next;
         let ids = block.buffer.clone();
         let cell_block = query_client.neb_client
@@ -52,9 +52,13 @@ impl ClientCursor {
     }
 
     pub async fn next(&mut self) -> Result<Option<IndexedCell>, RPCError> {
+        let mut res = None;
         if self.pos < self.cell_block.len() {
+            res = Some(mem::take(&mut self.cell_block[self.pos]).unwrap());
             self.pos += 1;
-            return Ok(Some(mem::take(&mut self.cell_block[self.pos]).unwrap()));
+            if self.pos < self.cell_block.len() {
+                return Ok(res);
+            }
         }
         let next_key = if let Some(key) = &self.next {
             // Have next, use it
@@ -74,15 +78,15 @@ impl ClientCursor {
             ).await?;
         if let Some(cursor) = next_cursor {
             *self = cursor;
-            Ok(self.current().cloned())
         } else {
-            Ok(None)
+            self.cell_block = vec![];
         }
+        return Ok(res);
     }
 
     pub fn current(&self) -> Option<&IndexedCell> {
-        match &self.cell_block[self.pos] {
-            Some(cell) => Some(cell),
+        match self.cell_block.get(self.pos) {
+            Some(Some(cell)) => Some(cell),
             _ => None,
         }
     }

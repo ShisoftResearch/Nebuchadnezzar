@@ -66,7 +66,6 @@ mod tests {
         let mut nums = (0..test_capacity).collect_vec();
         let mut nums_2 = nums.clone();
         let mut nums_3 = nums.clone();
-        nums.as_mut_slice().shuffle(&mut rng);
         nums_2.as_mut_slice().shuffle(&mut rng);
         nums_3.as_mut_slice().shuffle(&mut rng);
         info!("Adding insertion tasks");

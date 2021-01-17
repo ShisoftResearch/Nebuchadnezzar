@@ -135,7 +135,7 @@ impl RangedQueryClient {
         let mut ensure_updated = false;
         let mut retried: i32 = 0;
         loop {
-            if retried >= 10 {
+            if retried >= 300 {
                 // Retry attempts all failed
                 return Result::Err(RPCError::IOError(io::Error::new(
                     io::ErrorKind::Other,
@@ -176,7 +176,7 @@ impl RangedQueryClient {
         }
         if tree_prop.is_none() {
             let (lower, id, upper) = self.sm.locate_key(key).await.unwrap();
-            debug_assert!(key >= &lower && key < &upper);
+            debug_assert!(key >= &lower && key < &upper, "Key {:?}, lower {:?}, upper {:?}", key, lower, upper);
             self.placement
                 .write()
                 .insert(lower.clone(), (id, upper.clone()));
