@@ -17,7 +17,7 @@ pub struct ClientCursor {
     next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
     ordering: Ordering,
-    tree_boundary: EntryKey,
+    tree_key: EntryKey,
     pos: usize,
     buffer_size: u16
 }
@@ -26,11 +26,11 @@ impl ClientCursor {
     pub async fn new(
         ordering: Ordering,
         block: ServBlock,
-        tree_boundary: EntryKey,
+        tree_key: EntryKey,
         query_client: Arc<RangedQueryClient>,
         buffer_size: u16
     ) -> Result<Self, RPCError> {
-        trace!("Client cursor created with buffer next {:?}, bound {:?}", block.next, tree_boundary);
+        trace!("Client cursor created with buffer next {:?}, tree key {:?}", block.next, tree_key);
         let next = block.next;
         let ids = block.buffer.clone();
         let cell_block = query_client.neb_client
@@ -43,7 +43,7 @@ impl ClientCursor {
         Ok(Self {
             query_client,
             cell_block,
-            tree_boundary,
+            tree_key,
             ordering,
             next,
             buffer_size,

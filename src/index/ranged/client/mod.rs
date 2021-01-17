@@ -4,7 +4,7 @@ use super::sm::client::SMClient;
 use crate::client::AsyncClient;
 use crate::index::EntryKey;
 use crate::ram::types::Id;
-use bifrost::conshash::ConsistentHashing;
+use bifrost::{conshash::ConsistentHashing, raft::state_machine::master::ExecError};
 use bifrost::raft::client::RaftClient;
 use bifrost::rpc::RPCError;
 use futures::future::BoxFuture;
@@ -54,17 +54,13 @@ impl RangedQueryClient {
                 |action_res, _tree_client, lower, upper| {
                     async move {
                         if let Some(block) = action_res {
-                            let tree_boundary = match ordering {
-                                Ordering::Forward => upper,
-                                Ordering::Backward => lower,
-                            };
                             if block.buffer.is_empty() {
                                 return Ok(Some(None))
                             } else {
                                 let client_cursor = cursor::ClientCursor::new(
                                     ordering, 
                                     block, 
-                                    tree_boundary,
+                                    lower,
                                     self_ref.clone(),
                                     buffer_size,
                                 ).await?;
@@ -170,20 +166,24 @@ impl RangedQueryClient {
         if !ensure_updated {
             if let Some((lower, (id, upper))) = self.placement.read().range(..key.clone()).last() {
                 if key >= lower && key < upper {
-                    tree_prop = Some((*id, lower.clone(), upper.clone()));
+                    tree_prop = Some((lower.clone(), *id, upper.clone()));
                 }
             }
         }
         if tree_prop.is_none() {
-            let (lower, id, upper) = self.sm.locate_key(key).await.unwrap();
-            debug_assert!(key >= &lower && key < &upper, "Key {:?}, lower {:?}, upper {:?}", key, lower, upper);
-            self.placement
-                .write()
-                .insert(lower.clone(), (id, upper.clone()));
-            tree_prop = Some((id, lower, upper));
+            tree_prop = Some(self.refresh_key_mapping(key).await.expect("Cannot locate key"));
         }
-        let (tree_id, lower, upper) = tree_prop.unwrap();
+        let (lower, tree_id, upper) = tree_prop.unwrap();
         let tree_client = locate_tree_server_from_conshash(&tree_id, &self.conshash).await?;
         Ok((tree_id, tree_client, lower, upper))
+    }
+    
+    async fn refresh_key_mapping(&self, key: &EntryKey) -> Result<(EntryKey, Id, EntryKey), ExecError> {
+        let (lower, id, upper) = self.sm.locate_key(key).await?;
+        debug_assert!(key >= &lower && key < &upper, "Key {:?}, lower {:?}, upper {:?}", key, lower, upper);
+        self.placement
+            .write()
+            .insert(lower.clone(), (id, upper.clone()));
+        return Ok((lower, id, upper));
     }
 }

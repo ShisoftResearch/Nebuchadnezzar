@@ -12,6 +12,7 @@ use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::ops::Bound::*;
 
 pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
 
@@ -23,6 +24,8 @@ pub struct MasterTreeSM {
 
 raft_state_machine! {
     def qry locate_key(entry: EntryKey) -> (EntryKey, Id, EntryKey);
+    def qry prev_tree(tree_key: EntryKey) -> Option<Id>;
+    def qry next_tree(tree_key: EntryKey) -> Option<Id>;
     def cmd split(new_tree: Id, pivot: EntryKey);
     // No subscription for clients
 }
@@ -37,11 +40,19 @@ impl StateMachineCmds for MasterTreeSM {
             .unwrap();
         let upper = self
             .tree
-            .range(entry..)
+            .range((Excluded(entry), Unbounded))
             .next()
             .map(|(key, _)| key.clone())
             .unwrap_or_else(|| EntryKey::max());
         future::ready((lower, id, upper)).boxed()
+    }
+
+    fn prev_tree(&self, tree_key: EntryKey) -> BoxFuture<Option<Id>> {
+        future::ready(self.tree.range(..tree_key).last().map(|(_, id)| *id)).boxed()
+    }
+
+    fn next_tree(&self, tree_key: EntryKey) -> BoxFuture<Option<Id>> {
+        future::ready(self.tree.range((Excluded(tree_key), Unbounded)).next().map(|(_, id)| *id)).boxed()
     }
 
     fn split(&mut self, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
