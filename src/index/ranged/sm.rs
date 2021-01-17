@@ -62,20 +62,21 @@ impl StateMachineCmds for MasterTreeSM {
     }
 
     fn split(&mut self, src_tree: Id, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
-
         // Call this after the tree have been split and persisted
-        if let Some((_, mut prev_tree)) = self.tree.range_mut(..pivot).last() {
-            assert_eq!(prev_tree.id, src_tree);
-            prev_tree.epoch += 1;
-        }
-        let upper_bound = match self.tree.range(pivot..).next() {
-            Some((k, _id)) => k.clone(),
-            None => max_entry_key()
-        };
-        debug_assert!(pivot < upper_bound);
-        debug!("Splitted to new tree {:?}, starts at {:?}, ends at {:?}", new_tree, pivot, upper_bound);
-        self.tree.insert(pivot.clone(), TreePlacement::new(new_tree));
-        self.load_sub_tree(new_tree, pivot, upper_bound, INITIAL_TREE_EPOCH).boxed()
+        async move {
+            let upper_bound = match self.tree.range(pivot..).next() {
+                Some((k, _id)) => k.clone(),
+                None => max_entry_key()
+            };
+            debug_assert!(pivot < upper_bound);
+            debug!("Splitted to new tree {:?}, starts at {:?}, ends at {:?}", new_tree, pivot, upper_bound);
+            self.tree.insert(pivot.clone(), TreePlacement::new(new_tree));
+            self.load_sub_tree(new_tree, pivot, upper_bound, INITIAL_TREE_EPOCH).await;
+            if let Some((_, mut prev_tree)) = self.tree.range_mut(..pivot).last() {
+                assert_eq!(prev_tree.id, src_tree);
+                prev_tree.epoch += 1;
+            }
+        }.boxed()
     }
 }
 

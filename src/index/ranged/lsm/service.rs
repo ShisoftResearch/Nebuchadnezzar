@@ -252,7 +252,6 @@ impl LSMTreeService {
                                 }
                             }
                         }
-                        tree.retain(&mid_key);
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
                         debug!("Calling placement for split to {:?}", migration_target_id);
@@ -261,13 +260,15 @@ impl LSMTreeService {
                             .await
                             .unwrap();
                         // Reset state on current tree
-                        debug!("Unmark migration {:?}", dist_tree.id);
-                        tree.mark_migration(&dist_tree.id, None, &client).await;
                         {
                             let mut dist_prop = dist_tree.prop.write();
                             dist_prop.boundary.upper = mid_key;
                             dist_prop.migration = None;
+                            dist_prop.epoch += 1;
                         }
+                        debug!("Unmark migration {:?}", dist_tree.id);
+                        tree.mark_migration(&dist_tree.id, None, &client).await;
+                        tree.retain(&mid_key);
                     }
                 }
                 if !fast_mode {
@@ -285,7 +286,7 @@ impl LSMTreeService {
     {
         future::ready(if let Some(tree) = self.trees.get(&id) {
             let tree_prop = tree.prop.read();
-            if epoch != tree_prop.epoch {
+            if epoch < tree_prop.epoch {
                 OpResult::EpochMissMatch(tree_prop.epoch, epoch)
             } else if tree_prop.boundary.in_boundary(&entry) {
                 if let &Some(ref migration) = &tree_prop.migration {

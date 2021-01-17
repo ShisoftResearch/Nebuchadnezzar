@@ -48,8 +48,8 @@ impl RangedQueryClient {
         self_ref
             .run_on_destinated_tree(
                 key,
-                |key, client, tree_id| {
-                    async move { client.seek(tree_id, key, ordering, buffer_size).await }.boxed()
+                |key, client, tree_id, epoch| {
+                    async move { client.seek(tree_id, key, ordering, buffer_size, epoch).await }.boxed()
                 },
                 |action_res, _tree_client, lower, upper| {
                     async move {
@@ -79,7 +79,7 @@ impl RangedQueryClient {
     pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
-            |key, client, tree_id| async move { client.delete(tree_id, key.clone()).await }.boxed(),
+            |key, client, tree_id, epoch| async move { client.delete(tree_id, key.clone(), epoch).await }.boxed(),
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
         .await
@@ -88,7 +88,7 @@ impl RangedQueryClient {
     pub async fn insert(&self, key: &EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
-            |key, client, tree_id| async move { client.insert(tree_id, key.clone()).await }.boxed(),
+            |key, client, tree_id, epoch| async move { client.insert(tree_id, key.clone(), epoch).await }.boxed(),
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
         .await
@@ -121,6 +121,7 @@ impl RangedQueryClient {
             EntryKey,
             Arc<AsyncServiceClient>,
             Id,
+            u64
         ) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
         P: Fn(
             Option<AR>,
@@ -139,9 +140,9 @@ impl RangedQueryClient {
                     "Too many retry",
                 )));
             }
-            let (placmenet, tree_client, lower, upper) =
+            let (placement, tree_client, lower, upper) =
                 self.locate_key_server(&key, ensure_updated).await?;
-            match action(key.clone(), tree_client.clone(), placement).await? {
+            match action(key.clone(), tree_client.clone(), placement.id, placement.epoch).await? {
                 OpResult::Successful(res) => {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
@@ -151,6 +152,10 @@ impl RangedQueryClient {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 OpResult::OutOfBound | OpResult::NotFound => {
+                    ensure_updated = true;
+                }
+                OpResult::EpochMissMatch(expect, actual) => {
+                    debug!("Epoch mismatch, expect {}, actual {}", expect, actual);
                     ensure_updated = true;
                 }
             }
