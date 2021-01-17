@@ -241,8 +241,8 @@ impl LSMTree {
 }
 
 pub struct LSMTreeCursor {
+    pub current: Option<(usize, EntryKey)>,
     cursors: LevelCusors,
-    current: Option<(usize, EntryKey)>,
     ordering: Ordering,
     deletion: Arc<DeletionSet>,
 }

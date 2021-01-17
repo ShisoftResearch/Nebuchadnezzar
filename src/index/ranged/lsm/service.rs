@@ -7,7 +7,6 @@ use crate::client::AsyncClient;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
-use bifrost::utils::time::get_time;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -15,8 +14,7 @@ use lightning::map::Map;
 use lightning::map::{HashMap, ObjectMap};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::mem;
 use std::time::Duration;
 
 pub type IdBlock = [Id; BLOCK_SIZE];
@@ -36,9 +34,10 @@ pub enum OpResult<T> {
     Migrating,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub struct ServCursor {
-    cursor_id: u64,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ServBlock {
+    pub buffer: Vec<Id>,
+    pub next: Option<EntryKey>,
 }
 
 pub struct DistLSMTree {
@@ -56,11 +55,6 @@ pub struct DistProp {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Migration {
     pivot: EntryKey,
-}
-
-pub struct CursorMemo {
-    tree_cursor: LSMTreeCursor,
-    expires: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -85,18 +79,13 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary);
     rpc insert(id: Id, entry: EntryKey) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey) -> OpResult<bool>;
-    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, cursor_lifetime: u16)
-        -> OpResult<(ServCursor, Option<Id>)>;
-    rpc renew_cursor(cursor: ServCursor, time: u16) -> bool;
-    rpc dispose_cursor(cursor: ServCursor) -> bool;
-    rpc cursor_next(cursor: ServCursor) -> Option<IdBlock>;
+    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, buffer_size: u16)
+        -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
 
 pub struct LSMTreeService {
     client: Arc<AsyncClient>,
-    cursor_counter: AtomicUsize,
-    cursors: ObjectMap<Arc<RefCell<CursorMemo>>>,
     trees: Arc<HashMap<Id, Arc<DistLSMTree>>>,
 }
 
@@ -153,52 +142,25 @@ impl Service for LSMTreeService {
         id: Id,
         entry: EntryKey,
         ordering: Ordering,
-        cursor_lifetime: u16,
-    ) -> BoxFuture<OpResult<(ServCursor, Option<Id>)>> {
+        buffer_size: u16,
+    ) -> BoxFuture<OpResult<ServBlock>> {
         self.apply_in_ranged_tree(id, entry, |entry, tree| {
+            let buffer_size = buffer_size as usize;
             let mut tree_cursor = tree.seek(&entry, ordering);
-            let cursor_id = self.cursor_counter.fetch_add(1, Relaxed);
-            let expires = get_time() + cursor_lifetime as i64;
-            let first_entry = tree_cursor.next();
-            let cursor_memo = CursorMemo {
-                tree_cursor,
-                expires,
+            let mut buffer = Vec::with_capacity(buffer_size);
+            for _ in 0..buffer_size {
+                if let Some(key) = tree_cursor.next() {
+                    buffer.push(key.id());
+                } else {
+                    break;
+                }
+            }
+            let next = mem::take(&mut tree_cursor.current.map(|(_, k)| k));
+            let lsm_cursor = ServBlock {
+                buffer, next
             };
-            self.cursors
-                .insert(&(cursor_id), Arc::new(RefCell::new(cursor_memo)));
-            let cursor = ServCursor {
-                cursor_id: cursor_id as u64,
-            };
-            OpResult::Successful((cursor, first_entry.map(|entry| entry.id())))
+            OpResult::Successful(lsm_cursor)
         })
-    }
-
-    fn renew_cursor(&self, cursor: ServCursor, time: u16) -> BoxFuture<bool> {
-        future::ready(
-            if let Some(cursor) = self.cursors.write(cursor.cursor_id as usize) {
-                cursor.borrow_mut().expires = get_time() + time as i64;
-                true
-            } else {
-                false
-            },
-        )
-        .boxed()
-    }
-
-    fn dispose_cursor(&self, cursor: ServCursor) -> BoxFuture<bool> {
-        future::ready(self.cursors.remove(&(cursor.cursor_id as usize)).is_some()).boxed()
-    }
-
-    fn cursor_next(&self, cursor: ServCursor) -> BoxFuture<Option<IdBlock>> {
-        future::ready(
-            if let Some(cursor) = self.cursors.write(cursor.cursor_id as usize) {
-                let mut cursor_ref = cursor.borrow_mut();
-                Some(id_block_from_cursor_memo(&mut *cursor_ref))
-            } else {
-                None
-            },
-        )
-        .boxed()
     }
 
     fn stat(&self, id: Id) -> BoxFuture<OpResult<LSMTreeStat>> {
@@ -235,8 +197,6 @@ impl LSMTreeService {
         Self::start_tree_balancer(&trees_map, client, sm_client);
         Self {
             client: client.clone(),
-            cursor_counter: AtomicUsize::new(0),
-            cursors: ObjectMap::with_capacity(64),
             trees: trees_map,
         }
     }
@@ -341,18 +301,6 @@ impl LSMTreeService {
         })
         .boxed()
     }
-}
-
-fn id_block_from_cursor_memo(cursor_memo: &mut CursorMemo) -> IdBlock {
-    let mut res = IdBlock::default();
-    for entry in res.iter_mut() {
-        if let Some(tree_entry) = cursor_memo.tree_cursor.next() {
-            *entry = tree_entry.id();
-        } else {
-            break;
-        }
-    }
-    res
 }
 
 impl DistLSMTree {

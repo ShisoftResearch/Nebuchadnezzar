@@ -1,6 +1,5 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
-use crate::client::AsyncClient;
 use crate::index::ranged::client::RangedQueryClient;
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
@@ -10,174 +9,81 @@ use bifrost::rpc::RPCError;
 use std::mem;
 use std::sync::Arc;
 
-type CellBlock = Vec<CellSlot>;
+type CellBlock = Vec<Option<IndexedCell>>;
 pub type IndexedCell = (Id, Result<Cell, ReadError>);
 
-enum CellSlot {
-    Some(IndexedCell),
-    None,
-    Taken,
-}
-
 pub struct ClientCursor {
-    cell: CellSlot,
-    cell_block: Option<CellBlock>,
+    cell_block: CellBlock,
+    next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
-    tree_client: Arc<AsyncServiceClient>,
-    remote_cursor: ServCursor,
     ordering: Ordering,
     tree_boundary: EntryKey,
     pos: usize,
+    buffer_size: u16
 }
 
 impl ClientCursor {
-    pub fn new(
-        remote: ServCursor,
-        init_cell: IndexedCell,
+    pub async fn new(
         ordering: Ordering,
+        block: ServBlock,
         tree_boundary: EntryKey,
-        tree_client: Arc<AsyncServiceClient>,
         query_client: Arc<RangedQueryClient>,
-    ) -> Self {
-        Self {
-            cell: CellSlot::Some(init_cell),
-            remote_cursor: remote,
-            tree_client,
+        buffer_size: u16
+    ) -> Result<Self, RPCError> {
+        debug!("Client cursor created with buffer next {:?}, bound {:?}", block.next, tree_boundary);
+        let next = block.next;
+        let ids = block.buffer.clone();
+        let cell_block = query_client.neb_client
+            .read_all_cells(block.buffer)
+            .await?
+            .into_iter()
+            .zip(ids)
+            .map(|(cell_res, id)| Some((id, cell_res)))
+            .collect();
+        Ok(Self {
             query_client,
-            cell_block: None,
+            cell_block,
             tree_boundary,
             ordering,
+            next,
+            buffer_size,
             pos: 0,
-        }
+        })
     }
 
     pub async fn next(&mut self) -> Result<Option<IndexedCell>, RPCError> {
-        loop {
-            let res: IndexedCell;
-            if self.cell.is_some() && self.cell_block.is_none() {
-                res = mem::take(&mut self.cell).get_in();
-                let cells = Self::refresh_block(
-                    &self.tree_client,
-                    &self.query_client.neb_client,
-                    self.remote_cursor,
-                )
-                .await?;
-                self.cell_block = cells;
-            } else if let &mut Some(ref mut cells) = &mut self.cell_block {
-                if cells[0].is_none() {
-                    // have empty block will try to reload the cursor from the client for
-                    // next key may been placed on another
-                    let replacement = RangedQueryClient::seek(
-                        &self.query_client,
-                        &self.tree_boundary,
-                        self.ordering,
-                    )
-                    .await?;
-                    if let Some(new_cursor) = replacement {
-                        *self = new_cursor;
-                        continue;
-                    } else {
-                        // No replacement, set self empty
-                        return Ok(None);
-                    }
-                }
-                let old_cell = mem::replace(&mut cells[self.pos], CellSlot::Taken);
-                res = old_cell.get_in();
-                self.pos += 1;
-                // Check if pos is in range and have value. If not, get next block.
-                if self.pos >= cells.len() || cells[self.pos].is_none() {
-                    self.cell_block = Self::refresh_block(
-                        &self.tree_client,
-                        &self.query_client.neb_client,
-                        self.remote_cursor,
-                    )
-                    .await?;
-                    self.cell = CellSlot::Taken;
-                    self.pos = 0;
-                }
-            } else {
-                return Ok(None);
-            }
-            return if res.0.is_unit_id() {
-                self.cell = CellSlot::None;
-                self.cell_block = None;
-                Ok(None)
-            } else {
-                Ok(Some(res))
-            };
+        if self.pos < self.cell_block.len() {
+            self.pos += 1;
+            return Ok(Some(mem::take(&mut self.cell_block[self.pos]).unwrap()));
+        }
+        let next_key = if let Some(key) = &self.next {
+            // Have next, use it
+            key
+        } else {
+            // Key does not in the tree, and next key is unknown.
+            // Should use boundary
+            &self.tree_boundary
+        };
+        debug!("Buffer all used, refilling using key {:?}", next_key);
+        let next_cursor = 
+            RangedQueryClient::seek(
+                &self.query_client, 
+                next_key, 
+                self.ordering,
+                self.buffer_size
+            ).await?;
+        if let Some(cursor) = next_cursor {
+            *self = cursor;
+            Ok(self.current().cloned())
+        } else {
+            Ok(None)
         }
     }
 
     pub fn current(&self) -> Option<&IndexedCell> {
-        match &self.cell {
-            CellSlot::Some(cell) => Some(cell),
-            _ => match &self.cell_block.as_ref().unwrap()[self.pos] {
-                CellSlot::Some(cell) => Some(cell),
-                _ => None,
-            },
+        match &self.cell_block[self.pos] {
+            Some(cell) => Some(cell),
+            _ => None,
         }
-    }
-
-    async fn refresh_block(
-        tree_client: &Arc<AsyncServiceClient>,
-        neb_client: &Arc<AsyncClient>,
-        remote_cursor: ServCursor,
-    ) -> Result<Option<CellBlock>, RPCError> {
-        let cell_ids = tree_client.cursor_next(remote_cursor).await?.unwrap();
-        if cell_ids[0].is_unit_id() {
-            return Ok(None);
-        }
-        let id_vec = Vec::from(cell_ids);
-        let id_vec_copy = id_vec.clone();
-        let cells = neb_client
-            .read_all_cells(id_vec)
-            .await?
-            .into_iter()
-            .zip(id_vec_copy)
-            .map(|(cell_res, id)| CellSlot::Some((id, cell_res)))
-            .collect();
-        Ok(Some(cells))
-    }
-}
-
-impl Drop for ClientCursor {
-    fn drop(&mut self) {
-        let remote_cursor = self.remote_cursor;
-        let tree_client = self.tree_client.clone();
-        tokio::spawn(async move { tree_client.dispose_cursor(remote_cursor).await });
-    }
-}
-
-impl CellSlot {
-    fn is_none(&self) -> bool {
-        match self {
-            CellSlot::None => true,
-            _ => false,
-        }
-    }
-    fn is_some(&self) -> bool {
-        match self {
-            CellSlot::Some(_) => true,
-            _ => false,
-        }
-    }
-    fn get_in(self) -> IndexedCell {
-        match self {
-            CellSlot::Some(cell) => cell,
-            _ => unreachable!(),
-        }
-    }
-    fn borrow_into(&self) -> Option<&IndexedCell> {
-        match self {
-            CellSlot::Some(cell) => Some(cell),
-            CellSlot::None => None,
-            CellSlot::Taken => unreachable!(),
-        }
-    }
-}
-
-impl Default for CellSlot {
-    fn default() -> Self {
-        CellSlot::None
     }
 }

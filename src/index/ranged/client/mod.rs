@@ -43,33 +43,32 @@ impl RangedQueryClient {
         self_ref: &Arc<Self>,
         key: &EntryKey,
         ordering: Ordering,
+        buffer_size: u16
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         self_ref
             .run_on_destinated_tree(
                 key,
                 |key, client, tree_id| {
-                    async move { client.seek(tree_id, key, ordering, 160).await }.boxed()
+                    async move { client.seek(tree_id, key, ordering, buffer_size).await }.boxed()
                 },
-                |action_res, tree_client, lower, upper| {
+                |action_res, _tree_client, lower, upper| {
                     async move {
-                        if let Some((cursor, init_id)) = action_res {
+                        if let Some(block) = action_res {
                             let tree_boundary = match ordering {
                                 Ordering::Forward => upper,
                                 Ordering::Backward => lower,
                             };
-                            if let Some(init_id) = init_id {
-                                let init_cell =
-                                    (init_id, self_ref.neb_client.read_cell(init_id).await?);
-                                return Ok(Some(Some(cursor::ClientCursor::new(
-                                    cursor,
-                                    init_cell,
-                                    ordering,
-                                    tree_boundary,
-                                    tree_client,
-                                    self_ref.clone(),
-                                ))));
+                            if block.buffer.is_empty() {
+                                return Ok(Some(None))
                             } else {
-                                return Ok(Some(None));
+                                let client_cursor = cursor::ClientCursor::new(
+                                    ordering, 
+                                    block, 
+                                    tree_boundary,
+                                    self_ref.clone(),
+                                    buffer_size,
+                                ).await?;
+                                return Ok(Some(Some(client_cursor)));
                             }
                         } else {
                             unreachable!()
