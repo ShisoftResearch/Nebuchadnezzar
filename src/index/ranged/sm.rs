@@ -60,6 +60,7 @@ impl StateMachineCmds for MasterTreeSM {
     }
 
     fn next_tree(&self, tree_lower: EntryKey, ordering: Ordering) -> BoxFuture<Option<TreeInfo>> {
+        debug!("Query next tree for {:?}, ordering {:?}, trees {:?}", tree_lower, ordering, self.tree);
         future::ready(match ordering {
             Ordering::Forward => {
                 let mut iter = self.tree.range((Excluded(&tree_lower), Unbounded));

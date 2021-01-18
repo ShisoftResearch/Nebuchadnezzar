@@ -52,7 +52,7 @@ impl RangedQueryClient {
                 |key, client, tree_id, epoch| {
                     async move { client.seek(tree_id, key, ordering, buffer_size, epoch).await }.boxed()
                 },
-                |action_res, _tree_client, lower, upper| {
+                |action_res, _tree_client, lower, _upper| {
                     async move {
                         if let Some(block) = action_res {
                             if block.buffer.is_empty() {
@@ -199,7 +199,7 @@ impl RangedQueryClient {
         // This function must be able to detect tree changes and ensure consistency
         {
             let placement = self.placement.read();
-            let (origin_place, origin_upper) = placement.get(origin_lower).unwrap();
+            let (_origin_place, origin_upper) = placement.get(origin_lower).unwrap();
             let cached_next = match ordering {
                 Ordering::Forward => {
                     placement.range((Excluded(origin_lower), Unbounded)).next()
@@ -223,7 +223,7 @@ impl RangedQueryClient {
                     )
                 }
             } else {
-                debug!("Next tree does not have cache, ordering {:?}", ordering);
+                debug!("Next tree does not have cache, origin {:?}, ordering {:?}", origin_lower, ordering);
             }
         }
         Ok(self.sm.next_tree(origin_lower, &ordering).await?.map(|next| {

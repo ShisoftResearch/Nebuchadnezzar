@@ -1,7 +1,6 @@
 use super::node::NodeData;
 use super::*;
 use std::fmt::Debug;
-use std::sync::atomic::Ordering::*;
 
 // Assuming the tree is almost full, worst scenario it is half full
 // Pick the mid point in each of the levels, this will give us an approximate half key of the tree

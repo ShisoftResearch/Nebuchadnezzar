@@ -69,7 +69,7 @@ impl ClientCursor {
             self.refill_by_next_tree().await?;
             return Ok(res)
         };
-        debug!("Buffer all used, refilling using key {:?}", next_key);
+        trace!("Buffer all used, refilling using key {:?}", next_key);
         let next_cursor = 
             RangedQueryClient::seek(
                 &self.query_client, 
@@ -93,8 +93,10 @@ impl ClientCursor {
     }
 
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
+        debug!("Refill by next tree, key {:?}, ordering {:?}", self.tree_key, self.ordering);
         loop {
             if let Some((tree_key, tree)) = self.query_client.next_tree(&self.tree_key, self.ordering).await.unwrap() {
+                debug!("Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}", self.tree_key, tree, tree_key, self.ordering);
                 let tree_client = locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
                 let seek_key = match self.ordering {
                     Ordering::Forward => min_entry_key(),
@@ -105,8 +107,10 @@ impl ClientCursor {
                     OpResult::Successful(block) => {
                         if block.buffer.is_empty() {
                             // Clear, this will ensure the cursor returns 0
+                            debug!("Tree refill seek returns empty block");
                             self.cell_block.clear();
                         } else {
+                            debug!("Tree refill seek returns block sized {}", block.buffer.len());
                             *self = Self::new(
                                 self.ordering, 
                                 block,
@@ -126,6 +130,7 @@ impl ClientCursor {
                     }
                 }
             } else {
+                debug!("Next tree for {:?} does not return anything. ordering {:?}", self.tree_key, self.ordering);
                 return Ok(());
             }
         }

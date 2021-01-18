@@ -11,7 +11,7 @@ use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use lightning::map::Map;
-use lightning::map::{HashMap, ObjectMap};
+use lightning::map::HashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::mem;

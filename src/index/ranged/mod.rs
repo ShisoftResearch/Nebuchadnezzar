@@ -63,7 +63,7 @@ mod tests {
         );
         info!("Generating test set");
         let mut rng = rand::thread_rng();
-        let mut nums = (0..test_capacity).collect_vec();
+        let nums = (0..test_capacity).collect_vec();
         let mut nums_2 = nums.clone();
         let mut nums_3 = nums.clone();
         nums_2.as_mut_slice().shuffle(&mut rng);
@@ -151,7 +151,7 @@ mod tests {
         .unwrap();
         for num in &nums {
             let id = Id::new(1, *num as u64);
-            let current = rt_cursor.current().unwrap().0;
+            let current = rt_cursor.current().expect(&format!("Checking {}", num)).0;
             assert_eq!(id, current, "Expecting {:?}, key {:?}, got {:?}", id, EntryKey::from_id(&id), current);
             let _ = rt_cursor.next().await.unwrap();
             if num % (test_capacity / 128) == 0 {

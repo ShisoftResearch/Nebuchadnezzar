@@ -8,8 +8,7 @@ use super::*;
 use itertools::Itertools;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::{char::MAX, cmp::min};
-use std::sync::atomic::Ordering::*;
+use std::cmp::min;
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
@@ -159,7 +158,7 @@ where
                             clear_nodes(nodes, right_node.node_ref());
                             check_right(right_node)
                         }
-                        NodeSelection::PartialPage(nodes, mut terminal_node) => {
+                        NodeSelection::PartialPage(nodes, terminal_node) => {
                             clear_nodes(nodes, terminal_node.node_ref());
                             let search_pos = terminal_node.keys().binary_search(boundary);
                             let pos = match search_pos {
