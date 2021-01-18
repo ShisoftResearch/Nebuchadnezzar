@@ -1,12 +1,12 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
-use crate::index::ranged::client::RangedQueryClient;
+use crate::index::ranged::{client::RangedQueryClient, trees::{max_entry_key, min_entry_key}};
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
-use std::mem;
+use std::{mem, time::Duration};
 use std::sync::Arc;
 
 type CellBlock = Vec<Option<IndexedCell>>;
@@ -65,8 +65,9 @@ impl ClientCursor {
             key
         } else {
             // Key does not in the tree, and next key is unknown.
-            // Should use boundary
-            &self.tree_boundary
+            // Should refill by next tree and return the previous key
+            self.refill_by_next_tree().await?;
+            return Ok(res)
         };
         debug!("Buffer all used, refilling using key {:?}", next_key);
         let next_cursor = 
@@ -88,6 +89,45 @@ impl ClientCursor {
         match self.cell_block.get(self.pos) {
             Some(Some(cell)) => Some(cell),
             _ => None,
+        }
+    }
+
+    async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
+        loop {
+            if let Some((tree_key, tree)) = self.query_client.next_tree(&self.tree_key, self.ordering).await.unwrap() {
+                let tree_client = locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
+                let seek_key = match self.ordering {
+                    Ordering::Forward => min_entry_key(),
+                    Ordering::Backward => max_entry_key()
+                };
+                let seek_res = tree_client.seek(tree.id, seek_key, self.ordering, self.buffer_size, tree.epoch).await?;
+                match seek_res {
+                    OpResult::Successful(block) => {
+                        if block.buffer.is_empty() {
+                            // Clear, this will ensure the cursor returns 0
+                            self.cell_block.clear();
+                        } else {
+                            *self = Self::new(
+                                self.ordering, 
+                                block,
+                                tree_key,
+                                self.query_client.clone(),
+                                self.buffer_size
+                            ).await?;
+                        }
+                        return Ok(())
+                    }
+                    OpResult::Migrating => {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    OpResult::OutOfBound | OpResult::NotFound => unreachable!(),
+                    OpResult::EpochMissMatch(expect, actual) => {
+                        debug!("Epoch mismatch on refill, expected {}, actual {}", expect, actual);
+                    }
+                }
+            } else {
+                return Ok(());
+            }
         }
     }
 }

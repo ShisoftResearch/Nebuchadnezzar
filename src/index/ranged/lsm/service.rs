@@ -262,7 +262,7 @@ impl LSMTreeService {
                         // Reset state on current tree
                         {
                             let mut dist_prop = dist_tree.prop.write();
-                            dist_prop.boundary.upper = mid_key;
+                            dist_prop.boundary.upper = mid_key.clone();
                             dist_prop.migration = None;
                             dist_prop.epoch += 1;
                         }
@@ -325,7 +325,8 @@ impl Boundary {
         Boundary { lower, upper }
     }
     fn in_boundary(&self, entry: &EntryKey) -> bool {
-        return entry >= &self.lower && entry < &self.upper;
+        // Allow max/min query as special cases
+        (entry >= &self.lower && entry < &self.upper) || entry == &*MIN_ENTRY_KEY || entry == &*MAX_ENTRY_KEY
     }
 }
 
