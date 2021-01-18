@@ -1,5 +1,5 @@
-use super::lsm::{service::AsyncServiceClient as LSMServiceClient, tree::INITIAL_TREE_EPOCH};
 use super::lsm::service::*;
+use super::lsm::{service::AsyncServiceClient as LSMServiceClient, tree::INITIAL_TREE_EPOCH};
 use super::trees::*;
 use crate::ram::types::Id;
 use crate::ram::types::RandValue;
@@ -11,15 +11,15 @@ use bifrost::utils;
 use bifrost_plugins::hash_ident;
 use futures::prelude::*;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::ops::Bound::*;
+use std::sync::Arc;
 
 pub const DEFAULT_SM_ID: u64 = hash_ident!("RANGED_INDEX_SM_ID") as u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreePlacement {
     pub id: Id,
-    pub epoch: u64
+    pub epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,34 +60,41 @@ impl StateMachineCmds for MasterTreeSM {
     }
 
     fn next_tree(&self, tree_lower: EntryKey, ordering: Ordering) -> BoxFuture<Option<TreeInfo>> {
-        debug!("Query next tree for {:?}, ordering {:?}, trees {:?}", tree_lower, ordering, self.tree);
+        debug!(
+            "Query next tree for {:?}, ordering {:?}, trees {:?}",
+            tree_lower, ordering, self.tree
+        );
         future::ready(match ordering {
             Ordering::Forward => {
                 let mut iter = self.tree.range((Excluded(&tree_lower), Unbounded));
                 if let Some((next_lower, next_place)) = iter.next() {
-                    let next_upper = iter.next().map(|(k, _)| k).unwrap_or_else(|| &*MAX_ENTRY_KEY);
+                    let next_upper = iter
+                        .next()
+                        .map(|(k, _)| k)
+                        .unwrap_or_else(|| &*MAX_ENTRY_KEY);
                     Some(TreeInfo {
                         lower: next_lower.clone(),
                         upper: next_upper.clone(),
-                        placement: next_place.clone()
+                        placement: next_place.clone(),
                     })
                 } else {
                     None
                 }
-            },
+            }
             Ordering::Backward => {
                 let mut iter = self.tree.range(..&tree_lower).rev();
                 if let Some((next_lower, next_place)) = iter.next() {
                     Some(TreeInfo {
                         lower: next_lower.clone(),
                         upper: tree_lower.clone(),
-                        placement: next_place.clone()
+                        placement: next_place.clone(),
                     })
                 } else {
                     None
                 }
-            },
-        }).boxed()
+            }
+        })
+        .boxed()
     }
 
     fn split(&mut self, src_tree: Id, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
@@ -95,17 +102,23 @@ impl StateMachineCmds for MasterTreeSM {
         async move {
             let upper_bound = match self.tree.range(&pivot..).next() {
                 Some((k, _id)) => k.clone(),
-                None => max_entry_key()
+                None => max_entry_key(),
             };
             debug_assert!(pivot < upper_bound);
-            debug!("Splitted to new tree {:?}, starts at {:?}, ends at {:?}", new_tree, pivot, upper_bound);
-            self.tree.insert(pivot.clone(), TreePlacement::new(new_tree));
-            self.load_sub_tree(new_tree, &pivot, &upper_bound, INITIAL_TREE_EPOCH).await;
+            debug!(
+                "Splitted to new tree {:?}, starts at {:?}, ends at {:?}",
+                new_tree, pivot, upper_bound
+            );
+            self.tree
+                .insert(pivot.clone(), TreePlacement::new(new_tree));
+            self.load_sub_tree(new_tree, &pivot, &upper_bound, INITIAL_TREE_EPOCH)
+                .await;
             if let Some((_, mut prev_tree)) = self.tree.range_mut(..&pivot).last() {
                 assert_eq!(prev_tree.id, src_tree);
                 prev_tree.epoch += 1;
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
@@ -134,11 +147,16 @@ impl MasterTreeSM {
     }
     pub async fn try_initialize(&mut self) -> bool {
         let genesis_id = Id::rand();
-        self.tree.insert(min_entry_key(), TreePlacement::new(genesis_id));
+        self.tree
+            .insert(min_entry_key(), TreePlacement::new(genesis_id));
         locate_tree_server_from_conshash(&genesis_id, &self.conshash)
             .await
             .unwrap()
-            .crate_tree(genesis_id, Boundary::new(min_entry_key(), max_entry_key()), INITIAL_TREE_EPOCH)
+            .crate_tree(
+                genesis_id,
+                Boundary::new(min_entry_key(), max_entry_key()),
+                INITIAL_TREE_EPOCH,
+            )
             .await
             .unwrap();
         true
@@ -165,7 +183,8 @@ impl MasterTreeSM {
 impl TreePlacement {
     pub fn new(id: Id) -> Self {
         TreePlacement {
-            id, epoch: INITIAL_TREE_EPOCH
+            id,
+            epoch: INITIAL_TREE_EPOCH,
         }
     }
 }

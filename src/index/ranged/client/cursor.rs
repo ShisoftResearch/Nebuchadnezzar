@@ -1,13 +1,16 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
-use crate::index::ranged::{client::RangedQueryClient, trees::{max_entry_key, min_entry_key}};
+use crate::index::ranged::{
+    client::RangedQueryClient,
+    trees::{max_entry_key, min_entry_key},
+};
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
 use bifrost::rpc::RPCError;
-use std::{mem, time::Duration};
 use std::sync::Arc;
+use std::{mem, time::Duration};
 
 type CellBlock = Vec<Option<IndexedCell>>;
 pub type IndexedCell = (Id, Result<Cell, ReadError>);
@@ -19,7 +22,7 @@ pub struct ClientCursor {
     ordering: Ordering,
     tree_key: EntryKey,
     pos: usize,
-    buffer_size: u16
+    buffer_size: u16,
 }
 
 impl ClientCursor {
@@ -28,12 +31,17 @@ impl ClientCursor {
         block: ServBlock,
         tree_key: EntryKey,
         query_client: Arc<RangedQueryClient>,
-        buffer_size: u16
+        buffer_size: u16,
     ) -> Result<Self, RPCError> {
-        trace!("Client cursor created with buffer next {:?}, tree key {:?}", block.next, tree_key);
+        trace!(
+            "Client cursor created with buffer next {:?}, tree key {:?}",
+            block.next,
+            tree_key
+        );
         let next = block.next;
         let ids = block.buffer.clone();
-        let cell_block = query_client.neb_client
+        let cell_block = query_client
+            .neb_client
             .read_all_cells(block.buffer)
             .await?
             .into_iter()
@@ -67,16 +75,16 @@ impl ClientCursor {
             // Key does not in the tree, and next key is unknown.
             // Should refill by next tree and return the previous key
             self.refill_by_next_tree().await?;
-            return Ok(res)
+            return Ok(res);
         };
         trace!("Buffer all used, refilling using key {:?}", next_key);
-        let next_cursor = 
-            RangedQueryClient::seek(
-                &self.query_client, 
-                next_key, 
-                self.ordering,
-                self.buffer_size
-            ).await?;
+        let next_cursor = RangedQueryClient::seek(
+            &self.query_client,
+            next_key,
+            self.ordering,
+            self.buffer_size,
+        )
+        .await?;
         if let Some(cursor) = next_cursor {
             *self = cursor;
         } else {
@@ -93,16 +101,36 @@ impl ClientCursor {
     }
 
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
-        debug!("Refill by next tree, key {:?}, ordering {:?}", self.tree_key, self.ordering);
+        debug!(
+            "Refill by next tree, key {:?}, ordering {:?}",
+            self.tree_key, self.ordering
+        );
         loop {
-            if let Some((tree_key, tree)) = self.query_client.next_tree(&self.tree_key, self.ordering).await.unwrap() {
-                debug!("Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}", self.tree_key, tree, tree_key, self.ordering);
-                let tree_client = locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
+            if let Some((tree_key, tree)) = self
+                .query_client
+                .next_tree(&self.tree_key, self.ordering)
+                .await
+                .unwrap()
+            {
+                debug!(
+                    "Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}",
+                    self.tree_key, tree, tree_key, self.ordering
+                );
+                let tree_client =
+                    locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
                 let seek_key = match self.ordering {
                     Ordering::Forward => min_entry_key(),
-                    Ordering::Backward => max_entry_key()
+                    Ordering::Backward => max_entry_key(),
                 };
-                let seek_res = tree_client.seek(tree.id, seek_key, self.ordering, self.buffer_size, tree.epoch).await?;
+                let seek_res = tree_client
+                    .seek(
+                        tree.id,
+                        seek_key,
+                        self.ordering,
+                        self.buffer_size,
+                        tree.epoch,
+                    )
+                    .await?;
                 match seek_res {
                     OpResult::Successful(block) => {
                         if block.buffer.is_empty() {
@@ -110,27 +138,37 @@ impl ClientCursor {
                             debug!("Tree refill seek returns empty block");
                             self.cell_block.clear();
                         } else {
-                            debug!("Tree refill seek returns block sized {}", block.buffer.len());
+                            debug!(
+                                "Tree refill seek returns block sized {}",
+                                block.buffer.len()
+                            );
                             *self = Self::new(
-                                self.ordering, 
+                                self.ordering,
                                 block,
                                 tree_key,
                                 self.query_client.clone(),
-                                self.buffer_size
-                            ).await?;
+                                self.buffer_size,
+                            )
+                            .await?;
                         }
-                        return Ok(())
+                        return Ok(());
                     }
                     OpResult::Migrating => {
                         tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                     OpResult::OutOfBound | OpResult::NotFound => unreachable!(),
                     OpResult::EpochMissMatch(expect, actual) => {
-                        debug!("Epoch mismatch on refill, expected {}, actual {}", expect, actual);
+                        debug!(
+                            "Epoch mismatch on refill, expected {}, actual {}",
+                            expect, actual
+                        );
                     }
                 }
             } else {
-                debug!("Next tree for {:?} does not return anything. ordering {:?}", self.tree_key, self.ordering);
+                debug!(
+                    "Next tree for {:?} does not return anything. ordering {:?}",
+                    self.tree_key, self.ordering
+                );
                 return Ok(());
             }
         }

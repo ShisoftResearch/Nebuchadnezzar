@@ -1,20 +1,20 @@
-use super::{lsm::btree::Ordering, sm::TreePlacement};
 use super::lsm::service::*;
 use super::sm::client::SMClient;
+use super::{lsm::btree::Ordering, sm::TreePlacement};
 use crate::client::AsyncClient;
 use crate::index::EntryKey;
 use crate::ram::types::Id;
-use bifrost::{conshash::ConsistentHashing, raft::state_machine::master::ExecError};
 use bifrost::raft::client::RaftClient;
 use bifrost::rpc::RPCError;
+use bifrost::{conshash::ConsistentHashing, raft::state_machine::master::ExecError};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::io;
+use std::ops::Bound::*;
 use std::sync::Arc;
 use std::time::Duration;
-use std::ops::Bound::*;
 
 pub mod cursor;
 
@@ -44,27 +44,33 @@ impl RangedQueryClient {
         self_ref: &Arc<Self>,
         key: &EntryKey,
         ordering: Ordering,
-        buffer_size: u16
+        buffer_size: u16,
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         self_ref
             .run_on_destinated_tree(
                 key,
                 |key, client, tree_id, epoch| {
-                    async move { client.seek(tree_id, key, ordering, buffer_size, epoch).await }.boxed()
+                    async move {
+                        client
+                            .seek(tree_id, key, ordering, buffer_size, epoch)
+                            .await
+                    }
+                    .boxed()
                 },
                 |action_res, _tree_client, lower, _upper| {
                     async move {
                         if let Some(block) = action_res {
                             if block.buffer.is_empty() {
-                                return Ok(Some(None))
+                                return Ok(Some(None));
                             } else {
                                 let client_cursor = cursor::ClientCursor::new(
-                                    ordering, 
-                                    block, 
+                                    ordering,
+                                    block,
                                     lower,
                                     self_ref.clone(),
                                     buffer_size,
-                                ).await?;
+                                )
+                                .await?;
                                 return Ok(Some(Some(client_cursor)));
                             }
                         } else {
@@ -80,7 +86,9 @@ impl RangedQueryClient {
     pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
-            |key, client, tree_id, epoch| async move { client.delete(tree_id, key.clone(), epoch).await }.boxed(),
+            |key, client, tree_id, epoch| {
+                async move { client.delete(tree_id, key.clone(), epoch).await }.boxed()
+            },
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
         .await
@@ -89,7 +97,9 @@ impl RangedQueryClient {
     pub async fn insert(&self, key: &EntryKey) -> Result<bool, RPCError> {
         self.run_on_destinated_tree(
             key,
-            |key, client, tree_id, epoch| async move { client.insert(tree_id, key.clone(), epoch).await }.boxed(),
+            |key, client, tree_id, epoch| {
+                async move { client.insert(tree_id, key.clone(), epoch).await }.boxed()
+            },
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
         .await
@@ -122,7 +132,7 @@ impl RangedQueryClient {
             EntryKey,
             Arc<AsyncServiceClient>,
             Id,
-            u64
+            u64,
         ) -> BoxFuture<'a, Result<OpResult<AR>, RPCError>>,
         P: Fn(
             Option<AR>,
@@ -143,7 +153,14 @@ impl RangedQueryClient {
             }
             let (placement, tree_client, lower, upper) =
                 self.locate_key_server(&key, ensure_updated).await?;
-            match action(key.clone(), tree_client.clone(), placement.id, placement.epoch).await? {
+            match action(
+                key.clone(),
+                tree_client.clone(),
+                placement.id,
+                placement.epoch,
+            )
+            .await?
+            {
                 OpResult::Successful(res) => {
                     if let Some(proc_res) = proc(Some(res), tree_client, lower, upper).await? {
                         return Ok(proc_res);
@@ -171,48 +188,64 @@ impl RangedQueryClient {
     ) -> Result<(TreePlacement, Arc<AsyncServiceClient>, EntryKey, EntryKey), RPCError> {
         let mut tree_prop = None;
         if !ensure_updated {
-            if let Some((lower, (placement, upper))) = self.placement.read().range(..key.clone()).last() {
+            if let Some((lower, (placement, upper))) =
+                self.placement.read().range(..key.clone()).last()
+            {
                 if key >= lower && key < upper {
                     tree_prop = Some((lower.clone(), placement.clone(), upper.clone()));
                 }
             }
         }
         if tree_prop.is_none() {
-            tree_prop = Some(self.refresh_key_mapping(key).await.expect("Cannot locate key"));
+            tree_prop = Some(
+                self.refresh_key_mapping(key)
+                    .await
+                    .expect("Cannot locate key"),
+            );
         }
         let (lower, tree_placement, upper) = tree_prop.unwrap();
-        let tree_client = locate_tree_server_from_conshash(&tree_placement.id, &self.conshash).await?;
+        let tree_client =
+            locate_tree_server_from_conshash(&tree_placement.id, &self.conshash).await?;
         Ok((tree_placement, tree_client, lower, upper))
     }
-    
-    async fn refresh_key_mapping(&self, key: &EntryKey) -> Result<(EntryKey, TreePlacement, EntryKey), ExecError> {
+
+    async fn refresh_key_mapping(
+        &self,
+        key: &EntryKey,
+    ) -> Result<(EntryKey, TreePlacement, EntryKey), ExecError> {
         let (lower, placement, upper) = self.sm.locate_key(key).await?;
-        debug_assert!(key >= &lower && key < &upper, "Key {:?}, lower {:?}, upper {:?}", key, lower, upper);
+        debug_assert!(
+            key >= &lower && key < &upper,
+            "Key {:?}, lower {:?}, upper {:?}",
+            key,
+            lower,
+            upper
+        );
         self.placement
             .write()
             .insert(lower.clone(), (placement.clone(), upper.clone()));
         return Ok((lower, placement, upper));
     }
 
-    pub async fn next_tree(&self, origin_lower: &EntryKey, ordering: Ordering) -> Result<Option<(EntryKey, TreePlacement)>, ExecError> {
+    pub async fn next_tree(
+        &self,
+        origin_lower: &EntryKey,
+        ordering: Ordering,
+    ) -> Result<Option<(EntryKey, TreePlacement)>, ExecError> {
         // Next tree for cursor
         // This function must be able to detect tree changes and ensure consistency
         {
             let placement = self.placement.read();
             let (_origin_place, origin_upper) = placement.get(origin_lower).unwrap();
             let cached_next = match ordering {
-                Ordering::Forward => {
-                    placement.range((Excluded(origin_lower), Unbounded)).next()
-                }
-                Ordering::Backward => {
-                    placement.range((Unbounded, Excluded(origin_lower))).last()
-                }
+                Ordering::Forward => placement.range((Excluded(origin_lower), Unbounded)).next(),
+                Ordering::Backward => placement.range((Unbounded, Excluded(origin_lower))).last(),
             };
             // Check cache consistency against origin
             if let Some((cached_lower, (cached_placement, cached_upper))) = cached_next {
                 let matched_with_origin = match ordering {
                     Ordering::Forward => cached_lower == origin_upper,
-                    Ordering::Backward => cached_upper == origin_lower
+                    Ordering::Backward => cached_upper == origin_lower,
                 };
                 if matched_with_origin {
                     return Ok(Some((cached_lower.clone(), cached_placement.clone())));
@@ -223,12 +256,21 @@ impl RangedQueryClient {
                     )
                 }
             } else {
-                debug!("Next tree does not have cache, origin {:?}, ordering {:?}", origin_lower, ordering);
+                debug!(
+                    "Next tree does not have cache, origin {:?}, ordering {:?}",
+                    origin_lower, ordering
+                );
             }
         }
-        Ok(self.sm.next_tree(origin_lower, &ordering).await?.map(|next| {
-            self.placement.write().insert(next.lower.clone(), (next.placement.clone(), next.upper));
-            (next.lower, next.placement)
-        }))
+        Ok(self
+            .sm
+            .next_tree(origin_lower, &ordering)
+            .await?
+            .map(|next| {
+                self.placement
+                    .write()
+                    .insert(next.lower.clone(), (next.placement.clone(), next.upper));
+                (next.lower, next.placement)
+            }))
     }
 }

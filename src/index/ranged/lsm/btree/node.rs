@@ -11,7 +11,10 @@ pub struct EmptyNode {
 
 impl Default for EmptyNode {
     fn default() -> Self {
-        EmptyNode { left: Default::default(), right: Default::default() }
+        EmptyNode {
+            left: Default::default(),
+            right: Default::default(),
+        }
     }
 }
 

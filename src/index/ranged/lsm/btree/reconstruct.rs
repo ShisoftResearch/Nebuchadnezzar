@@ -120,7 +120,7 @@ pub async fn reconstruct_from_head_id<KS, PS>(
     head_id: Id,
     neb: &AsyncClient,
     deletion: &Arc<DeletionSet>,
-    level: usize
+    level: usize,
 ) -> BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
@@ -258,7 +258,8 @@ mod test {
             last_id = new_id;
         }
         let deletion = Arc::new(HashSet::with_capacity(8));
-        let tree = Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0).await);
+        let tree =
+            Arc::new(LevelBPlusTree::from_head_id(&Id::new(1, 1), &client, &deletion, 0).await);
         let threads = all_keys
             .clone()
             .into_iter()

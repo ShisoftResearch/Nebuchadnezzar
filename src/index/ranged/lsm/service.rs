@@ -1,6 +1,6 @@
 use super::super::sm::client::SMClient;
 use super::super::trees::*;
-pub use super::btree::level::{LEVEL_M as BLOCK_SIZE, LEVEL_1 as MIGRATE_SIZE};
+pub use super::btree::level::{LEVEL_1 as MIGRATE_SIZE, LEVEL_M as BLOCK_SIZE};
 use super::btree::storage;
 use super::tree::*;
 use crate::client::AsyncClient;
@@ -10,8 +10,8 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
-use lightning::map::Map;
 use lightning::map::HashMap;
+use lightning::map::Map;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::mem;
@@ -51,7 +51,7 @@ pub struct DistLSMTree {
 pub struct DistProp {
     boundary: Boundary,
     migration: Option<Migration>,
-    epoch: u64
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,7 +80,7 @@ service! {
     rpc crate_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
-    rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>; 
+    rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc seek(id: Id, entry: EntryKey, ordering: Ordering, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
@@ -98,8 +98,10 @@ impl Service for LSMTreeService {
                 return;
             }
             let tree = LSMTree::create(&self.client, &id).await;
-            self.trees
-                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)));
+            self.trees.insert(
+                &id,
+                Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
+            );
         }
         .boxed()
     }
@@ -112,9 +114,15 @@ impl Service for LSMTreeService {
             }
             info!("Called to load tree {:?}, boundary {:?}", id, boundary);
             let tree = LSMTree::recover(&self.client, &id).await;
-            debug!("LSM tree loaded with {} keys, capacity {}.", tree.count(), tree.ideal_capacity());
-            self.trees
-                .insert(&id, Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)));
+            debug!(
+                "LSM tree loaded with {} keys, capacity {}.",
+                tree.count(),
+                tree.ideal_capacity()
+            );
+            self.trees.insert(
+                &id,
+                Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
+            );
         }
         .boxed()
     }
@@ -145,7 +153,7 @@ impl Service for LSMTreeService {
         entry: EntryKey,
         ordering: Ordering,
         buffer_size: u16,
-        epoch: u64
+        epoch: u64,
     ) -> BoxFuture<OpResult<ServBlock>> {
         self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
             let buffer_size = buffer_size as usize;
@@ -159,9 +167,7 @@ impl Service for LSMTreeService {
                 }
             }
             let next = mem::take(&mut tree_cursor.current.map(|(_, k)| k));
-            let lsm_cursor = ServBlock {
-                buffer, next
-            };
+            let lsm_cursor = ServBlock { buffer, next };
             OpResult::Successful(lsm_cursor)
         })
     }
@@ -241,7 +247,10 @@ impl LSMTreeService {
                         let buffer_size = MIGRATE_SIZE << 4;
                         let mut cursor = tree.seek(&mid_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
-                        debug!("Start moving keys from {:?} to {:?}", dist_tree.id, migration_target_id);
+                        debug!(
+                            "Start moving keys from {:?} to {:?}",
+                            dist_tree.id, migration_target_id
+                        );
                         while cursor.current().is_some() {
                             if let Some(entry) = cursor.next() {
                                 entry_buffer.push(entry);
@@ -281,7 +290,13 @@ impl LSMTreeService {
         });
     }
 
-    fn apply_in_ranged_tree<F, R>(&self, id: Id, entry: EntryKey, epoch: u64, func: F) -> BoxFuture<OpResult<R>>
+    fn apply_in_ranged_tree<F, R>(
+        &self,
+        id: Id,
+        entry: EntryKey,
+        epoch: u64,
+        func: F,
+    ) -> BoxFuture<OpResult<R>>
     where
         F: Fn(&EntryKey, &LSMTree) -> OpResult<R>,
         R: Send + 'static,
@@ -312,11 +327,17 @@ impl LSMTreeService {
 }
 
 impl DistLSMTree {
-    fn new(id: Id, tree: LSMTree, boundary: Boundary, migration: Option<Migration>, epoch: u64) -> Self {
+    fn new(
+        id: Id,
+        tree: LSMTree,
+        boundary: Boundary,
+        migration: Option<Migration>,
+        epoch: u64,
+    ) -> Self {
         let prop = RwLock::new(DistProp {
             boundary,
             migration,
-            epoch
+            epoch,
         });
         Self { id, tree, prop }
     }
@@ -328,7 +349,9 @@ impl Boundary {
     }
     fn in_boundary(&self, entry: &EntryKey) -> bool {
         // Allow max/min query as special cases
-        (entry >= &self.lower && entry < &self.upper) || entry == &*MIN_ENTRY_KEY || entry == &*MAX_ENTRY_KEY
+        (entry >= &self.lower && entry < &self.upper)
+            || entry == &*MIN_ENTRY_KEY
+            || entry == &*MAX_ENTRY_KEY
     }
 }
 

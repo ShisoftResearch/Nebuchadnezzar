@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn clear_by_node<KS, PS>(node_ref: &NodeCellRef) 
+pub fn clear_by_node<KS, PS>(node_ref: &NodeCellRef)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -8,8 +8,8 @@ where
     match &*read_unchecked::<KS, PS>(node_ref) {
         &NodeData::Internal(ref node) => {
             clear_by_node::<KS, PS>(&node.ptrs.as_slice_immute()[0]);
-        },
-        &NodeData::External(_) => {},
+        }
+        &NodeData::External(_) => {}
         &NodeData::Empty(_) | &NodeData::None => unreachable!(),
     }
     let mut node = write_node::<KS, PS>(&node_ref);

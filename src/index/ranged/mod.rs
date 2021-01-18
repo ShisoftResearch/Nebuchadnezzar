@@ -144,7 +144,7 @@ mod tests {
             &index_client,
             &EntryKey::from_id(&Id::new(1, 0)),
             Ordering::Forward,
-            128
+            128,
         )
         .await
         .unwrap()
@@ -152,7 +152,14 @@ mod tests {
         for num in &nums {
             let id = Id::new(1, *num as u64);
             let current = rt_cursor.current().expect(&format!("Checking {}", num)).0;
-            assert_eq!(id, current, "Expecting {:?}, key {:?}, got {:?}", id, EntryKey::from_id(&id), current);
+            assert_eq!(
+                id,
+                current,
+                "Expecting {:?}, key {:?}, got {:?}",
+                id,
+                EntryKey::from_id(&id),
+                current
+            );
             let _ = rt_cursor.next().await.unwrap();
             if num % (test_capacity / 128) == 0 {
                 debug!("Scanned {} of {}", num, test_capacity);

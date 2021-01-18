@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::*};
 use std::sync::Arc;
 
 pub mod cell_ref;
+mod clear;
 mod cursor;
 mod dump;
 mod external;
@@ -38,12 +39,11 @@ mod internal;
 pub mod level;
 mod merge;
 mod node;
-mod clear;
 mod reconstruct;
 mod search;
+mod split;
 pub mod storage;
 pub mod verification;
-mod split;
 #[macro_use]
 pub mod marco;
 
@@ -111,8 +111,11 @@ where
 
     // Non-atomic
     pub fn clear(&self) {
-        let new_node = NodeCellRef::new(Node::<KS, PS>::new_external(self.head_page_id, max_entry_key()));
-        let old_node = mem::replace(&mut*self.root.write(), new_node);
+        let new_node = NodeCellRef::new(Node::<KS, PS>::new_external(
+            self.head_page_id,
+            max_entry_key(),
+        ));
+        let old_node = mem::replace(&mut *self.root.write(), new_node);
         self.len.store(0, Release);
         clear::clear_by_node::<KS, PS>(&old_node);
     }
@@ -126,7 +129,7 @@ where
         head_id: &Id,
         neb: &AsyncClient,
         deletion: &Arc<DeletionSet>,
-        level: usize
+        level: usize,
     ) -> Self {
         reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
     }
@@ -271,12 +274,12 @@ where
     }
 }
 
-impl <KS, PS> Drop for BPlusTree<KS, PS>
+impl<KS, PS> Drop for BPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    fn drop(&mut self) { 
+    fn drop(&mut self) {
         clear::clear_by_node::<KS, PS>(&*self.root.read());
     }
 }
@@ -450,7 +453,7 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn root(&self) -> NodeCellRef { 
+    fn root(&self) -> NodeCellRef {
         unreachable!()
     }
     fn retain_by_key(&self, _key: &EntryKey) {

@@ -6,9 +6,9 @@ use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
+use std::cmp::min;
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::cmp::min;
 
 pub const LEVEL_TREE_DEPTH: u32 = 2;
 
@@ -130,7 +130,11 @@ where
                     } else {
                         // This level and the tree should be the new root
                         debug_assert!(node.keys().len() > 0);
-                        debug!("The node is a level terminal {:?} with length {}", node.node_ref(), node.len());
+                        debug!(
+                            "The node is a level terminal {:?} with length {}",
+                            node.node_ref(),
+                            node.len()
+                        );
                         RightCheck::LevelTerminal(node.node_ref().clone())
                     }
                 } else {
@@ -329,7 +333,7 @@ pub fn level_merge<KS, PS>(
     src_tree: &BPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     deleted: &mut HashSet<EntryKey>,
-    prune: bool, 
+    prune: bool,
 ) -> usize
 where
     KS: Slice<EntryKey> + Debug + 'static,
