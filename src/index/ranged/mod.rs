@@ -63,10 +63,9 @@ mod tests {
         );
         info!("Generating test set");
         let mut rng = rand::thread_rng();
-        let mut nums = (0..test_capacity).collect_vec();
+        let nums = (0..test_capacity).collect_vec();
         let mut nums_2 = nums.clone();
         let mut nums_3 = nums.clone();
-        nums.as_mut_slice().shuffle(&mut rng);
         nums_2.as_mut_slice().shuffle(&mut rng);
         nums_3.as_mut_slice().shuffle(&mut rng);
         info!("Adding insertion tasks");
@@ -109,7 +108,7 @@ mod tests {
                 let id = Id::new(1, num as u64);
                 let key = EntryKey::from_id(&id);
                 let rt_cursor =
-                    client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward)
+                    client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward, 1)
                         .await
                         .unwrap()
                         .unwrap();
@@ -145,13 +144,14 @@ mod tests {
             &index_client,
             &EntryKey::from_id(&Id::new(1, 0)),
             Ordering::Forward,
+            128
         )
         .await
         .unwrap()
         .unwrap();
         for num in &nums {
             let id = Id::new(1, *num as u64);
-            let current = rt_cursor.current().unwrap().0;
+            let current = rt_cursor.current().expect(&format!("Checking {}", num)).0;
             assert_eq!(id, current, "Expecting {:?}, key {:?}, got {:?}", id, EntryKey::from_id(&id), current);
             let _ = rt_cursor.next().await.unwrap();
             if num % (test_capacity / 128) == 0 {
@@ -175,7 +175,6 @@ mod tests {
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
-        panic!("Explicit panic for error discovery");
     }
 
     fn schema() -> Schema {

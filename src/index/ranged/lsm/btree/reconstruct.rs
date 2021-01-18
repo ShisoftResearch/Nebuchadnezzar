@@ -2,7 +2,7 @@ use super::external::ExtNode;
 use super::internal::InNode;
 use super::node::{write_node, Node, NodeWriteGuard};
 use super::*;
-use super::{external, max_entry_key, BPlusTree, NodeCellRef};
+use super::{max_entry_key, BPlusTree, NodeCellRef};
 use crate::client::AsyncClient;
 use std::cell::RefCell;
 use std::fmt::Debug;

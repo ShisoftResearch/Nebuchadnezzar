@@ -102,7 +102,7 @@ fn crd() {
         .parse::<u64>()
         .unwrap();
     // die-rolling
-    let mut rng = thread_rng();
+    let rng = thread_rng();
     let die_range = Uniform::new_inclusive(1, 6);
     let mut roll_die = rng.sample_iter(&die_range);
     {

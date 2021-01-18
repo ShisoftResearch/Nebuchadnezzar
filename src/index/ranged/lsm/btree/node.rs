@@ -1,7 +1,6 @@
 use super::*;
 use futures::FutureExt;
 use std::any::TypeId;
-use std::backtrace;
 use std::ptr;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
 
