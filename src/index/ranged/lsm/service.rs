@@ -252,6 +252,8 @@ impl LSMTreeService {
                                 }
                             }
                         }
+                        debug!("Merging last batch of keys, size {}", entry_buffer.len());
+                        migration_tree.merge_keys(entry_buffer);
                         debug!("Waiting for new tree {:?} persisted", migration_target_id);
                         storage::wait_until_updated().await;
                         debug!("Calling placement for split to {:?}", migration_target_id);
