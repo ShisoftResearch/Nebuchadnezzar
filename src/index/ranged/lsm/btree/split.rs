@@ -11,7 +11,6 @@ where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    debug!("Searching for pivot key for split {:?}", node_ref);
     // Use read unchecked for there should be no writer for disk trees
     match &*read_unchecked::<KS, PS>(node_ref) {
         &NodeData::External(ref n) => {

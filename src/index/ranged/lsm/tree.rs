@@ -229,8 +229,9 @@ impl LSMTree {
         if trees.is_empty() {
             return None;
         }
-        let scale = self.ideal_capacity() / 4;
+        let scale = self.ideal_capacity() / 16;
         loop {
+            trace!("Probing trees for pivot {:?}", trees.iter().map(|t| (&t.1, &t.2)).collect::<Vec<_>>());
             if let Some((tree, (node_len, prev_node, mid_key), avil)) = trees
                 .iter_mut()
                 .filter(|(_, _, avil)| *avil)
@@ -238,6 +239,7 @@ impl LSMTree {
             {
                 accum_keys += *node_len;
                 if accum_keys > scale {
+                    debug!("Selected {} keys for pivot at {:?}", accum_keys, mid_key);
                     return Some(mid_key.clone());
                 }
                 if let Some((prev_len, prev_prev_node, prev_mid)) = tree.last_node_digest(prev_node)
