@@ -234,7 +234,10 @@ impl LSMTree {
         }
         let scale = self.ideal_capacity() / 16;
         loop {
-            trace!("Probing trees for pivot {:?}", trees.iter().map(|t| (&t.1, &t.2)).collect::<Vec<_>>());
+            trace!(
+                "Probing trees for pivot {:?}",
+                trees.iter().map(|t| (&t.1, &t.2)).collect::<Vec<_>>()
+            );
             if let Some((tree, (node_len, prev_node, mid_key), avil)) = trees
                 .iter_mut()
                 .filter(|(_, _, avil)| *avil)

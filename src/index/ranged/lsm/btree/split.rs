@@ -55,7 +55,10 @@ fn retain_by_node<KS, PS>(
     match &*read_unchecked::<KS, PS>(node_ref) {
         &NodeData::External(_) => {
             // Assert the key exists in the node for it is immutable
-            debug!("Retaining keys at {:?}, from node {:?}, external level {}", mid_key, node_ref, level);
+            debug!(
+                "Retaining keys at {:?}, from node {:?}, external level {}",
+                mid_key, node_ref, level
+            );
             let mut node = write_node::<KS, PS>(node_ref);
             debug!("Retain key lock obtained for {:?}", node_ref);
             let n = node.extnode_mut(tree);
@@ -66,7 +69,12 @@ fn retain_by_node<KS, PS>(
             }
             let selected_key = &n.keys.as_slice_immute()[key_index];
             let origin_node_len = n.len;
-            debug_assert!(selected_key >= mid_key, "Selected {:?}, mid {:?}", selected_key, mid_key);
+            debug_assert!(
+                selected_key >= mid_key,
+                "Selected {:?}, mid {:?}",
+                selected_key,
+                mid_key
+            );
             n.len = key_index; // All others will be ignored
             debug_assert_ne!(
                 n.len, 0,
