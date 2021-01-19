@@ -54,6 +54,7 @@ mod tests {
         let index_client = Arc::new(
             client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
         );
+        info!("Tree stat {:?}", index_client.tree_stats().await.unwrap());
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
         let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_1) * 3;
         let mut futs = FuturesUnordered::new();
@@ -184,7 +185,6 @@ mod tests {
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
-        panic!("Explicit panic for error detection");
     }
 
     fn schema() -> Schema {
