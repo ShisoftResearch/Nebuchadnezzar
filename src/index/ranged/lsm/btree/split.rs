@@ -104,6 +104,7 @@ fn retain_by_node<KS, PS>(
             if index >= n.len {
                 return;
             }
+            assert_ne!(index, 0, "This case is not possible and not handled");
             debug!("Retaining keys at internal level {}", level);
             let mut node = write_node::<KS, PS>(node_ref);
             debug_assert_eq!(
