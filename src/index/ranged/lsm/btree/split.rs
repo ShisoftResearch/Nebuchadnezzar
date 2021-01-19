@@ -86,9 +86,9 @@ fn retain_by_node<KS, PS>(
             let mut num_removed_keys = origin_node_len - key_index;
             drop(node);
             while !right_node_ref.is_default() {
-                debug!("Obtaining right node lock for {:?}", right_node_ref);
+                trace!("Obtaining right node lock for {:?}", right_node_ref);
                 let mut node = write_node::<KS, PS>(&right_node_ref);
-                debug!("Right node lock obrained for {:?}", right_node_ref);
+                trace!("Right node lock obrained for {:?}", right_node_ref);
                 let node_id = node.ext_id();
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
