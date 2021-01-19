@@ -201,7 +201,9 @@ impl LSMTree {
             guard.defer_destroy(mem_tree_ptr);
         }
         // Use retain by key only for the last disk tree
+        info!("Retaining last level disk tree keys");
         self.disk_trees[last_tree_index].retain_by_key(pivot);
+        info!("Updating deletion set with {} keys", deleted_keys.len());
         for dk in deleted_keys {
             self.deletion.remove(&dk);
         }
@@ -210,6 +212,7 @@ impl LSMTree {
                 self.deletion.remove(&dk);
             }
         }
+        info!("Retain process completed");
     }
 
     pub fn oversized(&self) -> bool {

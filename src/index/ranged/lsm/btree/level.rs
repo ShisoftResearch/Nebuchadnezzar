@@ -6,7 +6,6 @@ use super::LevelTree;
 use super::NodeCellRef;
 use super::*;
 use itertools::Itertools;
-use std::cmp::min;
 use std::collections::HashSet;
 use std::fmt::Debug;
 

@@ -55,12 +55,18 @@ fn retain_by_node<KS, PS>(
     match &*read_unchecked::<KS, PS>(node_ref) {
         &NodeData::External(_) => {
             // Assert the key exists in the node for it is immutable
+            debug!("Retaining keys at {:?}, from node {:?}, external level {}", mid_key, node_ref, level);
             let mut node = write_node::<KS, PS>(node_ref);
+            debug!("Retain key lock obtained for {:?}", node_ref);
             let n = node.extnode_mut(tree);
             let key_index = n.search(mid_key);
+            if key_index >= n.len {
+                // Pivot is beyond reach, nothing to do
+                return;
+            }
             let selected_key = &n.keys.as_slice_immute()[key_index];
             let origin_node_len = n.len;
-            debug_assert!(selected_key >= mid_key);
+            debug_assert!(selected_key >= mid_key, "Selected {:?}, mid {:?}", selected_key, mid_key);
             n.len = key_index; // All others will be ignored
             debug_assert_ne!(
                 n.len, 0,
@@ -72,7 +78,9 @@ fn retain_by_node<KS, PS>(
             let mut num_removed_keys = origin_node_len - key_index;
             drop(node);
             while !right_node_ref.is_default() {
+                debug!("Obtaining right node lock for {:?}", right_node_ref);
                 let mut node = write_node::<KS, PS>(&right_node_ref);
+                debug!("Right node lock obrained for {:?}", right_node_ref);
                 let node_id = node.ext_id();
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
@@ -85,6 +93,10 @@ fn retain_by_node<KS, PS>(
         &NodeData::Internal(ref n) => {
             let index = n.search(mid_key);
             retain_by_node::<KS, PS>(tree, &n.ptrs.as_slice_immute()[index], mid_key, level + 1);
+            if index >= n.len {
+                return;
+            }
+            debug!("Retaining keys at internal level {}", level);
             let mut node = write_node::<KS, PS>(node_ref);
             debug_assert_eq!(
                 // Ensure two searches have the same result

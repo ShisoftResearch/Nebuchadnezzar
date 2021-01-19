@@ -177,11 +177,14 @@ mod tests {
             "After end of the list have id {:?}",
             end_of_list.unwrap().0
         );
+        debug!("All check pased, waiting for 10 secs for statistics");
+        tokio::time::sleep(Duration::from_secs(10)).await;
         info!(
             "Total cells {}, Tree stat {:?}",
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
+        panic!("Explicit panic for error detection");
     }
 
     fn schema() -> Schema {
