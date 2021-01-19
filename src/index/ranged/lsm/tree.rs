@@ -218,11 +218,13 @@ impl LSMTree {
 
     pub fn pivot_key(&self) -> Option<EntryKey> {
         let mut accum_keys = 0;
-        let mut trees = self.disk_trees
+        let mut trees = self
+            .disk_trees
             .iter()
-            .filter_map(|tree| tree.last_node_digest(
-                &tree.root()).map(|tuple| (tree, tuple, true))
-            )
+            .filter_map(|tree| {
+                tree.last_node_digest(&tree.root())
+                    .map(|tuple| (tree, tuple, true))
+            })
             .collect::<Vec<_>>();
         if trees.is_empty() {
             return None;
@@ -232,15 +234,14 @@ impl LSMTree {
             if let Some((tree, (node_len, prev_node, mid_key), avil)) = trees
                 .iter_mut()
                 .filter(|(_, _, avil)| *avil)
-                .max_by(|(_, (_, _, k1), _), (_, (_, _, k2), _)|  {
-                    k1.cmp(k2)
-                })
+                .max_by(|(_, (_, _, k1), _), (_, (_, _, k2), _)| k1.cmp(k2))
             {
                 accum_keys += *node_len;
                 if accum_keys > scale {
                     return Some(mid_key.clone());
                 }
-                if let Some((prev_len, prev_prev_node, prev_mid)) = tree.last_node_digest(prev_node) {
+                if let Some((prev_len, prev_prev_node, prev_mid)) = tree.last_node_digest(prev_node)
+                {
                     *node_len = prev_len;
                     *prev_node = prev_prev_node;
                     *mid_key = prev_mid;

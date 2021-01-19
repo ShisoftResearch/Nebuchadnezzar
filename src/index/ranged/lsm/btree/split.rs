@@ -4,7 +4,9 @@ use std::fmt::Debug;
 
 // Assuming the tree is almost full, worst scenario it is half full
 // Pick the mid point in each of the levels, this will give us an approximate half key of the tree
-pub fn last_node_prev_digest<KS, PS>(node_ref: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)>
+pub fn last_node_prev_digest<KS, PS>(
+    node_ref: &NodeCellRef,
+) -> Option<(usize, NodeCellRef, EntryKey)>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -15,15 +17,15 @@ where
         &NodeData::External(ref n) => {
             let keys = n.keys.as_slice_immute();
             Some((n.len, n.prev.clone(), keys[n.len / 2].clone()))
-        },
+        }
         &NodeData::Internal(ref n) => {
             debug!("Collecting pivot in internal {:?}", node_ref);
             last_node_prev_digest::<KS, PS>(&n.ptrs.as_slice_immute()[..n.len].last().unwrap())
-        },
+        }
         &NodeData::Empty(ref n) => {
             debug!("Collecting pivot in empty {:?}", node_ref);
             last_node_prev_digest::<KS, PS>(n.left.as_ref().unwrap())
-        },
+        }
         &NodeData::None => None,
     }
 }
