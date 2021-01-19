@@ -306,7 +306,6 @@ pub trait LevelTree: Sync + Send {
     fn insert_into(&self, key: &EntryKey) -> bool;
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor>;
     fn dump(&self, f: &str);
-    fn mid_key(&self) -> Option<EntryKey>;
     fn head_id(&self) -> Id;
     fn verify(&self, level: usize) -> bool;
     fn ideal_capacity(&self) -> usize {
@@ -317,6 +316,7 @@ pub trait LevelTree: Sync + Send {
     }
     fn root(&self) -> NodeCellRef;
     fn clear_tree(&self);
+    fn last_node_digest(&self, node: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)>;
 }
 
 pub fn ideal_capacity_from_node_size(size: usize) -> usize {
@@ -372,10 +372,6 @@ where
         dump::dump_tree(self, f);
     }
 
-    fn mid_key(&self) -> Option<EntryKey> {
-        split::mid_key::<KS, PS>(&self.get_root())
-    }
-
     fn head_id(&self) -> Id {
         self.head_page_id
     }
@@ -391,6 +387,9 @@ where
     }
     fn clear_tree(&self) {
         self.clear()
+    }
+    fn last_node_digest(&self, node: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)> {
+        split::last_node_prev_digest::<KS, PS>(node)
     }
 }
 
@@ -441,10 +440,6 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
 
-    fn mid_key(&self) -> Option<EntryKey> {
-        unreachable!()
-    }
-
     fn head_id(&self) -> Id {
         unreachable!()
     }
@@ -460,6 +455,9 @@ impl LevelTree for DummyLevelTree {
         unreachable!()
     }
     fn clear_tree(&self) {
+        unreachable!()
+    }
+    fn last_node_digest(&self, _node: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)> {
         unreachable!()
     }
 }

@@ -4,17 +4,26 @@ use std::fmt::Debug;
 
 // Assuming the tree is almost full, worst scenario it is half full
 // Pick the mid point in each of the levels, this will give us an approximate half key of the tree
-pub fn mid_key<KS, PS>(node_ref: &NodeCellRef) -> Option<EntryKey>
+pub fn last_node_prev_digest<KS, PS>(node_ref: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    trace!("Searching for mid key for split");
+    debug!("Searching for pivot key for split {:?}", node_ref);
     // Use read unchecked for there should be no writer for disk trees
     match &*read_unchecked::<KS, PS>(node_ref) {
-        &NodeData::External(ref n) => Some(n.keys.as_slice_immute()[n.len / 2].clone()),
-        &NodeData::Internal(ref n) => mid_key::<KS, PS>(&n.ptrs.as_slice_immute()[n.len / 2]),
-        &NodeData::Empty(ref n) => mid_key::<KS, PS>(&n.right),
+        &NodeData::External(ref n) => {
+            let keys = n.keys.as_slice_immute();
+            Some((n.len, n.prev.clone(), keys[n.len / 2].clone()))
+        },
+        &NodeData::Internal(ref n) => {
+            debug!("Collecting pivot in internal {:?}", node_ref);
+            last_node_prev_digest::<KS, PS>(&n.ptrs.as_slice_immute()[..n.len].last().unwrap())
+        },
+        &NodeData::Empty(ref n) => {
+            debug!("Collecting pivot in empty {:?}", node_ref);
+            last_node_prev_digest::<KS, PS>(n.left.as_ref().unwrap())
+        },
         &NodeData::None => None,
     }
 }

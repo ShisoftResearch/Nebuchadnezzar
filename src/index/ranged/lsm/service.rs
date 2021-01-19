@@ -63,7 +63,6 @@ pub struct Migration {
 pub struct BTreeStat {
     pub size: usize,
     pub count: usize,
-    pub mid_key: Option<EntryKey>,
     pub head: Id,
     pub ideal_cap: usize,
     pub oversized: bool,
@@ -184,7 +183,6 @@ impl Service for LSMTreeService {
                     .map(|t| BTreeStat {
                         size: t.size(),
                         count: t.count(),
-                        mid_key: t.mid_key(),
                         head: t.head_id(),
                         ideal_cap: t.ideal_capacity(),
                         oversized: t.oversized(),
@@ -228,24 +226,24 @@ impl LSMTreeService {
                     if tree.oversized() {
                         info!("LSM Tree oversized {:?}, start migration", dist_tree.id);
                         // Tree oversized, need to migrate
-                        let mid_key = tree.mid_key().unwrap();
+                        let pivot_key = tree.pivot_key().unwrap();
                         let migration_target_id = Id::rand();
                         debug!(
                             "Creating migration target tree {:?} split at {:?}",
-                            migration_target_id, mid_key
+                            migration_target_id, pivot_key
                         );
                         let migration_tree = LSMTree::create(&client, &migration_target_id).await;
                         {
                             let mut dist_tree_prop = dist_tree.prop.write();
                             dist_tree_prop.migration = Some(Migration {
-                                pivot: mid_key.clone(),
+                                pivot: pivot_key.clone(),
                             });
                         }
                         debug!("Marking migration for tree {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, Some(migration_target_id), &client)
                             .await;
                         let buffer_size = MIGRATE_SIZE << 4;
-                        let mut cursor = tree.seek(&mid_key, Ordering::Forward);
+                        let mut cursor = tree.seek(&pivot_key, Ordering::Forward);
                         let mut entry_buffer = Vec::with_capacity(buffer_size);
                         debug!(
                             "Start moving keys from {:?} to {:?}",
@@ -267,19 +265,19 @@ impl LSMTreeService {
                         storage::wait_until_updated().await;
                         debug!("Calling placement for split to {:?}", migration_target_id);
                         sm_client
-                            .split(&dist_tree.id, &migration_target_id, &mid_key)
+                            .split(&dist_tree.id, &migration_target_id, &pivot_key)
                             .await
                             .unwrap();
                         // Reset state on current tree
                         {
                             let mut dist_prop = dist_tree.prop.write();
-                            dist_prop.boundary.upper = mid_key.clone();
+                            dist_prop.boundary.upper = pivot_key.clone();
                             dist_prop.migration = None;
                             dist_prop.epoch += 1;
                         }
                         debug!("Unmark migration {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, None, &client).await;
-                        tree.retain(&mid_key);
+                        tree.retain(&pivot_key);
                         debug!("LSM tree migration from {:?} to {:?} succeed", dist_tree.id, migration_target_id);
                     }
                 }

@@ -318,7 +318,7 @@ where
         // Pick half of the keys in the root
         // Genreally, higher level sub tree in LSM tree will select more keys to merged
         // into next level
-        let mid_idx = min(node_len / 2, 8);
+        let mid_idx = node_len / 2;
         // Return the mid key as the boundary for selection (cut)
         Ok(Some(node_keys[mid_idx].clone()))
     });
