@@ -280,6 +280,7 @@ impl LSMTreeService {
                         debug!("Unmark migration {:?}", dist_tree.id);
                         tree.mark_migration(&dist_tree.id, None, &client).await;
                         tree.retain(&mid_key);
+                        debug!("LSM tree migration from {:?} to {:?} succeed", dist_tree.id, migration_target_id);
                     }
                 }
                 if !fast_mode {
