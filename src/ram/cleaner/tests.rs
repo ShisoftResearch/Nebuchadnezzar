@@ -6,6 +6,7 @@ use crate::ram::schema::Field;
 use crate::ram::schema::*;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
+use lightning::map::Map;
 use env_logger;
 use std;
 use std::collections::HashSet;
