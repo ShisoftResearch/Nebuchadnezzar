@@ -64,7 +64,7 @@ pub fn full_clean_cycle() {
         }
 
         assert_eq!(chunk.segments().len(), 2);
-        assert_eq!(chunk.index.len(), 16);
+        assert_eq!(chunk.cell_index.len(), 16);
 
         println!("trying to delete cells");
 

@@ -32,7 +32,7 @@ pub type CellWriteGuard<'a> = chashmap::WriteGuard<'a, u64, usize>;
 pub struct Chunk {
     pub id: usize,
     #[cfg(feature = "fast_map")]
-    pub index: Arc<WordMap>,
+    pub cell_index: Arc<WordMap>,
     pub segs: Arc<LinkedObjectMap<Segment>>,
     #[cfg(feature = "slow_map")]
     pub cell_index: Arc<CHashMap<u64, usize>>,
@@ -79,7 +79,7 @@ impl Chunk {
         let chunk = Chunk {
             id,
             segs,
-            index,
+            cell_index: index,
             meta,
             backup_storage,
             wal_storage,
@@ -160,7 +160,7 @@ impl Chunk {
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
         #[cfg(feature = "fast_map")]
-        let guard = self.index.lock(hash as usize);
+        let guard = self.cell_index.lock(hash as usize);
         #[cfg(feature = "slow_map")]
         let guard = self.index.get(&hash);
         match guard {
@@ -187,7 +187,7 @@ impl Chunk {
 
     pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
         #[cfg(feature = "fast_map")]
-        let guard = self.index.lock(hash as usize);
+        let guard = self.cell_index.lock(hash as usize);
         #[cfg(feature = "slow_map")]
         let guard = self.index.get_mut(&hash);
 
@@ -239,7 +239,7 @@ impl Chunk {
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let cell_loc = cell.write_to_chunk(self)?;
-        match self.index.try_insert_locked(cell.header.hash as usize) {
+        match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
             }
@@ -305,7 +305,7 @@ impl Chunk {
                 self.mark_dead_entry_with_cell(cell_location, cell);
             } else {
                 #[cfg(feature = "fast_map")]
-                let reservation = self.index.try_insert_locked(hash as usize);
+                let reservation = self.cell_index.try_insert_locked(hash as usize);
                 #[cfg(feature = "slow_map")]
                 let reservation = self.index.insert(hash, new_cell_loc);
                 if let Some(mut guard) = reservation {
@@ -368,7 +368,7 @@ impl Chunk {
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         let hash_key = hash as usize;
         #[cfg(feature = "fast_map")]
-        let guard_opt = self.index.lock(hash_key);
+        let guard_opt = self.cell_index.lock(hash_key);
         #[cfg(feature = "slow_map")]
         let guard_opt = self.index.remove(&hash);
         if let Some(guard) = guard_opt {
@@ -389,7 +389,7 @@ impl Chunk {
         P: Fn(Cell) -> bool,
     {
         #[cfg(feature = "fast_map")]
-        let guard = self.index.lock(hash as usize);
+        let guard = self.cell_index.lock(hash as usize);
         #[cfg(feature = "slow_map")]
         let guard = self.index.get(&hash);
         if let Some(guard) = guard {
@@ -647,7 +647,7 @@ impl Chunk {
         seg.entry_iter()
             .filter_map(move |entry_meta| {
                 let chunk_id = &self.id;
-                let chunk_index = &self.index;
+                let chunk_index = &self.cell_index;
                 let chunk_segs = &self.segs;
                 let entry_size = entry_meta.entry_size;
                 let entry_header = entry_meta.entry_header;
@@ -713,7 +713,7 @@ impl Chunk {
     }
 
     pub fn cell_count(&self) -> usize {
-        self.index.len()
+        self.cell_index.len()
     }
 
     pub fn seg_count(&self) -> usize {
@@ -721,7 +721,7 @@ impl Chunk {
     }
 
     pub fn count(&self) -> usize {
-        self.index.len()
+        self.cell_index.len()
     }
 }
 

@@ -213,7 +213,7 @@ impl CombinedCleaner {
                     cells.into_par_iter().for_each(|(new, old, hash)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         #[cfg(feature = "fast_map")]
-                        let index = chunk.index.lock(hash as usize);
+                        let index = chunk.cell_index.lock(hash as usize);
                         #[cfg(feature = "slow_map")]
                         let index = chunk.index.get_mut(&hash);
 

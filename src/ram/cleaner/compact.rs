@@ -112,7 +112,7 @@ impl CompactCleaner {
                     header.id()
                 );
                 #[cfg(feature = "fast_map")]
-                let index = chunk.index.lock(header.hash as usize);
+                let index = chunk.cell_index.lock(header.hash as usize);
                 #[cfg(feature = "slow_map")]
                 let index = chunk.index.get_mut(&header.hash);
 
