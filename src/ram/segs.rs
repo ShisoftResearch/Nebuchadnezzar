@@ -1,5 +1,4 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::cleaner::Cleaner;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;

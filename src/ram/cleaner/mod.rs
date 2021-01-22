@@ -1,5 +1,4 @@
 use crate::ram::chunk::{Chunk, Chunks};
-use lightning::map::Map;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};

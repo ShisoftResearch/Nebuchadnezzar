@@ -3,7 +3,6 @@ use super::super::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::entry::*;
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use itertools::Itertools;
 use libc;

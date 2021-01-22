@@ -1,6 +1,5 @@
 use super::*;
 use crate::ram::cell::*;
-use crate::ram::chunk::Chunk;
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::{EntryContent, EntryType};
 use crate::ram::schema::Field;
