@@ -49,6 +49,7 @@ pub fn full_clean_cycle() {
         Arc::new(ServerMeta { schemas }),
         None,
         None,
+        None,
     );
     let chunk = &chunks.list[0];
 

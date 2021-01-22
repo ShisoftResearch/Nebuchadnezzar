@@ -45,6 +45,7 @@ pub fn cell_rw() {
         Arc::<ServerMeta>::new(ServerMeta { schemas }),
         None,
         None,
+        None,
     );
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_1_ptr = chunks.address_of(&Id::from_header(&header));

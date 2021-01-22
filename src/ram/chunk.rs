@@ -1,4 +1,4 @@
-use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::{index::builder::IndexBuilder, ram::cell::{Cell, CellHeader, ReadError, WriteError}};
 use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
@@ -35,7 +35,7 @@ pub struct Chunk {
     pub index: Arc<WordMap>,
     pub segs: Arc<LinkedObjectMap<Segment>>,
     #[cfg(feature = "slow_map")]
-    pub index: Arc<CHashMap<u64, usize>>,
+    pub cell_index: Arc<CHashMap<u64, usize>>,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -45,6 +45,7 @@ pub struct Chunk {
     pub gc_lock: Mutex<()>,
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
+    pub index_builder: Option<Arc<IndexBuilder>>,
 }
 
 impl Chunk {
@@ -52,6 +53,7 @@ impl Chunk {
         id: usize,
         size: usize,
         meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Chunk {
@@ -82,6 +84,7 @@ impl Chunk {
             backup_storage,
             wal_storage,
             allocator,
+            index_builder,
             capacity: size,
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
@@ -745,6 +748,7 @@ impl Chunks {
         count: usize,
         size: usize,
         meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Arc<Chunks> {
@@ -762,6 +766,7 @@ impl Chunks {
                 i,
                 chunk_size,
                 meta.clone(),
+                index_builder.clone(),
                 backup_storage,
                 wal_storage,
             ));
@@ -775,6 +780,7 @@ impl Chunks {
             Arc::<ServerMeta>::new(ServerMeta {
                 schemas: LocalSchemasCache::new_local(""),
             }),
+            None,
             None,
             None,
         )

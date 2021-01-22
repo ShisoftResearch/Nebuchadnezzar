@@ -205,6 +205,7 @@ mod test {
                 memory_size: 16 * 12024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
+                index_enabled: false,
                 services: vec![Service::Cell],
             },
             &server_addr,

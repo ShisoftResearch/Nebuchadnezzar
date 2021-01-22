@@ -1,7 +1,9 @@
-use super::{EntryKey, Feature};
-use crate::ram::cell::Cell;
+use std::sync::Arc;
+use super::{EntryKey, Feature, ranged::client::RangedQueryClient};
+use crate::{client::AsyncClient, ram::cell::Cell};
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
+use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
 use bifrost_hasher::hash_str;
 
 type FieldName = String;
@@ -45,17 +47,33 @@ pub struct IndexRes {
     meta: Vec<IndexMeta>,
 }
 
-pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
-    let new_index = probe_cell_indices(cell, schema);
-    for index in new_index {
-        let field_id = hash_str(&index.fields);
-        for meta in index.meta {
-            match meta {
-                IndexMeta::Ranged(ranged) => {
-                    
+pub struct IndexBuilder {
+    ranged_client: RangedQueryClient
+}
+
+impl IndexBuilder {
+    pub async fn new(
+        conshash: &Arc<ConsistentHashing>,
+        raft_client: &Arc<RaftClient>,
+        neb_client: &Arc<AsyncClient>
+    )  -> Self {
+        Self {
+            ranged_client: RangedQueryClient::new(conshash, raft_client, neb_client).await,
+        }
+    }
+
+    pub fn ensure_indices(&self, cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
+        let new_index = probe_cell_indices(cell, schema);
+        for index in new_index {
+            let field_id = hash_str(&index.fields);
+            for meta in index.meta {
+                match meta {
+                    IndexMeta::Ranged(ranged) => {
+                        
+                    }
+                    IndexMeta::Hashed(_) => {}
+                    IndexMeta::Vectorized(_) => {}
                 }
-                IndexMeta::Hashed(_) => {}
-                IndexMeta::Vectorized(_) => {}
             }
         }
     }

@@ -1,4 +1,4 @@
-use crate::client;
+use crate::{client, index::builder::IndexBuilder};
 use crate::client::AsyncClient;
 use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
@@ -49,6 +49,7 @@ pub struct ServerOptions {
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
     pub services: Vec<Service>,
+    pub index_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,14 +125,6 @@ impl NebServer {
             .await
             .unwrap();
         let meta_rc = Arc::new(ServerMeta { schemas });
-        let chunks = Chunks::new(
-            opts.chunk_count,
-            opts.memory_size,
-            meta_rc.clone(),
-            opts.backup_storage.clone(),
-            opts.wal_storage.clone(),
-        );
-        let cleaner = Cleaner::new_and_start(chunks.clone());
         let conshasing = init_conshash(
             group_name,
             server_addr,
@@ -140,6 +133,25 @@ impl NebServer {
             membership_client,
         )
         .await?;
+        let neb_client = Arc::new(
+            client::AsyncClient::new(rpc_server, membership_client, &meta_members, group_name)
+                .await
+                .unwrap(),
+        );
+        let index_builder = if opts.index_enabled {
+            Some(Arc::new(IndexBuilder::new(&conshasing, &raft_client, &neb_client).await))
+        } else {
+            None
+        };
+        let chunks = Chunks::new(
+            opts.chunk_count,
+            opts.memory_size,
+            meta_rc.clone(),
+            index_builder,
+            opts.backup_storage.clone(),
+            opts.wal_storage.clone(),
+        );
+        let cleaner = Cleaner::new_and_start(chunks.clone());
         let server = Arc::new(NebServer {
             chunks,
             cleaner,
@@ -153,11 +165,6 @@ impl NebServer {
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
         });
-        let client = Arc::new(
-            client::AsyncClient::new(&server.rpc, membership_client, &meta_members, group_name)
-                .await
-                .unwrap(),
-        );
         for service in &opts.services {
             match service {
                 &Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
@@ -165,7 +172,7 @@ impl NebServer {
                 &Service::RangedIndexer => {
                     init_ranged_indexer_service(
                         rpc_server,
-                        &client,
+                        &neb_client,
                         raft_service,
                         raft_client,
                         &conshasing,

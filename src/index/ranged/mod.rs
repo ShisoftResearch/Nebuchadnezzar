@@ -35,6 +35,7 @@ mod tests {
                 memory_size: 32 * 1024 * 1024 * 1024, // G
                 backup_storage: None,
                 wal_storage: None,
+                index_enabled: false, // We don't use the high level index builder here
                 services: vec![Service::Cell, Service::RangedIndexer],
             },
             &server_addr,
