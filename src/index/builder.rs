@@ -51,7 +51,9 @@ pub fn ensure_indices(cell: &Cell, schema: &Schema, old_indices: Option<Vec<Inde
         let field_id = hash_str(&index.fields);
         for meta in index.meta {
             match meta {
-                IndexMeta::Ranged(ranged) => {}
+                IndexMeta::Ranged(ranged) => {
+                    
+                }
                 IndexMeta::Hashed(_) => {}
                 IndexMeta::Vectorized(_) => {}
             }
@@ -89,8 +91,8 @@ fn probe_field_indices(
     } else {
         let mut components = vec![];
         if let &Value::Array(ref array) = value {
-            for val in array {
-                probe_field_indices(cell, &fields_name, field, schema_id, value, res);
+            for sub_val in array {
+                probe_field_indices(cell, &fields_name, field, schema_id, sub_val, res);
             }
         } else if let &Value::PrimArray(ref array) = value {
             for index in &field.indices {
