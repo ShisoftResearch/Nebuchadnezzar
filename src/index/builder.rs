@@ -2,9 +2,11 @@ use super::{ranged::client::RangedQueryClient, EntryKey, Feature};
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
 use crate::{client::AsyncClient, ram::cell::Cell};
-use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
+use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use bifrost_hasher::hash_str;
 use std::sync::Arc;
+use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 
 type FieldName = String;
 const UNSETTLED: Feature = [0u8; 8];
@@ -15,14 +17,20 @@ const UNSETTLED: Feature = [0u8; 8];
 // String for ranged will take first 64-bit, hash will hash the string
 // Index on nested fields are allowed
 
+#[derive(Hash)]
 pub struct RangedIndexMeta {
     key: EntryKey,
 }
 
+
+#[derive(Hash)]
 pub struct HashedIndexMeta {
-    id: Id,
+    hash_id: Id,
+    cell_id: Id
 }
 
+
+#[derive(Hash)]
 pub struct VectorizedMeta {
     cell_id: Id,
     feature: Feature,
@@ -30,6 +38,7 @@ pub struct VectorizedMeta {
     cell_ver: u64,
 }
 
+#[derive(Hash)]
 pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
@@ -47,6 +56,19 @@ pub struct IndexRes {
     meta: Vec<IndexMeta>,
 }
 
+impl IndexRes {
+    fn to_meta_hash_pairs(self) -> Vec<(u64, IndexMeta)> {
+        self.meta
+            .into_iter()
+            .map(|meta| {
+                let mut hasher = DefaultHasher::default();
+                meta.hash(&mut hasher);
+                (hasher.finish(), meta)
+            })
+            .collect()
+    }
+}
+
 pub struct IndexBuilder {
     ranged_client: RangedQueryClient,
 }
@@ -62,18 +84,51 @@ impl IndexBuilder {
         }
     }
 
-    pub fn ensure_indices(&self, cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
-        let new_index = probe_cell_indices(cell, schema);
-        for index in new_index {
-            let field_id = hash_str(&index.fields);
-            for meta in index.meta {
-                match meta {
-                    IndexMeta::Ranged(ranged) => {}
-                    IndexMeta::Hashed(_) => {}
-                    IndexMeta::Vectorized(_) => {}
+    pub async fn ensure_indices(&self, cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) -> Result<(), RPCError> {
+        let new_indices = probe_cell_indices(cell, schema);
+        let mut index_of_old_index = old_indices
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|res| res.to_meta_hash_pairs())
+            .collect::<HashMap<_, _>>();
+        let mut index_of_new_index = new_indices
+            .into_iter()
+            .flat_map(|res| res.to_meta_hash_pairs())
+            .collect::<HashMap<_, _>>();
+        for index in index_of_old_index.keys().cloned().collect::<Vec<_>>() {
+            if index_of_new_index.contains_key(&index) {
+                // Remove unchanged indeices
+                index_of_new_index.remove(&index);
+                index_of_old_index.remove(&index);
+            }
+        }
+        for new_index in index_of_new_index.values() {
+            match new_index {
+                &IndexMeta::Ranged(ref meta) => {
+                    self.ranged_client.insert(&meta.key).await?;
+                }
+                &IndexMeta::Hashed(ref meta) => {
+                    unimplemented!();
+                }
+                &IndexMeta::Vectorized(ref meta) => {
+                    unimplemented!();
                 }
             }
         }
+        for old_index in index_of_old_index.values() {
+            match old_index {
+                &IndexMeta::Ranged(ref meta) => {
+                    self.ranged_client.delete(&meta.key).await?;
+                }
+                &IndexMeta::Hashed(ref meta) => {
+                    unimplemented!();
+                }
+                &IndexMeta::Vectorized(ref meta) => {
+                    unimplemented!();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -149,22 +204,22 @@ fn probe_field_indices(
             }
         }
         let mut metas = vec![];
-        let id = cell.id();
+        let cell_id = cell.id();
         for comp in components {
             match comp {
                 IndexComps::Hashed(feat) => {
                     if feat == UNSETTLED {
                         continue;
                     }
-                    let id = Id::from_obj(&(schema_id, fields_name.clone(), feat));
-                    metas.push(IndexMeta::Hashed(HashedIndexMeta { id }));
+                    let hash_id = Id::from_obj(&(schema_id, fields_name.clone(), feat));
+                    metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
                 }
                 IndexComps::Ranged(feat) => {
                     if feat == UNSETTLED {
                         continue;
                     }
                     let field = hash_str(&fields_name);
-                    let key = EntryKey::from_props(&id, &feat, field, schema_id);
+                    let key = EntryKey::from_props(&cell_id, &feat, field, schema_id);
                     metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                 }
                 IndexComps::Vectorized(feat, size) => {
@@ -172,7 +227,7 @@ fn probe_field_indices(
                         continue;
                     }
                     metas.push(IndexMeta::Vectorized(VectorizedMeta {
-                        cell_id: id,
+                        cell_id,
                         feature: feat,
                         data_width: size,
                         cell_ver: cell.header.version,
