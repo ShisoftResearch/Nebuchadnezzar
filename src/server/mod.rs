@@ -1,5 +1,5 @@
-use crate::{client, index::builder::IndexBuilder};
 use crate::client::AsyncClient;
+use crate::{client, index::builder::IndexBuilder};
 use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::membership::client::ObserverClient;
@@ -139,7 +139,9 @@ impl NebServer {
                 .unwrap(),
         );
         let index_builder = if opts.index_enabled {
-            Some(Arc::new(IndexBuilder::new(&conshasing, &raft_client, &neb_client).await))
+            Some(Arc::new(
+                IndexBuilder::new(&conshasing, &raft_client, &neb_client).await,
+            ))
         } else {
             None
         };

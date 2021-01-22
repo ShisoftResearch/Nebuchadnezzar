@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use super::{EntryKey, Feature, ranged::client::RangedQueryClient};
-use crate::{client::AsyncClient, ram::cell::Cell};
+use super::{ranged::client::RangedQueryClient, EntryKey, Feature};
 use crate::ram::schema::{Field, IndexType, Schema};
 use crate::ram::types::{Id, Value};
+use crate::{client::AsyncClient, ram::cell::Cell};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
 use bifrost_hasher::hash_str;
+use std::sync::Arc;
 
 type FieldName = String;
 const UNSETTLED: Feature = [0u8; 8];
@@ -48,15 +48,15 @@ pub struct IndexRes {
 }
 
 pub struct IndexBuilder {
-    ranged_client: RangedQueryClient
+    ranged_client: RangedQueryClient,
 }
 
 impl IndexBuilder {
     pub async fn new(
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
-        neb_client: &Arc<AsyncClient>
-    )  -> Self {
+        neb_client: &Arc<AsyncClient>,
+    ) -> Self {
         Self {
             ranged_client: RangedQueryClient::new(conshash, raft_client, neb_client).await,
         }
@@ -68,9 +68,7 @@ impl IndexBuilder {
             let field_id = hash_str(&index.fields);
             for meta in index.meta {
                 match meta {
-                    IndexMeta::Ranged(ranged) => {
-                        
-                    }
+                    IndexMeta::Ranged(ranged) => {}
                     IndexMeta::Hashed(_) => {}
                     IndexMeta::Vectorized(_) => {}
                 }

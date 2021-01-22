@@ -1,4 +1,3 @@
-use crate::{index::builder::IndexBuilder, ram::cell::{Cell, CellHeader, ReadError, WriteError}};
 use crate::ram::cleaner::Cleaner;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::LocalSchemasCache;
@@ -6,6 +5,10 @@ use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
+use crate::{
+    index::builder::IndexBuilder,
+    ram::cell::{Cell, CellHeader, ReadError, WriteError},
+};
 
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
