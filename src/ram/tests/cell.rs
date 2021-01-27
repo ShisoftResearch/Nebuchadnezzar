@@ -3,7 +3,6 @@ use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
 use crate::ram::types;
 use crate::ram::types::*;
-use lightning::map::{Map, WordMap};
 
 use super::*;
 

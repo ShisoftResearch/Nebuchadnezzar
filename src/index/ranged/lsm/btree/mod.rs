@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use insert::*;
 use internal::*;
 use itertools::Itertools;
-use level::{LEVEL_M, LEVEL_TREE_DEPTH};
+use level::LEVEL_TREE_DEPTH;
 use merge::*;
 pub use node::*;
 use parking_lot::RwLock;
