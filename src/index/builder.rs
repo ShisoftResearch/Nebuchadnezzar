@@ -72,6 +72,37 @@ impl IndexRes {
     }
 }
 
+impl IndexMeta {
+    async fn insert(&self, indexers: &IndexerClients) -> Result<(), RPCError> {
+        match self {
+            &IndexMeta::Ranged(ref meta) => {
+                indexers.ranged_client.insert(&meta.key).await?;
+            }
+            &IndexMeta::Hashed(ref meta) => {
+                unimplemented!();
+            }
+            &IndexMeta::Vectorized(ref meta) => {
+                unimplemented!();
+            }
+        }
+        Ok(())
+    }
+    async fn remove(&self, indexers: &IndexerClients) -> Result<(), RPCError> {
+        match self {
+            &IndexMeta::Ranged(ref meta) => {
+                indexers.ranged_client.delete(&meta.key).await?;
+            }
+            &IndexMeta::Hashed(ref meta) => {
+                unimplemented!();
+            }
+            &IndexMeta::Vectorized(ref meta) => {
+                unimplemented!();
+            }
+        }
+        Ok(())
+    }
+}
+
 thread_local! {
     pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), RPCError>>>> = RefCell::new(Vec::new());
 }
@@ -108,11 +139,29 @@ impl IndexBuilder {
         });
     }
 
+    pub fn remove_indices(&self, cell: &Cell, schema: &Schema) {
+        let indices = probe_cell_indices(cell, schema);
+        let indexers = self.clients.to_owned();
+        let task = tokio::spawn(async move {
+            Self::remove_indices_(indices, indexers).await
+        });
+        PENDING_INDEX_TASKS.with(|task_list| {
+            task_list.borrow_mut().push(task);
+        });
+    }
+
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), RPCError>, JoinError>>> {
         PENDING_INDEX_TASKS.with(|task_list| {
             let tasks = std::mem::take(&mut*task_list.borrow_mut());
             tasks.into_iter().collect::<FuturesUnordered<_>>()
         }).collect::<Vec<_>>().boxed()
+    }
+
+    async fn remove_indices_(indices: Vec<IndexRes>, indexers: Arc<IndexerClients>) -> Result<(), RPCError> {
+        for index in indices.into_iter().flat_map(|res| res.meta) {
+            index.remove(&indexers).await?;
+        }
+        Ok(())
     }
 
     async fn ensure_indices_(new_indices: Vec<IndexRes>, old_indices: Option<Vec<IndexRes>>, indexers: Arc<IndexerClients>) -> Result<(), RPCError> {
@@ -133,30 +182,10 @@ impl IndexBuilder {
             }
         }
         for new_index in index_of_new_index.values() {
-            match new_index {
-                &IndexMeta::Ranged(ref meta) => {
-                    indexers.ranged_client.insert(&meta.key).await?;
-                }
-                &IndexMeta::Hashed(ref meta) => {
-                    unimplemented!();
-                }
-                &IndexMeta::Vectorized(ref meta) => {
-                    unimplemented!();
-                }
-            }
+            new_index.insert(&*indexers).await;
         }
         for old_index in index_of_old_index.values() {
-            match old_index {
-                &IndexMeta::Ranged(ref meta) => {
-                    indexers.ranged_client.delete(&meta.key).await?;
-                }
-                &IndexMeta::Hashed(ref meta) => {
-                    unimplemented!();
-                }
-                &IndexMeta::Vectorized(ref meta) => {
-                    unimplemented!();
-                }
-            }
+            old_index.remove(&*indexers).await;
         }
         Ok(())
     }

@@ -1,4 +1,4 @@
-use crate::ram::chunk::Chunk;
+use crate::{index::builder::IndexBuilder, ram::chunk::Chunk};
 use crate::ram::clock;
 use crate::ram::entry::*;
 use crate::ram::io::{reader, writer};
@@ -9,6 +9,8 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use serde::Serialize;
 use std::io::Cursor;
 use std::ops::{Index, IndexMut};
+
+use super::schema::ReadingSchema;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 
@@ -148,14 +150,15 @@ impl Cell {
     }
 
     //TODO: check or set checksum from crc32c cell content
-    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<Cell, ReadError> {
+    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Cell, ReadingSchema), ReadError> {
         let (header, data_ptr) = Cell::header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            Ok(Cell {
+            let cell = Cell {
                 header,
                 data: reader::read_by_schema(data_ptr, &*schema),
-            })
+            };
+            Ok((cell, schema))
         } else {
             error!("Schema {} does not existed to read", schema_id);
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
@@ -176,19 +179,6 @@ impl Cell {
         }
     }
 
-    //TODO: optimize for update
-    pub fn write_to_chunk(&mut self, chunk: &Chunk) -> Result<usize, WriteError> {
-        let schema_id = self.header.schema;
-        if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
-            let write_result = self.write_to_chunk_with_schema(chunk, &*schema);
-            if write_result.is_ok() {
-                // index::client::make_indices(self, &*schema, update);
-            }
-            write_result
-        } else {
-            Err(WriteError::SchemaDoesNotExisted(schema_id))
-        }
-    }
     pub fn write_to_chunk_with_schema(
         &mut self,
         chunk: &Chunk,

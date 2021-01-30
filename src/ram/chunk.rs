@@ -1,6 +1,6 @@
-use crate::ram::cleaner::Cleaner;
+use crate::{index::builder::probe_cell_indices, ram::cleaner::Cleaner};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
-use crate::ram::schema::LocalSchemasCache;
+use crate::ram::schema::{ReadingSchema, LocalSchemasCache};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, Value};
@@ -19,8 +19,7 @@ use lightning::map::*;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-
-use std::sync::atomic::{fence, Ordering::SeqCst};
+use super::schema::Schema;
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -210,7 +209,7 @@ impl Chunk {
     }
 
     fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
-        Cell::from_chunk_raw(*self.location_for_read(hash)?, self)
+        Cell::from_chunk_raw(*self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
@@ -238,17 +237,33 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
+    pub fn write_cell_to_chunk(&self, cell: &mut Cell) -> Result<(usize, ReadingSchema), WriteError> {
+        let schema_id = cell.header.schema;
+        if let Some(schema) = self.meta.schemas.get(&schema_id) {
+            Ok((cell.write_to_chunk_with_schema(self, &*schema)?, schema))
+        } else {
+            Err(WriteError::SchemaDoesNotExisted(schema_id))
+        }
+    }
+
+    pub fn ensure_indices(&self, new_cell: &Cell, old_cell: Option<&Cell>, schema: &Schema) {
+        if let Some(index_builder) = &self.index_builder {
+            let old_indices = old_cell.map(|cell| probe_cell_indices(cell, &*schema));
+            index_builder.ensure_indices(new_cell, &*schema, old_indices);
+        }
+    }
+
     #[cfg(feature = "fast_map")]
     fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let cell_loc = cell.write_to_chunk(self)?;
+        let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
+                self.ensure_indices(cell, None, &*schema);
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
-        // fence(SeqCst);
         Ok(cell.header)
     }
 
@@ -279,32 +294,45 @@ impl Chunk {
         }
     }
 
+    fn old_cell_for_index(&self, cell_loc: usize) -> Result<Option<Cell>, WriteError> {
+        if self.index_builder.is_some() {
+            Ok(Some(Cell::from_chunk_raw(cell_loc, self).map_err(|e| WriteError::ReadError(e)).map(|(c, _)| c)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
-        let new_cell_loc = cell.write_to_chunk(self)?;
+        let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
+            let old_cell = self.old_cell_for_index(cell_location)?;
             *guard = new_cell_loc;
             drop(guard);
+            self.ensure_indices(cell, old_cell.as_ref(), &*schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
         } else {
+            // Optimistic update will remove the new inserted one
+            self.mark_dead_entry_with_cell(new_cell_loc, cell);
             return Err(WriteError::CellDoesNotExisted);
         }
-        fence(SeqCst);
         Ok(cell.header)
     }
 
     fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
-        let new_cell_loc = cell.write_to_chunk(self)?;
+        let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         loop {
             if let Some(mut guard) = self.location_for_write(hash) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
+                let old_cell = self.old_cell_for_index(cell_location)?;
                 *guard = new_cell_loc;
                 drop(guard);
+                self.ensure_indices(cell, old_cell.as_ref(), &*schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
             } else {
                 #[cfg(feature = "fast_map")]
@@ -317,13 +345,13 @@ impl Chunk {
                     {
                         trace!("Cell {} does not exists, will insert for upsert", hash);
                         *guard = new_cell_loc;
+                        self.ensure_indices(cell, None, &*schema);
                     }
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
                 }
             }
-            fence(SeqCst);
             return Ok(cell.header);
         }
     }
@@ -334,7 +362,7 @@ impl Chunk {
     {
         let backoff = crossbeam::utils::Backoff::new();
         loop {
-            let (cell, old_loc) = {
+            let ((cell, schema), old_loc) = {
                 if let Some(cell_guard) = self.location_for_write(hash) {
                     match Cell::from_chunk_raw(*cell_guard, self) {
                         Ok(cell) => (cell, *cell_guard),
@@ -344,18 +372,20 @@ impl Chunk {
                     return Err(WriteError::CellDoesNotExisted);
                 }
             };
+            let old_indices = self.index_builder.as_ref().map(|_| probe_cell_indices(&cell, &*schema));
             let new_cell = update(cell);
             if let Some(mut new_cell) = new_cell {
-                let new_cell_loc = new_cell.write_to_chunk(self)?;
+                let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
                 if let Some(mut cell_guard) = self.location_for_write(hash) {
                     // Ensure location unchanged
                     if *cell_guard == old_loc {
                         let old_location = *cell_guard;
-                        let new_location = new_cell.write_to_chunk(self)?;
-                        *cell_guard = new_location;
+                        *cell_guard = new_cell_loc;
                         drop(cell_guard);
+                        if let Some(indexer) = &self.index_builder {
+                            indexer.ensure_indices(&new_cell, &*schema, old_indices);
+                        }
                         self.mark_dead_entry_with_cell(old_location, &new_cell);
-                        // fence(SeqCst);
                         return Ok(new_cell);
                     }
                 }
@@ -389,7 +419,7 @@ impl Chunk {
 
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
-        P: Fn(Cell) -> bool,
+        P: Fn(&Cell) -> bool,
     {
         #[cfg(feature = "fast_map")]
         let guard = self.cell_index.lock(hash as usize);
@@ -397,16 +427,18 @@ impl Chunk {
         let guard = self.index.get(&hash);
         if let Some(guard) = guard {
             let cell_location = *guard;
-            let cell = Cell::from_chunk_raw(cell_location, self);
-            match cell {
-                Ok(cell) => {
-                    if predict(cell) {
+            match Cell::from_chunk_raw(cell_location, self) {
+                Ok((cell, schema)) => {
+                    if predict(&cell) {
                         let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
                             #[cfg(feature = "fast_map")]
                             guard.remove();
+                            if let Some(indexer) = &self.index_builder {
+                                indexer.remove_indices(&cell, &*schema)
+                            }
                             Ok(())
                         }
                     } else {
@@ -845,7 +877,7 @@ impl Chunks {
     }
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
-        P: Fn(Cell) -> bool,
+        P: Fn(&Cell) -> bool,
     {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);
