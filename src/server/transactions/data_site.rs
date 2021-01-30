@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::{index::builder::IndexBuilder, ram::cell::{Cell, CellHeader, ReadError, WriteError}};
 use crate::ram::types::{Id, Value};
 use crate::server::NebServer;
 use bifrost::utils::time::get_time;
@@ -530,7 +530,9 @@ impl Service for DataManager {
         } else {
             // all set, able to commit
             txn.state = TxnState::Committed;
-            return self.response_with(DMCommitResult::Success);
+            // Commit all indices
+            let response = DataSiteResponse::new(&self.server.txn_peer, DMCommitResult::Success);
+            return IndexBuilder::await_indices().map(|_| response).boxed()
         }
     }
     fn abort(
