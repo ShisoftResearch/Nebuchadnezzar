@@ -6,9 +6,7 @@ use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
-use dovahkiin::types::value::ToValue;
 use itertools::Itertools;
 use std::marker::PhantomData;
 use std::{mem, panic};
@@ -74,7 +72,7 @@ where
         let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
         let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_array = if let Value::PrimArray(PrimitiveArray::SmallBytes(ref array)) = keys {
+        let keys_array = if let Value::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys {
             array
         } else {
             panic!()
@@ -102,7 +100,7 @@ where
     }
 
     pub fn to_cell(&self, deleted: &DeletionSet) -> Cell {
-        let mut value = Value::Map(Map::new());
+        let mut value = Value::Map(OwnedMap::new());
         let prev_id = {
             let node = read_unchecked::<KS, PS>(&self.prev);
             if node.is_none() {

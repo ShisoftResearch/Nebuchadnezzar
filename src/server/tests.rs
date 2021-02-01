@@ -5,7 +5,6 @@ use crate::ram::schema::Schema;
 use crate::ram::types::*;
 use crate::server::*;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::custom_types::map::Map;
 use dovahkiin::types::type_id_of;
 use futures::stream::FuturesUnordered;
 use rand::rngs::SmallRng;

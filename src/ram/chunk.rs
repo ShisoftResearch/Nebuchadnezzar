@@ -7,7 +7,7 @@ use crate::ram::types::{Id, Value};
 use crate::server::ServerMeta;
 use crate::{
     index::builder::IndexBuilder,
-    ram::cell::{Cell, CellHeader, ReadError, WriteError},
+    ram::cell::*,
 };
 
 use crate::utils::upper_power_of_2;
@@ -205,11 +205,11 @@ impl Chunk {
     }
 
     fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
-        Cell::header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
+        header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 
-    fn read_cell(&self, hash: u64) -> Result<Cell, ReadError> {
-        Cell::from_chunk_raw(*self.location_for_read(hash)?, self).map(|(c, _)| c)
+    fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
+        from_chunk_raw(*self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {

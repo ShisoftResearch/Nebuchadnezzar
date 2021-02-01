@@ -402,7 +402,7 @@ fn lsm_treee_schema() -> Schema {
 }
 
 fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> Cell {
-    let mut cell_map = Map::new();
+    let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(
         *LSM_TREE_LEVELS_HASH,
         Value::Array(level_ids.iter().map(|id| id.value()).collect()),

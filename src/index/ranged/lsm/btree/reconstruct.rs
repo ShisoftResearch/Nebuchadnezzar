@@ -188,7 +188,6 @@ mod test {
     use crate::rand::Rng;
     use crate::server::*;
     use dovahkiin::types::custom_types::id::Id;
-    use dovahkiin::types::custom_types::map::Map;
     use dovahkiin::types::Value;
     use itertools::Itertools;
     use lightning::map::HashSet;
@@ -233,7 +232,7 @@ mod test {
         let mut all_keys = vec![];
         for i in 1..=cell_limit {
             let new_id = Id::new(i, i);
-            let mut value = Value::Map(Map::new());
+            let mut value = Value::Map(OwnedMap::new());
             value[*PREV_PAGE_KEY_HASH] = Value::Id(last_id);
             value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit {
                 Value::Id(Id::new(i + 1, i + 1))

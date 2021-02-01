@@ -31,11 +31,11 @@ macro_rules! test_nums {
                     for i in 0..counts {
                         let addr = chunk_addr + i * types::$io::size(0);
                         types::$io::write(&d, addr);
-                        assert!(types::$io::read(addr) == d);
+                        assert_eq!(*types::$io::read(addr), d);
                     }
                     for i in 0..counts {
                         let addr = chunk_addr + i * types::$io::size(0);
-                        assert!(types::$io::read(addr) == d);
+                        assert!(*types::$io::read(addr) == d);
                     }
                 }
             }
@@ -81,11 +81,11 @@ mod pos2d32 {
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos2d32_io::size(0);
                 types::pos2d32_io::write(&d, addr);
-                assert_eq!(types::pos2d32_io::read(addr), d);
+                assert_eq!(*types::pos2d32_io::read(addr), d);
             }
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos2d32_io::size(0);
-                assert_eq!(types::pos2d32_io::read(addr), d);
+                assert_eq!(*types::pos2d32_io::read(addr), d);
             }
         }
     }
@@ -116,11 +116,11 @@ mod pos2d64 {
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos2d64_io::size(0);
                 types::pos2d64_io::write(&d, addr);
-                assert_eq!(types::pos2d64_io::read(addr), d);
+                assert_eq!(*types::pos2d64_io::read(addr), d);
             }
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos2d64_io::size(0);
-                assert_eq!(types::pos2d64_io::read(addr), d);
+                assert_eq!(*types::pos2d64_io::read(addr), d);
             }
         }
     }
@@ -153,11 +153,11 @@ mod pos3d32 {
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos3d32_io::size(0);
                 types::pos3d32_io::write(&d, addr);
-                assert_eq!(types::pos3d32_io::read(addr), d);
+                assert_eq!(*types::pos3d32_io::read(addr), d);
             }
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos3d32_io::size(0);
-                assert_eq!(types::pos3d32_io::read(addr), d);
+                assert_eq!(*types::pos3d32_io::read(addr), d);
             }
         }
     }
@@ -190,11 +190,11 @@ mod pos3d64 {
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos3d64_io::size(0);
                 types::pos3d64_io::write(&d, addr);
-                assert_eq!(types::pos3d64_io::read(addr), d);
+                assert_eq!(*types::pos3d64_io::read(addr), d);
             }
             for i in 0..counts {
                 let addr = chunk_addr + i * types::pos3d64_io::size(0);
-                assert_eq!(types::pos3d64_io::read(addr), d);
+                assert_eq!(*types::pos3d64_io::read(addr), d);
             }
         }
     }
@@ -218,11 +218,11 @@ mod uuid {
             for i in 0..counts {
                 let addr = chunk_addr + i * types::id_io::size(0);
                 types::id_io::write(&d, addr);
-                assert_eq!(types::id_io::read(addr), d);
+                assert_eq!(*types::id_io::read(addr), d);
             }
             for i in 0..counts {
                 let addr = chunk_addr + i * types::id_io::size(0);
-                assert_eq!(types::id_io::read(addr), d);
+                assert_eq!(*types::id_io::read(addr), d);
             }
         }
     }
@@ -275,11 +275,11 @@ fn null_type() {
 
 #[test]
 fn _in_map() {
-    let mut map2 = types::Map::new();
+    let mut map2 = types::OwnedMap::new();
     map2.insert(&String::from("a"), types::Value::I32(1));
     map2.insert(&String::from("b"), types::Value::I64(2));
 
-    let mut map = types::Map::new();
+    let mut map = types::OwnedMap::new();
     map.insert(&String::from("A"), types::Value::I32(1));
     map.insert(&String::from("B"), types::Value::Map(map2));
 
@@ -298,7 +298,7 @@ fn _in_map() {
 
 #[test]
 fn index_mut_map() {
-    let mut value = types::Value::Map(types::Map::new());
+    let mut value = types::Value::Map(types::OwnedMap::new());
     value["a"] = types::Value::String(String::from("A"));
     value["b"] = types::Value::Array(vec![types::Value::U64(5)]);
     assert_eq!(value["a"].String().unwrap(), &String::from("A"));

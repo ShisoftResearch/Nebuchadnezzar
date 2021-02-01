@@ -83,7 +83,7 @@ pub fn dynamic() {
         fields,
         is_dynamic: true,
     };
-    let mut data_map = types::Map::new();
+    let mut data_map = types::OwnedMap::new();
     data_map.insert("id", Value::I64(100));
     data_map.insert("score", Value::U64(70));
     data_map.insert("name", Value::String(String::from("Jack")));
@@ -109,7 +109,7 @@ pub fn dynamic() {
         assert_eq!(stored_cell.data["major"].String().unwrap(), "CS");
     }
 
-    data_map = types::Map::new();
+    data_map = types::OwnedMap::new();
     data_map.insert("id", Value::I64(2));
     data_map.insert("score", Value::U64(80));
     data_map.insert("name", Value::String(String::from("John")));

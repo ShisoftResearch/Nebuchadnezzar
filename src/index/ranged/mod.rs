@@ -77,7 +77,7 @@ mod tests {
             futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);
                 let key = EntryKey::from_id(&id);
-                let mut data_map = Map::new();
+                let mut data_map = OwnedMap::new();
                 data_map.insert("data", Value::U64(i as u64));
                 let cell = Cell::new_with_id(11, &id, Value::Map(data_map));
                 client.write_cell(cell).await.unwrap().unwrap();
