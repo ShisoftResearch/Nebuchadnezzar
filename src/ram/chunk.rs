@@ -3,7 +3,7 @@ use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{ReadingSchema, LocalSchemasCache};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
-use crate::ram::types::{Id, Value};
+use crate::ram::types::{Id, SharedValue};
 use crate::server::ServerMeta;
 use crate::{
     index::builder::IndexBuilder,
@@ -30,6 +30,8 @@ pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub type CellReadGuard<'a> = chashmap::ReadGuard<'a, u64, usize>;
 #[cfg(feature = "slow_map")]
 pub type CellWriteGuard<'a> = chashmap::WriteGuard<'a, u64, usize>;
+
+pub type SharedSelectedValue<'a> = SharedData<'a, Vec<SharedValue>>;
 
 pub struct Chunk {
     pub id: usize,
@@ -209,19 +211,19 @@ impl Chunk {
     }
 
     fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
-        from_chunk_raw(*self.location_for_read(hash)?, self).map(|(c, _)| c)
+        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
-    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
+    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedSelectedValue, ReadError> {
         let loc = self.location_for_read(hash)?;
-        let selected_data = Cell::select_from_chunk_raw(*loc, self, fields)?;
+        let selected_data = select_from_chunk_raw(*loc, self, fields)?;
         let mut result = Vec::with_capacity(fields.len());
         match selected_data {
-            Value::Map(map) => {
+            SharedValue::Map(map) => {
                 for field_id in fields {
-                    result.push(map.get_by_key_id(*field_id).clone())
+                    result.push(map.map.remove(field_id).unwrap())
                 }
-                return Ok(result);
+                return Ok(SharedData::compose(result, loc));
             }
             _ => Err(ReadError::CellTypeIsNotMapForSelect),
         }
@@ -237,7 +239,7 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
-    pub fn write_cell_to_chunk(&self, cell: &mut Cell) -> Result<(usize, ReadingSchema), WriteError> {
+    pub fn write_cell_to_chunk(&self, cell: &mut OwnedCell) -> Result<(usize, ReadingSchema), WriteError> {
         let schema_id = cell.header.schema;
         if let Some(schema) = self.meta.schemas.get(&schema_id) {
             Ok((cell.write_to_chunk_with_schema(self, &*schema)?, schema))
@@ -246,7 +248,7 @@ impl Chunk {
         }
     }
 
-    pub fn ensure_indices(&self, new_cell: &Cell, old_cell: Option<&Cell>, schema: &Schema) {
+    pub fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
         if let Some(index_builder) = &self.index_builder {
             let old_indices = old_cell.map(|cell| probe_cell_indices(cell, &*schema));
             index_builder.ensure_indices(new_cell, &*schema, old_indices);
@@ -254,7 +256,7 @@ impl Chunk {
     }
 
     #[cfg(feature = "fast_map")]
-    fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
@@ -294,23 +296,22 @@ impl Chunk {
         }
     }
 
-    fn old_cell_for_index(&self, cell_loc: usize) -> Result<Option<Cell>, WriteError> {
+    fn old_cell_for_index<'a>(&'a self, cell_loc: WordMutexGuard<'a>) -> Result<Option<SharedCell<'a>>, WriteError> {
         if self.index_builder.is_some() {
-            Ok(Some(Cell::from_chunk_raw(cell_loc, self).map_err(|e| WriteError::ReadError(e)).map(|(c, _)| c)?))
+            SharedCell::from_chunk_raw(cell_loc, self).map(|(c, _)| Some(c)).map_err(|e| WriteError::ReadError(e))
         } else {
             Ok(None)
         }
     }
 
-    fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
-            let old_cell = self.old_cell_for_index(cell_location)?;
+            let old_cell = self.old_cell_for_index(guard)?;
             *guard = new_cell_loc;
-            drop(guard);
             self.ensure_indices(cell, old_cell.as_ref(), &*schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
         } else {
@@ -321,7 +322,7 @@ impl Chunk {
         Ok(cell.header)
     }
 
-    fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
@@ -329,7 +330,7 @@ impl Chunk {
             if let Some(mut guard) = self.location_for_write(hash) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
-                let old_cell = self.old_cell_for_index(cell_location)?;
+                let old_cell = self.old_cell_for_index(guard)?;
                 *guard = new_cell_loc;
                 drop(guard);
                 self.ensure_indices(cell, old_cell.as_ref(), &*schema);
@@ -356,15 +357,15 @@ impl Chunk {
         }
     }
 
-    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<Cell, WriteError>
+    fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: Fn(Cell) -> Option<Cell>,
+        U: Fn(SharedCell) -> Option<OwnedCell>,
     {
         let backoff = crossbeam::utils::Backoff::new();
         loop {
             let ((cell, schema), old_loc) = {
                 if let Some(cell_guard) = self.location_for_write(hash) {
-                    match Cell::from_chunk_raw(*cell_guard, self) {
+                    match SharedCell::from_chunk_raw(cell_guard, self) {
                         Ok(cell) => (cell, *cell_guard),
                         Err(e) => return Err(WriteError::ReadError(e)),
                     }
@@ -419,7 +420,7 @@ impl Chunk {
 
     fn remove_cell_by<P>(&self, hash: u64, predict: P) -> Result<(), WriteError>
     where
-        P: Fn(&Cell) -> bool,
+        P: Fn(&SharedCell) -> bool,
     {
         #[cfg(feature = "fast_map")]
         let guard = self.cell_index.lock(hash as usize);
@@ -427,7 +428,7 @@ impl Chunk {
         let guard = self.index.get(&hash);
         if let Some(guard) = guard {
             let cell_location = *guard;
-            match Cell::from_chunk_raw(cell_location, self) {
+            match SharedCell::from_chunk_raw(guard, self) {
                 Ok((cell, schema)) => {
                     if predict(&cell) {
                         let put_tombstone_result = self.put_tombstone_by_cell_loc(cell_location);
@@ -514,7 +515,7 @@ impl Chunk {
             "Put tombstone for chunk {} for cell {}",
             self.id, cell_location
         );
-        let header = Cell::header_from_chunk_raw(cell_location)
+        let header = header_from_chunk_raw(cell_location)
             .map_err(|e| WriteError::ReadError(e))?
             .0;
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
@@ -543,8 +544,8 @@ impl Chunk {
             .fetch_add(entry.content_length, Ordering::Relaxed);
     }
 
-    pub fn mark_dead_entry_with_cell(&self, addr: usize, cell: &Cell) {
-        let seg = self.locate_segment_ensured(addr, &cell.header.id());
+    pub fn mark_dead_entry_with_cell(&self, addr: usize, cell: &dyn Cell) {
+        let seg = self.locate_segment_ensured(addr, &cell.id());
         self.mark_dead_entry_with_seg(addr, &seg)
     }
 
@@ -692,7 +693,7 @@ impl Chunk {
                     EntryType::CELL => {
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
-                            Cell::cell_header_from_entry_content_addr(
+                            cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
                         trace!("Cell header read, id is {:?}", cell_header.id());
 
@@ -827,11 +828,11 @@ impl Chunks {
     fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
         return (self.locate_chunk_by_partition(key.higher), key.lower);
     }
-    pub fn read_cell(&self, key: &Id) -> Result<Cell, ReadError> {
+    pub fn read_cell(&self, key: &Id) -> Result<SharedCell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<Vec<Value>, ReadError> {
+    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<SharedSelectedValue, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields);
     }
@@ -852,22 +853,22 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }
-    pub fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    pub fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.write_cell(cell);
     }
-    pub fn update_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    pub fn update_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.update_cell(cell);
     }
-    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<Cell, WriteError>
+    pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: Fn(Cell) -> Option<Cell>,
+        U: Fn(SharedCell) -> Option<OwnedCell>,
     {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);
     }
-    pub fn upsert_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
+    pub fn upsert_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         let chunk = self.locate_chunk_by_partition(cell.header.partition);
         return chunk.upsert_cell(cell);
     }
@@ -877,7 +878,7 @@ impl Chunks {
     }
     pub fn remove_cell_by<P>(&self, key: &Id, predict: P) -> Result<(), WriteError>
     where
-        P: Fn(&Cell) -> bool,
+        P: Fn(&SharedCell) -> bool,
     {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.remove_cell_by(hash, predict);

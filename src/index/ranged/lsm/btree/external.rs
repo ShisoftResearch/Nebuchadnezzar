@@ -1,7 +1,6 @@
 use super::*;
-use crate::index::ranged::lsm::btree::level::LEVEL_M;
+use crate::{index::ranged::lsm::btree::level::LEVEL_M, ram::cell::OwnedCell};
 use crate::index::ranged::lsm::tree::DeletionSet;
-use crate::ram::cell::Cell;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crossbeam::queue::SegQueue;
@@ -66,13 +65,13 @@ where
         }
     }
 
-    pub fn from_cell(cell: &Cell) -> Box<IncubatingExtNode<KS, PS>> {
+    pub fn from_cell(cell: &OwnedCell) -> Box<IncubatingExtNode<KS, PS>> {
         let cell_id = cell.id();
         let _cell_version = cell.header.version;
-        let next = cell.data[*NEXT_PAGE_KEY_HASH].Id().unwrap();
-        let prev = cell.data[*PREV_PAGE_KEY_HASH].Id().unwrap();
+        let next = cell.data[*NEXT_PAGE_KEY_HASH].id().unwrap();
+        let prev = cell.data[*PREV_PAGE_KEY_HASH].id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_array = if let Value::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys {
+        let keys_array = if let OwnedValue::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys {
             array
         } else {
             panic!()
@@ -99,8 +98,8 @@ where
         }
     }
 
-    pub fn to_cell(&self, deleted: &DeletionSet) -> Cell {
-        let mut value = Value::Map(OwnedMap::new());
+    pub fn to_cell(&self, deleted: &DeletionSet) -> OwnedCell {
+        let mut value = OwnedValue::Map(OwnedMap::new());
         let prev_id = {
             let node = read_unchecked::<KS, PS>(&self.prev);
             if node.is_none() {
@@ -117,15 +116,15 @@ where
             }
         });
 
-        value[*NEXT_PAGE_KEY_HASH] = Value::Id(next_id);
-        value[*PREV_PAGE_KEY_HASH] = Value::Id(prev_id);
+        value[*NEXT_PAGE_KEY_HASH] = OwnedValue::Id(next_id);
+        value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(prev_id);
         value[*KEYS_KEY_HASH] = self.keys.as_slice_immute()[..self.len]
             .iter()
             .filter(|&key| !deleted.contains(key))
             .map(|key| SmallBytes::from_vec(key.as_slice().to_vec()))
             .collect_vec()
             .value();
-        Cell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
+        OwnedCell::new_with_id(*PAGE_SCHEMA_ID, &self.id, value)
     }
 
     pub fn search(&self, key: &EntryKey) -> usize {

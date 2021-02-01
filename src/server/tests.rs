@@ -1,5 +1,4 @@
-use crate::client;
-use crate::ram::cell::Cell;
+use crate::{client, ram::cell::OwnedCell};
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
 use crate::ram::types::*;
@@ -18,18 +17,18 @@ use tokio_stream::StreamExt;
 fn cell_construct(b: &mut Bencher) {
     b.iter(|| {
         let id = Id::new(0, 1);
-        let mut value = Value::Map(Map::new());
-        value["DATA"] = Value::U64(2);
-        Cell::new_with_id(1, &id, value);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value["DATA"] = OwnedValue::U64(2);
+        OwnedCell::new_with_id(1, &id, value);
     })
 }
 
 #[bench]
 fn cell_clone(b: &mut Bencher) {
     let id = Id::new(0, 1);
-    let mut value = Value::Map(Map::new());
-    value["DATA"] = Value::U64(2);
-    let cell = Cell::new_with_id(1, &id, value);
+    let mut value = OwnedValue::Map(OwnedMap::new());
+    value["DATA"] = OwnedValue::U64(2);
+    let cell = OwnedCell::new_with_id(1, &id, value);
     b.iter(|| {
         let _ = cell.clone();
     })
@@ -116,14 +115,14 @@ pub async fn smoke_test() {
         let client_clone = client.clone();
         // intense upsert, half delete
         let id = Id::new(1, i / 2);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(i);
-        let cell = Cell::new_with_id(schema_id, &id, value);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA] = OwnedValue::U64(i);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
         client_clone.upsert_cell(cell).await.unwrap().unwrap();
 
         // read
         let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i);
+        assert_eq!(*(read_cell.data[DATA].u64().unwrap()), i);
 
         if i % 2 == 0 {
             client_clone.remove_cell(id).await.unwrap().unwrap();
@@ -132,14 +131,14 @@ pub async fn smoke_test() {
 
     for i in 0..num {
         let id = Id::new(1, i);
-        let mut value = Value::Map(Map::new());
-        value[DATA] = Value::U64(i * 2);
-        let cell = Cell::new_with_id(schema_id, &id, value);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA] = OwnedValue::U64(i * 2);
+        let cell = OwnedCell::new_with_id(schema_id, &id, value);
         client.upsert_cell(cell).await.unwrap().unwrap();
 
         // verify
         let read_cell = client.read_cell(id).await.unwrap().unwrap();
-        assert_eq!(*(read_cell.data[DATA].U64().unwrap()), i * 2);
+        assert_eq!(*(read_cell.data[DATA].u64().unwrap()), i * 2);
     }
 }
 
@@ -216,10 +215,10 @@ pub async fn smoke_test_parallel() {
                     debug!("Removing i {}, j {}", i, j);
                     client_clone.remove_cell(id).await.unwrap().unwrap();
                 }
-                let mut value = Value::Map(Map::new());
-                value[DATA] = Value::U64(j);
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value[DATA] = OwnedValue::U64(j);
                 value[ARRAY] = (1..rng.gen_range(1..1024)).collect::<Vec<u64>>().value();
-                let cell = Cell::new_with_id(schema_id, &id, value);
+                let cell = OwnedCell::new_with_id(schema_id, &id, value);
                 debug!("Upsert {:?}, i {}, j {}", id, i, j);
                 client_clone.upsert_cell(cell).await.unwrap().unwrap();
                 // read
@@ -229,7 +228,7 @@ pub async fn smoke_test_parallel() {
                     .unwrap()
                     .expect(&format!("Finally expecting {:?} at {}", id, j));
                 assert_eq!(
-                    *(read_cell.data[DATA].U64().unwrap()),
+                    *(read_cell.data[DATA].u64().unwrap()),
                     j,
                     "Parallel final read i {}, j {}",
                     i,
@@ -309,9 +308,9 @@ pub async fn txn() {
         client
             .transaction(async move |txn| {
                 let id = Id::new(0, 1);
-                let mut value = Value::Map(Map::new());
-                value[DATA] = Value::U64(2);
-                let cell = Cell::new_with_id(schema_id, &id, value);
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value[DATA] = OwnedValue::U64(2);
+                let cell = OwnedCell::new_with_id(schema_id, &id, value);
                 txn.upsert(cell).await
             })
             .await

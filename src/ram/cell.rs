@@ -4,11 +4,13 @@ use crate::ram::entry::*;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
-use crate::ram::types::{Id, RandValue, OwnedValue, SharedValue};
+use crate::ram::types::{Id, RandValue, OwnedValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use lightning::map::WordMutexGuard;
 use serde::Serialize;
 use std::io::Cursor;
 use std::ops::{Index, IndexMut};
+use std::ops::Deref;
 
 use super::schema::ReadingSchema;
 
@@ -77,16 +79,16 @@ pub const CELL_HEADER_SIZE: usize = CELL_HEADER_SIZE_U32 as usize;
 pub const CELL_HEADER_SIZE_U32: u32 = 32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Cell {
+pub struct OwnedCell {
     pub header: CellHeader,
     pub data: OwnedValue,
 }
 
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
 
-impl Cell {
-    pub fn new_with_id(schema_id: u32, id: &Id, value: OwnedValue) -> Cell {
-        Cell {
+impl OwnedCell {
+    pub fn new_with_id(schema_id: u32, id: &Id, value: OwnedValue) -> Self {
+        Self {
             header: CellHeader::new(0, schema_id, id),
             data: value,
         }
@@ -99,7 +101,7 @@ impl Cell {
         Id::from_obj(&(schema_id, value))
     }
 
-    pub fn new(schema: &Schema, value: OwnedValue) -> Option<Cell> {
+    pub fn new(schema: &Schema, value: OwnedValue) -> Option<Self> {
         let schema_id = schema.id;
         let id = if let OwnedValue::Map(ref data) = value {
             match schema.key_field {
@@ -107,7 +109,7 @@ impl Cell {
                     let value = data.get_in_by_ids(keys.iter());
                     match value {
                         &OwnedValue::Null => return None,
-                        _ => Cell::encode_cell_key(schema_id, value),
+                        _ => Self::encode_cell_key(schema_id, value),
                     }
                 }
                 None => Id::rand(),
@@ -115,7 +117,7 @@ impl Cell {
         } else {
             Id::rand()
         };
-        Some(Cell::new_with_id(schema_id, &id, value))
+        Some(Self::new_with_id(schema_id, &id, value))
     }
 
     pub fn write_to_chunk_with_schema(
@@ -183,7 +185,7 @@ impl Cell {
     }
 }
 
-impl Index<u64> for Cell {
+impl Index<u64> for OwnedCell {
     type Output = OwnedValue;
 
     fn index(&self, index: u64) -> &Self::Output {
@@ -191,7 +193,7 @@ impl Index<u64> for Cell {
     }
 }
 
-impl<'a> Index<&'a str> for Cell {
+impl<'a> Index<&'a str> for OwnedCell {
     type Output = OwnedValue;
 
     fn index(&self, index: &'a str) -> &Self::Output {
@@ -199,13 +201,13 @@ impl<'a> Index<&'a str> for Cell {
     }
 }
 
-impl<'a> IndexMut<&'a str> for Cell {
+impl<'a> IndexMut<&'a str> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
         &mut self.data[index]
     }
 }
 
-impl IndexMut<u64> for Cell {
+impl IndexMut<u64> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: u64) -> &'b mut Self::Output {
         &mut self.data[index]
     }
@@ -218,8 +220,8 @@ pub struct SharedCellData {
 }
 
 impl SharedCellData {
-       //TODO: check or set checksum from crc32c cell content
-       pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, ReadingSchema), ReadError> {
+    //TODO: check or set checksum from crc32c cell content
+    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, ReadingSchema), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
@@ -233,20 +235,90 @@ impl SharedCellData {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn select_from_chunk_raw(
-        ptr: usize,
-        chunk: &Chunk,
-        fields: &[u64],
-    ) -> Result<SharedValue, ReadError> {
-        let (header, data_ptr) = header_from_chunk_raw(ptr)?;
-        let schema_id = &header.schema;
-        if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))
-        } else {
-            error!("Schema {} does not existed to read", schema_id);
-            return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+    pub fn id(&self) -> Id {
+        self.header.id()
+    }
+    pub fn to_owned(&self) -> OwnedCell {
+        OwnedCell {
+            header: self.header.clone(),
+            data: self.data.to_owned()
         }
     }
+    pub fn into_shared(self, guard: WordMutexGuard) -> SharedCell {
+       SharedCell {
+           guard,
+           inner: self
+       }
+    }
+}
+
+pub struct SharedData<'a, T> {
+    guard: WordMutexGuard<'a>,
+    inner: T
+}
+
+impl <'a, T> Deref for SharedData<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl <'a, T> SharedData<'a, T> {
+    pub fn decompose(self) -> (T, WordMutexGuard<'a>) {
+        (self.inner, self.guard)
+    }
+    pub fn compose(data: T, guard: WordMutexGuard<'a>) -> Self {
+        Self {
+            inner: data,
+            guard
+        }
+    }
+}
+
+pub type SharedCell<'a> = SharedData<'a, SharedCellData>;
+
+impl <'a> SharedCell<'a> {
+    pub fn from_chunk_raw(ptr: WordMutexGuard<'a>, chunk: &'a Chunk) -> Result<(Self, ReadingSchema<'a>), ReadError> {
+        SharedCellData::from_chunk_raw(*ptr, chunk).map(|(data, schema)| {
+            let cell = Self {
+                guard: ptr,
+                inner: data
+            };
+            (cell, schema)
+        })
+    }
+    pub fn select_from_chunk_raw(
+        ptr: WordMutexGuard<'a>,
+        chunk: &'a Chunk,
+        fields: &[u64],
+    ) -> Result<SharedData<'a, SharedValue>, ReadError> {
+        select_from_chunk_raw(*ptr, chunk, fields).map(|val| {
+            SharedData {
+                guard: ptr,
+                inner: val
+            }
+        })
+    }   
+}
+
+pub trait Cell {
+    fn id(&self) -> Id;
+    fn header(&self) -> &CellHeader;
+    fn data(&self) -> &dyn Value;
+}
+
+impl Cell for OwnedCell {
+    fn id(&self) -> Id { OwnedCell::id(self) }
+    fn header(&self) -> &CellHeader { &self.header }
+    fn data(&self) -> &dyn Value { &self.data }
+}
+
+impl <'a> Cell for SharedCell<'a> {
+    fn id(&self) -> Id { self.inner.id() }
+    fn header(&self) -> &CellHeader { &self.inner.header }
+    fn data(&self) -> &dyn Value { &self.inner.data }
 }
 
 pub fn cell_header_from_entry_content_addr(
@@ -276,4 +348,19 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadErro
         (header, addr + CELL_HEADER_SIZE)
     });
     Ok(header)
+}
+
+pub fn select_from_chunk_raw(
+    ptr: usize,
+    chunk: &Chunk,
+    fields: &[u64],
+) -> Result<SharedValue, ReadError> {
+    let (header, data_ptr) = header_from_chunk_raw(ptr)?;
+    let schema_id = &header.schema;
+    if let Some(schema) = chunk.meta.schemas.get(schema_id) {
+        Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))
+    } else {
+        error!("Schema {} does not existed to read", schema_id);
+        return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+    }
 }

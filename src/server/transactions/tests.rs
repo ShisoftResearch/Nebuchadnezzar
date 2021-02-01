@@ -35,11 +35,11 @@ pub async fn workspace_wr() {
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(70));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1.to_owned())
         .await
@@ -57,14 +57,14 @@ pub async fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["id"].I64().unwrap(), &100);
-            assert_eq!(cell.data["name"].String().unwrap(), "Jack");
-            assert_eq!(cell.data["score"].U64().unwrap(), &70);
+            assert_eq!(cell.data["id"].i64().unwrap(), &100);
+            assert_eq!(cell.data["name"].string().unwrap(), "Jack");
+            assert_eq!(cell.data["score"].u64().unwrap(), &70);
         }
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
-    data_map.insert(&String::from("score"), Value::U64(90));
-    let cell_1_w2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
+    data_map.insert(&String::from("score"), OwnedValue::U64(90));
+    let cell_1_w2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -83,7 +83,7 @@ pub async fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["score"].U64().unwrap(), &70);
+            assert_eq!(cell.data["score"].u64().unwrap(), &70);
         }
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
@@ -104,7 +104,7 @@ pub async fn workspace_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["score"].U64().unwrap(), &90);
+            assert_eq!(cell.data["score"].u64().unwrap(), &90);
         }
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
@@ -169,11 +169,11 @@ pub async fn data_site_wr() {
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(70));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map.clone()));
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_non_exists_read = txn
         .read(txn_id.to_owned(), cell_1.id())
         .await
@@ -199,14 +199,14 @@ pub async fn data_site_wr() {
     match cell_1_r_res {
         TxnExecResult::Accepted(cell) => {
             assert_eq!(cell.id(), cell_1.id());
-            assert_eq!(cell.data["id"].I64().unwrap(), &100);
-            assert_eq!(cell.data["name"].String().unwrap(), "Jack");
-            assert_eq!(cell.data["score"].U64().unwrap(), &70);
+            assert_eq!(cell.data["id"].i64().unwrap(), &100);
+            assert_eq!(cell.data["name"].string().unwrap(), "Jack");
+            assert_eq!(cell.data["score"].u64().unwrap(), &70);
         }
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
-    data_map.insert(&String::from("score"), Value::U64(90));
-    let cell_1_w2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map.clone()));
+    data_map.insert(&String::from("score"), OwnedValue::U64(90));
+    let cell_1_w2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .update(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -227,9 +227,9 @@ pub async fn data_site_wr() {
     );
     let cell_r2 = server.chunks.read_cell(&cell_1.id()).unwrap();
     assert_eq!(cell_r2.id(), cell_1.id());
-    assert_eq!(cell_r2.data["id"].I64().unwrap(), &100);
-    assert_eq!(cell_r2.data["name"].String().unwrap(), "Jack");
-    assert_eq!(cell_r2.data["score"].U64().unwrap(), &90);
+    assert_eq!(cell_r2.data["id"].i64().unwrap(), &100);
+    assert_eq!(cell_r2.data["name"].string().unwrap(), "Jack");
+    assert_eq!(cell_r2.data["score"].u64().unwrap(), &90);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -261,19 +261,19 @@ pub async fn multi_transaction() {
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_1_id = txn.begin().await.unwrap().unwrap();
     let txn_2_id = txn.begin().await.unwrap().unwrap();
-    let mut data_map_1 = Map::new();
-    data_map_1.insert(&String::from("id"), Value::I64(100));
-    data_map_1.insert(&String::from("score"), Value::U64(70));
-    data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
+    let mut data_map_1 = OwnedMap::new();
+    data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map_1.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map_1.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     let _cell_1_t1_write = txn
         .update(txn_1_id.to_owned(), cell_1.to_owned())
         .await
         .unwrap()
         .unwrap();
     let data_map_2 = data_map_1.clone();
-    data_map_1.insert(&String::from("score"), Value::U64(90));
-    let cell_2 = Cell::new_with_id(schema.id, &cell_1.id(), Value::Map(data_map_2.clone()));
+    data_map_1.insert(&String::from("score"), OwnedValue::U64(90));
+    let cell_2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map_2.clone()));
     let _cell_1_t2_write = txn
         .write(txn_2_id.to_owned(), cell_2.to_owned())
         .await
@@ -360,11 +360,11 @@ pub async fn smoke_rw() {
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
-    let mut data_map_1 = Map::new();
-    data_map_1.insert(&String::from("id"), Value::I64(100));
-    data_map_1.insert(&String::from("score"), Value::U64(0));
-    data_map_1.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let mut cell_1 = Cell::new_with_id(schema.id, &Id::rand(), Value::Map(data_map_1.clone()));
+    let mut data_map_1 = OwnedMap::new();
+    data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map_1.insert(&String::from("score"), OwnedValue::U64(0));
+    data_map_1.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let mut cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     server.chunks.write_cell(&mut cell_1).unwrap();
     let cell_id = cell_1.id();
     let thread_count = 200;
@@ -378,11 +378,11 @@ pub async fn smoke_rw() {
                 .await
                 .unwrap();
             if let Ok(TxnExecResult::Accepted(mut cell)) = read_result {
-                let mut score = *cell.data["score"].U64().unwrap();
+                let mut score = *cell.data["score"].u64().unwrap();
                 score += 1;
                 let mut data = cell.data.Map().unwrap().clone();
-                data.insert(&String::from("score"), Value::U64(score));
-                cell.data = Value::Map(data);
+                data.insert(&String::from("score"), OwnedValue::U64(score));
+                cell.data = OwnedValue::Map(data);
                 txn.update(txn_id.to_owned(), cell.to_owned())
                     .await
                     .unwrap()

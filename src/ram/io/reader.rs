@@ -1,8 +1,12 @@
-use bifrost::utils::serde::deserialize;
+use itertools::Itertools;
 
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
-use crate::ram::types::{type_id_of, u32_io, u8_io, SharedMap, OwnedMap, Type, SharedValue};
+use crate::ram::types::{type_id_of, u32_io, u8_io, SharedMap, Type, SharedValue};
+
+use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
+use std::collections::HashMap;
+use dovahkiin::types::key_hash;
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedValue, usize) {
     let mut ptr = ptr;
@@ -66,16 +70,64 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
     }
 }
 
-pub fn read_attach_dynamic_part(tail_ptr: usize, dest: &mut SharedValue) {
-    let src = types::get_shared_val(type_id_of(Type::Bytes), tail_ptr);
+pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
+    let src = read_dynamic_value(&mut tail_ptr);
     if let &mut SharedValue::Map(ref mut map_dest) = dest {
-        if let SharedValue::Bytes(any_src) = src {
-            let mut map_src: OwnedMap = deserialize(any_src).unwrap();
+        if let SharedValue::Map(map_src) = src {
             for (k, v) in map_src.map.into_iter() {
                 map_dest.insert_key_id(k, v);
             }
             map_dest.fields.append(&mut map_src.fields);
         }
+    }
+}
+
+fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
+    let type_id = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+    let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
+    *ptr += types::u32_io::size(*ptr);
+    if is_array {
+        let base_type = type_id & (!ARRAY_TYPE_MASK);
+        let len = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+        *ptr += types::u32_io::size(*ptr);
+        if base_type != 0 {
+            // Primitive array
+            if let Some(prim_arr) = types::get_shared_prim_array_val(base_type, *len as usize, ptr) {
+                // ptr have been moved by `get_shared_prim_array_val`
+                return SharedValue::PrimArray(prim_arr);
+            } else {
+                panic!("Cannot read prim array for dynamic field");
+            }
+        } else {
+            let array = (0..*len).map(|_| read_dynamic_value(ptr)).collect();
+            // ptr have been moved by recursion
+            return SharedValue::Array(array);
+        }
+    } else if *type_id == 0{
+        // Map
+        let len = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+        *ptr += types::u32_io::size(*ptr);
+        let field_value_pair = (0..*len).map(|_| {
+            let name = types::get_shared_val(type_id_of(Type::String), *ptr).string().unwrap();
+            *ptr += types::string_io::size(*ptr);
+            let value = read_dynamic_value(ptr);
+            (name, value)
+        })
+        .collect_vec();
+        let fields = Vec::with_capacity(field_value_pair.len());
+        let map = HashMap::with_capacity(field_value_pair.len());
+        for (name, value) in field_value_pair {
+            let id = key_hash(&name);
+            fields.push(name.to_owned());
+            map.insert(id, value);
+        }
+        return SharedValue::Map(SharedMap { fields, map});
+    } else if *type_id == NULL_PLACEHOLDER {
+        return SharedValue::Null;
+    } else {
+        let value = types::get_shared_val(*type_id, *ptr);
+        *ptr += types::get_size(*type_id, *ptr);
+        return value;
     }
 }
 

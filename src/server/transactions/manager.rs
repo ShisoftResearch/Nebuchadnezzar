@@ -1,7 +1,7 @@
 use super::*;
 use crate::ram::cell::CellHeader;
-use crate::ram::cell::{Cell, ReadError, WriteError};
-use crate::ram::types::{Id, Value};
+use crate::ram::cell::{ReadError, WriteError};
+use crate::ram::types::{Id, OwnedValue};
 use crate::server::NebServer;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
@@ -23,7 +23,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64
 #[derive(Clone, Debug)]
 struct DataObject {
     server: u64,
-    cell: Option<Cell>,
+    cell: Option<OwnedCell>,
     version: Option<u64>,
     changed: bool,
     new: bool,
@@ -37,11 +37,11 @@ struct Transaction {
 
 service! {
     rpc begin() -> Result<TxnId, TMError>;
-    rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<Cell, ReadError>, TMError>;
-    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError>;
+    rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError>;
+    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError>;
     rpc head(tid: TxnId, id: Id) -> Result<TxnExecResult<CellHeader, ReadError>, TMError>;
-    rpc write(tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>;
-    rpc update(tid: TxnId, cell: Cell) -> Result<TxnExecResult<(), WriteError>, TMError>;
+    rpc write(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
+    rpc update(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
     rpc remove(tid: TxnId, id: Id) -> Result<TxnExecResult<(), WriteError>, TMError>;
 
     rpc prepare(tid: TxnId) -> Result<TMPrepareResult, TMError>;
@@ -79,7 +79,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<Result<TxnExecResult<Cell, ReadError>, TMError>> {
+    ) -> BoxFuture<Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -139,7 +139,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<Result<TxnExecResult<Vec<Value>, ReadError>, TMError>> {
+    ) -> BoxFuture<Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
@@ -149,7 +149,7 @@ impl Service for TransactionManager {
                     Some(ref cell) => {
                         let mut result = Vec::with_capacity(fields.len());
                         match cell.data {
-                            Value::Map(ref map) => {
+                            OwnedValue::Map(ref map) => {
                                 for field in fields {
                                     result.push(map.get_by_key_id(field).clone())
                                 }
@@ -275,7 +275,7 @@ impl Service for TransactionManager {
     fn write(
         &self,
         tid: TxnId,
-        cell: Cell,
+        cell: OwnedCell,
     ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
@@ -315,7 +315,7 @@ impl Service for TransactionManager {
     fn update(
         &self,
         tid: TxnId,
-        cell: Cell,
+        cell: OwnedCell,
     ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
@@ -465,7 +465,7 @@ impl TransactionManager {
         id: &Id,
         txn: &mut TxnGuard<'a>,
         awaits: &TxnAwaits,
-    ) -> Result<TxnExecResult<Cell, ReadError>, TMError> {
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
             let read_response = server
@@ -548,7 +548,7 @@ impl TransactionManager {
         fields: &Vec<u64>,
         _txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
-    ) -> Result<TxnExecResult<Vec<Value>, ReadError>, TMError> {
+    ) -> Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
             let read_response = server

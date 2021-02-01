@@ -276,35 +276,35 @@ fn null_type() {
 #[test]
 fn _in_map() {
     let mut map2 = types::OwnedMap::new();
-    map2.insert(&String::from("a"), types::Value::I32(1));
-    map2.insert(&String::from("b"), types::Value::I64(2));
+    map2.insert(&String::from("a"), types::OwnedValue::I32(1));
+    map2.insert(&String::from("b"), types::OwnedValue::I64(2));
 
     let mut map = types::OwnedMap::new();
-    map.insert(&String::from("A"), types::Value::I32(1));
-    map.insert(&String::from("B"), types::Value::Map(map2));
+    map.insert(&String::from("A"), types::OwnedValue::I32(1));
+    map.insert(&String::from("B"), types::OwnedValue::Map(map2));
 
-    assert_eq!(map.get(&String::from("A")).I32().unwrap(), &1);
-    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), &1);
+    assert_eq!(map.get(&String::from("A")).i32().unwrap(), &1);
+    assert_eq!(map.get_in(&["B", "a"]).i32().unwrap(), &1);
 
-    map.set_in(&["B", "a"], types::Value::I32(20)).unwrap();
-    assert_eq!(map.get_in(&["B", "a"]).I32().unwrap(), &20);
+    map.set_in(&["B", "a"], types::OwnedValue::I32(20)).unwrap();
+    assert_eq!(map.get_in(&["B", "a"]).i32().unwrap(), &20);
 
-    map.update_in(&["B", "b"], |value: &mut types::Value| {
-        assert_eq!(value.I64().unwrap(), &2);
-        *value = types::Value::I64(30);
+    map.update_in(&["B", "b"], |value: &mut types::OwnedValue| {
+        assert_eq!(value.i64().unwrap(), &2);
+        *value = types::OwnedValue::U64(30);
     });
-    assert_eq!(map.get_in(&["B", "b"]).I64().unwrap(), &30);
+    assert_eq!(map.get_in(&["B", "b"]).i64().unwrap(), &30);
 }
 
 #[test]
 fn index_mut_map() {
-    let mut value = types::Value::Map(types::OwnedMap::new());
-    value["a"] = types::Value::String(String::from("A"));
-    value["b"] = types::Value::Array(vec![types::Value::U64(5)]);
-    assert_eq!(value["a"].String().unwrap(), &String::from("A"));
-    assert_eq!(value["b"][0 as usize].U64().unwrap(), &5);
-    value["b"][0 as usize] = types::Value::U64(10);
-    assert_eq!(value["b"][0 as usize].U64().unwrap(), &10);
+    let mut value = types::OwnedValue::Map(types::OwnedMap::new());
+    value["a"] = types::OwnedValue::String(String::from("A"));
+    value["b"] = types::OwnedValue::Array(vec![types::OwnedValue::U64(5)]);
+    assert_eq!(value["a"].string().unwrap(), &String::from("A"));
+    assert_eq!(value["b"][0 as usize].u64().unwrap(), &5);
+    value["b"][0 as usize] = types::OwnedValue::U64(10);
+    assert_eq!(value["b"][0 as usize].u64().unwrap(), &10);
 }
 
 #[test]

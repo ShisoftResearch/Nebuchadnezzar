@@ -1,6 +1,6 @@
 use super::*;
-use crate::{index::builder::IndexBuilder, ram::cell::{Cell, CellHeader, ReadError, WriteError}};
-use crate::ram::types::{Id, Value};
+use crate::{index::builder::IndexBuilder, ram::cell::{CellHeader, OwnedCell, ReadError, WriteError}};
+use crate::ram::types::{Id, OwnedValue};
 use crate::server::NebServer;
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
@@ -38,12 +38,12 @@ struct Transaction {
 
 #[derive(Debug)]
 struct CellHistory {
-    cell: Option<Cell>,
+    cell: Option<OwnedCell>,
     current_version: u64,
 }
 
 impl CellHistory {
-    pub fn new(cell: Option<Cell>, current_ver: u64) -> CellHistory {
+    pub fn new(cell: Option<OwnedCell>, current_ver: u64) -> CellHistory {
         CellHistory {
             cell,
             current_version: current_ver,
@@ -62,8 +62,8 @@ pub struct DataManager {
 }
 
 service! {
-    rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<Cell, ReadError>>;
-    rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>;
+    rpc read(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>;
+    rpc read_selected(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, fields: Vec<u64>) -> DataSiteResponse<TxnExecResult<Vec<OwnedValue>, ReadError>>;
     rpc read_partial_raw(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id, offset: usize, len: usize) -> DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>;
     rpc head(server_id: u64, clock: StandardVectorClock, tid: TxnId, id: Id) -> DataSiteResponse<TxnExecResult<CellHeader, ReadError>>;
     // two phase commit
@@ -290,12 +290,12 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Cell, ReadError>>> {
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             r
         } else {
             match self.server.chunks.read_cell(&id) {
-                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell)),
+                Ok(cell) => self.response_with(TxnExecResult::Accepted(cell.to_owned())),
                 Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
             }
         }
@@ -307,12 +307,12 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<Value>, ReadError>>> {
+    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<OwnedValue>, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
         match self.server.chunks.read_selected(&id, &fields[..]) {
-            Ok(values) => self.response_with(TxnExecResult::Accepted(values)),
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values.into_iter().map(|v| v.to_owned()).collect())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
@@ -449,7 +449,7 @@ impl Service for DataManager {
                     CommitOp::Remove(ref cell_id) => {
                         let original_cell = {
                             match self.server.chunks.read_cell(cell_id) {
-                                Ok(cell) => cell,
+                                Ok(cell) => cell.to_owned(),
                                 Err(re) => {
                                     write_error = Some((*cell_id, WriteError::ReadError(re)));
                                     break;
@@ -476,7 +476,7 @@ impl Service for DataManager {
                         let cell_id = cell.id();
                         let original_cell = {
                             match self.server.chunks.read_cell(&cell_id) {
-                                Ok(cell) => cell,
+                                Ok(cell) => cell.to_owned(),
                                 Err(re) => {
                                     write_error = Some((cell_id, WriteError::ReadError(re)));
                                     break;

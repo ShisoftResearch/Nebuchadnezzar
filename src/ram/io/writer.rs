@@ -1,11 +1,10 @@
 use crate::ram::cell::*;
 use crate::ram::schema::Field;
 use crate::ram::types;
-use crate::ram::types::{type_id_of, Any, OwnedMap, Type, OwnedValue, NULL_TYPE_ID};
+use crate::ram::types::{OwnedMap, OwnedValue, NULL_TYPE_ID};
 
 use std::collections::{HashMap, HashSet};
 
-use bifrost_hasher::hash_str;
 use dovahkiin::types::key_hash;
 
 pub struct Instruction {
@@ -127,8 +126,8 @@ pub fn plan_write_dynamic_fields(
     return Ok(());
 }
 
-const ARRAY_TYPE_MASK: u32 = !(!0 << 1 >> 1); // 1000000...
-const NULL_PLACEHOLDER: u32 = ARRAY_TYPE_MASK >> 1; // 1000000...
+pub const ARRAY_TYPE_MASK: u32 = !(!0 << 1 >> 1); // 1000000...
+pub const NULL_PLACEHOLDER: u32 = ARRAY_TYPE_MASK >> 1; // 1000000...
 
 pub fn plan_write_dynamic_value(
     offset: &mut usize,
@@ -186,6 +185,13 @@ pub fn plan_write_dynamic_value(
                 offset: *offset,
             });
             *offset += types::u32_io::size(0);
+            // Write map size
+            ins.push(Instruction {
+                type_id: types::ARRAY_LEN_TYPE_ID,
+                val: OwnedValue::U32(map.fields.len() as u32), 
+                offset: *offset,
+            });
+            *offset += types::u32_io::size(0);
             for name in map.fields.iter() {
                 let id = key_hash(name);
                 let name_bytes = name.as_bytes().len();
@@ -212,6 +218,12 @@ pub fn plan_write_dynamic_value(
         _ => {
             // Primitives
             let type_id = value.base_type_id();
+            ins.push(Instruction {
+                type_id: types::TYPE_CODE_TYPE_ID,
+                val: OwnedValue::U32(type_id),
+                offset: *offset
+            });
+            *offset += types::u32_io::size(0);
             ins.push(Instruction {
                 type_id: type_id,
                 val: value.clone(),

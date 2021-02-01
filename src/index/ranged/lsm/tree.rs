@@ -2,8 +2,7 @@
 
 use super::btree::level::*;
 use super::btree::*;
-use crate::client::AsyncClient;
-use crate::ram::cell::Cell;
+use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crossbeam_epoch::*;
@@ -63,7 +62,7 @@ impl LSMTree {
         let trees = &cell.data[*LSM_TREE_LEVELS_HASH]
             .prim_array()
             .unwrap()
-            .Id()
+            .id()
             .unwrap();
         let tree_0_id = &trees[0usize];
         let tree_1_id = &trees[1usize];
@@ -401,17 +400,17 @@ fn lsm_treee_schema() -> Schema {
     }
 }
 
-fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> Cell {
+fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> OwnedCell {
     let mut cell_map = OwnedMap::new();
     cell_map.insert_key_id(
         *LSM_TREE_LEVELS_HASH,
-        Value::Array(level_ids.iter().map(|id| id.value()).collect()),
+        OwnedValue::Array(level_ids.iter().map(|id| id.value()).collect()),
     );
     cell_map.insert_key_id(
         *LSM_TREE_MIGRATION_HASH,
-        migration.map(|id| Value::Id(id)).unwrap_or(Value::Null),
+        migration.map(|id| OwnedValue::Id(id)).unwrap_or(OwnedValue::Null),
     );
-    Cell::new_with_id(*LSM_TREE_SCHEMA_ID, id, Value::Map(cell_map))
+    OwnedCell::new_with_id(*LSM_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }
 
 impl_btree_level!(LEVEL_M);
