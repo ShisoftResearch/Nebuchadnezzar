@@ -2,9 +2,9 @@
 
 use super::btree::level::*;
 use super::btree::*;
-use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
+use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use crossbeam_epoch::*;
 use lightning::map::HashSet as LFHashSet;
 use std::collections::HashSet as StdHashSet;
@@ -408,7 +408,9 @@ fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> OwnedCe
     );
     cell_map.insert_key_id(
         *LSM_TREE_MIGRATION_HASH,
-        migration.map(|id| OwnedValue::Id(id)).unwrap_or(OwnedValue::Null),
+        migration
+            .map(|id| OwnedValue::Id(id))
+            .unwrap_or(OwnedValue::Null),
     );
     OwnedCell::new_with_id(*LSM_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }

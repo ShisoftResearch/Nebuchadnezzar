@@ -1,7 +1,7 @@
-use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
+use crate::{client::AsyncClient, ram::cell::OwnedCell};
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
 
@@ -21,7 +21,8 @@ impl HashIndexer {
         cell_id: Id,
         index_id: Id,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
-        let cell = OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &index_id, OwnedValue::Id(cell_id));
+        let cell =
+            OwnedCell::new_with_id(*HASH_INDEX_SCHEMA_ID, &index_id, OwnedValue::Id(cell_id));
         self.neb_client.write_cell(cell).await
     }
 

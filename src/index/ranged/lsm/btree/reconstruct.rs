@@ -180,12 +180,12 @@ where
 #[cfg(test)]
 mod test {
     use super::external::*;
-    use crate::{client, ram::cell::OwnedCell};
     use crate::index::ranged::lsm::btree::test::*;
     use crate::index::ranged::lsm::btree::*;
     use crate::ram::types::*;
     use crate::rand::Rng;
     use crate::server::*;
+    use crate::{client, ram::cell::OwnedCell};
     use dovahkiin::types::custom_types::id::Id;
     use itertools::Itertools;
     use lightning::map::HashSet;

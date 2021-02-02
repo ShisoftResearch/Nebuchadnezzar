@@ -156,7 +156,10 @@ impl AsyncClient {
             })
             .collect())
     }
-    pub async fn write_cell(&self, cell: OwnedCell) -> Result<Result<CellHeader, WriteError>, RPCError> {
+    pub async fn write_cell(
+        &self,
+        cell: OwnedCell,
+    ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
         client.write_cell(cell).await
     }

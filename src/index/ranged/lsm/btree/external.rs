@@ -1,8 +1,8 @@
 use super::*;
-use crate::{index::ranged::lsm::btree::level::LEVEL_M, ram::cell::OwnedCell};
 use crate::index::ranged::lsm::tree::DeletionSet;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
+use crate::{index::ranged::lsm::btree::level::LEVEL_M, ram::cell::OwnedCell};
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
 use dovahkiin::types::type_id_of;
@@ -71,7 +71,8 @@ where
         let next = cell.data[*NEXT_PAGE_KEY_HASH].id().unwrap();
         let prev = cell.data[*PREV_PAGE_KEY_HASH].id().unwrap();
         let keys = &cell.data[*KEYS_KEY_HASH];
-        let keys_array = if let OwnedValue::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys {
+        let keys_array = if let OwnedValue::PrimArray(OwnedPrimArray::SmallBytes(ref array)) = keys
+        {
             array
         } else {
             panic!()

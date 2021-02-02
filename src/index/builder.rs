@@ -1,15 +1,24 @@
 use super::{ranged::client::RangedQueryClient, EntryKey, Feature};
-use crate::ram::{cell::Cell, schema::{Field, IndexType, Schema}};
 use crate::ram::types::{Id, Value};
-use crate::{client::AsyncClient, ram::cell::{SharedCell, OwnedCell}};
+use crate::ram::{
+    cell::Cell,
+    schema::{Field, IndexType, Schema},
+};
+use crate::{
+    client::AsyncClient,
+    ram::cell::{OwnedCell, SharedCell},
+};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use bifrost_hasher::hash_str;
-use futures::{future::BoxFuture, stream::{FuturesUnordered, StreamExt}};
-use tokio::task::{JoinError, JoinHandle};
-use std::{cell::RefCell, sync::Arc};
 use futures::FutureExt;
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use futures::{
+    future::BoxFuture,
+    stream::{FuturesUnordered, StreamExt},
+};
+use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::hash::{Hash, Hasher};
+use std::{cell::RefCell, sync::Arc};
+use tokio::task::{JoinError, JoinHandle};
 
 type FieldName = String;
 const UNSETTLED: Feature = [0u8; 8];
@@ -25,13 +34,11 @@ pub struct RangedIndexMeta {
     key: EntryKey,
 }
 
-
 #[derive(Hash)]
 pub struct HashedIndexMeta {
     hash_id: Id,
-    cell_id: Id
+    cell_id: Id,
 }
-
 
 #[derive(Hash)]
 pub struct VectorizedMeta {
@@ -123,17 +130,23 @@ impl IndexBuilder {
     ) -> Self {
         Self {
             clients: Arc::new(IndexerClients {
-                ranged_client: RangedQueryClient::new(conshash, raft_client, neb_client).await
+                ranged_client: RangedQueryClient::new(conshash, raft_client, neb_client).await,
             }),
         }
     }
 
-    pub fn ensure_indices(&self, cell: &OwnedCell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
+    pub fn ensure_indices(
+        &self,
+        cell: &OwnedCell,
+        schema: &Schema,
+        old_indices: Option<Vec<IndexRes>>,
+    ) {
         let new_indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
-        let task = tokio::spawn(async move {
-            Self::ensure_indices_(new_indices, old_indices, indexers).await
-        });
+        let task =
+            tokio::spawn(
+                async move { Self::ensure_indices_(new_indices, old_indices, indexers).await },
+            );
         PENDING_INDEX_TASKS.with(|task_list| {
             task_list.borrow_mut().push(task);
         });
@@ -142,29 +155,37 @@ impl IndexBuilder {
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
         let indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
-        let task = tokio::spawn(async move {
-            Self::remove_indices_(indices, indexers).await
-        });
+        let task = tokio::spawn(async move { Self::remove_indices_(indices, indexers).await });
         PENDING_INDEX_TASKS.with(|task_list| {
             task_list.borrow_mut().push(task);
         });
     }
 
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), RPCError>, JoinError>>> {
-        PENDING_INDEX_TASKS.with(|task_list| {
-            let tasks = std::mem::take(&mut*task_list.borrow_mut());
-            tasks.into_iter().collect::<FuturesUnordered<_>>()
-        }).collect::<Vec<_>>().boxed()
+        PENDING_INDEX_TASKS
+            .with(|task_list| {
+                let tasks = std::mem::take(&mut *task_list.borrow_mut());
+                tasks.into_iter().collect::<FuturesUnordered<_>>()
+            })
+            .collect::<Vec<_>>()
+            .boxed()
     }
 
-    async fn remove_indices_(indices: Vec<IndexRes>, indexers: Arc<IndexerClients>) -> Result<(), RPCError> {
+    async fn remove_indices_(
+        indices: Vec<IndexRes>,
+        indexers: Arc<IndexerClients>,
+    ) -> Result<(), RPCError> {
         for index in indices.into_iter().flat_map(|res| res.meta) {
             index.remove(&indexers).await?;
         }
         Ok(())
     }
 
-    async fn ensure_indices_(new_indices: Vec<IndexRes>, old_indices: Option<Vec<IndexRes>>, indexers: Arc<IndexerClients>) -> Result<(), RPCError> {
+    async fn ensure_indices_(
+        new_indices: Vec<IndexRes>,
+        old_indices: Option<Vec<IndexRes>>,
+        indexers: Arc<IndexerClients>,
+    ) -> Result<(), RPCError> {
         let mut index_of_old_index = old_indices
             .unwrap_or_default()
             .into_iter()

@@ -54,7 +54,10 @@ pub async fn general() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client
@@ -83,7 +86,11 @@ pub async fn general() {
     client
         .transaction(move |trans| {
             async move {
-                let empty_cell = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(OwnedMap::new()));
+                let empty_cell = OwnedCell::new_with_id(
+                    schema_id,
+                    &Id::rand(),
+                    OwnedValue::Map(OwnedMap::new()),
+                );
                 trans.write(empty_cell.to_owned()).await // empty cell write should fail
             }
         })
@@ -183,7 +190,10 @@ pub async fn multi_cell_update() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client.read_cell(cell_1.id()).await.unwrap().unwrap();
@@ -268,7 +278,10 @@ pub async fn write_skew() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client.read_cell(cell_1.id()).await.unwrap().unwrap();

@@ -1,15 +1,16 @@
-use crate::{index::builder::{IndexRes, probe_cell_indices}, ram::cleaner::Cleaner};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
-use crate::ram::schema::{ReadingSchema, LocalSchemasCache};
+use crate::ram::schema::{LocalSchemasCache, ReadingSchema};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, SharedValue};
 use crate::server::ServerMeta;
+use crate::{index::builder::IndexBuilder, ram::cell::*};
 use crate::{
-    index::builder::IndexBuilder,
-    ram::cell::*,
+    index::builder::{probe_cell_indices, IndexRes},
+    ram::cleaner::Cleaner,
 };
 
+use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 #[cfg(feature = "slow_map")]
@@ -19,7 +20,6 @@ use lightning::map::*;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use super::schema::Schema;
 
 #[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
@@ -239,7 +239,10 @@ impl Chunk {
         Ok(data.to_vec())
     }
 
-    pub fn write_cell_to_chunk(&self, cell: &mut OwnedCell) -> Result<(usize, ReadingSchema), WriteError> {
+    pub fn write_cell_to_chunk(
+        &self,
+        cell: &mut OwnedCell,
+    ) -> Result<(usize, ReadingSchema), WriteError> {
         let schema_id = cell.header.schema;
         if let Some(schema) = self.meta.schemas.get(&schema_id) {
             Ok((cell.write_to_chunk_with_schema(self, &*schema)?, schema))
@@ -248,14 +251,24 @@ impl Chunk {
         }
     }
 
-    pub fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
+    pub fn ensure_indices(
+        &self,
+        new_cell: &OwnedCell,
+        old_cell: Option<&SharedCell>,
+        schema: &Schema,
+    ) {
         if let Some(index_builder) = &self.index_builder {
             let old_indices = old_cell.map(|cell| probe_cell_indices(cell, &*schema));
             index_builder.ensure_indices(new_cell, &*schema, old_indices);
         }
     }
 
-    fn ensure_indices_with_res(&self, cell: &OwnedCell, old_indices: Option<Vec<IndexRes>>, schema: &Schema) {
+    fn ensure_indices_with_res(
+        &self,
+        cell: &OwnedCell,
+        old_indices: Option<Vec<IndexRes>>,
+        schema: &Schema,
+    ) {
         if let Some(index_builder) = &self.index_builder {
             index_builder.ensure_indices(cell, schema, old_indices)
         }
@@ -302,9 +315,15 @@ impl Chunk {
         }
     }
 
-    fn old_index_res<'a>(&'a self, cell_loc: &WordMutexGuard<'a>, schema: &Schema) -> Result<Option<Vec<IndexRes>>, WriteError> {
+    fn old_index_res<'a>(
+        &'a self,
+        cell_loc: &WordMutexGuard<'a>,
+        schema: &Schema,
+    ) -> Result<Option<Vec<IndexRes>>, WriteError> {
         if self.index_builder.is_some() {
-            SharedCellData::from_chunk_raw(**cell_loc, self).map(|(c, _)| Some(probe_cell_indices(&c, schema))).map_err(|e| WriteError::ReadError(e))
+            SharedCellData::from_chunk_raw(**cell_loc, self)
+                .map(|(c, _)| Some(probe_cell_indices(&c, schema)))
+                .map_err(|e| WriteError::ReadError(e))
         } else {
             Ok(None)
         }
@@ -380,7 +399,10 @@ impl Chunk {
                     return Err(WriteError::CellDoesNotExisted);
                 }
             };
-            let old_indices = self.index_builder.as_ref().map(|_| probe_cell_indices(&cell, &*schema));
+            let old_indices = self
+                .index_builder
+                .as_ref()
+                .map(|_| probe_cell_indices(&cell, &*schema));
             let new_cell = update(cell);
             if let Some(mut new_cell) = new_cell {
                 let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
@@ -839,7 +861,11 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<SharedSelectedValue, ReadError> {
+    pub fn read_selected(
+        &self,
+        key: &Id,
+        fields: &[u64],
+    ) -> Result<SharedSelectedValue, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields);
     }

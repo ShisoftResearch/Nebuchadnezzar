@@ -2,11 +2,11 @@ use itertools::Itertools;
 
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
-use crate::ram::types::{type_id_of, u32_io, u8_io, SharedMap, Type, SharedValue};
+use crate::ram::types::{type_id_of, u32_io, u8_io, SharedMap, SharedValue, Type};
 
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
-use std::collections::HashMap;
 use dovahkiin::types::key_hash;
+use std::collections::HashMap;
 
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedValue, usize) {
     let mut ptr = ptr;
@@ -83,16 +83,21 @@ pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
 }
 
 fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
-    let type_id = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+    let type_id = types::get_shared_val(type_id_of(Type::U32), *ptr)
+        .u32()
+        .unwrap();
     let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
     *ptr += types::u32_io::size(*ptr);
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
-        let len = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+        let len = types::get_shared_val(type_id_of(Type::U32), *ptr)
+            .u32()
+            .unwrap();
         *ptr += types::u32_io::size(*ptr);
         if base_type != 0 {
             // Primitive array
-            if let Some(prim_arr) = types::get_shared_prim_array_val(base_type, *len as usize, ptr) {
+            if let Some(prim_arr) = types::get_shared_prim_array_val(base_type, *len as usize, ptr)
+            {
                 // ptr have been moved by `get_shared_prim_array_val`
                 return SharedValue::PrimArray(prim_arr);
             } else {
@@ -103,17 +108,22 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
             // ptr have been moved by recursion
             return SharedValue::Array(array);
         }
-    } else if *type_id == 0{
+    } else if *type_id == 0 {
         // Map
-        let len = types::get_shared_val(type_id_of(Type::U32), *ptr).u32().unwrap();
+        let len = types::get_shared_val(type_id_of(Type::U32), *ptr)
+            .u32()
+            .unwrap();
         *ptr += types::u32_io::size(*ptr);
-        let field_value_pair = (0..*len).map(|_| {
-            let name = types::get_shared_val(type_id_of(Type::String), *ptr).string().unwrap();
-            *ptr += types::string_io::size(*ptr);
-            let value = read_dynamic_value(ptr);
-            (name, value)
-        })
-        .collect_vec();
+        let field_value_pair = (0..*len)
+            .map(|_| {
+                let name = types::get_shared_val(type_id_of(Type::String), *ptr)
+                    .string()
+                    .unwrap();
+                *ptr += types::string_io::size(*ptr);
+                let value = read_dynamic_value(ptr);
+                (name, value)
+            })
+            .collect_vec();
         let mut fields = Vec::with_capacity(field_value_pair.len());
         let mut map = HashMap::with_capacity(field_value_pair.len());
         for (name, value) in field_value_pair {
@@ -121,7 +131,7 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
             fields.push(name.to_owned());
             map.insert(id, value);
         }
-        return SharedValue::Map(SharedMap { fields, map});
+        return SharedValue::Map(SharedMap { fields, map });
     } else if *type_id == NULL_PLACEHOLDER {
         return SharedValue::Null;
     } else {

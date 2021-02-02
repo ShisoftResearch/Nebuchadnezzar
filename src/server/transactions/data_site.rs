@@ -1,7 +1,10 @@
 use super::*;
-use crate::{index::builder::IndexBuilder, ram::cell::{CellHeader, OwnedCell, ReadError, WriteError}};
 use crate::ram::types::{Id, OwnedValue};
 use crate::server::NebServer;
+use crate::{
+    index::builder::IndexBuilder,
+    ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
+};
 use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
@@ -312,7 +315,9 @@ impl Service for DataManager {
             return r;
         }
         match self.server.chunks.read_selected(&id, &fields[..]) {
-            Ok(values) => self.response_with(TxnExecResult::Accepted(values.iter().map(|v| v.owned()).collect())),
+            Ok(values) => self.response_with(TxnExecResult::Accepted(
+                values.iter().map(|v| v.owned()).collect(),
+            )),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }
@@ -532,7 +537,7 @@ impl Service for DataManager {
             txn.state = TxnState::Committed;
             // Commit all indices
             let response = DataSiteResponse::new(&self.server.txn_peer, DMCommitResult::Success);
-            return IndexBuilder::await_indices().map(|_| response).boxed()
+            return IndexBuilder::await_indices().map(|_| response).boxed();
         }
     }
     fn abort(

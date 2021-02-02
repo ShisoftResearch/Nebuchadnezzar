@@ -38,7 +38,10 @@ pub async fn workspace_wr() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(70));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1.to_owned())
@@ -64,7 +67,8 @@ pub async fn workspace_wr() {
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
     data_map.insert(&String::from("score"), OwnedValue::U64(90));
-    let cell_1_w2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
+    let cell_1_w2 =
+        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .write(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -172,7 +176,10 @@ pub async fn data_site_wr() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(70));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     let cell_1_non_exists_read = txn
         .read(txn_id.to_owned(), cell_1.id())
@@ -206,7 +213,8 @@ pub async fn data_site_wr() {
         _ => panic!("read cell 1 not accepted {:?}", cell_1_r_res),
     }
     data_map.insert(&String::from("score"), OwnedValue::U64(90));
-    let cell_1_w2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
+    let cell_1_w2 =
+        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map.clone()));
     let cell_1_w_res = txn
         .update(txn_id.to_owned(), cell_1_w2.to_owned())
         .await
@@ -264,8 +272,12 @@ pub async fn multi_transaction() {
     let mut data_map_1 = OwnedMap::new();
     data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
     data_map_1.insert(&String::from("score"), OwnedValue::U64(70));
-    data_map_1.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
-    let cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
+    data_map_1.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
+    let cell_1 =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     let _cell_1_t1_write = txn
         .update(txn_1_id.to_owned(), cell_1.to_owned())
         .await
@@ -273,7 +285,8 @@ pub async fn multi_transaction() {
         .unwrap();
     let data_map_2 = data_map_1.clone();
     data_map_1.insert(&String::from("score"), OwnedValue::U64(90));
-    let cell_2 = OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map_2.clone()));
+    let cell_2 =
+        OwnedCell::new_with_id(schema.id, &cell_1.id(), OwnedValue::Map(data_map_2.clone()));
     let _cell_1_t2_write = txn
         .write(txn_2_id.to_owned(), cell_2.to_owned())
         .await
@@ -363,8 +376,12 @@ pub async fn smoke_rw() {
     let mut data_map_1 = OwnedMap::new();
     data_map_1.insert(&String::from("id"), OwnedValue::I64(100));
     data_map_1.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map_1.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
-    let mut cell_1 = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
+    data_map_1.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
+    let mut cell_1 =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map_1.clone()));
     server.chunks.write_cell(&mut cell_1).unwrap();
     let cell_id = cell_1.id();
     let thread_count = 200;

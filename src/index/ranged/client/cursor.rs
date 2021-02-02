@@ -1,13 +1,16 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
-use crate::{index::ranged::{
-    client::RangedQueryClient,
-    trees::{max_entry_key, min_entry_key},
-}, ram::cell::OwnedCell};
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
+use crate::{
+    index::ranged::{
+        client::RangedQueryClient,
+        trees::{max_entry_key, min_entry_key},
+    },
+    ram::cell::OwnedCell,
+};
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
 use std::{mem, time::Duration};

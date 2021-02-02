@@ -167,7 +167,7 @@ impl NebServer {
             raft_service: raft_service.clone(),
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
-            indexer: index_builder
+            indexer: index_builder,
         });
         for service in &opts.services {
             match service {

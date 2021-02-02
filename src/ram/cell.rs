@@ -4,13 +4,13 @@ use crate::ram::entry::*;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
-use crate::ram::types::{Id, RandValue, OwnedValue, SharedValue, Value};
+use crate::ram::types::{Id, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use lightning::map::WordMutexGuard;
 use serde::Serialize;
 use std::io::Cursor;
-use std::ops::{Index, IndexMut};
 use std::ops::Deref;
+use std::ops::{Index, IndexMut};
 
 use super::schema::ReadingSchema;
 
@@ -241,23 +241,20 @@ impl SharedCellData {
     pub fn to_owned(&self) -> OwnedCell {
         OwnedCell {
             header: self.header.clone(),
-            data: self.data.owned()
+            data: self.data.owned(),
         }
     }
     pub fn into_shared(self, guard: WordMutexGuard) -> SharedCell {
-       SharedCell {
-           guard,
-           inner: self
-       }
+        SharedCell { guard, inner: self }
     }
 }
 
 pub struct SharedData<'a, T> {
     guard: WordMutexGuard<'a>,
-    inner: T
+    inner: T,
 }
 
-impl <'a, T> Deref for SharedData<'a, T> {
+impl<'a, T> Deref for SharedData<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -265,15 +262,12 @@ impl <'a, T> Deref for SharedData<'a, T> {
     }
 }
 
-impl <'a, T> SharedData<'a, T> {
+impl<'a, T> SharedData<'a, T> {
     pub fn decompose(self) -> (T, WordMutexGuard<'a>) {
         (self.inner, self.guard)
     }
     pub fn compose(data: T, guard: WordMutexGuard<'a>) -> Self {
-        Self {
-            inner: data,
-            guard
-        }
+        Self { inner: data, guard }
     }
     pub fn guard(&self) -> &WordMutexGuard {
         &self.guard
@@ -282,12 +276,15 @@ impl <'a, T> SharedData<'a, T> {
 
 pub type SharedCell<'a> = SharedData<'a, SharedCellData>;
 
-impl <'a> SharedCell<'a> {
-    pub fn from_chunk_raw(ptr: WordMutexGuard<'a>, chunk: &'a Chunk) -> Result<(Self, ReadingSchema<'a>), ReadError> {
+impl<'a> SharedCell<'a> {
+    pub fn from_chunk_raw(
+        ptr: WordMutexGuard<'a>,
+        chunk: &'a Chunk,
+    ) -> Result<(Self, ReadingSchema<'a>), ReadError> {
         SharedCellData::from_chunk_raw(*ptr, chunk).map(|(data, schema)| {
             let cell = Self {
                 guard: ptr,
-                inner: data
+                inner: data,
             };
             (cell, schema)
         })
@@ -297,13 +294,11 @@ impl <'a> SharedCell<'a> {
         chunk: &'a Chunk,
         fields: &[u64],
     ) -> Result<SharedData<'a, SharedValue>, ReadError> {
-        select_from_chunk_raw(*ptr, chunk, fields).map(|val| {
-            SharedData {
-                guard: ptr,
-                inner: val
-            }
+        select_from_chunk_raw(*ptr, chunk, fields).map(|val| SharedData {
+            guard: ptr,
+            inner: val,
         })
-    }   
+    }
 }
 
 pub trait Cell {
@@ -313,27 +308,42 @@ pub trait Cell {
 }
 
 impl Cell for OwnedCell {
-    fn id(&self) -> Id { OwnedCell::id(self) }
-    fn header(&self) -> &CellHeader { &self.header }
-    fn data(&self) -> &dyn Value { &self.data }
+    fn id(&self) -> Id {
+        OwnedCell::id(self)
+    }
+    fn header(&self) -> &CellHeader {
+        &self.header
+    }
+    fn data(&self) -> &dyn Value {
+        &self.data
+    }
 }
 
-impl <'a> Cell for SharedCell<'a> {
-    fn id(&self) -> Id { self.inner.id() }
-    fn header(&self) -> &CellHeader { &self.inner.header }
-    fn data(&self) -> &dyn Value { &self.inner.data }
+impl<'a> Cell for SharedCell<'a> {
+    fn id(&self) -> Id {
+        self.inner.id()
+    }
+    fn header(&self) -> &CellHeader {
+        &self.inner.header
+    }
+    fn data(&self) -> &dyn Value {
+        &self.inner.data
+    }
 }
 
 impl Cell for SharedCellData {
-    fn id(&self) -> Id { self.id() }
-    fn header(&self) -> &CellHeader { &self.header }
-    fn data(&self) -> &dyn Value { &self.data }
+    fn id(&self) -> Id {
+        self.id()
+    }
+    fn header(&self) -> &CellHeader {
+        &self.header
+    }
+    fn data(&self) -> &dyn Value {
+        &self.data
+    }
 }
 
-pub fn cell_header_from_entry_content_addr(
-    addr: usize,
-    entry_header: &EntryHeader,
-) -> CellHeader {
+pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &EntryHeader) -> CellHeader {
     let mut cursor = addr_to_header_cursor(addr);
     let header = CellHeader {
         version: cursor.read_u64::<Endian>().unwrap(),

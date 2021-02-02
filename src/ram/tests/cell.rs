@@ -56,13 +56,17 @@ pub fn cell_rw() {
 
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk).unwrap().0;
+        let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
+            .unwrap()
+            .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &80);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk).unwrap().0;
+        let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk)
+            .unwrap()
+            .0;
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
@@ -99,7 +103,9 @@ pub fn dynamic() {
     let mut loc = chunk.write_cell_to_chunk(&mut cell);
     let cell_1_ptr = loc.unwrap().0;
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk).unwrap().0;
+        let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk)
+            .unwrap()
+            .0;
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
@@ -121,7 +127,9 @@ pub fn dynamic() {
     loc = chunk.write_cell_to_chunk(&mut cell);
     let cell_2_ptr = loc.unwrap().0;
     {
-        let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk).unwrap().0;
+        let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
+            .unwrap()
+            .0;
         assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &80);

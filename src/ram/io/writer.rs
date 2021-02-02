@@ -113,12 +113,12 @@ pub fn plan_write_dynamic_fields(
             .iter()
             .filter_map(|n| {
                 let id = &key_hash(n);
-                dynamic_map.get(&id).map(|_| { n.clone() })
+                dynamic_map.get(&id).map(|_| n.clone())
             })
             .collect();
         let composed_map = OwnedMap {
             map: dynamic_map,
-            fields: dynamic_names
+            fields: dynamic_names,
         };
         let composed_value = OwnedValue::Map(composed_map);
         plan_write_dynamic_value(offset, &composed_value, ins);
@@ -132,7 +132,7 @@ pub const NULL_PLACEHOLDER: u32 = ARRAY_TYPE_MASK >> 1; // 1000000...
 pub fn plan_write_dynamic_value(
     offset: &mut usize,
     value: &OwnedValue,
-    ins: &mut Vec<Instruction>
+    ins: &mut Vec<Instruction>,
 ) -> Result<(), WriteError> {
     let base_type_id = value.base_type_id();
     match value {
@@ -147,7 +147,7 @@ pub fn plan_write_dynamic_value(
             let len = array.len();
             // Write array length
             ins.push(Instruction {
-                type_id: types::ARRAY_LEN_TYPE_ID, 
+                type_id: types::ARRAY_LEN_TYPE_ID,
                 val: OwnedValue::U32(len as u32),
                 offset: *offset,
             });
@@ -155,7 +155,7 @@ pub fn plan_write_dynamic_value(
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
             }
-        },
+        }
         &OwnedValue::PrimArray(ref array) => {
             // Write type id with array tag
             ins.push(Instruction {
@@ -166,7 +166,7 @@ pub fn plan_write_dynamic_value(
             *offset += types::u32_io::size(0);
             let len = array.len();
             ins.push(Instruction {
-                type_id: types::ARRAY_LEN_TYPE_ID, 
+                type_id: types::ARRAY_LEN_TYPE_ID,
                 val: OwnedValue::U32(len as u32),
                 offset: *offset,
             });
@@ -177,7 +177,7 @@ pub fn plan_write_dynamic_value(
                 offset: *offset,
             });
             *offset += array.size();
-        },
+        }
         &OwnedValue::Map(ref map) => {
             ins.push(Instruction {
                 type_id: types::TYPE_CODE_TYPE_ID,
@@ -188,7 +188,7 @@ pub fn plan_write_dynamic_value(
             // Write map size
             ins.push(Instruction {
                 type_id: types::ARRAY_LEN_TYPE_ID,
-                val: OwnedValue::U32(map.fields.len() as u32), 
+                val: OwnedValue::U32(map.fields.len() as u32),
                 offset: *offset,
             });
             *offset += types::u32_io::size(0);
@@ -200,7 +200,7 @@ pub fn plan_write_dynamic_value(
                 ins.push(Instruction {
                     type_id: name_value.base_type_id(),
                     val: name_value,
-                    offset: *offset
+                    offset: *offset,
                 });
                 *offset += name_size;
                 plan_write_dynamic_value(offset, map.map.get(&id).unwrap(), ins)?;
@@ -211,23 +211,23 @@ pub fn plan_write_dynamic_value(
             ins.push(Instruction {
                 type_id: types::TYPE_CODE_TYPE_ID,
                 val: OwnedValue::U32(NULL_PLACEHOLDER),
-                offset: *offset
+                offset: *offset,
             });
             *offset += types::u32_io::size(0);
-        },
+        }
         _ => {
             // Primitives
             let type_id = value.base_type_id();
             ins.push(Instruction {
                 type_id: types::TYPE_CODE_TYPE_ID,
                 val: OwnedValue::U32(type_id),
-                offset: *offset
+                offset: *offset,
             });
             *offset += types::u32_io::size(0);
             ins.push(Instruction {
                 type_id: type_id,
                 val: value.clone(),
-                offset: *offset
+                offset: *offset,
             });
             *offset += types::get_vsize(type_id, value);
         }

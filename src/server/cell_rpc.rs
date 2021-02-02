@@ -1,6 +1,9 @@
-use crate::{index::builder::IndexBuilder, ram::cell::{OwnedCell, CellHeader, ReadError, WriteError}};
 use crate::ram::types::Id;
 use crate::server::NebServer;
+use crate::{
+    index::builder::IndexBuilder,
+    ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
+};
 use bifrost::rpc::*;
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -61,7 +64,10 @@ impl NebRPCService {
             server: server.clone(),
         })
     }
-    fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<R> where R: Send + 'a {
+    fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<R>
+    where
+        R: Send + 'a,
+    {
         if self.server.indexer.is_some() {
             IndexBuilder::await_indices().map(|_| res).boxed()
         } else {

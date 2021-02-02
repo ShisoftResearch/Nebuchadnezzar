@@ -31,7 +31,10 @@ pub fn cell_rw() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(70));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Jack")),
+    );
     let mut data = OwnedValue::Map(data_map);
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());
@@ -58,7 +61,10 @@ pub fn cell_rw() {
     data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(2));
     data_map.insert(&String::from("score"), OwnedValue::U64(80));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("John")),
+    );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
         header: CellHeader::new(0, schema.id, &id2),
@@ -82,7 +88,10 @@ pub fn cell_rw() {
     data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(2));
     data_map.insert(&String::from("score"), OwnedValue::U64(95));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("John")),
+    );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
         header: CellHeader::new(0, schema.id, &id2),
@@ -107,7 +116,10 @@ pub fn cell_rw() {
             let mut data_map = OwnedMap::new();
             data_map.insert(&String::from("id"), OwnedValue::I64(2));
             data_map.insert(&String::from("score"), OwnedValue::U64(100));
-            data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+            data_map.insert(
+                &String::from("name"),
+                OwnedValue::String(String::from("John")),
+            );
             let data = OwnedValue::Map(data_map);
             let mut cell = cell.to_owned();
             cell.data = data;
