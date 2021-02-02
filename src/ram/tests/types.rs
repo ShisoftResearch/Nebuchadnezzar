@@ -291,7 +291,7 @@ fn _in_map() {
 
     map.update_in(&["B", "b"], |value: &mut types::OwnedValue| {
         assert_eq!(value.i64().unwrap(), &2);
-        *value = types::OwnedValue::U64(30);
+        *value = types::OwnedValue::I64(30);
     });
     assert_eq!(map.get_in(&["B", "b"]).i64().unwrap(), &30);
 }
