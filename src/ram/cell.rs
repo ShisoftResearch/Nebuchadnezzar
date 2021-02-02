@@ -75,8 +75,8 @@ impl CellHeader {
     }
 }
 
-pub const CELL_HEADER_SIZE: usize = CELL_HEADER_SIZE_U32 as usize;
-pub const CELL_HEADER_SIZE_U32: u32 = 32;
+pub const CELL_HEADER_SIZE: usize = std::mem::size_of::<CellHeader>();
+pub const CELL_HEADER_SIZE_U32: u32 = CELL_HEADER_SIZE as u32;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct OwnedCell {

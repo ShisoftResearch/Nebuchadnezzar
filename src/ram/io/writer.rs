@@ -121,7 +121,7 @@ pub fn plan_write_dynamic_fields(
             fields: dynamic_names,
         };
         let composed_value = OwnedValue::Map(composed_map);
-        plan_write_dynamic_value(offset, &composed_value, ins);
+        plan_write_dynamic_value(offset, &composed_value, ins)?;
     }
     return Ok(());
 }
