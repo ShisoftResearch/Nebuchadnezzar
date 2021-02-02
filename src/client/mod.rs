@@ -15,7 +15,7 @@ use std::io;
 use std::mem;
 use std::sync::Arc;
 
-use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::Schema;
@@ -109,14 +109,14 @@ impl AsyncClient {
         self.client_by_server_id(server_id).await
     }
 
-    pub async fn read_cell(&self, id: Id) -> Result<Result<Cell, ReadError>, RPCError> {
+    pub async fn read_cell(&self, id: Id) -> Result<Result<OwnedCell, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         client.read_cell(id).await
     }
     pub async fn read_all_cells(
         &self,
         ids: Vec<Id>,
-    ) -> Result<Vec<Result<Cell, ReadError>>, RPCError> {
+    ) -> Result<Vec<Result<OwnedCell, ReadError>>, RPCError> {
         let mut cells_by_client = ids
             .iter()
             .dedup()
@@ -156,20 +156,20 @@ impl AsyncClient {
             })
             .collect())
     }
-    pub async fn write_cell(&self, cell: Cell) -> Result<Result<CellHeader, WriteError>, RPCError> {
+    pub async fn write_cell(&self, cell: OwnedCell) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
         client.write_cell(cell).await
     }
     pub async fn update_cell(
         &self,
-        cell: Cell,
+        cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
         client.update_cell(cell).await
     }
     pub async fn upsert_cell(
         &self,
-        cell: Cell,
+        cell: OwnedCell,
     ) -> Result<Result<CellHeader, WriteError>, RPCError> {
         let client = self.locate_plain_server(cell.id()).await?;
         client.upsert_cell(cell).await

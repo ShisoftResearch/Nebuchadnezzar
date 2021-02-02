@@ -51,11 +51,11 @@ pub async fn general() {
         .unwrap(),
     );
     let schema_id = client.new_schema(schema).await.unwrap().0;
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(0));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(0));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client
         .read_cell(cell_1.clone().id())
@@ -83,7 +83,7 @@ pub async fn general() {
     client
         .transaction(move |trans| {
             async move {
-                let empty_cell = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(Map::new()));
+                let empty_cell = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(OwnedMap::new()));
                 trans.write(empty_cell.to_owned()).await // empty cell write should fail
             }
         })
@@ -108,12 +108,12 @@ pub async fn general() {
                         )
                         .await?
                         .unwrap();
-                    let mut score = *cell.data["score"].U64().unwrap();
-                    assert_eq!(selected.first().unwrap().U64().unwrap(), &score);
+                    let mut score = *cell.data["score"].u64().unwrap();
+                    assert_eq!(selected.first().unwrap().u64().unwrap(), &score);
                     score += 1;
                     let mut data = cell.data.Map().unwrap().clone();
-                    data.insert(&String::from("score"), Value::U64(score));
-                    cell.data = Value::Map(data);
+                    data.insert(&String::from("score"), OwnedValue::U64(score));
+                    cell.data = OwnedValue::Map(data);
                     txn.update(cell.to_owned()).await?;
                     let selected = txn
                         .read_selected(
@@ -122,7 +122,7 @@ pub async fn general() {
                         )
                         .await?
                         .unwrap();
-                    assert_eq!(selected[0].U64().unwrap(), &score);
+                    assert_eq!(selected[0].u64().unwrap(), &score);
 
                     let header = txn.head(cell.id()).await?.unwrap();
                     assert_eq!(header.id(), cell.id());
@@ -137,7 +137,7 @@ pub async fn general() {
     let _: Vec<_> = futs.collect().await;
     let cell_1_r = client.read_cell(cell_1.id()).await.unwrap().unwrap();
     assert_eq!(
-        cell_1_r.data["score"].U64().unwrap(),
+        cell_1_r.data["score"].u64().unwrap(),
         &(thread_count as u64)
     );
 }
@@ -180,11 +180,11 @@ pub async fn multi_cell_update() {
     let thread_count = 100;
     let schema_id = schema.id;
     client.new_schema(schema).await.unwrap();
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(0));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(0));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client.read_cell(cell_1.id()).await.unwrap().unwrap();
     let cell_1_id = cell_1.id();
@@ -203,16 +203,16 @@ pub async fn multi_cell_update() {
                     let mut score_2;
                     let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
                     let mut cell_2 = txn.read(cell_2_id.to_owned()).await?.unwrap();
-                    score_1 = *cell_1.data["score"].U64().unwrap();
-                    score_2 = *cell_2.data["score"].U64().unwrap();
+                    score_1 = *cell_1.data["score"].u64().unwrap();
+                    score_2 = *cell_2.data["score"].u64().unwrap();
                     score_1 += 1;
                     score_2 += 1;
                     let mut data_1 = cell_1.data.Map().unwrap().clone();
-                    data_1.insert(&String::from("score"), Value::U64(score_1));
-                    cell_1.data = Value::Map(data_1);
+                    data_1.insert(&String::from("score"), OwnedValue::U64(score_1));
+                    cell_1.data = OwnedValue::Map(data_1);
                     let mut data_2 = cell_2.data.Map().unwrap().clone();
-                    data_2.insert(&String::from("score"), Value::U64(score_2));
-                    cell_2.data = Value::Map(data_2);
+                    data_2.insert(&String::from("score"), OwnedValue::U64(score_2));
+                    cell_2.data = OwnedValue::Map(data_2);
                     txn.update(cell_1.to_owned()).await?;
                     txn.update(cell_2.to_owned()).await?;
                     Ok(())
@@ -224,8 +224,8 @@ pub async fn multi_cell_update() {
     let _: Vec<_> = futs.collect().await;
     let cell_1_r = client.read_cell(cell_1_id).await.unwrap().unwrap();
     let cell_2_r = client.read_cell(cell_2_id).await.unwrap().unwrap();
-    let cell_1_score = cell_1_r.data["score"].U64().unwrap();
-    let cell_2_score = cell_2_r.data["score"].U64().unwrap();
+    let cell_1_score = cell_1_r.data["score"].u64().unwrap();
+    let cell_2_score = cell_2_r.data["score"].u64().unwrap();
     assert_eq!(cell_1_score + cell_2_score, (thread_count * 2) as u64);
 }
 
@@ -265,11 +265,11 @@ pub async fn write_skew() {
         .unwrap(),
     );
     let schema_id = client.new_schema(schema).await.unwrap().0;
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(0));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let cell_1 = Cell::new_with_id(schema_id, &Id::rand(), Value::Map(data_map.clone()));
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(0));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
     client.read_cell(cell_1.id()).await.unwrap().unwrap();
     let cell_1_id = cell_1.id();
@@ -286,12 +286,12 @@ pub async fn write_skew() {
                 *skew_tried_c.lock() += 1;
                 async move {
                     let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
-                    let mut score_1 = *cell_1.data["score"].U64().unwrap();
+                    let mut score_1 = *cell_1.data["score"].u64().unwrap();
                     thread::sleep(Duration::new(2, 0)); // wait 2 secs to let late write occur
                     score_1 += 1;
                     let mut data_1 = cell_1.data.Map().unwrap().clone();
-                    data_1.insert(&String::from("score"), Value::U64(score_1));
-                    cell_1.data = Value::Map(data_1);
+                    data_1.insert(&String::from("score"), OwnedValue::U64(score_1));
+                    cell_1.data = OwnedValue::Map(data_1);
                     txn.update(cell_1.to_owned()).await?;
                     Ok(())
                 }
@@ -307,11 +307,11 @@ pub async fn write_skew() {
                 async move {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     let mut cell_1 = txn.read(cell_1_id.to_owned()).await?.unwrap();
-                    let mut score_1 = *cell_1.data["score"].U64().unwrap();
+                    let mut score_1 = *cell_1.data["score"].u64().unwrap();
                     score_1 += 1;
                     let mut data_1 = cell_1.data.Map().unwrap().clone();
-                    data_1.insert(&String::from("score"), Value::U64(score_1));
-                    cell_1.data = Value::Map(data_1);
+                    data_1.insert(&String::from("score"), OwnedValue::U64(score_1));
+                    cell_1.data = OwnedValue::Map(data_1);
                     txn.update(cell_1.to_owned()).await?;
                     Ok(())
                 }
@@ -322,7 +322,7 @@ pub async fn write_skew() {
     t2.await.unwrap();
     t1.await.unwrap();
     let cell_1_r = client.read_cell(cell_1_id).await.unwrap().unwrap();
-    let cell_1_score = *cell_1_r.data["score"].U64().unwrap();
+    let cell_1_score = *cell_1_r.data["score"].u64().unwrap();
     assert_eq!(cell_1_score, 2);
     //    assert_eq!(*skew_tried.lock(), 2);
     //    assert_eq!(*normal_tried.lock(), 1);

@@ -1,12 +1,12 @@
 use super::{ranged::client::RangedQueryClient, EntryKey, Feature};
-use crate::ram::schema::{Field, IndexType, Schema};
+use crate::ram::{cell::Cell, schema::{Field, IndexType, Schema}};
 use crate::ram::types::{Id, Value};
-use crate::{client::AsyncClient, ram::cell::Cell};
+use crate::{client::AsyncClient, ram::cell::{SharedCell, OwnedCell}};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use bifrost_hasher::hash_str;
 use futures::{future::BoxFuture, stream::{FuturesUnordered, StreamExt}};
 use tokio::task::{JoinError, JoinHandle};
-use std::{cell::RefCell, mem::take, sync::Arc};
+use std::{cell::RefCell, sync::Arc};
 use futures::FutureExt;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -128,7 +128,7 @@ impl IndexBuilder {
         }
     }
 
-    pub fn ensure_indices(&self, cell: &Cell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
+    pub fn ensure_indices(&self, cell: &OwnedCell, schema: &Schema, old_indices: Option<Vec<IndexRes>>) {
         let new_indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
         let task = tokio::spawn(async move {
@@ -139,7 +139,7 @@ impl IndexBuilder {
         });
     }
 
-    pub fn remove_indices(&self, cell: &Cell, schema: &Schema) {
+    pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
         let indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
         let task = tokio::spawn(async move {
@@ -191,61 +191,61 @@ impl IndexBuilder {
     }
 }
 
-pub fn probe_cell_indices(cell: &Cell, schema: &Schema) -> Vec<IndexRes> {
+pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
     probe_field_indices(
-        &cell,
+        cell,
         &"".to_string(),
         &schema.fields,
         schema.id,
-        &cell.data,
+        cell.data(),
         &mut res,
     );
     res
 }
 
 fn probe_field_indices(
-    cell: &Cell,
+    cell: &dyn Cell,
     fields_name: &FieldName,
     field: &Field,
     schema_id: u32,
-    value: &Value,
+    value: &dyn Value,
     res: &mut Vec<IndexRes>,
 ) {
     if let &Some(ref fields) = &field.sub_fields {
         for field in fields {
-            let value = &value[field.name_id];
+            let value = &value.index_of(field.name_id as usize);
             let field_name = format!("{} -> {}", fields_name, field.name);
-            probe_field_indices(cell, &field_name, field, schema_id, value, res);
+            probe_field_indices(cell, &field_name, field, schema_id, *value, res);
         }
     } else {
         let mut components = vec![];
-        if let &Value::Array(ref array) = value {
+        if let Some(ref array) = value.uni_array() {
             for sub_val in array {
-                probe_field_indices(cell, &fields_name, field, schema_id, sub_val, res);
+                probe_field_indices(cell, &fields_name, field, schema_id, *sub_val, res);
             }
-        } else if let &Value::PrimArray(ref array) = value {
+        } else if let Some(array_data_size) = value.prim_array_data_size() {
             for index in &field.indices {
                 match index {
                     &IndexType::Ranged => components.append(
-                        &mut array
+                        &mut value
                             .features()
                             .into_iter()
                             .map(|vec| IndexComps::Ranged(vec))
                             .collect(),
                     ),
                     &IndexType::Hashed => components.append(
-                        &mut array
+                        &mut value
                             .hashes()
                             .into_iter()
                             .map(|vec| IndexComps::Hashed(vec))
                             .collect(),
                     ),
                     &IndexType::Vectorized => components.append(
-                        &mut array
+                        &mut value
                             .features()
                             .into_iter()
-                            .map(|vec| IndexComps::Vectorized(vec, array.data_size()))
+                            .map(|vec| IndexComps::Vectorized(vec, array_data_size))
                             .collect(),
                     ),
                 }
@@ -289,7 +289,7 @@ fn probe_field_indices(
                         cell_id,
                         feature: feat,
                         data_width: size,
-                        cell_ver: cell.header.version,
+                        cell_ver: cell.header().version,
                     }));
                 }
             }

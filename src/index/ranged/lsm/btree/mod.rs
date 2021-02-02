@@ -5,7 +5,7 @@ use crate::ram::types::RandValue;
 pub use cell_ref::NodeCellRef;
 pub use cursor::*;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::{key_hash, PrimitiveArray, Value};
+use dovahkiin::types::{key_hash};
 pub use external::page_schema;
 use external::*;
 use futures::future::BoxFuture;

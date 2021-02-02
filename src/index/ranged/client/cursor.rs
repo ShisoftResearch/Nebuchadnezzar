@@ -1,9 +1,9 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
-use crate::index::ranged::{
+use crate::{index::ranged::{
     client::RangedQueryClient,
     trees::{max_entry_key, min_entry_key},
-};
+}, ram::cell::OwnedCell};
 use crate::index::EntryKey;
 use crate::ram::cell::Cell;
 use crate::ram::cell::ReadError;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::{mem, time::Duration};
 
 type CellBlock = Vec<Option<IndexedCell>>;
-pub type IndexedCell = (Id, Result<Cell, ReadError>);
+pub type IndexedCell = (Id, Result<OwnedCell, ReadError>);
 
 pub struct ClientCursor {
     cell_block: CellBlock,

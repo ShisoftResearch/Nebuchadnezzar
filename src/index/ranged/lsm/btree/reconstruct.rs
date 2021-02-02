@@ -180,16 +180,13 @@ where
 #[cfg(test)]
 mod test {
     use super::external::*;
-    use crate::client;
+    use crate::{client, ram::cell::OwnedCell};
     use crate::index::ranged::lsm::btree::test::*;
     use crate::index::ranged::lsm::btree::*;
-    use crate::ram::cell::Cell;
     use crate::ram::types::*;
     use crate::rand::Rng;
     use crate::server::*;
     use dovahkiin::types::custom_types::id::Id;
-    use dovahkiin::types::custom_types::map::Map;
-    use dovahkiin::types::Value;
     use itertools::Itertools;
     use lightning::map::HashSet;
     use std::sync::Arc;
@@ -233,12 +230,12 @@ mod test {
         let mut all_keys = vec![];
         for i in 1..=cell_limit {
             let new_id = Id::new(i, i);
-            let mut value = Value::Map(Map::new());
-            value[*PREV_PAGE_KEY_HASH] = Value::Id(last_id);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[*PREV_PAGE_KEY_HASH] = OwnedValue::Id(last_id);
             value[*NEXT_PAGE_KEY_HASH] = if i < cell_limit {
-                Value::Id(Id::new(i + 1, i + 1))
+                OwnedValue::Id(Id::new(i + 1, i + 1))
             } else {
-                Value::Id(Id::unit_id())
+                OwnedValue::Id(Id::unit_id())
             };
             value[*KEYS_KEY_HASH] = (0..PAGE_SIZE)
                 .map(|_| {
@@ -252,7 +249,7 @@ mod test {
                 .collect_vec()
                 .value();
             client
-                .write_cell(Cell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value))
+                .write_cell(OwnedCell::new_with_id(*PAGE_SCHEMA_ID, &new_id, value))
                 .await
                 .unwrap()
                 .unwrap();

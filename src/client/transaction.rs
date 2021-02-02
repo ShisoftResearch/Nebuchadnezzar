@@ -1,4 +1,4 @@
-use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::types::{Id, Value};
 use crate::server::transactions::TxnId;
 use crate::server::transactions::*;
@@ -7,6 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use bifrost::rpc::RPCError;
+use dovahkiin::types::OwnedValue;
 
 #[derive(Debug)]
 pub enum TxnError {
@@ -37,7 +38,7 @@ unsafe impl Send for Transaction {}
 unsafe impl Sync for Transaction {}
 
 impl Transaction {
-    pub async fn read(&self, id: Id) -> Result<Option<Cell>, TxnError> {
+    pub async fn read(&self, id: Id) -> Result<Option<OwnedCell>, TxnError> {
         match self.client.read(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -52,7 +53,7 @@ impl Transaction {
         &self,
         id: Id,
         fields: Vec<u64>,
-    ) -> Result<Option<Vec<Value>>, TxnError> {
+    ) -> Result<Option<Vec<OwnedValue>>, TxnError> {
         match self
             .client
             .read_selected(self.tid.to_owned(), id, fields)
@@ -67,7 +68,7 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
-    pub async fn write(&self, cell: Cell) -> Result<(), TxnError> {
+    pub async fn write(&self, cell: OwnedCell) -> Result<(), TxnError> {
         match self.client.write(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -77,7 +78,7 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
-    pub async fn update(&self, cell: Cell) -> Result<(), TxnError> {
+    pub async fn update(&self, cell: OwnedCell) -> Result<(), TxnError> {
         match self.client.update(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
@@ -108,7 +109,7 @@ impl Transaction {
             Err(e) => Err(TxnError::RPCError(e)),
         }
     }
-    pub async fn upsert(&self, cell: Cell) -> Result<(), TxnError> {
+    pub async fn upsert(&self, cell: OwnedCell) -> Result<(), TxnError> {
         match self.head(cell.id()).await {
             Ok(Some(_)) => self.update(cell).await,
             Ok(None) => self.write(cell).await,

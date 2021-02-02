@@ -77,9 +77,9 @@ mod tests {
             futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);
                 let key = EntryKey::from_id(&id);
-                let mut data_map = Map::new();
-                data_map.insert("data", Value::U64(i as u64));
-                let cell = Cell::new_with_id(11, &id, Value::Map(data_map));
+                let mut data_map = OwnedMap::new();
+                data_map.insert("data", OwnedValue::U64(i as u64));
+                let cell = OwnedCell::new_with_id(11, &id, OwnedValue::Map(data_map));
                 client.write_cell(cell).await.unwrap().unwrap();
                 index_client.insert(&key).await
             }));
@@ -94,7 +94,7 @@ mod tests {
             let cell_res = client.read_cell(id).await.unwrap();
             match cell_res {
                 Ok(cell) => {
-                    assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
+                    assert_eq!(*cell.data["data"].u64().unwrap(), *i as u64);
                 }
                 Err(e) => {
                     panic!("Expecting cell, found error {:?}", e);
@@ -134,7 +134,7 @@ mod tests {
             let cell_res = client.read_cell(id).await.unwrap();
             match cell_res {
                 Ok(cell) => {
-                    assert_eq!(*cell.data["data"].U64().unwrap(), *i as u64);
+                    assert_eq!(*cell.data["data"].u64().unwrap(), *i as u64);
                 }
                 Err(e) => {
                     panic!("Expecting cell at round 2, found error {:?}", e);

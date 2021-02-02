@@ -28,14 +28,14 @@ pub fn cell_rw() {
     let id2 = Id::new(1, 2);
     let fields = default_fields();
     let schema = Schema::new("dummy", None, fields, false);
-    let mut data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(100));
-    data_map.insert(&String::from("score"), Value::U64(70));
-    data_map.insert(&String::from("name"), Value::String(String::from("Jack")));
-    let mut data = Value::Map(data_map);
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Jack")));
+    let mut data = OwnedValue::Map(data_map);
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());
-    let mut cell = Cell {
+    let mut cell = OwnedCell {
         header: CellHeader::new(0, schema.id, &id1),
         data,
     };
@@ -51,16 +51,16 @@ pub fn cell_rw() {
     let cell_1_ptr = chunks.address_of(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
     }
-    data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(2));
-    data_map.insert(&String::from("score"), Value::U64(80));
-    data_map.insert(&String::from("name"), Value::String(String::from("John")));
-    data = Value::Map(data_map);
-    cell = Cell {
+    data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(2));
+    data_map.insert(&String::from("score"), OwnedValue::U64(80));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+    data = OwnedValue::Map(data_map);
+    cell = OwnedCell {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
@@ -69,22 +69,22 @@ pub fn cell_rw() {
     assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &80);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &80);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
     }
-    data_map = Map::new();
-    data_map.insert(&String::from("id"), Value::I64(2));
-    data_map.insert(&String::from("score"), Value::U64(95));
-    data_map.insert(&String::from("name"), Value::String(String::from("John")));
-    data = Value::Map(data_map);
-    cell = Cell {
+    data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(2));
+    data_map.insert(&String::from("score"), OwnedValue::U64(95));
+    data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+    data = OwnedValue::Map(data_map);
+    cell = OwnedCell {
         header: CellHeader::new(0, schema.id, &id2),
         data,
     };
@@ -92,32 +92,33 @@ pub fn cell_rw() {
     let _cell_2_ptr = chunks.address_of(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &95);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &95);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &100);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "Jack");
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &70);
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
     }
     chunks
-        .update_cell_by(&id2, |mut cell| {
-            let mut data_map = Map::new();
-            data_map.insert(&String::from("id"), Value::I64(2));
-            data_map.insert(&String::from("score"), Value::U64(100));
-            data_map.insert(&String::from("name"), Value::String(String::from("John")));
-            let data = Value::Map(data_map);
+        .update_cell_by(&id2, |cell| {
+            let mut data_map = OwnedMap::new();
+            data_map.insert(&String::from("id"), OwnedValue::I64(2));
+            data_map.insert(&String::from("score"), OwnedValue::U64(100));
+            data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
+            let data = OwnedValue::Map(data_map);
+            let mut cell = cell.to_owned();
             cell.data = data;
             Some(cell)
         })
         .unwrap();
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
-        assert_eq!(stored_cell.data["id"].I64().unwrap(), &2);
-        assert_eq!(stored_cell.data["score"].U64().unwrap(), &100);
-        assert_eq!(stored_cell.data["name"].String().unwrap(), "John");
+        assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
+        assert_eq!(stored_cell.data["score"].u64().unwrap(), &100);
+        assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());

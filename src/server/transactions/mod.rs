@@ -1,4 +1,4 @@
-use crate::ram::cell::{Cell, WriteError};
+use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
 use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
@@ -113,8 +113,8 @@ pub enum CheckError {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum CommitOp {
-    Write(Cell),
-    Update(Cell),
+    Write(OwnedCell),
+    Update(OwnedCell),
     Remove(Id),
     Read(Id, u64), // id, version
     None,
