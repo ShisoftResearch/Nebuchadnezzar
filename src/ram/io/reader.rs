@@ -27,7 +27,6 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
             // maybe primitive array
             let mut ptr = ptr;
             let val = types::get_shared_prim_array_val(field.type_id, len as usize, &mut ptr);
-            info!("Got array {} length {}, subs {:?}, value {:?}", field.name, len, field.sub_fields, val);
             if let Some(prim_arr) = val {
                 return (SharedValue::PrimArray(prim_arr), ptr);
             } else {
