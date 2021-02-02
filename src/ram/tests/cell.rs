@@ -106,13 +106,12 @@ pub fn dynamic() {
         let stored_cell = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk)
             .unwrap()
             .0;
-        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
-        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
         assert_eq!(stored_cell.data["year"].u16().unwrap(), &2010);
         assert_eq!(stored_cell.data["major"].string().unwrap(), "CS");
+        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
     }
 
     data_map = types::OwnedMap::new();
@@ -130,7 +129,6 @@ pub fn dynamic() {
         let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
             .unwrap()
             .0;
-        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &80);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
