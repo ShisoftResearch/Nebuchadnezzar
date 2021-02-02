@@ -1,4 +1,4 @@
-use crate::{index::builder::probe_cell_indices, ram::cleaner::Cleaner};
+use crate::{index::builder::{IndexRes, probe_cell_indices}, ram::cleaner::Cleaner};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{ReadingSchema, LocalSchemasCache};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -219,7 +219,7 @@ impl Chunk {
         let selected_data = select_from_chunk_raw(*loc, self, fields)?;
         let mut result = Vec::with_capacity(fields.len());
         match selected_data {
-            SharedValue::Map(map) => {
+            SharedValue::Map(mut map) => {
                 for field_id in fields {
                     result.push(map.map.remove(field_id).unwrap())
                 }
@@ -252,6 +252,12 @@ impl Chunk {
         if let Some(index_builder) = &self.index_builder {
             let old_indices = old_cell.map(|cell| probe_cell_indices(cell, &*schema));
             index_builder.ensure_indices(new_cell, &*schema, old_indices);
+        }
+    }
+
+    fn ensure_indices_with_res(&self, cell: &OwnedCell, old_indices: Option<Vec<IndexRes>>, schema: &Schema) {
+        if let Some(index_builder) = &self.index_builder {
+            index_builder.ensure_indices(cell, schema, old_indices)
         }
     }
 
@@ -296,9 +302,9 @@ impl Chunk {
         }
     }
 
-    fn old_cell_for_index<'a>(&'a self, cell_loc: WordMutexGuard<'a>) -> Result<Option<SharedCell<'a>>, WriteError> {
+    fn old_index_res<'a>(&'a self, cell_loc: &WordMutexGuard<'a>, schema: &Schema) -> Result<Option<Vec<IndexRes>>, WriteError> {
         if self.index_builder.is_some() {
-            SharedCell::from_chunk_raw(cell_loc, self).map(|(c, _)| Some(c)).map_err(|e| WriteError::ReadError(e))
+            SharedCellData::from_chunk_raw(**cell_loc, self).map(|(c, _)| Some(probe_cell_indices(&c, schema))).map_err(|e| WriteError::ReadError(e))
         } else {
             Ok(None)
         }
@@ -310,9 +316,9 @@ impl Chunk {
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
-            let old_cell = self.old_cell_for_index(guard)?;
+            let old_indices = self.old_index_res(&guard, &*schema)?;
+            self.ensure_indices_with_res(cell, old_indices, &*schema);
             *guard = new_cell_loc;
-            self.ensure_indices(cell, old_cell.as_ref(), &*schema);
             self.mark_dead_entry_with_cell(cell_location, cell);
         } else {
             // Optimistic update will remove the new inserted one
@@ -330,10 +336,10 @@ impl Chunk {
             if let Some(mut guard) = self.location_for_write(hash) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
-                let old_cell = self.old_cell_for_index(guard)?;
+                let old_indices = self.old_index_res(&guard, &*schema)?;
                 *guard = new_cell_loc;
                 drop(guard);
-                self.ensure_indices(cell, old_cell.as_ref(), &*schema);
+                self.ensure_indices_with_res(cell, old_indices, &*schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
             } else {
                 #[cfg(feature = "fast_map")]
@@ -365,8 +371,9 @@ impl Chunk {
         loop {
             let ((cell, schema), old_loc) = {
                 if let Some(cell_guard) = self.location_for_write(hash) {
+                    let loc = *cell_guard;
                     match SharedCell::from_chunk_raw(cell_guard, self) {
-                        Ok(cell) => (cell, *cell_guard),
+                        Ok(cell) => (cell, loc),
                         Err(e) => return Err(WriteError::ReadError(e)),
                     }
                 } else {
@@ -436,10 +443,10 @@ impl Chunk {
                             put_tombstone_result
                         } else {
                             #[cfg(feature = "fast_map")]
-                            guard.remove();
                             if let Some(indexer) = &self.index_builder {
                                 indexer.remove_indices(&cell, &*schema)
                             }
+                            cell.decompose().1.remove();
                             Ok(())
                         }
                     } else {

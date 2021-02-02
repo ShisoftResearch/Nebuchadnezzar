@@ -241,7 +241,7 @@ impl SharedCellData {
     pub fn to_owned(&self) -> OwnedCell {
         OwnedCell {
             header: self.header.clone(),
-            data: self.data.to_owned()
+            data: self.data.owned()
         }
     }
     pub fn into_shared(self, guard: WordMutexGuard) -> SharedCell {
@@ -274,6 +274,9 @@ impl <'a, T> SharedData<'a, T> {
             inner: data,
             guard
         }
+    }
+    pub fn guard(&self) -> &WordMutexGuard {
+        &self.guard
     }
 }
 
@@ -319,6 +322,12 @@ impl <'a> Cell for SharedCell<'a> {
     fn id(&self) -> Id { self.inner.id() }
     fn header(&self) -> &CellHeader { &self.inner.header }
     fn data(&self) -> &dyn Value { &self.inner.data }
+}
+
+impl Cell for SharedCellData {
+    fn id(&self) -> Id { self.id() }
+    fn header(&self) -> &CellHeader { &self.header }
+    fn data(&self) -> &dyn Value { &self.data }
 }
 
 pub fn cell_header_from_entry_content_addr(

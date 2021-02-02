@@ -220,32 +220,32 @@ fn probe_field_indices(
         }
     } else {
         let mut components = vec![];
-        if let &Value::Array(ref array) = value {
+        if let Some(ref array) = value.uni_array() {
             for sub_val in array {
-                probe_field_indices(cell, &fields_name, field, schema_id, sub_val, res);
+                probe_field_indices(cell, &fields_name, field, schema_id, *sub_val, res);
             }
-        } else if let &Value::PrimArray(ref array) = value {
+        } else if let Some(array_data_size) = value.prim_array_data_size() {
             for index in &field.indices {
                 match index {
                     &IndexType::Ranged => components.append(
-                        &mut array
+                        &mut value
                             .features()
                             .into_iter()
                             .map(|vec| IndexComps::Ranged(vec))
                             .collect(),
                     ),
                     &IndexType::Hashed => components.append(
-                        &mut array
+                        &mut value
                             .hashes()
                             .into_iter()
                             .map(|vec| IndexComps::Hashed(vec))
                             .collect(),
                     ),
                     &IndexType::Vectorized => components.append(
-                        &mut array
+                        &mut value
                             .features()
                             .into_iter()
-                            .map(|vec| IndexComps::Vectorized(vec, array.data_size()))
+                            .map(|vec| IndexComps::Vectorized(vec, array_data_size))
                             .collect(),
                     ),
                 }

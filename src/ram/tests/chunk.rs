@@ -103,13 +103,13 @@ pub fn cell_rw() {
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
     }
     chunks
-        .update_cell_by(&id2, |mut cell| {
+        .update_cell_by(&id2, |cell| {
             let mut data_map = OwnedMap::new();
             data_map.insert(&String::from("id"), OwnedValue::I64(2));
             data_map.insert(&String::from("score"), OwnedValue::U64(100));
             data_map.insert(&String::from("name"), OwnedValue::String(String::from("John")));
             let data = OwnedValue::Map(data_map);
-            let cell = cell.to_owned();
+            let mut cell = cell.to_owned();
             cell.data = data;
             Some(cell)
         })

@@ -312,7 +312,7 @@ impl Service for DataManager {
             return r;
         }
         match self.server.chunks.read_selected(&id, &fields[..]) {
-            Ok(values) => self.response_with(TxnExecResult::Accepted(values.into_iter().map(|v| v.to_owned()).collect())),
+            Ok(values) => self.response_with(TxnExecResult::Accepted(values.iter().map(|v| v.owned()).collect())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }
     }

@@ -27,6 +27,7 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
             // maybe primitive array
             let mut ptr = ptr;
             let val = types::get_shared_prim_array_val(field.type_id, len as usize, &mut ptr);
+            info!("Got array {} length {}, subs {:?}, value {:?}", field.name, len, field.sub_fields, val);
             if let Some(prim_arr) = val {
                 return (SharedValue::PrimArray(prim_arr), ptr);
             } else {
@@ -73,11 +74,11 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
 pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
     let src = read_dynamic_value(&mut tail_ptr);
     if let &mut SharedValue::Map(ref mut map_dest) = dest {
-        if let SharedValue::Map(map_src) = src {
+        if let SharedValue::Map(mut map_src) = src {
+            map_dest.fields.append(&mut map_src.fields);
             for (k, v) in map_src.map.into_iter() {
                 map_dest.insert_key_id(k, v);
             }
-            map_dest.fields.append(&mut map_src.fields);
         }
     }
 }
@@ -114,8 +115,8 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
             (name, value)
         })
         .collect_vec();
-        let fields = Vec::with_capacity(field_value_pair.len());
-        let map = HashMap::with_capacity(field_value_pair.len());
+        let mut fields = Vec::with_capacity(field_value_pair.len());
+        let mut map = HashMap::with_capacity(field_value_pair.len());
         for (name, value) in field_value_pair {
             let id = key_hash(&name);
             fields.push(name.to_owned());
