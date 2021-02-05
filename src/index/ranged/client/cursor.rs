@@ -68,7 +68,7 @@ impl ClientCursor {
             self.refill_by_next_tree().await?;
             return Ok(res);
         };
-        debug!("Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}", next_key, current_key, next_key.id());
+        trace!("Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}", next_key, current_key, next_key.id());
         let next_cursor = RangedQueryClient::seek(
             &self.query_client,
             next_key,
