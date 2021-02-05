@@ -10,7 +10,7 @@ use crate::{
 };
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
-use std::{mem, time::Duration};
+use std::time::Duration;
 
 pub struct ClientCursor {
     pub ids: Vec<Id>,
@@ -31,9 +31,10 @@ impl ClientCursor {
         buffer_size: u16,
     ) -> Result<Self, RPCError> {
         trace!(
-            "Client cursor created with buffer next {:?}, tree key {:?}",
+            "Client cursor created with buffer next {:?}, tree key {:?}, block keys {:?}",
             block.next,
-            tree_key
+            tree_key,
+            block.buffer
         );
         let next = block.next;
         let ids = block.buffer;
@@ -51,7 +52,7 @@ impl ClientCursor {
     pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
         let mut res = None;
         if self.pos < self.ids.len() {
-            res = Some(mem::take(&mut self.ids[self.pos]));
+            res = Some(self.ids[self.pos]);
             self.pos += 1;
             if self.pos < self.ids.len() {
                 return Ok(res);

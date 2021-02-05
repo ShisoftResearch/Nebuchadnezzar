@@ -109,15 +109,17 @@ mod tests {
             index_client.tree_stats().await.unwrap()
         );
         info!("Scanning forward...");
+        let start_id = Id::new(1, 0);
         let mut rt_cursor = client::RangedQueryClient::seek(
             &index_client,
-            &EntryKey::from_id(&Id::new(1, 0)),
+            &EntryKey::from_id(&start_id),
             Ordering::Forward,
             128,
         )
         .await
         .unwrap()
         .unwrap();
+        assert_eq!(rt_cursor.current(), Some(&start_id));
         for (i, num) in nums.iter().enumerate() {
             let id = Id::new(1, *num as u64);
             let current = rt_cursor.current().expect(&format!("Checking {}", num));

@@ -158,9 +158,29 @@ impl Service for LSMTreeService {
             let buffer_size = buffer_size as usize;
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
-            for _ in 0..buffer_size {
+            let mut num_collected = 0;
+            while num_collected < buffer_size {
                 if let Some(key) = tree_cursor.next() {
-                    buffer.push(key.id());
+                    let key_id = key.id();
+                    if let Some(last_key) = buffer.last() {
+                        if last_key == &key_id {
+                            continue;
+                        }
+                    }
+                    match ordering {
+                        Ordering::Forward => {
+                            if &key < entry {
+                                continue;
+                            }
+                        },
+                        Ordering::Backward => {
+                            if &key > entry {
+                                continue;
+                            }
+                        }
+                    }
+                    buffer.push(key_id);
+                    num_collected += 1;
                 } else {
                     break;
                 }
