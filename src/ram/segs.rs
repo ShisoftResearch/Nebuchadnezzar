@@ -332,9 +332,10 @@ impl SegmentAllocator {
         self.free
             .pop()
             .or_else(|| loop {
+                debug!("Allocate segment by bump pointer");
                 let addr = self.offset.load(Relaxed);
                 let new_addr = addr + SEGMENT_SIZE;
-                if addr > self.limit {
+                if new_addr > self.limit {
                     return None;
                 } else {
                     if self.offset.compare_and_swap(addr, new_addr, Relaxed) == addr {
