@@ -39,7 +39,7 @@ pub fn cell_rw() {
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id1),
+        header: CellHeader::new(schema.id, &id1),
         data,
     };
     let chunks = Chunks::new(
@@ -67,12 +67,11 @@ pub fn cell_rw() {
     );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id2),
+        header: CellHeader::new(schema.id, &id2),
         data,
     };
     let header = chunks.write_cell(&mut cell).unwrap();
     let cell_2_ptr = chunks.address_of(&Id::from_header(&header));
-    assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);
@@ -94,7 +93,7 @@ pub fn cell_rw() {
     );
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id2),
+        header: CellHeader::new(schema.id, &id2),
         data,
     };
     let header = chunks.update_cell(&mut cell).unwrap();

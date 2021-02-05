@@ -23,8 +23,6 @@ pub struct CellHeader {
     pub schema: u32,
     pub partition: u64,
     pub hash: u64,
-    // this shall be calculated from entry header
-    pub size: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Eq, PartialEq)]
@@ -51,11 +49,10 @@ pub enum ReadError {
 }
 
 impl CellHeader {
-    pub fn new(size: u32, schema: u32, id: &Id) -> CellHeader {
+    pub fn new(schema: u32, id: &Id) -> CellHeader {
         let now = clock::now();
         CellHeader {
             version: 1,
-            size,
             schema,
             timestamp: now,
             partition: id.higher,
@@ -89,7 +86,7 @@ def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor
 impl OwnedCell {
     pub fn new_with_id(schema_id: u32, id: &Id, value: OwnedValue) -> Self {
         Self {
-            header: CellHeader::new(0, schema_id, id),
+            header: CellHeader::new(schema_id, id),
             data: value,
         }
     }
@@ -136,6 +133,7 @@ impl OwnedCell {
                 &mut instructions,
             )?;
         }
+        debug_assert_ne!(offset, 0);
         let entry_body_size = offset + CELL_HEADER_SIZE;
         let len_bytes = Entry::count_len_bytes(entry_body_size as u32);
         let total_size = Entry::size(len_bytes, entry_body_size as u32);
@@ -143,7 +141,6 @@ impl OwnedCell {
             return Err(WriteError::CellIsTooLarge(total_size as usize));
         }
         let addr_opt = chunk.try_acquire(total_size);
-        self.header.size = total_size as u32;
         self.header.version += 1;
         match addr_opt {
             None => {
@@ -351,7 +348,6 @@ pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &EntryHead
         schema: cursor.read_u32::<Endian>().unwrap(),
         partition: cursor.read_u64::<Endian>().unwrap(),
         hash: cursor.read_u64::<Endian>().unwrap(),
-        size: entry_header.content_length - CELL_HEADER_SIZE_U32,
     };
     release_cursor(cursor);
     return header;

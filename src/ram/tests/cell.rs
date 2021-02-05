@@ -30,14 +30,13 @@ pub fn cell_rw() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id1),
+        header: CellHeader::new(schema.id, &id1),
         data,
     };
     let mut loc = chunk.write_cell_to_chunk(&mut cell);
     let cell_1_ptr = loc.unwrap().0;
     {
         let (stored_cell, _) = SharedCellData::from_chunk_raw(cell_1_ptr, &chunk).unwrap();
-        assert_eq!(stored_cell.header.size, 24);
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "Jack");
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
@@ -48,13 +47,11 @@ pub fn cell_rw() {
         name: "John"
     };
     cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id2),
+        header: CellHeader::new(schema.id, &id2),
         data,
     };
     loc = chunk.write_cell_to_chunk(&mut cell);
     let cell_2_ptr = loc.unwrap().0;
-
-    assert_eq!(cell_2_ptr, cell_1_ptr + cell.header.size as usize);
     {
         let stored_cell = SharedCellData::from_chunk_raw(cell_2_ptr, &chunk)
             .unwrap()
@@ -97,7 +94,7 @@ pub fn dynamic() {
     let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
     chunk.meta.schemas.new_schema(schema.clone());
     let mut cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id1),
+        header: CellHeader::new(schema.id, &id1),
         data,
     };
     let mut loc = chunk.write_cell_to_chunk(&mut cell);
@@ -111,7 +108,6 @@ pub fn dynamic() {
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &70);
         assert_eq!(stored_cell.data["year"].u16().unwrap(), &2010);
         assert_eq!(stored_cell.data["major"].string().unwrap(), "CS");
-        assert!(stored_cell.header.size > (4 + CELL_HEADER_SIZE) as u32);
     }
 
     data_map = types::OwnedMap::new();
@@ -120,7 +116,7 @@ pub fn dynamic() {
     data_map.insert("name", OwnedValue::String(String::from("John")));
     data = OwnedValue::Map(data_map);
     cell = OwnedCell {
-        header: CellHeader::new(0, schema.id, &id2),
+        header: CellHeader::new(schema.id, &id2),
         data,
     };
     loc = chunk.write_cell_to_chunk(&mut cell);

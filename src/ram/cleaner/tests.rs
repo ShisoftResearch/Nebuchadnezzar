@@ -18,7 +18,7 @@ const MAX_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 fn default_cell(id: &Id) -> OwnedCell {
     let data: Vec<_> = std::iter::repeat(id.lower as u8).take(DATA_SIZE).collect();
     OwnedCell {
-        header: CellHeader::new(0, 0, id),
+        header: CellHeader::new(0, id),
         data: data_map_value!(id: id.lower as i32, data: data),
     }
 }
