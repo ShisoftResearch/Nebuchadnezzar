@@ -64,86 +64,73 @@ impl CompactCleaner {
             "Segment {} from chunk {}. Total size {} bytes for new segment.",
             seg.id, chunk.id, live_size
         );
-        let new_seg = chunk
-            .allocator
-            .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
-            .expect("No space left during compact");
-        let seg_addr = new_seg.addr;
-        new_seg
-            .append_header
-            .store(seg_addr + live_size, Ordering::Relaxed);
-        let new_seg_id = new_seg.id as usize;
-        // Put the segment into the chunk right after it was allocated *BEFORE* any cell have been moved on it.
-        chunk.put_segment(new_seg);
-        let new_seg = chunk.segs.get(&new_seg_id).unwrap();
+        let seg_addr = seg.addr;
         let mut cursor = seg_addr;
+        // Compact in place
         entries
             .into_iter()
-            .map(|e: Entry| {
-                let entry_size = e.meta.entry_size;
-                let entry_pos = e.meta.entry_pos;
-                trace!(
-                    "Memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
-                    entry_size,
-                    entry_pos,
-                    cursor,
-                    seg_addr + live_size,
-                    seg_addr,
-                    live_size,
-                    e.content
-                );
-                let result = (e, cursor);
-                debug_assert!(cursor + entry_size < new_seg.bound);
-                debug_assert!(entry_pos + entry_size < seg.bound);
-                unsafe {
-                    libc::memcpy(
-                        cursor as *mut libc::c_void,
-                        entry_pos as *mut libc::c_void,
+            .for_each(|entry: Entry| {
+                let entry_size = entry.meta.entry_size;
+                let entry_pos = entry.meta.entry_pos;
+                if cursor != entry_pos {
+                    // Need to move
+                    let cell_migration = if entry.meta.entry_header.entry_type == EntryType::CELL {
+                        // Is cell
+                        let header = entry.content.as_cell_header();
+                        trace!(
+                            "Acquiring cell guard for update on compact {:?}",
+                            header.id()
+                        );
+                        Some(chunk.cell_index.lock(header.hash as usize))
+                    } else {
+                        None
+                    };
+                    trace!(
+                        "Memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
                         entry_size,
+                        entry_pos,
+                        cursor,
+                        seg_addr + live_size,
+                        seg_addr,
+                        live_size,
+                        entry.content
                     );
+                    unsafe {
+                        libc::memcpy(
+                            cursor as *mut libc::c_void,
+                            entry_pos as *mut libc::c_void,
+                            entry_size,
+                        );
+                    }
+                    if let Some(cell_migrating) = cell_migration {
+                        let old_addr = entry_pos;
+                        let new_addr = cursor;
+                        if let Some(mut cell_guard)  = cell_migrating {
+                            if *cell_guard == old_addr {
+                                *cell_guard = new_addr;
+                            } else {
+                                trace!(
+                                    "Cell {:?} address {} have been changed to {} on relocating on compact",
+                                    entry.content,
+                                    old_addr,
+                                    *cell_guard
+                                );
+                                drop(cell_guard);
+                                chunk.mark_dead_entry_with_seg(new_addr, seg);
+                            }
+                        } else {
+                            trace!(
+                                "Cell {:?} address {} have been remove during compact",
+                                entry.content,
+                                old_addr
+                            );
+                            let _ = chunk.put_tombstone_by_cell_loc(new_addr);
+                        }
+                    }
                 }
                 cursor += entry_size;
-                return result;
-            })
-            .filter(|pair| pair.0.meta.entry_header.entry_type == EntryType::CELL)
-            .for_each(|(entry, new_addr)| {
-                let header = entry.content.as_cell_header();
-                trace!(
-                    "Acquiring cell guard for update on compact {:?}",
-                    header.id()
-                );
-                #[cfg(feature = "fast_map")]
-                let index = chunk.cell_index.lock(header.hash as usize);
-                #[cfg(feature = "slow_map")]
-                let index = chunk.index.get_mut(&header.hash);
-
-                let old_addr = entry.meta.entry_pos;
-                if let Some(mut cell_guard) = index {
-                    if *cell_guard == old_addr {
-                        *cell_guard = new_addr;
-                    } else {
-                        trace!(
-                            "Cell {:?} address {} have been changed to {} on relocating on compact",
-                            entry.content,
-                            old_addr,
-                            *cell_guard
-                        );
-                        drop(cell_guard);
-                        chunk.mark_dead_entry_with_seg(new_addr, &new_seg);
-                    }
-                } else {
-                    trace!(
-                        "Cell {:?} address {} have been remove during compact",
-                        entry.content,
-                        old_addr
-                    );
-                    let _ = chunk.put_tombstone_by_cell_loc(new_addr);
-                }
             });
-        new_seg.shrink(cursor - seg_addr);
-        chunk.remove_segment(seg.id);
-        seg.mem_drop(chunk);
-
+        seg.shrink(cursor - seg_addr);
         let space_cleaned = seg.used_spaces() as usize - live_size;
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {}",

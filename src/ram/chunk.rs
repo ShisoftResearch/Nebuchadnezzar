@@ -568,7 +568,7 @@ impl Chunk {
     // make the changes in corresponding segments.
     // Because calculate segment from location is computation intensive, it have to be done lazily
     #[inline]
-    pub fn mark_dead_entry_with_seg(&self, addr: usize, seg: &MapNodeRef<Segment>) {
+    pub fn mark_dead_entry_with_seg(&self, addr: usize, seg: &Segment) {
         let (entry, _) = Entry::decode_from(addr, |_, _| {});
         seg.dead_space
             .fetch_add(entry.content_length, Ordering::Relaxed);
