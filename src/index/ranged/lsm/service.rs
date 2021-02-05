@@ -185,7 +185,11 @@ impl Service for LSMTreeService {
                     break;
                 }
             }
-            let next = mem::take(&mut tree_cursor.current.map(|(_, k)| k));
+            let mut next = tree_cursor.current.as_ref().map(|(_, k)| k.clone());
+            // Skip next duplicates
+            while next.is_some() && next.as_ref().map(|k| k.id()).as_ref() == buffer.last() {
+                next = tree_cursor.next();
+            }
             let lsm_cursor = ServBlock { buffer, next };
             OpResult::Successful(lsm_cursor)
         })
