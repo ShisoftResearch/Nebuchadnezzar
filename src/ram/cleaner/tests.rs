@@ -45,7 +45,7 @@ pub fn full_clean_cycle() {
     schemas.new_schema(schema);
     let chunks = Chunks::new(
         1,                    // single chunk
-        MAX_SEGMENT_SIZE * 2, // chunk two segments
+        MAX_SEGMENT_SIZE * 3, // chunk three segments
         Arc::new(ServerMeta { schemas }),
         None,
         None,
