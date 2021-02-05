@@ -126,11 +126,10 @@ impl IndexBuilder {
     pub async fn new(
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
-        neb_client: &Arc<AsyncClient>,
     ) -> Self {
         Self {
             clients: Arc::new(IndexerClients {
-                ranged_client: RangedQueryClient::new(conshash, raft_client, neb_client).await,
+                ranged_client: RangedQueryClient::new(conshash, raft_client).await,
             }),
         }
     }

@@ -1,30 +1,24 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
 use crate::index::EntryKey;
-use crate::ram::cell::Cell;
-use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
 use crate::{
     index::ranged::{
         client::RangedQueryClient,
         trees::{max_entry_key, min_entry_key},
     },
-    ram::cell::OwnedCell,
 };
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
-use std::{mem, time::Duration};
-
-type CellBlock = Vec<Option<IndexedCell>>;
-pub type IndexedCell = (Id, Result<OwnedCell, ReadError>);
+use std::time::Duration;
 
 pub struct ClientCursor {
-    cell_block: CellBlock,
+    pub ids: Vec<Id>,
     next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
     ordering: Ordering,
     tree_key: EntryKey,
-    pos: usize,
+    pub pos: usize,
     buffer_size: u16,
 }
 
@@ -37,23 +31,16 @@ impl ClientCursor {
         buffer_size: u16,
     ) -> Result<Self, RPCError> {
         trace!(
-            "Client cursor created with buffer next {:?}, tree key {:?}",
+            "Client cursor created with buffer next {:?}, tree key {:?}, block keys {:?}",
             block.next,
-            tree_key
+            tree_key,
+            block.buffer
         );
         let next = block.next;
-        let ids = block.buffer.clone();
-        let cell_block = query_client
-            .neb_client
-            .read_all_cells(block.buffer)
-            .await?
-            .into_iter()
-            .zip(ids)
-            .map(|(cell_res, id)| Some((id, cell_res)))
-            .collect();
+        let ids = block.buffer;
         Ok(Self {
+            ids,
             query_client,
-            cell_block,
             tree_key,
             ordering,
             next,
@@ -62,15 +49,16 @@ impl ClientCursor {
         })
     }
 
-    pub async fn next(&mut self) -> Result<Option<IndexedCell>, RPCError> {
+    pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
         let mut res = None;
-        if self.pos < self.cell_block.len() {
-            res = Some(mem::take(&mut self.cell_block[self.pos]).unwrap());
+        if self.pos < self.ids.len() {
+            res = Some(self.ids[self.pos]);
             self.pos += 1;
-            if self.pos < self.cell_block.len() {
+            if self.pos < self.ids.len() {
                 return Ok(res);
             }
         }
+        let current_key = if self.pos == 0 { None } else { self.ids.get(self.pos - 1) };
         let next_key = if let Some(key) = &self.next {
             // Have next, use it
             key
@@ -80,7 +68,7 @@ impl ClientCursor {
             self.refill_by_next_tree().await?;
             return Ok(res);
         };
-        trace!("Buffer all used, refilling using key {:?}", next_key);
+        trace!("Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}", next_key, current_key, next_key.id());
         let next_cursor = RangedQueryClient::seek(
             &self.query_client,
             next_key,
@@ -91,14 +79,14 @@ impl ClientCursor {
         if let Some(cursor) = next_cursor {
             *self = cursor;
         } else {
-            self.cell_block = vec![];
+            self.ids = vec![];
         }
         return Ok(res);
     }
 
-    pub fn current(&self) -> Option<&IndexedCell> {
-        match self.cell_block.get(self.pos) {
-            Some(Some(cell)) => Some(cell),
+    pub fn current(&self) -> Option<&Id> {
+        match self.ids.get(self.pos) {
+            Some(id ) => Some(id),
             _ => None,
         }
     }
@@ -139,7 +127,7 @@ impl ClientCursor {
                         if block.buffer.is_empty() {
                             // Clear, this will ensure the cursor returns 0
                             debug!("Tree refill seek returns empty block");
-                            self.cell_block.clear();
+                            self.ids.clear();
                         } else {
                             debug!(
                                 "Tree refill seek returns block sized {}",
