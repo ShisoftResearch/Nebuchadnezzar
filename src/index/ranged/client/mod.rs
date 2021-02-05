@@ -22,20 +22,17 @@ pub struct RangedQueryClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
     placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
-    neb_client: Arc<AsyncClient>,
 }
 
 impl RangedQueryClient {
     pub async fn new(
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
-        neb_client: &Arc<AsyncClient>,
     ) -> Self {
         let sm = SMClient::new(crate::index::ranged::sm::DEFAULT_SM_ID, raft_client);
         Self {
             conshash: conshash.clone(),
             sm: Arc::new(sm),
-            neb_client: neb_client.clone(),
             placement: RwLock::new(BTreeMap::new()),
         }
     }

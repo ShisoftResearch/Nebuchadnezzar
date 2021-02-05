@@ -11,10 +11,8 @@ mod tests {
     use crate::client::*;
     use crate::index::ranged::lsm::btree;
     use crate::index::EntryKey;
-    use crate::ram::cell::*;
     use crate::ram::schema::*;
     use crate::ram::types::Id;
-    use crate::ram::types::*;
     use crate::server::*;
     use futures::stream::FuturesUnordered;
     use itertools::Itertools;
@@ -53,7 +51,7 @@ mod tests {
             .unwrap(),
         );
         let index_client = Arc::new(
-            client::RangedQueryClient::new(&server.consh, &server.raft_client, &client).await,
+            client::RangedQueryClient::new(&server.consh, &server.raft_client).await,
         );
         info!("Tree stat {:?}", index_client.tree_stats().await.unwrap());
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
@@ -73,33 +71,15 @@ mod tests {
         info!("Adding insertion tasks");
         for i in nums_2 {
             let index_client = index_client.clone();
-            let client = client.clone();
             futs.push(tokio::spawn(async move {
                 let id = Id::new(1, i as u64);
                 let key = EntryKey::from_id(&id);
-                let mut data_map = OwnedMap::new();
-                data_map.insert("data", OwnedValue::U64(i as u64));
-                let cell = OwnedCell::new_with_id(11, &id, OwnedValue::Map(data_map));
-                client.write_cell(cell).await.unwrap().unwrap();
                 index_client.insert(&key).await
             }));
         }
         info!("All tasks queued, waiting for finish");
         while let Some(result) = futs.next().await {
             assert!(result.unwrap().unwrap(), "Insertion return false");
-        }
-        info!("Verifiying insertion");
-        for i in &nums {
-            let id = Id::new(1, *i as u64);
-            let cell_res = client.read_cell(id).await.unwrap();
-            match cell_res {
-                Ok(cell) => {
-                    assert_eq!(*cell.data["data"].u64().unwrap(), *i as u64);
-                }
-                Err(e) => {
-                    panic!("Expecting cell, found error {:?}", e);
-                }
-            }
         }
         info!("All keys inserted. The background task should merging trees. Doing searches.");
         let mut futs = FuturesUnordered::new();
@@ -114,7 +94,7 @@ mod tests {
                         .await
                         .unwrap()
                         .unwrap();
-                assert_eq!(id, rt_cursor.current().unwrap().0, "at {}", i);
+                assert_eq!(&id, rt_cursor.current().unwrap(), "at {}", i);
                 trace!("Id at {}, index {} have been checked", num, i);
             }));
         }
@@ -128,19 +108,6 @@ mod tests {
             client.count().await.unwrap(),
             index_client.tree_stats().await.unwrap()
         );
-        info!("Verifiying insertion round 2");
-        for i in &nums {
-            let id = Id::new(1, *i as u64);
-            let cell_res = client.read_cell(id).await.unwrap();
-            match cell_res {
-                Ok(cell) => {
-                    assert_eq!(*cell.data["data"].u64().unwrap(), *i as u64);
-                }
-                Err(e) => {
-                    panic!("Expecting cell at round 2, found error {:?}", e);
-                }
-            }
-        }
         info!("Scanning forward...");
         let mut rt_cursor = client::RangedQueryClient::seek(
             &index_client,
@@ -153,9 +120,9 @@ mod tests {
         .unwrap();
         for num in &nums {
             let id = Id::new(1, *num as u64);
-            let current = rt_cursor.current().expect(&format!("Checking {}", num)).0;
+            let current = rt_cursor.current().expect(&format!("Checking {}", num));
             assert_eq!(
-                id,
+                &id,
                 current,
                 "Expecting {:?}, key {:?}, got {:?}",
                 id,
@@ -172,12 +139,12 @@ mod tests {
         assert!(
             end_of_list.is_none(),
             "End of the list have id {:?}",
-            end_of_list.unwrap().0
+            end_of_list.unwrap()
         );
         assert!(
             end_of_list.is_none(),
             "After end of the list have id {:?}",
-            end_of_list.unwrap().0
+            end_of_list.unwrap()
         );
         debug!("All check pased, waiting for 10 secs for statistics");
         tokio::time::sleep(Duration::from_secs(10)).await;

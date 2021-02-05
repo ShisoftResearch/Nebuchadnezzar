@@ -141,7 +141,7 @@ impl NebServer {
         );
         let index_builder = if opts.index_enabled {
             Some(Arc::new(
-                IndexBuilder::new(&conshasing, &raft_client, &neb_client).await,
+                IndexBuilder::new(&conshasing, &raft_client).await,
             ))
         } else {
             None

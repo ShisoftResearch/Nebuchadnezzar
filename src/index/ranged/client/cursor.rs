@@ -1,25 +1,19 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
 use crate::index::EntryKey;
-use crate::ram::cell::Cell;
-use crate::ram::cell::ReadError;
 use crate::ram::types::Id;
 use crate::{
     index::ranged::{
         client::RangedQueryClient,
         trees::{max_entry_key, min_entry_key},
     },
-    ram::cell::OwnedCell,
 };
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
 use std::{mem, time::Duration};
 
-type CellBlock = Vec<Option<IndexedCell>>;
-pub type IndexedCell = (Id, Result<OwnedCell, ReadError>);
-
 pub struct ClientCursor {
-    cell_block: CellBlock,
+    ids: Vec<Id>,
     next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
     ordering: Ordering,
@@ -42,18 +36,10 @@ impl ClientCursor {
             tree_key
         );
         let next = block.next;
-        let ids = block.buffer.clone();
-        let cell_block = query_client
-            .neb_client
-            .read_all_cells(block.buffer)
-            .await?
-            .into_iter()
-            .zip(ids)
-            .map(|(cell_res, id)| Some((id, cell_res)))
-            .collect();
+        let ids = block.buffer;
         Ok(Self {
+            ids,
             query_client,
-            cell_block,
             tree_key,
             ordering,
             next,
@@ -62,12 +48,12 @@ impl ClientCursor {
         })
     }
 
-    pub async fn next(&mut self) -> Result<Option<IndexedCell>, RPCError> {
+    pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
         let mut res = None;
-        if self.pos < self.cell_block.len() {
-            res = Some(mem::take(&mut self.cell_block[self.pos]).unwrap());
+        if self.pos < self.ids.len() {
+            res = Some(mem::take(&mut self.ids[self.pos]));
             self.pos += 1;
-            if self.pos < self.cell_block.len() {
+            if self.pos < self.ids.len() {
                 return Ok(res);
             }
         }
@@ -91,14 +77,14 @@ impl ClientCursor {
         if let Some(cursor) = next_cursor {
             *self = cursor;
         } else {
-            self.cell_block = vec![];
+            self.ids = vec![];
         }
         return Ok(res);
     }
 
-    pub fn current(&self) -> Option<&IndexedCell> {
-        match self.cell_block.get(self.pos) {
-            Some(Some(cell)) => Some(cell),
+    pub fn current(&self) -> Option<&Id> {
+        match self.ids.get(self.pos) {
+            Some(id ) => Some(id),
             _ => None,
         }
     }
@@ -139,7 +125,7 @@ impl ClientCursor {
                         if block.buffer.is_empty() {
                             // Clear, this will ensure the cursor returns 0
                             debug!("Tree refill seek returns empty block");
-                            self.cell_block.clear();
+                            self.ids.clear();
                         } else {
                             debug!(
                                 "Tree refill seek returns block sized {}",
