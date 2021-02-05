@@ -71,6 +71,7 @@ impl Chunk {
                 n + 1
             }
         };
+        debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = LinkedObjectMap::with_capacity(upper_power_of_2(num_segs));
         #[cfg(feature = "fast_map")]
         let index = WordMap::with_capacity(64);
@@ -819,7 +820,7 @@ impl Chunks {
     ) -> Arc<Chunks> {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
-        debug!("Creating {} chunks, total {} bytes", count, size);
+        debug!("Creating chunks, count {} , total {} bytes", count, size);
         for i in 0..count {
             let backup_storage = backup_storage
                 .clone()

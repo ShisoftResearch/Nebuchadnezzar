@@ -93,6 +93,8 @@ impl CompactCleaner {
                     e.content
                 );
                 let result = (e, cursor);
+                debug_assert!(cursor + entry_size < new_seg.bound);
+                debug_assert!(entry_pos + entry_size < seg.bound);
                 unsafe {
                     libc::memcpy(
                         cursor as *mut libc::c_void,

@@ -1,3 +1,5 @@
+use std::slice::{from_raw_parts, from_raw_parts_mut};
+
 use crate::ram::cell::CellHeader;
 use crate::ram::tombstone::Tombstone;
 use byteorder::{ByteOrder, LittleEndian};
@@ -17,7 +19,7 @@ pub struct EntryHeader {
     pub content_length: u32,
 }
 
-fn encode_len(len: u32, bytes: &mut [u8]) {
+fn  encode_len(len: u32, bytes: &mut [u8]) {
     LittleEndian::write_u32(bytes, len);
 }
 
@@ -51,14 +53,15 @@ impl Entry {
     ) where
         W: Fn(usize),
     {
-        let entry_type_bit = entry_type.bits;
+        debug_assert!(len_bytes_count.leading_zeros() >= 4);
+        let entry_type_bits = entry_type.bits;
         let len_bytes_count_usize = len_bytes_count as usize;
-        let flag_byte = len_bytes_count | entry_type_bit;
+        let flag_byte = len_bytes_count | entry_type_bits;
         let mut len_bytes = [0u8; 4];
         encode_len(content_len, &mut len_bytes);
         let raw_len_bytes = Box::into_raw(box len_bytes);
         trace!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
-               pos, flag_byte, entry_type_bit, len_bytes_count, content_len);
+               pos, flag_byte, entry_type_bits, len_bytes_count, content_len);
         unsafe {
             // write entry flags
             *(pos as *mut u8) = flag_byte;
@@ -71,8 +74,6 @@ impl Entry {
             );
             pos += len_bytes_count_usize;
             write_content(pos);
-            // release raw pointers
-            Box::from_raw(raw_len_bytes);
         }
     }
 
