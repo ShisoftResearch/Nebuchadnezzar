@@ -1,8 +1,8 @@
 use super::*;
-use crate::ram::cell::*;
 use crate::ram::schema::*;
 use crate::ram::tests::default_fields;
 use crate::ram::types::*;
+use crate::ram::{cell::*, segs::SEGMENT_SIZE};
 use crate::server::transactions;
 use crate::server::*;
 use env_logger;
@@ -14,7 +14,7 @@ pub async fn workspace_wr() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024,
+            memory_size: SEGMENT_SIZE,
             backup_storage: None,
             wal_storage: None,
             index_enabled: false,

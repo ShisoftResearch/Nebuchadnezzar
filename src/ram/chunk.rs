@@ -62,7 +62,9 @@ impl Chunk {
         wal_storage: Option<String>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
-        let bootstrap_segment = allocator.alloc_seg(&backup_storage, &wal_storage).expect(&format!("No space left for first segment in chunk {}", id));
+        let bootstrap_segment = allocator
+            .alloc_seg(&backup_storage, &wal_storage)
+            .expect(&format!("No space left for first segment in chunk {}", id));
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {

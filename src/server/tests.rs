@@ -35,6 +35,7 @@ fn cell_clone(b: &mut Bencher) {
 }
 
 #[tokio::test]
+#[ignore]
 pub async fn init() {
     let _ = env_logger::try_init();
     NebServer::new_from_opts(

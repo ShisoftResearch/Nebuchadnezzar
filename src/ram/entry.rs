@@ -19,7 +19,7 @@ pub struct EntryHeader {
     pub content_length: u32,
 }
 
-fn  encode_len(len: u32, bytes: &mut [u8]) {
+fn encode_len(len: u32, bytes: &mut [u8]) {
     LittleEndian::write_u32(bytes, len);
 }
 
