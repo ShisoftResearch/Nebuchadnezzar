@@ -62,7 +62,7 @@ impl Chunk {
         wal_storage: Option<String>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(size);
-        let bootstrap_segment = allocator.alloc_seg(&backup_storage, &wal_storage).unwrap();
+        let bootstrap_segment = allocator.alloc_seg(&backup_storage, &wal_storage).expect(&format!("No space left for first segment in chunk {}", id));
         let num_segs = {
             let n = size / SEGMENT_SIZE;
             if n > 0 {
@@ -820,6 +820,7 @@ impl Chunks {
     ) -> Arc<Chunks> {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
+        assert!(size >= SEGMENT_SIZE);
         debug!("Creating chunks, count {} , total {} bytes", count, size);
         for i in 0..count {
             let backup_storage = backup_storage

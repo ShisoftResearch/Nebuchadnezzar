@@ -1,6 +1,6 @@
-use crate::ram::types;
+use crate::ram::{segs::SEGMENT_SIZE, types};
 
-pub const CHUNK_SIZE: usize = 2048;
+pub const CHUNK_SIZE: usize = SEGMENT_SIZE;
 
 macro_rules! test_nums {
     (
