@@ -130,6 +130,7 @@ impl CompactCleaner {
                 }
                 cursor += entry_size;
             });
+        seg.append_header.store(cursor, Ordering::Release);
         seg.shrink(cursor - seg_addr);
         let space_cleaned = seg.used_spaces() as usize - live_size;
         debug!(
