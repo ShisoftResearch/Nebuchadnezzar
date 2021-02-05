@@ -118,16 +118,19 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        for num in &nums {
+        for (i, num) in nums.iter().enumerate() {
             let id = Id::new(1, *num as u64);
             let current = rt_cursor.current().expect(&format!("Checking {}", num));
             assert_eq!(
                 &id,
                 current,
-                "Expecting {:?}, key {:?}, got {:?}",
+                "Expecting {:?}, key {:?}, got {:?}, list index {}, cursor ids {:?}, cursor pos {:?}",
                 id,
                 EntryKey::from_id(&id),
-                current
+                current,
+                i,
+                rt_cursor.ids,
+                rt_cursor.pos
             );
             let _ = rt_cursor.next().await.unwrap();
             if num % (test_capacity / 128) == 0 {

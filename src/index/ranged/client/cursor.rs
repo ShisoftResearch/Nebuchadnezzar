@@ -13,12 +13,12 @@ use std::sync::Arc;
 use std::{mem, time::Duration};
 
 pub struct ClientCursor {
-    ids: Vec<Id>,
+    pub ids: Vec<Id>,
     next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
     ordering: Ordering,
     tree_key: EntryKey,
-    pos: usize,
+    pub pos: usize,
     buffer_size: u16,
 }
 
