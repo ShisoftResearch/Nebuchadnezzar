@@ -124,7 +124,7 @@ pub fn full_clean_cycle() {
             compact::CompactCleaner::clean_segment(chunk, &seg);
         });
 
-        assert_eq!(chunk.seg_count(), 2);
+        assert_eq!(chunk.seg_count(), 1);
         assert_eq!(chunk.cell_count(), 8);
 
         // scan segments to check entries
