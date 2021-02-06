@@ -14,7 +14,6 @@ use lightning::map::HashMap;
 use lightning::map::Map;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::mem;
 use std::time::Duration;
 
 pub type IdBlock = [Id; BLOCK_SIZE];

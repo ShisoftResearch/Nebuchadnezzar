@@ -589,15 +589,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62aca2aba2d62b4a7f5b33f3712cb1b0692779a56fb510499d5c0aa594daeaf3"
 
 [[package]]
-name = "hermes"
-version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Hermes.git#200255cbd016bca90961e38d94ceda0298a7db35"
-dependencies = [
- "log",
- "parking_lot 0.11.1",
-]
-
-[[package]]
 name = "hermit-abi"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -792,7 +783,6 @@ dependencies = [
  "env_logger",
  "futures",
  "futures-timer",
- "hermes",
  "itertools",
  "lazy_static",
  "libc",
