@@ -158,7 +158,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "lazy_static",
- "lightning 0.2.0 (git+https://github.com/ShisoftResearch/Lightning.git?branch=develop)",
+ "lightning",
  "log",
  "num_cpus",
  "parking_lot 0.11.1",
@@ -660,6 +660,7 @@ checksum = "1cca32fa0182e8c0989459524dc356b8f2b5c10f1b9eb521b7d182c03cf8c5ff"
 [[package]]
 name = "lightning"
 version = "0.2.0"
+source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#ede5d561f81b26dfd020481ec8edf5f5bf46c1cd"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -672,16 +673,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightning"
+name = "lightning-containers"
 version = "0.2.0"
-source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#ede5d561f81b26dfd020481ec8edf5f5bf46c1cd"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a09f5135396ad8393066578c2d3dcd113f20e1896ab3dcdec8d69dd4211d2182"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "libc",
  "log",
  "num_cpus",
- "parking_lot 0.11.1",
  "seahash",
  "smallvec 1.6.1",
 ]
@@ -786,7 +787,7 @@ dependencies = [
  "itertools",
  "lazy_static",
  "libc",
- "lightning 0.2.0",
+ "lightning-containers",
  "linked-hash-map",
  "log",
  "num_cpus",
