@@ -14,6 +14,7 @@ mod tests {
     use crate::ram::schema::*;
     use crate::ram::types::Id;
     use crate::server::*;
+    use dovahkiin::types::Type;
     use futures::stream::FuturesUnordered;
     use itertools::Itertools;
     use rand::seq::SliceRandom;
@@ -168,10 +169,10 @@ mod tests {
             str_key_field: None,
             fields: Field::new(
                 "*",
-                0,
+                Type::Id,
                 false,
                 false,
-                Some(vec![Field::new("data", 10, false, false, None, vec![])]),
+                Some(vec![Field::new("data", Type::U8, false, false, None, vec![])]),
                 vec![],
             ),
             is_dynamic: false,

@@ -416,13 +416,13 @@ pub async fn server_isolation() {
         str_key_field: None,
         fields: Field::new(
             &String::from("*"),
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![
-                Field::new(&String::from("-id"), 6, false, false, None, vec![]),
-                Field::new(&String::from("-name"), 20, false, false, None, vec![]),
-                Field::new(&String::from("-score"), 10, false, false, None, vec![]),
+                Field::new(&String::from("-id"), Type::U32, false, false, None, vec![]),
+                Field::new(&String::from("-name"), Type::String, false, false, None, vec![]),
+                Field::new(&String::from("-score"), Type::U8, false, false, None, vec![]),
             ]),
             vec![],
         ),

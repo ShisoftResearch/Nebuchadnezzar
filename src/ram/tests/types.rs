@@ -1,3 +1,5 @@
+use dovahkiin::types::Type;
+
 use crate::ram::{segs::SEGMENT_SIZE, types};
 
 pub const CHUNK_SIZE: usize = SEGMENT_SIZE;
@@ -261,15 +263,7 @@ mod string {
 fn array_len_type() {
     assert_eq!(
         types::u32_io::size(0),
-        types::get_size(types::ARRAY_LEN_TYPE_ID, 0)
-    )
-}
-
-#[test]
-fn null_type() {
-    assert_eq!(
-        types::u8_io::size(0),
-        types::get_size(types::NULL_TYPE_ID, 0)
+        types::get_size(types::ARRAY_LEN_TYPE, 0)
     )
 }
 

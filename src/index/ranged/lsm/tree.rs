@@ -374,13 +374,13 @@ fn lsm_treee_schema() -> Schema {
         is_dynamic: false,
         fields: Field::new(
             "*",
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![
                 Field::new(
                     LSM_TREE_LEVELS_NAME,
-                    type_id_of(Type::Id),
+                    Type::Id,
                     false,
                     true,
                     None,
@@ -388,7 +388,7 @@ fn lsm_treee_schema() -> Schema {
                 ),
                 Field::new(
                     LSM_TREE_MIGRATION_NAME,
-                    type_id_of(Type::Id),
+                    Type::Id,
                     true,
                     false,
                     None,

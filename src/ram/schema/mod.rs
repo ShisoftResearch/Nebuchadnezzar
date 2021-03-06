@@ -2,6 +2,7 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
+use dovahkiin::types::Type;
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 
@@ -67,7 +68,7 @@ impl Schema {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Field {
-    pub type_id: u32,
+    pub data_type: Type,
     pub nullable: bool,
     pub is_array: bool,
     pub sub_fields: Option<Vec<Field>>,
@@ -79,7 +80,7 @@ pub struct Field {
 impl Field {
     pub fn new(
         name: &str,
-        type_id: u32,
+        data_type: Type,
         nullable: bool,
         is_array: bool,
         sub_fields: Option<Vec<Field>>,
@@ -88,7 +89,7 @@ impl Field {
         Field {
             name: name.to_string(),
             name_id: types::key_hash(name),
-            type_id,
+            data_type,
             nullable,
             is_array,
             sub_fields,

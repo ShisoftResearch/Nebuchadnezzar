@@ -5,7 +5,6 @@ use crate::ram::types::*;
 use crate::{index::ranged::lsm::btree::level::LEVEL_M, ram::cell::OwnedCell};
 use crossbeam::queue::SegQueue;
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::type_id_of;
 use itertools::Itertools;
 use std::marker::PhantomData;
 use std::{mem, panic};
@@ -412,16 +411,16 @@ pub fn page_schema() -> Schema {
         is_dynamic: false,
         fields: Field::new(
             "*",
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![
-                Field::new(NEXT_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
-                Field::new(PREV_FIELD, type_id_of(Type::Id), false, false, None, vec![]),
+                Field::new(NEXT_FIELD, Type::Id, false, false, None, vec![]),
+                Field::new(PREV_FIELD, Type::Id, false, false, None, vec![]),
                 Field::new(
                     KEYS_FIELD,
                     // The small bytes is for keys
-                    type_id_of(Type::SmallBytes),
+                    Type::SmallBytes,
                     false,
                     true,
                     None,

@@ -157,7 +157,7 @@ impl OwnedCell {
                     EntryType::CELL,
                     entry_body_size as u32,
                     len_bytes,
-                    move |content_addr| {
+                    |content_addr| {
                         // write cell header
                         let header = &self.header;
                         let mut cursor = addr_to_header_cursor(content_addr);

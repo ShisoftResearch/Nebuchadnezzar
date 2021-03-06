@@ -2,7 +2,7 @@ use itertools::Itertools;
 
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
-use crate::ram::types::{type_id_of, u32_io, u8_io, SharedMap, SharedValue, Type};
+use crate::ram::types::{u32_io, bool_io, SharedMap, SharedValue, Type};
 
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
@@ -11,9 +11,9 @@ use std::collections::HashMap;
 fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedValue, usize) {
     let mut ptr = ptr;
     if field.nullable {
-        let null_byte = *u8_io::read(ptr);
+        let null_byte = *bool_io::read(ptr);
         ptr += 1;
-        if null_byte == 1 {
+        if null_byte {
             return (SharedValue::Null, ptr);
         }
     }
@@ -26,11 +26,11 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
         if field.sub_fields.is_none() {
             // maybe primitive array
             let mut ptr = ptr;
-            let val = types::get_shared_prim_array_val(field.type_id, len as usize, &mut ptr);
+            let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
             if let Some(prim_arr) = val {
                 return (SharedValue::PrimArray(prim_arr), ptr);
             } else {
-                panic!("type cannot been convert to prim array: {}", field.type_id)
+                panic!("type cannot been convert to prim array: {:?}", field.data_type)
             }
         } else {
             let mut vals = Vec::<SharedValue>::new();
@@ -64,8 +64,8 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
         (SharedValue::Map(map), ptr)
     } else {
         (
-            types::get_shared_val(field.type_id, ptr),
-            ptr + types::get_size(field.type_id, ptr),
+            types::get_shared_val(field.data_type, ptr),
+            ptr + types::get_size(field.data_type, ptr),
         )
     }
 }
@@ -82,21 +82,23 @@ pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
     }
 }
 
+const MAP_TYPE_ID: u8 = Type::Map.id();
+
 fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
-    let type_id = types::get_shared_val(type_id_of(Type::U32), *ptr)
-        .u32()
+    let type_id = types::get_shared_val(Type::U8, *ptr)
+        .u8()
         .unwrap();
     let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
-    *ptr += types::u32_io::size(*ptr);
+    *ptr += types::u8_io::size(*ptr);
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
-        let len = types::get_shared_val(type_id_of(Type::U32), *ptr)
+        let len = types::get_shared_val(Type::U32, *ptr)
             .u32()
             .unwrap();
         *ptr += types::u32_io::size(*ptr);
-        if base_type != 0 {
+        if base_type != MAP_TYPE_ID {
             // Primitive array
-            if let Some(prim_arr) = types::get_shared_prim_array_val(base_type, *len as usize, ptr)
+            if let Some(prim_arr) = types::get_shared_prim_array_val(Type::from_id(base_type), *len as usize, ptr)
             {
                 // ptr have been moved by `get_shared_prim_array_val`
                 return SharedValue::PrimArray(prim_arr);
@@ -108,15 +110,15 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
             // ptr have been moved by recursion
             return SharedValue::Array(array);
         }
-    } else if *type_id == 0 {
+    } else if *type_id == MAP_TYPE_ID {
         // Map
-        let len = types::get_shared_val(type_id_of(Type::U32), *ptr)
+        let len = types::get_shared_val(Type::U32, *ptr)
             .u32()
             .unwrap();
         *ptr += types::u32_io::size(*ptr);
         let field_value_pair = (0..*len)
             .map(|_| {
-                let name = types::get_shared_val(type_id_of(Type::String), *ptr)
+                let name = types::get_shared_val(Type::String, *ptr)
                     .string()
                     .unwrap();
                 *ptr += types::string_io::size(*ptr);
@@ -135,8 +137,9 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
     } else if *type_id == NULL_PLACEHOLDER {
         return SharedValue::Null;
     } else {
-        let value = types::get_shared_val(*type_id, *ptr);
-        *ptr += types::get_size(*type_id, *ptr);
+        let ty = Type::from_id(*type_id);
+        let value = types::get_shared_val(ty, *ptr);
+        *ptr += types::get_size(ty, *ptr);
         return value;
     }
 }

@@ -43,7 +43,7 @@ fn hash_index_schema() -> Schema {
         name: HASH_SCHEMA.to_string(),
         key_field: None,
         str_key_field: None,
-        fields: Field::new("*", type_id_of(Type::Id), false, false, None, vec![]),
+        fields: Field::new("*", Type::Id, false, false, None, vec![]),
         is_dynamic: false,
     }
 }

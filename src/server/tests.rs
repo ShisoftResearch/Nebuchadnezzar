@@ -4,7 +4,6 @@ use crate::ram::types::*;
 use crate::server::*;
 use crate::{client, ram::cell::OwnedCell};
 use dovahkiin::types::custom_types::id::Id;
-use dovahkiin::types::type_id_of;
 use futures::stream::FuturesUnordered;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -85,12 +84,12 @@ pub async fn smoke_test() {
         is_dynamic: false,
         fields: Field::new(
             "*",
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![Field::new(
                 DATA,
-                type_id_of(Type::U64),
+                Type::U64,
                 false,
                 false,
                 None,
@@ -176,12 +175,12 @@ pub async fn smoke_test_parallel() {
         is_dynamic: false,
         fields: Field::new(
             "*",
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![
-                Field::new(DATA, type_id_of(Type::U64), false, false, None, vec![]),
-                Field::new(ARRAY, type_id_of(Type::U64), false, true, None, vec![]),
+                Field::new(DATA, Type::U64, false, false, None, vec![]),
+                Field::new(ARRAY, Type::U64, false, true, None, vec![]),
             ]),
             vec![],
         ),
@@ -278,12 +277,12 @@ pub async fn txn() {
         is_dynamic: false,
         fields: Field::new(
             "*",
-            0,
+            Type::Map,
             false,
             false,
             Some(vec![Field::new(
                 DATA,
-                type_id_of(Type::U64),
+                Type::U64,
                 false,
                 false,
                 None,
