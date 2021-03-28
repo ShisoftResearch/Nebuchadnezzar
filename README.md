@@ -11,10 +11,10 @@ Distributed in-memory Key-Value store, optional transaction, made to power the [
 * Rich-typed schema (scalar, array, map, nested, length-variable data types)
 * Hash based low overhead primal key-value operations 
 * Timestamp transactions, read committed
-* Non-blocking LSM-tree (B+ tree based) for range query (comming soon)
+* Non-blocking LSM-tree (B+ tree based) for range query
 
 Nebuchadnezzar (aka Neb) have already been converted from it's former [Clojure version](https://github.com/shisoft/Nebuchadnezzar/tree/clojure-version) and will stay with rust afterwards.  
 
-Copyright © 2019 Shisoft Research
+Copyright © 2021 Shisoft Research
 
 Distributed under the GNU Lesser General Public License v3.0 or any later version.
