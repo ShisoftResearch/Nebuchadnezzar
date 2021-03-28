@@ -58,7 +58,7 @@ pub struct DataManager {
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
     cell_lru: Mutex<LinkedHashMap<Id, i64>>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
-    tnxs_sorted: Mutex<BTreeSet<TxnId>>,
+    txns_sorted: Mutex<BTreeSet<TxnId>>,
     managers: ObjectMap<Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
     cleanup_signal: Arc<AtomicBool>,
@@ -90,7 +90,7 @@ impl DataManager {
             cells: LFMap::with_capacity(256),
             cell_lru: Mutex::new(LinkedHashMap::new()),
             txns: LFMap::with_capacity(128),
-            tnxs_sorted: Mutex::new(BTreeSet::new()),
+            txns_sorted: Mutex::new(BTreeSet::new()),
             managers: ObjectMap::with_capacity(16),
             server: server.clone(),
             cleanup_signal: cleanup_signal.clone(),
@@ -111,14 +111,22 @@ impl DataManager {
         self.server.txn_peer.clock.merge_with(clock);
     }
     fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
-        self.txns.get_or_insert(tid, || {
-            Arc::new(Mutex::new(Transaction {
-                state: TxnState::Started,
-                affected_cells: Vec::new(),
-                last_activity: get_time(),
-                history: BTreeMap::new(),
-            }))
-        })
+        loop {
+            if let Some(txn) = self.txns.get(tid) {
+                return txn;
+            } else {
+                let txn = Arc::new(Mutex::new(Transaction {
+                    state: TxnState::Started,
+                    affected_cells: Vec::new(),
+                    last_activity: get_time(),
+                    history: BTreeMap::new(),
+                }));
+                if self.txns.insert(tid, txn.clone()).is_none() {
+                    self.txns_sorted.lock().insert(tid.clone());
+                    return txn;
+                }
+            }
+        }
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
@@ -206,12 +214,12 @@ impl DataManager {
         if let Some(txn) = self.txns.write(tid) {
             txn.remove();
         }
-        self.tnxs_sorted.lock().remove(tid);
+        self.txns_sorted.lock().remove(tid);
     }
     async fn cell_meta_cleanup(&self) {
         let mut cell_lru = self.cell_lru.lock();
         let oldest_transaction = {
-            self.tnxs_sorted
+            self.txns_sorted
                 .lock()
                 .iter()
                 .next()
