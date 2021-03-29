@@ -388,8 +388,13 @@ impl Service for DataManager {
         }
         for cell_mutex in &cell_mutices {
             let meta = cell_mutex.lock();
-            if tid < meta.read || tid < meta.write {
+            if tid < meta.read {
                 // write too late
+                break;
+            }
+            if tid < meta.write {
+                // Thomas write rule
+                // TODO: Allow transaction to continue but don't write
                 break;
             }
             cell_guards.push(meta);
