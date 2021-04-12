@@ -39,6 +39,8 @@ tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
 chashmap = { version = "2.2.2", optional = true }
+arrow = "3"
+num = "*"
 
 [dev-dependencies]
 env_logger = "*"
