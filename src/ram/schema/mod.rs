@@ -32,6 +32,7 @@ pub enum IndexType {
     Ranged,
     Hashed,
     Vectorized,
+    Statistics
 }
 
 impl Schema {

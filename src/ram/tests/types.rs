@@ -1,5 +1,3 @@
-use dovahkiin::types::Type;
-
 use crate::ram::{segs::SEGMENT_SIZE, types};
 
 pub const CHUNK_SIZE: usize = SEGMENT_SIZE;
