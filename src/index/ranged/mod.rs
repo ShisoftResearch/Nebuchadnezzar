@@ -52,7 +52,7 @@ mod tests {
             .unwrap(),
         );
         let index_client = Arc::new(
-            client::RangedQueryClient::new(&server.consh, &server.raft_client).await,
+            client::RangedQueryClient::new(&server.consh, &server.raft_client),
         );
         info!("Tree stat {:?}", index_client.tree_stats().await.unwrap());
         client.new_schema_with_id(schema()).await.unwrap().unwrap();

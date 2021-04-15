@@ -25,7 +25,7 @@ pub struct RangedQueryClient {
 }
 
 impl RangedQueryClient {
-    pub async fn new(
+    pub fn new(
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
     ) -> Self {

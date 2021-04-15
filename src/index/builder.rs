@@ -1,11 +1,10 @@
-use super::{ranged::client::RangedQueryClient, EntryKey, Feature};
+use super::{EntryKey, Feature, IndexerClients};
 use crate::ram::types::{Id, Value};
 use crate::ram::{
     cell::Cell,
     schema::{Field, IndexType, Schema},
 };
 use crate::{
-    client::AsyncClient,
     ram::cell::{OwnedCell, SharedCell},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
@@ -114,23 +113,17 @@ thread_local! {
     pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), RPCError>>>> = RefCell::new(Vec::new());
 }
 
-struct IndexerClients {
-    ranged_client: RangedQueryClient,
-}
-
 pub struct IndexBuilder {
     clients: Arc<IndexerClients>,
 }
 
 impl IndexBuilder {
-    pub async fn new(
+    pub fn new(
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
     ) -> Self {
         Self {
-            clients: Arc::new(IndexerClients {
-                ranged_client: RangedQueryClient::new(conshash, raft_client).await,
-            }),
+            clients: Arc::new(IndexerClients::new(conshash, raft_client)),
         }
     }
 
@@ -202,10 +195,10 @@ impl IndexBuilder {
             }
         }
         for new_index in index_of_new_index.values() {
-            new_index.insert(&*indexers).await;
+            new_index.insert(&*indexers).await?;
         }
         for old_index in index_of_old_index.values() {
-            old_index.remove(&*indexers).await;
+            old_index.remove(&*indexers).await?;
         }
         Ok(())
     }
@@ -268,6 +261,7 @@ fn probe_field_indices(
                             .map(|vec| IndexComps::Vectorized(vec, array_data_size))
                             .collect(),
                     ),
+                    &IndexType::Statistics => {}
                 }
             }
         } else {
@@ -279,6 +273,7 @@ fn probe_field_indices(
                         value.feature(),
                         value.base_size() as u8,
                     )),
+                    &IndexType::Statistics => {}
                 }
             }
         }

@@ -76,3 +76,28 @@ impl Function for MakeSource {
         }
     }
 }
+
+pub struct TreeLookup {
+
+}
+impl Function for TreeLookup {
+    fn func_type(&self) -> FuncType {
+        FuncType::DataSource
+    }
+    fn data_source(
+        &self,
+        options: &OwnedValue,
+        batch_size: usize,
+        _servers: &Arc<ConsistentHashing>,
+    ) -> Result<Box<dyn DataSource>, String> {
+        if let &OwnedValue::Array(arr) = &options {
+            Ok(Box::new(SourceData {
+                data: arr.clone(),
+                cursor: 0,
+                batch_size,
+            }))
+        } else {
+            return Err(format!("Cannot take value {:?} into data source", options));
+        }
+    }  
+}
