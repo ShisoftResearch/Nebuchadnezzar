@@ -222,14 +222,16 @@ impl SharedCellData {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-            let cell = Self {
-                header,
-                data: reader::read_by_schema(data_ptr, &*schema),
-            };
+            let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
             Ok((cell, schema))
         } else {
             error!("Schema {} does not existed to read", schema_id);
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
+        }
+    }
+    pub fn from_data(header: CellHeader, data: SharedValue) -> Self {
+        Self {
+            header, data
         }
     }
     pub fn id(&self) -> Id {
@@ -260,6 +262,11 @@ impl<'a, T> Deref for SharedData<'a, T> {
 }
 
 impl<'a, T> SharedData<'a, T> {
+    pub fn new(data: T, guard: WordMutexGuard<'a>) -> Self {
+        Self {
+            inner: data, guard
+        }
+    }
     pub fn decompose(self) -> (T, WordMutexGuard<'a>) {
         (self.inner, self.guard)
     }
@@ -269,22 +276,26 @@ impl<'a, T> SharedData<'a, T> {
     pub fn guard(&self) -> &WordMutexGuard {
         &self.guard
     }
+    pub fn into_guard(self) -> WordMutexGuard<'a> {
+        self.guard
+    }
 }
 
 pub type SharedCell<'a> = SharedData<'a, SharedCellData>;
 
 impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
-        ptr: WordMutexGuard<'a>,
+        guard: WordMutexGuard<'a>,
         chunk: &'a Chunk,
-    ) -> Result<(Self, ReadingSchema<'a>), ReadError> {
-        SharedCellData::from_chunk_raw(*ptr, chunk).map(|(data, schema)| {
-            let cell = Self {
-                guard: ptr,
-                inner: data,
-            };
-            (cell, schema)
-        })
+    ) -> Result<(Self, ReadingSchema<'a>), (ReadError, WordMutexGuard<'a>)> {
+        let ptr = *guard;
+        match SharedCellData::from_chunk_raw(ptr, chunk) {
+            Ok((data, schema)) => {
+                let cell = Self { guard, inner: data };
+                Ok((cell, schema))
+            }
+            Err(e) => Err((e, guard)),
+        }
     }
     pub fn select_from_chunk_raw(
         ptr: WordMutexGuard<'a>,

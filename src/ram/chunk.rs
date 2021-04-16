@@ -10,7 +10,7 @@ use crate::{
     ram::cleaner::Cleaner,
 };
 
-use super::schema::Schema;
+use super::{io::reader, schema::Schema};
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
@@ -190,7 +190,9 @@ impl Chunk {
     }
 
     fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
-        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
+        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self)
+            .map(|(c, _)| c)
+            .map_err(|(e, _)| e)
     }
 
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedSelectedValue, ReadError> {
@@ -230,15 +232,16 @@ impl Chunk {
         }
     }
 
-    pub fn ensure_indices(
-        &self,
-        new_cell: &OwnedCell,
-        old_cell: Option<&SharedCell>,
-        schema: &Schema,
-    ) {
+    fn ensure_indices(&self, new_cell: &OwnedCell, old_cell: Option<&SharedCell>, schema: &Schema) {
         if let Some(index_builder) = &self.index_builder {
             let old_indices = old_cell.map(|cell| probe_cell_indices(cell, &*schema));
             index_builder.ensure_indices(new_cell, &*schema, old_indices);
+        }
+    }
+
+    fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
+        if let Some(indexer) = &self.index_builder {
+            indexer.remove_indices(&cell, &*schema)
         }
     }
 
@@ -256,6 +259,29 @@ impl Chunk {
                 }
             }
         }
+    }
+
+    fn remove_scannable(&self, hash: u64, schema: &Schema) {
+        if schema.is_scannable {
+            let schema_id = schema.id as usize;
+            let hash = hash as usize;
+            if let Some(list) = self.schema_cells.get(&schema_id) {
+                list.remove(&hash);
+                return;
+            }
+        }
+    }
+
+    fn remove_scannable_wo_schema(&self, loc: usize) -> Option<(CellHeader, ReadingSchema)> {
+        if let Ok((header, _)) = header_from_chunk_raw(loc) {
+            let schema_id = header.schema;
+            let hash = header.hash;
+            if let Some(schema) = self.meta.schemas.get(&schema_id) {
+                self.remove_scannable(hash, &*schema);
+                return Some((header, schema));
+            }
+        }
+        None
     }
 
     fn ensure_indices_with_res(
@@ -356,7 +382,7 @@ impl Chunk {
                     let loc = *cell_guard;
                     match SharedCell::from_chunk_raw(cell_guard, self) {
                         Ok(cell) => (cell, loc),
-                        Err(e) => return Err(WriteError::ReadError(e)),
+                        Err((e, _)) => return Err(WriteError::ReadError(e)),
                     }
                 } else {
                     return Err(WriteError::CellDoesNotExisted);
@@ -394,9 +420,18 @@ impl Chunk {
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         let hash_key = hash as usize;
         let guard_opt = self.cell_index.lock(hash_key);
-        if let Some(guard) = guard_opt {
+        if let Some(mut guard) = guard_opt {
             let cell_location = *guard;
             self.put_tombstone_by_cell_loc(cell_location)?;
+            if let Some((header, schema)) = self.remove_scannable_wo_schema(cell_location) {
+                if let Some(indexer) = &self.index_builder {
+                    let data = reader::read_by_schema(cell_location, &schema);
+                    let cell_data = SharedCellData::from_data(header, data);
+                    let cell = SharedCell::new(cell_data, guard);
+                    indexer.remove_indices(&cell, &*schema);
+                    guard = cell.into_guard();
+                }
+            }
             guard.remove();
             Ok(())
         } else {
@@ -418,17 +453,16 @@ impl Chunk {
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
-                            if let Some(indexer) = &self.index_builder {
-                                indexer.remove_indices(&cell, &*schema)
-                            }
-                            cell.decompose().1.remove();
+                            self.remove_indices(&cell, &schema);
+                            self.remove_scannable(cell.header.hash, &schema);
+                            cell.into_guard().remove();
                             Ok(())
                         }
                     } else {
                         Err(WriteError::CellDoesNotExisted)
                     }
                 }
-                Err(e) => Err(WriteError::ReadError(e)),
+                Err((e, _)) => Err(WriteError::ReadError(e)),
             }
         } else {
             Err(WriteError::CellDoesNotExisted)
