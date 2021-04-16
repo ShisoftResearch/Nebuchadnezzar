@@ -13,33 +13,21 @@ use crate::{
 use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
-#[cfg(feature = "slow_map")]
-use chashmap::*;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-#[cfg(feature = "fast_map")]
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
-#[cfg(feature = "fast_map")]
 pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
-
-#[cfg(feature = "slow_map")]
-pub type CellReadGuard<'a> = chashmap::ReadGuard<'a, u64, usize>;
-#[cfg(feature = "slow_map")]
-pub type CellWriteGuard<'a> = chashmap::WriteGuard<'a, u64, usize>;
 
 pub type SharedSelectedValue<'a> = SharedData<'a, Vec<SharedValue>>;
 
 pub struct Chunk {
     pub id: usize,
-    #[cfg(feature = "fast_map")]
-    pub cell_index: Arc<WordMap>,
-    pub segs: Arc<LinkedObjectMap<Segment>>,
-    #[cfg(feature = "slow_map")]
-    pub cell_index: Arc<CHashMap<u64, usize>>,
+    pub cell_index: WordMap,
+    pub segs: LinkedObjectMap<Segment>,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -50,6 +38,7 @@ pub struct Chunk {
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
     pub index_builder: Option<Arc<IndexBuilder>>,
+    pub schema_cells: ObjectMap<Arc<LinkedObjectMap<()>>>,
 }
 
 impl Chunk {
@@ -75,14 +64,7 @@ impl Chunk {
         };
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = LinkedObjectMap::with_capacity(upper_power_of_2(num_segs));
-        #[cfg(feature = "fast_map")]
         let index = WordMap::with_capacity(64);
-        #[cfg(feature = "slow_map")]
-        let index = CHashMap::new();
-
-        let segs = Arc::new(segs);
-        let index = Arc::new(index);
-
         let chunk = Chunk {
             id,
             segs,
@@ -97,6 +79,7 @@ impl Chunk {
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()),
+            schema_cells: ObjectMap::with_capacity(16),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -166,10 +149,7 @@ impl Chunk {
     }
 
     pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
-        #[cfg(feature = "fast_map")]
         let guard = self.cell_index.lock(hash as usize);
-        #[cfg(feature = "slow_map")]
-        let guard = self.index.get(&hash);
         match guard {
             Some(index) => {
                 if *index == 0 {
@@ -193,11 +173,7 @@ impl Chunk {
     }
 
     pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
-        #[cfg(feature = "fast_map")]
         let guard = self.cell_index.lock(hash as usize);
-        #[cfg(feature = "slow_map")]
-        let guard = self.index.get_mut(&hash);
-
         match guard {
             Some(index) => {
                 if *index == 0 {
@@ -266,6 +242,22 @@ impl Chunk {
         }
     }
 
+    fn ensure_scannable(&self, hash: u64, schema: &Schema) {
+        if schema.is_scannable {
+            let schema_id = schema.id as usize;
+            let hash = hash as usize;
+            loop {
+                if let Some(list) = self.schema_cells.get(&schema_id) {
+                    list.insert_back(&hash, ());
+                    return;
+                } else {
+                    self.schema_cells
+                        .try_insert(&schema_id, Arc::new(LinkedObjectMap::with_capacity(128)));
+                }
+            }
+        }
+    }
+
     fn ensure_indices_with_res(
         &self,
         cell: &OwnedCell,
@@ -277,7 +269,6 @@ impl Chunk {
         }
     }
 
-    #[cfg(feature = "fast_map")]
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
@@ -285,37 +276,11 @@ impl Chunk {
             Some(mut guard) => {
                 *guard = cell_loc;
                 self.ensure_indices(cell, None, &*schema);
+                self.ensure_scannable(cell.header.hash, &*schema);
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
         Ok(cell.header)
-    }
-
-    #[cfg(feature = "slow_map")]
-    fn write_cell(&self, cell: &mut Cell) -> Result<CellHeader, WriteError> {
-        debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
-        let header = cell.header;
-        let mut new = false;
-        self.index.upsert(
-            header.hash,
-            || {
-                new = true;
-                0
-            },
-            |_| {},
-        );
-        // This one have hazard, only use it in debug
-        if new {
-            debug!("Will insert cell {}", header.hash);
-            let mut guard = self.index.get_mut(&header.hash).unwrap();
-            let loc = cell.write_to_chunk(self).unwrap();
-            *guard = loc;
-            debug!("Cell inserted for {}", header.hash);
-            Ok(header)
-        } else {
-            debug!("Cell already existed {}", header.hash);
-            Err(WriteError::CellAlreadyExisted)
-        }
     }
 
     fn old_index_res<'a>(
@@ -364,18 +329,13 @@ impl Chunk {
                 self.ensure_indices_with_res(cell, old_indices, &*schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
             } else {
-                #[cfg(feature = "fast_map")]
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
-                #[cfg(feature = "slow_map")]
-                let reservation = self.index.insert(hash, new_cell_loc);
                 if let Some(mut guard) = reservation {
                     // New cell
-                    #[cfg(feature = "fast_map")]
-                    {
-                        trace!("Cell {} does not exists, will insert for upsert", hash);
-                        *guard = new_cell_loc;
-                        self.ensure_indices(cell, None, &*schema);
-                    }
+                    trace!("Cell {} does not exists, will insert for upsert", hash);
+                    *guard = new_cell_loc;
+                    self.ensure_indices(cell, None, &*schema);
+                    self.ensure_scannable(cell.header.hash, &*schema);
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -433,17 +393,11 @@ impl Chunk {
 
     fn remove_cell(&self, hash: u64) -> Result<(), WriteError> {
         let hash_key = hash as usize;
-        #[cfg(feature = "fast_map")]
         let guard_opt = self.cell_index.lock(hash_key);
-        #[cfg(feature = "slow_map")]
-        let guard_opt = self.index.remove(&hash);
         if let Some(guard) = guard_opt {
-            #[cfg(feature = "fast_map")]
-            {
-                let cell_location = *guard;
-                self.put_tombstone_by_cell_loc(cell_location)?;
-                guard.remove();
-            }
+            let cell_location = *guard;
+            self.put_tombstone_by_cell_loc(cell_location)?;
+            guard.remove();
             Ok(())
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -454,10 +408,7 @@ impl Chunk {
     where
         P: Fn(&SharedCell) -> bool,
     {
-        #[cfg(feature = "fast_map")]
         let guard = self.cell_index.lock(hash as usize);
-        #[cfg(feature = "slow_map")]
-        let guard = self.index.get(&hash);
         if let Some(guard) = guard {
             let cell_location = *guard;
             match SharedCell::from_chunk_raw(guard, self) {
@@ -467,7 +418,6 @@ impl Chunk {
                         if put_tombstone_result.is_err() {
                             put_tombstone_result
                         } else {
-                            #[cfg(feature = "fast_map")]
                             if let Some(indexer) = &self.index_builder {
                                 indexer.remove_indices(&cell, &*schema)
                             }
@@ -581,12 +531,6 @@ impl Chunk {
         self.mark_dead_entry_with_seg(addr, &seg)
     }
 
-    #[cfg(feature = "slow_map")]
-    pub fn contains_seg(&self, seg_id: u64) -> bool {
-        self.segs.contains_key(&(seg_id as usize))
-    }
-
-    #[cfg(feature = "fast_map")]
     pub fn contains_seg(&self, seg_id: u64) -> bool {
         self.segs.contains_key(&(seg_id as usize))
     }
@@ -728,13 +672,8 @@ impl Chunk {
                             cell_header_from_entry_content_addr(
                                 entry_meta.body_pos, &entry_header);
                         trace!("Cell header read, id is {:?}", cell_header.id());
-
                         let expect = Some(entry_meta.entry_pos);
-                        #[cfg(feature = "slow_map")]
-                        let actual = chunk_index.get(&cell_header.hash).map(|g| *g);
-                        #[cfg(feature = "fast_map")]
                         let actual = chunk_index.get_from_mutex(&(cell_header.hash as usize));
-
                         if expect == actual {
                             trace!(
                                 "Cell entry {:?} is valid", cell_header.id()
@@ -754,12 +693,7 @@ impl Chunk {
                         trace!("Entry at {} is a tombstone", entry_meta.entry_pos);
                         let tombstone =
                             Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-
-                        #[cfg(feature = "slow_map")]
                         let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
-                        #[cfg(feature = "fast_map")]
-                        let contains_seg = chunk_segs.contains_key(&(tombstone.segment_id as usize));
-
                         if contains_seg {
                             trace!("Tomestone entry {:?} - {:?} at {} is valid",
                                    tombstone.partition, tombstone.hash, tombstone.segment_id);
