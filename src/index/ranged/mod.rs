@@ -51,9 +51,10 @@ mod tests {
             .await
             .unwrap(),
         );
-        let index_client = Arc::new(
-            client::RangedQueryClient::new(&server.consh, &server.raft_client),
-        );
+        let index_client = Arc::new(client::RangedQueryClient::new(
+            &server.consh,
+            &server.raft_client,
+        ));
         info!("Tree stat {:?}", index_client.tree_stats().await.unwrap());
         client.new_schema_with_id(schema()).await.unwrap().unwrap();
         let test_capacity = btree::ideal_capacity_from_node_size(btree::level::LEVEL_1) * 3;
@@ -172,11 +173,18 @@ mod tests {
                 Type::Id,
                 false,
                 false,
-                Some(vec![Field::new("data", Type::U8, false, false, None, vec![])]),
+                Some(vec![Field::new(
+                    "data",
+                    Type::U8,
+                    false,
+                    false,
+                    None,
+                    vec![],
+                )]),
                 vec![],
             ),
             is_dynamic: false,
-            is_scannable: false
+            is_scannable: false,
         }
     }
 }

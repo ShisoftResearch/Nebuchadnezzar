@@ -3,16 +3,19 @@ use crate::ram::schema::Field;
 use crate::ram::types;
 use crate::ram::types::{OwnedMap, OwnedValue};
 
-use std::{collections::{HashMap, HashSet}, mem};
+use std::{
+    collections::{HashMap, HashSet},
+    mem,
+};
 
-use dovahkiin::types::{Type, key_hash};
+use dovahkiin::types::{key_hash, Type};
 
 enum InstData<'a> {
     Ref(&'a OwnedValue),
-    Val(OwnedValue)
+    Val(OwnedValue),
 }
 
-impl <'a>InstData<'a> {
+impl<'a> InstData<'a> {
     fn val_ref(&self) -> &OwnedValue {
         match self {
             InstData::Ref(r) => r,
@@ -130,9 +133,7 @@ pub fn plan_write_dynamic_fields<'a>(
                 dynamic_map.get(&id).map(|_| n)
             })
             .collect();
-        if !dynamic_map.is_empty() {
-
-        }
+        if !dynamic_map.is_empty() {}
         plan_write_dynamic_map(offset, &dynamic_names, &dynamic_map, ins)?;
     }
     return Ok(());
@@ -225,14 +226,12 @@ pub fn plan_write_dynamic_value<'a>(
             });
             *offset += array_size;
         }
-        &OwnedValue::Map(map) => {
-            plan_write_dynamic_map(
-                offset, 
-                &map.fields.iter().collect(), 
-                &map.map.iter().collect(), 
-                ins
-            )?
-        }
+        &OwnedValue::Map(map) => plan_write_dynamic_map(
+            offset,
+            &map.fields.iter().collect(),
+            &map.map.iter().collect(),
+            ins,
+        )?,
         &OwnedValue::Null | OwnedValue::NA => {
             // Write a placeholder because mapping required
             ins.push(Instruction {

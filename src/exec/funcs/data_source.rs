@@ -77,9 +77,7 @@ impl Function for MakeSource {
     }
 }
 
-pub struct TreeLookup {
-
-}
+pub struct TreeLookup {}
 
 impl Function for TreeLookup {
     fn func_type(&self) -> FuncType {
@@ -100,5 +98,5 @@ impl Function for TreeLookup {
         } else {
             return Err(format!("Cannot take value {:?} into data source", options));
         }
-    }  
+    }
 }

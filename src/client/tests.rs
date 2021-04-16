@@ -39,7 +39,7 @@ pub async fn general() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
-        is_scannable: false
+        is_scannable: false,
     };
     let client = Arc::new(
         client::AsyncClient::new(
@@ -174,7 +174,7 @@ pub async fn multi_cell_update() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
-        is_scannable: false
+        is_scannable: false,
     };
     let client = Arc::new(
         client::AsyncClient::new(
@@ -265,7 +265,7 @@ pub async fn write_skew() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
-        is_scannable: false
+        is_scannable: false,
     };
     let client = Arc::new(
         client::AsyncClient::new(
@@ -411,7 +411,7 @@ pub async fn server_isolation() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
-        is_scannable: false
+        is_scannable: false,
     };
     let schema2 = Schema {
         id: 1,
@@ -425,13 +425,27 @@ pub async fn server_isolation() {
             false,
             Some(vec![
                 Field::new(&String::from("-id"), Type::U32, false, false, None, vec![]),
-                Field::new(&String::from("-name"), Type::String, false, false, None, vec![]),
-                Field::new(&String::from("-score"), Type::U8, false, false, None, vec![]),
+                Field::new(
+                    &String::from("-name"),
+                    Type::String,
+                    false,
+                    false,
+                    None,
+                    vec![],
+                ),
+                Field::new(
+                    &String::from("-score"),
+                    Type::U8,
+                    false,
+                    false,
+                    None,
+                    vec![],
+                ),
             ]),
             vec![],
         ),
         is_dynamic: false,
-        is_scannable: false
+        is_scannable: false,
     };
 
     client1

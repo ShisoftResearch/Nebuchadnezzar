@@ -1,11 +1,9 @@
 use super::{EntryKey, Feature, IndexerClients};
+use crate::ram::cell::{OwnedCell, SharedCell};
 use crate::ram::types::{Id, Value};
 use crate::ram::{
     cell::Cell,
     schema::{Field, IndexType, Schema},
-};
-use crate::{
-    ram::cell::{OwnedCell, SharedCell},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use bifrost_hasher::hash_str;
@@ -118,10 +116,7 @@ pub struct IndexBuilder {
 }
 
 impl IndexBuilder {
-    pub fn new(
-        conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
-    ) -> Self {
+    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         Self {
             clients: Arc::new(IndexerClients::new(conshash, raft_client)),
         }

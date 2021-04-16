@@ -230,9 +230,7 @@ impl SharedCellData {
         }
     }
     pub fn from_data(header: CellHeader, data: SharedValue) -> Self {
-        Self {
-            header, data
-        }
+        Self { header, data }
     }
     pub fn id(&self) -> Id {
         self.header.id()
@@ -263,9 +261,7 @@ impl<'a, T> Deref for SharedData<'a, T> {
 
 impl<'a, T> SharedData<'a, T> {
     pub fn new(data: T, guard: WordMutexGuard<'a>) -> Self {
-        Self {
-            inner: data, guard
-        }
+        Self { inner: data, guard }
     }
     pub fn decompose(self) -> (T, WordMutexGuard<'a>) {
         (self.inner, self.guard)

@@ -25,10 +25,7 @@ pub struct RangedQueryClient {
 }
 
 impl RangedQueryClient {
-    pub fn new(
-        conshash: &Arc<ConsistentHashing>,
-        raft_client: &Arc<RaftClient>,
-    ) -> Self {
+    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         let sm = SMClient::new(crate::index::ranged::sm::DEFAULT_SM_ID, raft_client);
         Self {
             conshash: conshash.clone(),

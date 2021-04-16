@@ -43,7 +43,7 @@ pub mod utils;
 #[macro_use]
 pub mod ram;
 pub mod client;
-pub mod index;
-pub mod server;
 pub mod exec;
+pub mod index;
 pub mod query;
+pub mod server;

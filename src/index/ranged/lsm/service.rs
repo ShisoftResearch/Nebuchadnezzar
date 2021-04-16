@@ -171,7 +171,7 @@ impl Service for LSMTreeService {
                             if &key < entry {
                                 continue;
                             }
-                        },
+                        }
                         Ordering::Backward => {
                             if &key > entry {
                                 continue;

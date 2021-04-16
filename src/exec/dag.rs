@@ -1,6 +1,6 @@
-use std::rc::Rc;
 use dovahkiin::{expr::SExpr, types::OwnedValue};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::rc::Rc;
 
 use super::*;
 
@@ -19,8 +19,7 @@ pub struct Node {
     expr: DAGExpr,
 }
 
-
 #[derive(Serialize, Deserialize)]
 pub struct DAG {
-    nodes: Vec<Rc<Node>>
+    nodes: Vec<Rc<Node>>,
 }

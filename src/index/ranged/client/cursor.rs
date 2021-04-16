@@ -1,13 +1,11 @@
 use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
+use crate::index::ranged::{
+    client::RangedQueryClient,
+    trees::{max_entry_key, min_entry_key},
+};
 use crate::index::EntryKey;
 use crate::ram::types::Id;
-use crate::{
-    index::ranged::{
-        client::RangedQueryClient,
-        trees::{max_entry_key, min_entry_key},
-    },
-};
 use bifrost::rpc::RPCError;
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,7 +56,11 @@ impl ClientCursor {
                 return Ok(res);
             }
         }
-        let current_key = if self.pos == 0 { None } else { self.ids.get(self.pos - 1) };
+        let current_key = if self.pos == 0 {
+            None
+        } else {
+            self.ids.get(self.pos - 1)
+        };
         let next_key = if let Some(key) = &self.next {
             // Have next, use it
             key
@@ -68,7 +70,12 @@ impl ClientCursor {
             self.refill_by_next_tree().await?;
             return Ok(res);
         };
-        trace!("Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}", next_key, current_key, next_key.id());
+        trace!(
+            "Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}",
+            next_key,
+            current_key,
+            next_key.id()
+        );
         let next_cursor = RangedQueryClient::seek(
             &self.query_client,
             next_key,
@@ -86,7 +93,7 @@ impl ClientCursor {
 
     pub fn current(&self) -> Option<&Id> {
         match self.ids.get(self.pos) {
-            Some(id ) => Some(id),
+            Some(id) => Some(id),
             _ => None,
         }
     }

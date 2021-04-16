@@ -10,19 +10,17 @@ pub struct IndexedDataClient {
 }
 
 pub struct ServerDataClient {
-    server: Arc<NebServer>
+    server: Arc<NebServer>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum DataCursor {
-    ServerChunk(ServerChunkScanCursor)
+    ServerChunk(ServerChunkScanCursor),
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ServerChunkScanCursor {
     server_id: u64,
-    
 }
 
 impl IndexedDataClient {
@@ -52,9 +50,9 @@ impl IndexedDataClient {
 }
 
 impl ServerDataClient {
-    pub fn new(server:  &Arc<NebServer>) -> Self {
+    pub fn new(server: &Arc<NebServer>) -> Self {
         Self {
-            server: server.clone()
+            server: server.clone(),
         }
     }
     pub fn scan_chunks(

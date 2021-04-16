@@ -25,7 +25,7 @@ pub struct Schema {
     pub str_key_field: Option<Vec<String>>,
     pub fields: Field,
     pub is_dynamic: bool,
-    pub is_scannable: bool
+    pub is_scannable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub enum IndexType {
     Ranged,
     Hashed,
     Vectorized,
-    Statistics
+    Statistics,
 }
 
 impl Schema {
@@ -54,7 +54,7 @@ impl Schema {
             str_key_field: key_field,
             fields,
             is_dynamic,
-            is_scannable
+            is_scannable,
         }
     }
     pub fn new_with_id(
