@@ -31,6 +31,7 @@ pub async fn workspace_wr() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
+        is_scannable: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
@@ -169,6 +170,7 @@ pub async fn data_site_wr() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: true,
+        is_scannable: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
@@ -264,6 +266,7 @@ pub async fn multi_transaction() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
+        is_scannable: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
@@ -370,6 +373,7 @@ pub async fn smoke_rw() {
         str_key_field: None,
         fields: default_fields(),
         is_dynamic: false,
+        is_scannable: false
     };
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
