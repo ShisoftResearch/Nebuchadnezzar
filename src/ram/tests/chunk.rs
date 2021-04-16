@@ -27,7 +27,7 @@ pub fn cell_rw() {
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
     let fields = default_fields();
-    let schema = Schema::new("dummy", None, fields, false);
+    let schema = Schema::new("dummy", None, fields, false, false);
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(70));

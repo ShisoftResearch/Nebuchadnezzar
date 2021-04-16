@@ -40,7 +40,7 @@ fn default_fields() -> Field {
 #[test]
 pub fn full_clean_cycle() {
     let _ = env_logger::try_init();
-    let schema = Schema::new("cleaner_test", None, default_fields(), false);
+    let schema = Schema::new("cleaner_test", None, default_fields(), false, false);
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema);
     let chunks = Chunks::new(

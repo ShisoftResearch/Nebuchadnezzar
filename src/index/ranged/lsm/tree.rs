@@ -372,6 +372,7 @@ fn lsm_treee_schema() -> Schema {
         key_field: None,
         str_key_field: None,
         is_dynamic: false,
+        is_scannable: false,
         fields: Field::new(
             "*",
             Type::Map,

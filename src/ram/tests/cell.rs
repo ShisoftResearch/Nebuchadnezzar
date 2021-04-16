@@ -21,6 +21,7 @@ pub fn cell_rw() {
         str_key_field: None,
         fields,
         is_dynamic: false,
+        is_scannable: false
     };
     let mut data = data_map_value! {
         id: 100 as i64,
@@ -83,6 +84,7 @@ pub fn dynamic() {
         str_key_field: None,
         fields,
         is_dynamic: true,
+        is_scannable: true,
     };
     let mut data_map = types::OwnedMap::new();
     data_map.insert("id", OwnedValue::I64(100));

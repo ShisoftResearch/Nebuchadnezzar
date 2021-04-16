@@ -80,6 +80,7 @@ impl Function for MakeSource {
 pub struct TreeLookup {
 
 }
+
 impl Function for TreeLookup {
     fn func_type(&self) -> FuncType {
         FuncType::DataSource

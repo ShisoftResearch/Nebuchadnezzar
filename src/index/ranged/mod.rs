@@ -176,6 +176,7 @@ mod tests {
                 vec![],
             ),
             is_dynamic: false,
+            is_scannable: false
         }
     }
 }

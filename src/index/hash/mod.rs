@@ -45,5 +45,6 @@ fn hash_index_schema() -> Schema {
         str_key_field: None,
         fields: Field::new("*", Type::Id, false, false, None, vec![]),
         is_dynamic: false,
+        is_scannable: false
     }
 }

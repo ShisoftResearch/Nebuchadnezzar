@@ -17,19 +17,21 @@ pub use entry::EntryKey;
 pub use entry::ID_SIZE;
 
 use self::ranged::client::RangedQueryClient;
+
 pub type Feature = [u8; FEATURE_SIZE];
 
-struct IndexerClients {
-    ranged_client: RangedQueryClient,
+
+pub struct IndexerClients {
+  ranged_client: RangedQueryClient,
 }
 
 impl IndexerClients {
-    pub fn new(
-      conshash: &Arc<ConsistentHashing>,
-      raft_client: &Arc<RaftClient>
-    ) -> Self {
-        IndexerClients {
-            ranged_client: RangedQueryClient::new(conshash, raft_client),
-        }
-    }
+  pub fn new(
+    conshash: &Arc<ConsistentHashing>,
+    raft_client: &Arc<RaftClient>
+  ) -> Self {
+      IndexerClients {
+          ranged_client: RangedQueryClient::new(conshash, raft_client),
+      }
+  }
 }

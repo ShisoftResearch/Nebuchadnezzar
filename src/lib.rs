@@ -46,3 +46,4 @@ pub mod client;
 pub mod index;
 pub mod server;
 pub mod exec;
+pub mod query;

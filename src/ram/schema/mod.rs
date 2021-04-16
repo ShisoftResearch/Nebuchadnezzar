@@ -25,6 +25,7 @@ pub struct Schema {
     pub str_key_field: Option<Vec<String>>,
     pub fields: Field,
     pub is_dynamic: bool,
+    pub is_scannable: bool
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,7 @@ impl Schema {
         key_field: Option<Vec<String>>,
         fields: Field,
         is_dynamic: bool,
+        is_scannable: bool,
     ) -> Schema {
         Schema {
             id: 0,
@@ -52,6 +54,7 @@ impl Schema {
             str_key_field: key_field,
             fields,
             is_dynamic,
+            is_scannable
         }
     }
     pub fn new_with_id(
@@ -60,8 +63,9 @@ impl Schema {
         key_field: Option<Vec<String>>,
         fields: Field,
         dynamic: bool,
+        scannable: bool,
     ) -> Schema {
-        let mut schema = Schema::new(name, key_field, fields, dynamic);
+        let mut schema = Schema::new(name, key_field, fields, dynamic, scannable);
         schema.id = id;
         schema
     }
