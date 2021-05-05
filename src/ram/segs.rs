@@ -84,15 +84,15 @@ impl Segment {
     pub fn try_acquire(&self, size: u32) -> Option<usize> {
         let size = size as usize;
         loop {
-            let curr_last = self.append_header.load(Ordering::SeqCst);
+            let curr_last = self.append_header.load(Ordering::Acquire);
             let exp_last = curr_last + size;
             if exp_last > self.bound {
                 return None;
             } else {
                 if self
                     .append_header
-                    .compare_and_swap(curr_last, exp_last, Ordering::SeqCst)
-                    != curr_last
+                    .compare_exchange(curr_last, exp_last, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
                 {
                     continue;
                 } else {
@@ -229,9 +229,10 @@ impl Segment {
     }
 
     pub fn mem_drop(&self, chunk: &Chunk) {
-        if !self
+        if self
             .dropped
-            .compare_and_swap(false, true, Ordering::Relaxed)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
         {
             chunk.allocator.free(self.addr);
         }

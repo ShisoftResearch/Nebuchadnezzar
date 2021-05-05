@@ -38,7 +38,7 @@ pub struct Chunk {
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
     pub index_builder: Option<Arc<IndexBuilder>>,
-    pub schema_cells: ObjectMap<Arc<LinkedObjectMap<()>>>,
+    pub schema_cells: ObjectMap<Arc<LinkedObjectMap<()>>>, // Need to be rebuilt on recovery
 }
 
 impl Chunk {
@@ -78,7 +78,7 @@ impl Chunk {
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
-            alloc_lock: Mutex::new(()),
+            alloc_lock: Mutex::new(()), // TODO: optimize this
             schema_cells: ObjectMap::with_capacity(16),
         };
         chunk.put_segment(bootstrap_segment);
