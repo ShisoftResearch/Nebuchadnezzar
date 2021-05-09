@@ -35,7 +35,6 @@ struct DebugNode {
 }
 
 pub const PAGE_SIZE: usize = 26;
-impl_btree_level!(PAGE_SIZE);
 pub type KeySlice = [EntryKey; PAGE_SIZE];
 pub type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
 pub type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
@@ -321,7 +320,6 @@ fn parallel() {
 }
 
 const TINY_PAGE_SIZE: usize = 5;
-impl_btree_level!(TINY_PAGE_SIZE);
 type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
 type TinyPtrSlice = [NodeCellRef; TINY_PAGE_SIZE + 1];
 type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;

@@ -62,6 +62,18 @@ pub trait Slice<T: Default>: Send + Sync {
     }
 }
 
+impl <T: Default + Send + Sync, const N: usize> Slice<T> for [T; N] {
+    fn as_slice(&mut self) -> &mut [T] {
+        self
+    }
+    fn init() -> Self {
+        unsafe { mem::zeroed() }
+    }
+    fn slice_len() -> usize {
+        N
+    }
+}
+
 pub trait Cursor: Send {
     fn next(&mut self) -> Option<EntryKey>;
     fn current(&self) -> Option<&EntryKey>;

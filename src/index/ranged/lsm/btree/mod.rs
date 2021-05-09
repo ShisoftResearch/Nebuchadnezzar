@@ -462,8 +462,5 @@ impl LevelTree for DummyLevelTree {
     }
 }
 
-impl_slice_ops!([EntryKey; 0], EntryKey, 0);
-impl_slice_ops!([NodeCellRef; 0], NodeCellRef, 0);
-
 #[cfg(test)]
 pub mod test;
