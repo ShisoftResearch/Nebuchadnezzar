@@ -128,8 +128,11 @@ impl IndexBuilder {
         schema: &Schema,
         old_indices: Option<Vec<IndexRes>>,
     ) {
-        let new_indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
+        if schema.is_scannable {
+            self.ensure_scannable(cell, &indexers);
+        }
+        let new_indices = probe_cell_indices(cell, schema);
         let task =
             tokio::spawn(
                 async move { Self::ensure_indices_(new_indices, old_indices, indexers).await },
@@ -139,10 +142,37 @@ impl IndexBuilder {
         });
     }
 
+    fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
+        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+        let indexers = indexers.to_owned();
+        let task = tokio::spawn(async move {
+            indexers.ranged_client.insert(&key).await?;
+            Ok(())
+        });
+        PENDING_INDEX_TASKS.with(|task_list| {
+            task_list.borrow_mut().push(task);
+        });
+    }
+
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
-        let indices = probe_cell_indices(cell, schema);
         let indexers = self.clients.to_owned();
+        if schema.is_scannable {
+            self.remove_scannable(cell, &indexers);
+        }
+        let indices = probe_cell_indices(cell, schema);
         let task = tokio::spawn(async move { Self::remove_indices_(indices, indexers).await });
+        PENDING_INDEX_TASKS.with(|task_list| {
+            task_list.borrow_mut().push(task);
+        });
+    }
+
+    fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
+        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+        let indexers = indexers.to_owned();
+        let task = tokio::spawn(async move {
+            indexers.ranged_client.delete(&key).await?;
+            Ok(())
+        });
         PENDING_INDEX_TASKS.with(|task_list| {
             task_list.borrow_mut().push(task);
         });

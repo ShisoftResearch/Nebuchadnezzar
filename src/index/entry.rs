@@ -25,12 +25,16 @@ impl EntryKey {
     pub fn from_props(id: &Id, feature: &Feature, field: u64, schema_id: u32) -> Self {
         let mut key = Self::new();
         let mut cursor = Cursor::new(&mut key.slice[..]);
-        cursor.write(feature).unwrap();
         cursor.write_u32::<BigEndian>(schema_id).unwrap();
         cursor.write_u32::<BigEndian>(field as u32).unwrap();
+        cursor.write(feature).unwrap();
         cursor.write_u64::<BigEndian>(id.higher).unwrap();
         cursor.write_u64::<BigEndian>(id.lower).unwrap();
         key
+    }
+
+    pub fn for_scannable(id: &Id, schema_id: u32) -> Self {
+        Self::from_props(id, &Default::default(), 0, schema_id)
     }
 
     #[inline(always)]
