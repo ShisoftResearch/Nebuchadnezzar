@@ -143,15 +143,15 @@ impl IndexBuilder {
     }
 
     fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
-        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
-        let indexers = indexers.to_owned();
-        let task = tokio::spawn(async move {
-            indexers.ranged_client.insert(&key).await?;
-            Ok(())
-        });
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
-        });
+        // let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+        // let indexers = indexers.to_owned();
+        // let task = tokio::spawn(async move {
+        //     indexers.ranged_client.insert(&key).await?;
+        //     Ok(())
+        // });
+        // PENDING_INDEX_TASKS.with(|task_list| {
+        //     task_list.borrow_mut().push(task);
+        // });
     }
 
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
@@ -167,15 +167,15 @@ impl IndexBuilder {
     }
 
     fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
-        let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
-        let indexers = indexers.to_owned();
-        let task = tokio::spawn(async move {
-            indexers.ranged_client.delete(&key).await?;
-            Ok(())
-        });
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
-        });
+        // let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
+        // let indexers = indexers.to_owned();
+        // let task = tokio::spawn(async move {
+        //     indexers.ranged_client.delete(&key).await?;
+        //     Ok(())
+        // });
+        // PENDING_INDEX_TASKS.with(|task_list| {
+        //     task_list.borrow_mut().push(task);
+        // });
     }
 
     pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), RPCError>, JoinError>>> {
