@@ -92,7 +92,7 @@ impl Segment {
                 if self
                     .append_header
                     .compare_exchange(curr_last, exp_last, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
+                    .is_err()
                 {
                     continue;
                 } else {
