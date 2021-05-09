@@ -12,7 +12,7 @@ use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::Relaxed,
+    AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*,
 };
 
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
@@ -340,7 +340,7 @@ impl SegmentAllocator {
                     // Check the right boundary
                     return None;
                 } else {
-                    if self.offset.compare_and_swap(addr, new_addr, Relaxed) == addr {
+                    if self.offset.compare_exchange(addr, new_addr, AcqRel, Relaxed).is_ok() {
                         return Some(addr);
                     }
                 }
