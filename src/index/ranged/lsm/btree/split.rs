@@ -34,7 +34,7 @@ where
 // Worst scenario, the will be some node have no key but one ptr
 //  In this scenario, we can split its left hand side node and rebalance the keys
 //  This can potentially produce a quarter filled page, which makes it still valid as a node
-pub fn retain<KS, PS>(tree: &BPlusTree<KS, PS>, mid_key: &EntryKey)
+pub fn retain<KS, PS>(tree: &GenericBPlusTree<KS, PS>, mid_key: &EntryKey)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -43,7 +43,7 @@ where
 }
 
 fn retain_by_node<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
+    tree: &GenericBPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     mid_key: &EntryKey,
     level: usize,

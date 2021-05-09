@@ -402,17 +402,9 @@ fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> OwnedCe
     OwnedCell::new_with_id(*LSM_TREE_SCHEMA_ID, id, OwnedValue::Map(cell_map))
 }
 
-type LevelMTreeKeySlice = [EntryKey; LEVEL_M];
-type LevelMTreePtrSlice = [NodeCellRef; LEVEL_M + 1];
-type LevelMTree = BPlusTree<LevelMTreeKeySlice, LevelMTreePtrSlice>;
-
-type Level0TreeKeySlice = [EntryKey; LEVEL_0];
-type Level0TreePtrSlice = [NodeCellRef; LEVEL_0 + 1];
-type Level0Tree = BPlusTree<Level0TreeKeySlice, Level0TreePtrSlice>;
-
-type Level1TreeKeySlice = [EntryKey; LEVEL_1];
-type Level1TreePtrSlice = [NodeCellRef; LEVEL_1 + 1];
-type Level1Tree = BPlusTree<Level1TreeKeySlice, Level1TreePtrSlice>;
+type LevelMTree = BPlusTree<LEVEL_M>;
+type Level0Tree = BPlusTree<LEVEL_0>;
+type Level1Tree = BPlusTree<LEVEL_1>;
 
 unsafe impl Send for LSMTree {}
 unsafe impl Sync for LSMTree {}

@@ -49,7 +49,7 @@ where
 }
 
 pub fn insert_external_tree_node<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
+    tree: &GenericBPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     parent: &NodeCellRef,
     key: &EntryKey,
@@ -80,7 +80,7 @@ where
 }
 
 pub fn check_root_modification<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
+    tree: &GenericBPlusTree<KS, PS>,
     modification: &Option<NodeSplit<KS, PS>>,
     parent: &NodeCellRef,
 ) -> Option<NodeSplit<KS, PS>>
@@ -112,7 +112,7 @@ where
 }
 
 pub fn insert_to_tree_node<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
+    tree: &GenericBPlusTree<KS, PS>,
     node_ref: &NodeCellRef,
     parent: &NodeCellRef,
     key: &EntryKey,

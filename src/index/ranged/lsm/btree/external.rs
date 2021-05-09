@@ -155,12 +155,12 @@ where
         pos: usize,
         self_ref: &NodeCellRef,
         self_next: &mut NodeWriteGuard<KS, PS>,
-        tree: &BPlusTree<KS, PS>,
+        tree: &GenericBPlusTree<KS, PS>,
     ) -> (NodeCellRef, EntryKey) {
         // cached.dump();
         let keys_1 = &mut self.keys;
         let pivot = self.len / 2;
-        let new_page_id = BPlusTree::<KS, PS>::new_page_id();
+        let new_page_id = GenericBPlusTree::<KS, PS>::new_page_id();
         let mut keys_2 = keys_1.split_at_pivot(pivot, self.len);
         let mut keys_1_len = pivot;
         let mut keys_2_len = self.len - pivot;
@@ -237,7 +237,7 @@ where
     pub fn insert(
         &mut self,
         key: &EntryKey,
-        tree: &BPlusTree<KS, PS>,
+        tree: &GenericBPlusTree<KS, PS>,
         self_ref: &NodeCellRef,
         parent: &NodeCellRef,
     ) -> Option<Option<NodeSplit<KS, PS>>> {
@@ -371,7 +371,7 @@ where
     }
 }
 
-pub fn make_changed<KS, PS>(node: &NodeCellRef, tree: &BPlusTree<KS, PS>)
+pub fn make_changed<KS, PS>(node: &NodeCellRef, tree: &GenericBPlusTree<KS, PS>)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

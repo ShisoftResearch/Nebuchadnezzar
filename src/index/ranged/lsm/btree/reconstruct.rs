@@ -9,7 +9,9 @@ use std::fmt::Debug;
 use std::mem;
 use std::rc::Rc;
 
-pub struct TreeConstructor<KS, PS>
+pub type TreeConstructor<const N: usize> = GenericTreeConstructor<KeySlice<N>, RefSlice<N>>;
+
+pub struct GenericTreeConstructor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -17,13 +19,13 @@ where
     level_guards: Vec<Rc<RefCell<NodeWriteGuard<KS, PS>>>>,
 }
 
-impl<KS, PS> TreeConstructor<KS, PS>
+impl<KS, PS> GenericTreeConstructor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new() -> Self {
-        TreeConstructor {
+        Self {
             level_guards: vec![],
         }
     }
@@ -116,12 +118,12 @@ where
     }
 }
 
-pub async fn reconstruct_from_head_id<KS, PS>(
+pub async fn generic_reconstruct_from_head_id<KS, PS>(
     head_id: Id,
     neb: &AsyncClient,
     deletion: &Arc<DeletionSet>,
     level: usize,
-) -> BPlusTree<KS, PS>
+) -> GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -129,7 +131,7 @@ where
     info!("Reconstructing level tree from head {:?}", head_id);
     let mut len = 0;
     let root = {
-        let mut constructor = TreeConstructor::<KS, PS>::new();
+        let mut constructor = GenericTreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
         let mut id = head_id;
         let mut at_end = false;
@@ -162,7 +164,7 @@ where
         constructor.root()
     };
     info!("Reconstruct tree {:?} completed", head_id);
-    let tree = BPlusTree::from_root(root, head_id, len, deletion);
+    let tree = GenericBPlusTree::<KS, PS>::from_root(root, head_id, len, deletion);
     debug!("Verifying reconstruction at {}", level);
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
@@ -170,7 +172,7 @@ where
     tree
 }
 
-unsafe impl<KS, PS> Send for TreeConstructor<KS, PS>
+unsafe impl<KS, PS> Send for GenericTreeConstructor<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

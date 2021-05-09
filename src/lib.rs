@@ -3,6 +3,7 @@
 #![feature(test)]
 #![feature(async_closure)]
 #![feature(backtrace)]
+#![feature(const_generics, const_evaluatable_checked)]
 
 extern crate static_assertions;
 #[macro_use]

@@ -35,9 +35,7 @@ struct DebugNode {
 }
 
 pub const PAGE_SIZE: usize = 26;
-pub type KeySlice = [EntryKey; PAGE_SIZE];
-pub type PtrSlice = [NodeCellRef; PAGE_SIZE + 1];
-pub type LevelBPlusTree = BPlusTree<KeySlice, PtrSlice>;
+pub type LevelBPlusTree = BPlusTree<PAGE_SIZE>;
 
 pub fn u64_to_slice(n: u64) -> [u8; 8] {
     let mut key_slice = [0u8; 8];
@@ -52,7 +50,7 @@ pub fn u64_to_slice(n: u64) -> [u8; 8] {
 fn node_size() {
     // expecting the node size to be an on-heap pointer plus node type tag, aligned, and one for concurrency control.
     assert_eq!(
-        size_of::<Node<KeySlice, PtrSlice>>(),
+        size_of::<Node<KeySlice<PAGE_SIZE>, RefSlice<PAGE_SIZE>>>(),
         size_of::<usize>() * 3
     );
 }
@@ -320,9 +318,9 @@ fn parallel() {
 }
 
 const TINY_PAGE_SIZE: usize = 5;
-type TinyKeySlice = [EntryKey; TINY_PAGE_SIZE];
-type TinyPtrSlice = [NodeCellRef; TINY_PAGE_SIZE + 1];
-type TinyLevelBPlusTree = BPlusTree<TinyKeySlice, TinyPtrSlice>;
+type TinyLevelBPlusTree = BPlusTree<TINY_PAGE_SIZE>;
+type TinyKeySlice = KeySlice<TINY_PAGE_SIZE>;
+type TinyPtrSlice = RefSlice<TINY_PAGE_SIZE>;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn level_merge() {
@@ -464,7 +462,7 @@ fn reconstruct() {
         .unwrap();
 
     let tree = {
-        let mut reconstructor = TreeConstructor::<TinyKeySlice, TinyPtrSlice>::new();
+        let mut reconstructor = TreeConstructor::<TINY_PAGE_SIZE>::new();
         let new_node = || ExtNode::<TinyKeySlice, TinyPtrSlice>::new(Id::rand(), max_entry_key());
         let mut nodes = vec![];
         let mut last_node = new_node();
@@ -504,7 +502,7 @@ fn reconstruct() {
                 .clone();
             reconstructor.push_extnode(n, first_node);
         });
-        BPlusTree::<TinyKeySlice, TinyPtrSlice>::from_root(
+        BPlusTree::<TINY_PAGE_SIZE>::from_root(
             reconstructor.root(),
             Id::rand(),
             num as usize,

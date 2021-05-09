@@ -29,7 +29,7 @@ where
 fn merge_prune<KS, PS>(
     level: usize,
     node: &NodeCellRef,
-    src_tree: &BPlusTree<KS, PS>,
+    src_tree: &GenericBPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     boundary: &EntryKey,
     deleted: &mut HashSet<EntryKey>,
@@ -329,7 +329,7 @@ where
 
 pub fn level_merge<KS, PS>(
     level: usize,
-    src_tree: &BPlusTree<KS, PS>,
+    src_tree: &GenericBPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     deleted: &mut HashSet<EntryKey>,
     prune: bool,
@@ -346,7 +346,7 @@ where
 
 pub fn merge_with_boundary<KS, PS>(
     level: usize,
-    src_tree: &BPlusTree<KS, PS>,
+    src_tree: &GenericBPlusTree<KS, PS>,
     dest_tree: &dyn LevelTree,
     key_boundary: &EntryKey,
     deleted: &mut HashSet<EntryKey>,

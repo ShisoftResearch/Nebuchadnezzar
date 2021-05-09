@@ -44,14 +44,16 @@ mod search;
 mod split;
 pub mod storage;
 pub mod verification;
-#[macro_use]
-pub mod marco;
 
 // Items can be added in real-time
 // It is not supposed to hold a lot of items when it is actually feasible
 // There will be a limit for maximum items in ths data structure, when the limit exceeds, higher ordering
 // items with number of one page will be merged to next level
-pub struct BPlusTree<KS, PS>
+pub type KeySlice<const N: usize> = [EntryKey; N];
+pub type RefSlice<const N: usize> = [NodeCellRef; N + 1];
+pub type BPlusTree<const N: usize> = GenericBPlusTree<KeySlice<N>, RefSlice<N>>;
+
+pub struct GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -64,14 +66,14 @@ where
     marker: PhantomData<(KS, PS)>,
 }
 
-unsafe impl<KS, PS> Sync for BPlusTree<KS, PS>
+unsafe impl<KS, PS> Sync for GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
 }
 
-unsafe impl<KS, PS> Send for BPlusTree<KS, PS>
+unsafe impl<KS, PS> Send for GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -84,14 +86,14 @@ impl Default for Ordering {
     }
 }
 
-impl<KS, PS> BPlusTree<KS, PS>
+impl<KS, PS> GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
 {
-    pub fn new(deletion: &Arc<DeletionSet>) -> BPlusTree<KS, PS> {
+    pub fn new(deletion: &Arc<DeletionSet>) -> Self {
         trace!("Creating B+ Tree, with capacity {}", KS::slice_len());
-        let mut tree = BPlusTree {
+        let mut tree = Self {
             root: RwLock::new(NodeCellRef::new(Node::<KS, PS>::new(NodeData::None))),
             root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: Id::unit_id(),
@@ -131,7 +133,7 @@ where
         deletion: &Arc<DeletionSet>,
         level: usize,
     ) -> Self {
-        reconstruct::reconstruct_from_head_id(*head_id, neb, deletion, level).await
+        reconstruct::generic_reconstruct_from_head_id(*head_id, neb, deletion, level).await
     }
 
     pub fn from_root(
@@ -140,7 +142,7 @@ where
         len: usize,
         deletion: &Arc<DeletionSet>,
     ) -> Self {
-        BPlusTree {
+        Self {
             root: RwLock::new(root),
             root_versioning: NodeCellRef::default(),
             head_page_id: head_id,
@@ -274,7 +276,7 @@ where
     }
 }
 
-impl<KS, PS> Drop for BPlusTree<KS, PS>
+impl<KS, PS> Drop for GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -323,7 +325,7 @@ pub fn ideal_capacity_from_node_size(size: usize) -> usize {
     size.pow(LEVEL_TREE_DEPTH)
 }
 
-impl<KS, PS> LevelTree for BPlusTree<KS, PS>
+impl<KS, PS> LevelTree for GenericBPlusTree<KS, PS>
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

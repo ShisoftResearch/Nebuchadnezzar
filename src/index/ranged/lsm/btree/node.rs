@@ -584,7 +584,7 @@ where
         }
     }
 
-    pub fn extnode_mut(&mut self, tree: &BPlusTree<KS, PS>) -> &mut ExtNode<KS, PS> {
+    pub fn extnode_mut(&mut self, tree: &GenericBPlusTree<KS, PS>) -> &mut ExtNode<KS, PS> {
         external::make_changed(&self.node_ref, tree);
         self.extnode_mut_no_persist()
     }

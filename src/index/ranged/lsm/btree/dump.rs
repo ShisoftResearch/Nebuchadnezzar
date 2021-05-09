@@ -20,7 +20,7 @@ struct DebugNode {
     bound: String,
 }
 
-pub fn dump_tree<KS, PS>(tree: &BPlusTree<KS, PS>, f: &str)
+pub fn dump_tree<KS, PS>(tree: &GenericBPlusTree<KS, PS>, f: &str)
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

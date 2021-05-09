@@ -146,7 +146,7 @@ where
     }
 }
 
-pub fn is_tree_in_order<KS, PS>(tree: &BPlusTree<KS, PS>, level: usize) -> bool
+pub fn is_tree_in_order<KS, PS>(tree: &GenericBPlusTree<KS, PS>, level: usize) -> bool
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,
@@ -218,7 +218,7 @@ where
     return true;
 }
 
-pub fn tree_has_no_empty_node<KS, PS>(tree: &BPlusTree<KS, PS>) -> bool
+pub fn tree_has_no_empty_node<KS, PS>(tree: &GenericBPlusTree<KS, PS>) -> bool
 where
     KS: Slice<EntryKey> + Debug + 'static,
     PS: Slice<NodeCellRef> + 'static,

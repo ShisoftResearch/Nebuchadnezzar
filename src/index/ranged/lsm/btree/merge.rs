@@ -77,7 +77,7 @@ fn debug_check_serialized(keys: &Vec<EntryKey>) {
 }
 
 pub fn merge_into_tree_node<KS, PS>(
-    tree: &BPlusTree<KS, PS>,
+    tree: &GenericBPlusTree<KS, PS>,
     node: &NodeCellRef,
     _parent: &NodeCellRef,
     keys: Vec<EntryKey>,
