@@ -43,7 +43,7 @@ fn sort(values: &ArrayRef, desc: bool) -> ArrowResult<UInt32Array> {
         descending: desc,
         nulls_first: true,
     };
-    sort_to_indices(values, Some(opt))
+    sort_to_indices(values, Some(opt), None)
 }
 
 pub struct Filter;
