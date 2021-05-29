@@ -22,7 +22,7 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
         trace!("Got array length {}", len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
-        ptr += u32_io::size(ptr);
+        ptr += u32_io::type_size();
         if field.sub_fields.is_none() {
             // maybe primitive array
             let mut ptr = ptr;
@@ -90,11 +90,11 @@ const MAP_TYPE_ID: u8 = Type::Map.id();
 fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
     let type_id = types::get_shared_val(Type::U8, *ptr).u8().unwrap();
     let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
-    *ptr += types::u8_io::size(*ptr);
+    *ptr += types::u8_io::type_size();
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
         let len = types::get_shared_val(Type::U32, *ptr).u32().unwrap();
-        *ptr += types::u32_io::size(*ptr);
+        *ptr += types::u32_io::type_size();
         if base_type != MAP_TYPE_ID {
             // Primitive array
             if let Some(prim_arr) =
@@ -113,11 +113,11 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
     } else if *type_id == MAP_TYPE_ID {
         // Map
         let len = types::get_shared_val(Type::U32, *ptr).u32().unwrap();
-        *ptr += types::u32_io::size(*ptr);
+        *ptr += types::u32_io::type_size();
         let field_value_pair = (0..*len)
             .map(|_| {
                 let name = types::get_shared_val(Type::String, *ptr).string().unwrap();
-                *ptr += types::string_io::size(*ptr);
+                *ptr += types::string_io::size_at(*ptr);
                 let value = read_dynamic_value(ptr);
                 (name, value)
             })

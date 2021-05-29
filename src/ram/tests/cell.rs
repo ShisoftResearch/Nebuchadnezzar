@@ -14,15 +14,14 @@ pub fn cell_rw() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let schema = Schema {
-        id: 1,
-        name: String::from("dummy"),
-        key_field: None,
-        str_key_field: None,
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("dummy"),
+        None,
         fields,
-        is_dynamic: false,
-        is_scannable: false,
-    };
+        false,
+        false,
+    );
     let mut data = data_map_value! {
         id: 100 as i64,
         score: 70 as u64,
@@ -77,15 +76,14 @@ pub fn dynamic() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let schema = Schema {
-        id: 1,
-        name: String::from("dummy"),
-        key_field: None,
-        str_key_field: None,
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("dummy"),
+        None,
         fields,
-        is_dynamic: true,
-        is_scannable: true,
-    };
+        true,
+        true,
+    );
     let mut data_map = types::OwnedMap::new();
     data_map.insert("id", OwnedValue::I64(100));
     data_map.insert("score", OwnedValue::U64(70));

@@ -58,7 +58,7 @@ pub fn plan_write_field<'a>(
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             for val in array {
                 plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
             }
@@ -71,7 +71,7 @@ pub fn plan_write_field<'a>(
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
@@ -153,14 +153,14 @@ pub fn plan_write_dynamic_map<'a>(
         val: InstData::Val(OwnedValue::U8(Type::Map.id())),
         offset: *offset,
     });
-    *offset += types::u8_io::size(0);
+    *offset += types::u8_io::type_size();
     // Write map size
     ins.push(Instruction {
         data_type: types::ARRAY_LEN_TYPE,
         val: InstData::Val(OwnedValue::U32(names.len() as u32)),
         offset: *offset,
     });
-    *offset += types::u32_io::size(0);
+    *offset += types::u32_io::type_size();
     for name in names {
         let id = key_hash(name);
         let name_value = OwnedValue::String((*name).to_owned());
@@ -190,7 +190,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK)), // Only put the mask cause we don't know the type
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let len = array.len();
             // Write array length
             ins.push(Instruction {
@@ -198,7 +198,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
             }
@@ -210,14 +210,14 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK | base_type.id())),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let len = array.len();
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             let array_size = array.size();
             ins.push(Instruction {
                 data_type: base_type,
@@ -239,7 +239,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(NULL_PLACEHOLDER)),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
         }
         _ => {
             // Primitives
@@ -249,7 +249,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ty.id())),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let value_size = types::get_vsize(ty, &value);
             ins.push(Instruction {
                 data_type: ty,

@@ -1,4 +1,4 @@
-use crate::ram::cell::{Cell, CellHeader, ReadError, WriteError};
+use crate::ram::cell::{CellHeader, ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
@@ -38,13 +38,12 @@ impl HashIndexer {
 
 #[allow(dead_code)]
 fn hash_index_schema() -> Schema {
-    Schema {
-        id: *HASH_INDEX_SCHEMA_ID,
-        name: HASH_SCHEMA.to_string(),
-        key_field: None,
-        str_key_field: None,
-        fields: Field::new("*", Type::Id, false, false, None, vec![]),
-        is_dynamic: false,
-        is_scannable: false,
-    }
+    Schema::new_with_id(
+        *HASH_INDEX_SCHEMA_ID,
+        &HASH_SCHEMA.to_string(),
+        None,
+        Field::new("*", Type::Id, false, false, None, vec![]),
+        false,
+        false
+    )
 }

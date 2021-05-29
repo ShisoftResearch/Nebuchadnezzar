@@ -5,6 +5,7 @@ use bifrost_hasher::hash_str;
 use dovahkiin::types::Type;
 use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
+use std::mem;
 
 use super::types;
 use core::borrow::Borrow;
@@ -24,8 +25,9 @@ pub struct Schema {
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
     pub fields: Field,
+    pub static_bound: usize,
     pub is_dynamic: bool,
-    pub is_scannable: bool,
+    pub is_scannable: bool
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -40,10 +42,12 @@ impl Schema {
     pub fn new(
         name: &str,
         key_field: Option<Vec<String>>,
-        fields: Field,
+        mut fields: Field,
         is_dynamic: bool,
         is_scannable: bool,
     ) -> Schema {
+        let mut bound = 0;
+        fields.assign_offsets(&mut bound);
         Schema {
             id: 0,
             name: name.to_string(),
@@ -52,9 +56,11 @@ impl Schema {
                 Some(ref keys) => Some(keys.iter().map(|f| hash_str(f)).collect()), // field list into field ids
             },
             str_key_field: key_field,
+            static_bound: bound,
             fields,
             is_dynamic,
             is_scannable,
+
         }
     }
     pub fn new_with_id(
@@ -80,6 +86,7 @@ pub struct Field {
     pub name: String,
     pub name_id: u64,
     pub indices: Vec<IndexType>,
+    pub offset: Option<usize>,
 }
 
 impl Field {
@@ -99,6 +106,21 @@ impl Field {
             is_array,
             sub_fields,
             indices,
+            offset: None
+        }
+    }
+    fn assign_offsets(&mut self, offset: &mut usize) {
+        self.offset = Some(*offset);
+        if self.nullable {
+            *offset += 1;
+        }
+        if self.is_array {
+            // u32 as indication of the offset to the actual data
+            *offset += mem::size_of::<u32>();
+        } else if let Some(ref mut subs) = self.sub_fields {
+            subs.iter_mut().for_each(|f| f.assign_offsets(offset));
+        } else {
+            *offset += types::size_of_type(self.data_type);
         }
     }
 }
