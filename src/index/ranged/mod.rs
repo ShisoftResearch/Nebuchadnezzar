@@ -163,12 +163,11 @@ mod tests {
     }
 
     fn schema() -> Schema {
-        Schema {
-            id: 11,
-            name: String::from("test"),
-            key_field: None,
-            str_key_field: None,
-            fields: Field::new(
+        Schema::new_with_id(
+            11,
+            &String::from("test"),
+            None,
+            Field::new(
                 "*",
                 Type::Id,
                 false,
@@ -183,8 +182,8 @@ mod tests {
                 )]),
                 vec![],
             ),
-            is_dynamic: false,
-            is_scannable: false,
-        }
+            false,
+            false
+        )
     }
 }

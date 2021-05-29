@@ -60,7 +60,6 @@ impl Schema {
             fields,
             is_dynamic,
             is_scannable,
-
         }
     }
     pub fn new_with_id(

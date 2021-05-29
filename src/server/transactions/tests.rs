@@ -24,15 +24,14 @@ pub async fn workspace_wr() {
         "test",
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
@@ -163,15 +162,14 @@ pub async fn data_site_wr() {
         "test",
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: true,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        true,
+        false,
+    );
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_id = txn.begin().await.unwrap().unwrap();
@@ -259,15 +257,14 @@ pub async fn multi_transaction() {
         "test",
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let txn_1_id = txn.begin().await.unwrap().unwrap();
@@ -366,15 +363,14 @@ pub async fn smoke_rw() {
         "test",
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     server.meta.schemas.new_schema(schema.clone());
     let txn = transactions::new_async_client(&server_addr).await.unwrap();
     let mut data_map_1 = OwnedMap::new();

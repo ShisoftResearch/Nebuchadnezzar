@@ -32,15 +32,14 @@ pub async fn general() {
         &server_group,
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let client = Arc::new(
         client::AsyncClient::new(
             &server.rpc,
@@ -167,15 +166,14 @@ pub async fn multi_cell_update() {
         server_group,
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let client = Arc::new(
         client::AsyncClient::new(
             &server.rpc,
@@ -258,15 +256,14 @@ pub async fn write_skew() {
         server_group,
     )
     .await;
-    let schema = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
     let client = Arc::new(
         client::AsyncClient::new(
             &server.rpc,
@@ -404,21 +401,19 @@ pub async fn server_isolation() {
         .unwrap(),
     );
 
-    let schema1 = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: default_fields(),
-        is_dynamic: false,
-        is_scannable: false,
-    };
-    let schema2 = Schema {
-        id: 1,
-        name: String::from("test"),
-        key_field: None,
-        str_key_field: None,
-        fields: Field::new(
+    let schema1 = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        default_fields(),
+        false,
+        false,
+    );
+    let schema2 = Schema::new_with_id(
+        1,
+        &String::from("test"),
+        None,
+        Field::new(
             &String::from("*"),
             Type::Map,
             false,
@@ -444,10 +439,9 @@ pub async fn server_isolation() {
             ]),
             vec![],
         ),
-        is_dynamic: false,
-        is_scannable: false,
-    };
-
+        false,
+        false,
+    );
     client1
         .new_schema_with_id(schema1.clone())
         .await
