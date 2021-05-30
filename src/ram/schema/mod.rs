@@ -111,7 +111,8 @@ impl Field {
     fn assign_offsets(&mut self, offset: &mut usize) {
         const POINTER_SIZE: usize = mem::size_of::<u32>();
         self.offset = Some(*offset);
-        if self.nullable {
+        let is_field_var = self.is_array || !types::fixed_size(self.data_type);
+        if self.nullable && !is_field_var {
             *offset += 1;
         }
         if self.is_array {
@@ -120,7 +121,7 @@ impl Field {
         } else if let Some(ref mut subs) = self.sub_fields {
             subs.iter_mut().for_each(|f| f.assign_offsets(offset));
         } else {
-            if types::fixed_size(self.data_type) {
+            if is_field_var {
                 *offset += types::size_of_type(self.data_type);
             } else {
                 *offset += POINTER_SIZE;
