@@ -31,11 +31,33 @@ pub struct Instruction<'a> {
 }
 
 pub fn plan_write_field<'a>(
-    mut offset: &mut usize,
+    tail_offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
     mut ins: &mut Vec<Instruction<'a>>,
 ) -> Result<(), WriteError> {
+    let mut schema_offset = field.offset.unwrap();
+    let offset = if let Some(ref subs) = field.sub_fields {
+        if let OwnedValue::Map(map) = value {
+            for sub in subs {
+                let val = map.get_by_key_id(sub.name_id);
+                plan_write_field(tail_offset, &sub, val, &mut ins)?;
+            }
+            return Ok(())
+        } else {
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+        }
+    } else if field.is_array || !types::fixed_size(field.data_type) {
+        // Write position tag for variable sized field
+        ins.push(Instruction {
+            data_type: Type::U32,
+            val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
+            offset: schema_offset
+        });
+        tail_offset
+    } else {
+        &mut schema_offset
+    };
     if field.nullable {
         let null_bit = match value {
             OwnedValue::Null => true,
@@ -60,7 +82,7 @@ pub fn plan_write_field<'a>(
             });
             *offset += types::u32_io::type_size();
             for val in array {
-                plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
+                plan_write_field(offset, &sub_field, val, &mut ins)?;
             }
         } else if let OwnedValue::PrimArray(ref array) = value {
             let len = array.len();
@@ -78,15 +100,6 @@ pub fn plan_write_field<'a>(
                 offset: *offset,
             });
             *offset += size;
-        } else {
-            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
-        }
-    } else if let Some(ref subs) = field.sub_fields {
-        if let OwnedValue::Map(map) = value {
-            for sub in subs {
-                let val = map.get_by_key_id(sub.name_id);
-                plan_write_field(&mut offset, &sub, val, &mut ins)?;
-            }
         } else {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
