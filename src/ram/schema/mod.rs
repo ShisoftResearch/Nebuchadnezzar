@@ -119,7 +119,11 @@ impl Field {
         } else if let Some(ref mut subs) = self.sub_fields {
             subs.iter_mut().for_each(|f| f.assign_offsets(offset));
         } else {
-            *offset += types::size_of_type(self.data_type);
+            if types::fixed_size(self.data_type) {
+                *offset += types::size_of_type(self.data_type);
+            } else {
+                *offset += mem::size_of::<u32>();
+            }
         }
     }
 }
