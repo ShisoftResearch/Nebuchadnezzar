@@ -111,7 +111,7 @@ impl Field {
     fn assign_offsets(&mut self, offset: &mut usize) {
         const POINTER_SIZE: usize = mem::size_of::<u32>();
         self.offset = Some(*offset);
-        let is_field_var = self.is_array || !types::fixed_size(self.data_type);
+        let is_field_var = self.is_var();
         if self.nullable && !is_field_var {
             *offset += 1;
         }
@@ -127,6 +127,9 @@ impl Field {
                 *offset += POINTER_SIZE;
             }
         }
+    }
+    pub fn is_var(&self) -> bool {
+        self.is_array || !types::fixed_size(self.data_type)
     }
 }
 

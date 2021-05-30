@@ -6,28 +6,39 @@ use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
+use std::cmp::max;
 use std::collections::HashMap;
 
-fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedValue, usize) {
-    let mut ptr = ptr;
+fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: bool, tail_ptr: &mut usize) -> (SharedValue, usize) {
+    let field_ptr = if is_var {
+        // Is inside size variable field, read directly from the address
+        base_ptr
+    } else if !field.is_var() {
+        // Is not inside var and field not var, read from the offset in field
+        base_ptr + field.offset.unwrap()
+    } else {
+        // Is not inside var and field is var, read the pointer and direct to it
+        base_ptr + *u32_io::read(base_ptr + field.offset.unwrap()) as usize
+    };
     if field.nullable {
-        let null_byte = *bool_io::read(ptr);
-        ptr += 1;
+        let null_byte = *bool_io::read(field_ptr);
+        field_ptr += 1;
         if null_byte {
-            return (SharedValue::Null, ptr);
+            return (SharedValue::Null, field_ptr);
         }
     }
     if field.is_array {
-        let len = *u32_io::read(ptr);
+        let len = *u32_io::read(field_ptr);
         trace!("Got array length {}", len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
-        ptr += u32_io::type_size();
+        field_ptr += u32_io::type_size();
         if field.sub_fields.is_none() {
             // maybe primitive array
-            let mut ptr = ptr;
+            let mut ptr = field_ptr;
             let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
             if let Some(prim_arr) = val {
+                *tail_ptr = max(*tail_ptr, ptr);
                 return (SharedValue::PrimArray(prim_arr), ptr);
             } else {
                 panic!(
@@ -38,17 +49,19 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
         } else {
             let mut vals = Vec::<SharedValue>::new();
             for _ in 0..len {
-                let (nxt_val, nxt_ptr) = read_field(ptr, &sub_field, None);
-                ptr = nxt_ptr;
+                let (nxt_val, nxt_ptr) = read_field(field_ptr, &sub_field, None, true, tail_ptr);
+                field_ptr = nxt_ptr;
                 vals.push(nxt_val);
             }
-            (SharedValue::Array(vals), ptr)
+            *tail_ptr = max(*tail_ptr, field_ptr);
+            (SharedValue::Array(vals), field_ptr)
         }
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = SharedMap::new();
         let mut selected_pos = 0;
+        let mut ptr = field_ptr;
         for sub in subs {
-            let (cval, cptr) = read_field(ptr, &sub, selected);
+            let (cval, cptr) = read_field(ptr, &sub, selected, is_var, tail_ptr);
             map.insert_key_id(sub.name_id, cval);
             ptr = cptr;
             match selected {
@@ -64,11 +77,14 @@ fn read_field(ptr: usize, field: &Field, selected: Option<&[u64]>) -> (SharedVal
             }
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
+        *tail_ptr = max(*tail_ptr, ptr);
         (SharedValue::Map(map), ptr)
     } else {
+        let next_field = field_ptr + types::get_size(field.data_type, field_ptr);
+        *tail_ptr = max(*tail_ptr, next_field);
         (
-            types::get_shared_val(field.data_type, ptr),
-            ptr + types::get_size(field.data_type, ptr),
+            types::get_shared_val(field.data_type, field_ptr),
+            next_field,
         )
     }
 }
@@ -141,7 +157,8 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
 }
 
 pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
-    let (mut schema_value, tail_ptr) = read_field(ptr, &schema.fields, None);
+    let mut tail_ptr = 0;
+    let (mut schema_value, _) = read_field(ptr, &schema.fields, None, false, &mut tail_ptr);
     if schema.is_dynamic {
         read_attach_dynamic_part(tail_ptr, &mut schema_value)
     }
@@ -149,5 +166,6 @@ pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
 }
 
 pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> SharedValue {
-    read_field(ptr, &schema.fields, Some(fields)).0
+    let mut tail_ptr = 0;
+    read_field(ptr, &schema.fields, Some(fields), false, &mut tail_ptr).0
 }

@@ -38,7 +38,7 @@ pub fn plan_write_field<'a>(
     is_var: bool,
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.unwrap();
-    let is_field_var = field.is_array || !types::fixed_size(field.data_type);
+    let is_field_var = field.is_var();
     let offset = if let Some(ref subs) = field.sub_fields {
         if let OwnedValue::Map(map) = value {
             for sub in subs {
