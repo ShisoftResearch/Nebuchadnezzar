@@ -183,7 +183,7 @@ mod tests {
                 vec![],
             ),
             false,
-            false
+            false,
         )
     }
 }

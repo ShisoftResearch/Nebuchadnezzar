@@ -383,10 +383,8 @@ impl Chunk {
                     Ok((cell, schema)) => {
                         indexer.remove_indices(&cell, &*schema);
                         guard = cell.into_guard();
-                    },
-                    Err((e, _)) => {
-                        return Err(WriteError::ReadError(e))
                     }
+                    Err((e, _)) => return Err(WriteError::ReadError(e)),
                 }
             }
             let cell_location = *guard;

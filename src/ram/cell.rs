@@ -124,7 +124,13 @@ impl OwnedCell {
     ) -> Result<usize, WriteError> {
         let mut tail_offset: usize = schema.static_bound;
         let mut instructions = Vec::<writer::Instruction>::new();
-        writer::plan_write_field(&mut tail_offset, &schema.fields, &self.data, &mut instructions, false)?;
+        writer::plan_write_field(
+            &mut tail_offset,
+            &schema.fields,
+            &self.data,
+            &mut instructions,
+            false,
+        )?;
         if schema.is_dynamic {
             writer::plan_write_dynamic_fields(
                 &mut tail_offset,

@@ -44,6 +44,6 @@ fn hash_index_schema() -> Schema {
         None,
         Field::new("*", Type::Id, false, false, None, vec![]),
         false,
-        false
+        false,
     )
 }

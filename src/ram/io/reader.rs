@@ -8,7 +8,13 @@ use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
 use std::collections::HashMap;
 
-fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: bool, tail_offset: &mut usize) -> SharedValue {
+fn read_field(
+    base_ptr: usize,
+    field: &Field,
+    selected: Option<&[u64]>,
+    is_var: bool,
+    tail_offset: &mut usize,
+) -> SharedValue {
     let mut rec_field_offset = field.offset.unwrap_or(0);
     let field_offset = if is_var {
         // Is inside size variable field, read directly from the address
@@ -76,7 +82,7 @@ fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: 
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         SharedValue::Map(map)
     } else {
-        let field_ptr = base_ptr + * field_offset;
+        let field_ptr = base_ptr + *field_offset;
         *field_offset += types::get_size(field.data_type, field_ptr);
         types::get_shared_val(field.data_type, field_ptr)
     }
