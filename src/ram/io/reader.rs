@@ -6,40 +6,41 @@ use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
-use std::cmp::max;
 use std::collections::HashMap;
 
-fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: bool, tail_ptr: &mut usize) -> (SharedValue, usize) {
-    let field_ptr = if is_var {
+fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: bool, tail_offset: &mut usize) -> SharedValue {
+    let mut rec_field_offset = field.offset.unwrap_or(0);
+    let field_offset = if is_var {
         // Is inside size variable field, read directly from the address
-        base_ptr
+        tail_offset
     } else if !field.is_var() {
         // Is not inside var and field not var, read from the offset in field
-        base_ptr + field.offset.unwrap()
+        &mut rec_field_offset
     } else {
         // Is not inside var and field is var, read the pointer and direct to it
-        base_ptr + *u32_io::read(base_ptr + field.offset.unwrap()) as usize
+        *tail_offset = *u32_io::read(base_ptr + field.offset.unwrap()) as usize;
+        tail_offset
     };
     if field.nullable {
-        let null_byte = *bool_io::read(field_ptr);
-        field_ptr += 1;
+        let null_byte = *bool_io::read(base_ptr + *field_offset);
+        *field_offset += 1;
         if null_byte {
-            return (SharedValue::Null, field_ptr);
+            return SharedValue::Null;
         }
     }
     if field.is_array {
-        let len = *u32_io::read(field_ptr);
+        let len = *u32_io::read(base_ptr + *field_offset);
         trace!("Got array length {}", len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
-        field_ptr += u32_io::type_size();
+        *field_offset += u32_io::type_size();
         if field.sub_fields.is_none() {
             // maybe primitive array
-            let mut ptr = field_ptr;
+            let mut ptr = base_ptr + *field_offset;
             let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
+            *field_offset = ptr - base_ptr;
             if let Some(prim_arr) = val {
-                *tail_ptr = max(*tail_ptr, ptr);
-                return (SharedValue::PrimArray(prim_arr), ptr);
+                SharedValue::PrimArray(prim_arr)
             } else {
                 panic!(
                     "type cannot been convert to prim array: {:?}",
@@ -49,43 +50,35 @@ fn read_field(base_ptr: usize, field: &Field, selected: Option<&[u64]>, is_var: 
         } else {
             let mut vals = Vec::<SharedValue>::new();
             for _ in 0..len {
-                let (nxt_val, nxt_ptr) = read_field(field_ptr, &sub_field, None, true, tail_ptr);
-                field_ptr = nxt_ptr;
+                let nxt_val = read_field(base_ptr, &sub_field, None, true, field_offset);
                 vals.push(nxt_val);
             }
-            *tail_ptr = max(*tail_ptr, field_ptr);
-            (SharedValue::Array(vals), field_ptr)
+            SharedValue::Array(vals)
         }
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = SharedMap::new();
         let mut selected_pos = 0;
-        let mut ptr = field_ptr;
         for sub in subs {
-            let (cval, cptr) = read_field(ptr, &sub, selected, is_var, tail_ptr);
+            let cval = read_field(base_ptr, &sub, selected, is_var, field_offset);
             map.insert_key_id(sub.name_id, cval);
-            ptr = cptr;
             match selected {
                 None => {}
                 Some(field_ids) => {
                     if field_ids[selected_pos] == sub.name_id {
                         selected_pos += 1;
                         if field_ids.len() <= selected_pos {
-                            return (SharedValue::Map(map), ptr);
+                            return SharedValue::Map(map);
                         }
                     }
                 }
             }
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
-        *tail_ptr = max(*tail_ptr, ptr);
-        (SharedValue::Map(map), ptr)
+        SharedValue::Map(map)
     } else {
-        let next_field = field_ptr + types::get_size(field.data_type, field_ptr);
-        *tail_ptr = max(*tail_ptr, next_field);
-        (
-            types::get_shared_val(field.data_type, field_ptr),
-            next_field,
-        )
+        let field_ptr = base_ptr + * field_offset;
+        *field_offset += types::get_size(field.data_type, field_ptr);
+        types::get_shared_val(field.data_type, field_ptr)
     }
 }
 
@@ -157,15 +150,15 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
 }
 
 pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
-    let mut tail_ptr = 0;
-    let (mut schema_value, _) = read_field(ptr, &schema.fields, None, false, &mut tail_ptr);
+    let mut tail_offset = schema.static_bound;
+    let mut schema_value = read_field(ptr, &schema.fields, None, false, &mut tail_offset);
     if schema.is_dynamic {
-        read_attach_dynamic_part(tail_ptr, &mut schema_value)
+        read_attach_dynamic_part(ptr + tail_offset, &mut schema_value)
     }
     schema_value
 }
 
 pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> SharedValue {
-    let mut tail_ptr = 0;
-    read_field(ptr, &schema.fields, Some(fields), false, &mut tail_ptr).0
+    let mut tail_offset = schema.static_bound;
+    read_field(ptr, &schema.fields, Some(fields), false, &mut tail_offset)
 }

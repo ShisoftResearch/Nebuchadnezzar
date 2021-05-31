@@ -8,7 +8,6 @@ use super::*;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-#[cfg(feature = "fast_map")]
 #[test]
 pub fn cell_rw() {
     let fields = default_fields();

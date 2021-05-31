@@ -45,7 +45,7 @@ pub fn plan_write_field<'a>(
                 let val = map.get_by_key_id(sub.name_id);
                 plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
             }
-            return Ok(())
+            return Ok(());
         } else {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
@@ -56,13 +56,23 @@ pub fn plan_write_field<'a>(
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
-                offset: schema_offset
+                offset: schema_offset,
             });
         }
+        trace!("Using tailing offset for {}", field.name);
         tail_offset
     } else {
         &mut schema_offset
     };
+    trace!(
+        "Plan to write {} at {}, field var {}, in var {}, value {:?}, field {:?}",
+        field.name,
+        offset,
+        is_field_var,
+        is_var,
+        value,
+        field
+    );
     if field.nullable {
         let null_bit = match value {
             OwnedValue::Null => true,

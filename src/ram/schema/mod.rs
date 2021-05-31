@@ -27,7 +27,7 @@ pub struct Schema {
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
-    pub is_scannable: bool
+    pub is_scannable: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -48,6 +48,7 @@ impl Schema {
     ) -> Schema {
         let mut bound = 0;
         fields.assign_offsets(&mut bound);
+        trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
             name: name.to_string(),
@@ -105,7 +106,7 @@ impl Field {
             is_array,
             sub_fields,
             indices,
-            offset: None
+            offset: None,
         }
     }
     fn assign_offsets(&mut self, offset: &mut usize) {
@@ -121,12 +122,20 @@ impl Field {
         } else if let Some(ref mut subs) = self.sub_fields {
             subs.iter_mut().for_each(|f| f.assign_offsets(offset));
         } else {
-            if is_field_var {
+            if !is_field_var {
                 *offset += types::size_of_type(self.data_type);
             } else {
                 *offset += POINTER_SIZE;
             }
         }
+        trace!(
+            "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
+            self.name,
+            self.offset,
+            offset,
+            is_field_var,
+            *offset - self.offset.unwrap()
+        );
     }
     pub fn is_var(&self) -> bool {
         self.is_array || !types::fixed_size(self.data_type)
