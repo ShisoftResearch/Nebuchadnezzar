@@ -11,7 +11,6 @@ use std::collections::HashMap;
 fn read_field(
     base_ptr: usize,
     field: &Field,
-    selected: Option<&[u64]>,
     is_var: bool,
     tail_offset: &mut usize,
 ) -> SharedValue {
@@ -56,31 +55,15 @@ fn read_field(
         } else {
             let mut vals = Vec::<SharedValue>::new();
             for _ in 0..len {
-                let nxt_val = read_field(base_ptr, &sub_field, None, true, field_offset);
+                let nxt_val = read_field(base_ptr, &sub_field, true, field_offset);
                 vals.push(nxt_val);
             }
             SharedValue::Array(vals)
         }
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = SharedMap::new();
-        let mut read_sub = |sub: &Field| {
-            map.insert_key_id(sub.name_id, read_field(base_ptr, &sub, selected, is_var, field_offset));
-        };
-        if let Some(field_ids) = selected {
-            for sub in subs {
-                let mut selected_pos = 0;
-                if field_ids[selected_pos] == sub.name_id {
-                    read_sub(sub);
-                    selected_pos += 1;
-                    if field_ids.len() <= selected_pos {
-                        return SharedValue::Map(map);
-                    }
-                }
-            }
-        } else {
-            for sub in subs {
-                read_sub(sub);
-            }
+        for sub in subs {
+            map.insert_key_id(sub.name_id, read_field(base_ptr, &sub, is_var, field_offset));
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         SharedValue::Map(map)
@@ -160,7 +143,7 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
 
 pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
     let mut tail_offset = schema.static_bound;
-    let mut schema_value = read_field(ptr, &schema.fields, None, false, &mut tail_offset);
+    let mut schema_value = read_field(ptr, &schema.fields, false, &mut tail_offset);
     if schema.is_dynamic {
         read_attach_dynamic_part(ptr + tail_offset, &mut schema_value)
     }
@@ -169,5 +152,30 @@ pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
 
 pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> SharedValue {
     let mut tail_offset = schema.static_bound;
-    read_field(ptr, &schema.fields, Some(fields), false, &mut tail_offset)
+    if fields.is_empty() {
+        return read_by_schema(ptr, schema);
+    }
+    if let Some(schema_fields) = &schema.fields.sub_fields {
+        let mut map = SharedMap::new();
+        'SEARCH:
+        for field in fields {
+            if let Some(index_path) = schema.id_index.get(field) {
+                if index_path.is_empty() {
+                    continue;
+                } 
+                if let Some(mut field) = schema_fields.get(index_path[0]) {
+                    for i in index_path.iter().skip(1) {
+                        if let Some(Some(sub_field)) = field.sub_fields.as_ref().map(|sub| sub.get(*i)) {
+                            field = sub_field;
+                        } else {
+                            continue 'SEARCH;
+                        }
+                    }
+                    map.insert_key_id(field.name_id, read_field(ptr, field, false, &mut tail_offset));
+                }
+            }
+        }
+        return SharedValue::Map(map)
+    }
+    SharedValue::Null
 }
