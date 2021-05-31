@@ -63,20 +63,23 @@ fn read_field(
         }
     } else if let Some(ref subs) = field.sub_fields {
         let mut map = SharedMap::new();
-        let mut selected_pos = 0;
-        for sub in subs {
-            let cval = read_field(base_ptr, &sub, selected, is_var, field_offset);
-            map.insert_key_id(sub.name_id, cval);
-            match selected {
-                None => {}
-                Some(field_ids) => {
-                    if field_ids[selected_pos] == sub.name_id {
-                        selected_pos += 1;
-                        if field_ids.len() <= selected_pos {
-                            return SharedValue::Map(map);
-                        }
+        let mut read_sub = |sub: &Field| {
+            map.insert_key_id(sub.name_id, read_field(base_ptr, &sub, selected, is_var, field_offset));
+        };
+        if let Some(field_ids) = selected {
+            for sub in subs {
+                let mut selected_pos = 0;
+                if field_ids[selected_pos] == sub.name_id {
+                    read_sub(sub);
+                    selected_pos += 1;
+                    if field_ids.len() <= selected_pos {
+                        return SharedValue::Map(map);
                     }
                 }
+            }
+        } else {
+            for sub in subs {
+                read_sub(sub);
             }
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
