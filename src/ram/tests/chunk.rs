@@ -4,6 +4,7 @@ use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
+use bifrost_hasher::hash_str;
 use env_logger;
 use std;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -131,6 +132,20 @@ pub fn cell_rw() {
         assert_eq!(stored_cell.data["score"].u64().unwrap(), &100);
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
+    {
+        let sel_cell = chunks.read_selected(&id2, &[
+            hash_str("score"),
+            hash_str("name")
+        ]).unwrap();
+        assert_eq!(sel_cell["score"].u64().unwrap(), &100);
+        assert_eq!(sel_cell["name"].string().unwrap(), "John");
+    }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());
+}
+
+#[test]
+pub fn cell_sel_read() {
+    let _ = env_logger::try_init();
+
 }

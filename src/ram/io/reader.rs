@@ -171,7 +171,12 @@ pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> S
                             continue 'SEARCH;
                         }
                     }
-                    map.insert_key_id(field.name_id, read_field(ptr, field, false, &mut tail_offset));
+                    let field_data = read_field(ptr, field, false, &mut tail_offset);
+                    if fields.len() == 1 {
+                        return field_data;
+                    } else {
+                        map.insert_key_id(field.name_id, field_data);
+                    }
                 }
             }
         }
