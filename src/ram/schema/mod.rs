@@ -24,6 +24,7 @@ pub struct Schema {
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
+    pub id_index: HashMap<u64, Vec<usize>>,
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
@@ -47,7 +48,8 @@ impl Schema {
         is_scannable: bool,
     ) -> Schema {
         let mut bound = 0;
-        fields.assign_offsets(&mut bound);
+        let mut id_index = HashMap::new();
+        fields.assign_offsets(&mut bound, &mut id_index, String::new(), vec![]);
         trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
@@ -61,6 +63,7 @@ impl Schema {
             fields,
             is_dynamic,
             is_scannable,
+            id_index,
         }
     }
     pub fn new_with_id(
@@ -109,10 +112,17 @@ impl Field {
             offset: None,
         }
     }
-    fn assign_offsets(&mut self, offset: &mut usize) {
+    fn assign_offsets(
+        &mut self,
+        offset: &mut usize,
+        id_index: &mut HashMap<u64, Vec<usize>>,
+        name_path: String,
+        field_path: Vec<usize>,
+    ) {
         const POINTER_SIZE: usize = mem::size_of::<u32>();
         self.offset = Some(*offset);
         let is_field_var = self.is_var();
+        let name_path_hash = hash_str(&name_path);
         if self.nullable && !is_field_var {
             *offset += 1;
         }
@@ -120,13 +130,26 @@ impl Field {
             // u32 as indication of the offset to the actual data
             *offset += POINTER_SIZE;
         } else if let Some(ref mut subs) = self.sub_fields {
-            subs.iter_mut().for_each(|f| f.assign_offsets(offset));
+            let format_name = if name_path.is_empty() {
+                name_path
+            } else {
+                format!("{}|", name_path)
+            };
+            subs.iter_mut().enumerate().for_each(|(i, f)| {
+                let mut new_path = field_path.clone();
+                new_path.push(i);
+                let new_name_path = format!("{}{}", format_name, f.name);
+                f.assign_offsets(offset, id_index, new_name_path, new_path);
+            });
         } else {
             if !is_field_var {
                 *offset += types::size_of_type(self.data_type);
             } else {
                 *offset += POINTER_SIZE;
             }
+        }
+        if !field_path.is_empty() {
+            id_index.insert(name_path_hash, field_path);
         }
         trace!(
             "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
