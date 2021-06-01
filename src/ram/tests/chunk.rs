@@ -172,15 +172,80 @@ pub fn simple_cell_rw() {
     }
 }
 
-// #[test]
-// pub fn complex_cell_sel_read() {
-//     let _ = env_logger::try_init();
-//     let fields = Field::new(
-//         &String::from("*"), 
-//         data_type, 
-//         nullable, 
-//         is_array,
-//          sub_fields, 
-//          indices
-//     )
-// }
+#[test]
+pub fn complex_cell_sel_read() {
+    let _ = env_logger::try_init();
+    let id1 = Id::new(1, 1);
+    let fields = complex_fields();
+    let schema = Schema::new("complex", None, fields, false, true);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None
+    );
+    let data = data_map_value!(
+        id: OwnedValue::I64(128),
+        strings: OwnedValue::PrimArray(OwnedPrimArray::String(vec![
+            String::from("aaaa"),
+            String::from("bbbb"),
+            String::from("cccc")
+        ])),
+        num: OwnedValue::U64(256),
+        nums: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
+            512, 1024, 2048
+        ])),
+        sub: data_map_value!(
+            sub1: OwnedValue::U32(4096),
+            sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                8192, 16384
+            ])),
+            sub3: OwnedValue::U32(1),
+            sub4: data_map_value!(
+                sub4sub1: OwnedValue::U32(2),
+                sub4sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                    3, 4, 5
+                ])),
+                sub4sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                    6, 7
+                ])),
+                sub4sub4: OwnedValue::U16(8)
+            ),
+            sub5: OwnedValue::Array(vec![
+                data_map_value!(
+                    sub5sub1: OwnedValue::U32(9),
+                    sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                        10, 11
+                    ])),
+                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                        12, 13, 14
+                    ])),
+                    sub5sub4: OwnedValue::U16(15)
+                ),
+                data_map_value!(
+                    sub5sub1: OwnedValue::U32(16),
+                    sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                        17, 18, 19, 20
+                    ])),
+                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                        21, 22
+                    ])),
+                    sub5sub4: OwnedValue::U16(23)
+                )
+            ]),
+            end: OwnedValue::String(String::from("END OF OBJECT"))
+        )
+    );
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &id1),
+        data
+    };
+    chunks.write_cell(&mut cell).unwrap();
+    {
+        unimplemented!() // READ
+    }
+}
