@@ -46,7 +46,7 @@ pub fn cell_rw() {
     let chunks = Chunks::new(
         1,
         CHUNK_SIZE,
-        Arc::<ServerMeta>::new(ServerMeta { schemas }),
+        Arc::new(ServerMeta { schemas }),
         None,
         None,
         None,
@@ -145,7 +145,42 @@ pub fn cell_rw() {
 }
 
 #[test]
-pub fn cell_sel_read() {
+pub fn simple_cell_rw() {
     let _ = env_logger::try_init();
-
+    let id1 = Id::new(1, 1);
+    let fields = simple_fields();
+    let schema = Schema::new("simple", None, fields, false, true);
+    let data = OwnedValue::U64(128);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &id1),
+        data
+    };
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None
+    );
+    chunks.write_cell(&mut cell).unwrap();
+    {
+        let stored_cell = chunks.read_cell(&id1).unwrap();
+        assert_eq!(stored_cell.data.u64(), Some(&128));
+    }
 }
+
+// #[test]
+// pub fn complex_cell_sel_read() {
+//     let _ = env_logger::try_init();
+//     let fields = Field::new(
+//         &String::from("*"), 
+//         data_type, 
+//         nullable, 
+//         is_array,
+//          sub_fields, 
+//          indices
+//     )
+// }
