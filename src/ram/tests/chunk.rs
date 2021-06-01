@@ -210,7 +210,7 @@ pub fn complex_cell_sel_read() {
                 sub4sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
                     3, 4, 5
                 ])),
-                sub4sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                sub4sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
                     6, 7
                 ])),
                 sub4sub4: OwnedValue::U16(8)
@@ -221,7 +221,7 @@ pub fn complex_cell_sel_read() {
                     sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
                         10, 11
                     ])),
-                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
                         12, 13, 14
                     ])),
                     sub5sub4: OwnedValue::U16(15)
@@ -231,13 +231,13 @@ pub fn complex_cell_sel_read() {
                     sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
                         17, 18, 19, 20
                     ])),
-                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
                         21, 22
                     ])),
                     sub5sub4: OwnedValue::U16(23)
                 )
             ]),
-            end: OwnedValue::String(String::from("END OF OBJECT"))
+            end: OwnedValue::U32(24)
         )
     );
     let mut cell = OwnedCell {

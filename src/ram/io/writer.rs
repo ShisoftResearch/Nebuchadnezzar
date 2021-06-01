@@ -37,10 +37,12 @@ pub fn plan_write_field<'a>(
     mut ins: &mut Vec<Instruction<'a>>,
     is_var: bool,
 ) -> Result<(), WriteError> {
-    let mut schema_offset = field.offset.unwrap();
+    let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
     let offset = if let Some(ref subs) = field.sub_fields {
-        if let OwnedValue::Map(map) = value {
+        if let OwnedValue::Array(_) = value {
+            tail_offset
+        } else if let OwnedValue::Map(map) = value {
             for sub in subs {
                 let val = map.get_by_key_id(sub.name_id);
                 plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
@@ -56,13 +58,18 @@ pub fn plan_write_field<'a>(
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
-                offset: schema_offset,
+                offset: schema_offset.unwrap(),
             });
         }
         trace!("Using tailing offset for {}", field.name);
         tail_offset
+    } else if !is_var {
+        schema_offset.as_mut().expect(&format!(
+            "schema should have offset is_var: {}, field var: {}",
+            is_var, is_field_var
+        ))
     } else {
-        &mut schema_offset
+        tail_offset
     };
     trace!(
         "Plan to write {} at {}, field var {}, in var {}, value {:?}, field {:?}",

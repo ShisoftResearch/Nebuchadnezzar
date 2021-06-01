@@ -91,7 +91,7 @@ pub fn complex_fields() -> Field {
                         &String::from("sub2"),
                         Type::U32,
                         false,
-                        false, // array
+                        true, // array
                         None,
                         vec![]
                     ),
