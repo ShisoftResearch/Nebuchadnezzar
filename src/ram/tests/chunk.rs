@@ -215,29 +215,8 @@ pub fn complex_cell_sel_read() {
                 ])),
                 sub4sub4: OwnedValue::U16(8)
             ),
-            sub5: OwnedValue::Array(vec![
-                data_map_value!(
-                    sub5sub1: OwnedValue::U32(9),
-                    sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
-                        10, 11
-                    ])),
-                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
-                        12, 13, 14
-                    ])),
-                    sub5sub4: OwnedValue::U16(15)
-                ),
-                data_map_value!(
-                    sub5sub1: OwnedValue::U32(16),
-                    sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
-                        17, 18, 19, 20
-                    ])),
-                    sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
-                        21, 22
-                    ])),
-                    sub5sub4: OwnedValue::U16(23)
-                )
-            ]),
-            end: OwnedValue::U32(24)
+            sub5: dyn_map_value(),
+            subend: OwnedValue::U32(24)
         )
     );
     let mut cell = OwnedCell {
@@ -246,6 +225,35 @@ pub fn complex_cell_sel_read() {
     };
     chunks.write_cell(&mut cell).unwrap();
     {
+        let read_cell = chunks.read_cell(&id1).unwrap().to_owned();
+        assert_eq!(cell.data, read_cell.data);
+    }
+    {
         unimplemented!() // READ
     }
+}
+
+fn dyn_map_value() -> OwnedValue {
+    OwnedValue::Array(vec![
+        data_map_value!(
+            sub5sub1: OwnedValue::U32(9),
+            sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                10, 11
+            ])),
+            sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
+                12, 13, 14
+            ])),
+            sub5sub4: OwnedValue::U16(15)
+        ),
+        data_map_value!(
+            sub5sub1: OwnedValue::U32(16),
+            sub5sub2: OwnedValue::PrimArray(OwnedPrimArray::U32(vec![
+                17, 18, 19, 20
+            ])),
+            sub5sub3: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
+                21, 22
+            ])),
+            sub5sub4: OwnedValue::U16(23)
+        )
+    ])
 }

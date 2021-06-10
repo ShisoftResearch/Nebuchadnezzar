@@ -144,49 +144,9 @@ pub fn complex_fields() -> Field {
                         ]),
                         vec![]
                     ),
+                    dyn_map_field("sub5"),
                     Field::new(
-                        &String::from("sub5"),
-                        Type::Map,
-                        false,
-                        true, // array
-                        Some(vec![
-                            Field::new(
-                                "sub5sub1", 
-                                Type::U32, 
-                                false, 
-                                false, 
-                                None, 
-                                vec![]
-                            ),
-                            Field::new(
-                                "sub5sub2", 
-                                Type::U32, 
-                                false, 
-                                true, // array
-                                None, 
-                                vec![]
-                            ),
-                            Field::new(
-                                "sub5sub3", 
-                                Type::U64, 
-                                true, // nullable
-                                true, // array
-                                None, 
-                                vec![]
-                            ),
-                            Field::new(
-                                "sub5sub4", 
-                                Type::U16, 
-                                false, 
-                                false, 
-                                None, 
-                                vec![]
-                            ),
-                        ]),
-                        vec![]
-                    ),
-                    Field::new(
-                        &String::from("end"),
+                        &String::from("subend"),
                         Type::U32,
                         false,
                         false,
@@ -198,5 +158,49 @@ pub fn complex_fields() -> Field {
             )
         ]),
         vec![],
+    )
+}
+
+pub fn dyn_map_field<'a>(name: &'a str) -> Field {
+    Field::new(
+        &String::from(name),
+        Type::Map,
+        false,
+        true, // array
+        Some(vec![
+            Field::new(
+                "sub5sub1", 
+                Type::U32, 
+                false, 
+                false, 
+                None, 
+                vec![]
+            ),
+            Field::new(
+                "sub5sub2", 
+                Type::U32, 
+                false, 
+                true, // array
+                None, 
+                vec![]
+            ),
+            Field::new(
+                "sub5sub3", 
+                Type::U64, 
+                true, // nullable
+                true, // array
+                None, 
+                vec![]
+            ),
+            Field::new(
+                "sub5sub4", 
+                Type::U16, 
+                false, 
+                false, 
+                None, 
+                vec![]
+            ),
+        ]),
+        vec![]
     )
 }
