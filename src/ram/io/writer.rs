@@ -41,8 +41,33 @@ pub fn plan_write_field<'a>(
     let is_field_var = field.is_var();
     let offset = if let Some(ref subs) = field.sub_fields {
         if let OwnedValue::Array(_) = value {
+            if !field.is_array {
+                return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+            }
+            if !is_var {
+                trace!(
+                    "Push jump tailing for map array with {} at {}",
+                    tail_offset,
+                    schema_offset.unwrap()
+                );
+                ins.push(Instruction {
+                    data_type: Type::U32,
+                    val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
+                    offset: schema_offset.unwrap(),
+                });
+            }
+            trace!(
+                "Taking tailing offset for array {} at {}",
+                field.name,
+                tail_offset
+            );
             tail_offset
         } else if let OwnedValue::Map(map) = value {
+            trace!(
+                "Writing map fields with for {} at {}",
+                field.name,
+                tail_offset
+            );
             for sub in subs {
                 let val = map.get_by_key_id(sub.name_id);
                 plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
@@ -55,13 +80,18 @@ pub fn plan_write_field<'a>(
         // Write position tag for variable sized field
         if !is_var {
             // No need to jump to var region when it is var
+            trace!(
+                "Push jump tailing inst with {} at {:?}",
+                tail_offset,
+                schema_offset
+            );
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
                 offset: schema_offset.unwrap(),
             });
         }
-        trace!("Using tailing offset for {}", field.name);
+        trace!("Using tailing offset for {} at {}", field.name, tail_offset);
         tail_offset
     } else if !is_var {
         schema_offset.as_mut().expect(&format!(
@@ -85,6 +115,7 @@ pub fn plan_write_field<'a>(
             OwnedValue::Null => true,
             _ => false,
         };
+        trace!("Push null bit inst with {} at {}", null_bit, *offset);
         ins.push(Instruction {
             data_type: Type::Bool,
             val: InstData::Val(OwnedValue::Bool(null_bit)),
@@ -97,6 +128,7 @@ pub fn plan_write_field<'a>(
             let len = array.len();
             let mut sub_field = field.clone();
             sub_field.is_array = false;
+            trace!("Pushing array len inst with {} at {}", len, *offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
@@ -110,12 +142,18 @@ pub fn plan_write_field<'a>(
             let len = array.len();
             let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
+            trace!("Pushing prim array len inst with {} at {}", len, *offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
             *offset += types::u32_io::type_size();
+            trace!(
+                "Pushing prim array ref inst with {:?} at {}",
+                value,
+                *offset
+            );
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
@@ -140,7 +178,15 @@ pub fn plan_write_field<'a>(
                 val: InstData::Ref(value),
                 offset: *offset,
             });
-            *offset += size;
+            let new_offset = *offset + size;
+            trace!(
+                "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
+                value,
+                *offset,
+                size,
+                new_offset
+            );
+            *offset = new_offset;
         }
     }
     return Ok(());

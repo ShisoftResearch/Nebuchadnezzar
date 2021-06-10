@@ -26,6 +26,7 @@ fn read_field(
         *tail_offset = *u32_io::read(base_ptr + field.offset.unwrap()) as usize;
         tail_offset
     };
+    trace!("Reading {} at offset {}", field.name, field_offset);
     if field.nullable {
         let null_byte = *bool_io::read(base_ptr + *field_offset);
         *field_offset += 1;
@@ -35,7 +36,7 @@ fn read_field(
     }
     if field.is_array {
         let len = *u32_io::read(base_ptr + *field_offset);
-        trace!("Got array length {}", len);
+        trace!("Field {} is array, length {}", field.name, len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
         *field_offset += u32_io::type_size();
@@ -61,6 +62,7 @@ fn read_field(
             SharedValue::Array(vals)
         }
     } else if let Some(ref subs) = field.sub_fields {
+        trace!("Field {} is map", field.name);
         let mut map = SharedMap::new();
         for sub in subs {
             map.insert_key_id(sub.name_id, read_field(base_ptr, &sub, is_var, field_offset));
@@ -70,7 +72,9 @@ fn read_field(
     } else {
         let field_ptr = base_ptr + *field_offset;
         *field_offset += types::get_size(field.data_type, field_ptr);
-        types::get_shared_val(field.data_type, field_ptr)
+        let val = types::get_shared_val(field.data_type, field_ptr);
+        trace!("Field {} is value: {:?}", field.name, val);
+        val
     }
 }
 

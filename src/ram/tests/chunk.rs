@@ -173,6 +173,57 @@ pub fn simple_cell_rw() {
 }
 
 #[test]
+pub fn array_dyn_map() {
+    let _ = env_logger::try_init();
+    let id1 = Id::new(1, 1);
+    let fields = Field::new(
+        &String::from("*"),
+        Type::Map,
+        false,
+        false,
+        Some(vec![
+            Field::new(
+                &String::from("fixed"),
+                Type::U32,
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            dyn_map_field("dynamic")
+        ]),
+        vec![]
+    );
+    let schema = Schema::new("array_dyn_map", None, fields, false, true);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None
+    );
+    let data = data_map_value!(
+        fixed: OwnedValue::U32(42),
+        dynamic: dyn_map_value()
+    );
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &id1),
+        data
+    };
+    chunks.write_cell(&mut cell).unwrap();
+    {
+        let read_cell = chunks.read_cell(&id1).unwrap().to_owned();
+        assert_eq!(cell.data, read_cell.data);
+    }
+    {
+        unimplemented!() // READ
+    }
+}
+
+#[test]
 pub fn complex_cell_sel_read() {
     let _ = env_logger::try_init();
     let id1 = Id::new(1, 1);
@@ -227,9 +278,6 @@ pub fn complex_cell_sel_read() {
     {
         let read_cell = chunks.read_cell(&id1).unwrap().to_owned();
         assert_eq!(cell.data, read_cell.data);
-    }
-    {
-        unimplemented!() // READ
     }
 }
 
