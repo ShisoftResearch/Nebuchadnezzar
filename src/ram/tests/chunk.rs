@@ -218,9 +218,6 @@ pub fn array_dyn_map() {
         let read_cell = chunks.read_cell(&id1).unwrap().to_owned();
         assert_eq!(cell.data, read_cell.data);
     }
-    {
-        unimplemented!() // READ
-    }
 }
 
 #[test]
