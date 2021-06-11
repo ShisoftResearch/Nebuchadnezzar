@@ -366,14 +366,11 @@ impl Cursor for LSMTreeCursor {
 }
 
 fn lsm_treee_schema() -> Schema {
-    Schema {
-        id: *LSM_TREE_SCHEMA_ID,
-        name: String::from(LSM_TREE_SCHEMA_NAME),
-        key_field: None,
-        str_key_field: None,
-        is_dynamic: false,
-        is_scannable: false,
-        fields: Field::new(
+    Schema::new_with_id(
+        *LSM_TREE_SCHEMA_ID,
+        &String::from(LSM_TREE_SCHEMA_NAME),
+        None,
+        Field::new(
             "*",
             Type::Map,
             false,
@@ -384,7 +381,9 @@ fn lsm_treee_schema() -> Schema {
             ]),
             vec![],
         ),
-    }
+        false,
+        false,
+    )
 }
 
 fn lsm_tree_cell(level_ids: &Vec<Id>, id: &Id, migration: Option<Id>) -> OwnedCell {

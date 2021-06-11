@@ -76,14 +76,11 @@ pub async fn smoke_test() {
     )
     .await;
     let schema_id = 123;
-    let schema = Schema {
-        id: schema_id,
-        name: String::from("schema"),
-        key_field: None,
-        str_key_field: None,
-        is_dynamic: false,
-        is_scannable: false,
-        fields: Field::new(
+    let schema = Schema::new_with_id(
+        schema_id,
+        &String::from("schema"),
+        None,
+        Field::new(
             "*",
             Type::Map,
             false,
@@ -98,7 +95,9 @@ pub async fn smoke_test() {
             )]),
             vec![],
         ),
-    };
+        false,
+        false,
+    );
 
     let client = Arc::new(
         client::AsyncClient::new(
@@ -168,14 +167,11 @@ pub async fn smoke_test_parallel() {
     )
     .await;
     let schema_id = 123;
-    let schema = Schema {
-        id: schema_id,
-        name: String::from("schema"),
-        key_field: None,
-        str_key_field: None,
-        is_dynamic: false,
-        is_scannable: false,
-        fields: Field::new(
+    let schema = Schema::new_with_id(
+        schema_id,
+        &String::from("schema"),
+        None,
+        Field::new(
             "*",
             Type::Map,
             false,
@@ -186,7 +182,9 @@ pub async fn smoke_test_parallel() {
             ]),
             vec![],
         ),
-    };
+        false,
+        false,
+    );
 
     let client = Arc::new(
         client::AsyncClient::new(
@@ -271,14 +269,11 @@ pub async fn txn() {
     )
     .await;
     let schema_id = 123;
-    let schema = Schema {
-        id: schema_id,
-        name: String::from("schema"),
-        key_field: None,
-        str_key_field: None,
-        is_dynamic: false,
-        is_scannable: false,
-        fields: Field::new(
+    let schema = Schema::new_with_id(
+        schema_id,
+        &String::from("schema"),
+        None,
+        Field::new(
             "*",
             Type::Map,
             false,
@@ -293,7 +288,9 @@ pub async fn txn() {
             )]),
             vec![],
         ),
-    };
+        false,
+        false,
+    );
 
     let client = Arc::new(
         client::AsyncClient::new(

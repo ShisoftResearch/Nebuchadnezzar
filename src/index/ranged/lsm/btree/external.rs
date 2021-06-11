@@ -403,14 +403,11 @@ where
 }
 
 pub fn page_schema() -> Schema {
-    Schema {
-        id: *PAGE_SCHEMA_ID,
-        name: String::from(PAGE_SCHEMA),
-        key_field: None,
-        str_key_field: None,
-        is_dynamic: false,
-        is_scannable: false,
-        fields: Field::new(
+    Schema::new_with_id(
+        *PAGE_SCHEMA_ID,
+        &String::from(PAGE_SCHEMA),
+        None,
+        Field::new(
             "*",
             Type::Map,
             false,
@@ -430,7 +427,9 @@ pub fn page_schema() -> Schema {
             ]),
             vec![],
         ),
-    }
+        false,
+        false,
+    )
 }
 
 pub struct IncubatingExtNode<KS, PS>

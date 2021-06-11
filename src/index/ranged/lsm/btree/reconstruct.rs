@@ -194,7 +194,7 @@ mod test {
     use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn tree_reconstruct_from_head_cell() {
+    async fn tree_reconstruct_from_head() {
         let _ = env_logger::try_init();
         let server_group = "btree-reconstruct";
         let server_addr = String::from("127.0.0.1:5600");

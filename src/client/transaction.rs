@@ -53,7 +53,7 @@ impl Transaction {
         &self,
         id: Id,
         fields: Vec<u64>,
-    ) -> Result<Option<Vec<OwnedValue>>, TxnError> {
+    ) -> Result<Option<OwnedValue>, TxnError> {
         match self
             .client
             .read_selected(self.tid.to_owned(), id, fields)

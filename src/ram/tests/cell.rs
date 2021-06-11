@@ -8,21 +8,12 @@ use super::*;
 
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-#[cfg(feature = "fast_map")]
 #[test]
 pub fn cell_rw() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let schema = Schema {
-        id: 1,
-        name: String::from("dummy"),
-        key_field: None,
-        str_key_field: None,
-        fields,
-        is_dynamic: false,
-        is_scannable: false,
-    };
+    let schema = Schema::new_with_id(1, &String::from("dummy"), None, fields, false, false);
     let mut data = data_map_value! {
         id: 100 as i64,
         score: 70 as u64,
@@ -77,15 +68,7 @@ pub fn dynamic() {
     let fields = default_fields();
     let id1 = Id::new(1, 1);
     let id2 = Id::new(1, 2);
-    let schema = Schema {
-        id: 1,
-        name: String::from("dummy"),
-        key_field: None,
-        str_key_field: None,
-        fields,
-        is_dynamic: true,
-        is_scannable: true,
-    };
+    let schema = Schema::new_with_id(1, &String::from("dummy"), None, fields, true, true);
     let mut data_map = types::OwnedMap::new();
     data_map.insert("id", OwnedValue::I64(100));
     data_map.insert("score", OwnedValue::U64(70));
