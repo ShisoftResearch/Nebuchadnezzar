@@ -38,7 +38,7 @@ struct Transaction {
 service! {
     rpc begin() -> Result<TxnId, TMError>;
     rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError>;
-    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError>;
+    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<OwnedValue, ReadError>, TMError>;
     rpc head(tid: TxnId, id: Id) -> Result<TxnExecResult<CellHeader, ReadError>, TMError>;
     rpc write(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
     rpc update(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
@@ -139,7 +139,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError>> {
+    ) -> BoxFuture<Result<TxnExecResult<OwnedValue, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
@@ -147,12 +147,9 @@ impl Service for TransactionManager {
             if let Some(data_obj) = txn.data.get(&id) {
                 match data_obj.cell {
                     Some(ref cell) => {
-                        let mut result = Vec::with_capacity(fields.len());
                         match cell.data {
-                            OwnedValue::Map(ref map) => {
-                                for field in fields {
-                                    result.push(map.get_by_key_id(field).clone())
-                                }
+                            OwnedValue::Map(ref _map) => {
+                                return Ok(TxnExecResult::Accepted(cell.data.clone()));
                             }
                             _ => {
                                 return Ok(TxnExecResult::Error(
@@ -160,7 +157,6 @@ impl Service for TransactionManager {
                                 ))
                             }
                         }
-                        return Ok(TxnExecResult::Accepted(result));
                     } // read from cache
                     None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),
                 }
@@ -548,7 +544,7 @@ impl TransactionManager {
         fields: &Vec<u64>,
         _txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
-    ) -> Result<TxnExecResult<Vec<OwnedValue>, ReadError>, TMError> {
+    ) -> Result<TxnExecResult<OwnedValue, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
             let read_response = server

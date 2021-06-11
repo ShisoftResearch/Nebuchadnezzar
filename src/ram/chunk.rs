@@ -22,8 +22,6 @@ use std::sync::Arc;
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 
-pub type SharedSelectedValue<'a> = SharedData<'a, Vec<SharedValue>>;
-
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
@@ -193,19 +191,9 @@ impl Chunk {
             .map_err(|(e, _)| e)
     }
 
-    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedSelectedValue, ReadError> {
+    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedValue, ReadError> {
         let loc = self.location_for_read(hash)?;
-        let selected_data = select_from_chunk_raw(*loc, self, fields)?;
-        let mut result = Vec::with_capacity(fields.len());
-        match selected_data {
-            SharedValue::Map(mut map) => {
-                for field_id in fields {
-                    result.push(map.map.remove(field_id).unwrap())
-                }
-                return Ok(SharedData::compose(result, loc));
-            }
-            _ => Err(ReadError::CellTypeIsNotMapForSelect),
-        }
+        select_from_chunk_raw(*loc, self, fields)
     }
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
@@ -383,10 +371,8 @@ impl Chunk {
                     Ok((cell, schema)) => {
                         indexer.remove_indices(&cell, &*schema);
                         guard = cell.into_guard();
-                    },
-                    Err((e, _)) => {
-                        return Err(WriteError::ReadError(e))
                     }
+                    Err((e, _)) => return Err(WriteError::ReadError(e)),
                 }
             }
             let cell_location = *guard;
@@ -795,7 +781,7 @@ impl Chunks {
         &self,
         key: &Id,
         fields: &[u64],
-    ) -> Result<SharedSelectedValue, ReadError> {
+    ) -> Result<SharedValue, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields);
     }

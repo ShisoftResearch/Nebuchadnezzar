@@ -25,16 +25,16 @@ macro_rules! test_nums {
                     127 as $t,
                 ];
                 let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-                let counts = CHUNK_SIZE / types::$io::size(0) as usize;
+                let counts = CHUNK_SIZE / types::$io::type_size() as usize;
                 let chunk_addr = chunk.segments()[0].addr;
                 for d in test_data {
                     for i in 0..counts {
-                        let addr = chunk_addr + i * types::$io::size(0);
+                        let addr = chunk_addr + i * types::$io::type_size();
                         types::$io::write(&d, addr);
                         assert_eq!(*types::$io::read(addr), d);
                     }
                     for i in 0..counts {
-                        let addr = chunk_addr + i * types::$io::size(0);
+                        let addr = chunk_addr + i * types::$io::type_size();
                         assert!(*types::$io::read(addr) == d);
                     }
                 }
@@ -75,16 +75,16 @@ mod pos2d32 {
             },
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::pos2d32_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::pos2d32_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos2d32_io::size(0);
+                let addr = chunk_addr + i * types::pos2d32_io::type_size();
                 types::pos2d32_io::write(&d, addr);
                 assert_eq!(*types::pos2d32_io::read(addr), d);
             }
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos2d32_io::size(0);
+                let addr = chunk_addr + i * types::pos2d32_io::type_size();
                 assert_eq!(*types::pos2d32_io::read(addr), d);
             }
         }
@@ -110,16 +110,16 @@ mod pos2d64 {
             },
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::pos2d64_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::pos2d64_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos2d64_io::size(0);
+                let addr = chunk_addr + i * types::pos2d64_io::type_size();
                 types::pos2d64_io::write(&d, addr);
                 assert_eq!(*types::pos2d64_io::read(addr), d);
             }
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos2d64_io::size(0);
+                let addr = chunk_addr + i * types::pos2d64_io::type_size();
                 assert_eq!(*types::pos2d64_io::read(addr), d);
             }
         }
@@ -147,16 +147,16 @@ mod pos3d32 {
             },
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::pos3d32_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::pos3d32_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos3d32_io::size(0);
+                let addr = chunk_addr + i * types::pos3d32_io::type_size();
                 types::pos3d32_io::write(&d, addr);
                 assert_eq!(*types::pos3d32_io::read(addr), d);
             }
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos3d32_io::size(0);
+                let addr = chunk_addr + i * types::pos3d32_io::type_size();
                 assert_eq!(*types::pos3d32_io::read(addr), d);
             }
         }
@@ -184,16 +184,16 @@ mod pos3d64 {
             },
         ];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::pos3d64_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::pos3d64_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos3d64_io::size(0);
+                let addr = chunk_addr + i * types::pos3d64_io::type_size();
                 types::pos3d64_io::write(&d, addr);
                 assert_eq!(*types::pos3d64_io::read(addr), d);
             }
             for i in 0..counts {
-                let addr = chunk_addr + i * types::pos3d64_io::size(0);
+                let addr = chunk_addr + i * types::pos3d64_io::type_size();
                 assert_eq!(*types::pos3d64_io::read(addr), d);
             }
         }
@@ -212,16 +212,16 @@ mod uuid {
             lower: 2,
         }];
         let chunk = &Chunks::new_dummy(1, CHUNK_SIZE).list[0];
-        let counts = CHUNK_SIZE / types::id_io::size(0) as usize;
+        let counts = CHUNK_SIZE / types::id_io::type_size() as usize;
         let chunk_addr = chunk.segments()[0].addr;
         for d in test_data {
             for i in 0..counts {
-                let addr = chunk_addr + i * types::id_io::size(0);
+                let addr = chunk_addr + i * types::id_io::type_size();
                 types::id_io::write(&d, addr);
                 assert_eq!(*types::id_io::read(addr), d);
             }
             for i in 0..counts {
-                let addr = chunk_addr + i * types::id_io::size(0);
+                let addr = chunk_addr + i * types::id_io::type_size();
                 assert_eq!(*types::id_io::read(addr), d);
             }
         }
@@ -241,7 +241,7 @@ mod string {
         for d in test_data.clone() {
             let test_str = String::from(d);
             types::string_io::write(&test_str, addr);
-            let len = types::string_io::size(addr);
+            let len = types::string_io::size_at(addr);
             let dec_str = types::string_io::read(addr);
             assert_eq!(dec_str, test_str);
             println!("{}", dec_str);
@@ -250,7 +250,7 @@ mod string {
         addr = chunk.segments()[0].addr;
         for d in test_data.clone() {
             let test_str = String::from(d);
-            let len = types::string_io::size(addr);
+            let len = types::string_io::size_at(addr);
             assert_eq!(types::string_io::read(addr), test_str);
             addr += len;
         }
@@ -260,7 +260,7 @@ mod string {
 #[test]
 fn array_len_type() {
     assert_eq!(
-        types::u32_io::size(0),
+        types::u32_io::type_size(),
         types::get_size(types::ARRAY_LEN_TYPE, 0)
     )
 }

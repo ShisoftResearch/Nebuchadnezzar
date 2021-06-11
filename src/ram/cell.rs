@@ -122,19 +122,24 @@ impl OwnedCell {
         chunk: &Chunk,
         schema: &Schema,
     ) -> Result<usize, WriteError> {
-        let mut offset: usize = 0;
+        let mut tail_offset: usize = schema.static_bound;
         let mut instructions = Vec::<writer::Instruction>::new();
-        writer::plan_write_field(&mut offset, &schema.fields, &self.data, &mut instructions)?;
+        writer::plan_write_field(
+            &mut tail_offset,
+            &schema.fields,
+            &self.data,
+            &mut instructions,
+            false,
+        )?;
         if schema.is_dynamic {
             writer::plan_write_dynamic_fields(
-                &mut offset,
+                &mut tail_offset,
                 &schema.fields,
                 &self.data,
                 &mut instructions,
             )?;
         }
-        debug_assert_ne!(offset, 0);
-        let entry_body_size = offset + CELL_HEADER_SIZE;
+        let entry_body_size = tail_offset + CELL_HEADER_SIZE;
         let len_bytes = Entry::count_len_bytes(entry_body_size as u32);
         let total_size = Entry::size(len_bytes, entry_body_size as u32);
         if total_size > MAX_CELL_SIZE {

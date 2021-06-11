@@ -31,16 +31,91 @@ pub struct Instruction<'a> {
 }
 
 pub fn plan_write_field<'a>(
-    mut offset: &mut usize,
+    tail_offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
     mut ins: &mut Vec<Instruction<'a>>,
+    is_var: bool,
 ) -> Result<(), WriteError> {
+    let mut schema_offset = field.offset.clone();
+    let is_field_var = field.is_var();
+    let offset = if let Some(ref subs) = field.sub_fields {
+        if let OwnedValue::Array(_) = value {
+            if !field.is_array {
+                return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+            }
+            if !is_var {
+                trace!(
+                    "Push jump tailing for map array with {} at {}",
+                    tail_offset,
+                    schema_offset.unwrap()
+                );
+                ins.push(Instruction {
+                    data_type: Type::U32,
+                    val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
+                    offset: schema_offset.unwrap(),
+                });
+            }
+            trace!(
+                "Taking tailing offset for array {} at {}",
+                field.name,
+                tail_offset
+            );
+            tail_offset
+        } else if let OwnedValue::Map(map) = value {
+            trace!(
+                "Writing map fields with for {} at {}",
+                field.name,
+                tail_offset
+            );
+            for sub in subs {
+                let val = map.get_by_key_id(sub.name_id);
+                plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
+            }
+            return Ok(());
+        } else {
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+        }
+    } else if is_field_var {
+        // Write position tag for variable sized field
+        if !is_var {
+            // No need to jump to var region when it is var
+            trace!(
+                "Push jump tailing inst with {} at {:?}",
+                tail_offset,
+                schema_offset
+            );
+            ins.push(Instruction {
+                data_type: Type::U32,
+                val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
+                offset: schema_offset.unwrap(),
+            });
+        }
+        trace!("Using tailing offset for {} at {}", field.name, tail_offset);
+        tail_offset
+    } else if !is_var {
+        schema_offset.as_mut().expect(&format!(
+            "schema should have offset is_var: {}, field var: {}",
+            is_var, is_field_var
+        ))
+    } else {
+        tail_offset
+    };
+    trace!(
+        "Plan to write {} at {}, field var {}, in var {}, value {:?}, field {:?}",
+        field.name,
+        offset,
+        is_field_var,
+        is_var,
+        value,
+        field
+    );
     if field.nullable {
         let null_bit = match value {
             OwnedValue::Null => true,
             _ => false,
         };
+        trace!("Push null bit inst with {} at {}", null_bit, *offset);
         ins.push(Instruction {
             data_type: Type::Bool,
             val: InstData::Val(OwnedValue::Bool(null_bit)),
@@ -53,40 +128,38 @@ pub fn plan_write_field<'a>(
             let len = array.len();
             let mut sub_field = field.clone();
             sub_field.is_array = false;
+            trace!("Pushing array len inst with {} at {}", len, *offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             for val in array {
-                plan_write_field(&mut offset, &sub_field, val, &mut ins)?;
+                plan_write_field(offset, &sub_field, val, &mut ins, true)?;
             }
         } else if let OwnedValue::PrimArray(ref array) = value {
             let len = array.len();
             let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
+            trace!("Pushing prim array len inst with {} at {}", len, *offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
+            trace!(
+                "Pushing prim array ref inst with {:?} at {}",
+                value,
+                *offset
+            );
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
                 offset: *offset,
             });
             *offset += size;
-        } else {
-            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
-        }
-    } else if let Some(ref subs) = field.sub_fields {
-        if let OwnedValue::Map(map) = value {
-            for sub in subs {
-                let val = map.get_by_key_id(sub.name_id);
-                plan_write_field(&mut offset, &sub, val, &mut ins)?;
-            }
         } else {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
@@ -105,7 +178,15 @@ pub fn plan_write_field<'a>(
                 val: InstData::Ref(value),
                 offset: *offset,
             });
-            *offset += size;
+            let new_offset = *offset + size;
+            trace!(
+                "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
+                value,
+                *offset,
+                size,
+                new_offset
+            );
+            *offset = new_offset;
         }
     }
     return Ok(());
@@ -153,14 +234,14 @@ pub fn plan_write_dynamic_map<'a>(
         val: InstData::Val(OwnedValue::U8(Type::Map.id())),
         offset: *offset,
     });
-    *offset += types::u8_io::size(0);
+    *offset += types::u8_io::type_size();
     // Write map size
     ins.push(Instruction {
         data_type: types::ARRAY_LEN_TYPE,
         val: InstData::Val(OwnedValue::U32(names.len() as u32)),
         offset: *offset,
     });
-    *offset += types::u32_io::size(0);
+    *offset += types::u32_io::type_size();
     for name in names {
         let id = key_hash(name);
         let name_value = OwnedValue::String((*name).to_owned());
@@ -190,7 +271,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK)), // Only put the mask cause we don't know the type
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let len = array.len();
             // Write array length
             ins.push(Instruction {
@@ -198,7 +279,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
             }
@@ -210,14 +291,14 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK | base_type.id())),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let len = array.len();
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
                 offset: *offset,
             });
-            *offset += types::u32_io::size(0);
+            *offset += types::u32_io::type_size();
             let array_size = array.size();
             ins.push(Instruction {
                 data_type: base_type,
@@ -239,7 +320,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(NULL_PLACEHOLDER)),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
         }
         _ => {
             // Primitives
@@ -249,7 +330,7 @@ pub fn plan_write_dynamic_value<'a>(
                 val: InstData::Val(OwnedValue::U8(ty.id())),
                 offset: *offset,
             });
-            *offset += types::u8_io::size(0);
+            *offset += types::u8_io::type_size();
             let value_size = types::get_vsize(ty, &value);
             ins.push(Instruction {
                 data_type: ty,
