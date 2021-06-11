@@ -160,7 +160,7 @@ pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> S
         return read_by_schema(ptr, schema);
     }
     if let Some(schema_fields) = &schema.fields.sub_fields {
-        let mut map = SharedMap::new();
+        let mut res = vec![];
         'SEARCH:
         for field in fields {
             if let Some(index_path) = schema.id_index.get(field) {
@@ -179,12 +179,12 @@ pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> S
                     if fields.len() == 1 {
                         return field_data;
                     } else {
-                        map.insert_key_id(field.name_id, field_data);
+                        res.push(field_data);
                     }
                 }
             }
         }
-        return SharedValue::Map(map)
+        return SharedValue::Array(res)
     }
     SharedValue::Null
 }

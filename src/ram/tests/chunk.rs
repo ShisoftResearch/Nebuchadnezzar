@@ -133,12 +133,11 @@ pub fn cell_rw() {
         assert_eq!(stored_cell.data["name"].string().unwrap(), "John");
     }
     {
-        let sel_cell = chunks.read_selected(&id2, &[
-            hash_str("score"),
-            hash_str("name")
-        ]).unwrap();
-        assert_eq!(sel_cell["score"].u64().unwrap(), &100);
-        assert_eq!(sel_cell["name"].string().unwrap(), "John");
+        let sel_cell = chunks
+            .read_selected(&id2, &[hash_str("score"), hash_str("name")])
+            .unwrap();
+        assert_eq!(sel_cell[0usize].u64().unwrap(), &100);
+        assert_eq!(sel_cell[1usize].string().unwrap(), "John");
     }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());
@@ -155,7 +154,7 @@ pub fn simple_cell_rw() {
     schemas.new_schema(schema.clone());
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
-        data
+        data,
     };
     let chunks = Chunks::new(
         1,
@@ -163,7 +162,7 @@ pub fn simple_cell_rw() {
         Arc::new(ServerMeta { schemas }),
         None,
         None,
-        None
+        None,
     );
     chunks.write_cell(&mut cell).unwrap();
     {
@@ -188,11 +187,11 @@ pub fn array_dyn_map() {
                 false,
                 false,
                 None,
-                vec![]
+                vec![],
             ),
-            dyn_map_field("dynamic")
+            dyn_map_field("dynamic"),
         ]),
-        vec![]
+        vec![],
     );
     let schema = Schema::new("array_dyn_map", None, fields, false, true);
     let schemas = LocalSchemasCache::new_local("");
@@ -203,7 +202,7 @@ pub fn array_dyn_map() {
         Arc::new(ServerMeta { schemas }),
         None,
         None,
-        None
+        None,
     );
     let data = data_map_value!(
         fixed: OwnedValue::U32(42),
@@ -211,7 +210,7 @@ pub fn array_dyn_map() {
     );
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
-        data
+        data,
     };
     chunks.write_cell(&mut cell).unwrap();
     {
@@ -234,7 +233,7 @@ pub fn complex_cell_sel_read() {
         Arc::new(ServerMeta { schemas }),
         None,
         None,
-        None
+        None,
     );
     let data = data_map_value!(
         id: OwnedValue::I64(128),
@@ -269,12 +268,74 @@ pub fn complex_cell_sel_read() {
     );
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
-        data
+        data,
     };
     chunks.write_cell(&mut cell).unwrap();
     {
         let read_cell = chunks.read_cell(&id1).unwrap().to_owned();
-        assert_eq!(cell.data, read_cell.data);
+        assert_eq!(read_cell.data, cell.data);
+    }
+    {
+        // Basic select case
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("id"),
+            String::from("num")
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell[0usize], &cell["id"]);
+        assert_eq!(&partial_cell[1usize], &cell["num"]);
+    }
+    {
+        // Selecting one in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub1"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub1"]);
+    }
+    {
+        // Selecting one array in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub2"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub2"]);
+    }
+    {
+        // Selecting one string in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub3"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub3"]);
+    }
+    {
+        // Selecting one map array in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub4"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub4"]);
+    }
+    {
+        // Selecting one deeper in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub4|sub4sub1"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub1"]);
+    }
+    {
+        // Selecting one deeper nullable array in nested map
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub4|sub4sub3"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub3"]);
+    }
+    {
+        // Selecting multiple
+        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
+            String::from("sub|sub3"),
+            String::from("sub|sub4|sub4sub3"),
+        ])).unwrap().owned();
+        assert_eq!(&partial_cell, &OwnedValue::Array(vec![
+            cell["sub"]["sub3"].clone(),
+            cell["sub"]["sub4"]["sub4sub3"].clone()
+        ]));
     }
 }
 
@@ -299,6 +360,6 @@ fn dyn_map_value() -> OwnedValue {
                 21, 22
             ])),
             sub5sub4: OwnedValue::U16(23)
-        )
+        ),
     ])
 }

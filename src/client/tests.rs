@@ -116,7 +116,8 @@ pub async fn general() {
                         .await?
                         .unwrap();
                     let mut score = *cell.data["score"].u64().unwrap();
-                    assert_eq!(selected["score"].u64().unwrap(), &score);
+                    let selected_score = &selected[0usize];
+                    assert_eq!(selected_score.u64().unwrap(), &score);
                     score += 1;
                     let mut data = cell.data.Map().unwrap().clone();
                     data.insert(&String::from("score"), OwnedValue::U64(score));
@@ -129,7 +130,8 @@ pub async fn general() {
                         )
                         .await?
                         .unwrap();
-                    assert_eq!(selected["score"].u64().unwrap(), &score);
+                    let selected_score = &selected[0usize];
+                    assert_eq!(selected_score.u64().unwrap(), &score);
 
                     let header = txn.head(cell.id()).await?.unwrap();
                     assert_eq!(header.id(), cell.id());
