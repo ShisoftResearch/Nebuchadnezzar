@@ -12,7 +12,7 @@ use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 
-use super::schema::ReadingSchema;
+use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 
@@ -223,7 +223,7 @@ pub struct SharedCellData {
 
 impl SharedCellData {
     //TODO: check or set checksum from crc32c cell content
-    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, ReadingSchema), ReadError> {
+    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
@@ -288,7 +288,7 @@ impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
         guard: WordMutexGuard<'a>,
         chunk: &'a Chunk,
-    ) -> Result<(Self, ReadingSchema<'a>), (ReadError, WordMutexGuard<'a>)> {
+    ) -> Result<(Self, SchemaRef), (ReadError, WordMutexGuard<'a>)> {
         let ptr = *guard;
         match SharedCellData::from_chunk_raw(ptr, chunk) {
             Ok((data, schema)) => {

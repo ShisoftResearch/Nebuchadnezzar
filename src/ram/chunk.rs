@@ -1,5 +1,5 @@
 use crate::ram::entry::{Entry, EntryContent, EntryType};
-use crate::ram::schema::{LocalSchemasCache, ReadingSchema};
+use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
 use crate::ram::types::{Id, SharedValue};
@@ -209,7 +209,7 @@ impl Chunk {
     pub fn write_cell_to_chunk(
         &self,
         cell: &mut OwnedCell,
-    ) -> Result<(usize, ReadingSchema), WriteError> {
+    ) -> Result<(usize, SchemaRef), WriteError> {
         let schema_id = cell.header.schema;
         if let Some(schema) = self.meta.schemas.get(&schema_id) {
             Ok((cell.write_to_chunk_with_schema(self, &*schema)?, schema))

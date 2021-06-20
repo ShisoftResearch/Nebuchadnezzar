@@ -163,26 +163,27 @@ pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> S
         let mut res = vec![];
         'SEARCH:
         for field in fields {
-            if let Some(index_path) = schema.id_index.get(field) {
-                if index_path.is_empty() {
-                    continue;
-                } 
-                if let Some(mut field) = schema_fields.get(index_path[0]) {
-                    for i in index_path.iter().skip(1) {
-                        if let Some(Some(sub_field)) = field.sub_fields.as_ref().map(|sub| sub.get(*i)) {
-                            field = sub_field;
+            if let Some(index_path) = schema.field_index.get(field) {
+                if !index_path.is_empty() { 
+                    if let Some(mut field) = schema_fields.get(index_path[0]) {
+                        for i in index_path.iter().skip(1) {
+                            if let Some(Some(sub_field)) = field.sub_fields.as_ref().map(|sub| sub.get(*i)) {
+                                field = sub_field;
+                            } else {
+                                break;
+                            }
+                        }
+                        let field_data = read_field(ptr, field, false, &mut tail_offset);
+                        if fields.len() == 1 {
+                            return field_data;
                         } else {
+                            res.push(field_data);
                             continue 'SEARCH;
                         }
                     }
-                    let field_data = read_field(ptr, field, false, &mut tail_offset);
-                    if fields.len() == 1 {
-                        return field_data;
-                    } else {
-                        res.push(field_data);
-                    }
                 }
             }
+            res.push(SharedValue::Null);
         }
         return SharedValue::Array(res)
     }
