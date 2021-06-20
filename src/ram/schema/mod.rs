@@ -25,7 +25,8 @@ pub struct Schema {
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
-    pub id_index: HashMap<u64, Vec<usize>>,
+    pub field_index: HashMap<u64, Vec<usize>>,
+    pub id_index: HashMap<u64, Vec<u64>>,
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
@@ -49,8 +50,9 @@ impl Schema {
         is_scannable: bool,
     ) -> Schema {
         let mut bound = 0;
+        let mut field_index = HashMap::new();
         let mut id_index = HashMap::new();
-        fields.assign_offsets(&mut bound, &mut id_index, String::new(), vec![]);
+        fields.assign_offsets(&mut bound, &mut field_index, &mut id_index, String::new(), vec![], vec![]);
         trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
@@ -64,7 +66,8 @@ impl Schema {
             fields,
             is_dynamic,
             is_scannable,
-            id_index,
+            field_index,
+            id_index
         }
     }
     pub fn new_with_id(
@@ -116,9 +119,11 @@ impl Field {
     fn assign_offsets(
         &mut self,
         offset: &mut usize,
-        id_index: &mut HashMap<u64, Vec<usize>>,
+        field_index: &mut HashMap<u64, Vec<usize>>,
+        id_index: &mut HashMap<u64, Vec<u64>>,
         name_path: String,
         field_path: Vec<usize>,
+        id_path: Vec<u64>
     ) {
         const POINTER_SIZE: usize = mem::size_of::<u32>();
         self.offset = Some(*offset);
@@ -138,9 +143,11 @@ impl Field {
             };
             subs.iter_mut().enumerate().for_each(|(i, f)| {
                 let mut new_path = field_path.clone();
+                let mut new_id = id_path.clone();
                 new_path.push(i);
+                new_id.push(f.name_id);
                 let new_name_path = format!("{}{}", format_name, f.name);
-                f.assign_offsets(offset, id_index, new_name_path, new_path);
+                f.assign_offsets(offset, field_index, id_index, new_name_path, new_path, new_id);
             });
         } else {
             if !is_field_var {
@@ -150,7 +157,10 @@ impl Field {
             }
         }
         if !field_path.is_empty() {
-            id_index.insert(name_path_hash, field_path);
+            field_index.insert(name_path_hash, field_path);
+        }
+        if !id_path.is_empty() {
+            id_index.insert(name_path_hash, id_path);
         }
         trace!(
             "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
