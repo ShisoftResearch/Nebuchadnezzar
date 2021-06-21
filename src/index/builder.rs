@@ -59,7 +59,6 @@ pub enum IndexComps {
 }
 
 pub struct IndexRes {
-    fields: FieldName,
     meta: Vec<IndexMeta>,
 }
 
@@ -231,112 +230,86 @@ impl IndexBuilder {
 
 pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
-    probe_field_indices(
-        cell,
-        &"".to_string(),
-        &schema.fields,
-        schema.id,
-        cell.data(),
-        &mut res,
-    );
+    schema.field_index.iter().for_each(|(field_id, indices)| {
+        if let Some(id_path) = schema.id_index.get(field_id) {
+            let value = cell.data().get_in_by_ids(id_path);
+            let mut components = vec![];
+            if let Some(array_data_size) = value.prim_array_data_size() {
+                for index in indices {
+                    match index {
+                        &IndexType::Ranged => components.append(
+                            &mut value
+                                .features()
+                                .into_iter()
+                                .map(|vec| IndexComps::Ranged(vec))
+                                .collect(),
+                        ),
+                        &IndexType::Hashed => components.append(
+                            &mut value
+                                .hashes()
+                                .into_iter()
+                                .map(|vec| IndexComps::Hashed(vec))
+                                .collect(),
+                        ),
+                        &IndexType::Vectorized => components.append(
+                            &mut value
+                                .features()
+                                .into_iter()
+                                .map(|vec| IndexComps::Vectorized(vec, array_data_size))
+                                .collect(),
+                        ),
+                        &IndexType::Statistics => {}
+                    }
+                }
+            } else {
+                for index in indices {
+                    match index {
+                        &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
+                        &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                        &IndexType::Vectorized => components.push(IndexComps::Vectorized(
+                            value.feature(),
+                            value.base_size() as u8,
+                        )),
+                        &IndexType::Statistics => {}
+                    }
+                }
+            }
+            let mut metas = vec![];
+            let cell_id = cell.id();
+            for comp in components {
+                match comp {
+                    IndexComps::Hashed(feat) => {
+                        if feat == UNSETTLED {
+                            continue;
+                        }
+                        let hash_id = Id::from_obj(&(schema.id, field_id, feat));
+                        metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
+                    }
+                    IndexComps::Ranged(feat) => {
+                        if feat == UNSETTLED {
+                            continue;
+                        }
+                        let field = field_id;
+                        let key = EntryKey::from_props(&cell_id, &feat, field, schema.id);
+                        metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
+                    }
+                    IndexComps::Vectorized(feat, size) => {
+                        if feat == UNSETTLED {
+                            continue;
+                        }
+                        metas.push(IndexMeta::Vectorized(VectorizedMeta {
+                            cell_id,
+                            feature: feat,
+                            data_width: size,
+                            cell_ver: cell.header().version,
+                        }));
+                    }
+                }
+            }
+            res.push(IndexRes {
+                meta: metas,
+            });
+        }
+    });
     res
-}
-
-fn probe_field_indices(
-    cell: &dyn Cell,
-    fields_name: &FieldName,
-    field: &Field,
-    schema_id: u32,
-    value: &dyn Value,
-    res: &mut Vec<IndexRes>,
-) {
-    if let &Some(ref fields) = &field.sub_fields {
-        for field in fields {
-            let value = &value.index_of(field.name_id as usize);
-            let field_name = format!("{} -> {}", fields_name, field.name);
-            probe_field_indices(cell, &field_name, field, schema_id, *value, res);
-        }
-    } else {
-        let mut components = vec![];
-        if let Some(ref array) = value.uni_array() {
-            for sub_val in array {
-                probe_field_indices(cell, &fields_name, field, schema_id, *sub_val, res);
-            }
-        } else if let Some(array_data_size) = value.prim_array_data_size() {
-            for index in &field.indices {
-                match index {
-                    &IndexType::Ranged => components.append(
-                        &mut value
-                            .features()
-                            .into_iter()
-                            .map(|vec| IndexComps::Ranged(vec))
-                            .collect(),
-                    ),
-                    &IndexType::Hashed => components.append(
-                        &mut value
-                            .hashes()
-                            .into_iter()
-                            .map(|vec| IndexComps::Hashed(vec))
-                            .collect(),
-                    ),
-                    &IndexType::Vectorized => components.append(
-                        &mut value
-                            .features()
-                            .into_iter()
-                            .map(|vec| IndexComps::Vectorized(vec, array_data_size))
-                            .collect(),
-                    ),
-                    &IndexType::Statistics => {}
-                }
-            }
-        } else {
-            for index in &field.indices {
-                match index {
-                    &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
-                    &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
-                    &IndexType::Vectorized => components.push(IndexComps::Vectorized(
-                        value.feature(),
-                        value.base_size() as u8,
-                    )),
-                    &IndexType::Statistics => {}
-                }
-            }
-        }
-        let mut metas = vec![];
-        let cell_id = cell.id();
-        for comp in components {
-            match comp {
-                IndexComps::Hashed(feat) => {
-                    if feat == UNSETTLED {
-                        continue;
-                    }
-                    let hash_id = Id::from_obj(&(schema_id, fields_name.clone(), feat));
-                    metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
-                }
-                IndexComps::Ranged(feat) => {
-                    if feat == UNSETTLED {
-                        continue;
-                    }
-                    let field = hash_str(&fields_name);
-                    let key = EntryKey::from_props(&cell_id, &feat, field, schema_id);
-                    metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
-                }
-                IndexComps::Vectorized(feat, size) => {
-                    if feat == UNSETTLED {
-                        continue;
-                    }
-                    metas.push(IndexMeta::Vectorized(VectorizedMeta {
-                        cell_id,
-                        feature: feat,
-                        data_width: size,
-                        cell_ver: cell.header().version,
-                    }));
-                }
-            }
-        }
-        res.push(IndexRes {
-            fields: fields_name.clone(),
-            meta: metas,
-        });
-    }
 }
