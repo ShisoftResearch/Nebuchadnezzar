@@ -3,10 +3,10 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
-use std::collections::HashMap;
-use std::sync::atomic::AtomicU32;
 use lightning::map::{HashMap as LFHashMap, Map, ObjectMap};
+use std::collections::HashMap;
 use std::mem;
+use std::sync::atomic::AtomicU32;
 
 use super::types;
 use core::borrow::Borrow;
@@ -27,13 +27,14 @@ pub struct Schema {
     pub str_key_field: Option<Vec<String>>,
     pub field_index: HashMap<u64, Vec<usize>>,
     pub id_index: HashMap<u64, Vec<u64>>,
+    pub index_fields: HashMap<u64, Vec<IndexType>>,
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
     pub is_scannable: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexType {
     Ranged,
     Hashed,
@@ -52,7 +53,16 @@ impl Schema {
         let mut bound = 0;
         let mut field_index = HashMap::new();
         let mut id_index = HashMap::new();
-        fields.assign_offsets(&mut bound, &mut field_index, &mut id_index, String::new(), vec![], vec![]);
+        let mut index_fields = HashMap::new();
+        fields.assign_offsets(
+            &mut bound,
+            &mut field_index,
+            &mut id_index,
+            &mut index_fields,
+            String::new(),
+            vec![],
+            vec![],
+        );
         trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
@@ -67,7 +77,8 @@ impl Schema {
             is_dynamic,
             is_scannable,
             field_index,
-            id_index
+            id_index,
+            index_fields,
         }
     }
     pub fn new_with_id(
@@ -121,9 +132,10 @@ impl Field {
         offset: &mut usize,
         field_index: &mut HashMap<u64, Vec<usize>>,
         id_index: &mut HashMap<u64, Vec<u64>>,
+        index_fields: &mut HashMap<u64, Vec<IndexType>>,
         name_path: String,
         field_path: Vec<usize>,
-        id_path: Vec<u64>
+        id_path: Vec<u64>,
     ) {
         const POINTER_SIZE: usize = mem::size_of::<u32>();
         self.offset = Some(*offset);
@@ -147,7 +159,15 @@ impl Field {
                 new_path.push(i);
                 new_id.push(f.name_id);
                 let new_name_path = format!("{}{}", format_name, f.name);
-                f.assign_offsets(offset, field_index, id_index, new_name_path, new_path, new_id);
+                f.assign_offsets(
+                    offset,
+                    field_index,
+                    id_index,
+                    index_fields,
+                    new_name_path,
+                    new_path,
+                    new_id,
+                );
             });
         } else {
             if !is_field_var {
@@ -161,6 +181,9 @@ impl Field {
         }
         if !id_path.is_empty() {
             id_index.insert(name_path_hash, id_path);
+            if !self.indices.is_empty() {
+                index_fields.insert(name_path_hash, self.indices.clone());
+            }
         }
         trace!(
             "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
@@ -273,9 +296,13 @@ impl SchemasMap {
         self.name_map.get(&name.to_string()).map(|id| id as u32)
     }
     fn next_id(&mut self) -> u32 {
-        let mut id = self.id_counter.fetch_and(1, std::sync::atomic::Ordering::AcqRel);
+        let mut id = self
+            .id_counter
+            .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
         while self.schema_map.contains_key(&(id as usize)) {
-            id = self.id_counter.fetch_and(1, std::sync::atomic::Ordering::AcqRel)
+            id = self
+                .id_counter
+                .fetch_and(1, std::sync::atomic::Ordering::AcqRel)
         }
         id
     }
@@ -283,9 +310,7 @@ impl SchemasMap {
         self.schema_map
             .entries()
             .iter()
-            .map(|(_, s_ref)| {
-                (**s_ref).clone()
-            })
+            .map(|(_, s_ref)| (**s_ref).clone())
             .collect()
     }
     fn load_from_list(&mut self, data: Vec<Schema>) {
