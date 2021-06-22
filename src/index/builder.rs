@@ -230,7 +230,7 @@ impl IndexBuilder {
 
 pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
-    schema.field_index.iter().for_each(|(field_id, indices)| {
+    schema.index_fields.iter().for_each(|(field_id, indices)| {
         if let Some(id_path) = schema.id_index.get(field_id) {
             let value = cell.data().get_in_by_ids(id_path);
             let mut components = vec![];
@@ -289,8 +289,7 @@ pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
                         if feat == UNSETTLED {
                             continue;
                         }
-                        let field = field_id;
-                        let key = EntryKey::from_props(&cell_id, &feat, field, schema.id);
+                        let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.id);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }
                     IndexComps::Vectorized(feat, size) => {
