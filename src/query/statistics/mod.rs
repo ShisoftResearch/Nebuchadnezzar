@@ -91,7 +91,9 @@ impl ChunkStatistics {
                                             .push(val.feature());
                                     }
                                     *sizes.entry(schema_id).or_insert(0) += cell_size;
-                                    *segs.entry(schema_id).or_insert(0) += 1;
+                                    segs.entry(schema_id)
+                                        .or_insert_with(|| HashSet::new())
+                                        .insert(cell_seg);
                                 }
                             } else {
                                 warn!("Cannot get schema {} for statistics", schema_id);
@@ -151,7 +153,7 @@ impl ChunkStatistics {
                     *sid,
                     partitations
                         .iter()
-                        .map(|(_, segs, _)| segs.get(sid).unwrap_or(&0))
+                        .map(|(_, segs, _)| segs.get(sid).map(|set| set.len()).unwrap_or(0))
                         .sum::<usize>(),
                 )
             })
@@ -171,14 +173,16 @@ impl ChunkStatistics {
                         .flatten()
                         .dedup()
                         .collect::<Vec<_>>();
-                    field_ids.iter().map(|field_id| {
-                        let schema_field_histograms = parted_histos
-                            .iter()
-                            .map(|histo_map| &histo_map[field_id])
-                            .collect_vec();
-                        (**field_id, build_histogram(schema_field_histograms))
-                    })
-                    .collect::<HashMap<u64, Vec<HistogramKey>>>()
+                    field_ids
+                        .par_iter()
+                        .map(|field_id| {
+                            let schema_field_histograms = parted_histos
+                                .iter()
+                                .map(|histo_map| &histo_map[field_id])
+                                .collect_vec();
+                            (**field_id, build_histogram(schema_field_histograms))
+                        })
+                        .collect::<HashMap<u64, Vec<HistogramKey>>>()
                 })
             })
             .collect::<HashMap<_, _>>();
