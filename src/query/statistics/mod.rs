@@ -197,32 +197,39 @@ fn build_histogram(
     // Build the approximated histogram from partitation histograms
     // https://arxiv.org/abs/1606.05633
     let mut part_idxs = vec![0; partitations.len()];
-    let num_total = partitations.iter().map(|(_, num, _)| num).sum::<usize>();
-    let part_depths = partitations.iter().map(|(_, _, depth)| *depth).collect_vec();
-    let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
     let part_histos = partitations
         .iter()
         .map(|(histo, _, _)| histo)
         .filter(|histo| !histo.is_empty())
         .collect_vec();
+    let num_total = partitations.iter().map(|(_, num, _)| num).sum::<usize>();
+    let part_depths = partitations
+        .iter()
+        .map(|(_, _, depth)| *depth)
+        .collect_vec();
+    let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
     let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
     // Perform a merge sort for sorted pre-histogram
     let mut filled = target_width;
     let mut last_key = Default::default();
-    'HISTO_CONST:
-    for i in 0..HISTOGRAM_PARTITATION_BUCKETS {
+    'HISTO_CONST: for i in 0..HISTOGRAM_PARTITATION_BUCKETS {
         loop {
-            let (key, ended) = if let Some((part_idx, histo)) =
-                part_histos.iter().enumerate().filter(|(i, h)| {
+            let (key, ended) = if let Some((part_idx, histo)) = part_histos
+                .iter()
+                .enumerate()
+                .filter(|(i, h)| {
                     let idx = part_idxs[*i];
                     idx < h.len()
-                }).min_by(|(i1, h1), (i2, h2)| {
+                })
+                .min_by(|(i1, h1), (i2, h2)| {
                     let h1_idx = part_idxs[*i1];
                     let h2_idx = part_idxs[*i2];
                     h1[h1_idx].cmp(&h2[h2_idx])
-                }) {
+                }) 
+            {
+                let histo_idx = part_idxs[part_idx];
                 part_idxs[part_idx] += 1;
-                ((histo[part_idx], part_idx), false)
+                ((histo[histo_idx], part_idx), false)
             } else {
                 (last_key, true)
             };
