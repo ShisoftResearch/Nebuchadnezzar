@@ -32,6 +32,8 @@ pub struct ChunkStatistics {
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_DEPTH: usize = 128;
 
+type HistogramKey = [u8; 8];
+
 impl ChunkStatistics {
     pub fn from_chunk(chunk: &Chunk) -> Self {
         let histogram_partitations = chunk
@@ -89,7 +91,7 @@ impl ChunkStatistics {
                                             .push(val.feature());
                                     }
                                     *sizes.entry(schema_id).or_insert(0) += cell_size;
-                                    *segs.entry(schema_id).or_insert_with(0) += 1;
+                                    *segs.entry(schema_id).or_insert(0) += 1;
                                 }
                             } else {
                                 warn!("Cannot get schema {} for statistics", schema_id);
@@ -115,7 +117,7 @@ impl ChunkStatistics {
                                 if histogram.last().unwrap() != last_item {
                                     histogram.push(*last_item);
                                 }
-                                (field, histogram)
+                                (field, (histogram, items.len(), depth))
                             })
                             .collect::<HashMap<_, _>>();
                         (schema_id, compiled_histograms)
@@ -138,7 +140,7 @@ impl ChunkStatistics {
                     partitations
                         .iter()
                         .map(|(sizes, _, _)| sizes.get(sid).unwrap_or(&0))
-                        .sum(),
+                        .sum::<usize>(),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -150,11 +152,40 @@ impl ChunkStatistics {
                     partitations
                         .iter()
                         .map(|(_, segs, _)| segs.get(sid).unwrap_or(&0))
-                        .sum(),
+                        .sum::<usize>(),
                 )
             })
             .collect::<HashMap<_, _>>();
-        
+        let empty_histo = Default::default();
+        let schema_histograms = schema_ids
+            .iter()
+            .map(|sid| {
+                (*sid, {
+                    let parted_histos = partitations
+                        .iter()
+                        .map(|(_, _, histo)| histo.get(sid).unwrap_or(&empty_histo))
+                        .collect_vec();
+                    let field_ids = parted_histos
+                        .iter()
+                        .map(|histo_map| histo_map.keys())
+                        .flatten()
+                        .dedup()
+                        .collect::<Vec<_>>();
+                    field_ids.iter().map(|field_id| {
+                        let schema_field_histograms = parted_histos
+                            .iter()
+                            .map(|histo_map| &histo_map[field_id])
+                            .collect_vec();
+                        (**field_id, build_histogram(schema_field_histograms))
+                    })
+                    .collect::<HashMap<u64, Vec<HistogramKey>>>()
+                })
+            })
+            .collect::<HashMap<_, _>>();
         unimplemented!()
     }
+}
+
+fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> Vec<HistogramKey> {
+    unimplemented!()
 }
