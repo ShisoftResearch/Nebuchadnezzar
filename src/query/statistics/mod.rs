@@ -30,7 +30,8 @@ pub struct ChunkStatistics {
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
-const HISTOGRAM_PARTITATION_DEPTH: usize = 128;
+const HISTOGRAM_PARTITATION_BUCKETS: usize = 256;
+const HISTOGRAM_TARGET_BUCKETS: usize = 100;
 
 type HistogramKey = [u8; 8];
 
@@ -111,8 +112,8 @@ impl ChunkStatistics {
                             .into_iter()
                             .map(|(field, mut items)| {
                                 items.sort();
-                                let depth = items.len() / HISTOGRAM_PARTITATION_DEPTH;
-                                let mut histogram = (0..HISTOGRAM_PARTITATION_DEPTH)
+                                let depth = items.len() / HISTOGRAM_PARTITATION_BUCKETS;
+                                let mut histogram = (0..HISTOGRAM_PARTITATION_BUCKETS)
                                     .map(|tile| items[tile * depth])
                                     .collect_vec();
                                 let last_item = &items[items.len() - 1];
@@ -182,7 +183,7 @@ impl ChunkStatistics {
                                 .collect_vec();
                             (**field_id, build_histogram(schema_field_histograms))
                         })
-                        .collect::<HashMap<u64, Vec<HistogramKey>>>()
+                        .collect::<HashMap<u64, _>>()
                 })
             })
             .collect::<HashMap<_, _>>();
@@ -190,6 +191,50 @@ impl ChunkStatistics {
     }
 }
 
-fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> Vec<HistogramKey> {
-    unimplemented!()
+fn build_histogram(
+    partitations: Vec<&(Vec<HistogramKey>, usize, usize)>,
+) -> [HistogramKey; HISTOGRAM_TARGET_BUCKETS + 1] {
+    // Build the approximated histogram from partitation histograms
+    // https://arxiv.org/abs/1606.05633
+    let mut part_idxs = vec![0; partitations.len()];
+    let num_total = partitations.iter().map(|(_, num, _)| num).sum::<usize>();
+    let part_depths = partitations.iter().map(|(_, _, depth)| *depth).collect_vec();
+    let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
+    let part_histos = partitations
+        .iter()
+        .map(|(histo, _, _)| histo)
+        .filter(|histo| !histo.is_empty())
+        .collect_vec();
+    let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
+    // Perform a merge sort for sorted pre-histogram
+    let mut filled = target_width;
+    let mut last_key = Default::default();
+    'HISTO_CONST:
+    for i in 0..HISTOGRAM_PARTITATION_BUCKETS {
+        loop {
+            let (key, ended) = if let Some((part_idx, histo)) =
+                part_histos.iter().enumerate().filter(|(i, h)| {
+                    let idx = part_idxs[*i];
+                    idx < h.len()
+                }).min_by(|(i1, h1), (i2, h2)| {
+                    let h1_idx = part_idxs[*i1];
+                    let h2_idx = part_idxs[*i2];
+                    h1[h1_idx].cmp(&h2[h2_idx])
+                }) {
+                part_idxs[part_idx] += 1;
+                ((histo[part_idx], part_idx), false)
+            } else {
+                (last_key, true)
+            };
+            last_key = key;
+            let idx = last_key.1;
+            if filled >= target_width || ended {
+                target_histogram[i] = last_key.0;
+                filled = 0;
+                continue 'HISTO_CONST;
+            }
+            filled += part_depths[idx];
+        }
+    }
+    target_histogram
 }
