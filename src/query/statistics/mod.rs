@@ -12,21 +12,22 @@ use dovahkiin::types::{OwnedValue, SharedValue};
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},
     chunk::Chunk,
+    clock::now,
 };
 
 mod histogram;
 pub mod sm;
 
 pub struct SchemaStatistics {
-    histogram: HashMap<u64, [OwnedValue; 10]>,
-    count: usize,
-    segs: usize,
-    bytes: usize,
-    timestamp: u64,
+    pub histogram: HashMap<u64, [HistogramKey; HISTOGRAM_TARGET_BUCKETS + 1]>,
+    pub count: usize,
+    pub segs: usize,
+    pub bytes: usize,
+    pub timestamp: u32,
 }
 
 pub struct ChunkStatistics {
-    schemas: ObjectMap<Arc<SchemaStatistics>>,
+    pub schemas: ObjectMap<Arc<SchemaStatistics>>,
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
@@ -49,6 +50,7 @@ impl ChunkStatistics {
                 // Build exact histogram for each of the partitation and then approximate overall histogram
                 let mut sizes = HashMap::new();
                 let mut segs = HashMap::new();
+                let mut counts = HashMap::new();
                 let mut exact_accumlators = HashMap::new();
                 let partitation_size = partitation.len();
                 for (hash, _) in partitation {
@@ -91,6 +93,7 @@ impl ChunkStatistics {
                                             .or_insert_with(|| Vec::with_capacity(partitation_size))
                                             .push(val.feature());
                                     }
+                                    *counts.entry(schema_id).or_insert(0) += 1;
                                     *sizes.entry(schema_id).or_insert(0) += cell_size;
                                     segs.entry(schema_id)
                                         .or_insert_with(|| HashSet::new())
@@ -126,12 +129,12 @@ impl ChunkStatistics {
                         (schema_id, compiled_histograms)
                     })
                     .collect::<HashMap<_, _>>();
-                (sizes, segs, histograms)
+                (sizes, segs, counts, histograms)
             })
             .collect();
         let schema_ids: Vec<_> = partitations
             .iter()
-            .map(|(sizes, _, _)| sizes.keys())
+            .map(|(sizes, _, _, _)| sizes.keys())
             .flatten()
             .dedup()
             .collect();
@@ -142,7 +145,19 @@ impl ChunkStatistics {
                     *sid,
                     partitations
                         .iter()
-                        .map(|(sizes, _, _)| sizes.get(sid).unwrap_or(&0))
+                        .map(|(sizes, _, _, _)| sizes.get(sid).unwrap_or(&0))
+                        .sum::<usize>(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let total_counts = schema_ids
+            .iter()
+            .map(|sid| {
+                (
+                    *sid,
+                    partitations
+                        .iter()
+                        .map(|(_, _, counts, _)| counts.get(sid).unwrap_or(&0))
                         .sum::<usize>(),
                 )
             })
@@ -154,19 +169,19 @@ impl ChunkStatistics {
                     *sid,
                     partitations
                         .iter()
-                        .map(|(_, segs, _)| segs.get(sid).map(|set| set.len()).unwrap_or(0))
+                        .map(|(_, segs, _, _)| segs.get(sid).map(|set| set.len()).unwrap_or(0))
                         .sum::<usize>(),
                 )
             })
             .collect::<HashMap<_, _>>();
         let empty_histo = Default::default();
-        let schema_histograms = schema_ids
+        let mut schema_histograms = schema_ids
             .iter()
             .map(|sid| {
                 (*sid, {
                     let parted_histos = partitations
                         .iter()
-                        .map(|(_, _, histo)| histo.get(sid).unwrap_or(&empty_histo))
+                        .map(|(_, _, _, histo)| histo.get(sid).unwrap_or(&empty_histo))
                         .collect_vec();
                     let field_ids = parted_histos
                         .iter()
@@ -187,7 +202,22 @@ impl ChunkStatistics {
                 })
             })
             .collect::<HashMap<_, _>>();
-        unimplemented!()
+        let schema_statistics = ObjectMap::<Arc<SchemaStatistics>>::with_capacity(
+            schema_ids.capacity().next_power_of_two(),
+        );
+        for schema_id in schema_ids {
+            let statistics = SchemaStatistics {
+                histogram: schema_histograms.remove(&schema_id).unwrap(),
+                count: *total_counts.get(&schema_id).unwrap(),
+                segs: *total_segs.get(&schema_id).unwrap(),
+                bytes: *total_size.get(&schema_id).unwrap(),
+                timestamp: now(),
+            };
+            schema_statistics.insert(&(*schema_id as usize), Arc::new(statistics));
+        }
+        Self {
+            schemas: schema_statistics
+        }
     }
 }
 
@@ -225,8 +255,7 @@ fn build_histogram(
                     let h1_idx = part_idxs[*i1];
                     let h2_idx = part_idxs[*i2];
                     h1[h1_idx].cmp(&h2[h2_idx])
-                }) 
-            {
+                }) {
                 let histo_idx = part_idxs[part_idx];
                 part_idxs[part_idx] += 1;
                 ((histo[histo_idx], part_idx), false)
