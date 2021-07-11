@@ -30,7 +30,7 @@ pub struct ChunkStatistics {
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
-const HISTOGRAM_PARTITATION_BUCKETS: usize = 256;
+const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
 const HISTOGRAM_TARGET_BUCKETS: usize = 100;
 
 type HistogramKey = [u8; 8];
@@ -223,6 +223,9 @@ fn build_partitation_statistics(
 }
 
 fn build_partitation_histogram(mut items: Vec<HistogramKey>) -> (Vec<HistogramKey>, usize) {
+    if items.len() <= HISTOGRAM_PARTITATION_BUCKETS {
+        return (items, 1);
+    }
     items.sort();
     let depth = items.len() / HISTOGRAM_PARTITATION_BUCKETS;
     let mut histogram = (0..HISTOGRAM_PARTITATION_BUCKETS)
@@ -287,4 +290,47 @@ fn build_histogram(
         }
     }
     target_histogram
+}
+
+#[cfg(test)]
+mod tests {
+    use dovahkiin::types::OwnedValue;
+
+    use super::*;
+
+    #[test]
+    fn partitation_histogram() {
+        let small_set = (0..10).map(|n| OwnedValue::U64(n).feature()).collect_vec();
+        assert_eq!(
+            build_partitation_histogram(small_set.clone()),
+            (small_set, 1)
+        );
+        let eq_set = (0..HISTOGRAM_PARTITATION_BUCKETS)
+            .map(|n| OwnedValue::U64(n as u64).feature())
+            .collect_vec();
+        assert_eq!(
+            build_partitation_histogram(eq_set.clone()),
+            (eq_set, 1)
+        );
+
+        let double_set = (0..HISTOGRAM_PARTITATION_BUCKETS * 2)
+        .map(|n| OwnedValue::U64(n as u64).feature())
+        .collect_vec();
+        let mut expect = double_set.iter().step_by(2).cloned().collect_vec();
+        expect.push(double_set.last().unwrap().to_owned());
+        assert_eq!(
+            build_partitation_histogram(double_set),
+            (expect, 2)
+        );
+
+        let triple_set = (0..HISTOGRAM_PARTITATION_BUCKETS * 3)
+        .map(|n| OwnedValue::U64(n as u64).feature())
+        .collect_vec();
+        let mut expect = triple_set.iter().step_by(3).cloned().collect_vec();
+        expect.push(triple_set.last().unwrap().to_owned());
+        assert_eq!(
+            build_partitation_histogram(triple_set),
+            (expect, 3)
+        );
+    }
 }
