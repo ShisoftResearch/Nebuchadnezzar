@@ -45,7 +45,7 @@ impl ChunkStatistics {
             .collect_vec();
         let partitations: Vec<_> = histogram_partitations
             .into_par_iter()
-            .map(|partitation| build_partitation_histogram(partitation, chunk))
+            .map(|partitation| build_partitation_statistics(partitation, chunk))
             .collect();
         let schema_ids: Vec<_> = partitations
             .iter()
@@ -136,7 +136,7 @@ impl ChunkStatistics {
     }
 }
 
-fn build_partitation_histogram(
+fn build_partitation_statistics(
     partitation: Vec<(usize, usize)>,
     chunk: &Chunk,
 ) -> (
@@ -210,23 +210,29 @@ fn build_partitation_histogram(
         .map(|(schema_id, schema_histograms)| {
             let compiled_histograms = schema_histograms
                 .into_iter()
-                .map(|(field, mut items)| {
-                    items.sort();
-                    let depth = items.len() / HISTOGRAM_PARTITATION_BUCKETS;
-                    let mut histogram = (0..HISTOGRAM_PARTITATION_BUCKETS)
-                        .map(|tile| items[tile * depth])
-                        .collect_vec();
-                    let last_item = &items[items.len() - 1];
-                    if histogram.last().unwrap() != last_item {
-                        histogram.push(*last_item);
-                    }
-                    (field, (histogram, items.len(), depth))
+                .map(|(field, items)| {
+                    let num_items = items.len();
+                    let (histogram, depth) = build_partitation_histogram(items);
+                    (field, (histogram, num_items, depth))
                 })
                 .collect::<HashMap<_, _>>();
             (schema_id, compiled_histograms)
         })
         .collect::<HashMap<_, _>>();
     (sizes, segs, counts, histograms)
+}
+
+fn build_partitation_histogram(mut items: Vec<HistogramKey>) -> (Vec<HistogramKey>, usize) {
+    items.sort();
+    let depth = items.len() / HISTOGRAM_PARTITATION_BUCKETS;
+    let mut histogram = (0..HISTOGRAM_PARTITATION_BUCKETS)
+        .map(|tile| items[tile * depth])
+        .collect_vec();
+    let last_item = &items[items.len() - 1];
+    if histogram.last().unwrap() != last_item {
+        histogram.push(*last_item);
+    }
+    (histogram, depth)
 }
 
 fn build_histogram(
