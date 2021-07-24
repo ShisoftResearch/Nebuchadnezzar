@@ -254,12 +254,17 @@ fn build_histogram(
         .iter()
         .map(|(_, _, depth)| *depth)
         .collect_vec();
+    let max_key = partitations
+        .iter()
+        .filter_map(|(part, _, _)| part.last())
+        .max()
+        .unwrap();
     let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
     let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
     // Perform a merge sort for sorted pre-histogram
     let mut filled = target_width;
     let mut last_key = Default::default();
-    'HISTO_CONST: for i in 0..HISTOGRAM_PARTITATION_BUCKETS {
+    'HISTO_CONST: for i in 0..HISTOGRAM_TARGET_BUCKETS {
         loop {
             let (key, ended) = if let Some((part_idx, histo)) = part_histos
                 .iter()
@@ -289,6 +294,7 @@ fn build_histogram(
             filled += part_depths[idx];
         }
     }
+    target_histogram[HISTOGRAM_TARGET_BUCKETS] = max_key.clone();
     target_histogram
 }
 
@@ -308,29 +314,56 @@ mod tests {
         let eq_set = (0..HISTOGRAM_PARTITATION_BUCKETS)
             .map(|n| OwnedValue::U64(n as u64).feature())
             .collect_vec();
-        assert_eq!(
-            build_partitation_histogram(eq_set.clone()),
-            (eq_set, 1)
-        );
+        assert_eq!(build_partitation_histogram(eq_set.clone()), (eq_set, 1));
 
         let double_set = (0..HISTOGRAM_PARTITATION_BUCKETS * 2)
-        .map(|n| OwnedValue::U64(n as u64).feature())
-        .collect_vec();
+            .map(|n| OwnedValue::U64(n as u64).feature())
+            .collect_vec();
         let mut expect = double_set.iter().step_by(2).cloned().collect_vec();
         expect.push(double_set.last().unwrap().to_owned());
-        assert_eq!(
-            build_partitation_histogram(double_set),
-            (expect, 2)
-        );
+        assert_eq!(build_partitation_histogram(double_set), (expect, 2));
 
         let triple_set = (0..HISTOGRAM_PARTITATION_BUCKETS * 3)
-        .map(|n| OwnedValue::U64(n as u64).feature())
-        .collect_vec();
+            .map(|n| OwnedValue::U64(n as u64).feature())
+            .collect_vec();
         let mut expect = triple_set.iter().step_by(3).cloned().collect_vec();
         expect.push(triple_set.last().unwrap().to_owned());
-        assert_eq!(
-            build_partitation_histogram(triple_set),
-            (expect, 3)
-        );
+        assert_eq!(build_partitation_histogram(triple_set), (expect, 3));
+    }
+
+    #[test]
+    fn approximated_histogram() {
+        // Test with example from the paper
+        let histo_1 = vec![2, 7, 18, 25];
+        let histo_1_height = 4;
+
+        let histo_2 = vec![3, 15, 24, 30];
+        let histo_2_height = 5;
+
+        let test_data = vec![
+            (
+                histo_1
+                    .iter()
+                    .map(|n| OwnedValue::U64(*n).feature())
+                    .collect::<Vec<_>>(),
+                (histo_1.len() - 1) * histo_1_height,
+                histo_1_height,
+            ),
+            (
+                histo_2
+                    .iter()
+                    .map(|n| OwnedValue::U64(*n).feature())
+                    .collect::<Vec<_>>(),
+                (histo_2.len() - 1) * histo_2_height,
+                histo_2_height,
+            ),
+        ];
+        let histogram = build_histogram(test_data.iter().collect_vec());
+        let mut histogram_base = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
+        histogram_base[0] = OwnedValue::U64(2).feature();
+        histogram_base[1] = OwnedValue::U64(7).feature();
+        histogram_base[2] = OwnedValue::U64(18).feature();
+        histogram_base[3] = OwnedValue::U64(30).feature();
+        assert_eq!(histogram, histogram_base);
     }
 }
