@@ -3,6 +3,7 @@ use lightning::map::{Map, ObjectMap};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
+    iter,
     sync::Arc,
 };
 
@@ -18,7 +19,7 @@ mod histogram;
 pub mod sm;
 
 pub struct SchemaStatistics {
-    pub histogram: HashMap<u64, [HistogramKey; HISTOGRAM_TARGET_BUCKETS + 1]>,
+    pub histogram: HashMap<u64, TargetHistogram>,
     pub count: usize,
     pub segs: usize,
     pub bytes: usize,
@@ -32,8 +33,10 @@ pub struct ChunkStatistics {
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
 const HISTOGRAM_TARGET_BUCKETS: usize = 100;
+const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_PARTITATION_BUCKETS + 1;
 
 type HistogramKey = [u8; 8];
+type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
 
 impl ChunkStatistics {
     pub fn from_chunk(chunk: &Chunk) -> Self {
@@ -238,9 +241,11 @@ fn build_partitation_histogram(mut items: Vec<HistogramKey>) -> (Vec<HistogramKe
     (histogram, depth)
 }
 
-fn build_histogram(
-    partitations: Vec<&(Vec<HistogramKey>, usize, usize)>,
-) -> [HistogramKey; HISTOGRAM_TARGET_BUCKETS + 1] {
+fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> TargetHistogram {
+    let num_all_keys: usize = partitations.iter().map(|(h, _, _)| h.len()).sum();
+    if num_all_keys < HISTOGRAM_TARGET_KEYS {
+        return repeated_histogram(partitations);
+    }
     // Build the approximated histogram from partitation histograms
     // https://arxiv.org/abs/1606.05633
     let mut part_idxs = vec![0; partitations.len()];
@@ -260,7 +265,7 @@ fn build_histogram(
         .max()
         .unwrap();
     let target_width = num_total / HISTOGRAM_TARGET_BUCKETS;
-    let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
+    let mut target_histogram = [[0u8; 8]; HISTOGRAM_TARGET_KEYS];
     // Perform a merge sort for sorted pre-histogram
     let mut filled = target_width;
     let mut last_key = Default::default();
@@ -296,6 +301,39 @@ fn build_histogram(
     }
     target_histogram[HISTOGRAM_TARGET_BUCKETS] = max_key.clone();
     target_histogram
+}
+
+fn repeated_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> TargetHistogram {
+    let combined = partitations
+        .iter()
+        .map(|(histo, _, depth)| {
+            let depth = *depth;
+            histo.iter().map(move |k| (k, depth))
+        })
+        .flatten()
+        .sorted_by(|a, b| Ord::cmp(&a.0, &b.0))
+        .collect_vec();
+    let total_keys: usize = combined.iter().map(|(_, d)| *d).sum();
+    let repeat_ratio: f64 = HISTOGRAM_TARGET_KEYS as f64 / total_keys as f64;
+    let repeated = combined
+        .iter()
+        .map(|(k, d)| iter::repeat(*k).take((*d as f64 * repeat_ratio).ceil() as usize))
+        .flatten()
+        .collect_vec();
+    let mut histo = empty_target_histogram();
+    debug_assert!(repeated.len() >= histo.len());
+    histo
+        .iter_mut()
+        .zip(repeated.into_iter())
+        .for_each(|(h, k)| {
+            *h = *k;
+        });
+    *histo.last_mut().unwrap() = combined.last().unwrap().0.clone();
+    histo
+}
+
+fn empty_target_histogram() -> TargetHistogram {
+    [[0u8; 8]; HISTOGRAM_TARGET_KEYS]
 }
 
 #[cfg(test)]
@@ -359,11 +397,11 @@ mod tests {
             ),
         ];
         let histogram = build_histogram(test_data.iter().collect_vec());
-        let mut histogram_base = [[0u8; 8]; HISTOGRAM_TARGET_BUCKETS + 1];
-        histogram_base[0] = OwnedValue::U64(2).feature();
-        histogram_base[1] = OwnedValue::U64(7).feature();
-        histogram_base[2] = OwnedValue::U64(18).feature();
-        histogram_base[3] = OwnedValue::U64(30).feature();
-        assert_eq!(histogram, histogram_base);
+        let mut expect_histogram = empty_target_histogram();
+        expect_histogram[0] = OwnedValue::U64(2).feature();
+        expect_histogram[1] = OwnedValue::U64(7).feature();
+        expect_histogram[2] = OwnedValue::U64(18).feature();
+        expect_histogram[3] = OwnedValue::U64(30).feature();
+        assert_eq!(histogram, expect_histogram);
     }
 }
