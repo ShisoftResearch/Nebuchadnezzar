@@ -3,6 +3,7 @@
 #![feature(test)]
 #![feature(async_closure)]
 #![feature(backtrace)]
+#![feature(is_sorted)]
 
 extern crate static_assertions;
 #[macro_use]

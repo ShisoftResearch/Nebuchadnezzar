@@ -33,7 +33,7 @@ pub struct ChunkStatistics {
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
 const HISTOGRAM_TARGET_BUCKETS: usize = 100;
-const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_PARTITATION_BUCKETS + 1;
+const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
 
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
@@ -396,12 +396,23 @@ mod tests {
                 histo_2_height,
             ),
         ];
+        // Test for the repeatdly case
         let histogram = build_histogram(test_data.iter().collect_vec());
-        let mut expect_histogram = empty_target_histogram();
-        expect_histogram[0] = OwnedValue::U64(2).feature();
-        expect_histogram[1] = OwnedValue::U64(7).feature();
-        expect_histogram[2] = OwnedValue::U64(18).feature();
-        expect_histogram[3] = OwnedValue::U64(30).feature();
-        assert_eq!(histogram, expect_histogram);
+        assert!(histogram.is_sorted());
+        assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(30).feature());
+
+        let histo_1 = (0..1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
+        let histo_2 = (0..1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
+        let histo_3 = (0..=1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
+        let histo_1_height = histo_1.len();
+        let histo_2_height = histo_2.len();
+        let test_data = vec![
+            (histo_1, histo_1_height, 1),
+            (histo_2, histo_2_height, 2),
+            (histo_3, histo_2_height, 3)
+        ];
+        let histogram = build_histogram(test_data.iter().collect_vec());
+        assert!(histogram.is_sorted(), "Got {:?}", histogram);
+        assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(1024).feature());
     }
 }
