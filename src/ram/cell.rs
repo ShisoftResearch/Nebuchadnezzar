@@ -12,7 +12,7 @@ use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 
-use super::schema::ReadingSchema;
+use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 
@@ -223,8 +223,8 @@ pub struct SharedCellData {
 
 impl SharedCellData {
     //TODO: check or set checksum from crc32c cell content
-    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, ReadingSchema), ReadError> {
-        let (header, data_ptr) = header_from_chunk_raw(ptr)?;
+    pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
+        let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
@@ -288,7 +288,7 @@ impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
         guard: WordMutexGuard<'a>,
         chunk: &'a Chunk,
-    ) -> Result<(Self, ReadingSchema<'a>), (ReadError, WordMutexGuard<'a>)> {
+    ) -> Result<(Self, SchemaRef), (ReadError, WordMutexGuard<'a>)> {
         let ptr = *guard;
         match SharedCellData::from_chunk_raw(ptr, chunk) {
             Ok((data, schema)) => {
@@ -365,14 +365,14 @@ pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &EntryHead
     return header;
 }
 
-pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
+pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHeader), ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
     }
     let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
         assert_eq!(entry_header.entry_type, EntryType::CELL);
         let header = cell_header_from_entry_content_addr(addr, &entry_header);
-        (header, addr + CELL_HEADER_SIZE)
+        (header, addr + CELL_HEADER_SIZE, entry_header)
     });
     Ok(header)
 }
@@ -382,7 +382,7 @@ pub fn select_from_chunk_raw(
     chunk: &Chunk,
     fields: &[u64],
 ) -> Result<SharedValue, ReadError> {
-    let (header, data_ptr) = header_from_chunk_raw(ptr)?;
+    let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {
         Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))

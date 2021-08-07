@@ -116,8 +116,7 @@ pub async fn general() {
                         .await?
                         .unwrap();
                     let mut score = *cell.data["score"].u64().unwrap();
-                    let selected_score = &selected[0usize];
-                    assert_eq!(selected_score.u64().unwrap(), &score);
+                    assert_eq!(selected.u64(), Some(&score), "Selected value {:?}", selected);
                     score += 1;
                     let mut data = cell.data.Map().unwrap().clone();
                     data.insert(&String::from("score"), OwnedValue::U64(score));
@@ -130,8 +129,7 @@ pub async fn general() {
                         )
                         .await?
                         .unwrap();
-                    let selected_score = &selected[0usize];
-                    assert_eq!(selected_score.u64().unwrap(), &score);
+                    assert_eq!(selected.u64().unwrap(), &score);
 
                     let header = txn.head(cell.id()).await?.unwrap();
                     assert_eq!(header.id(), cell.id());
@@ -153,6 +151,7 @@ pub async fn general() {
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn multi_cell_update() {
+    let _ = env_logger::try_init();
     let server_group = "multi_cell_update_test";
     let server_addr = String::from("127.0.0.1:5401");
     let server = NebServer::new_from_opts(
@@ -188,7 +187,10 @@ pub async fn multi_cell_update() {
     );
     let thread_count = 100;
     let schema_id = schema.id;
-    client.new_schema(schema).await.unwrap();
+    client.new_schema_with_id(schema).await.unwrap();
+    let all_schemas = client.get_all_schema().await.unwrap();
+    assert!(!all_schemas.is_empty());
+    info!("Schema id {}, all schemas: {:?}", schema_id, all_schemas);
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));

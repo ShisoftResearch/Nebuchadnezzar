@@ -5,6 +5,7 @@ use crate::ram::types::{Id, OwnedValue};
 use crate::server::NebServer;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
+use itertools::Itertools;
 use lightning::map::{HashMap as LFMap, Map, ObjectMap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 // Use async mutex because this module is a distributed coordinator
@@ -147,15 +148,34 @@ impl Service for TransactionManager {
             if let Some(data_obj) = txn.data.get(&id) {
                 match data_obj.cell {
                     Some(ref cell) => {
-                        match cell.data {
-                            OwnedValue::Map(ref _map) => {
-                                return Ok(TxnExecResult::Accepted(cell.data.clone()));
-                            }
-                            _ => {
+                        let schema_id = cell.header.schema;
+                        if let Some(schema) = self.server.meta.schemas.get(&schema_id) {
+                            if let OwnedValue::Map(map) = &cell.data {
+                                let mut res = vec![];
+                                'SEARCH: for field in &fields {
+                                    if let Some(index_path) = schema.id_index.get(field) {
+                                        let path = index_path.iter().map(|id| *id as u64).collect_vec();
+                                        trace!("Get into map for txn select {:?}", path);
+                                        let val = map.get_in_by_ids(path.iter()).clone();
+                                        if fields.len() == 1 {
+                                            return Ok(TxnExecResult::Accepted(val));
+                                        } else {
+                                            res.push(val);
+                                            continue 'SEARCH;
+                                        }
+                                    }
+                                    res.push(OwnedValue::Null);
+                                }
+                                return Ok(TxnExecResult::Accepted(OwnedValue::Array(res)));
+                            } else {
                                 return Ok(TxnExecResult::Error(
                                     ReadError::CellTypeIsNotMapForSelect,
-                                ))
+                                ));
                             }
+                        } else {
+                            return Ok(TxnExecResult::Error(ReadError::SchemaDoesNotExisted(
+                                schema_id,
+                            )));
                         }
                     } // read from cache
                     None => return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted)),

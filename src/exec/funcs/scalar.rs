@@ -1,4 +1,5 @@
 use super::*;
+use std::ops::Rem;
 
 macro_rules! scalar_op {
     ($fn: ident, $in: expr) => {{
@@ -10,6 +11,7 @@ macro_rules! scalar_op {
                 + Sub<Output = T::Native>
                 + Mul<Output = T::Native>
                 + Div<Output = T::Native>
+                + Rem<Output = T::Native>
                 + Zero
                 + One,
         {

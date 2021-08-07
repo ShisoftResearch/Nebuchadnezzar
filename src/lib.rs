@@ -4,6 +4,7 @@
 #![feature(async_closure)]
 #![feature(backtrace)]
 #![feature(const_generics, const_evaluatable_checked)]
+#![feature(is_sorted)]
 
 extern crate static_assertions;
 #[macro_use]
