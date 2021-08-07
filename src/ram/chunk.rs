@@ -1,3 +1,4 @@
+use crate::query::statistics::ChunkStatistics;
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -15,7 +16,7 @@ use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -35,7 +36,8 @@ pub struct Chunk {
     pub gc_lock: Mutex<()>,
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
-    pub index_builder: Option<Arc<IndexBuilder>>,
+    pub index_builder: Option<Arc<IndexBuilder>>, 
+    pub statistics: ChunkStatistics
 }
 
 impl Chunk {
@@ -76,6 +78,7 @@ impl Chunk {
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()), // TODO: optimize this
+            statistics: ChunkStatistics::new()
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -249,6 +252,7 @@ impl Chunk {
             Some(mut guard) => {
                 *guard = cell_loc;
                 self.ensure_indices(cell, None, &*schema);
+                self.refresh_statistics();
             }
             None => return Err(WriteError::CellAlreadyExisted),
         }
@@ -279,6 +283,7 @@ impl Chunk {
             self.ensure_indices_with_res(cell, old_indices, &*schema);
             *guard = new_cell_loc;
             self.mark_dead_entry_with_cell(cell_location, cell);
+            self.refresh_statistics();
         } else {
             // Optimistic update will remove the new inserted one
             self.mark_dead_entry_with_cell(new_cell_loc, cell);
@@ -300,6 +305,7 @@ impl Chunk {
                 drop(guard);
                 self.ensure_indices_with_res(cell, old_indices, &*schema);
                 self.mark_dead_entry_with_cell(cell_location, cell);
+                self.refresh_statistics();
             } else {
                 let reservation = self.cell_index.try_insert_locked(hash as usize);
                 if let Some(mut guard) = reservation {
@@ -307,6 +313,7 @@ impl Chunk {
                     trace!("Cell {} does not exists, will insert for upsert", hash);
                     *guard = new_cell_loc;
                     self.ensure_indices(cell, None, &*schema);
+                    self.refresh_statistics();
                 } else {
                     trace!("Cell {} was not exists, but found exists, will try", hash);
                     continue;
@@ -350,6 +357,7 @@ impl Chunk {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
                         self.mark_dead_entry_with_cell(old_location, &new_cell);
+                        self.refresh_statistics();
                         return Ok(new_cell);
                     }
                 }
@@ -702,6 +710,11 @@ impl Chunk {
 
     pub fn count(&self) -> usize {
         self.cell_index.len()
+    }
+
+    #[inline]
+    fn refresh_statistics(&self) {
+       self.statistics.refresh_from_chunk(self) 
     }
 }
 

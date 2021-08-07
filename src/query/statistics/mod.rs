@@ -1,11 +1,7 @@
 use itertools::Itertools;
 use lightning::map::{Map, ObjectMap};
 use rayon::prelude::*;
-use std::{
-    collections::{HashMap, HashSet},
-    iter,
-    sync::Arc,
-};
+use std::{collections::{HashMap, HashSet}, iter, sync::{Arc, atomic::{AtomicU32, Ordering}}};
 
 use dovahkiin::types::SharedValue;
 
@@ -27,6 +23,7 @@ pub struct SchemaStatistics {
 }
 
 pub struct ChunkStatistics {
+    pub timestamp: AtomicU32,
     pub schemas: ObjectMap<Arc<SchemaStatistics>>,
 }
 
@@ -39,7 +36,18 @@ type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
 
 impl ChunkStatistics {
-    pub fn from_chunk(chunk: &Chunk) -> Self {
+    pub fn new() -> Self {
+        Self {
+            timestamp: AtomicU32::new(0),
+            schemas: ObjectMap::with_capacity(32),
+        }
+    }
+    pub fn refresh_from_chunk(&self, chunk: &Chunk) {
+        let last_update = self.timestamp.load(Ordering::Relaxed);
+        // Refresh rate 10 seconds
+        if now() - last_update < 10 {
+            return;
+        }
         let histogram_partitations = chunk
             .cell_index
             .entries()
@@ -120,9 +128,6 @@ impl ChunkStatistics {
                 })
             })
             .collect::<HashMap<_, _>>();
-        let schema_statistics = ObjectMap::<Arc<SchemaStatistics>>::with_capacity(
-            schema_ids.capacity().next_power_of_two(),
-        );
         for schema_id in schema_ids {
             let statistics = SchemaStatistics {
                 histogram: schema_histograms.remove(&schema_id).unwrap(),
@@ -131,10 +136,7 @@ impl ChunkStatistics {
                 bytes: *total_size.get(&schema_id).unwrap(),
                 timestamp: now(),
             };
-            schema_statistics.insert(&(*schema_id as usize), Arc::new(statistics));
-        }
-        Self {
-            schemas: schema_statistics,
+            self.schemas.insert(&(*schema_id as usize), Arc::new(statistics));
         }
     }
 }
