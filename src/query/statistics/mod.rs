@@ -24,6 +24,7 @@ pub struct SchemaStatistics {
 
 pub struct ChunkStatistics {
     pub timestamp: AtomicU32,
+    pub changes: AtomicU32,
     pub schemas: ObjectMap<Arc<SchemaStatistics>>,
 }
 
@@ -31,6 +32,7 @@ const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
 const HISTOGRAM_TARGET_BUCKETS: usize = 100;
 const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
+const REFRESH_CHANGES_THRESHOLD: u32 = 1024;
 
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
@@ -39,14 +41,19 @@ impl ChunkStatistics {
     pub fn new() -> Self {
         Self {
             timestamp: AtomicU32::new(0),
+            changes: AtomicU32::new(0),
             schemas: ObjectMap::with_capacity(32),
         }
     }
     pub fn refresh_from_chunk(&self, chunk: &Chunk) {
+        let num_cells = chunk.cell_index.len();
         let last_update = self.timestamp.load(Ordering::Relaxed);
+        let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed);
         // Refresh rate 10 seconds
-        if now() - last_update < 10 {
-            return;
+        if num_cells > REFRESH_CHANGES_THRESHOLD as usize {
+            if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < 10 {
+                return;
+            }
         }
         let histogram_partitations = chunk
             .cell_index
@@ -138,6 +145,7 @@ impl ChunkStatistics {
             };
             self.schemas.insert(&(*schema_id as usize), Arc::new(statistics));
         }
+        self.timestamp.store(now(), Ordering::Relaxed);
     }
 }
 
