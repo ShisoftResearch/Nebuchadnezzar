@@ -76,7 +76,7 @@ impl RangedQueryClient {
             .await
     }
 
-    pub async fn delete(&self, key: &EntryKey) -> Result<bool, RPCError> {
+    pub fn delete<'a>(&'a self, key: &'a EntryKey) -> impl Future<Output = Result<bool, RPCError>> + 'a {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id, epoch| {
@@ -84,10 +84,9 @@ impl RangedQueryClient {
             },
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
-        .await
     }
 
-    pub async fn insert(&self, key: &EntryKey) -> Result<bool, RPCError> {
+    pub fn insert<'a>(&'a self, key: &'a EntryKey) -> impl Future<Output = Result<bool, RPCError>> + 'a {
         self.run_on_destinated_tree(
             key,
             |key, client, tree_id, epoch| {
@@ -95,7 +94,6 @@ impl RangedQueryClient {
             },
             |action_res, _, _, _| future::ready(Ok(action_res)).boxed(),
         )
-        .await
     }
 
     pub async fn tree_stats(&self) -> Result<Vec<LSMTreeStat>, RPCError> {
