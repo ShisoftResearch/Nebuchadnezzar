@@ -11,7 +11,6 @@ use crate::ram::{
     clock::now,
 };
 
-mod histogram;
 pub mod sm;
 
 pub struct SchemaStatistics {

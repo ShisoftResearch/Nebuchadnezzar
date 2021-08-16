@@ -1,4 +1,4 @@
-use crate::query::statistics::ChunkStatistics;
+use crate::query::statistics::{ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -14,6 +14,7 @@ use crate::{
 use super::{io::reader, schema::Schema};
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
+use itertools::Itertools;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
 use parking_lot::{Mutex, RwLock};
@@ -36,8 +37,8 @@ pub struct Chunk {
     pub gc_lock: Mutex<()>,
     pub allocator: SegmentAllocator,
     pub alloc_lock: Mutex<()>,
-    pub index_builder: Option<Arc<IndexBuilder>>, 
-    pub statistics: ChunkStatistics
+    pub index_builder: Option<Arc<IndexBuilder>>,
+    pub statistics: ChunkStatistics,
 }
 
 impl Chunk {
@@ -78,7 +79,7 @@ impl Chunk {
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()), // TODO: optimize this
-            statistics: ChunkStatistics::new()
+            statistics: ChunkStatistics::new(),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -714,7 +715,7 @@ impl Chunk {
 
     #[inline]
     fn refresh_statistics(&self) {
-       self.statistics.refresh_from_chunk(self) 
+        self.statistics.refresh_from_chunk(self)
     }
 }
 
@@ -790,11 +791,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn read_selected(
-        &self,
-        key: &Id,
-        fields: &[u64],
-    ) -> Result<SharedValue, ReadError> {
+    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<SharedValue, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields);
     }
@@ -852,5 +849,12 @@ impl Chunks {
 
     pub fn count(&self) -> usize {
         self.list.iter().map(|c| c.count()).sum()
+    }
+
+    pub fn all_chunk_statistics(&self, schema_id: u32) -> Vec<Option<Arc<SchemaStatistics>>> {
+        self.list
+            .iter()
+            .map(|c| c.statistics.schemas.get(&(schema_id as usize)))
+            .collect_vec()
     }
 }

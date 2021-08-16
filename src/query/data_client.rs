@@ -6,7 +6,7 @@ use dovahkiin::types::{Id, OwnedValue};
 use crate::{index::IndexerClients, server::NebServer};
 
 pub struct IndexedDataClient {
-    clients: Arc<IndexerClients>,
+    index_clients: Arc<IndexerClients>,
 }
 
 pub struct ServerDataClient {
@@ -26,7 +26,7 @@ pub struct ServerChunkScanCursor {
 impl IndexedDataClient {
     pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         Self {
-            clients: Arc::new(IndexerClients::new(conshash, raft_client)),
+            index_clients: Arc::new(IndexerClients::new(conshash, raft_client)),
         }
     }
     pub async fn range_index_scan(
