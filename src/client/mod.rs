@@ -89,15 +89,11 @@ impl AsyncClient {
         }
     }
 
-    pub async fn client_by_server_id(
-        &self,
+    pub fn client_by_server_id<'a>(
+        &'a self,
         server_id: u64,
-    ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
-        DEFAULT_CLIENT_POOL
-            .get_by_id(server_id, move |sid| self.conshash.to_server_name(sid))
-            .await
-            .map_err(|e| RPCError::IOError(e))
-            .map(|c| client_by_rpc_client(&c))
+    ) -> impl Future<Output = Result<Arc<plain_server::AsyncServiceClient>, RPCError>> + 'a {
+        client_by_server_id(&self.conshash, server_id)
     }
 
     pub async fn locate_plain_server(
@@ -285,4 +281,15 @@ impl AsyncClient {
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await
     }
+}
+
+pub async fn client_by_server_id(
+    conshash: &Arc<ConsistentHashing>,
+    server_id: u64,
+) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
+    DEFAULT_CLIENT_POOL
+        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+        .await
+        .map_err(|e| RPCError::IOError(e))
+        .map(|c| client_by_rpc_client(&c))
 }

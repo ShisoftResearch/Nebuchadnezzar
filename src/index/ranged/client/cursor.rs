@@ -48,7 +48,7 @@ impl ClientCursor {
     }
 
     pub async fn next(&mut self) -> Result<Option<Id>, RPCError> {
-        let mut res = None;
+        let mut res;
         if self.pos < self.ids.len() {
             res = Some(self.ids[self.pos]);
             self.pos += 1;
@@ -56,10 +56,10 @@ impl ClientCursor {
                 return Ok(res);
             }
         }
-        let current_key = if self.pos == 0 {
+        res = if self.pos == 0 {
             None
         } else {
-            self.ids.get(self.pos - 1)
+            self.ids.get(self.pos - 1).cloned()
         };
         let next_key = if let Some(key) = &self.next {
             // Have next, use it
@@ -73,7 +73,7 @@ impl ClientCursor {
         trace!(
             "Buffer all used, refilling using key {:?}, current id {:?}, next id {:?}",
             next_key,
-            current_key,
+            res,
             next_key.id()
         );
         let next_cursor = RangedQueryClient::seek(
@@ -91,11 +91,21 @@ impl ClientCursor {
         return Ok(res);
     }
 
+    pub async fn next_block(&mut self) -> Result<bool, RPCError> {
+        self.pos = self.ids.len();
+        self.next().await?;
+        Ok(!self.ids.is_empty())
+    }
+
     pub fn current(&self) -> Option<&Id> {
         match self.ids.get(self.pos) {
             Some(id) => Some(id),
             _ => None,
         }
+    }
+
+    pub fn current_block(&self) -> &Vec<Id> {
+        &self.ids
     }
 
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
