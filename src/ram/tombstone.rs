@@ -3,11 +3,9 @@ use crate::ram::entry::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Write};
 
-lazy_static! {
-    pub static ref TOMBSTONE_LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
-    pub static ref TOMBSTONE_ENTRY_SIZE: u32 =
-        Entry::size(*TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
-}
+pub const TOMBSTONE_LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
+pub const TOMBSTONE_ENTRY_SIZE: u32 =
+        Entry::size(TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
 
 #[derive(Debug)]
 pub struct Tombstone {
@@ -35,7 +33,7 @@ impl Tombstone {
             addr,
             EntryType::TOMBSTONE,
             TOMBSTONE_SIZE_U32,
-            *TOMBSTONE_LEN_BYTES_COUNT,
+            TOMBSTONE_LEN_BYTES_COUNT,
             |addr| {
                 let mut cursor = addr_to_cursor(addr);
                 {

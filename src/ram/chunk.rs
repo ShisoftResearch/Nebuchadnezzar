@@ -41,6 +41,8 @@ pub struct Chunk {
     pub statistics: ChunkStatistics,
 }
 
+
+
 impl Chunk {
     fn new(
         id: usize,
@@ -461,7 +463,7 @@ impl Chunk {
     #[inline]
     fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &MapNodeRef<Segment>) {
         let pending_entry = (|| loop {
-            if let Some(pending_entry) = self.try_acquire(*TOMBSTONE_ENTRY_SIZE) {
+            if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE) {
                 return pending_entry;
             }
             warn!(

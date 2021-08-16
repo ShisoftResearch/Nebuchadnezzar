@@ -11,8 +11,6 @@ use crate::ram::{
     clock::now,
 };
 
-pub mod sm;
-
 pub struct SchemaStatistics {
     pub histogram: HashMap<u64, TargetHistogram>,
     pub count: usize,

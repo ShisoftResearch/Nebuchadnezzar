@@ -109,19 +109,18 @@ impl Entry {
     }
 
     #[inline]
-    pub fn size(len_bytes_count: u8, size: u32) -> u32 {
+    pub const fn size(len_bytes_count: u8, size: u32) -> u32 {
         1 + len_bytes_count as u32 + size
     }
 
     #[inline]
-    pub fn count_len_bytes(len: u32) -> u8 {
+    pub const fn count_len_bytes(len: u32) -> u8 {
         let mut n = 0;
         let mut x = len;
         while x != 0 {
             x = x >> 8;
             n += 1;
         }
-        trace!("count len bytes {} -> {}", len, n);
         return n;
     }
 }
