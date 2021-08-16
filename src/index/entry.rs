@@ -37,6 +37,14 @@ impl EntryKey {
         Self::from_props(id, &Default::default(), 0, schema_id)
     }
 
+    pub fn for_schema(schema_id: u32) -> Self {
+        Self::from_props(&Id::unit_id(), &Default::default(), 0, schema_id)
+    }
+
+    pub fn for_schema_field_feature(schema_id: u32, field: u64, feature: &Feature) -> Self {
+        Self::from_props(&Id::unit_id(), feature, field, schema_id)
+    }
+
     #[inline(always)]
     pub fn new() -> Self {
         Self::default()
