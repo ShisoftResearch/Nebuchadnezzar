@@ -8,12 +8,12 @@ use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
 use std::collections::HashMap;
 
-fn read_field(
+fn read_field<'v>(
     base_ptr: usize,
     field: &Field,
     is_var: bool,
     tail_offset: &mut usize,
-) -> SharedValue {
+) -> SharedValue<'v> {
     let mut rec_field_offset = field.offset.unwrap_or(0);
     let field_offset = if is_var {
         // Is inside size variable field, read directly from the address
@@ -78,7 +78,7 @@ fn read_field(
     }
 }
 
-pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
+pub fn read_attach_dynamic_part<'v>(mut tail_ptr: usize, dest: &mut SharedValue<'v>) {
     let src = read_dynamic_value(&mut tail_ptr);
     if let &mut SharedValue::Map(ref mut map_dest) = dest {
         if let SharedValue::Map(mut map_src) = src {
@@ -92,13 +92,15 @@ pub fn read_attach_dynamic_part(mut tail_ptr: usize, dest: &mut SharedValue) {
 
 const MAP_TYPE_ID: u8 = Type::Map.id();
 
-fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
-    let type_id = types::get_shared_val(Type::U8, *ptr).u8().unwrap();
+fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
+    let type_id_val = types::get_shared_val(Type::U8, *ptr);
+    let type_id = type_id_val.u8().unwrap();
     let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
     *ptr += types::u8_io::type_size();
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
-        let len = types::get_shared_val(Type::U32, *ptr).u32().unwrap();
+        let len_val = types::get_shared_val(Type::U32, *ptr);
+        let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
         if base_type != MAP_TYPE_ID {
             // Primitive array
@@ -117,11 +119,12 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
         }
     } else if *type_id == MAP_TYPE_ID {
         // Map
-        let len = types::get_shared_val(Type::U32, *ptr).u32().unwrap();
+        let len_val = types::get_shared_val(Type::U32, *ptr);
+        let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
         let field_value_pair = (0..*len)
             .map(|_| {
-                let name = types::get_shared_val(Type::String, *ptr).string().unwrap();
+                let name = types::get_shared_val(Type::String, *ptr).string().unwrap().to_owned();
                 *ptr += types::string_io::size_at(*ptr);
                 let value = read_dynamic_value(ptr);
                 (name, value)
@@ -131,7 +134,7 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
         let mut map = HashMap::with_capacity(field_value_pair.len());
         for (name, value) in field_value_pair {
             let id = key_hash(&name);
-            fields.push(name.to_owned());
+            fields.push(name);
             map.insert(id, value);
         }
         return SharedValue::Map(SharedMap { fields, map });
@@ -145,7 +148,7 @@ fn read_dynamic_value(ptr: &mut usize) -> SharedValue {
     }
 }
 
-pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
+pub fn read_by_schema<'v>(ptr: usize, schema: &Schema) -> SharedValue<'v> {
     let mut tail_offset = schema.static_bound;
     let mut schema_value = read_field(ptr, &schema.fields, false, &mut tail_offset);
     if schema.is_dynamic {
@@ -154,7 +157,7 @@ pub fn read_by_schema(ptr: usize, schema: &Schema) -> SharedValue {
     schema_value
 }
 
-pub fn read_by_schema_selected(ptr: usize, schema: &Schema, fields: &[u64]) -> SharedValue {
+pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) -> SharedValue<'v> {
     let mut tail_offset = schema.static_bound;
     if fields.is_empty() {
         return read_by_schema(ptr, schema);

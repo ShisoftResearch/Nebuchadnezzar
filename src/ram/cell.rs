@@ -216,12 +216,12 @@ impl IndexMut<u64> for OwnedCell {
 }
 
 #[derive(Debug)]
-pub struct SharedCellData {
+pub struct SharedCellData<'v> {
     pub header: CellHeader,
-    pub data: SharedValue,
+    pub data: SharedValue<'v>,
 }
 
-impl SharedCellData {
+impl <'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
@@ -234,7 +234,7 @@ impl SharedCellData {
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
-    pub fn from_data(header: CellHeader, data: SharedValue) -> Self {
+    pub fn from_data(header: CellHeader, data: SharedValue<'v>) -> Self {
         Self { header, data }
     }
     pub fn id(&self) -> Id {
@@ -246,7 +246,7 @@ impl SharedCellData {
             data: self.data.owned(),
         }
     }
-    pub fn into_shared(self, guard: WordMutexGuard) -> SharedCell {
+    pub fn into_shared(self, guard: WordMutexGuard<'v>) -> SharedCell {
         SharedCell { guard, inner: self }
     }
 }
@@ -282,7 +282,7 @@ impl<'a, T> SharedData<'a, T> {
     }
 }
 
-pub type SharedCell<'a> = SharedData<'a, SharedCellData>;
+pub type SharedCell<'a> = SharedData<'a, SharedCellData<'a>>;
 
 impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
@@ -302,7 +302,7 @@ impl<'a> SharedCell<'a> {
         ptr: WordMutexGuard<'a>,
         chunk: &'a Chunk,
         fields: &[u64],
-    ) -> Result<SharedData<'a, SharedValue>, ReadError> {
+    ) -> Result<SharedData<'a, SharedValue<'a>>, ReadError> {
         select_from_chunk_raw(*ptr, chunk, fields).map(|val| SharedData {
             guard: ptr,
             inner: val,
@@ -340,7 +340,7 @@ impl<'a> Cell for SharedCell<'a> {
     }
 }
 
-impl Cell for SharedCellData {
+impl <'v> Cell for SharedCellData<'v> {
     fn id(&self) -> Id {
         self.id()
     }
@@ -377,11 +377,11 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHead
     Ok(header)
 }
 
-pub fn select_from_chunk_raw(
+pub fn select_from_chunk_raw<'v>(
     ptr: usize,
     chunk: &Chunk,
     fields: &[u64],
-) -> Result<SharedValue, ReadError> {
+) -> Result<SharedValue<'v>, ReadError> {
     let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {

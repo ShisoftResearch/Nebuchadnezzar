@@ -48,7 +48,7 @@ impl IndexedDataClient {
         &self,
         schema: u32,
         selection: OwnedValue,  // Checker expression
-        projection: &[u64], // Column array
+        projection: Vec<u64>, // Column array
     ) -> Result<Option<DataCursor>, RPCError> {
         let key = EntryKey::for_schema(schema);
         self.index_clients
@@ -69,10 +69,10 @@ impl IndexedDataClient {
                         async move {
                             let client = client_by_server_id(&self.conshash, sid).await;
                             client.map(|client| {
-                                client.read_all_cells(keys)
+                                // client.read_all_cells(keys)
                             })
                         }
-                    })
+                    });
                     unimplemented!()
                 })
             })
