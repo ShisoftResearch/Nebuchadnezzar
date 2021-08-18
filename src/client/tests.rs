@@ -116,7 +116,12 @@ pub async fn general() {
                         .await?
                         .unwrap();
                     let mut score = *cell.data["score"].u64().unwrap();
-                    assert_eq!(selected.u64(), Some(&score), "Selected value {:?}", selected);
+                    assert_eq!(
+                        selected.u64(),
+                        Some(&score),
+                        "Selected value {:?}",
+                        selected
+                    );
                     score += 1;
                     let mut data = cell.data.Map().unwrap().clone();
                     data.insert(&String::from("score"), OwnedValue::U64(score));

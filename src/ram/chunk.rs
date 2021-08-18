@@ -41,8 +41,6 @@ pub struct Chunk {
     pub statistics: ChunkStatistics,
 }
 
-
-
 impl Chunk {
     fn new(
         id: usize,

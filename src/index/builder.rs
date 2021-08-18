@@ -305,9 +305,7 @@ pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
                     }
                 }
             }
-            res.push(IndexRes {
-                meta: metas,
-            });
+            res.push(IndexRes { meta: metas });
         }
     });
     res

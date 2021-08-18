@@ -154,7 +154,8 @@ impl Service for TransactionManager {
                                 let mut res = vec![];
                                 'SEARCH: for field in &fields {
                                     if let Some(index_path) = schema.id_index.get(field) {
-                                        let path = index_path.iter().map(|id| *id as u64).collect_vec();
+                                        let path =
+                                            index_path.iter().map(|id| *id as u64).collect_vec();
                                         trace!("Get into map for txn select {:?}", path);
                                         let val = map.get_in_by_ids(path.iter()).clone();
                                         if fields.len() == 1 {

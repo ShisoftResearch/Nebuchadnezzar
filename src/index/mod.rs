@@ -19,8 +19,8 @@ pub use entry::EntryKey;
 pub use entry::ID_SIZE;
 use futures::Future;
 
-use self::ranged::client::RangedQueryClient;
 use self::ranged::client::cursor::ClientCursor;
+use self::ranged::client::RangedQueryClient;
 use self::ranged::lsm::btree::Ordering;
 
 pub type Feature = [u8; FEATURE_SIZE];

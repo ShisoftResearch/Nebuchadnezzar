@@ -221,7 +221,7 @@ pub struct SharedCellData<'v> {
     pub data: SharedValue<'v>,
 }
 
-impl <'v> SharedCellData<'v> {
+impl<'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
         let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
@@ -340,7 +340,7 @@ impl<'a> Cell for SharedCell<'a> {
     }
 }
 
-impl <'v> Cell for SharedCellData<'v> {
+impl<'v> Cell for SharedCellData<'v> {
     fn id(&self) -> Id {
         self.id()
     }

@@ -53,18 +53,11 @@ pub fn complex_fields() -> Field {
                 &String::from("strings"),
                 Type::String,
                 false, // Not null
-                true, // String array
+                true,  // String array
                 None,
                 vec![],
             ),
-            Field::new(
-                &String::from("num"),
-                Type::U64,
-                false,
-                false,
-                None,
-                vec![]
-            ),
+            Field::new(&String::from("num"), Type::U64, false, false, None, vec![]),
             Field::new(
                 &String::from("nums"),
                 Type::U64,
@@ -74,75 +67,47 @@ pub fn complex_fields() -> Field {
                 vec![],
             ),
             Field::new(
-                &String::from("sub"), 
-                Type::Map, 
-                false, 
-                false, 
+                &String::from("sub"),
+                Type::Map,
+                false,
+                false,
                 Some(vec![
-                    Field::new(
-                        &String::from("sub1"),
-                        Type::U32,
-                        false,
-                        false,
-                        None,
-                        vec![]
-                    ),
+                    Field::new(&String::from("sub1"), Type::U32, false, false, None, vec![]),
                     Field::new(
                         &String::from("sub2"),
                         Type::U32,
                         false,
                         true, // array
                         None,
-                        vec![]
+                        vec![],
                     ),
-                    Field::new(
-                        &String::from("sub3"),
-                        Type::U32,
-                        false,
-                        false,
-                        None,
-                        vec![]
-                    ),
+                    Field::new(&String::from("sub3"), Type::U32, false, false, None, vec![]),
                     Field::new(
                         &String::from("sub4"),
                         Type::Map,
                         false,
                         false,
                         Some(vec![
+                            Field::new("sub4sub1", Type::U32, false, false, None, vec![]),
                             Field::new(
-                                "sub4sub1", 
-                                Type::U32, 
-                                false, 
-                                false, 
-                                None, 
-                                vec![]
-                            ),
-                            Field::new(
-                                "sub4sub2", 
-                                Type::U32, 
-                                false, 
+                                "sub4sub2",
+                                Type::U32,
+                                false,
                                 true, // array
-                                None, 
-                                vec![]
+                                None,
+                                vec![],
                             ),
                             Field::new(
-                                "sub4sub3", 
-                                Type::U64, 
+                                "sub4sub3",
+                                Type::U64,
                                 true, // nullable
                                 true, // array
-                                None, 
-                                vec![]
+                                None,
+                                vec![],
                             ),
-                            Field::new(
-                                "sub4sub4", 
-                                Type::U16, 
-                                false, 
-                                false, 
-                                None, 
-                                vec![]
-                            ),
+                            Field::new("sub4sub4", Type::U16, false, false, None, vec![]),
                         ]),
-                        vec![]
+                        vec![],
                     ),
                     dyn_map_field("sub5"),
                     Field::new(
@@ -151,11 +116,11 @@ pub fn complex_fields() -> Field {
                         false,
                         false,
                         None,
-                        vec![]
-                    )
-                ]), 
-                vec![]
-            )
+                        vec![],
+                    ),
+                ]),
+                vec![],
+            ),
         ]),
         vec![],
     )
@@ -168,39 +133,25 @@ pub fn dyn_map_field<'a>(name: &'a str) -> Field {
         false,
         true, // array
         Some(vec![
+            Field::new("sub5sub1", Type::U32, false, false, None, vec![]),
             Field::new(
-                "sub5sub1", 
-                Type::U32, 
-                false, 
-                false, 
-                None, 
-                vec![]
-            ),
-            Field::new(
-                "sub5sub2", 
-                Type::U32, 
-                false, 
+                "sub5sub2",
+                Type::U32,
+                false,
                 true, // array
-                None, 
-                vec![]
+                None,
+                vec![],
             ),
             Field::new(
-                "sub5sub3", 
-                Type::U64, 
+                "sub5sub3",
+                Type::U64,
                 true, // nullable
                 true, // array
-                None, 
-                vec![]
+                None,
+                vec![],
             ),
-            Field::new(
-                "sub5sub4", 
-                Type::U16, 
-                false, 
-                false, 
-                None, 
-                vec![]
-            ),
+            Field::new("sub5sub4", Type::U16, false, false, None, vec![]),
         ]),
-        vec![]
+        vec![],
     )
 }

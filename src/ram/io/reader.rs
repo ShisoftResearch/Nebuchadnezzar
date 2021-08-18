@@ -65,7 +65,10 @@ fn read_field<'v>(
         trace!("Field {} is map", field.name);
         let mut map = SharedMap::new();
         for sub in subs {
-            map.insert_key_id(sub.name_id, read_field(base_ptr, &sub, is_var, field_offset));
+            map.insert_key_id(
+                sub.name_id,
+                read_field(base_ptr, &sub, is_var, field_offset),
+            );
         }
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         SharedValue::Map(map)
@@ -124,7 +127,10 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
         *ptr += types::u32_io::type_size();
         let field_value_pair = (0..*len)
             .map(|_| {
-                let name = types::get_shared_val(Type::String, *ptr).string().unwrap().to_owned();
+                let name = types::get_shared_val(Type::String, *ptr)
+                    .string()
+                    .unwrap()
+                    .to_owned();
                 *ptr += types::string_io::size_at(*ptr);
                 let value = read_dynamic_value(ptr);
                 (name, value)
@@ -164,13 +170,14 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
     }
     if let Some(schema_fields) = &schema.fields.sub_fields {
         let mut res = vec![];
-        'SEARCH:
-        for field in fields {
+        'SEARCH: for field in fields {
             if let Some(index_path) = schema.field_index.get(field) {
-                if !index_path.is_empty() { 
+                if !index_path.is_empty() {
                     if let Some(mut field) = schema_fields.get(index_path[0]) {
                         for i in index_path.iter().skip(1) {
-                            if let Some(Some(sub_field)) = field.sub_fields.as_ref().map(|sub| sub.get(*i)) {
+                            if let Some(Some(sub_field)) =
+                                field.sub_fields.as_ref().map(|sub| sub.get(*i))
+                            {
                                 field = sub_field;
                             } else {
                                 break;
@@ -188,7 +195,7 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
             }
             res.push(SharedValue::Null);
         }
-        return SharedValue::Array(res)
+        return SharedValue::Array(res);
     }
     SharedValue::Null
 }

@@ -1,7 +1,14 @@
 use itertools::Itertools;
 use lightning::map::{Map, ObjectMap};
 use rayon::prelude::*;
-use std::{collections::{HashMap, HashSet}, iter, sync::{Arc, atomic::{AtomicU32, Ordering}}};
+use std::{
+    collections::{HashMap, HashSet},
+    iter,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 
 use dovahkiin::types::SharedValue;
 
@@ -140,7 +147,8 @@ impl ChunkStatistics {
                 bytes: *total_size.get(&schema_id).unwrap(),
                 timestamp: now(),
             };
-            self.schemas.insert(&(*schema_id as usize), Arc::new(statistics));
+            self.schemas
+                .insert(&(*schema_id as usize), Arc::new(statistics));
         }
         self.timestamp.store(now(), Ordering::Relaxed);
     }
@@ -408,15 +416,21 @@ mod tests {
         assert!(histogram.is_sorted());
         assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(30).feature());
 
-        let histo_1 = (0..1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
-        let histo_2 = (0..1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
-        let histo_3 = (0..=1024).map(|n| OwnedValue::U64(n).feature()).collect_vec();
+        let histo_1 = (0..1024)
+            .map(|n| OwnedValue::U64(n).feature())
+            .collect_vec();
+        let histo_2 = (0..1024)
+            .map(|n| OwnedValue::U64(n).feature())
+            .collect_vec();
+        let histo_3 = (0..=1024)
+            .map(|n| OwnedValue::U64(n).feature())
+            .collect_vec();
         let histo_1_height = histo_1.len();
         let histo_2_height = histo_2.len();
         let test_data = vec![
             (histo_1, histo_1_height, 1),
             (histo_2, histo_2_height, 2),
-            (histo_3, histo_2_height, 3)
+            (histo_3, histo_2_height, 3),
         ];
         let histogram = build_histogram(test_data.iter().collect_vec());
         assert!(histogram.is_sorted(), "Got {:?}", histogram);

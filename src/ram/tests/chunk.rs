@@ -277,65 +277,83 @@ pub fn complex_cell_sel_read() {
     }
     {
         // Basic select case
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("id"),
-            String::from("num")
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![String::from("id"), String::from("num")]),
+            )
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell[0usize], &cell["id"]);
         assert_eq!(&partial_cell[1usize], &cell["num"]);
     }
     {
         // Selecting one in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub1"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub1")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub1"]);
     }
     {
         // Selecting one array in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub2"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub2")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub2"]);
     }
     {
         // Selecting one string in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub3"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub3")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub3"]);
     }
     {
         // Selecting one map array in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub4"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]);
     }
     {
         // Selecting one deeper in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub4|sub4sub1"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub1")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub1"]);
     }
     {
         // Selecting one deeper nullable array in nested map
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub4|sub4sub3"),
-        ])).unwrap().owned();
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub3")]))
+            .unwrap()
+            .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub3"]);
     }
     {
         // Selecting multiple
-        let partial_cell = chunks.read_selected(&id1, &key_hashes(&vec![
-            String::from("sub|sub3"),
-            String::from("sub|sub4|sub4sub3"),
-        ])).unwrap().owned();
-        assert_eq!(&partial_cell, &OwnedValue::Array(vec![
-            cell["sub"]["sub3"].clone(),
-            cell["sub"]["sub4"]["sub4sub3"].clone()
-        ]));
+        let partial_cell = chunks
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![
+                    String::from("sub|sub3"),
+                    String::from("sub|sub4|sub4sub3"),
+                ]),
+            )
+            .unwrap()
+            .owned();
+        assert_eq!(
+            &partial_cell,
+            &OwnedValue::Array(vec![
+                cell["sub"]["sub3"].clone(),
+                cell["sub"]["sub4"]["sub4sub3"].clone()
+            ])
+        );
     }
 }
 

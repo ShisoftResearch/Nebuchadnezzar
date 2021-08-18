@@ -73,14 +73,11 @@ mod tests {
         info!("Adding insertion tasks");
         for i in nums_2 {
             let index_client = index_client.clone();
-            futs.push(tokio::time::timeout(
-                Duration::from_secs(240),
-                async move {
-                    let id = Id::new(1, i as u64);
-                    let key = EntryKey::from_id(&id);
-                    index_client.insert(&key).await
-                },
-            ));
+            futs.push(tokio::time::timeout(Duration::from_secs(240), async move {
+                let id = Id::new(1, i as u64);
+                let key = EntryKey::from_id(&id);
+                index_client.insert(&key).await
+            }));
         }
         info!("All tasks queued, waiting for finish");
         while let Some(result) = futs.next().await {

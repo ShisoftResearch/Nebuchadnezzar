@@ -4,8 +4,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Write};
 
 pub const TOMBSTONE_LEN_BYTES_COUNT: u8 = Entry::count_len_bytes(TOMBSTONE_SIZE_U32);
-pub const TOMBSTONE_ENTRY_SIZE: u32 =
-        Entry::size(TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
+pub const TOMBSTONE_ENTRY_SIZE: u32 = Entry::size(TOMBSTONE_LEN_BYTES_COUNT, TOMBSTONE_SIZE_U32);
 
 #[derive(Debug)]
 pub struct Tombstone {
