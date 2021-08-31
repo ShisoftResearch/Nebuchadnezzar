@@ -254,7 +254,7 @@ impl LocalSchemasCache {
     }
     pub fn new_schema(&self, schema: Schema) {
         // for debug only
-        let mut m = &self.map;
+        let m = &self.map;
         m.new_schema(schema)
     }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {

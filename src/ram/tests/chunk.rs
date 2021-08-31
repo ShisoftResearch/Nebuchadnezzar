@@ -52,7 +52,7 @@ pub fn cell_rw() {
         None,
     );
     let header = chunks.write_cell(&mut cell).unwrap();
-    let cell_1_ptr = chunks.address_of(&Id::from_header(&header));
+    let _cell_1_ptr = chunks.address_of(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id1).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &100);
@@ -72,7 +72,7 @@ pub fn cell_rw() {
         data,
     };
     let header = chunks.write_cell(&mut cell).unwrap();
-    let cell_2_ptr = chunks.address_of(&Id::from_header(&header));
+    let _cell_2_ptr = chunks.address_of(&Id::from_header(&header));
     {
         let stored_cell = chunks.read_cell(&id2).unwrap();
         assert_eq!(stored_cell.data["id"].i64().unwrap(), &2);

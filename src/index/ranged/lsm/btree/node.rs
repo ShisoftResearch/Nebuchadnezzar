@@ -86,7 +86,7 @@ where
         match self {
             &NodeData::External(_) => true,
             &NodeData::Internal(_) => false,
-            &NodeData::None | &NodeData::Empty(_) => panic!(self.type_name()),
+            &NodeData::None | &NodeData::Empty(_) => panic!("{}", self.type_name()),
         }
     }
     pub fn is_internal(&self) -> bool {
@@ -94,7 +94,7 @@ where
             &NodeData::External(_) => false,
             &NodeData::Internal(_) => true,
             &NodeData::Empty(_) => false,
-            &NodeData::None => panic!(self.type_name()),
+            &NodeData::None => panic!("{}", self.type_name()),
         }
     }
 
@@ -276,7 +276,7 @@ where
         match self {
             &NodeData::External(ref n) => &n.right_bound,
             &NodeData::Internal(ref n) => &n.right_bound,
-            _ => panic!(self.type_name()),
+            _ => panic!("{}", self.type_name()),
         }
     }
 
@@ -284,7 +284,7 @@ where
         match self {
             &mut NodeData::External(ref mut n) => &mut n.right_bound,
             &mut NodeData::Internal(ref mut n) => &mut n.right_bound,
-            _ => panic!(self.type_name()),
+            _ => panic!("{}", self.type_name()),
         }
     }
 }

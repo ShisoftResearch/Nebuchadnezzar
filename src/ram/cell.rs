@@ -352,7 +352,7 @@ impl<'v> Cell for SharedCellData<'v> {
     }
 }
 
-pub fn cell_header_from_entry_content_addr(addr: usize, entry_header: &EntryHeader) -> CellHeader {
+pub fn cell_header_from_entry_content_addr(addr: usize, _entry_header: &EntryHeader) -> CellHeader {
     let mut cursor = addr_to_header_cursor(addr);
     let header = CellHeader {
         version: cursor.read_u64::<Endian>().unwrap(),

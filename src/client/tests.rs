@@ -192,7 +192,7 @@ pub async fn multi_cell_update() {
     );
     let thread_count = 100;
     let schema_id = schema.id;
-    client.new_schema_with_id(schema).await.unwrap();
+    let _ = client.new_schema_with_id(schema).await.unwrap();
     let all_schemas = client.get_all_schema().await.unwrap();
     assert!(!all_schemas.is_empty());
     info!("Schema id {}, all schemas: {:?}", schema_id, all_schemas);

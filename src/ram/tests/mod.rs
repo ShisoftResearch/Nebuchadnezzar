@@ -2,8 +2,6 @@ mod cell;
 mod chunk;
 mod types;
 
-use std::collections::vec_deque;
-
 use dovahkiin::types::Type;
 
 use crate::ram::schema::Field;

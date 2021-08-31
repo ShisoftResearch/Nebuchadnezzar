@@ -1,12 +1,11 @@
 use super::{EntryKey, Feature, IndexerClients};
 use crate::ram::cell::{OwnedCell, SharedCell};
-use crate::ram::types::{Id, Value};
+use crate::ram::types::Id;
 use crate::ram::{
     cell::Cell,
-    schema::{Field, IndexType, Schema},
+    schema::{IndexType, Schema},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
-use bifrost_hasher::hash_str;
 use futures::FutureExt;
 use futures::{
     future::BoxFuture,
@@ -17,7 +16,6 @@ use std::hash::{Hash, Hasher};
 use std::{cell::RefCell, sync::Arc};
 use tokio::task::{JoinError, JoinHandle};
 
-type FieldName = String;
 const UNSETTLED: Feature = [0u8; 8];
 
 // Define index rules
@@ -81,10 +79,10 @@ impl IndexMeta {
             &IndexMeta::Ranged(ref meta) => {
                 indexers.ranged_client.insert(&meta.key).await?;
             }
-            &IndexMeta::Hashed(ref meta) => {
+            &IndexMeta::Hashed(ref _meta) => {
                 unimplemented!();
             }
-            &IndexMeta::Vectorized(ref meta) => {
+            &IndexMeta::Vectorized(ref _meta) => {
                 unimplemented!();
             }
         }
@@ -95,10 +93,10 @@ impl IndexMeta {
             &IndexMeta::Ranged(ref meta) => {
                 indexers.ranged_client.delete(&meta.key).await?;
             }
-            &IndexMeta::Hashed(ref meta) => {
+            &IndexMeta::Hashed(ref _meta) => {
                 unimplemented!();
             }
-            &IndexMeta::Vectorized(ref meta) => {
+            &IndexMeta::Vectorized(ref _meta) => {
                 unimplemented!();
             }
         }

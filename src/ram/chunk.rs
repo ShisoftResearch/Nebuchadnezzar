@@ -11,13 +11,13 @@ use crate::{
     ram::cleaner::Cleaner,
 };
 
-use super::{io::reader, schema::Schema};
+use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use itertools::Itertools;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 

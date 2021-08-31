@@ -1,6 +1,6 @@
-use dovahkiin::expr::SExpr;
+use dovahkiin::expr::serde::Expr;
 pub enum QExpr {
-    SExpr(SExpr),
+    SExpr(Expr),
 }
 
 pub struct Source {}

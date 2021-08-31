@@ -1,11 +1,10 @@
 use crate::ram::cell::*;
 use crate::ram::schema::Field;
 use crate::ram::types;
-use crate::ram::types::{OwnedMap, OwnedValue};
+use crate::ram::types::OwnedValue;
 
 use std::{
-    collections::{HashMap, HashSet},
-    mem,
+    collections::{HashMap, HashSet}
 };
 
 use dovahkiin::types::{key_hash, Type};

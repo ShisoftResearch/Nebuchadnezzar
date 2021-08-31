@@ -1,8 +1,6 @@
-use dovahkiin::{expr::SExpr, types::OwnedValue};
+use dovahkiin::types::OwnedValue;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
-
-use super::*;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum DAGExpr {

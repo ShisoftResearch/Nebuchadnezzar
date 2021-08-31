@@ -146,7 +146,7 @@ impl AsyncClient {
                 if cfg!(debug_assertions) && id_ref.is_none() {
                     let msg = format!("Cannot find {:?} for read_all_cells", id);
                     error!("{}", msg);
-                    panic!(msg);
+                    panic!("{}", msg);
                 }
                 mem::replace(id_ref, None).unwrap()
             })
