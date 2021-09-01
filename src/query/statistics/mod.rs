@@ -183,7 +183,7 @@ fn build_partitation_statistics(
                 let schema_id = header.schema;
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
                     let fields = schema.index_fields.keys().cloned().collect_vec();
-                    if let Ok(partial_cell) = select_from_chunk_raw(*loc, chunk, fields.as_slice())
+                    if let Ok((partial_cell, _)) = select_from_chunk_raw(*loc, chunk, fields.as_slice())
                     {
                         let field_array = if fields.len() == 1 {
                             vec![partial_cell]

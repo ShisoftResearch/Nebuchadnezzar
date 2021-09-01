@@ -114,7 +114,8 @@ pub async fn general() {
                             types::key_hashes(&vec![String::from("score")]),
                         )
                         .await?
-                        .unwrap();
+                        .unwrap()
+                        .data;
                     let mut score = *cell.data["score"].u64().unwrap();
                     assert_eq!(
                         selected.u64(),
@@ -133,7 +134,8 @@ pub async fn general() {
                             types::key_hashes(&vec![String::from("score")]),
                         )
                         .await?
-                        .unwrap();
+                        .unwrap()
+                        .data;
                     assert_eq!(selected.u64().unwrap(), &score);
 
                     let header = txn.head(cell.id()).await?.unwrap();

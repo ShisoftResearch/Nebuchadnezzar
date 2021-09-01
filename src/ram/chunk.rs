@@ -3,7 +3,7 @@ use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
-use crate::ram::types::{Id, SharedValue};
+use crate::ram::types::Id;
 use crate::server::ServerMeta;
 use crate::{index::builder::IndexBuilder, ram::cell::*};
 use crate::{
@@ -195,9 +195,10 @@ impl Chunk {
             .map_err(|(e, _)| e)
     }
 
-    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedValue, ReadError> {
+    fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedCell, ReadError> {
         let loc = self.location_for_read(hash)?;
-        select_from_chunk_raw(*loc, self, fields)
+        let (val, hdr) = select_from_chunk_raw(*loc, self, fields)?;
+        Ok(SharedCell::compose(SharedCellData::from_data(hdr, val), loc))
     }
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {
@@ -791,7 +792,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<SharedValue, ReadError> {
+    pub fn read_selected(&self, key: &Id, fields: &[u64]) -> Result<SharedCell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields);
     }

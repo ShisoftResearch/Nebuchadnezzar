@@ -39,7 +39,7 @@ struct Transaction {
 service! {
     rpc begin() -> Result<TxnId, TMError>;
     rpc read(tid: TxnId, id: Id) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError>;
-    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<OwnedValue, ReadError>, TMError>;
+    rpc read_selected(tid: TxnId, id: Id, fields: Vec<u64>) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError>;
     rpc head(tid: TxnId, id: Id) -> Result<TxnExecResult<CellHeader, ReadError>, TMError>;
     rpc write(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
     rpc update(tid: TxnId, cell: OwnedCell) -> Result<TxnExecResult<(), WriteError>, TMError>;
@@ -140,7 +140,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<Result<TxnExecResult<OwnedValue, ReadError>, TMError>> {
+    ) -> BoxFuture<Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
@@ -159,7 +159,9 @@ impl Service for TransactionManager {
                                         trace!("Get into map for txn select {:?}", path);
                                         let val = map.get_in_by_ids(path.iter()).clone();
                                         if fields.len() == 1 {
-                                            return Ok(TxnExecResult::Accepted(val));
+                                            return Ok(TxnExecResult::Accepted(OwnedCell {
+                                                header: cell.header, data: val
+                                            }));
                                         } else {
                                             res.push(val);
                                             continue 'SEARCH;
@@ -167,7 +169,9 @@ impl Service for TransactionManager {
                                     }
                                     res.push(OwnedValue::Null);
                                 }
-                                return Ok(TxnExecResult::Accepted(OwnedValue::Array(res)));
+                                return Ok(TxnExecResult::Accepted(OwnedCell {
+                                    header: cell.header, data: OwnedValue::Array(res)
+                                }));
                             } else {
                                 return Ok(TxnExecResult::Error(
                                     ReadError::CellTypeIsNotMapForSelect,
@@ -565,7 +569,7 @@ impl TransactionManager {
         fields: &Vec<u64>,
         _txn: &TxnGuard<'a>,
         awaits: &TxnAwaits,
-    ) -> Result<TxnExecResult<OwnedValue, ReadError>, TMError> {
+    ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
         let self_server_id = self.server.server_id;
         loop {
             let read_response = server

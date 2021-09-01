@@ -136,8 +136,8 @@ pub fn cell_rw() {
         let sel_cell = chunks
             .read_selected(&id2, &[hash_str("score"), hash_str("name")])
             .unwrap();
-        assert_eq!(sel_cell[0usize].u64().unwrap(), &100);
-        assert_eq!(sel_cell[1usize].string().unwrap(), "John");
+        assert_eq!(sel_cell.data[0usize].u64().unwrap(), &100);
+        assert_eq!(sel_cell.data[1usize].string().unwrap(), "John");
     }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());
@@ -283,6 +283,7 @@ pub fn complex_cell_sel_read() {
                 &key_hashes(&vec![String::from("id"), String::from("num")]),
             )
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell[0usize], &cell["id"]);
         assert_eq!(&partial_cell[1usize], &cell["num"]);
@@ -292,6 +293,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub1")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub1"]);
     }
@@ -300,6 +302,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub2")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub2"]);
     }
@@ -308,6 +311,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub3")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub3"]);
     }
@@ -316,6 +320,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]);
     }
@@ -324,6 +329,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub1")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub1"]);
     }
@@ -332,6 +338,7 @@ pub fn complex_cell_sel_read() {
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub3")]))
             .unwrap()
+            .data
             .owned();
         assert_eq!(&partial_cell, &cell["sub"]["sub4"]["sub4sub3"]);
     }
@@ -346,6 +353,7 @@ pub fn complex_cell_sel_read() {
                 ]),
             )
             .unwrap()
+            .data
             .owned();
         assert_eq!(
             &partial_cell,

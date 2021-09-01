@@ -5,6 +5,7 @@ use crate::{
     ram::cell::{CellHeader, OwnedCell, ReadError, WriteError},
 };
 use bifrost::rpc::*;
+use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::OwnedValue;
 use futures::future::BoxFuture;
 use futures::prelude::*;
@@ -16,7 +17,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells(keys: Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
-    rpc read_all_cells_selected(keys: Vec<Id>, colums: Vec<u64>) -> Vec<Result<OwnedValue, ReadError>>;
+    rpc read_all_cells_selected(keys: Vec<Id>, colums: Vec<u64>) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells_proced(keys: Vec<Id>, colums: Vec<u64>, filter: Expr, proc: Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -44,14 +46,14 @@ impl Service for NebRPCService {
         &self,
         keys: Vec<Id>,
         colums: Vec<u64>,
-    ) -> BoxFuture<Vec<Result<OwnedValue, ReadError>>> {
+    ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
                 .map(|id| {
                     self.server
                         .chunks
                         .read_selected(&id, colums.as_slice())
-                        .map(|c| c.owned())
+                        .map(|c| c.to_owned())
                 })
                 .collect(),
         )
@@ -72,6 +74,23 @@ impl Service for NebRPCService {
     }
     fn count(&self) -> BoxFuture<u64> {
         future::ready(self.server.chunks.count() as u64).boxed()
+    }
+
+    fn read_all_cells_proced(
+        &self,
+        keys: Vec<Id>,
+        colums: Vec<u64>,
+        filter: Expr,
+        proc: Expr,
+    ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
+        keys.into_iter().filter_map(|id| {
+            self.server
+                .chunks
+                .read_selected(&id, colums.as_slice())
+                .ok()
+                .map(|v| (id, v))
+        });
+        unimplemented!()
     }
 }
 

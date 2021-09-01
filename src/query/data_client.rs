@@ -64,7 +64,7 @@ impl IndexedDataClient {
                     let tasks = all_ids
                         .iter()
                         .filter_map(|id| self.conshash.get_server_id_by(id).map(|sid| (sid, id)))
-                        .group_by(|(sid, id)| *sid)
+                        .group_by(|(sid, _id)| *sid)
                         .into_iter()
                         .map(|(sid, pairs)| {
                             let ids = pairs.map(|(_, id)| id).collect_vec();

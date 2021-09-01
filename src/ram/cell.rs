@@ -302,10 +302,10 @@ impl<'a> SharedCell<'a> {
         ptr: WordMutexGuard<'a>,
         chunk: &'a Chunk,
         fields: &[u64],
-    ) -> Result<SharedData<'a, SharedValue<'a>>, ReadError> {
-        select_from_chunk_raw(*ptr, chunk, fields).map(|val| SharedData {
+    ) -> Result<SharedCell<'a>, ReadError> {
+        select_from_chunk_raw(*ptr, chunk, fields).map(|(val, hdr)| SharedData {
             guard: ptr,
-            inner: val,
+            inner: SharedCellData::from_data(hdr, val),
         })
     }
 }
@@ -381,11 +381,11 @@ pub fn select_from_chunk_raw<'v>(
     ptr: usize,
     chunk: &Chunk,
     fields: &[u64],
-) -> Result<SharedValue<'v>, ReadError> {
+) -> Result<(SharedValue<'v>, CellHeader), ReadError> {
     let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-        Ok(reader::read_by_schema_selected(data_ptr, &*schema, fields))
+        Ok((reader::read_by_schema_selected(data_ptr, &*schema, fields), header))
     } else {
         error!("Schema {} does not existed to read", schema_id);
         return Err(ReadError::SchemaDoesNotExisted(*schema_id));
