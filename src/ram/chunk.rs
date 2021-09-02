@@ -198,7 +198,10 @@ impl Chunk {
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedCell, ReadError> {
         let loc = self.location_for_read(hash)?;
         let (val, hdr) = select_from_chunk_raw(*loc, self, fields)?;
-        Ok(SharedCell::compose(SharedCellData::from_data(hdr, val), loc))
+        Ok(SharedCell::compose(
+            SharedCellData::from_data(hdr, val),
+            loc,
+        ))
     }
 
     fn read_partial_raw(&self, hash: u64, offset: usize, len: usize) -> Result<Vec<u8>, ReadError> {

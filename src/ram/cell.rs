@@ -47,7 +47,7 @@ pub enum ReadError {
     CellTypeIsNotMapForSelect,
     CellIdIsUnitId,
     NotMatch,
-    ExecError(String)
+    ExecError(String),
 }
 
 impl CellHeader {
@@ -387,7 +387,10 @@ pub fn select_from_chunk_raw<'v>(
     let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {
-        Ok((reader::read_by_schema_selected(data_ptr, &*schema, fields), header))
+        Ok((
+            reader::read_by_schema_selected(data_ptr, &*schema, fields),
+            header,
+        ))
     } else {
         error!("Schema {} does not existed to read", schema_id);
         return Err(ReadError::SchemaDoesNotExisted(*schema_id));

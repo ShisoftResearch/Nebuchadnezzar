@@ -160,7 +160,8 @@ impl Service for TransactionManager {
                                         let val = map.get_in_by_ids(path.iter()).clone();
                                         if fields.len() == 1 {
                                             return Ok(TxnExecResult::Accepted(OwnedCell {
-                                                header: cell.header, data: val
+                                                header: cell.header,
+                                                data: val,
                                             }));
                                         } else {
                                             res.push(val);
@@ -170,7 +171,8 @@ impl Service for TransactionManager {
                                     res.push(OwnedValue::Null);
                                 }
                                 return Ok(TxnExecResult::Accepted(OwnedCell {
-                                    header: cell.header, data: OwnedValue::Array(res)
+                                    header: cell.header,
+                                    data: OwnedValue::Array(res),
                                 }));
                             } else {
                                 return Ok(TxnExecResult::Error(

@@ -6,8 +6,8 @@ use crate::{
 };
 use bifrost::rpc::*;
 use dovahkiin::expr::serde::Expr;
-use dovahkiin::expr::SExpr;
 use dovahkiin::expr::symbols::utils::is_true;
+use dovahkiin::expr::SExpr;
 use dovahkiin::integrated::lisp;
 use dovahkiin::types::{OwnedValue, SharedMap, SharedValue};
 use futures::future::BoxFuture;
@@ -148,30 +148,32 @@ impl Service for NebRPCService {
         };
         if !filter_empty {
             let filter = filter.to_sexpr();
-            rows = rows.into_iter().map(|row| {
-                if let Ok((cell, mut exec)) = row {
-                    let check_res = filter.clone().eval(exec.get_env());
-                    match check_res {
-                        Ok(sexp) => {
-                            if is_true(sexp) {
-                                return Ok((cell, exec));
-                            } else {
-                                return Err(ReadError::NotMatch);
+            rows = rows
+                .into_iter()
+                .map(|row| {
+                    if let Ok((cell, mut exec)) = row {
+                        let check_res = filter.clone().eval(exec.get_env());
+                        match check_res {
+                            Ok(sexp) => {
+                                if is_true(sexp) {
+                                    return Ok((cell, exec));
+                                } else {
+                                    return Err(ReadError::NotMatch);
+                                }
                             }
+                            Err(e) => return Err(ReadError::ExecError(e)),
                         }
-                        Err(e) => {
-                            return Err(ReadError::ExecError(e))
-                        }
+                    } else {
+                        return row;
                     }
-                } else {
-                    return row;
-                }
-            }).collect()
+                })
+                .collect()
         }
         if !proc_empty {
             let proc = proc.to_sexpr();
-            let res = rows.into_iter().map(|row| {
-                match row {
+            let res = rows
+                .into_iter()
+                .map(|row| match row {
                     Ok((cell, mut exec)) => {
                         let proc_res = proc.clone().eval(exec.get_env());
                         match proc_res {
@@ -179,23 +181,21 @@ impl Service for NebRPCService {
                                 let val = sexp.owned_val().unwrap_or(OwnedValue::NA);
                                 return Ok(OwnedCell {
                                     header: cell.header,
-                                    data: val
+                                    data: val,
                                 });
                             }
-                            Err(e) => {
-                                return Err(ReadError::ExecError(e))
-                            }
+                            Err(e) => return Err(ReadError::ExecError(e)),
                         }
                     }
-                    Err(e) => Err(e)
-                }
-            })
-            .collect();
+                    Err(e) => Err(e),
+                })
+                .collect();
             return future::ready(res).boxed();
         } else {
-            let res: Vec<_> = rows.into_iter().map(|row| {
-                row.map(|(cell, _)| cell.to_owned())
-            }).collect();
+            let res: Vec<_> = rows
+                .into_iter()
+                .map(|row| row.map(|(cell, _)| cell.to_owned()))
+                .collect();
             return future::ready(res).boxed();
         }
     }
