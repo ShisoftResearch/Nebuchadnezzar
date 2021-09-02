@@ -6,11 +6,15 @@ use crate::{
 };
 use bifrost::rpc::*;
 use dovahkiin::expr::serde::Expr;
-use dovahkiin::types::OwnedValue;
+use dovahkiin::expr::SExpr;
+use dovahkiin::expr::symbols::utils::is_true;
+use dovahkiin::integrated::lisp;
+use dovahkiin::types::{OwnedValue, SharedMap, SharedValue};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 
 use bifrost_plugins::hash_ident;
+use itertools::Itertools;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
@@ -83,14 +87,117 @@ impl Service for NebRPCService {
         filter: Expr,
         proc: Expr,
     ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
-        keys.into_iter().filter_map(|id| {
-            self.server
-                .chunks
-                .read_selected(&id, colums.as_slice())
-                .ok()
-                .map(|v| (id, v))
-        });
-        unimplemented!()
+        let filter_empty = filter.is_empty();
+        let proc_empty = proc.is_empty();
+        if filter_empty && proc_empty {
+            // Fast path for naive query
+            if colums.is_empty() {
+                let res = keys
+                    .iter()
+                    .map(|id| self.server.chunks.read_cell(id).map(|c| c.to_owned()))
+                    .collect_vec();
+                return future::ready(res).boxed();
+            } else {
+                let res = keys
+                    .iter()
+                    .map(|id| {
+                        self.server
+                            .chunks
+                            .read_selected(id, colums.as_slice())
+                            .map(|c| c.to_owned())
+                    })
+                    .collect_vec();
+                return future::ready(res).boxed();
+            }
+        };
+        let mut rows = if colums.is_empty() {
+            keys.into_iter()
+                .map(|id| self.server.chunks.read_cell(&id))
+                .map(|cell| {
+                    cell.map(|cell| {
+                        let mut interpreter = lisp::get_interpreter();
+                        if let &SharedValue::Map(ref map) = &cell.data {
+                            for (id, val) in &map.map {
+                                interpreter.bind_by_id(*id, SExpr::shared_value(val.clone()));
+                            }
+                        }
+                        interpreter.bind("data", SExpr::shared_value(cell.data.clone()));
+                        (cell, interpreter)
+                    })
+                })
+                .collect_vec()
+        } else {
+            keys.into_iter()
+                .map(|id| self.server.chunks.read_selected(&id, colums.as_slice()))
+                .map(|fields| {
+                    fields.map(|fields| {
+                        if let &SharedValue::Array(ref arr) = &fields.data {
+                            let mut interpreter = lisp::get_interpreter();
+                            debug_assert_eq!(arr.len(), colums.len());
+                            for (i, col) in colums.iter().enumerate() {
+                                interpreter.bind_by_id(*col, SExpr::shared_value(arr[i].clone()));
+                            }
+                            interpreter.bind("data", SExpr::shared_value(fields.data.clone()));
+                            return (fields, interpreter);
+                        } else {
+                            unreachable!()
+                        }
+                    })
+                })
+                .collect_vec()
+        };
+        if !filter_empty {
+            let filter = filter.to_sexpr();
+            rows = rows.into_iter().map(|row| {
+                if let Ok((cell, mut exec)) = row {
+                    let check_res = filter.clone().eval(exec.get_env());
+                    match check_res {
+                        Ok(sexp) => {
+                            if is_true(sexp) {
+                                return Ok((cell, exec));
+                            } else {
+                                return Err(ReadError::NotMatch);
+                            }
+                        }
+                        Err(e) => {
+                            return Err(ReadError::ExecError(e))
+                        }
+                    }
+                } else {
+                    return row;
+                }
+            }).collect()
+        }
+        if !proc_empty {
+            let proc = proc.to_sexpr();
+            let res = rows.into_iter().map(|row| {
+                match row {
+                    Ok((cell, mut exec)) => {
+                        let proc_res = proc.clone().eval(exec.get_env());
+                        match proc_res {
+                            Ok(sexp) => {
+                                let val = sexp.owned_val().unwrap_or(OwnedValue::NA);
+                                return Ok(OwnedCell {
+                                    header: cell.header,
+                                    data: val
+                                });
+                            }
+                            Err(e) => {
+                                return Err(ReadError::ExecError(e))
+                            }
+                        }
+                    }
+                    Err(e) => Err(e)
+                }
+            })
+            .collect();
+            return future::ready(res).boxed();
+        } else {
+            let res: Vec<_> = rows.into_iter().map(|row| {
+                row.map(|(cell, _)| cell.to_owned())
+            }).collect();
+            return future::ready(res).boxed();
+        }
     }
 }
 

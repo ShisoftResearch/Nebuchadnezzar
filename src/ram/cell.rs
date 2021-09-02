@@ -46,6 +46,8 @@ pub enum ReadError {
     NetworkingError,
     CellTypeIsNotMapForSelect,
     CellIdIsUnitId,
+    NotMatch,
+    ExecError(String)
 }
 
 impl CellHeader {

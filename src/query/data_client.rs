@@ -71,6 +71,7 @@ impl IndexedDataClient {
                             async move {
                                 let client = client_by_server_id(&self.conshash, sid).await;
                                 client.map(|client| {
+                                    
                                     // client.read_all_cells(keys)
                                 })
                             }

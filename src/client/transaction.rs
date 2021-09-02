@@ -7,7 +7,6 @@ use std::io;
 use std::sync::Arc;
 
 use bifrost::rpc::RPCError;
-use dovahkiin::types::OwnedValue;
 
 #[derive(Debug)]
 pub enum TxnError {
