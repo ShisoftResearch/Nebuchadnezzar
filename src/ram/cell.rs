@@ -16,7 +16,7 @@ use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
 
-#[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, Serialize, Deserialize, Default)]
 pub struct CellHeader {
     pub version: u64,
     pub timestamp: u32,
@@ -77,7 +77,7 @@ impl CellHeader {
 pub const CELL_HEADER_SIZE: usize = std::mem::size_of::<CellHeader>();
 pub const CELL_HEADER_SIZE_U32: u32 = CELL_HEADER_SIZE as u32;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct OwnedCell {
     pub header: CellHeader,
     pub data: OwnedValue,
