@@ -79,7 +79,7 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
-    rpc seek(id: Id, entry: EntryKey, ordering: Ordering, buffer_size: u16, epoch: u64)
+    rpc seek(id: Id, entry: EntryKey, pattern: Option<Vec<u8>>, ordering: Ordering, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
@@ -149,6 +149,7 @@ impl Service for LSMTreeService {
         &self,
         id: Id,
         entry: EntryKey,
+        pattern: Option<Vec<u8>>,
         ordering: Ordering,
         buffer_size: u16,
         epoch: u64,
@@ -158,8 +159,18 @@ impl Service for LSMTreeService {
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
             let mut num_collected = 0;
+            let pattern = pattern.as_ref().map(|p| {
+                let remaining = KEY_SIZE - (p.len() as usize);
+                (&p.as_slice()[remaining..], remaining)
+            });
             while num_collected < buffer_size {
                 if let Some(key) = tree_cursor.next() {
+                    if let Some((patt_key, patt_remain)) = pattern {
+                        if &key.as_slice()[patt_remain..] != patt_key {
+                            // Pattern unmatch
+                            break;
+                        }
+                    }
                     let key_id = key.id();
                     if let Some(last_key) = buffer.last() {
                         if last_key == &key_id {

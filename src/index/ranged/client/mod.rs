@@ -1,7 +1,7 @@
 use super::lsm::service::*;
 use super::sm::client::SMClient;
 use super::{lsm::btree::Ordering, sm::TreePlacement};
-use crate::index::EntryKey;
+use crate::index::{EntryKey, KEY_SIZE};
 use crate::ram::types::Id;
 use bifrost::raft::client::RaftClient;
 use bifrost::rpc::RPCError;
@@ -38,19 +38,22 @@ impl RangedQueryClient {
         key: &EntryKey,
         ordering: Ordering,
         buffer_size: u16,
+        pattern: Option<Vec<u8>>
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         self_ref
             .run_on_destinated_tree(
                 key,
                 |key, client, tree_id, epoch| {
+                    let pattern = pattern.clone();
                     async move {
                         client
-                            .seek(tree_id, key, ordering, buffer_size, epoch)
+                            .seek(tree_id, key, pattern, ordering, buffer_size, epoch)
                             .await
                     }
                     .boxed()
                 },
                 |action_res, _tree_client, lower, _upper| {
+                    let pattern = pattern.clone();
                     async move {
                         if let Some(block) = action_res {
                             if block.buffer.is_empty() {
@@ -62,6 +65,7 @@ impl RangedQueryClient {
                                     lower,
                                     self_ref.clone(),
                                     buffer_size,
+                                    pattern
                                 )
                                 .await?;
                                 return Ok(Some(Some(client_cursor)));

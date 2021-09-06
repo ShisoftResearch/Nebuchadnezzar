@@ -92,7 +92,7 @@ mod tests {
                 let id = Id::new(1, num as u64);
                 let key = EntryKey::from_id(&id);
                 let rt_cursor =
-                    client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward, 1)
+                    client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward, 1, None)
                         .await
                         .unwrap()
                         .unwrap();
@@ -117,6 +117,7 @@ mod tests {
             &EntryKey::from_id(&start_id),
             Ordering::Forward,
             128,
+            None
         )
         .await
         .unwrap()

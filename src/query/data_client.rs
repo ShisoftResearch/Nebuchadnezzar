@@ -5,10 +5,14 @@ use dovahkiin::{expr::serde::Expr, types::OwnedValue};
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
-use crate::{client::{client_by_server_id, client_by_server_name}, index::{
+use crate::{
+    client::{client_by_server_id, client_by_server_name},
+    index::{
         ranged::{client::cursor::ClientCursor, lsm::btree::Ordering},
-        EntryKey, IndexerClients,
-    }, ram::cell::{OwnedCell, ReadError}};
+        EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
+    },
+    ram::cell::{OwnedCell, ReadError},
+};
 
 const SCAN_BUFFER_SIZE: u16 = 64;
 
@@ -24,7 +28,7 @@ pub struct DataCursor<'a> {
     selection: Expr,
     proc: Expr,
     client: &'a IndexedDataClient,
-    pos: usize
+    pos: usize,
 }
 
 impl IndexedDataClient {
@@ -54,7 +58,12 @@ impl IndexedDataClient {
         let key = EntryKey::for_schema(schema);
         let index_cursor = self
             .index_clients
-            .range_seek(&key, Ordering::Forward, SCAN_BUFFER_SIZE)
+            .range_seek(
+                &key,
+                Ordering::Forward,
+                SCAN_BUFFER_SIZE,
+                Some(SCHEMA_SCAN_PATT_SIZE),
+            )
             .await?;
         let mut cursor = DataCursor {
             index_cursor,
@@ -63,14 +72,14 @@ impl IndexedDataClient {
             proc,
             client: self,
             buffer: vec![],
-            pos: 0
+            pos: 0,
         };
         cursor.refresh_batch().await;
         Ok(cursor)
     }
 }
 
-impl <'a> DataCursor<'a> {
+impl<'a> DataCursor<'a> {
     pub async fn next(&mut self) -> Result<Option<OwnedCell>, RPCError> {
         if self.buffer.len() <= self.pos {
             if self.next_block().await? {
@@ -92,7 +101,7 @@ impl <'a> DataCursor<'a> {
                 return Ok(true);
             }
         }
-        // If cannot get next block, set the index cursor to none 
+        // If cannot get next block, set the index cursor to none
         // We are done with this cursor
         self.index_cursor = None;
         self.buffer = vec![];
@@ -105,7 +114,12 @@ impl <'a> DataCursor<'a> {
             let all_ids = cursor.current_block();
             let mut tasks = all_ids
                 .iter()
-                .filter_map(|id| self.client.conshash.get_server_id_by(id).map(|sid| (sid, id)))
+                .filter_map(|id| {
+                    self.client
+                        .conshash
+                        .get_server_id_by(id)
+                        .map(|sid| (sid, id))
+                })
                 .group_by(|(sid, _id)| *sid)
                 .into_iter()
                 .map(|(sid, pairs)| {
@@ -121,7 +135,9 @@ impl <'a> DataCursor<'a> {
                                     .read_all_cells_proced(ids, projection, selection, proc)
                                     .await;
                                 match read_res {
-                                    Ok(cells) => Ok(cells.into_iter().filter_map(|c| c.ok()).collect_vec()),
+                                    Ok(cells) => {
+                                        Ok(cells.into_iter().filter_map(|c| c.ok()).collect_vec())
+                                    }
                                     Err(e) => return Err(e),
                                 }
                             }
