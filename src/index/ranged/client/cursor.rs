@@ -18,7 +18,7 @@ pub struct ClientCursor {
     tree_key: EntryKey,
     pub pos: usize,
     buffer_size: u16,
-    pattern: Option<Vec<u8>>
+    pattern: Option<Vec<u8>>,
 }
 
 impl ClientCursor {
@@ -28,7 +28,7 @@ impl ClientCursor {
         tree_key: EntryKey,
         query_client: Arc<RangedQueryClient>,
         buffer_size: u16,
-        pattern: Option<Vec<u8>>
+        pattern: Option<Vec<u8>>,
     ) -> Result<Self, RPCError> {
         trace!(
             "Client cursor created with buffer next {:?}, tree key {:?}, block keys {:?}",
@@ -46,7 +46,7 @@ impl ClientCursor {
             next,
             buffer_size,
             pos: 0,
-            pattern
+            pattern,
         })
     }
 
@@ -84,7 +84,7 @@ impl ClientCursor {
             next_key,
             self.ordering,
             self.buffer_size,
-            self.pattern.clone()
+            self.pattern.clone(),
         )
         .await?;
         if let Some(cursor) = next_cursor {
@@ -161,7 +161,7 @@ impl ClientCursor {
                                 tree_key,
                                 self.query_client.clone(),
                                 self.buffer_size,
-                                self.pattern.clone()
+                                self.pattern.clone(),
                             )
                             .await?;
                         }

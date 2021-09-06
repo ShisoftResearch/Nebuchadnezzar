@@ -41,7 +41,7 @@ impl IndexerClients {
         key: &'a EntryKey,
         ordering: Ordering,
         buffer_size: u16,
-        pattern: Option<u8>
+        pattern: Option<u8>,
     ) -> impl Future<Output = Result<Option<ClientCursor>, RPCError>> + 'a {
         let pattern = pattern.map(|n| {
             let remain = KEY_SIZE - (n as usize);

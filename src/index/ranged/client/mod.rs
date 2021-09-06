@@ -38,7 +38,7 @@ impl RangedQueryClient {
         key: &EntryKey,
         ordering: Ordering,
         buffer_size: u16,
-        pattern: Option<Vec<u8>>
+        pattern: Option<Vec<u8>>,
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         self_ref
             .run_on_destinated_tree(
@@ -65,7 +65,7 @@ impl RangedQueryClient {
                                     lower,
                                     self_ref.clone(),
                                     buffer_size,
-                                    pattern
+                                    pattern,
                                 )
                                 .await?;
                                 return Ok(Some(Some(client_cursor)));

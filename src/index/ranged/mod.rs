@@ -91,11 +91,16 @@ mod tests {
                 trace!("Seeking Id at {}, index {}", num, i);
                 let id = Id::new(1, num as u64);
                 let key = EntryKey::from_id(&id);
-                let rt_cursor =
-                    client::RangedQueryClient::seek(&index_client, &key, Ordering::Forward, 1, None)
-                        .await
-                        .unwrap()
-                        .unwrap();
+                let rt_cursor = client::RangedQueryClient::seek(
+                    &index_client,
+                    &key,
+                    Ordering::Forward,
+                    1,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
                 assert_eq!(&id, rt_cursor.current().unwrap(), "at {}", i);
                 trace!("Id at {}, index {} have been checked", num, i);
             }));
@@ -117,7 +122,7 @@ mod tests {
             &EntryKey::from_id(&start_id),
             Ordering::Forward,
             128,
-            None
+            None,
         )
         .await
         .unwrap()
