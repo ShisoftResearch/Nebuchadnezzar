@@ -18,7 +18,6 @@ use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
 use futures::Future;
-use smallvec::SmallVec;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedQueryClient;

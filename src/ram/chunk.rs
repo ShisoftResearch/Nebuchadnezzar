@@ -256,6 +256,7 @@ impl Chunk {
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
+                drop(guard);
                 self.ensure_indices(cell, None, &*schema);
                 self.refresh_statistics();
             }
@@ -287,6 +288,7 @@ impl Chunk {
             let old_indices = self.old_index_res(&guard, &*schema)?;
             self.ensure_indices_with_res(cell, old_indices, &*schema);
             *guard = new_cell_loc;
+            drop(guard);
             self.mark_dead_entry_with_cell(cell_location, cell);
             self.refresh_statistics();
         } else {
@@ -317,6 +319,7 @@ impl Chunk {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
                     *guard = new_cell_loc;
+                    drop(guard);
                     self.ensure_indices(cell, None, &*schema);
                     self.refresh_statistics();
                 } else {

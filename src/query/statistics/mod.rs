@@ -188,8 +188,8 @@ fn build_partitation_statistics(
                     {
                         let field_array = if fields.len() == 1 {
                             vec![partial_cell]
-                        } else if let SharedValue::Array(arr) = partial_cell {
-                            arr
+                        } else if let SharedValue::Map(map) = partial_cell {
+                            fields.iter().map(|key| map.get_by_key_id(*key).clone()).collect_vec()
                         } else {
                             error!(
                                 "Cannot decode partial cell for statistics {:?}",

@@ -1,7 +1,7 @@
 use super::lsm::service::*;
 use super::sm::client::SMClient;
 use super::{lsm::btree::Ordering, sm::TreePlacement};
-use crate::index::{EntryKey, KEY_SIZE};
+use crate::index::EntryKey;
 use crate::ram::types::Id;
 use bifrost::raft::client::RaftClient;
 use bifrost::rpc::RPCError;
