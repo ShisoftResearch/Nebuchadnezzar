@@ -36,7 +36,7 @@ const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
 const HISTOGRAM_TARGET_BUCKETS: usize = 100;
 const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
-const REFRESH_CHANGES_THRESHOLD: u32 = 1024;
+const REFRESH_CHANGES_THRESHOLD: u32 = 512;
 
 type HistogramKey = [u8; 8];
 type TargetHistogram = [HistogramKey; HISTOGRAM_TARGET_KEYS];
@@ -59,6 +59,11 @@ impl ChunkStatistics {
                 return;
             }
         }
+        self.ensured_refresh_chunk(chunk)
+    }
+
+    fn ensured_refresh_chunk(&self, chunk: &Chunk) {
+        let refresh_changes = self.changes.load(Ordering::Relaxed);
         let histogram_partitations = chunk
             .cell_index
             .entries()
@@ -139,18 +144,20 @@ impl ChunkStatistics {
                 })
             })
             .collect::<HashMap<_, _>>();
+        let now = now();
         for schema_id in schema_ids {
             let statistics = SchemaStatistics {
                 histogram: schema_histograms.remove(&schema_id).unwrap(),
                 count: *total_counts.get(&schema_id).unwrap(),
                 segs: *total_segs.get(&schema_id).unwrap(),
                 bytes: *total_size.get(&schema_id).unwrap(),
-                timestamp: now(),
+                timestamp: now,
             };
             self.schemas
                 .insert(&(*schema_id as usize), Arc::new(statistics));
         }
-        self.timestamp.store(now(), Ordering::Relaxed);
+        self.timestamp.store(now, Ordering::Relaxed);
+        self.changes.fetch_sub(refresh_changes, Ordering::Relaxed);
     }
 }
 
@@ -189,7 +196,10 @@ fn build_partitation_statistics(
                         let field_array = if fields.len() == 1 {
                             vec![partial_cell]
                         } else if let SharedValue::Map(map) = partial_cell {
-                            fields.iter().map(|key| map.get_by_key_id(*key).clone()).collect_vec()
+                            fields
+                                .iter()
+                                .map(|key| map.get_by_key_id(*key).clone())
+                                .collect_vec()
                         } else {
                             error!(
                                 "Cannot decode partial cell for statistics {:?}",
@@ -437,4 +447,7 @@ mod tests {
         assert!(histogram.is_sorted(), "Got {:?}", histogram);
         assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(1024).feature());
     }
+
+    #[test]
+    fn chunk_statistics() {}
 }
