@@ -1,6 +1,6 @@
-mod cell;
-mod chunk;
-mod types;
+pub mod cell;
+pub mod chunk;
+pub mod types;
 
 use dovahkiin::types::Type;
 

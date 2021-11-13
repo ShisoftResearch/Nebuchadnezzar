@@ -18,6 +18,7 @@ use crate::ram::{
     clock::now,
 };
 
+#[derive(Debug)]
 pub struct SchemaStatistics {
     pub histogram: HashMap<u64, TargetHistogram>,
     pub count: usize,
@@ -50,30 +51,30 @@ impl ChunkStatistics {
         }
     }
     pub fn refresh_from_chunk(&self, chunk: &Chunk) {
-        let num_cells = chunk.cell_index.len();
         let last_update = self.timestamp.load(Ordering::Relaxed);
         let refresh_changes = self.changes.fetch_add(1, Ordering::Relaxed);
         // Refresh rate 10 seconds
-        if num_cells > REFRESH_CHANGES_THRESHOLD as usize {
-            if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < 10 {
-                return;
-            }
+        if refresh_changes < REFRESH_CHANGES_THRESHOLD || now() - last_update < 10 {
+            return;
         }
         self.ensured_refresh_chunk(chunk)
     }
 
-    fn ensured_refresh_chunk(&self, chunk: &Chunk) {
+    pub fn ensured_refresh_chunk(&self, chunk: &Chunk) {
         let refresh_changes = self.changes.load(Ordering::Relaxed);
+        debug!("Building histogram for chunk {}, changes {}", chunk.id, refresh_changes);
         let histogram_partitations = chunk
             .cell_index
             .entries()
             .chunks(HISTOGRAM_PARTITATION_SIZE)
             .map(|s| s.to_vec())
             .collect_vec();
+        debug!("Histogram for chunk {} have {} partitations", chunk.id, histogram_partitations.len());
         let partitations: Vec<_> = histogram_partitations
             .into_par_iter()
             .map(|partitation| build_partitation_statistics(partitation, chunk))
             .collect();
+        debug!("Partitations {:?}", partitations);
         let schema_ids: Vec<_> = partitations
             .iter()
             .map(|(sizes, _, _, _)| sizes.keys())
@@ -270,10 +271,12 @@ fn build_partitation_histogram(mut items: Vec<HistogramKey>) -> (Vec<HistogramKe
 fn build_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> TargetHistogram {
     let num_all_keys: usize = partitations.iter().map(|(h, _, _)| h.len()).sum();
     if num_all_keys < HISTOGRAM_TARGET_KEYS {
+        // debug!("Building histogram with repeatdly keys");
         return repeated_histogram(partitations);
     }
     // Build the approximated histogram from partitation histograms
     // https://arxiv.org/abs/1606.05633
+    // debug!("Building histogram with approximation");
     let mut part_idxs = vec![0; partitations.len()];
     let part_histos = partitations
         .iter()
@@ -364,7 +367,20 @@ fn empty_target_histogram() -> TargetHistogram {
 
 #[cfg(test)]
 mod tests {
-    use dovahkiin::types::OwnedValue;
+    use dovahkiin::types::{Id, OwnedMap, OwnedValue};
+    use rand::Rng;
+
+    use crate::ram::cell::{CellHeader, OwnedCell};
+    use crate::ram::segs::SEGMENT_SIZE;
+    use crate::ram::types::RandValue;
+    use crate::{
+        ram::{
+            chunk::Chunks,
+            schema::{LocalSchemasCache, Schema},
+            tests::default_fields,
+        },
+        server::ServerMeta,
+    };
 
     use super::*;
 
@@ -448,6 +464,46 @@ mod tests {
         assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(1024).feature());
     }
 
+    const CHUNK_TEST_SIZE: usize = REFRESH_CHANGES_THRESHOLD as usize * 4;
     #[test]
-    fn chunk_statistics() {}
+    fn chunk_statistics() {
+        let _ = env_logger::try_init();
+        let fields = default_fields();
+        let schema = Schema::new("dummy", None, fields, false, true);
+        let schemas = LocalSchemasCache::new_local("");
+        schemas.new_schema(schema.clone());
+        let schema_id = schema.id;
+        let chunks = Chunks::new(
+            1,
+            SEGMENT_SIZE,
+            Arc::new(ServerMeta { schemas }),
+            None,
+            None,
+            None,
+        );
+        let mut rng = rand::thread_rng();
+        for i in 0..CHUNK_TEST_SIZE {
+            let mut data_map = OwnedMap::new();
+            data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+            data_map.insert(&String::from("score"), OwnedValue::U64(rng.gen_range(60..100)));
+            data_map.insert(
+                &String::from("name"),
+                OwnedValue::String(String::from("Jack")),
+            );
+            let data = OwnedValue::Map(data_map);
+            let header = CellHeader::new(schema_id, &Id::rand());
+            let mut cell = OwnedCell { data, header };
+            chunks.write_cell(&mut cell).unwrap();
+        }
+        // chunks.ensure_statistics();
+        let stats = chunks.all_chunk_statistics(schema_id);
+        assert_eq!(stats.len(), 1);
+        let stat = stats[0].as_ref().unwrap();
+        info!("Stat {:?}", &*stat);
+        assert!(stat.count > 0, "Statistics should be triggered");
+        assert!(stat.bytes > 0, "Statistics should have bytes");
+        assert!(stat.timestamp > 0, "timestamp should not be zero");
+        assert!(stat.segs > 0, "Segs should not be zero");
+        assert_eq!(stat.histogram.len(), HISTOGRAM_TARGET_KEYS, "Histogram should be in right shape");
+    }
 }

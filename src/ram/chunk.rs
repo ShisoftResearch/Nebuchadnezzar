@@ -864,4 +864,9 @@ impl Chunks {
             .map(|c| c.statistics.schemas.get(&(schema_id as usize)))
             .collect_vec()
     }
+    pub fn ensure_statistics(&self) {
+        self.list
+            .iter()
+            .for_each(|c| c.statistics.ensured_refresh_chunk(c));
+    }
 }
