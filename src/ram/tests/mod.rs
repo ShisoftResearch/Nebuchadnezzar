@@ -4,7 +4,7 @@ pub mod types;
 
 use dovahkiin::types::Type;
 
-use crate::ram::schema::Field;
+use crate::ram::schema::{Field, IndexType};
 
 pub fn default_fields() -> Field {
     Field::new(
@@ -13,7 +13,7 @@ pub fn default_fields() -> Field {
         false,
         false,
         Some(vec![
-            Field::new(&String::from("id"), Type::I64, false, false, None, vec![]),
+            Field::new(&String::from("id"), Type::I64, false, false, None, vec![IndexType::Statistics]),
             Field::new(
                 &String::from("name"),
                 Type::String,
@@ -28,7 +28,7 @@ pub fn default_fields() -> Field {
                 false,
                 false,
                 None,
-                vec![],
+                vec![IndexType::Statistics],
             ),
         ]),
         vec![],

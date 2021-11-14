@@ -62,19 +62,26 @@ impl ChunkStatistics {
 
     pub fn ensured_refresh_chunk(&self, chunk: &Chunk) {
         let refresh_changes = self.changes.load(Ordering::Relaxed);
-        debug!("Building histogram for chunk {}, changes {}", chunk.id, refresh_changes);
+        debug!(
+            "Building histogram for chunk {}, changes {}",
+            chunk.id, refresh_changes
+        );
         let histogram_partitations = chunk
             .cell_index
             .entries()
             .chunks(HISTOGRAM_PARTITATION_SIZE)
             .map(|s| s.to_vec())
             .collect_vec();
-        debug!("Histogram for chunk {} have {} partitations", chunk.id, histogram_partitations.len());
+        debug!(
+            "Histogram for chunk {} have {} partitations",
+            chunk.id,
+            histogram_partitations.len()
+        );
         let partitations: Vec<_> = histogram_partitations
             .into_par_iter()
             .map(|partitation| build_partitation_statistics(partitation, chunk))
             .collect();
-        debug!("Partitations {:?}", partitations);
+        debug!("Total of {} partitations", partitations.len());
         let schema_ids: Vec<_> = partitations
             .iter()
             .map(|(sizes, _, _, _)| sizes.keys())
@@ -172,12 +179,17 @@ fn build_partitation_statistics(
     HashMap<u32, HashMap<u64, (Vec<HistogramKey>, usize, usize)>>,
 ) {
     // Build exact histogram for each of the partitation and then approximate overall histogram
+    debug!(
+        "Building partitation for chunk {} with {} cells",
+        chunk.id,
+        partitation.len()
+    );
     let mut sizes = HashMap::new();
     let mut segs = HashMap::new();
     let mut counts = HashMap::new();
     let mut exact_accumlators = HashMap::new();
     let partitation_size = partitation.len();
-    for (hash, _) in partitation {
+    for (hash, _addr) in partitation {
         let loc = if let Ok(ptr) = chunk.location_for_read(hash as u64) {
             ptr
         } else {
@@ -191,41 +203,46 @@ fn build_partitation_statistics(
                 let schema_id = header.schema;
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
                     let fields = schema.index_fields.keys().cloned().collect_vec();
-                    if let Ok((partial_cell, _)) =
-                        select_from_chunk_raw(*loc, chunk, fields.as_slice())
-                    {
-                        let field_array = if fields.len() == 1 {
-                            vec![partial_cell]
-                        } else if let SharedValue::Map(map) = partial_cell {
-                            fields
-                                .iter()
-                                .map(|key| map.get_by_key_id(*key).clone())
-                                .collect_vec()
-                        } else {
-                            error!(
-                                "Cannot decode partial cell for statistics {:?}",
-                                partial_cell
-                            );
-                            continue;
-                        };
-                        for (i, val) in field_array.into_iter().enumerate() {
-                            if val == SharedValue::Null || val == SharedValue::NA {
+                    if !fields.is_empty() {
+                        trace!("Schema {} has fields {:?}", schema_id, fields);
+                        if let Ok((partial_cell, _)) =
+                            select_from_chunk_raw(*loc, chunk, fields.as_slice())
+                        {
+                            let field_array = if fields.len() == 1 {
+                                vec![partial_cell]
+                            } else if let SharedValue::Map(map) = partial_cell {
+                                fields
+                                    .iter()
+                                    .map(|key| map.get_by_key_id(*key).clone())
+                                    .collect_vec()
+                            } else if let SharedValue::Array(array) = partial_cell {
+                                array
+                            } else {
+                                error!(
+                                    "Cannot decode partial cell for statistics {:?}",
+                                    partial_cell
+                                );
                                 continue;
+                            };
+                            for (i, val) in field_array.into_iter().enumerate() {
+                                if val == SharedValue::Null || val == SharedValue::NA {
+                                    continue;
+                                }
+                                let field_id = fields[i];
+                                exact_accumlators
+                                    .entry(schema_id)
+                                    .or_insert_with(|| HashMap::new())
+                                    .entry(field_id)
+                                    .or_insert_with(|| Vec::with_capacity(partitation_size))
+                                    .push(val.feature());
                             }
-                            let field_id = fields[i];
-                            exact_accumlators
-                                .entry(schema_id)
-                                .or_insert_with(|| HashMap::new())
-                                .entry(field_id)
-                                .or_insert_with(|| Vec::with_capacity(partitation_size))
-                                .push(val.feature());
                         }
-                        *counts.entry(schema_id).or_insert(0) += 1;
-                        *sizes.entry(schema_id).or_insert(0) += cell_size;
-                        segs.entry(schema_id)
-                            .or_insert_with(|| HashSet::new())
-                            .insert(cell_seg);
                     }
+                    *counts.entry(schema_id).or_insert(0) += 1;
+                    *sizes.entry(schema_id).or_insert(0) += cell_size;
+                    segs.entry(schema_id)
+                        .or_insert_with(|| HashSet::new())
+                        .insert(cell_seg);
                 } else {
                     warn!("Cannot get schema {} for statistics", schema_id);
                 }
@@ -367,7 +384,7 @@ fn empty_target_histogram() -> TargetHistogram {
 
 #[cfg(test)]
 mod tests {
-    use dovahkiin::types::{Id, OwnedMap, OwnedValue};
+    use dovahkiin::types::{key_hash, Id, OwnedMap, OwnedValue};
     use rand::Rng;
 
     use crate::ram::cell::{CellHeader, OwnedCell};
@@ -485,7 +502,10 @@ mod tests {
         for i in 0..CHUNK_TEST_SIZE {
             let mut data_map = OwnedMap::new();
             data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
-            data_map.insert(&String::from("score"), OwnedValue::U64(rng.gen_range(60..100)));
+            data_map.insert(
+                &String::from("score"),
+                OwnedValue::U64(rng.gen_range(60..100)),
+            );
             data_map.insert(
                 &String::from("name"),
                 OwnedValue::String(String::from("Jack")),
@@ -495,7 +515,7 @@ mod tests {
             let mut cell = OwnedCell { data, header };
             chunks.write_cell(&mut cell).unwrap();
         }
-        // chunks.ensure_statistics();
+        chunks.ensure_statistics();
         let stats = chunks.all_chunk_statistics(schema_id);
         assert_eq!(stats.len(), 1);
         let stat = stats[0].as_ref().unwrap();
@@ -504,6 +524,16 @@ mod tests {
         assert!(stat.bytes > 0, "Statistics should have bytes");
         assert!(stat.timestamp > 0, "timestamp should not be zero");
         assert!(stat.segs > 0, "Segs should not be zero");
-        assert_eq!(stat.histogram.len(), HISTOGRAM_TARGET_KEYS, "Histogram should be in right shape");
+        info!("Statistics fields: {:?}", stat.histogram.keys());
+        assert_eq!(stat.histogram.len(), 2, "Should have 2 statistics fields");
+        let id_key = key_hash("id");
+        let score_key = key_hash("score");
+        assert!(stat.histogram.contains_key(&id_key));
+        assert!(stat.histogram.contains_key(&score_key));
+        let id_histo = stat.histogram[&id_key];
+        let score_histo = stat.histogram[&score_key];
+        assert_eq!(id_histo.len(), score_histo.len());
+        assert_eq!(id_histo.len(), HISTOGRAM_PARTITATION_BUCKETS);
+        assert_eq!(score_histo.len(), HISTOGRAM_PARTITATION_BUCKETS);
     }
 }
