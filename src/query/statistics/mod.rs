@@ -34,8 +34,9 @@ pub struct ChunkStatistics {
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
-const HISTOGRAM_PARTITATION_BUCKETS: usize = 128;
-const HISTOGRAM_TARGET_BUCKETS: usize = 100;
+const HISTOGRAM_PARTITATION_BUCKETS: usize = 100;
+const HISTOGRAM_PARTITATION_KEYS: usize = HISTOGRAM_PARTITATION_BUCKETS + 1;
+const HISTOGRAM_TARGET_BUCKETS: usize = HISTOGRAM_PARTITATION_BUCKETS;
 const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
 const REFRESH_CHANGES_THRESHOLD: u32 = 512;
 
@@ -481,7 +482,7 @@ mod tests {
         assert_eq!(histogram.last().unwrap(), &OwnedValue::U64(1024).feature());
     }
 
-    const CHUNK_TEST_SIZE: usize = REFRESH_CHANGES_THRESHOLD as usize * 4;
+    const CHUNK_TEST_SIZE: usize = REFRESH_CHANGES_THRESHOLD as usize * 16;
     #[test]
     fn chunk_statistics() {
         let _ = env_logger::try_init();
@@ -519,7 +520,7 @@ mod tests {
         let stats = chunks.all_chunk_statistics(schema_id);
         assert_eq!(stats.len(), 1);
         let stat = stats[0].as_ref().unwrap();
-        info!("Stat {:?}", &*stat);
+        debug!("Stat {:?}", &*stat);
         assert!(stat.count > 0, "Statistics should be triggered");
         assert!(stat.bytes > 0, "Statistics should have bytes");
         assert!(stat.timestamp > 0, "timestamp should not be zero");
@@ -533,7 +534,18 @@ mod tests {
         let id_histo = stat.histogram[&id_key];
         let score_histo = stat.histogram[&score_key];
         assert_eq!(id_histo.len(), score_histo.len());
-        assert_eq!(id_histo.len(), HISTOGRAM_PARTITATION_BUCKETS);
-        assert_eq!(score_histo.len(), HISTOGRAM_PARTITATION_BUCKETS);
+        assert_eq!(id_histo.len(), HISTOGRAM_PARTITATION_KEYS);
+        assert_eq!(score_histo.len(), HISTOGRAM_PARTITATION_KEYS);
+        assert_eq!(
+            id_histo[0],
+            0u64.to_be_bytes(),
+            "Histogram does not include minimal"
+        );
+        assert_eq!(
+            id_histo[id_histo.len() - 1],
+            (CHUNK_TEST_SIZE as u64 - 1).to_be_bytes(),
+            "Histogram does not include maxnimal"
+        );
+        // TODO: Test on the distribution
     }
 }
