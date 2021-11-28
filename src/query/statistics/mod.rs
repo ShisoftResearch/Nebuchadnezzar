@@ -516,7 +516,6 @@ mod tests {
             let mut cell = OwnedCell { data, header };
             chunks.write_cell(&mut cell).unwrap();
         }
-        chunks.ensure_statistics();
         let stats = chunks.all_chunk_statistics(schema_id);
         assert_eq!(stats.len(), 1);
         let stat = stats[0].as_ref().unwrap();
@@ -525,6 +524,9 @@ mod tests {
         assert!(stat.bytes > 0, "Statistics should have bytes");
         assert!(stat.timestamp > 0, "timestamp should not be zero");
         assert!(stat.segs > 0, "Segs should not be zero");
+        chunks.ensure_statistics();
+        let stats = chunks.all_chunk_statistics(schema_id);
+        let stat = stats[0].as_ref().unwrap();
         info!("Statistics fields: {:?}", stat.histogram.keys());
         assert_eq!(stat.histogram.len(), 2, "Should have 2 statistics fields");
         let id_key = key_hash("id");
