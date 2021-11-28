@@ -183,6 +183,9 @@ impl ClientCursor {
                     "Next tree for {:?} does not return anything. ordering {:?}",
                     self.tree_key, self.ordering
                 );
+                // Clear the cursor
+                self.ids.clear();
+                self.pos = 0;
                 return Ok(());
             }
         }

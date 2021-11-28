@@ -128,8 +128,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(rt_cursor.current(), Some(&start_id));
+        let mut id = Default::default();
         for (i, num) in nums.iter().enumerate() {
-            let id = Id::new(1, *num as u64);
+            id = Id::new(1, *num as u64);
             let current = rt_cursor.current().expect(&format!("Checking {}", num));
             assert_eq!(
                 &id,
@@ -147,12 +148,13 @@ mod tests {
                 debug!("Scanned {} of {}", num, test_capacity);
             }
         }
-        info!("Scan finished");
+        info!("Scan finished, last checked id is {:?}", id);
         let end_of_list = rt_cursor.next().await.unwrap();
         assert!(
             end_of_list.is_none(),
-            "End of the list have id {:?}, should be none",
-            end_of_list.unwrap()
+            "End of the list have id {:?}, should be none, next is {:?}",
+            end_of_list.unwrap(),
+            rt_cursor.next().await
         );
         assert!(
             end_of_list.is_none(),
