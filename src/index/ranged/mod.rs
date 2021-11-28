@@ -151,7 +151,7 @@ mod tests {
         let end_of_list = rt_cursor.next().await.unwrap();
         assert!(
             end_of_list.is_none(),
-            "End of the list have id {:?}",
+            "End of the list have id {:?}, should be none",
             end_of_list.unwrap()
         );
         assert!(
