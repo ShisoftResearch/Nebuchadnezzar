@@ -54,13 +54,14 @@ impl IndexedDataClient {
         projection: Vec<u64>, // Column array
         selection: Expr,      // Checker expression
         proc: Expr,
+        ordering: Ordering,
     ) -> Result<DataCursor<'a>, RPCError> {
         let key = EntryKey::for_schema(schema);
         let index_cursor = self
             .index_clients
             .range_seek(
                 &key,
-                Ordering::Forward,
+                ordering,
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
             )
@@ -114,16 +115,22 @@ impl<'a> DataCursor<'a> {
             let all_ids = cursor.current_block();
             let mut tasks = all_ids
                 .iter()
-                .filter_map(|id| {
+                .enumerate()
+                .filter_map(|(i, id)| {
                     self.client
                         .conshash
                         .get_server_id_by(id)
-                        .map(|sid| (sid, id))
+                        .map(|sid| (i, sid, id))
                 })
-                .group_by(|(sid, _id)| *sid)
+                .group_by(|(_i, sid, _id)| *sid)
                 .into_iter()
                 .map(|(sid, pairs)| {
-                    let ids = pairs.map(|(_, id)| *id).collect_vec();
+                    let mut ids = vec![];
+                    let mut idx = vec![];
+                    pairs.for_each(|(i, _, id)| {
+                        idx.push(i);
+                        ids.push(*id);
+                    });
                     let projection = self.projection.clone();
                     let selection = self.selection.clone();
                     let proc = self.proc.clone();
@@ -133,10 +140,15 @@ impl<'a> DataCursor<'a> {
                             Ok(client) => {
                                 let read_res = client
                                     .read_all_cells_proced(ids, projection, selection, proc)
-                                    .await;
+                                    .await
+                                    .map(|v| {
+                                        v.into_iter()
+                                            .zip(idx)
+                                            .collect_vec()
+                                    });
                                 match read_res {
                                     Ok(cells) => {
-                                        Ok(cells.into_iter().filter_map(|c| c.ok()).collect_vec())
+                                        Ok(cells.into_iter().filter_map(|(c, i)| c.ok().map(|c| (c, i))).collect_vec())
                                     }
                                     Err(e) => return Err(e),
                                 }
@@ -152,8 +164,8 @@ impl<'a> DataCursor<'a> {
                     all_cells.append(&mut cells);
                 }
             }
-            all_cells.sort_by(|a, b| a.header.id().cmp(&b.header.id()));
-            self.buffer = all_cells;
+            all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
+            self.buffer = all_cells.into_iter().map(|(c, _)| c).collect_vec();
             self.pos = 0;
             true
         } else {
