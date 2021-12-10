@@ -13,6 +13,7 @@ use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
+use itertools::Itertools;
 // use crate::index::lsmtree;
 use crate::index::ranged;
 use crate::ram::chunk::Chunks;
@@ -53,12 +54,12 @@ pub struct ServerOptions {
     pub index_enabled: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub enum Service {
-    Cell,
-    Transaction,
-    RangedIndexer,
-    Query
+    Cell = 0,
+    Transaction = 1,
+    RangedIndexer = 2,
+    Query = 3
 }
 
 pub struct ServerMeta {
@@ -184,7 +185,9 @@ impl NebServer {
                     )
                     .await
                 }
-                Service::Query => todo!(),
+                Service::Query => {
+                    // todo!()
+                },
             }
         }
 
@@ -382,13 +385,15 @@ pub async fn init_ranged_indexer_service(
     raft_svr.register_state_machine(box tree_sm).await;
 }
 
-fn proc_services(svrs: &Vec<Service>) -> HashSet<Service> {
-    let mut res = HashSet::new();
+fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
+    let mut res_set = HashSet::new();
     for svr in svrs {
-        res.insert(*svr);
+        res_set.insert(*svr);
     }
-    if res.contains(&Service::Query) {
-        res.insert(Service::RangedIndexer);
+    if res_set.contains(&Service::Query) {
+        res_set.insert(Service::RangedIndexer);
     }
+    let mut res = res_set.into_iter().collect_vec();
+    res.sort(); // Sort by service priority
     res
 }

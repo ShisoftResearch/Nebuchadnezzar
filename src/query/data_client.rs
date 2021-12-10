@@ -175,10 +175,15 @@ impl<'a> DataCursor<'a> {
 
 #[cfg(test)]
 mod test {
-    use crate::server::*;
+    use std::sync::Arc;
+
+    use dovahkiin::types::Type;
+
+    use crate::{server::*, ram::schema::{Schema, Field}, client};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
+        const DATA: &'static str = "DATA";
         let _ = env_logger::try_init();
         let server_addr = String::from("127.0.0.1:6701");
         let server_group = String::from("smoke_test");
@@ -195,5 +200,40 @@ mod test {
             &server_group,
         )
         .await;
+        // Require schema to be scannable to insert special scan key to the range indexer
+        let schema_id = 123;
+        let schema = Schema::new_with_id(
+            schema_id,
+            &String::from("schema"),
+            None,
+            Field::new(
+                "*",
+                Type::Map,
+                false,
+                false,
+                Some(vec![Field::new(
+                    DATA,
+                    Type::U64,
+                    false,
+                    false,
+                    None,
+                    vec![],
+                )]),
+                vec![],
+            ),
+            false,
+            true, // Scannable
+        );
+        let client = Arc::new(
+            client::AsyncClient::new(
+                &server.rpc,
+                &server.membership,
+                &vec![server_addr],
+                &server_group,
+            )
+            .await
+            .unwrap(),
+        );
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
     }
 }
