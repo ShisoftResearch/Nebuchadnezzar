@@ -20,6 +20,7 @@ use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::sm as schema_sm;
 use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 
@@ -52,11 +53,12 @@ pub struct ServerOptions {
     pub index_enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub enum Service {
     Cell,
     Transaction,
     RangedIndexer,
+    Query
 }
 
 pub struct ServerMeta {
@@ -167,11 +169,12 @@ impl NebServer {
             server_id: rpc_server.server_id,
             indexer: index_builder,
         });
-        for service in &opts.services {
+        let servs = proc_services(&opts.services);
+        for service in servs {
             match service {
-                &Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
-                &Service::Transaction => init_txn_service(rpc_server, &server).await,
-                &Service::RangedIndexer => {
+                Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
+                Service::Transaction => init_txn_service(rpc_server, &server).await,
+                Service::RangedIndexer => {
                     init_ranged_indexer_service(
                         rpc_server,
                         &neb_client,
@@ -181,6 +184,7 @@ impl NebServer {
                     )
                     .await
                 }
+                Service::Query => todo!(),
             }
         }
 
@@ -376,4 +380,15 @@ pub async fn init_ranged_indexer_service(
     let mut tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash);
     tree_sm.try_initialize().await;
     raft_svr.register_state_machine(box tree_sm).await;
+}
+
+fn proc_services(svrs: &Vec<Service>) -> HashSet<Service> {
+    let mut res = HashSet::new();
+    for svr in svrs {
+        res.insert(*svr);
+    }
+    if res.contains(&Service::Query) {
+        res.insert(Service::RangedIndexer);
+    }
+    res
 }

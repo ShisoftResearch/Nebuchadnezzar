@@ -127,10 +127,10 @@ impl<'a> DataCursor<'a> {
                 .map(|(sid, pairs)| {
                     let mut ids = vec![];
                     let mut idx = vec![];
-                    pairs.for_each(|(i, _, id)| {
+                    for (i, _, id) in pairs {
                         idx.push(i);
                         ids.push(*id);
-                    });
+                    }
                     let projection = self.projection.clone();
                     let selection = self.selection.clone();
                     let proc = self.proc.clone();
@@ -141,15 +141,12 @@ impl<'a> DataCursor<'a> {
                                 let read_res = client
                                     .read_all_cells_proced(ids, projection, selection, proc)
                                     .await
-                                    .map(|v| {
-                                        v.into_iter()
-                                            .zip(idx)
-                                            .collect_vec()
-                                    });
+                                    .map(|v| v.into_iter().zip(idx).collect_vec());
                                 match read_res {
-                                    Ok(cells) => {
-                                        Ok(cells.into_iter().filter_map(|(c, i)| c.ok().map(|c| (c, i))).collect_vec())
-                                    }
+                                    Ok(cells) => Ok(cells
+                                        .into_iter()
+                                        .filter_map(|(c, i)| c.ok().map(|c| (c, i)))
+                                        .collect_vec()),
                                     Err(e) => return Err(e),
                                 }
                             }
@@ -173,5 +170,30 @@ impl<'a> DataCursor<'a> {
             self.pos = 0;
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::server::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_all() {
+        let _ = env_logger::try_init();
+        let server_addr = String::from("127.0.0.1:6701");
+        let server_group = String::from("smoke_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 1,
+                memory_size: 512 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+                index_enabled: false,
+                services: vec![Service::Cell, Service::Query],
+            },
+            &server_addr,
+            &server_group,
+        )
+        .await;
     }
 }
