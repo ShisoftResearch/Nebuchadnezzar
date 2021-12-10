@@ -176,10 +176,8 @@ impl<'a> DataCursor<'a> {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
-
-    use dovahkiin::types::Type;
-
-    use crate::{server::*, ram::schema::{Schema, Field}, client};
+    use dovahkiin::types::*;
+    use crate::{server::*, ram::{schema::{Schema, Field}, cell::OwnedCell}, client};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -235,5 +233,14 @@ mod test {
             .unwrap(),
         );
         client.new_schema_with_id(schema).await.unwrap().unwrap();
+        let num = 10240;
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA] = OwnedValue::U64(i);
+            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+    
     }
 }

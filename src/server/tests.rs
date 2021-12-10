@@ -112,20 +112,19 @@ pub async fn smoke_test() {
     client.new_schema_with_id(schema).await.unwrap().unwrap();
 
     for i in 0..num {
-        let client_clone = client.clone();
         // intense upsert, half delete
         let id = Id::new(1, i / 2);
         let mut value = OwnedValue::Map(OwnedMap::new());
         value[DATA] = OwnedValue::U64(i);
         let cell = OwnedCell::new_with_id(schema_id, &id, value);
-        client_clone.upsert_cell(cell).await.unwrap().unwrap();
+        client.upsert_cell(cell).await.unwrap().unwrap();
 
         // read
-        let read_cell = client_clone.read_cell(id).await.unwrap().unwrap();
+        let read_cell = client.read_cell(id).await.unwrap().unwrap();
         assert_eq!(*(read_cell.data[DATA].u64().unwrap()), i);
 
         if i % 2 == 0 {
-            client_clone.remove_cell(id).await.unwrap().unwrap();
+            client.remove_cell(id).await.unwrap().unwrap();
         }
     }
 
