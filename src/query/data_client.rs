@@ -179,7 +179,7 @@ mod test {
         index::ranged::lsm::btree::Ordering,
         ram::{
             cell::OwnedCell,
-            schema::{Field, Schema, IndexType},
+            schema::{Field, IndexType, Schema},
         },
         server::*,
     };
@@ -194,7 +194,7 @@ mod test {
         let server_group = String::from("indexed_scan_all_test");
         let server = NebServer::new_from_opts(
             &ServerOptions {
-                chunk_count: 1,
+                chunk_count: 8,
                 memory_size: 512 * 1024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
@@ -206,40 +206,58 @@ mod test {
         )
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
-        let schema_id = 123;
-        let schema = Schema::new_with_id(
-            schema_id,
+        let fields = Field::new(
+            "*",
+            Type::Map,
+            false,
+            false,
+            Some(vec![
+                Field::new(
+                    DATA_1,
+                    Type::U64,
+                    false,
+                    false,
+                    None,
+                    vec![IndexType::Ranged],
+                ),
+                Field::new(DATA_2, Type::U32, false, false, None, vec![]),
+            ]),
+            vec![],
+        );
+        let schema_id_1 = 123;
+        let schema_id_2 = 234;
+        let schema_1 = Schema::new_with_id(
+            schema_id_1,
             &String::from("schema_1"),
             None,
-            Field::new(
-                "*",
-                Type::Map,
-                false,
-                false,
-                Some(vec![
-                    Field::new(DATA_1, Type::U64, false, false, None, vec![IndexType::Ranged]),
-                    Field::new(DATA_2, Type::U32, false, false, None, vec![]),
-                ]),
-                vec![],
-            ),
+            fields.clone(),
+            false,
+            true, // Scannable
+        );
+        let schema_2 = Schema::new_with_id(
+            schema_id_2,
+            &String::from("schema_2"),
+            None,
+            fields,
             false,
             true, // Scannable
         );
         let client = server.data_client(&vec![server_addr]).await.unwrap();
-        client.new_schema_with_id(schema).await.unwrap().unwrap();
+        client.new_schema_with_id(schema_1).await.unwrap().unwrap();
+        client.new_schema_with_id(schema_2).await.unwrap().unwrap();
         let num = 1024;
         for i in 0..num {
             let id = Id::new(1, i);
             let mut value = OwnedValue::Map(OwnedMap::new());
             value[DATA_1] = OwnedValue::U64(i);
             value[DATA_2] = OwnedValue::U32((i * 2) as u32);
-            let cell = OwnedCell::new_with_id(schema_id, &id, value);
+            let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
         let idx_data_client = server.indexed_data_client();
         let mut cursor = idx_data_client
             .scan_all(
-                schema_id,
+                schema_id_1,
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
@@ -269,6 +287,73 @@ mod test {
         let out_of_range_item = cursor.next().await.unwrap();
         if let Some(cell) = out_of_range_item {
             panic!("Should not have any more cell. Got id {:?}", cell.id());
+        }
+        for i in 0..num {
+            let id = Id::new(2, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+        let mut cursor = idx_data_client
+            .scan_all(
+                schema_id_2,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+        for i in 0..num {
+            let id = Id::new(2, i);
+            let cell_res = match cursor.next().await {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("Error next for {}, {:?}", i, e);
+                }
+            };
+            let cell = match cell_res {
+                Some(c) => c,
+                None => {
+                    panic!("Have none for {}", i);
+                }
+            };
+            assert_eq!(id, cell.id());
+            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+            debug!("Checked cell id {:?} from index", id);
+        }
+        let out_of_range_item = cursor.next().await.unwrap();
+        if let Some(cell) = out_of_range_item {
+            panic!("Should not have any more cell. Got id {:?}", cell.id());
+        }
+        let mut cursor = idx_data_client
+            .scan_all(
+                schema_id_1,
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let cell_res = match cursor.next().await {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("Error next for {}, {:?}", i, e);
+                }
+            };
+            let cell = match cell_res {
+                Some(c) => c,
+                None => {
+                    panic!("Have none for {}", i);
+                }
+            };
+            assert_eq!(id, cell.id());
         }
     }
 }
