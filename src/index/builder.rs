@@ -130,13 +130,14 @@ impl IndexBuilder {
             self.ensure_scannable(cell, &indexers);
         }
         let new_indices = probe_cell_indices(cell, schema);
-        let task =
-            tokio::spawn(
-                async move { Self::ensure_indices_(new_indices, old_indices, indexers).await },
-            );
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
-        });
+        if !new_indices.is_empty() {
+            let task = tokio::spawn(async move {
+                Self::ensure_indices_(new_indices, old_indices, indexers).await
+            });
+            PENDING_INDEX_TASKS.with(|task_list| {
+                task_list.borrow_mut().push(task);
+            });
+        }
     }
 
     fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {

@@ -83,6 +83,7 @@ impl LSMTree {
         let guard = crossbeam_epoch::pin();
         let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
         let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
+        debug!("Inserting entry: {:?}", entry);
         mem_tree.insert_into(entry)
     }
 
@@ -297,6 +298,7 @@ pub struct LSMTreeCursor {
 
 impl LSMTreeCursor {
     fn new(key: &EntryKey, lsm_tree: &LSMTree, ordering: Ordering) -> Self {
+        debug!("LSM tree cursor for key {:?}, ordering {:?}", key, ordering);
         let guard = crossbeam_epoch::pin();
         let disk_trees = &lsm_tree.disk_trees;
         let mem_tree_ptr = lsm_tree.mem_tree.load(Acquire, &guard);

@@ -43,8 +43,8 @@ impl IndexerClients {
         pattern: Option<u8>,
     ) -> impl Future<Output = Result<Option<ClientCursor>, RPCError>> + 'a {
         let pattern = pattern.map(|n| {
-            let remain = KEY_SIZE - (n as usize);
-            key.as_slice()[remain..].to_vec()
+            let n = n as usize;
+            key.as_slice()[..n].to_vec()
         });
         RangedQueryClient::seek(&self.ranged_client, key, ordering, buffer_size, pattern)
     }

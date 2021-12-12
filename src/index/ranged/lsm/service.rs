@@ -159,14 +159,13 @@ impl Service for LSMTreeService {
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
             let mut num_collected = 0;
-            let pattern = pattern.as_ref().map(|p| {
-                let remaining = KEY_SIZE - (p.len() as usize);
-                (&p.as_slice()[remaining..], remaining)
+            let pattern = pattern.as_ref().map(|p| {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+                (p.as_slice(), p.len())
             });
             while num_collected < buffer_size {
                 if let Some(key) = tree_cursor.next() {
-                    if let Some((patt_key, patt_remain)) = pattern {
-                        if &key.as_slice()[patt_remain..] != patt_key {
+                    if let Some((patt_key, patt_len)) = pattern {
+                        if &key.as_slice()[..patt_len] != patt_key {
                             // Pattern unmatch
                             break;
                         }
@@ -404,10 +403,13 @@ pub async fn locate_tree_server_from_conshash(
     id: &Id,
     conshash: &Arc<ConsistentHashing>,
 ) -> Result<Arc<AsyncServiceClient>, RPCError> {
-    let server_id = conshash.get_server_id_by(id).unwrap();
-    DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
-        .await
-        .map_err(|e| RPCError::IOError(e))
-        .map(|c| client_by_rpc_client(&c))
+    if let Some(server_id) = conshash.get_server_id_by(id) {
+        DEFAULT_CLIENT_POOL
+            .get_by_id(server_id, move |sid| conshash.to_server_name(sid))
+            .await
+            .map_err(|e| RPCError::IOError(e))
+            .map(|c| client_by_rpc_client(&c))
+    } else {
+        Err(RPCError::RequestError(RPCRequestError::Other))
+    }
 }

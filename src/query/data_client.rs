@@ -190,14 +190,14 @@ mod test {
         const DATA: &'static str = "DATA";
         let _ = env_logger::try_init();
         let server_addr = String::from("127.0.0.1:6701");
-        let server_group = String::from("smoke_test");
+        let server_group = String::from("indexed_scan_all_test");
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
                 memory_size: 512 * 1024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
-                index_enabled: false,
+                index_enabled: true,
                 services: vec![Service::Cell, Service::Query],
             },
             &server_addr,
@@ -264,6 +264,11 @@ mod test {
                 }
             };
             assert_eq!(id, cell.id());
+            debug!("Checked cell id {:?} from index", id);
+        }
+        let out_of_range_item = cursor.next().await.unwrap();
+        if let Some(cell) = out_of_range_item {
+            panic!("Should not have any more cell. Got id {:?}", cell.id());
         }
     }
 }
