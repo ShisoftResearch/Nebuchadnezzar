@@ -179,7 +179,7 @@ mod test {
         index::ranged::lsm::btree::Ordering,
         ram::{
             cell::OwnedCell,
-            schema::{Field, Schema},
+            schema::{Field, Schema, IndexType},
         },
         server::*,
     };
@@ -187,7 +187,8 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
-        const DATA: &'static str = "DATA";
+        const DATA_1: &'static str = "DATA_1";
+        const DATA_2: &'static str = "DATA_2";
         let _ = env_logger::try_init();
         let server_addr = String::from("127.0.0.1:6701");
         let server_group = String::from("indexed_scan_all_test");
@@ -208,21 +209,17 @@ mod test {
         let schema_id = 123;
         let schema = Schema::new_with_id(
             schema_id,
-            &String::from("schema"),
+            &String::from("schema_1"),
             None,
             Field::new(
                 "*",
                 Type::Map,
                 false,
                 false,
-                Some(vec![Field::new(
-                    DATA,
-                    Type::U64,
-                    false,
-                    false,
-                    None,
-                    vec![],
-                )]),
+                Some(vec![
+                    Field::new(DATA_1, Type::U64, false, false, None, vec![IndexType::Ranged]),
+                    Field::new(DATA_2, Type::U32, false, false, None, vec![]),
+                ]),
                 vec![],
             ),
             false,
@@ -230,11 +227,12 @@ mod test {
         );
         let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
-        let num = 10240;
+        let num = 1024;
         for i in 0..num {
             let id = Id::new(1, i);
             let mut value = OwnedValue::Map(OwnedMap::new());
-            value[DATA] = OwnedValue::U64(i);
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
@@ -264,6 +262,8 @@ mod test {
                 }
             };
             assert_eq!(id, cell.id());
+            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
             debug!("Checked cell id {:?} from index", id);
         }
         let out_of_range_item = cursor.next().await.unwrap();

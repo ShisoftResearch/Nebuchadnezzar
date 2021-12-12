@@ -167,6 +167,7 @@ impl Service for LSMTreeService {
                     if let Some((patt_key, patt_len)) = pattern {
                         if &key.as_slice()[..patt_len] != patt_key {
                             // Pattern unmatch
+                            debug!("Pattern unmatch for key {:?}, expect {:?}, break cursor.", key, patt_key);
                             break;
                         }
                     }
