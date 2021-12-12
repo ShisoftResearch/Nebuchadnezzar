@@ -1,4 +1,5 @@
-use crate::client::AsyncClient;
+use crate::client::{AsyncClient, NebClientError};
+use crate::query::data_client::IndexedDataClient;
 use crate::{client, index::builder::IndexBuilder};
 use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
@@ -59,7 +60,7 @@ pub enum Service {
     Cell = 0,
     Transaction = 1,
     RangedIndexer = 2,
-    Query = 3
+    Query = 3,
 }
 
 pub struct ServerMeta {
@@ -79,6 +80,7 @@ pub struct NebServer {
     pub server_id: u64,
     pub cleaner: Cleaner,
     pub indexer: Option<Arc<IndexBuilder>>,
+    pub group_name: String,
 }
 
 pub async fn init_conshash(
@@ -169,6 +171,7 @@ impl NebServer {
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
             indexer: index_builder,
+            group_name: group_name.clone(),
         });
         let servs = proc_services(&opts.services);
         for service in servs {
@@ -187,7 +190,7 @@ impl NebServer {
                 }
                 Service::Query => {
                     // todo!()
-                },
+                }
             }
         }
 
@@ -302,6 +305,15 @@ impl NebServer {
     }
     pub fn conshash(&self) -> &ConsistentHashing {
         &*self.consh
+    }
+    pub fn raft_client(&self) -> &RaftClient {
+        &*self.raft_client
+    }
+    pub fn indexed_data_client(&self) -> IndexedDataClient {
+        IndexedDataClient::new(&self.consh, &self.raft_client)
+    }
+    pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
+        AsyncClient::new(&self.rpc, &self.membership, members, &self.group_name).await
     }
 }
 

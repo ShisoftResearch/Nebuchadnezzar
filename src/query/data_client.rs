@@ -175,9 +175,18 @@ impl<'a> DataCursor<'a> {
 
 #[cfg(test)]
 mod test {
+    use crate::{
+        client,
+        index::ranged::lsm::btree::Ordering,
+        query::data_client::IndexedDataClient,
+        ram::{
+            cell::OwnedCell,
+            schema::{Field, Schema},
+        },
+        server::*,
+    };
+    use dovahkiin::{expr::serde::Expr, types::*};
     use std::sync::Arc;
-    use dovahkiin::types::*;
-    use crate::{server::*, ram::{schema::{Schema, Field}, cell::OwnedCell}, client};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -222,16 +231,7 @@ mod test {
             false,
             true, // Scannable
         );
-        let client = Arc::new(
-            client::AsyncClient::new(
-                &server.rpc,
-                &server.membership,
-                &vec![server_addr],
-                &server_group,
-            )
-            .await
-            .unwrap(),
-        );
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
         client.new_schema_with_id(schema).await.unwrap().unwrap();
         let num = 10240;
         for i in 0..num {
@@ -241,6 +241,16 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-    
+        let idx_data_client = server.indexed_data_client();
+        let cursor = idx_data_client
+            .scan_all(
+                schema_id,
+                vec![],
+                Expr::Vec(vec![]),
+                Expr::Vec(vec![]),
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
     }
 }
