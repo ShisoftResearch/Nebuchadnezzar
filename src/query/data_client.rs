@@ -242,15 +242,21 @@ mod test {
             client.write_cell(cell).await.unwrap().unwrap();
         }
         let idx_data_client = server.indexed_data_client();
-        let cursor = idx_data_client
+        let mut cursor = idx_data_client
             .scan_all(
                 schema_id,
                 vec![],
-                Expr::Vec(vec![]),
-                Expr::Vec(vec![]),
+                Expr::nothing(),
+                Expr::nothing(),
                 Ordering::Forward,
             )
             .await
             .unwrap();
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let cell_res = cursor.next().await.unwrap();
+            let cell = cell_res.unwrap();
+            assert_eq!(id, cell.id());
+        }
     }
 }
