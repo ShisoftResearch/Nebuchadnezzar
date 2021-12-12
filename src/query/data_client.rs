@@ -176,9 +176,7 @@ impl<'a> DataCursor<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
-        client,
         index::ranged::lsm::btree::Ordering,
-        query::data_client::IndexedDataClient,
         ram::{
             cell::OwnedCell,
             schema::{Field, Schema},
@@ -186,7 +184,6 @@ mod test {
         server::*,
     };
     use dovahkiin::{expr::serde::Expr, types::*};
-    use std::sync::Arc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -254,8 +251,18 @@ mod test {
             .unwrap();
         for i in 0..num {
             let id = Id::new(1, i);
-            let cell_res = cursor.next().await.unwrap();
-            let cell = cell_res.unwrap();
+            let cell_res = match cursor.next().await {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("Error next for {}, {:?}", i, e);
+                }
+            };
+            let cell = match cell_res {
+                Some(c) => c,
+                None => {
+                    panic!("Have none for {}", i);
+                }
+            };
             assert_eq!(id, cell.id());
         }
     }
