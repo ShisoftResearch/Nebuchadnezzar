@@ -7,6 +7,7 @@ use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::types::key_hash;
 use std::collections::HashMap;
+use std::mem;
 
 fn read_field<'v>(
     base_ptr: usize,
@@ -169,33 +170,36 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
         return read_by_schema(ptr, schema);
     }
     if let Some(schema_fields) = &schema.fields.sub_fields {
-        let mut res = vec![];
-        'SEARCH: for field in fields {
+        let mut res = SharedMap::new();
+        for field in fields {
             if let Some(index_path) = schema.field_index.get(field) {
                 if !index_path.is_empty() {
                     if let Some(mut field) = schema_fields.get(index_path[0]) {
+                        let mut target_map = &mut res;
                         for i in index_path.iter().skip(1) {
                             if let Some(Some(sub_field)) =
                                 field.sub_fields.as_ref().map(|sub| sub.get(*i))
                             {
-                                field = sub_field;
+                                let prev_field = mem::replace(&mut field, sub_field);
+                                let prev_id = prev_field.name_id;
+                                target_map.map.insert(prev_id, SharedValue::Map(SharedMap::new()));
+                                target_map.fields.push(prev_field.name.clone());
+                                target_map = match target_map.get_mut_by_key_id(prev_id) {
+                                    SharedValue::Map(m) => m,
+                                    _ => unreachable!()
+                                };
                             } else {
                                 break;
                             }
                         }
                         let field_data = read_field(ptr, field, false, &mut tail_offset);
-                        if fields.len() == 1 {
-                            return field_data;
-                        } else {
-                            res.push(field_data);
-                            continue 'SEARCH;
-                        }
+                        target_map.map.insert(field.name_id, field_data);
+                        target_map.fields.push(field.name.clone());
                     }
                 }
             }
-            res.push(SharedValue::Null);
         }
-        return SharedValue::Array(res);
+        return SharedValue::Map(res);
     }
     SharedValue::Null
 }

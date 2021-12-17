@@ -209,21 +209,13 @@ fn build_partitation_statistics(
                         if let Ok((partial_cell, _)) =
                             select_from_chunk_raw(*loc, chunk, fields.as_slice())
                         {
-                            let field_array = if fields.len() == 1 {
-                                vec![partial_cell]
-                            } else if let SharedValue::Map(map) = partial_cell {
-                                fields
+                            let field_array = match partial_cell {
+                                SharedValue::Map(map) => fields
                                     .iter()
-                                    .map(|key| map.get_by_key_id(*key).clone())
-                                    .collect_vec()
-                            } else if let SharedValue::Array(array) = partial_cell {
-                                array
-                            } else {
-                                error!(
-                                    "Cannot decode partial cell for statistics {:?}",
-                                    partial_cell
-                                );
-                                continue;
+                                    .filter_map(|path_key| schema.id_index.get(path_key))
+                                    .map(|key| map.get_in_by_ids(key.iter()).clone())
+                                    .collect_vec(),
+                                _ => unreachable!(),
                             };
                             for (i, val) in field_array.into_iter().enumerate() {
                                 if val == SharedValue::Null || val == SharedValue::NA {
