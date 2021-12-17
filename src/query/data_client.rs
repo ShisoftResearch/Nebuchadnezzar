@@ -183,6 +183,7 @@ mod test {
         },
         server::*,
     };
+    use bifrost_hasher::hash_str;
     use dovahkiin::{expr::serde::Expr, types::*};
 
     #[tokio::test(flavor = "multi_thread")]
@@ -292,7 +293,7 @@ mod test {
             let id = Id::new(2, i);
             let mut value = OwnedValue::Map(OwnedMap::new());
             value[DATA_1] = OwnedValue::U64(i);
-            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            value[DATA_2] = OwnedValue::U32((i * 3) as u32);
             let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
@@ -322,7 +323,7 @@ mod test {
             };
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
-            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 3) as u32);
             debug!("Checked cell id {:?} from index", id);
         }
         let out_of_range_item = cursor.next().await.unwrap();
@@ -354,6 +355,37 @@ mod test {
                 }
             };
             assert_eq!(id, cell.id());
+        }
+        // Testing projection
+        let f1_id = hash_str(DATA_1);
+        let mut cursor = idx_data_client
+        .scan_all(
+            schema_id_1,
+            vec![f1_id],
+            Expr::nothing(),
+            Expr::nothing(),
+            Ordering::Forward,
+        )
+        .await
+        .unwrap();
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let cell_res = match cursor.next().await {
+                Ok(r) => r,
+                Err(e) => {
+                    panic!("Error next for {}, {:?}", i, e);
+                }
+            };
+            let cell = match cell_res {
+                Some(c) => c,
+                None => {
+                    panic!("Have none for {}", i);
+                }
+            };
+            assert_eq!(id, cell.id());
+            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+            assert!(cell[DATA_2].u32().is_none());
+            debug!("Checked cell id {:?} from index", id);
         }
     }
 }
