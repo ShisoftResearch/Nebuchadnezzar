@@ -91,6 +91,9 @@ impl<'a> DataCursor<'a> {
                 return Ok(None);
             }
         }
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
         let cell = mem::take(&mut self.buffer[self.pos]);
         self.pos += 1;
         return Ok(Some(cell));
@@ -184,7 +187,7 @@ mod test {
         server::*,
     };
     use bifrost_hasher::hash_str;
-    use dovahkiin::{expr::serde::Expr, types::*};
+    use dovahkiin::{expr::serde::Expr, types::*, integrated::lisp::*};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -356,19 +359,20 @@ mod test {
             };
             assert_eq!(id, cell.id());
         }
-        // Testing projection
-        let f1_id = hash_str(DATA_1);
+        // Testing selection
+        let select_expr = parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))").unwrap()[0].clone();
         let mut cursor = idx_data_client
         .scan_all(
             schema_id_1,
-            vec![f1_id],
-            Expr::nothing(),
+            vec![],
+            select_expr,
             Expr::nothing(),
             Ordering::Forward,
         )
         .await
         .unwrap();
-        for i in 0..num {
+        // Start from 10 to 100 due to the selection expression
+        for i in 10..100 {
             let id = Id::new(1, i);
             let cell_res = match cursor.next().await {
                 Ok(r) => r,
@@ -384,8 +388,12 @@ mod test {
             };
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
-            assert!(cell[DATA_2].u32().is_none());
+            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
             debug!("Checked cell id {:?} from index", id);
+        }
+        let out_of_range_item = cursor.next().await.unwrap();
+        if let Some(cell) = out_of_range_item {
+            panic!("Should not have any more cell. Got id {:?}", cell.id());
         }
     }
 }
