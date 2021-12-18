@@ -187,7 +187,7 @@ mod test {
         server::*,
     };
     use bifrost_hasher::hash_str;
-    use dovahkiin::{expr::serde::Expr, types::*, integrated::lisp::*};
+    use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
 
     #[tokio::test(flavor = "multi_thread")]
     async fn scan_all() {
@@ -289,67 +289,102 @@ mod test {
             let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
             client.write_cell(cell).await.unwrap().unwrap();
         }
-        let mut cursor = idx_data_client
-            .scan_all(
-                schema_id_2,
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
-            )
-            .await
-            .unwrap();
-        for i in 0..num {
-            let id = Id::new(2, i);
-            let cell = cursor.next().await.unwrap().unwrap();
-            assert_eq!(id, cell.id());
-            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
-            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 3) as u32);
-            debug!("Checked cell id {:?} from index", id);
+        {
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_2,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            for i in 0..num {
+                let id = Id::new(2, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+                assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+                assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 3) as u32);
+                debug!("Checked cell id {:?} from index", id);
+            }
+            let out_of_range_item = cursor.next().await.unwrap();
+            if let Some(cell) = out_of_range_item {
+                panic!("Should not have any more cell. Got id {:?}", cell.id());
+            }
         }
-        let out_of_range_item = cursor.next().await.unwrap();
-        if let Some(cell) = out_of_range_item {
-            panic!("Should not have any more cell. Got id {:?}", cell.id());
+        {
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_1,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            for i in 0..num {
+                let id = Id::new(1, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+            }
         }
-        let mut cursor = idx_data_client
-            .scan_all(
-                schema_id_1,
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
-            )
-            .await
-            .unwrap();
-        for i in 0..num {
-            let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().unwrap();
-            assert_eq!(id, cell.id());
+        {
+            // Testing selection
+            let select_expr = parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))")
+                .unwrap()[0]
+                .clone();
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_1,
+                    vec![],
+                    select_expr,
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            // Start from 10 to 100 due to the selection expression
+            for i in 10..100 {
+                let id = Id::new(1, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+                assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+                assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+                debug!("Checked cell id {:?} from index", id);
+            }
+            let out_of_range_item = cursor.next().await.unwrap();
+            if let Some(cell) = out_of_range_item {
+                panic!("Should not have any more cell. Got id {:?}", cell.id());
+            }
         }
-        // Testing selection
-        let select_expr = parse_to_serde_expr("(and (>= DATA_1 10u64) (< DATA_1 100u64))").unwrap()[0].clone();
-        let mut cursor = idx_data_client
-        .scan_all(
-            schema_id_1,
-            vec![],
-            select_expr,
-            Expr::nothing(),
-            Ordering::Forward,
-        )
-        .await
-        .unwrap();
-        // Start from 10 to 100 due to the selection expression
-        for i in 10..100 {
-            let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().unwrap();
-            assert_eq!(id, cell.id());
-            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
-            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
-            debug!("Checked cell id {:?} from index", id);
-        }
-        let out_of_range_item = cursor.next().await.unwrap();
-        if let Some(cell) = out_of_range_item {
-            panic!("Should not have any more cell. Got id {:?}", cell.id());
+        {
+            info!("Testing selection 2");
+            let select_expr = parse_to_serde_expr("(= DATA_1 10u64)").unwrap()[0].clone();
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_1,
+                    vec![],
+                    select_expr,
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            // 10 and 500 due to the selection expression
+            for i in vec![10] {
+                let id = Id::new(1, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+                assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+                assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+                debug!("-> Checked cell id {:?} from index", id);
+            }
+            let out_of_range_item = cursor.next().await.unwrap();
+            if let Some(cell) = out_of_range_item {
+                panic!("Should not have any more cell. Got id {:?}", cell.id());
+            }
         }
     }
 }
