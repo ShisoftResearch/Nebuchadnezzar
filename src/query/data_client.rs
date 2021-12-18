@@ -271,18 +271,7 @@ mod test {
             .unwrap();
         for i in 0..num {
             let id = Id::new(1, i);
-            let cell_res = match cursor.next().await {
-                Ok(r) => r,
-                Err(e) => {
-                    panic!("Error next for {}, {:?}", i, e);
-                }
-            };
-            let cell = match cell_res {
-                Some(c) => c,
-                None => {
-                    panic!("Have none for {}", i);
-                }
-            };
+            let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
             assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
@@ -312,18 +301,7 @@ mod test {
             .unwrap();
         for i in 0..num {
             let id = Id::new(2, i);
-            let cell_res = match cursor.next().await {
-                Ok(r) => r,
-                Err(e) => {
-                    panic!("Error next for {}, {:?}", i, e);
-                }
-            };
-            let cell = match cell_res {
-                Some(c) => c,
-                None => {
-                    panic!("Have none for {}", i);
-                }
-            };
+            let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
             assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 3) as u32);
@@ -345,18 +323,7 @@ mod test {
             .unwrap();
         for i in 0..num {
             let id = Id::new(1, i);
-            let cell_res = match cursor.next().await {
-                Ok(r) => r,
-                Err(e) => {
-                    panic!("Error next for {}, {:?}", i, e);
-                }
-            };
-            let cell = match cell_res {
-                Some(c) => c,
-                None => {
-                    panic!("Have none for {}", i);
-                }
-            };
+            let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
         }
         // Testing selection
@@ -374,18 +341,7 @@ mod test {
         // Start from 10 to 100 due to the selection expression
         for i in 10..100 {
             let id = Id::new(1, i);
-            let cell_res = match cursor.next().await {
-                Ok(r) => r,
-                Err(e) => {
-                    panic!("Error next for {}, {:?}", i, e);
-                }
-            };
-            let cell = match cell_res {
-                Some(c) => c,
-                None => {
-                    panic!("Have none for {}", i);
-                }
-            };
+            let cell = cursor.next().await.unwrap().unwrap();
             assert_eq!(id, cell.id());
             assert_eq!(*cell[DATA_1].u64().unwrap(), i);
             assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
