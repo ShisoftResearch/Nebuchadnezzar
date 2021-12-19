@@ -109,20 +109,21 @@ impl ClientCursor {
     }
 
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
-        debug!(
-            "Refill by next tree, key {:?}, ordering {:?}",
-            self.range.key(), self.range.ordering
-        );
         loop {
+            let current_key = self.range.key();
+            debug!(
+                "Refill by next tree, key {:?}, ordering {:?}",
+                self.range.key(), self.range.ordering
+            );
             if let Some((tree_key, tree)) = self
                 .query_client
-                .next_tree(self.range.key(), self.range.ordering)
+                .next_tree(current_key, self.range.ordering)
                 .await
                 .unwrap()
             {
                 debug!(
                     "Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}",
-                    self.range.key(), tree, tree_key, self.range.ordering
+                    current_key, tree, tree_key, self.range.ordering
                 );
                 let tree_client =
                     locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
@@ -176,7 +177,7 @@ impl ClientCursor {
             } else {
                 debug!(
                     "Next tree for {:?} does not return anything. ordering {:?}",
-                    self.range.key(),
+                    current_key,
                     self.range.ordering
                 );
                 // Clear the cursor

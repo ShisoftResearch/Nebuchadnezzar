@@ -234,7 +234,13 @@ impl RangedQueryClient {
         // This function must be able to detect tree changes and ensure consistency
         {
             let placement = self.placement.read();
-            let (_origin_place, origin_upper) = placement.get(origin_lower).unwrap();
+            let (_origin_place, origin_upper) = match placement.get(origin_lower) {
+                Some(t) => t,
+                None => {
+                    warn!("Cannot find next tree placement for {:?}. Mapping {:?}", origin_lower, &*placement);
+                    return Ok(None);
+                },
+            };
             let cached_next = match ordering {
                 Ordering::Forward => placement.range((Excluded(origin_lower), Unbounded)).next(),
                 Ordering::Backward => placement.range((Unbounded, Excluded(origin_lower))).last(),

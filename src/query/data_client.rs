@@ -48,16 +48,18 @@ pub enum ValueRangeTerm<'a> {
 
 impl <'a> ValueRange <'a> {
     pub fn to_key_range(self, schema: u32, field: u64, ordering: Ordering) -> Range {
+        let schema_lower_bound = EntryKey::for_schema_field_feature(schema, field, &MIN_FEATURE);
+        let schema_higher_bound = EntryKey::for_schema_field_feature(schema, field, &MAX_FEATURE);
         Range {
             start: match self.start {
                 ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
                 ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Open => RangeTerm::Open,
+                ValueRangeTerm::Open => RangeTerm::Inclusive(schema_lower_bound),
             },
             end: match self.end {
                 ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
                 ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Open => RangeTerm::Open,
+                ValueRangeTerm::Open => RangeTerm::Inclusive(schema_higher_bound),
             },
             ordering
         }
@@ -82,8 +84,6 @@ impl IndexedDataClient {
         ordering: Ordering,
     ) -> Result<DataCursor<'a>, RPCError> {
         let range = range.to_key_range(schema, field, ordering);
-        let schema_lower_bound = EntryKey::for_schema_field_feature(schema, field, &MIN_FEATURE);
-        let schema_higher_bound = EntryKey::for_schema_field_feature(schema, field, &MAX_FEATURE);
         let index_cursor = self
             .index_clients
             .range_seek(range, SCAN_BUFFER_SIZE, None)
@@ -548,7 +548,7 @@ mod test {
             client.write_cell(cell).await.unwrap().unwrap();
         }
         let idx_data_client = server.indexed_data_client();
-        let query_key = OwnedValue::U64(100);
+        let query_key = OwnedValue::U64(5);
         let val_range = ValueRange { start: ValueRangeTerm::Inclusive(query_key.shared()), end: ValueRangeTerm::Open };
         let mut cursor = idx_data_client
             .range_index_scan(
@@ -562,7 +562,7 @@ mod test {
             )
             .await
             .unwrap();
-        for i in 100..num {
+        for i in 5..num {
             let id = Id::new(1, i);
             let cell = cursor.next().await.unwrap().expect(&format!("at {}", i));
             assert_eq!(id, cell.id());
