@@ -407,5 +407,31 @@ mod test {
                 panic!("Should not have any more cell. Got id {:?}", cell.id());
             }
         }
+        {
+            info!("Testing processing");
+            let proc_expr =
+                parse_to_serde_expr("(+ DATA_1 (u64 DATA_2))").unwrap()[0].clone();
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_1,
+                    vec![],
+                    Expr::nothing(),
+                    proc_expr,
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            for i in 0..num {
+                let id = Id::new(1, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+                assert_eq!(*cell.data.u64().unwrap(), i + (i * 2));
+                debug!("-> Checked cell id {:?} from index", id);
+            }
+            let out_of_range_item = cursor.next().await.unwrap();
+            if let Some(cell) = out_of_range_item {
+                panic!("Should not have any more cell. Got id {:?}", cell.id());
+            }
+        }
     }
 }
