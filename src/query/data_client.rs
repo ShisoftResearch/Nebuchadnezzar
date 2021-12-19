@@ -114,54 +114,72 @@ impl<'a> DataCursor<'a> {
     }
 
     pub async fn refresh_batch(&mut self) -> bool {
-        if let Some(cursor) = &self.index_cursor {
-            let all_ids = cursor.current_block();
-            let mut tasks = all_ids
-                .iter()
-                .enumerate()
-                .filter_map(|(i, id)| {
-                    self.client
-                        .conshash
-                        .get_server_id_by(id)
-                        .map(|sid| (i, sid, id))
-                })
-                .group_by(|(_i, sid, _id)| *sid)
-                .into_iter()
-                .map(|(sid, pairs)| {
-                    let mut ids = vec![];
-                    let mut idx = vec![];
-                    for (i, _, id) in pairs {
-                        idx.push(i);
-                        ids.push(*id);
-                    }
-                    let projection = self.projection.clone();
-                    let selection = self.selection.clone();
-                    let proc = self.proc.clone();
-                    let server_name = self.client.conshash.to_server_name(sid);
-                    async move {
-                        match client_by_server_name(sid, server_name).await {
-                            Ok(client) => {
-                                let read_res = client
-                                    .read_all_cells_proced(ids, projection, selection, proc)
-                                    .await
-                                    .map(|v| v.into_iter().zip(idx).collect_vec());
-                                match read_res {
-                                    Ok(cells) => Ok(cells
-                                        .into_iter()
-                                        .filter_map(|(c, i)| c.ok().map(|c| (c, i)))
-                                        .collect_vec()),
+        if self.index_cursor.is_some() {
+            let mut all_cells = vec![];
+            loop {
+                {
+                    let cursor = self.index_cursor.as_ref().unwrap();
+                    let mut tasks = cursor
+                        .current_block()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, id)| {
+                            self.client
+                                .conshash
+                                .get_server_id_by(id)
+                                .map(|sid| (i, sid, id))
+                        })
+                        .group_by(|(_i, sid, _id)| *sid)
+                        .into_iter()
+                        .map(|(sid, pairs)| {
+                            let mut ids = vec![];
+                            let mut idx = vec![];
+                            for (i, _, id) in pairs {
+                                idx.push(i);
+                                ids.push(*id);
+                            }
+                            let projection = self.projection.clone();
+                            let selection = self.selection.clone();
+                            let proc = self.proc.clone();
+                            let server_name = self.client.conshash.to_server_name(sid);
+                            async move {
+                                match client_by_server_name(sid, server_name).await {
+                                    Ok(client) => {
+                                        let read_res = client
+                                            .read_all_cells_proced(ids, projection, selection, proc)
+                                            .await
+                                            .map(|v| v.into_iter().zip(idx).collect_vec());
+                                        match read_res {
+                                            Ok(cells) => Ok(cells
+                                                .into_iter()
+                                                .filter_map(|(c, i)| c.ok().map(|c| (c, i)))
+                                                .collect_vec()),
+                                            Err(e) => return Err(e),
+                                        }
+                                    }
                                     Err(e) => return Err(e),
                                 }
                             }
-                            Err(e) => return Err(e),
+                        })
+                        .collect::<FuturesUnordered<_>>();
+                    while let Some(task_res) = tasks.next().await {
+                        if let Ok(mut cells) = task_res {
+                            all_cells.append(&mut cells);
                         }
                     }
-                })
-                .collect::<FuturesUnordered<_>>();
-            let mut all_cells = vec![];
-            while let Some(task_res) = tasks.next().await {
-                if let Ok(mut cells) = task_res {
-                    all_cells.append(&mut cells);
+                }
+                if !all_cells.is_empty() {
+                    break;
+                } else {
+                    let cursor = self.index_cursor.as_mut().unwrap();
+                    match cursor.next_block().await {
+                        Ok(true) => continue,
+                        _ => {
+                            self.buffer = vec![];
+                            self.pos = 0;
+                            return false;
+                        }
+                    }
                 }
             }
             all_cells.sort_by(|(_, i1), (_, i2)| i1.cmp(i2));
@@ -259,27 +277,29 @@ mod test {
             client.write_cell(cell).await.unwrap().unwrap();
         }
         let idx_data_client = server.indexed_data_client();
-        let mut cursor = idx_data_client
-            .scan_all(
-                schema_id_1,
-                vec![],
-                Expr::nothing(),
-                Expr::nothing(),
-                Ordering::Forward,
-            )
-            .await
-            .unwrap();
-        for i in 0..num {
-            let id = Id::new(1, i);
-            let cell = cursor.next().await.unwrap().unwrap();
-            assert_eq!(id, cell.id());
-            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
-            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
-            debug!("Checked cell id {:?} from index", id);
-        }
-        let out_of_range_item = cursor.next().await.unwrap();
-        if let Some(cell) = out_of_range_item {
-            panic!("Should not have any more cell. Got id {:?}", cell.id());
+        {
+            let mut cursor = idx_data_client
+                .scan_all(
+                    schema_id_1,
+                    vec![],
+                    Expr::nothing(),
+                    Expr::nothing(),
+                    Ordering::Forward,
+                )
+                .await
+                .unwrap();
+            for i in 0..num {
+                let id = Id::new(1, i);
+                let cell = cursor.next().await.unwrap().unwrap();
+                assert_eq!(id, cell.id());
+                assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+                assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+                debug!("Checked cell id {:?} from index", id);
+            }
+            let out_of_range_item = cursor.next().await.unwrap();
+            if let Some(cell) = out_of_range_item {
+                panic!("Should not have any more cell. Got id {:?}", cell.id());
+            }
         }
         for i in 0..num {
             let id = Id::new(2, i);
@@ -361,7 +381,8 @@ mod test {
         }
         {
             info!("Testing selection 2");
-            let select_expr = parse_to_serde_expr("(= DATA_1 10u64)").unwrap()[0].clone();
+            let select_expr =
+                parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))").unwrap()[0].clone();
             let mut cursor = idx_data_client
                 .scan_all(
                     schema_id_1,
@@ -372,8 +393,8 @@ mod test {
                 )
                 .await
                 .unwrap();
-            // 10 and 500 due to the selection expression
-            for i in vec![10] {
+            // 100 and 1000 due to the selection expression
+            for i in vec![100, 1000] {
                 let id = Id::new(1, i);
                 let cell = cursor.next().await.unwrap().unwrap();
                 assert_eq!(id, cell.id());
