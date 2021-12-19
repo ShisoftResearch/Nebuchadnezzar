@@ -21,7 +21,7 @@ use futures::Future;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedQueryClient;
-use self::ranged::lsm::btree::Ordering;
+use self::ranged::lsm::service::Range;
 
 pub type Feature = [u8; FEATURE_SIZE];
 
@@ -37,16 +37,15 @@ impl IndexerClients {
     }
     pub fn range_seek<'a>(
         &'a self,
-        key: &'a EntryKey,
-        ordering: Ordering,
+        range: Range,
         buffer_size: u16,
         pattern: Option<u8>,
-        termination_key: Option<EntryKey>
     ) -> impl Future<Output = Result<Option<ClientCursor>, RPCError>> + 'a {
+        let key = range.key();
         let pattern = pattern.map(|n| {
             let n = n as usize;
             key.as_slice()[..n].to_vec()
         });
-        RangedQueryClient::seek(&self.ranged_client, key, ordering, buffer_size, pattern, termination_key)
+        RangedQueryClient::seek(&self.ranged_client, range, buffer_size, pattern)
     }
 }

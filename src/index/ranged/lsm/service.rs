@@ -74,12 +74,26 @@ pub struct LSMTreeStat {
     pub trees: Vec<BTreeStat>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum RangeTerm {
+    Inclusive(EntryKey),
+    Exclusive(EntryKey),
+    Open,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Range {
+    pub start: RangeTerm,
+    pub end: RangeTerm,
+    pub ordering: Ordering,
+}
+
 service! {
     rpc crate_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
-    rpc seek(id: Id, entry: EntryKey, pattern: Option<Vec<u8>>, termination_key: Option<EntryKey>, ordering: Ordering, buffer_size: u16, epoch: u64)
+    rpc seek(id: Id, range: Range, pattern: Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
@@ -126,7 +140,7 @@ impl Service for LSMTreeService {
     }
 
     fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
-        self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
+        self.apply_in_ranged_tree(id, &entry, epoch, |entry, tree| {
             if tree.insert(&entry) {
                 OpResult::Successful(true)
             } else {
@@ -136,7 +150,7 @@ impl Service for LSMTreeService {
     }
 
     fn delete(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
-        self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
+        self.apply_in_ranged_tree(id, &entry, epoch, |entry, tree| {
             if tree.delete(&entry) {
                 OpResult::Successful(true)
             } else {
@@ -148,27 +162,28 @@ impl Service for LSMTreeService {
     fn seek(
         &self,
         id: Id,
-        entry: EntryKey,
+        range: Range,
         pattern: Option<Vec<u8>>,
-        termination_key: Option<EntryKey>,
-        ordering: Ordering,
         buffer_size: u16,
         epoch: u64,
     ) -> BoxFuture<OpResult<ServBlock>> {
+        let entry = range.key();
+        let ordering = range.ordering;
         self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
             let buffer_size = buffer_size as usize;
             let mut tree_cursor = tree.seek(&entry, ordering);
             let mut buffer = Vec::with_capacity(buffer_size);
             let mut num_collected = 0;
-            let pattern = pattern.as_ref().map(|p| {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
-                (p.as_slice(), p.len())
-            });
+            let pattern = pattern.as_ref().map(|p| (p.as_slice(), p.len()));
             while num_collected < buffer_size {
                 if let Some(key) = tree_cursor.next() {
                     if let Some((patt_key, patt_len)) = pattern {
                         if &key.as_slice()[..patt_len] != patt_key {
                             // Pattern unmatch
-                            debug!("Pattern unmatch for key {:?}, expect {:?}, break cursor.", key, patt_key);
+                            debug!(
+                                "Pattern unmatch for key {:?}, expect {:?}, break cursor.",
+                                key, patt_key
+                            );
                             break;
                         }
                     }
@@ -180,21 +195,59 @@ impl Service for LSMTreeService {
                     }
                     match ordering {
                         Ordering::Forward => {
-                            if &key < entry {
-                                continue;
-                            } else if let Some(term_key) = termination_key.as_ref() {
-                                if &key > term_key {
-                                    break;
+                            match &range.start {
+                                RangeTerm::Inclusive(k) => {
+                                    if &key < k {
+                                        continue;
+                                    }
                                 }
+                                RangeTerm::Exclusive(k) => {
+                                    if &key <= k {
+                                        continue;
+                                    }
+                                }
+                                RangeTerm::Open => {}
+                            }
+                            match &range.end {
+                                RangeTerm::Inclusive(k) => {
+                                    if &key > k {
+                                        break;
+                                    }
+                                }
+                                RangeTerm::Exclusive(k) => {
+                                    if &key >= k {
+                                        break;
+                                    }
+                                }
+                                RangeTerm::Open => {}
                             }
                         }
                         Ordering::Backward => {
-                            if &key > entry {
-                                continue;
-                            } else if let Some(term_key) = termination_key.as_ref() {
-                                if &key < term_key {
-                                    break;
+                            match &range.end {
+                                RangeTerm::Inclusive(k) => {
+                                    if &key > k {
+                                        continue;
+                                    }
                                 }
+                                RangeTerm::Exclusive(k) => {
+                                    if &key >= k {
+                                        continue;
+                                    }
+                                }
+                                RangeTerm::Open => {}
+                            }
+                            match &range.start {
+                                RangeTerm::Inclusive(k) => {
+                                    if &key < k {
+                                        break;
+                                    }
+                                }
+                                RangeTerm::Exclusive(k) => {
+                                    if &key <= k {
+                                        break;
+                                    }
+                                }
+                                RangeTerm::Open => {}
                             }
                         }
                     }
@@ -338,7 +391,7 @@ impl LSMTreeService {
     fn apply_in_ranged_tree<F, R>(
         &self,
         id: Id,
-        entry: EntryKey,
+        entry: &EntryKey,
         epoch: u64,
         func: F,
     ) -> BoxFuture<OpResult<R>>
@@ -350,16 +403,16 @@ impl LSMTreeService {
             let tree_prop = tree.prop.read();
             if epoch < tree_prop.epoch {
                 OpResult::EpochMissMatch(tree_prop.epoch, epoch)
-            } else if tree_prop.boundary.in_boundary(&entry) {
+            } else if tree_prop.boundary.in_boundary(entry) {
                 if let &Some(ref migration) = &tree_prop.migration {
-                    if entry < migration.pivot {
+                    if entry < &migration.pivot {
                         // Entries lower than pivot should be safe to work on
                         func(&entry, &tree.tree)
                     } else {
                         OpResult::Migrating
                     }
                 } else {
-                    func(&entry, &tree.tree)
+                    func(entry, &tree.tree)
                 }
             } else {
                 OpResult::OutOfBound
@@ -397,6 +450,42 @@ impl Boundary {
         (entry >= &self.lower && entry < &self.upper)
             || entry == &*MIN_ENTRY_KEY
             || entry == &*MAX_ENTRY_KEY
+    }
+}
+
+impl Range {
+    pub fn new_inclusive_opened(key: EntryKey, ordering: Ordering) -> Self {
+        match ordering {
+            Ordering::Forward => Self {
+                start: RangeTerm::Inclusive(key),
+                end: RangeTerm::Open,
+                ordering,
+            },
+            Ordering::Backward => Self {
+                start: RangeTerm::Open,
+                end: RangeTerm::Inclusive(key),
+                ordering,
+            },
+        }
+    }
+    pub fn move_to(mut self, key: EntryKey) -> Self {
+        match self.ordering {
+            Ordering::Forward => self.start = RangeTerm::Inclusive(key),
+            Ordering::Backward => self.end = RangeTerm::Exclusive(key),
+        }
+        self
+    }
+    pub fn key(&self) -> &EntryKey {
+        match self.ordering {
+            Ordering::Forward => match self.start {
+                RangeTerm::Inclusive(ref e) | RangeTerm::Exclusive(ref e) => e,
+                RangeTerm::Open => &*MIN_ENTRY_KEY,
+            },
+            Ordering::Backward => match self.end {
+                RangeTerm::Inclusive(ref e) | RangeTerm::Exclusive(ref e) => e,
+                RangeTerm::Open => &*MAX_ENTRY_KEY,
+            },
+        }
     }
 }
 

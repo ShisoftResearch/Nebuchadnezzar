@@ -107,28 +107,6 @@ impl EntryKey {
         key.set_id(id);
         key
     }
-    pub fn less(mut self) -> Self {
-        for b in self.slice.as_mut() {
-            if *b > 0 {
-               *b -= 1;
-               break; 
-            } else {
-                *b = !0;
-            }
-        }
-        self
-    }
-    pub fn greater(mut self) -> Self {
-        for b in self.slice.as_mut() {
-            if *b < !0 {
-                *b += 1;
-                break;
-            } else {
-                *b = 0;
-            }
-        }
-        self
-    }
 }
 
 impl Default for EntryKey {

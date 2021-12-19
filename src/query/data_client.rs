@@ -9,13 +9,13 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::{client_by_server_id, client_by_server_name},
+    client::{client_by_server_name},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
-        ranged::{client::cursor::ClientCursor, lsm::btree::Ordering},
+        ranged::{client::cursor::ClientCursor, lsm::{btree::{Ordering}, service::{RangeTerm, Range}}},
         EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
-    ram::cell::{OwnedCell, ReadError},
+    ram::cell::{OwnedCell},
 };
 
 const SCAN_BUFFER_SIZE: u16 = 64;
@@ -35,13 +35,33 @@ pub struct DataCursor<'a> {
     pos: usize,
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy)]
-pub enum Comparator {
-    Eq,
-    Less,
-    LessEq,
-    Greater,
-    GreaterEq,
+pub struct ValueRange<'a> {
+    start: ValueRangeTerm<'a>,
+    end: ValueRangeTerm<'a>
+}
+
+pub enum ValueRangeTerm<'a> {
+    Inclusive(SharedValue<'a>),
+    Exclusive(SharedValue<'a>),
+    Open
+}
+
+impl <'a> ValueRange <'a> {
+    pub fn to_key_range(self, schema: u32, field: u64, ordering: Ordering) -> Range {
+        Range {
+            start: match self.start {
+                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
+                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
+                ValueRangeTerm::Open => RangeTerm::Open,
+            },
+            end: match self.end {
+                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
+                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
+                ValueRangeTerm::Open => RangeTerm::Open,
+            },
+            ordering
+        }
+    } 
 }
 
 impl IndexedDataClient {
@@ -55,59 +75,18 @@ impl IndexedDataClient {
         &'a self,
         schema: u32,
         field: u64,
-        key: SharedValue<'b>,
+        range: ValueRange<'b>,
         projection: Vec<u64>, // Column array
         selection: Expr,      // Checker expression
         proc: Expr,
-        comp: Comparator,
         ordering: Ordering,
     ) -> Result<DataCursor<'a>, RPCError> {
+        let range = range.to_key_range(schema, field, ordering);
         let schema_lower_bound = EntryKey::for_schema_field_feature(schema, field, &MIN_FEATURE);
         let schema_higher_bound = EntryKey::for_schema_field_feature(schema, field, &MAX_FEATURE);
-        let schema_search_key = EntryKey::for_schema_field_feature(schema, field, &key.feature());
-        let end_key;
-        let start_key;
-        match (comp, ordering) {
-            (Comparator::Eq, _) => {
-                start_key = schema_search_key.clone();
-                end_key = schema_search_key;
-            }
-            (Comparator::Less, Ordering::Forward) => {
-                start_key = schema_lower_bound;
-                end_key = schema_search_key.less();
-            }
-            (Comparator::Less, Ordering::Backward) => {
-                start_key = schema_search_key.less();
-                end_key = schema_lower_bound;
-            }
-            (Comparator::LessEq, Ordering::Forward) => {
-                start_key = schema_lower_bound;
-                end_key = schema_search_key;
-            }
-            (Comparator::LessEq, Ordering::Backward) => {
-                start_key = schema_search_key;
-                end_key = schema_lower_bound;
-            }
-            (Comparator::Greater, Ordering::Forward) => {
-                start_key = schema_search_key.greater();
-                end_key = schema_higher_bound;
-            }
-            (Comparator::Greater, Ordering::Backward) => {
-                start_key = schema_higher_bound;
-                end_key = schema_search_key.greater();
-            }
-            (Comparator::GreaterEq, Ordering::Forward) => {
-                start_key = schema_search_key;
-                end_key = schema_higher_bound;
-            }
-            (Comparator::GreaterEq, Ordering::Backward) => {
-                start_key = schema_higher_bound;
-                end_key = schema_search_key;
-            }
-        }
         let index_cursor = self
             .index_clients
-            .range_seek(&start_key, ordering, SCAN_BUFFER_SIZE, None, Some(end_key))
+            .range_seek(range, SCAN_BUFFER_SIZE, None)
             .await?;
         Ok(self
             .new_cursor(index_cursor, projection, selection, proc)
@@ -125,11 +104,9 @@ impl IndexedDataClient {
         let index_cursor = self
             .index_clients
             .range_seek(
-                &key,
-                ordering,
+                Range::new_inclusive_opened(key, ordering),
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
-                None,
             )
             .await?;
         Ok(self
@@ -274,13 +251,11 @@ impl<'a> DataCursor<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
-        index::ranged::lsm::btree::Ordering,
-        query::data_client::Comparator,
         ram::{
             cell::OwnedCell,
             schema::{Field, IndexType, Schema},
         },
-        server::*,
+        server::*, index::ranged::lsm::{service::RangeTerm, btree::Ordering}, query::data_client::{ValueRange, ValueRangeTerm},
     };
     use bifrost_hasher::hash_str;
     use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
@@ -513,7 +488,6 @@ mod test {
         }
     }
 
-
     #[tokio::test(flavor = "multi_thread")]
     async fn range_query_scan() {
         const DATA_1: &'static str = "DATA_1";
@@ -575,16 +549,16 @@ mod test {
         }
         let idx_data_client = server.indexed_data_client();
         let query_key = OwnedValue::U64(100);
+        let val_range = ValueRange { start: ValueRangeTerm::Inclusive(query_key.shared()), end: ValueRangeTerm::Open };
         let mut cursor = idx_data_client
             .range_index_scan(
                 schema_id_1,
                 hash_str(DATA_1),
-                query_key.shared(),
+                val_range,
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
-                Comparator::GreaterEq,
-                Ordering::Forward,
+                Ordering::Forward
             )
             .await
             .unwrap();

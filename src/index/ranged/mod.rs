@@ -11,6 +11,7 @@ mod tests {
     use crate::client::*;
     use crate::index::ranged::lsm::btree;
     use crate::index::EntryKey;
+    use crate::index::ranged::trees::Range;
     use crate::ram::schema::*;
     use crate::ram::types::Id;
     use crate::server::*;
@@ -93,11 +94,9 @@ mod tests {
                 let key = EntryKey::from_id(&id);
                 let rt_cursor = client::RangedQueryClient::seek(
                     &index_client,
-                    &key,
-                    Ordering::Forward,
+                    Range::new_inclusive_opened(key, Ordering::Forward),
                     1,
                     None,
-                    None
                 )
                 .await
                 .unwrap()
@@ -120,11 +119,9 @@ mod tests {
         let start_id = Id::new(1, 0);
         let mut rt_cursor = client::RangedQueryClient::seek(
             &index_client,
-            &EntryKey::from_id(&start_id),
-            Ordering::Forward,
+            Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
             128,
             None,
-            None
         )
         .await
         .unwrap()

@@ -14,28 +14,24 @@ pub struct ClientCursor {
     pub ids: Vec<Id>,
     next: Option<EntryKey>,
     query_client: Arc<RangedQueryClient>,
-    ordering: Ordering,
-    tree_key: EntryKey,
     pub pos: usize,
     buffer_size: u16,
     pattern: Option<Vec<u8>>,
-    termination_key: Option<EntryKey>
+    range: Range,
 }
 
 impl ClientCursor {
     pub async fn new(
-        ordering: Ordering,
         block: ServBlock,
-        tree_key: EntryKey,
+        range: Range,
         query_client: Arc<RangedQueryClient>,
         buffer_size: u16,
         pattern: Option<Vec<u8>>,
-        termination_key: Option<EntryKey>
     ) -> Result<Self, RPCError> {
         trace!(
             "Client cursor created with buffer next {:?}, tree key {:?}, block keys {:?}",
             block.next,
-            tree_key,
+            range.key(),
             block.buffer
         );
         let next = block.next;
@@ -43,13 +39,11 @@ impl ClientCursor {
         Ok(Self {
             ids,
             query_client,
-            tree_key,
-            ordering,
             next,
             buffer_size,
             pos: 0,
             pattern,
-            termination_key
+            range,
         })
     }
 
@@ -84,11 +78,9 @@ impl ClientCursor {
         );
         let next_cursor = RangedQueryClient::seek(
             &self.query_client,
-            next_key,
-            self.ordering,
+            self.range.clone().move_to(next_key.clone()),
             self.buffer_size,
             self.pattern.clone(),
-            self.termination_key.clone()
         )
         .await?;
         if let Some(cursor) = next_cursor {
@@ -119,32 +111,31 @@ impl ClientCursor {
     async fn refill_by_next_tree(&mut self) -> Result<(), RPCError> {
         debug!(
             "Refill by next tree, key {:?}, ordering {:?}",
-            self.tree_key, self.ordering
+            self.range.key(), self.range.ordering
         );
         loop {
             if let Some((tree_key, tree)) = self
                 .query_client
-                .next_tree(&self.tree_key, self.ordering)
+                .next_tree(self.range.key(), self.range.ordering)
                 .await
                 .unwrap()
             {
                 debug!(
                     "Next tree for {:?} returns {:?}, lower key {:?}, ordering {:?}",
-                    self.tree_key, tree, tree_key, self.ordering
+                    self.range.key(), tree, tree_key, self.range.ordering
                 );
                 let tree_client =
                     locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
-                let seek_key = match self.ordering {
-                    Ordering::Forward => min_entry_key(),
-                    Ordering::Backward => max_entry_key(),
+                let range = Range {
+                    start: RangeTerm::Open,
+                    end: RangeTerm::Open,
+                    ordering: self.range.ordering,
                 };
                 let seek_res = tree_client
                     .seek(
                         tree.id,
-                        seek_key,
+                        range,
                         self.pattern.clone(),
-                        self.termination_key.clone(),
-                        self.ordering,
                         self.buffer_size,
                         tree.epoch,
                     )
@@ -161,13 +152,11 @@ impl ClientCursor {
                                 block.buffer.len()
                             );
                             *self = Self::new(
-                                self.ordering,
                                 block,
-                                tree_key,
+                                self.range.clone().move_to(tree_key),
                                 self.query_client.clone(),
                                 self.buffer_size,
                                 self.pattern.clone(),
-                                self.termination_key.clone()
                             )
                             .await?;
                         }
@@ -187,7 +176,8 @@ impl ClientCursor {
             } else {
                 debug!(
                     "Next tree for {:?} does not return anything. ordering {:?}",
-                    self.tree_key, self.ordering
+                    self.range.key(),
+                    self.range.ordering
                 );
                 // Clear the cursor
                 self.ids.clear();
