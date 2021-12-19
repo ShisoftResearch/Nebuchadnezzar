@@ -11,6 +11,7 @@ use itertools::Itertools;
 use crate::{
     client::{client_by_server_id, client_by_server_name},
     index::{
+        entry::{MAX_FEATURE, MIN_FEATURE},
         ranged::{client::cursor::ClientCursor, lsm::btree::Ordering},
         EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
@@ -51,7 +52,7 @@ impl IndexedDataClient {
         }
     }
     pub async fn range_index_scan<'a, 'b>(
-        &self,
+        &'a self,
         schema: u32,
         field: u64,
         key: SharedValue<'b>,
@@ -60,8 +61,58 @@ impl IndexedDataClient {
         proc: Expr,
         comp: Comparator,
         ordering: Ordering,
-    ) -> DataCursor<'a> {
-        unimplemented!()
+    ) -> Result<DataCursor<'a>, RPCError> {
+        let schema_lower_bound = EntryKey::for_schema_field_feature(schema, field, &MIN_FEATURE);
+        let schema_higher_bound = EntryKey::for_schema_field_feature(schema, field, &MAX_FEATURE);
+        let schema_search_key = EntryKey::for_schema_field_feature(schema, field, &key.feature());
+        let end_key;
+        let start_key;
+        match (comp, ordering) {
+            (Comparator::Eq, _) => {
+                start_key = schema_search_key.clone();
+                end_key = schema_search_key;
+            }
+            (Comparator::Less, Ordering::Forward) => {
+                start_key = schema_lower_bound;
+                end_key = schema_search_key.less();
+            }
+            (Comparator::Less, Ordering::Backward) => {
+                start_key = schema_search_key.less();
+                end_key = schema_lower_bound;
+            }
+            (Comparator::LessEq, Ordering::Forward) => {
+                start_key = schema_lower_bound;
+                end_key = schema_search_key;
+            }
+            (Comparator::LessEq, Ordering::Backward) => {
+                start_key = schema_search_key;
+                end_key = schema_lower_bound;
+            }
+            (Comparator::Greater, Ordering::Forward) => {
+                start_key = schema_search_key.greater();
+                end_key = schema_higher_bound;
+            }
+            (Comparator::Greater, Ordering::Backward) => {
+                start_key = schema_higher_bound;
+                end_key = schema_search_key.greater();
+            }
+            (Comparator::GreaterEq, Ordering::Forward) => {
+                start_key = schema_search_key;
+                end_key = schema_higher_bound;
+            }
+            (Comparator::GreaterEq, Ordering::Backward) => {
+                start_key = schema_higher_bound;
+                end_key = schema_search_key;
+            }
+        }
+        let index_cursor = self.index_clients.range_seek(
+            &start_key,
+            ordering,
+            SCAN_BUFFER_SIZE,
+            None,
+            Some(end_key),
+        ).await?;
+        Ok(self.new_cursor(index_cursor, projection, selection, proc).await)
     }
     pub async fn scan_all<'a>(
         &'a self,
@@ -79,9 +130,18 @@ impl IndexedDataClient {
                 ordering,
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
-                None
+                None,
             )
             .await?;
+        Ok(self.new_cursor(index_cursor, projection, selection, proc).await)
+    }
+    async fn new_cursor<'a>(
+        &'a self,
+        index_cursor: Option<ClientCursor>,
+        projection: Vec<u64>,
+        selection: Expr,
+        proc: Expr,
+    ) -> DataCursor<'a> {
         let mut cursor = DataCursor {
             index_cursor,
             projection,
@@ -92,7 +152,7 @@ impl IndexedDataClient {
             pos: 0,
         };
         cursor.refresh_batch().await;
-        Ok(cursor)
+        cursor
     }
 }
 

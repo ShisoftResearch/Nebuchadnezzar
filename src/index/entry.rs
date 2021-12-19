@@ -1,4 +1,4 @@
-use super::{Feature, KEY_SIZE};
+use super::{Feature, KEY_SIZE, FEATURE_SIZE};
 use crate::ram::types::Id;
 use byteorder::{BigEndian, WriteBytesExt};
 use serde::de::{SeqAccess, Visitor};
@@ -15,6 +15,8 @@ use std::slice::SliceIndex;
 
 type InnerSlice = [u8; KEY_SIZE];
 pub const ID_SIZE: usize = 16;
+pub const MIN_FEATURE: Feature = [0; FEATURE_SIZE];
+pub const MAX_FEATURE: Feature = [!0; FEATURE_SIZE];
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash)]
 pub struct EntryKey {
@@ -104,6 +106,28 @@ impl EntryKey {
         let mut key = EntryKey::new();
         key.set_id(id);
         key
+    }
+    pub fn less(mut self) -> Self {
+        for b in self.slice.as_mut() {
+            if *b > 0 {
+               *b -= 1;
+               break; 
+            } else {
+                *b = !0;
+            }
+        }
+        self
+    }
+    pub fn greater(mut self) -> Self {
+        for b in self.slice.as_mut() {
+            if *b < !0 {
+                *b += 1;
+                break;
+            } else {
+                *b = 0;
+            }
+        }
+        self
     }
 }
 
