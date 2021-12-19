@@ -105,14 +105,13 @@ impl IndexedDataClient {
                 end_key = schema_search_key;
             }
         }
-        let index_cursor = self.index_clients.range_seek(
-            &start_key,
-            ordering,
-            SCAN_BUFFER_SIZE,
-            None,
-            Some(end_key),
-        ).await?;
-        Ok(self.new_cursor(index_cursor, projection, selection, proc).await)
+        let index_cursor = self
+            .index_clients
+            .range_seek(&start_key, ordering, SCAN_BUFFER_SIZE, None, Some(end_key))
+            .await?;
+        Ok(self
+            .new_cursor(index_cursor, projection, selection, proc)
+            .await)
     }
     pub async fn scan_all<'a>(
         &'a self,
@@ -133,7 +132,9 @@ impl IndexedDataClient {
                 None,
             )
             .await?;
-        Ok(self.new_cursor(index_cursor, projection, selection, proc).await)
+        Ok(self
+            .new_cursor(index_cursor, projection, selection, proc)
+            .await)
     }
     async fn new_cursor<'a>(
         &'a self,
@@ -274,6 +275,7 @@ impl<'a> DataCursor<'a> {
 mod test {
     use crate::{
         index::ranged::lsm::btree::Ordering,
+        query::data_client::Comparator,
         ram::{
             cell::OwnedCell,
             schema::{Field, IndexType, Schema},
@@ -508,6 +510,95 @@ mod test {
             if let Some(cell) = out_of_range_item {
                 panic!("Should not have any more cell. Got id {:?}", cell.id());
             }
+        }
+    }
+
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn range_query_scan() {
+        const DATA_1: &'static str = "DATA_1";
+        const DATA_2: &'static str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server_addr = String::from("127.0.0.1:6702");
+        let server_group = String::from("indexed_scan_all_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 8,
+                memory_size: 512 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query],
+            },
+            &server_addr,
+            &server_group,
+        )
+        .await;
+        // Require schema to be scannable to insert special scan key to the range indexer
+        let fields = Field::new(
+            "*",
+            Type::Map,
+            false,
+            false,
+            Some(vec![
+                Field::new(
+                    DATA_1,
+                    Type::U64,
+                    false,
+                    false,
+                    None,
+                    vec![IndexType::Ranged],
+                ),
+                Field::new(DATA_2, Type::U32, false, false, None, vec![]),
+            ]),
+            vec![],
+        );
+        let schema_id_1 = 123;
+        let schema_1 = Schema::new_with_id(
+            schema_id_1,
+            &String::from("schema_1"),
+            None,
+            fields.clone(),
+            false,
+            true, // Scannable
+        );
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema_1).await.unwrap().unwrap();
+        let num = 1024;
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[DATA_1] = OwnedValue::U64(i);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+        let idx_data_client = server.indexed_data_client();
+        let query_key = OwnedValue::U64(100);
+        let mut cursor = idx_data_client
+            .range_index_scan(
+                schema_id_1,
+                hash_str(DATA_1),
+                query_key.shared(),
+                vec![],
+                Expr::nothing(),
+                Expr::nothing(),
+                Comparator::GreaterEq,
+                Ordering::Forward,
+            )
+            .await
+            .unwrap();
+        for i in 100..num {
+            let id = Id::new(1, i);
+            let cell = cursor.next().await.unwrap().expect(&format!("at {}", i));
+            assert_eq!(id, cell.id());
+            assert_eq!(*cell[DATA_1].u64().unwrap(), i);
+            assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
+            debug!("Checked cell id {:?} from index", id);
+        }
+        let out_of_range_item = cursor.next().await.unwrap();
+        if let Some(cell) = out_of_range_item {
+            panic!("Should not have any more cell. Got id {:?}", cell.id());
         }
     }
 }
