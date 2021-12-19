@@ -97,6 +97,7 @@ mod tests {
                     Ordering::Forward,
                     1,
                     None,
+                    None
                 )
                 .await
                 .unwrap()
@@ -123,6 +124,7 @@ mod tests {
             Ordering::Forward,
             128,
             None,
+            None
         )
         .await
         .unwrap()

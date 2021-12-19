@@ -39,21 +39,24 @@ impl RangedQueryClient {
         ordering: Ordering,
         buffer_size: u16,
         pattern: Option<Vec<u8>>,
+        termination_key: Option<EntryKey>
     ) -> Result<Option<cursor::ClientCursor>, RPCError> {
         self_ref
             .run_on_destinated_tree(
                 key,
                 |key, client, tree_id, epoch| {
                     let pattern = pattern.clone();
+                    let termination_key = termination_key.clone();
                     async move {
                         client
-                            .seek(tree_id, key, pattern, ordering, buffer_size, epoch)
+                            .seek(tree_id, key, pattern, termination_key, ordering, buffer_size, epoch)
                             .await
                     }
                     .boxed()
                 },
                 |action_res, _tree_client, lower, _upper| {
                     let pattern = pattern.clone();
+                    let termination_key = termination_key.clone();
                     async move {
                         if let Some(block) = action_res {
                             if block.buffer.is_empty() {
@@ -66,6 +69,7 @@ impl RangedQueryClient {
                                     self_ref.clone(),
                                     buffer_size,
                                     pattern,
+                                    termination_key
                                 )
                                 .await?;
                                 return Ok(Some(Some(client_cursor)));

@@ -79,7 +79,7 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
-    rpc seek(id: Id, entry: EntryKey, pattern: Option<Vec<u8>>, ordering: Ordering, buffer_size: u16, epoch: u64)
+    rpc seek(id: Id, entry: EntryKey, pattern: Option<Vec<u8>>, termination_key: Option<EntryKey>, ordering: Ordering, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
@@ -150,6 +150,7 @@ impl Service for LSMTreeService {
         id: Id,
         entry: EntryKey,
         pattern: Option<Vec<u8>>,
+        termination_key: Option<EntryKey>,
         ordering: Ordering,
         buffer_size: u16,
         epoch: u64,
@@ -181,11 +182,19 @@ impl Service for LSMTreeService {
                         Ordering::Forward => {
                             if &key < entry {
                                 continue;
+                            } else if let Some(term_key) = termination_key.as_ref() {
+                                if &key > term_key {
+                                    break;
+                                }
                             }
                         }
                         Ordering::Backward => {
                             if &key > entry {
                                 continue;
+                            } else if let Some(term_key) = termination_key.as_ref() {
+                                if &key < term_key {
+                                    break;
+                                }
                             }
                         }
                     }

@@ -1,7 +1,10 @@
 use std::{mem, sync::Arc};
 
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
-use dovahkiin::{expr::serde::Expr, types::OwnedValue};
+use dovahkiin::{
+    expr::serde::Expr,
+    types::{OwnedValue, SharedValue},
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
@@ -31,6 +34,15 @@ pub struct DataCursor<'a> {
     pos: usize,
 }
 
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy)]
+pub enum Comparator {
+    Eq,
+    Less,
+    LessEq,
+    Greater,
+    GreaterEq,
+}
+
 impl IndexedDataClient {
     pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         Self {
@@ -38,13 +50,16 @@ impl IndexedDataClient {
             index_clients: Arc::new(IndexerClients::new(conshash, raft_client)),
         }
     }
-    pub async fn range_index_scan<'a>(
+    pub async fn range_index_scan<'a, 'b>(
         &self,
         schema: u32,
         field: u64,
-        key: u64,
-        selection: OwnedValue,
-        projection: OwnedValue,
+        key: SharedValue<'b>,
+        projection: Vec<u64>, // Column array
+        selection: Expr,      // Checker expression
+        proc: Expr,
+        comp: Comparator,
+        ordering: Ordering,
     ) -> DataCursor<'a> {
         unimplemented!()
     }
@@ -64,6 +79,7 @@ impl IndexedDataClient {
                 ordering,
                 SCAN_BUFFER_SIZE,
                 Some(SCHEMA_SCAN_PATT_SIZE),
+                None
             )
             .await?;
         let mut cursor = DataCursor {
@@ -381,8 +397,9 @@ mod test {
         }
         {
             info!("Testing selection 2");
-            let select_expr =
-                parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))").unwrap()[0].clone();
+            let select_expr = parse_to_serde_expr("(or (= DATA_1 100u64) (= DATA_1 1000u64))")
+                .unwrap()[0]
+                .clone();
             let mut cursor = idx_data_client
                 .scan_all(
                     schema_id_1,
@@ -409,8 +426,7 @@ mod test {
         }
         {
             info!("Testing processing");
-            let proc_expr =
-                parse_to_serde_expr("(+ DATA_1 (u64 DATA_2))").unwrap()[0].clone();
+            let proc_expr = parse_to_serde_expr("(+ DATA_1 (u64 DATA_2))").unwrap()[0].clone();
             let mut cursor = idx_data_client
                 .scan_all(
                     schema_id_1,
