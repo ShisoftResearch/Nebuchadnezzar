@@ -75,12 +75,9 @@ impl<'a> ValueRange<'a> {
                     field,
                     schema,
                 )),
-                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::from_props(
-                    &Id::max_id(),
-                    &v.feature(),
-                    field,
-                    schema,
-                )),
+                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(
+                    EntryKey::for_schema_field_feature(schema, field, &v.feature()),
+                ),
                 ValueRangeTerm::Open => RangeTerm::Inclusive(EntryKey::from_props(
                     &Id::max_id(),
                     &MAX_FEATURE,
