@@ -109,43 +109,30 @@ impl CombinedCleaner {
         if entries.len() > 0 {
             // Simulate the combine process to determine the efficiency
             let mut pending_segments = Vec::with_capacity(segments.len());
-            let entries_num = entries.len();
-            let mut entries_to_claim = entries_num;
-            let mut cursor = 0;
             pending_segments.push(DummySegment::new());
-            while entries_to_claim > 0 {
+            let entries_num = entries.len();
+            for (index, entry_pair) in entries.iter_mut().enumerate() {
                 let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
-                let index = cursor % entries_num;
-                let entry_pair = entries.get_mut(index).unwrap();
-                if entry_pair.1 {
-                    // entry claimed
-                    cursor += 1;
-                    continue;
-                }
-
                 let entry = &entry_pair.0;
                 let entry_size = entry.size;
-                if entry_size > segment_space_remains {
+                if entry_pair.1 {
+                    // entry claimed
+                } else if entry_size > segment_space_remains {
                     if index == entries_num - 1 {
                         // iterated to the last one, which means no more entries can be placed
                         // in the segment, then create a new segment
                         pending_segments.push(DummySegment::new());
                     }
-                    cursor += 1;
-                    continue;
+                } else {
+                    let last_segment = pending_segments.last_mut().unwrap();
+                    last_segment.entries.push(entry.clone());
+
+                    // pump dummy segment head pointer
+                    last_segment.head += entry_size;
+
+                    // mark entry claimed
+                    entry_pair.1 = true;
                 }
-                let last_segment = pending_segments.last_mut().unwrap();
-                last_segment.entries.push(entry.clone());
-
-                // pump dummy segment head pointer
-                last_segment.head += entry_size;
-
-                // mark entry claimed
-                entry_pair.1 = true;
-                entries_to_claim -= 1;
-
-                // move to next entry
-                cursor += 1;
             }
 
             debug!("Checking combine feasibility");

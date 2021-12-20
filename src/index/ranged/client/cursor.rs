@@ -128,8 +128,8 @@ impl ClientCursor {
                 let tree_client =
                     locate_tree_server_from_conshash(&tree.id, &self.query_client.conshash).await?;
                 let range = Range {
-                    start: RangeTerm::Open,
-                    end: RangeTerm::Open,
+                    start: RangeTerm::Inclusive(min_entry_key()),
+                    end: RangeTerm::Inclusive(max_entry_key()),
                     ordering: self.range.ordering,
                 };
                 let seek_res = tree_client
