@@ -117,6 +117,7 @@ impl CombinedCleaner {
                 let entry_size = entry.size;
                 if entry_pair.1 {
                     // entry claimed
+                    continue;
                 } else if entry_size > segment_space_remains {
                     if index == entries_num - 1 {
                         // iterated to the last one, which means no more entries can be placed

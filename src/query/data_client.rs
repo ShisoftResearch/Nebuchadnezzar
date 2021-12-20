@@ -3,19 +3,25 @@ use std::{mem, sync::Arc};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
     expr::serde::Expr,
-    types::{OwnedValue, SharedValue},
+    types::{Id, OwnedValue, SharedValue},
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::{client_by_server_name},
+    client::client_by_server_name,
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
-        ranged::{client::cursor::ClientCursor, lsm::{btree::{Ordering}, service::{RangeTerm, Range}}},
+        ranged::{
+            client::cursor::ClientCursor,
+            lsm::{
+                btree::Ordering,
+                service::{Range, RangeTerm},
+            },
+        },
         EntryKey, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
-    ram::cell::{OwnedCell},
+    ram::cell::OwnedCell,
 };
 
 const SCAN_BUFFER_SIZE: u16 = 64;
@@ -37,33 +43,54 @@ pub struct DataCursor<'a> {
 
 pub struct ValueRange<'a> {
     start: ValueRangeTerm<'a>,
-    end: ValueRangeTerm<'a>
+    end: ValueRangeTerm<'a>,
 }
 
 pub enum ValueRangeTerm<'a> {
     Inclusive(SharedValue<'a>),
     Exclusive(SharedValue<'a>),
-    Open
+    Open,
 }
 
-impl <'a> ValueRange <'a> {
+impl<'a> ValueRange<'a> {
     pub fn to_key_range(self, schema: u32, field: u64, ordering: Ordering) -> Range {
-        let schema_lower_bound = EntryKey::for_schema_field_feature(schema, field, &MIN_FEATURE);
-        let schema_higher_bound = EntryKey::for_schema_field_feature(schema, field, &MAX_FEATURE);
         Range {
             start: match self.start {
-                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Open => RangeTerm::Inclusive(schema_lower_bound),
+                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(
+                    EntryKey::for_schema_field_feature(schema, field, &v.feature()),
+                ),
+                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(
+                    EntryKey::for_schema_field_feature(schema, field, &v.feature()),
+                ),
+                ValueRangeTerm::Open => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(
+                    schema,
+                    field,
+                    &MIN_FEATURE,
+                )),
             },
             end: match self.end {
-                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::for_schema_field_feature(schema, field, &v.feature())),
-                ValueRangeTerm::Open => RangeTerm::Inclusive(schema_higher_bound),
+                ValueRangeTerm::Inclusive(v) => RangeTerm::Inclusive(EntryKey::from_props(
+                    &Id::max_id(),
+                    &v.feature(),
+                    field,
+                    schema,
+                )),
+                ValueRangeTerm::Exclusive(v) => RangeTerm::Exclusive(EntryKey::from_props(
+                    &Id::max_id(),
+                    &v.feature(),
+                    field,
+                    schema,
+                )),
+                ValueRangeTerm::Open => RangeTerm::Inclusive(EntryKey::from_props(
+                    &Id::max_id(),
+                    &MAX_FEATURE,
+                    field,
+                    schema,
+                )),
             },
-            ordering
+            ordering,
         }
-    } 
+    }
 }
 
 impl IndexedDataClient {
@@ -251,11 +278,13 @@ impl<'a> DataCursor<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
+        index::ranged::lsm::{btree::Ordering, service::RangeTerm},
+        query::data_client::{ValueRange, ValueRangeTerm},
         ram::{
             cell::OwnedCell,
             schema::{Field, IndexType, Schema},
         },
-        server::*, index::ranged::lsm::{service::RangeTerm, btree::Ordering}, query::data_client::{ValueRange, ValueRangeTerm},
+        server::*,
     };
     use bifrost_hasher::hash_str;
     use dovahkiin::{expr::serde::Expr, integrated::lisp::*, types::*};
@@ -548,8 +577,10 @@ mod test {
             client.write_cell(cell).await.unwrap().unwrap();
         }
         let idx_data_client = server.indexed_data_client();
-        let query_key = OwnedValue::U64(5);
-        let val_range = ValueRange { start: ValueRangeTerm::Inclusive(query_key.shared()), end: ValueRangeTerm::Open };
+        let val_range = ValueRange {
+            start: ValueRangeTerm::Inclusive(OwnedValue::U64(5).shared()),
+            end: ValueRangeTerm::Inclusive(OwnedValue::U64(515).shared()),
+        };
         let mut cursor = idx_data_client
             .range_index_scan(
                 schema_id_1,
@@ -558,11 +589,11 @@ mod test {
                 vec![],
                 Expr::nothing(),
                 Expr::nothing(),
-                Ordering::Forward
+                Ordering::Forward,
             )
             .await
             .unwrap();
-        for i in 5..num {
+        for i in 5..=515 {
             let id = Id::new(1, i);
             let cell = cursor.next().await.unwrap().expect(&format!("at {}", i));
             assert_eq!(id, cell.id());

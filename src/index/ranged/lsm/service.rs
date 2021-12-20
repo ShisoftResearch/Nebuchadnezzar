@@ -211,11 +211,13 @@ impl Service for LSMTreeService {
                             match &range.end {
                                 RangeTerm::Inclusive(k) => {
                                     if &key > k {
+                                        debug!("Seek terminated due to inclusive end condition {:?} > {:?}", key, k);
                                         break;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
                                     if &key >= k {
+                                        debug!("Seek terminated due to exclusive end condition {:?} >= {:?}", key, k);
                                         break;
                                     }
                                 }
@@ -239,11 +241,13 @@ impl Service for LSMTreeService {
                             match &range.start {
                                 RangeTerm::Inclusive(k) => {
                                     if &key < k {
+                                        debug!("Seek terminated due to inclusive start condition {:?} > {:?}", key, k);
                                         break;
                                     }
                                 }
                                 RangeTerm::Exclusive(k) => {
                                     if &key <= k {
+                                        debug!("Seek terminated due to exclusive start condition {:?} > {:?}", key, k);
                                         break;
                                     }
                                 }
