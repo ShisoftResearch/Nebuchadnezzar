@@ -60,6 +60,7 @@ where
     root_versioning: NodeCellRef,
     head_page_id: Id,
     len: AtomicUsize,
+    height: AtomicUsize,
     pub deletion: Arc<DeletionSet>,
     marker: PhantomData<(KS, PS)>,
 }
@@ -96,6 +97,7 @@ where
             root_versioning: NodeCellRef::new(Node::<KS, PS>::new(NodeData::None)),
             head_page_id: Id::unit_id(),
             len: AtomicUsize::new(0),
+            height: AtomicUsize::new(0),
             marker: PhantomData,
             deletion: deletion.clone(),
         };
@@ -117,6 +119,7 @@ where
         ));
         let old_node = mem::replace(&mut *self.root.write(), new_node);
         self.len.store(0, Release);
+        self.height.store(0, Release);
         clear::clear_by_node::<KS, PS>(&old_node);
     }
 
@@ -138,6 +141,7 @@ where
         root: NodeCellRef,
         head_id: Id,
         len: usize,
+        height: usize,
         deletion: &Arc<DeletionSet>,
     ) -> Self {
         BPlusTree {
@@ -145,6 +149,7 @@ where
             root_versioning: NodeCellRef::default(),
             head_page_id: head_id,
             len: AtomicUsize::new(len),
+            height: AtomicUsize::new(height),
             marker: PhantomData,
             deletion: deletion.clone(),
         }
@@ -170,6 +175,7 @@ where
                 new_in_root.ptrs.as_slice()[0] = old_root;
                 new_in_root.ptrs.as_slice()[1] = new_node;
                 *self.root.write() = NodeCellRef::new(Node::new(NodeData::Internal(new_in_root)));
+                self.height.fetch_add(1, AcqRel);
             }
             Some(None) => {}
             None => return false,
@@ -241,6 +247,7 @@ where
                             &mut this_level_new_pages,
                         );
                     }
+                    self.height.fetch_add(1, AcqRel);
                     if this_level_new_pages.is_empty() {
                         // All sub pages merged into the new page, should set the page as root and break
                         *self.root.write() = new_node_ref;
@@ -268,6 +275,10 @@ where
         self.len.load(Relaxed)
     }
 
+    pub fn _height(&self) -> usize {
+        self.height.load(Relaxed)
+    }
+
     fn new_page_id() -> Id {
         // TODO: achieve locality
         Id::rand()
@@ -287,6 +298,7 @@ where
 pub trait LevelTree: Sync + Send {
     fn size(&self) -> usize;
     fn count(&self) -> usize;
+    fn height(&self) -> usize;
     fn merge_to<'a>(
         &'a self,
         level: usize,
@@ -334,6 +346,10 @@ where
 
     fn count(&self) -> usize {
         self.len()
+    }
+
+    fn height(&self) -> usize {
+        self._height()
     }
 
     fn merge_to<'a>(
@@ -459,6 +475,10 @@ impl LevelTree for DummyLevelTree {
     }
     fn last_node_digest(&self, _node: &NodeCellRef) -> Option<(usize, NodeCellRef, EntryKey)> {
         unreachable!()
+    }
+
+    fn height(&self) -> usize {
+        todo!()
     }
 }
 

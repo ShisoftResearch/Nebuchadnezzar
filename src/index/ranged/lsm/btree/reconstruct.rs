@@ -102,8 +102,8 @@ where
     }
 
     pub fn root(&self) -> NodeCellRef {
-        debug_assert!(self.level_guards.len() > 0, "reconstructed levels is zero");
-        debug!("The tree have {} levels", self.level_guards.len());
+        debug_assert!(self.levels() > 0, "reconstructed levels is zero");
+        debug!("The tree have {} levels", self.levels());
         let last_ref = self.level_guards.last().unwrap().clone();
         let last_guard = last_ref.borrow();
         if last_guard.len() == 0 {
@@ -113,6 +113,10 @@ where
             debug!("Taking level root");
             last_guard.node_ref().clone()
         }
+    }
+
+    pub fn levels(&self) -> usize {
+        self.level_guards.len()
     }
 }
 
@@ -128,7 +132,7 @@ where
 {
     info!("Reconstructing level tree from head {:?}", head_id);
     let mut len = 0;
-    let root = {
+    let (root, height) = {
         let mut constructor = TreeConstructor::<KS, PS>::new();
         let mut prev_ref = NodeCellRef::new_none::<KS, PS>();
         let mut id = head_id;
@@ -159,10 +163,10 @@ where
             prev_ref = node_ref;
             id = next_id;
         }
-        constructor.root()
+        (constructor.root(), constructor.levels())
     };
     info!("Reconstruct tree {:?} completed", head_id);
-    let tree = BPlusTree::from_root(root, head_id, len, deletion);
+    let tree = BPlusTree::from_root(root, head_id, len, height, deletion);
     debug!("Verifying reconstruction at {}", level);
     // debug_assert!(verification::tree_has_no_empty_node(&tree));
     debug_assert!(verification::is_tree_in_order(&tree, level));
