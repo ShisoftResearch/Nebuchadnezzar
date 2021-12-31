@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    server::NebServer,
-};
+use crate::server::NebServer;
 
 use super::*;
 
