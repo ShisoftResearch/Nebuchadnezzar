@@ -2,12 +2,13 @@ use itertools::Itertools;
 use lightning::map::{Map, ObjectMap};
 use rayon::prelude::*;
 use std::{
+    cmp::max,
     collections::{HashMap, HashSet},
     iter,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
-    }, cmp::max,
+    },
 };
 
 use dovahkiin::types::SharedValue;
@@ -215,7 +216,10 @@ fn build_partitation_statistics(
                                     .filter_map(|path_key| schema.id_index.get(path_key))
                                     .map(|key| map.get_in_by_ids(key.iter()).clone())
                                     .collect_vec(),
-                                _ => unreachable!("Other data structure is not possible. Got {:?}", partial_cell),
+                                _ => unreachable!(
+                                    "Other data structure is not possible. Got {:?}",
+                                    partial_cell
+                                ),
                             };
                             for (i, val) in field_array.into_iter().enumerate() {
                                 if val == SharedValue::Null || val == SharedValue::NA {

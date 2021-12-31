@@ -113,7 +113,8 @@ impl ClientCursor {
             let current_key = self.range.key();
             debug!(
                 "Refill by next tree, key {:?}, ordering {:?}",
-                self.range.key(), self.range.ordering
+                self.range.key(),
+                self.range.ordering
             );
             if let Some((tree_key, tree)) = self
                 .query_client
@@ -177,8 +178,7 @@ impl ClientCursor {
             } else {
                 debug!(
                     "Next tree for {:?} does not return anything. ordering {:?}",
-                    current_key,
-                    self.range.ordering
+                    current_key, self.range.ordering
                 );
                 // Clear the cursor
                 self.ids.clear();

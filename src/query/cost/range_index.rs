@@ -24,7 +24,6 @@ impl CostFunction for RangeIndexCost {
         //     .into_iter()
         //     .filter_map(|s| s)
         //     .collect::<Vec<_>>();
-      unimplemented!()
-        
+        unimplemented!()
     }
 }
