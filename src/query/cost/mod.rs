@@ -1,8 +1,10 @@
-use std::iter::Sum;
+use std::{iter::Sum, sync::Arc};
 
 use dovahkiin::expr::serde::Expr;
 
-use super::data_client::ValueRange;
+use crate::server::NebServer;
+
+use super::{data_client::ValueRange, statistics::SchemaStatistics};
 
 pub mod range_index;
 pub mod scan;
@@ -47,5 +49,18 @@ impl Default for CostResult {
             row_count: Default::default(),
             row_bytes: Default::default(),
         }
+    }
+}
+
+fn row_bytes(
+    schema: u32,
+    projection: &Vec<u64>,
+    server: &Arc<NebServer>,
+    stat: &Arc<SchemaStatistics>,
+) -> usize {
+    if projection.is_empty() {
+        ((stat.bytes as f64) / (stat.count as f64)) as usize
+    } else {
+        server.meta.schemas.fields_size(&schema, projection.as_slice())?
     }
 }
