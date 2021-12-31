@@ -478,7 +478,7 @@ impl LevelTree for DummyLevelTree {
     }
 
     fn height(&self) -> usize {
-        todo!()
+        unreachable!()
     }
 }
 

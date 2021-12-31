@@ -15,7 +15,7 @@ bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 dovahkiin = { path = "../Dovahkiin" }
-lightning-containers = "*"
+lightning-containers = { git = "https://github.com/ShisoftResearch/Lightning.git" }
 rayon = "*"
 serde = "*"
 serde_derive = "*"

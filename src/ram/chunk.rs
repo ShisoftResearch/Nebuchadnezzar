@@ -1,4 +1,4 @@
-use crate::query::statistics::{ChunkStatistics, SchemaStatistics};
+use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -17,6 +17,7 @@ use bifrost::utils::time::get_time;
 use itertools::Itertools;
 use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
 use lightning::map::*;
+use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -742,6 +743,7 @@ impl Drop for PendingEntry {
 
 pub struct Chunks {
     pub list: Vec<Chunk>,
+    pub statistics: TTLCache<Arc<SchemaStatistics>>,
 }
 
 impl Chunks {
@@ -773,7 +775,11 @@ impl Chunks {
                 wal_storage,
             ));
         }
-        Arc::new(Chunks { list: chunks })
+        let num_schemas = meta.schemas.count() + 1;
+        Arc::new(Chunks {
+            list: chunks,
+            statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
+        })
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(
@@ -868,5 +874,18 @@ impl Chunks {
         self.list
             .iter()
             .for_each(|c| c.statistics.ensured_refresh_chunk(c));
+    }
+    pub fn overall_statistics(&self, schema: u32) -> Arc<SchemaStatistics> {
+        self.statistics
+            .get(schema as usize, 5 * 60, |schema| {
+                let schema = schema as u32;
+                let all_stats = self
+                    .all_chunk_statistics(schema)
+                    .into_iter()
+                    .filter_map(|s| s)
+                    .collect::<Vec<_>>();
+                merge_statistics(all_stats).map(|s| Arc::new(s))
+            })
+            .unwrap()
     }
 }

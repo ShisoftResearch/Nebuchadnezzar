@@ -261,6 +261,9 @@ impl LocalSchemasCache {
         let m = &self.map;
         m.name_to_id(name)
     }
+    pub fn count(&self) -> usize {
+        self.map.schema_map.len()
+    }
 }
 
 impl SchemasMap {

@@ -7,7 +7,7 @@ use std::{
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
-    },
+    }, cmp::max,
 };
 
 use dovahkiin::types::SharedValue;
@@ -373,6 +373,52 @@ fn repeated_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> 
 
 fn empty_target_histogram() -> TargetHistogram {
     [[0u8; 8]; HISTOGRAM_TARGET_KEYS]
+}
+
+pub fn merge_statistics(all_stats: Vec<Arc<SchemaStatistics>>) -> Option<SchemaStatistics> {
+    if all_stats.is_empty() {
+        return None;
+    }
+    let mut count = 0;
+    let mut segs = 0;
+    let mut bytes = 0;
+    let mut timestamp = 0;
+    all_stats.iter().for_each(|s| {
+        count += s.count;
+        segs += s.segs;
+        bytes += s.bytes;
+        timestamp = max(timestamp, s.timestamp);
+    });
+    let histogram = all_stats
+        .iter()
+        .map(|s| {
+            let s_count = s.count;
+            s.histogram
+                .iter()
+                .map(move |(field, keys)| (field, keys, s_count))
+        })
+        .flatten()
+        .group_by(|(field, _, _)| **field)
+        .into_iter()
+        .map(|(field, parts)| {
+            let parts = parts
+                .into_iter()
+                .map(|(_, keys, s_count)| {
+                    let num_keys = keys.len();
+                    (keys.to_vec(), s_count, s_count / num_keys)
+                })
+                .collect::<Vec<_>>();
+            let histo = build_histogram(parts.iter().collect());
+            (field, histo)
+        })
+        .collect::<HashMap<_, _>>();
+    Some(SchemaStatistics {
+        histogram,
+        count,
+        segs,
+        bytes,
+        timestamp,
+    })
 }
 
 #[cfg(test)]
