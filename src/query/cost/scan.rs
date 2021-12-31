@@ -12,8 +12,8 @@ impl CostFunction for ScanIndexCost {
     fn cost<'a>(
         &self,
         schema: u32,
-        field: Option<u64>,
-        range: Option<&ValueRange>,
+        _field: Option<u64>,
+        _range: Option<&ValueRange>,
         projection: Vec<u64>,
     ) -> Option<CostResult> {
         let stat = self.server.chunks.overall_statistics(schema);

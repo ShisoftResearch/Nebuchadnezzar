@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::types::{Id, OwnedValue};
+use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
     index::builder::IndexBuilder,

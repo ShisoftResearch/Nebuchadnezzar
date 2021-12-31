@@ -9,7 +9,7 @@ use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
 use dovahkiin::expr::SExpr;
 use dovahkiin::integrated::lisp;
-use dovahkiin::types::{OwnedValue, SharedMap, SharedValue};
+use dovahkiin::types::{OwnedValue, SharedValue};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 

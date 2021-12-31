@@ -3,7 +3,7 @@ use std::{mem, sync::Arc};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
     expr::serde::Expr,
-    types::{Id, OwnedValue, SharedValue},
+    types::{Id, SharedValue},
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
@@ -292,7 +292,7 @@ impl<'a> DataCursor<'a> {
 #[cfg(test)]
 mod test {
     use crate::{
-        index::ranged::lsm::{btree::Ordering, service::RangeTerm},
+        index::ranged::lsm::btree::Ordering,
         query::data_client::{ValueRange, ValueRangeTerm},
         ram::{
             cell::OwnedCell,
