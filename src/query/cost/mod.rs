@@ -61,6 +61,11 @@ fn row_bytes(
     if projection.is_empty() {
         Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
-        Some(server.meta.schemas.fields_size(&schema, projection.as_slice())?)
+        Some(
+            server
+                .meta
+                .schemas
+                .fields_size(&schema, projection.as_slice())?,
+        )
     }
 }
