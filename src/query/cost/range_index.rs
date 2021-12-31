@@ -26,7 +26,7 @@ impl CostFunction for RangeIndexCost {
         let width = end_index - start_index;
         let ratio = (width as f64) / (field_histo.len() as f64);
         let row_count = (ratio * (num_all_rows as f64)) as usize;
-        let row_bytes = row_bytes(schema, &projection, &self.server, &stat);
+        let row_bytes = row_bytes(schema, &projection, &self.server, &stat)?;
         Some(CostResult {
             row_count,
             row_bytes,

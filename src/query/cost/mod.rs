@@ -57,10 +57,10 @@ fn row_bytes(
     projection: &Vec<u64>,
     server: &Arc<NebServer>,
     stat: &Arc<SchemaStatistics>,
-) -> usize {
+) -> Option<usize> {
     if projection.is_empty() {
-        ((stat.bytes as f64) / (stat.count as f64)) as usize
+        Some(((stat.bytes as f64) / (stat.count as f64)) as usize)
     } else {
-        server.meta.schemas.fields_size(&schema, projection.as_slice())?
+        Some(server.meta.schemas.fields_size(&schema, projection.as_slice())?)
     }
 }

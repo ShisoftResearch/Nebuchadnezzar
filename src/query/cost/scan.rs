@@ -17,8 +17,8 @@ impl CostFunction for ScanIndexCost {
         projection: Vec<u64>,
     ) -> Option<CostResult> {
         let stat = self.server.chunks.overall_statistics(schema);
-        let nrow_count = stat.count;
-        let row_bytes = row_bytes(schema, &projection, &self.server, &stat);
+        let row_count = stat.count;
+        let row_bytes = row_bytes(schema, &projection, &self.server, &stat)?;
         Some(CostResult {
             row_count,
             row_bytes,
