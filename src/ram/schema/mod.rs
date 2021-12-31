@@ -93,6 +93,18 @@ impl Schema {
         schema.id = id;
         schema
     }
+
+    pub fn field_by_id_path(&self, path: &[u64]) -> Option<&Field> {
+        let mut field = &self.fields;
+        for name_id in path {
+            if let Some(new_field) = field.field_by_name_id(name_id) {
+                field = new_field;
+            } else {
+                return None;
+            }
+        }
+        Some(field)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -101,6 +113,7 @@ pub struct Field {
     pub nullable: bool,
     pub is_array: bool,
     pub sub_fields: Option<Vec<Field>>,
+    pub sub_fields_map: Option<HashMap<u64, usize>>,
     pub name: String,
     pub name_id: u64,
     pub indices: Vec<IndexType>,
@@ -116,6 +129,13 @@ impl Field {
         sub_fields: Option<Vec<Field>>,
         indices: Vec<IndexType>,
     ) -> Field {
+        let sub_fields_map = sub_fields.as_ref().map(|fields| {
+            fields
+                .iter()
+                .enumerate()
+                .map(|(id, field)| (field.name_id, id))
+                .collect::<HashMap<_, _>>()
+        });
         Field {
             name: name.to_string(),
             name_id: types::key_hash(name),
@@ -123,6 +143,7 @@ impl Field {
             nullable,
             is_array,
             sub_fields,
+            sub_fields_map,
             indices,
             offset: None,
         }
@@ -197,6 +218,12 @@ impl Field {
     pub fn is_var(&self) -> bool {
         self.is_array || !types::fixed_size(self.data_type)
     }
+    pub fn field_by_name_id(&self, name_id: &u64) -> Option<&Field> {
+        self.sub_fields_map.as_ref().and_then(|m| {
+            m.get(name_id)
+                .and_then(|idx| self.sub_fields.as_ref().map(|f| &f[*idx]))
+        })
+    }
 }
 
 pub struct SchemasMap {
@@ -253,7 +280,9 @@ impl LocalSchemasCache {
         self.map.get(id)
     }
     pub fn new_schema(&self, schema: Schema) {
-        // for debug only
+        if !cfg!(debug_assertions) {
+            panic!("for debug only");
+        }
         let m = &self.map;
         m.new_schema(schema)
     }
@@ -263,6 +292,32 @@ impl LocalSchemasCache {
     }
     pub fn count(&self) -> usize {
         self.map.schema_map.len()
+    }
+    pub fn fields_size(&self, schema_id: &u32, fields: &[u64]) -> Option<usize> {
+        const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
+        const DEFAULT_ARRAY_SIZE: usize = 32;
+        self.get(schema_id).map(|schema| {
+            fields
+                .iter()
+                .map(|field| {
+                    if let Some(id_path) = schema.id_index.get(field) {
+                        schema
+                            .field_by_id_path(id_path.as_slice())
+                            .map(|f| {
+                                let mut type_size =
+                                    f.data_type.size().unwrap_or(DEFAULT_FIELD_SIZE);
+                                if f.is_array {
+                                    type_size *= DEFAULT_ARRAY_SIZE;
+                                }
+                                type_size
+                            })
+                            .unwrap_or(DEFAULT_FIELD_SIZE)
+                    } else {
+                        DEFAULT_FIELD_SIZE
+                    }
+                })
+                .sum::<usize>()
+        })
     }
 }
 

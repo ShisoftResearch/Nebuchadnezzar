@@ -8,9 +8,8 @@ pub mod range_index;
 pub mod scan;
 
 pub struct CostResult {
-    compute: usize,
     row_count: usize,
-    total_bytes: usize,
+    row_bytes: usize,
 }
 
 pub struct DistHostCostResult {
@@ -22,26 +21,22 @@ trait CostFunction {
         &self,
         schema: u32,
         field: Option<u64>,
-        range: Option<ValueRange<'a>>,
+        range: Option<&ValueRange>,
         projection: Vec<u64>,
-        row_cost: u64,
-    ) -> CostResult;
+    ) -> Option<CostResult>;
 }
 
 impl DistHostCostResult {
     fn total_cost(&self) -> CostResult {
-        let mut total_compute = 0;
         let mut total_rows = 0;
         let mut total_bytes = 0;
         self.costs.iter().for_each(|x| {
-            total_compute += x.compute;
             total_rows += x.row_count;
-            total_bytes += x.total_bytes;
+            total_bytes += x.row_bytes;
         });
         CostResult {
-            compute: total_compute,
             row_count: total_rows,
-            total_bytes,
+            row_bytes: total_bytes,
         }
     }
 }
@@ -49,9 +44,8 @@ impl DistHostCostResult {
 impl Default for CostResult {
     fn default() -> Self {
         Self {
-            compute: Default::default(),
             row_count: Default::default(),
-            total_bytes: Default::default(),
+            row_bytes: Default::default(),
         }
     }
 }
