@@ -1,4 +1,4 @@
-use super::{Feature, KEY_SIZE, FEATURE_SIZE};
+use super::{Feature, FEATURE_SIZE, KEY_SIZE};
 use crate::ram::types::Id;
 use byteorder::{BigEndian, WriteBytesExt};
 use serde::de::{SeqAccess, Visitor};

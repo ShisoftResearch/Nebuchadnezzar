@@ -510,6 +510,7 @@ fn reconstruct() {
             reconstructor.root(),
             Id::rand(),
             num as usize,
+            reconstructor.levels(),
             &deletion_set(),
         )
     };

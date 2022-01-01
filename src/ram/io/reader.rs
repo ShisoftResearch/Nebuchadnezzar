@@ -182,11 +182,13 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
                             {
                                 let prev_field = mem::replace(&mut field, sub_field);
                                 let prev_id = prev_field.name_id;
-                                target_map.map.insert(prev_id, SharedValue::Map(SharedMap::new()));
+                                target_map
+                                    .map
+                                    .insert(prev_id, SharedValue::Map(SharedMap::new()));
                                 target_map.fields.push(prev_field.name.clone());
                                 target_map = match target_map.get_mut_by_key_id(prev_id) {
                                     SharedValue::Map(m) => m,
-                                    _ => unreachable!()
+                                    _ => unreachable!(),
                                 };
                             } else {
                                 break;

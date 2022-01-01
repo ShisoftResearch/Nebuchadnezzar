@@ -9,7 +9,7 @@ use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
 use dovahkiin::expr::SExpr;
 use dovahkiin::integrated::lisp;
-use dovahkiin::types::{OwnedValue, SharedMap, SharedValue};
+use dovahkiin::types::{OwnedValue, SharedValue};
 use futures::future::BoxFuture;
 use futures::prelude::*;
 
@@ -104,7 +104,7 @@ impl Service for NebRPCService {
                 interpreters.push(cell_res.as_ref().ok().map(|cell| {
                     let mut interpreter = lisp::get_interpreter();
                     if let &SharedValue::Map(ref map) = &cell.data {
-                        for (id, val) in &map.map { 
+                        for (id, val) in &map.map {
                             interpreter.bind_by_id(*id, SExpr::shared_value(val.clone()));
                         }
                     }
@@ -124,10 +124,20 @@ impl Service for NebRPCService {
                             match check_res {
                                 Ok(sexp) => {
                                     if is_true(&sexp) {
-                                        trace!("!!! Checked {:?} with filter {:?} got match, res {:?}", cell.id(), filter, sexp);
+                                        trace!(
+                                            "!!! Checked {:?} with filter {:?} got match, res {:?}",
+                                            cell.id(),
+                                            filter,
+                                            sexp
+                                        );
                                         Ok(cell)
                                     } else {
-                                        trace!("Checked {:?} with filter {:?} unmatch, res {:?}", cell.id(), filter, sexp);
+                                        trace!(
+                                            "Checked {:?} with filter {:?} unmatch, res {:?}",
+                                            cell.id(),
+                                            filter,
+                                            sexp
+                                        );
                                         Err(ReadError::NotMatch)
                                     }
                                 }

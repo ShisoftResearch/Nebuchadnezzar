@@ -2,6 +2,7 @@ use itertools::Itertools;
 use lightning::map::{Map, ObjectMap};
 use rayon::prelude::*;
 use std::{
+    cmp::max,
     collections::{HashMap, HashSet},
     iter,
     sync::{
@@ -35,6 +36,7 @@ pub struct ChunkStatistics {
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
 const HISTOGRAM_PARTITATION_BUCKETS: usize = 100;
+#[cfg(test)]
 const HISTOGRAM_PARTITATION_KEYS: usize = HISTOGRAM_PARTITATION_BUCKETS + 1;
 const HISTOGRAM_TARGET_BUCKETS: usize = HISTOGRAM_PARTITATION_BUCKETS;
 const HISTOGRAM_TARGET_KEYS: usize = HISTOGRAM_TARGET_BUCKETS + 1;
@@ -215,7 +217,10 @@ fn build_partitation_statistics(
                                     .filter_map(|path_key| schema.id_index.get(path_key))
                                     .map(|key| map.get_in_by_ids(key.iter()).clone())
                                     .collect_vec(),
-                                _ => unreachable!("Other data structure is not possible. Got {:?}", partial_cell),
+                                _ => unreachable!(
+                                    "Other data structure is not possible. Got {:?}",
+                                    partial_cell
+                                ),
                             };
                             for (i, val) in field_array.into_iter().enumerate() {
                                 if val == SharedValue::Null || val == SharedValue::NA {
@@ -373,6 +378,52 @@ fn repeated_histogram(partitations: Vec<&(Vec<HistogramKey>, usize, usize)>) -> 
 
 fn empty_target_histogram() -> TargetHistogram {
     [[0u8; 8]; HISTOGRAM_TARGET_KEYS]
+}
+
+pub fn merge_statistics(all_stats: Vec<Arc<SchemaStatistics>>) -> Option<SchemaStatistics> {
+    if all_stats.is_empty() {
+        return None;
+    }
+    let mut count = 0;
+    let mut segs = 0;
+    let mut bytes = 0;
+    let mut timestamp = 0;
+    all_stats.iter().for_each(|s| {
+        count += s.count;
+        segs += s.segs;
+        bytes += s.bytes;
+        timestamp = max(timestamp, s.timestamp);
+    });
+    let histogram = all_stats
+        .iter()
+        .map(|s| {
+            let s_count = s.count;
+            s.histogram
+                .iter()
+                .map(move |(field, keys)| (field, keys, s_count))
+        })
+        .flatten()
+        .group_by(|(field, _, _)| **field)
+        .into_iter()
+        .map(|(field, parts)| {
+            let parts = parts
+                .into_iter()
+                .map(|(_, keys, s_count)| {
+                    let num_keys = keys.len();
+                    (keys.to_vec(), s_count, s_count / num_keys)
+                })
+                .collect::<Vec<_>>();
+            let histo = build_histogram(parts.iter().collect());
+            (field, histo)
+        })
+        .collect::<HashMap<_, _>>();
+    Some(SchemaStatistics {
+        histogram,
+        count,
+        segs,
+        bytes,
+        timestamp,
+    })
 }
 
 #[cfg(test)]

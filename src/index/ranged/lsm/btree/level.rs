@@ -178,7 +178,7 @@ where
                             for (i, p) in terminal_node.ptrs()[pos..].iter().enumerate() {
                                 new_ptrs.as_slice()[i] = p.clone();
                             }
-                            let terminal_ref = terminal_node.node_ref().clone();
+                            let terminal_ref = terminal_node.node_ref();
                             {
                                 let mut terminal_node = write_node(&terminal_ref);
                                 let innode = terminal_node.innode_mut();
@@ -204,6 +204,7 @@ where
                                 ),
                             }
                         }
+                        src_tree.height.fetch_sub(1, AcqRel);
                         Some(sub_level_new_root)
                     } else {
                         match right_node {
@@ -384,6 +385,7 @@ where
         debug!("Merged {} keys, pruning: {}", num_keys, prune);
         if let Some(new_root_ref) = new_root {
             debug!("Level merge update source root {:?}", &new_root_ref);
+            src_tree.height.fetch_sub(1, AcqRel);
             *src_tree.root.write() = new_root_ref;
         }
         num_keys

@@ -10,8 +10,8 @@ mod tests {
     use super::*;
     use crate::client::*;
     use crate::index::ranged::lsm::btree;
-    use crate::index::EntryKey;
     use crate::index::ranged::trees::Range;
+    use crate::index::EntryKey;
     use crate::ram::schema::*;
     use crate::ram::types::Id;
     use crate::server::*;
