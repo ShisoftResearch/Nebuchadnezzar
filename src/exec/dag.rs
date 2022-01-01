@@ -19,5 +19,5 @@ pub struct Node {
 
 #[derive(Serialize, Deserialize)]
 pub struct DAG {
-    nodes: Vec<Rc<Node>>,
+    nodes: Vec<Node>,
 }

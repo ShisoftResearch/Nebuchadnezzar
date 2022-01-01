@@ -2,7 +2,7 @@
 name = "neb"
 version = "0.2.0"
 authors = ["Hao Shi <shisoftgenius@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [lib]
 name = "neb"
@@ -39,7 +39,7 @@ tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
 chashmap = { version = "2.2.2", optional = true }
-arrow = "5"
+arrow = "6"
 num = "*"
 
 [dev-dependencies]
