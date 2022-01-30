@@ -15,7 +15,8 @@ use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use itertools::Itertools;
-use lightning::linked_map::{LinkedObjectMap, NodeRef as MapNodeRef};
+use lightning::linked_map::LinkedHashMap;
+use lightning::list::LinkedRingBufferList;
 use lightning::map::*;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
@@ -28,7 +29,7 @@ pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
-    pub segs: LinkedObjectMap<Segment>,
+    pub segs: LinkedHashMap<usize, Arc<Segment>, 64>,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -64,7 +65,7 @@ impl Chunk {
             }
         };
         debug!("Creating chunk {}, num segments {}", id, num_segs);
-        let segs = LinkedObjectMap::with_capacity(upper_power_of_2(num_segs));
+        let segs = LinkedHashMap::with_capacity(upper_power_of_2(num_segs));
         let index = WordMap::with_capacity(64);
         let chunk = Chunk {
             id,
@@ -438,7 +439,7 @@ impl Chunk {
         );
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
-        self.segs.insert_back(&segment_key, segment);
+        self.segs.insert_back(segment_key, Arc::new(segment));
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
@@ -451,7 +452,7 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<MapNodeRef<Segment>> {
+    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<Arc<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
@@ -460,14 +461,14 @@ impl Chunk {
                 cell_id,
                 addr,
                 seg_id,
-                self.segs.all_keys()
+                self.segs.iter_front_keys().collect_vec()
             );
         }
         return res;
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &MapNodeRef<Segment>) {
+    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &Arc<Segment>) {
         let pending_entry = (|| loop {
             if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE) {
                 return pending_entry;
@@ -501,7 +502,7 @@ impl Chunk {
         Ok(())
     }
 
-    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> MapNodeRef<Segment> {
+    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> Arc<Segment> {
         self.locate_segment(cell_location, cell_id).expect(
             format!(
                 "Cannot locate cell segment for cell id: {:?} at {}",
@@ -531,11 +532,11 @@ impl Chunk {
     }
 
     pub fn segment_ids(&self) -> Vec<usize> {
-        self.segs.all_keys()
+        self.segs.iter_front_keys().collect()
     }
 
-    pub fn segments(&self) -> Vec<MapNodeRef<Segment>> {
-        self.segs.all_values()
+    pub fn segments(&self) -> Vec<Arc<Segment>> {
+        self.segs.iter_front_values().collect()
     }
 
     // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
@@ -594,7 +595,7 @@ impl Chunk {
         }
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<MapNodeRef<Segment>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -611,7 +612,7 @@ impl Chunk {
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<MapNodeRef<Segment>> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<Arc<Segment>> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -728,7 +729,7 @@ impl Chunk {
 }
 
 pub struct PendingEntry {
-    pub seg: MapNodeRef<Segment>,
+    pub seg: Arc<Segment>,
     pub addr: usize,
     pub size: u32,
 }

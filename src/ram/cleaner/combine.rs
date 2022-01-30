@@ -2,9 +2,9 @@ use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use itertools::Itertools;
-use lightning::linked_map::NodeRef as MapNodeRef;
 use rayon::prelude::*;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
@@ -42,7 +42,7 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, segments: &Vec<MapNodeRef<Segment>>) -> usize {
+    pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
         if segments.len() < 2 {
             trace!(
                 "too few segments to combine, chunk {}, segments {}",

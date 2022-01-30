@@ -26,7 +26,6 @@ extern crate bincode;
 extern crate byteorder;
 extern crate core;
 extern crate libc;
-extern crate linked_hash_map;
 extern crate num_cpus;
 extern crate parking_lot;
 extern crate rand;
