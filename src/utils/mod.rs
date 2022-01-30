@@ -1,4 +1,3 @@
-pub mod lru_cache;
 pub mod raii_mutex_table;
 
 pub fn upper_power_of_2(mut v: usize) -> usize {
