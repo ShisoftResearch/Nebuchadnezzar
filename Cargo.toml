@@ -23,7 +23,6 @@ bincode = "*"
 byteorder = "*"
 parking_lot = "*"
 rand = { version = "*", features = ["small_rng"] }
-linked-hash-map = "*"
 bitflags = "*"
 itertools = "*"
 smallvec = { version = "*", features = ["serde", "union"] }

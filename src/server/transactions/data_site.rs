@@ -10,9 +10,9 @@ use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
 use lightning::map::{HashMap as LFMap, ObjectMap};
-use linked_hash_map::LinkedHashMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -23,6 +23,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) a
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
+
+const LRU_PAGE_SIZE: usize = 32;
 
 #[derive(Debug)]
 pub struct CellMeta {
@@ -56,7 +58,7 @@ impl CellHistory {
 
 pub struct DataManager {
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
-    cell_lru: Mutex<LinkedHashMap<Id, i64>>,
+    cell_lru: LRUCache<Id, i64, LRU_PAGE_SIZE>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
     managers: ObjectMap<Arc<manager::AsyncServiceClient>>,
@@ -88,7 +90,7 @@ impl DataManager {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
-            cell_lru: Mutex::new(LinkedHashMap::new()),
+            cell_lru: LRUCache::new(256),
             txns: LFMap::with_capacity(128),
             txns_sorted: Mutex::new(BTreeSet::new()),
             managers: ObjectMap::with_capacity(16),
@@ -130,9 +132,8 @@ impl DataManager {
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
-            let mut lru = self.cell_lru.lock();
-            *lru.entry(id.clone()).or_insert(0) = get_time();
-            lru.get_refresh(id);
+            let lru = &self.cell_lru;
+            lru.get(id, |_| { Some(get_time()) }, |_, _| {});
         }
         self.cells.get_or_insert(id, || {
             Arc::new(Mutex::new(CellMeta {
@@ -217,7 +218,6 @@ impl DataManager {
         self.txns_sorted.lock().remove(tid);
     }
     async fn cell_meta_cleanup(&self) {
-        let mut cell_lru = self.cell_lru.lock();
         let oldest_transaction = {
             self.txns_sorted
                 .lock()
@@ -229,7 +229,9 @@ impl DataManager {
         let now = get_time();
         let mut cell_to_evict = Vec::new();
         let mut need_break = false;
-        for (cell_id, timestamp) in cell_lru.iter() {
+        for pair in self.cell_lru.iter() {
+            let kv = pair.deref().unwrap();
+            let (cell_id, timestamp) = kv.pair();
             if let Some(cell_meta) = self.cells.get(cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction
@@ -249,7 +251,7 @@ impl DataManager {
         }
         for evicted_cell in &cell_to_evict {
             self.cells.remove(evicted_cell);
-            cell_lru.remove(evicted_cell);
+            self.cell_lru.remove(evicted_cell);
         }
     }
     fn prepare_read<T: Send>(

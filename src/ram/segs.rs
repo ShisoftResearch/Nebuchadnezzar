@@ -3,7 +3,7 @@ use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use libc::*;
-use lightning::list::WordList;
+use lightning::list::LinkedRingBufferList;
 use parking_lot;
 use std::fs::{copy, create_dir_all, remove_file, File};
 use std::io;
@@ -18,6 +18,7 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
+#[derive(Default)]
 pub struct Segment {
     pub id: u64,
     pub addr: usize,
@@ -290,7 +291,7 @@ pub struct SegmentAllocator {
     offset: AtomicUsize,
     limit: usize,
     gc_threshold: usize,
-    free: WordList,
+    free: LinkedRingBufferList<usize, 64>,
 }
 
 impl SegmentAllocator {
@@ -315,7 +316,7 @@ impl SegmentAllocator {
             offset: AtomicUsize::new(aligned_addr),
             limit: aligned_addr + chunk_size,
             gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
-            free: WordList::with_capacity(chunk_size / SEGMENT_SIZE / 2),
+            free: LinkedRingBufferList::new(),
         }
     }
 
@@ -329,7 +330,7 @@ impl SegmentAllocator {
         wal_storage: &Option<String>,
     ) -> Option<Segment> {
         self.free
-            .pop()
+            .pop_front()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer");
                 let addr = self.offset.load(Relaxed);
@@ -357,7 +358,7 @@ impl SegmentAllocator {
         debug_assert!(seg_addr >= self.base);
         debug_assert!(seg_addr < self.limit);
         debug!("Segment {} freed", seg_addr);
-        self.free.push(seg_addr);
+        self.free.push_front(seg_addr);
     }
 
     pub fn id_by_addr(&self, addr: usize) -> usize {
