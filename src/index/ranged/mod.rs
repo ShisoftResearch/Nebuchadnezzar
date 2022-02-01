@@ -23,7 +23,7 @@ mod tests {
     use std::time::Duration;
     use tokio_stream::StreamExt;
 
-    // #[ignore]
+    #[ignore]
     #[tokio::test(flavor = "multi_thread")]
     async fn general() {
         let _ = env_logger::try_init();

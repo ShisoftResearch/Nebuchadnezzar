@@ -147,7 +147,7 @@ pub async fn smoke_test_parallel() {
     const DATA: &'static str = "DATA";
     const ARRAY: &'static str = "ARRAY";
     let num = env::var("NEB_KV_SMOKE_TEST_ITEMS")
-        .unwrap_or("1024".to_string())
+        .unwrap_or("256".to_string())
         .parse::<u64>()
         .unwrap();
     let server_addr = String::from("127.0.0.1:5301");

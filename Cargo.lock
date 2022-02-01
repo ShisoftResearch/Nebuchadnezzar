@@ -816,7 +816,7 @@ dependencies = [
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+https://github.com/ShisoftResearch/Lightning.git#b30ad8b20d4ab4c5457d3cd546ef8bb2872e862a"
+source = "git+https://github.com/ShisoftResearch/Lightning.git#6d89e161ce6e7a12ec1e175e0da25521e31b758b"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
