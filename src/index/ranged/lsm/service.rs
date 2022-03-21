@@ -10,8 +10,7 @@ use bifrost::conshash::ConsistentHashing;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
-use lightning::map::HashMap;
-use lightning::map::Map;
+use lightning::map::{Map, PtrHashMap as HashMap};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -111,7 +110,7 @@ impl Service for LSMTreeService {
             }
             let tree = LSMTree::create(&self.client, &id).await;
             self.trees.insert(
-                &id,
+                id,
                 Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
             );
         }
@@ -132,7 +131,7 @@ impl Service for LSMTreeService {
                 tree.ideal_capacity()
             );
             self.trees.insert(
-                &id,
+                id,
                 Arc::new(DistLSMTree::new(id, tree, boundary, None, epoch)),
             );
         }

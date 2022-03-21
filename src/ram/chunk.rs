@@ -16,7 +16,6 @@ use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use itertools::Itertools;
 use lightning::linked_map::LinkedHashMap;
-use lightning::list::LinkedRingBufferList;
 use lightning::map::*;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
@@ -868,7 +867,7 @@ impl Chunks {
     pub fn all_chunk_statistics(&self, schema_id: u32) -> Vec<Option<Arc<SchemaStatistics>>> {
         self.list
             .iter()
-            .map(|c| c.statistics.schemas.get(&(schema_id as usize)))
+            .map(|c| c.statistics.schemas.get(&schema_id))
             .collect_vec()
     }
     pub fn ensure_statistics(&self) {

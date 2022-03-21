@@ -6,7 +6,7 @@ use crate::server::NebServer;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use itertools::Itertools;
-use lightning::map::{HashMap as LFMap, Map, ObjectMap};
+use lightning::map::{PtrHashMap as LFMap, Map, LiteHashMap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
@@ -57,7 +57,7 @@ dispatch_rpc_service_functions!(TransactionManager);
 pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: LFMap<TxnId, TxnMutex>,
-    data_sites: ObjectMap<Arc<data_site::AsyncServiceClient>>,
+    data_sites: LiteHashMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager,
 }
 
@@ -66,7 +66,7 @@ impl TransactionManager {
         Arc::new(Self {
             server: server.clone(),
             transactions: LFMap::with_capacity(128),
-            data_sites: ObjectMap::with_capacity(8),
+            data_sites: LiteHashMap::with_capacity(8),
             await_manager: AwaitManager::new(),
         })
     }
@@ -280,7 +280,7 @@ impl Service for TransactionManager {
         if self
             .transactions
             .insert(
-                &id,
+                id.clone(),
                 Arc::new(Mutex::new(Transaction {
                     data: HashMap::new(),
                     affected_objects: AffectedObjs::new(),
@@ -444,14 +444,13 @@ impl TransactionManager {
         &self,
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
-        let server_id_usize = server_id as usize;
-        if !self.data_sites.contains_key(&server_id_usize) {
+        if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id).await?;
-            return Ok(self.data_sites.get_or_insert(&server_id_usize, || {
+            return Ok(self.data_sites.get_or_insert(server_id, || {
                 data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)
             }));
         }
-        Ok(self.data_sites.get(&server_id_usize).unwrap().clone())
+        Ok(self.data_sites.get(&server_id).unwrap())
     }
     async fn get_data_site_by_id(
         &self,
@@ -830,7 +829,7 @@ impl TransactionManager {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
-        self.transactions.write(tid).map(|g| g.remove());
+        self.transactions.lock(tid).map(|g| g.remove());
     }
 }
 
@@ -860,7 +859,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
-    map: ObjectMap<Arc<AwaitingServer>>,
+    map:LiteHashMap<u64, Arc<AwaitingServer>>,
 }
 
 impl AwaitManager {
@@ -870,19 +869,19 @@ impl AwaitManager {
         }
     }
     pub fn get_txn(&self, tid: &TxnId) -> Arc<TxnAwaits> {
-        self.channels.get_or_insert(tid, || TxnAwaits::new_ref())
+        self.channels.get_or_insert(tid.clone(), || TxnAwaits::new_ref())
     }
 }
 
 impl TxnAwaits {
     pub fn new_ref() -> Arc<Self> {
         Arc::new(Self {
-            map: ObjectMap::with_capacity(8),
+            map: LiteHashMap::with_capacity(8),
         })
     }
     pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {
         self.map
-            .get_or_insert(&(server_id as usize), || Arc::new(AwaitingServer::new()))
+            .get_or_insert(server_id, || Arc::new(AwaitingServer::new()))
     }
     pub async fn send(&self, server_id: u64) {
         debug!("Will sending to wakeup from {}", server_id);

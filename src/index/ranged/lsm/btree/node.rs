@@ -79,7 +79,7 @@ where
         match self {
             &mut NodeData::External(ref mut node) => node.remove_at(pos),
             &mut NodeData::Internal(ref mut node) => node.remove_at(pos),
-            &mut NodeData::None | &mut NodeData::Empty(_) => unreachable!(self.type_name()),
+            &mut NodeData::None | &mut NodeData::Empty(_) => unreachable!("{}", self.type_name()),
         }
     }
     pub fn is_ext(&self) -> bool {
@@ -176,19 +176,19 @@ where
     pub fn innode_mut(&mut self) -> &mut InNode<KS, PS> {
         match self {
             &mut NodeData::Internal(ref mut n) => n,
-            _ => unreachable!(self.type_name()),
+            _ => unreachable!("{}", self.type_name()),
         }
     }
     pub fn extnode(&self) -> &ExtNode<KS, PS> {
         match self {
             &NodeData::External(ref node) => node,
-            _ => unreachable!(self.type_name()),
+            _ => unreachable!("{}", self.type_name()),
         }
     }
     pub fn extnode_mut(&mut self) -> &mut ExtNode<KS, PS> {
         match self {
             &mut NodeData::External(ref mut node) => node,
-            _ => unreachable!(self.type_name()),
+            _ => unreachable!("{}", self.type_name()),
         }
     }
     pub fn ext_id(&self) -> Id {
@@ -196,13 +196,13 @@ where
             &NodeData::External(ref node) => node.id,
             &NodeData::None => Id::unit_id(),
             &NodeData::Empty(_) => Id::unit_id(),
-            &NodeData::Internal(_) => unreachable!(self.type_name()),
+            &NodeData::Internal(_) => unreachable!("{}", self.type_name()),
         }
     }
     pub fn innode(&self) -> &InNode<KS, PS> {
         match self {
             &NodeData::Internal(ref n) => n,
-            _ => unreachable!(self.type_name()),
+            _ => unreachable!("{}", self.type_name()),
         }
     }
     pub fn type_name(&self) -> &'static str {
@@ -580,7 +580,7 @@ where
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {
         match { unsafe { &mut *self.data } } {
             &mut NodeData::External(ref mut node) => return node,
-            _ => unreachable!(self.type_name().to_owned()),
+            _ => unreachable!("{}", self.type_name().to_owned()),
         }
     }
 

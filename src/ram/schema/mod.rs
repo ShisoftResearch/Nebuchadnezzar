@@ -3,7 +3,7 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
-use lightning::map::{HashMap as LFHashMap, Map, ObjectMap};
+use lightning::map::{PtrHashMap as LFHashMap, Map, LiteHashMap};
 use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::AtomicU32;
@@ -227,8 +227,8 @@ impl Field {
 }
 
 pub struct SchemasMap {
-    schema_map: ObjectMap<SchemaRef>,
-    name_map: LFHashMap<String, usize>,
+    schema_map: LiteHashMap<u32, SchemaRef>,
+    name_map: LFHashMap<String, u32>,
     id_counter: AtomicU32,
 }
 
@@ -324,7 +324,7 @@ impl LocalSchemasCache {
 impl SchemasMap {
     pub fn new() -> SchemasMap {
         SchemasMap {
-            schema_map: ObjectMap::with_capacity(32),
+            schema_map: LiteHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
             id_counter: AtomicU32::new(0),
         }
@@ -332,8 +332,8 @@ impl SchemasMap {
     pub fn new_schema(&self, schema: Schema) {
         let name = &schema.name;
         let id = schema.id;
-        self.name_map.insert(name, id as usize);
-        self.schema_map.insert(&(id as usize), Arc::new(schema));
+        self.name_map.insert(name.clone(), id);
+        self.schema_map.insert(id, Arc::new(schema));
     }
     pub fn del_schema(&self, name: &str) -> Result<(), ()> {
         if let Some(id) = self.name_map.remove(&(name.to_owned())) {
@@ -348,7 +348,7 @@ impl SchemasMap {
         return None;
     }
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
-        self.schema_map.get(&(*id as usize))
+        self.schema_map.get(id)
     }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         self.name_map.get(&name.to_string()).map(|id| id as u32)
@@ -357,7 +357,7 @@ impl SchemasMap {
         let mut id = self
             .id_counter
             .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
-        while self.schema_map.contains_key(&(id as usize)) {
+        while self.schema_map.contains_key(&id) {
             id = self
                 .id_counter
                 .fetch_and(1, std::sync::atomic::Ordering::AcqRel)
@@ -373,9 +373,9 @@ impl SchemasMap {
     }
     fn load_from_list(&mut self, data: Vec<Schema>) {
         for schema in data {
-            let id = schema.id as usize;
-            self.name_map.insert(&schema.name, id);
-            self.schema_map.insert(&id, Arc::new(schema));
+            let id = schema.id;
+            self.name_map.insert(schema.name.clone(), id);
+            self.schema_map.insert(id, Arc::new(schema));
         }
     }
 }

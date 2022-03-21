@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
-use lightning::map::{HashMap as LFMap, ObjectMap};
+use lightning::map::{PtrHashMap as LFMap, LiteHashMap};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -61,7 +61,7 @@ pub struct DataManager {
     cell_lru: LRUCache<Id, i64, LRU_PAGE_SIZE>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
-    managers: ObjectMap<Arc<manager::AsyncServiceClient>>,
+    managers: LiteHashMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
     cleanup_signal: Arc<AtomicBool>,
 }
@@ -93,7 +93,7 @@ impl DataManager {
             cell_lru: LRUCache::new(256),
             txns: LFMap::with_capacity(128),
             txns_sorted: Mutex::new(BTreeSet::new()),
-            managers: ObjectMap::with_capacity(16),
+            managers: LiteHashMap::with_capacity(16),
             server: server.clone(),
             cleanup_signal: cleanup_signal.clone(),
         });
@@ -123,7 +123,7 @@ impl DataManager {
                     last_activity: get_time(),
                     history: BTreeMap::new(),
                 }));
-                if self.txns.insert(tid, txn.clone()).is_none() {
+                if self.txns.insert(tid.clone(), txn.clone()).is_none() {
                     self.txns_sorted.lock().insert(tid.clone());
                     return txn;
                 }
@@ -135,7 +135,7 @@ impl DataManager {
             let lru = &self.cell_lru;
             lru.get(id, |_| { Some(get_time()) }, |_, _| {});
         }
-        self.cells.get_or_insert(id, || {
+        self.cells.get_or_insert(*id, || {
             Arc::new(Mutex::new(CellMeta {
                 read: TxnId::new(),
                 write: TxnId::new(),
@@ -197,22 +197,21 @@ impl DataManager {
         &self,
         server_id: u64,
     ) -> io::Result<Arc<manager::AsyncServiceClient>> {
-        let server_id_ref = &(server_id as usize);
         loop {
-            if !self.managers.contains_key(server_id_ref) {
+            if !self.managers.contains_key(&server_id) {
                 let client = self.server.get_member_by_server_id(server_id).await?;
-                return Ok(self.managers.get_or_insert(server_id_ref, || {
+                return Ok(self.managers.get_or_insert(server_id, || {
                     manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
                 }));
             } else {
-                if let Some(manager) = self.managers.get(server_id_ref) {
+                if let Some(manager) = self.managers.get(&server_id) {
                     return Ok(manager.clone());
                 }
             }
         }
     }
     fn wipe_out_transaction(&self, tid: &TxnId) {
-        if let Some(txn) = self.txns.write(tid) {
+        if let Some(txn) = self.txns.lock(tid) {
             txn.remove();
         }
         self.txns_sorted.lock().remove(tid);
