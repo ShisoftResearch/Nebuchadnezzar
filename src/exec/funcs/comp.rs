@@ -31,7 +31,11 @@ macro_rules! str_cmp_op_fn {
 macro_rules! cmp_op {
     ($vec_fn: ident, $scalar_fn: ident, $str_vec_fn: ident, $str_scalar_fn: ident, $in: expr) => {{
         #[inline(always)]
-        fn op_fn<T: ArrowNumericType>(input: &[&dyn Array]) -> ArrowResult<ArrayRef> {
+        fn op_fn<T>(input: &[&dyn Array]) -> ArrowResult<ArrayRef>
+            where
+                T: ArrowNumericType + ArrowPrimitiveType,
+                T::Native: ArrowNativeTypeOp
+        {
             let x = input[0];
             let y = input[1];
             let res: Box<dyn Array>;

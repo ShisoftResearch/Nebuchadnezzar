@@ -3,10 +3,10 @@ use super::*;
 macro_rules! vec_by_key_ref_type {
     ($data: expr, $owned: ident => $builder: ty) => {{
         let data_len = $data.len();
-        let mut builder = <$builder>::new(data_len);
+        let mut builder = <$builder>::new();
         $data.iter().for_each(|v| match v.$owned() {
-            Some(v) => builder.append_value((*v).into()).unwrap(),
-            None => builder.append_null().unwrap(),
+            Some(v) => builder.append_value((*v).into()),
+            None => builder.append_null(),
         });
         let array: ArrayRef = Arc::new(builder.finish());
         array
@@ -16,13 +16,13 @@ macro_rules! vec_by_key_ref_type {
 macro_rules! vec_by_key_type {
     ($data: expr, $owned: ident => $builder: ty) => {{
         let data_len = $data.len();
-        let mut builder = <$builder>::new(data_len);
+        let mut builder = <$builder>::new();
         $data.iter().for_each(|v| match v.$owned() {
             Some(v) => {
-                builder.append_value(v).unwrap();
+                builder.append_value(v);
             }
             None => {
-                builder.append_null().unwrap();
+                builder.append_null();
             }
         });
         let array: ArrayRef = Arc::new(builder.finish());

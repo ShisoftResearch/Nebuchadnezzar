@@ -12,6 +12,7 @@ macro_rules! scalar_op {
                 + Mul<Output = T::Native>
                 + Div<Output = T::Native>
                 + Rem<Output = T::Native>
+                + ArrowNativeTypeOp
                 + Zero
                 + One,
         {
