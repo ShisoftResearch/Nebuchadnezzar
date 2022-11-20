@@ -37,15 +37,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
-chashmap = { version = "2.2.2", optional = true }
 arrow = "27"
 num = "*"
 
 [dev-dependencies]
 env_logger = "*"
 rayon = "*"
-
-[features]
-default = ["fast_map"]
-slow_map = ["chashmap"]
-fast_map = []

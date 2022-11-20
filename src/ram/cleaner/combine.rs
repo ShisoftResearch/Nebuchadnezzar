@@ -199,11 +199,7 @@ impl CombinedCleaner {
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
                     cells.into_par_iter().for_each(|(new, old, hash)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
-                        #[cfg(feature = "fast_map")]
                         let index = chunk.cell_index.lock(hash as usize);
-                        #[cfg(feature = "slow_map")]
-                        let index = chunk.index.get_mut(&hash);
-
                         if let Some(mut actual_addr) = index {
                             if *actual_addr == old {
                                 *actual_addr = new;
