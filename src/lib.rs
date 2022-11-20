@@ -35,7 +35,6 @@ extern crate serde;
 extern crate itertools;
 #[macro_use]
 extern crate smallvec;
-extern crate owning_ref;
 extern crate serde_json;
 extern crate test;
 
