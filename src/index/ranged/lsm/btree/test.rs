@@ -95,7 +95,7 @@ fn check_ordering(tree: &LevelBPlusTree, key: &EntryKey) {
 fn crd() {
     let _ = env_logger::try_init();
     let tree = LevelBPlusTree::new(&deletion_set());
-    std::fs::remove_dir_all("dumps").unwrap();
+    let _ = std::fs::remove_dir_all("dumps");
     std::fs::create_dir_all("dumps").unwrap();
     let num = env::var("BTREE_TEST_ITEMS")
         .unwrap_or("1000".to_string())
