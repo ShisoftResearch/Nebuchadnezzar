@@ -359,6 +359,7 @@ pub async fn write_skew() {
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn server_isolation() {
+    let _ = env_logger::try_init();
     let server_1_group = "server_isolation_test_1";
     let server_2_group = "server_isolation_test_2";
     let server_address_1 = "127.0.0.1:5403";
@@ -421,7 +422,7 @@ pub async fn server_isolation() {
         false,
     );
     let schema2 = Schema::new_with_id(
-        1,
+        2,
         &String::from("test"),
         None,
         Field::new(
@@ -513,7 +514,7 @@ pub async fn server_isolation() {
         .first()
         .unwrap()
         .clone();
-    assert_eq!(schema_2_got.id, 1);
+    assert_eq!(schema_2_got.id, 2);
     let schema_2_fields = schema2.fields;
     assert_eq!(
         schema_2_fields

@@ -3,10 +3,13 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
-use lightning::map::{PtrHashMap as LFHashMap, Map, LiteHashMap};
+use itertools::Itertools;
+use lightning::map::{LiteHashMap, Map, PtrHashMap as LFHashMap};
 use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::AtomicU32;
+
+use crate::utils::thread_id;
 
 use super::types;
 use core::borrow::Borrow;
@@ -291,7 +294,9 @@ impl LocalSchemasCache {
         m.name_to_id(name)
     }
     pub fn count(&self) -> usize {
-        self.map.schema_map.len()
+        let len = self.map.schema_map.len();
+        debug!("Counted schema length {}", len);
+        len
     }
     pub fn fields_size(&self, schema_id: &u32, fields: &[u64]) -> Option<usize> {
         const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
@@ -323,6 +328,7 @@ impl LocalSchemasCache {
 
 impl SchemasMap {
     pub fn new() -> SchemasMap {
+        debug!("Schema map created");
         SchemasMap {
             schema_map: LiteHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
@@ -334,10 +340,12 @@ impl SchemasMap {
         let id = schema.id;
         self.name_map.insert(name.clone(), id);
         self.schema_map.insert(id, Arc::new(schema));
+        debug!("Schema map inserted with id {}, tid {}", id, thread_id());
     }
     pub fn del_schema(&self, name: &str) -> Result<(), ()> {
         if let Some(id) = self.name_map.remove(&(name.to_owned())) {
             self.schema_map.remove(&id);
+            debug!("Schema map removed {}", id);
         }
         Ok(())
     }
@@ -348,7 +356,13 @@ impl SchemasMap {
         return None;
     }
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
-        self.schema_map.get(id)
+        let res = self.schema_map.get(id);
+        debug!(
+            "Gettting from schema map for {}, return res {}",
+            id,
+            res.is_some()
+        );
+        return res;
     }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         self.name_map.get(&name.to_string()).map(|id| id as u32)
@@ -365,17 +379,22 @@ impl SchemasMap {
         id
     }
     fn get_all(&self) -> Vec<Schema> {
-        self.schema_map
-            .entries()
-            .iter()
-            .map(|(_, s_ref)| (**s_ref).clone())
-            .collect()
+        let entries = self.schema_map.entries();
+        entries
+            .into_iter()
+            .map(|(id, s_ref)| {
+                debug!("Get all schema listed {}({}), tid {}", id, s_ref.id, thread_id());
+                debug_assert_eq!(id, s_ref.id);
+                (&*s_ref).clone()
+            })
+            .collect_vec()
     }
     fn load_from_list(&mut self, data: Vec<Schema>) {
         for schema in data {
             let id = schema.id;
             self.name_map.insert(schema.name.clone(), id);
             self.schema_map.insert(id, Arc::new(schema));
+            debug!("Inserted listed schema {}", id);
         }
     }
 }

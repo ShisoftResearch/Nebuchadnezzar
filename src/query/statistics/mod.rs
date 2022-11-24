@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use lightning::map::{Map, LiteHashMap};
+use lightning::map::{LiteHashMap, Map};
 use rayon::prelude::*;
 use std::{
     cmp::max,
@@ -31,7 +31,7 @@ pub struct SchemaStatistics {
 pub struct ChunkStatistics {
     pub timestamp: AtomicU32,
     pub changes: AtomicU32,
-    pub schemas: LiteHashMap<u32,Arc<SchemaStatistics>>,
+    pub schemas: LiteHashMap<u32, Arc<SchemaStatistics>>,
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
@@ -164,8 +164,7 @@ impl ChunkStatistics {
                 bytes: *total_size.get(&schema_id).unwrap(),
                 timestamp: now,
             };
-            self.schemas
-                .insert(*schema_id, Arc::new(statistics));
+            self.schemas.insert(*schema_id, Arc::new(statistics));
         }
         self.timestamp.store(now, Ordering::Relaxed);
         self.changes.fetch_sub(refresh_changes, Ordering::Relaxed);

@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
-use lightning::map::{PtrHashMap as LFMap, LiteHashMap};
+use lightning::map::{LiteHashMap, PtrHashMap as LFMap};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -133,7 +133,7 @@ impl DataManager {
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
         {
             let lru = &self.cell_lru;
-            lru.get(id, |_| { Some(get_time()) }, |_, _| {});
+            lru.get(id, |_| Some(get_time()), |_, _| {});
         }
         self.cells.get_or_insert(*id, || {
             Arc::new(Mutex::new(CellMeta {

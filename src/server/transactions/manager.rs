@@ -6,7 +6,7 @@ use crate::server::NebServer;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use itertools::Itertools;
-use lightning::map::{PtrHashMap as LFMap, Map, LiteHashMap};
+use lightning::map::{LiteHashMap, Map, PtrHashMap as LFMap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
@@ -859,7 +859,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
-    map:LiteHashMap<u64, Arc<AwaitingServer>>,
+    map: LiteHashMap<u64, Arc<AwaitingServer>>,
 }
 
 impl AwaitManager {
@@ -869,7 +869,8 @@ impl AwaitManager {
         }
     }
     pub fn get_txn(&self, tid: &TxnId) -> Arc<TxnAwaits> {
-        self.channels.get_or_insert(tid.clone(), || TxnAwaits::new_ref())
+        self.channels
+            .get_or_insert(tid.clone(), || TxnAwaits::new_ref())
     }
 }
 

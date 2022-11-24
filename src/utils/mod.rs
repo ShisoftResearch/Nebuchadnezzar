@@ -1,3 +1,5 @@
+use std::thread;
+
 pub mod raii_mutex_table;
 
 pub fn upper_power_of_2(mut v: usize) -> usize {
@@ -10,4 +12,8 @@ pub fn upper_power_of_2(mut v: usize) -> usize {
     v |= v >> 16;
     v += 1;
     return v;
+}
+
+pub fn thread_id() -> u64 {
+    thread::current().id().as_u64().get()
 }

@@ -106,7 +106,7 @@ pub fn full_clean_cycle() {
             }
         }
 
-        assert_eq!(chunk.cell_count(), 8);
+        assert_eq!(chunk.cell_count(), 8, "Cell count does not match");
     }
 
     // check integrity

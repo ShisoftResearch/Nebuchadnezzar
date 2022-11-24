@@ -4,9 +4,9 @@ use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use itertools::Itertools;
 use rayon::prelude::*;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 
 use libc;
 

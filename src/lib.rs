@@ -1,8 +1,7 @@
-#![feature(asm)]
 #![feature(box_syntax)]
 #![feature(test)]
 #![feature(async_closure)]
-#![feature(backtrace)]
+#![feature(thread_id_value)]
 #![feature(is_sorted)]
 
 extern crate static_assertions;
