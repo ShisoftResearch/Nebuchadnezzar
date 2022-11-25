@@ -343,7 +343,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "lazy_static",
- "lightning-containers 0.2.2 (git+https://github.com/ShisoftResearch/Lightning.git?branch=develop)",
+ "lightning-containers",
  "log",
  "num_cpus",
  "parking_lot",
@@ -1105,23 +1105,6 @@ checksum = "348108ab3fba42ec82ff6e9564fc4ca0247bdccdc68dd8af9764bbc79c3c8ffb"
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-dependencies = [
- "affinity",
- "crossbeam-epoch",
- "crossbeam-utils",
- "itertools",
- "lazy_static",
- "libc",
- "log",
- "num_cpus",
- "page_size",
- "parking_lot",
- "static_assertions",
-]
-
-[[package]]
-name = "lightning-containers"
-version = "0.2.2"
 source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#c47142d7d4f2603d1a3062577947a13c649387c2"
 dependencies = [
  "affinity",
@@ -1234,7 +1217,7 @@ dependencies = [
  "itertools",
  "lazy_static",
  "libc",
- "lightning-containers 0.2.2",
+ "lightning-containers",
  "log",
  "num",
  "num_cpus",
