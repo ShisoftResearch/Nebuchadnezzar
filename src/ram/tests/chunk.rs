@@ -367,13 +367,11 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(
-            &partial_cell,
-            &OwnedValue::Array(vec![
-                cell["sub"]["sub3"].clone(),
-                cell["sub"]["sub4"]["sub4sub3"].clone()
-            ])
-        );
+        assert_eq!(partial_cell.len().unwrap(), 1);
+        assert_eq!(partial_cell["sub"].len().unwrap(), 2);
+        assert_eq!(partial_cell["sub"]["sub4"].len().unwrap(), 1);
+        assert_eq!(partial_cell["sub"]["sub3"], cell["sub"]["sub3"]);
+        assert_eq!(partial_cell["sub"]["sub4"]["sub4sub3"], cell["sub"]["sub4"]["sub4sub3"]);
     }
 }
 

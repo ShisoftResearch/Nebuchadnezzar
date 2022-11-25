@@ -171,32 +171,44 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
     }
     if let Some(schema_fields) = &schema.fields.sub_fields {
         let mut res = SharedMap::new();
+        // iterate all selected field ids
         for field in fields {
+            // Get cached index path from ids
             if let Some(index_path) = schema.field_index.get(field) {
+                // Make sure the index path is valid
                 if !index_path.is_empty() {
+                    // Get the first level field from the index path
+                    let num_levels = index_path.len();
                     if let Some(mut field) = schema_fields.get(index_path[0]) {
-                        let mut target_map = &mut res;
-                        for i in index_path.iter().skip(1) {
+                        // Iterate fields in each level, construct the result map and reach the selected field and value
+                        // The map is initialized as res and woulf be updated when going to the next level
+                        let mut inserting_map = &mut res;
+                        // Skip the first level field since we already have the first level
+                        for (l, fid) in index_path.iter().enumerate().skip(1) {
                             if let Some(Some(sub_field)) =
-                                field.sub_fields.as_ref().map(|sub| sub.get(*i))
+                                field.sub_fields.as_ref().map(|sub| sub.get(*fid))
                             {
+                                // Go to next level field and get the previous level field
                                 let prev_field = mem::replace(&mut field, sub_field);
                                 let prev_id = prev_field.name_id;
-                                target_map
+                                let next_level_value = inserting_map
                                     .map
-                                    .insert(prev_id, SharedValue::Map(SharedMap::new()));
-                                target_map.fields.push(prev_field.name.clone());
-                                target_map = match target_map.get_mut_by_key_id(prev_id) {
+                                    .entry(prev_id)
+                                    .or_insert(SharedValue::Map(SharedMap::new()));
+                                inserting_map.fields.push(prev_field.name.clone());
+                                inserting_map = match next_level_value {
                                     SharedValue::Map(m) => m,
-                                    _ => unreachable!(),
+                                    _ => unreachable!("Got unexpected value instead of map, got {:?}, at level {} of {}", next_level_value, l, num_levels),
                                 };
                             } else {
+                                // Reached the last level of fields
                                 break;
                             }
                         }
+                        // Insert the last level of field to the map
                         let field_data = read_field(ptr, field, false, &mut tail_offset);
-                        target_map.map.insert(field.name_id, field_data);
-                        target_map.fields.push(field.name.clone());
+                        inserting_map.map.insert(field.name_id, field_data);
+                        inserting_map.fields.push(field.name.clone());
                     }
                 }
             }

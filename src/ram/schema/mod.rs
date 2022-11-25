@@ -383,7 +383,12 @@ impl SchemasMap {
         entries
             .into_iter()
             .map(|(id, s_ref)| {
-                debug!("Get all schema listed {}({}), tid {}", id, s_ref.id, thread_id());
+                debug!(
+                    "Get all schema listed {}({}), tid {}",
+                    id,
+                    s_ref.id,
+                    thread_id()
+                );
                 debug_assert_eq!(id, s_ref.id);
                 (&*s_ref).clone()
             })
