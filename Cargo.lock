@@ -246,13 +246,13 @@ dependencies = [
 
 [[package]]
 name = "async-io"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8121296a9f05be7f34aa4196b1747243b3b62e048bb7906f644f3fbfc490cf7"
+checksum = "6fe557ebe0829511ddff4ad3011d159c0e6f144e05e3e8c3ab5095a131900a7b"
 dependencies = [
  "async-lock",
  "autocfg",
- "concurrent-queue 1.2.4",
+ "concurrent-queue 2.0.0",
  "futures-lite",
  "libc",
  "log",
@@ -1125,7 +1125,7 @@ checksum = "348108ab3fba42ec82ff6e9564fc4ca0247bdccdc68dd8af9764bbc79c3c8ffb"
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#3d75c6d9dd473f7deb2ddf647b96ff73f38989e5"
+source = "git+https://github.com/ShisoftResearch/Lightning.git?branch=develop#cb30b6810298545e545c56cae540947effc68b40"
 dependencies = [
  "affinity",
  "crossbeam-epoch",

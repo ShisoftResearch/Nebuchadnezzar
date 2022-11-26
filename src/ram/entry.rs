@@ -57,7 +57,6 @@ impl Entry {
         let flag_byte = len_bytes_count | entry_type_bits;
         let mut len_bytes = [0u8; 4];
         encode_len(content_len, &mut len_bytes);
-        let raw_len_bytes = Box::into_raw(box len_bytes);
         trace!("encoding entry header to {}, flag {:#010b}, type bits {:#010b}, len bits {:#010b}, content len {}",
                pos, flag_byte, entry_type_bits, len_bytes_count, content_len);
         unsafe {
@@ -67,7 +66,7 @@ impl Entry {
             // write entry length
             libc::memmove(
                 pos as *mut libc::c_void,
-                raw_len_bytes as *mut libc::c_void,
+                &mut len_bytes as *mut [u8; 4] as *mut libc::c_void,
                 len_bytes_count_usize,
             );
             pos += len_bytes_count_usize;
