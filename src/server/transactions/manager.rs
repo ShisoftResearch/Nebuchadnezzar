@@ -57,7 +57,7 @@ dispatch_rpc_service_functions!(TransactionManager);
 pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: LFMap<TxnId, TxnMutex>,
-    data_sites: LiteHashMap<u64, Arc<data_site::AsyncServiceClient>>,
+    data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     await_manager: AwaitManager,
 }
 
@@ -66,7 +66,7 @@ impl TransactionManager {
         Arc::new(Self {
             server: server.clone(),
             transactions: LFMap::with_capacity(128),
-            data_sites: LiteHashMap::with_capacity(8),
+            data_sites: LFMap::with_capacity(8),
             await_manager: AwaitManager::new(),
         })
     }
@@ -859,7 +859,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
-    map: LiteHashMap<u64, Arc<AwaitingServer>>,
+    map: LFMap<u64, Arc<AwaitingServer>>,
 }
 
 impl AwaitManager {
@@ -877,7 +877,7 @@ impl AwaitManager {
 impl TxnAwaits {
     pub fn new_ref() -> Arc<Self> {
         Arc::new(Self {
-            map: LiteHashMap::with_capacity(8),
+            map: LFMap::with_capacity(8),
         })
     }
     pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {

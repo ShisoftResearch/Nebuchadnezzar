@@ -61,7 +61,7 @@ pub struct DataManager {
     cell_lru: LRUCache<Id, i64, LRU_PAGE_SIZE>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
-    managers: LiteHashMap<u64, Arc<manager::AsyncServiceClient>>,
+    managers: LFMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
     cleanup_signal: Arc<AtomicBool>,
 }
@@ -93,7 +93,7 @@ impl DataManager {
             cell_lru: LRUCache::new(256),
             txns: LFMap::with_capacity(128),
             txns_sorted: Mutex::new(BTreeSet::new()),
-            managers: LiteHashMap::with_capacity(16),
+            managers: LFMap::with_capacity(16),
             server: server.clone(),
             cleanup_signal: cleanup_signal.clone(),
         });

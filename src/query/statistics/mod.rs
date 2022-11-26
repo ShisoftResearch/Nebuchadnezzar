@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use lightning::map::{LiteHashMap, Map};
+use lightning::map::{PtrHashMap, Map};
 use rayon::prelude::*;
 use std::{
     cmp::max,
@@ -31,7 +31,7 @@ pub struct SchemaStatistics {
 pub struct ChunkStatistics {
     pub timestamp: AtomicU32,
     pub changes: AtomicU32,
-    pub schemas: LiteHashMap<u32, Arc<SchemaStatistics>>,
+    pub schemas: PtrHashMap<u32, Arc<SchemaStatistics>>,
 }
 
 const HISTOGRAM_PARTITATION_SIZE: usize = 1024;
@@ -50,7 +50,7 @@ impl ChunkStatistics {
         Self {
             timestamp: AtomicU32::new(0),
             changes: AtomicU32::new(0),
-            schemas: LiteHashMap::with_capacity(32),
+            schemas: PtrHashMap::with_capacity(32),
         }
     }
     pub fn refresh_from_chunk(&self, chunk: &Chunk) {

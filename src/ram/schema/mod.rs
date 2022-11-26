@@ -230,7 +230,7 @@ impl Field {
 }
 
 pub struct SchemasMap {
-    schema_map: LiteHashMap<u32, SchemaRef>,
+    schema_map: LFHashMap<u32, SchemaRef>,
     name_map: LFHashMap<String, u32>,
     id_counter: AtomicU32,
 }
@@ -330,7 +330,7 @@ impl SchemasMap {
     pub fn new() -> SchemasMap {
         debug!("Schema map created");
         SchemasMap {
-            schema_map: LiteHashMap::with_capacity(32),
+            schema_map: LFHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
             id_counter: AtomicU32::new(0),
         }
