@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use lightning::map::{PtrHashMap, Map};
+use lightning::map::{Map, PtrHashMap};
 use rayon::prelude::*;
 use std::{
     cmp::max,

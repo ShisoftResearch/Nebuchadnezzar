@@ -94,7 +94,13 @@ impl Chunk {
         let mut tried_gc = false;
         loop {
             let head_seg_id = self.get_head_seg_id() as usize;
-            let head = self.segs.get(&head_seg_id).expect("Cannot get header");
+            let head = self.segs.get(&head_seg_id).unwrap_or_else(|| {
+                panic!(
+                    "Cannot get header segment with id: {}, have ids {:?}",
+                    head_seg_id,
+                    self.segs.iter_front_keys().collect_vec()
+                );
+            });
             match head.try_acquire(size) {
                 Some(addr) => {
                     trace!(

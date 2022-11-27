@@ -371,7 +371,10 @@ pub fn complex_cell_sel_read() {
         assert_eq!(partial_cell["sub"].len().unwrap(), 2);
         assert_eq!(partial_cell["sub"]["sub4"].len().unwrap(), 1);
         assert_eq!(partial_cell["sub"]["sub3"], cell["sub"]["sub3"]);
-        assert_eq!(partial_cell["sub"]["sub4"]["sub4sub3"], cell["sub"]["sub4"]["sub4sub3"]);
+        assert_eq!(
+            partial_cell["sub"]["sub4"]["sub4sub3"],
+            cell["sub"]["sub4"]["sub4sub3"]
+        );
     }
 }
 
