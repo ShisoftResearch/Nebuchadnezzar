@@ -387,7 +387,13 @@ mod test {
             for i in 0..num {
                 let id = Id::new(1, i);
                 let cell = cursor.next().await.unwrap().unwrap();
-                assert_eq!(id, cell.id(), "Id does not match sequence. Exoecting {:?}, got {:?}", id, cell.id());
+                assert_eq!(
+                    id,
+                    cell.id(),
+                    "Id does not match sequence. Exoecting {:?}, got {:?}",
+                    id,
+                    cell.id()
+                );
                 assert_eq!(*cell[DATA_1].u64().unwrap(), i);
                 assert_eq!(*cell[DATA_2].u32().unwrap(), (i * 2) as u32);
                 debug!("Checked cell id {:?} from index", id);
