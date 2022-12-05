@@ -399,6 +399,7 @@ impl Service for DataManager {
             cell_guards.push(meta);
         }
         if cell_guards.len() != cell_ids.len() {
+            debug!("SITE PREPARE CELL GUARD MISMATCH: {} expecting {}", cell_ids.len(), cell_guards.len());
             return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
             for mut meta in cell_guards {
@@ -407,6 +408,7 @@ impl Service for DataManager {
             txn.state = TxnState::Prepared;
             txn.affected_cells = cell_ids.clone(); // for cell number check
             txn.last_activity = get_time(); // check if transaction timeout
+            debug!("SITE PREPARE SUCCESSFUL FOR {:?}", tid);
             return self.response_with(DMPrepareResult::Success);
         }
     }

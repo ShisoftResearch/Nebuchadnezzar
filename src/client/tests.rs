@@ -252,6 +252,7 @@ pub async fn multi_cell_update() {
 
 #[tokio::test(flavor = "multi_thread")]
 pub async fn write_skew() {
+    let _ = env_logger::try_init();
     let server_group = "write_skew_test";
     let server_addr = String::from("127.0.0.1:5402");
     let server = NebServer::new_from_opts(
