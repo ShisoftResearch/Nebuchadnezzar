@@ -96,7 +96,7 @@ impl CompactCleaner {
                         entry.content
                     );
                     unsafe {
-                        libc::memcpy(
+                        libc::memmove(
                             cursor as *mut libc::c_void,
                             entry_pos as *mut libc::c_void,
                             entry_size,
