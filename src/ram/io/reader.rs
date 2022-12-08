@@ -5,7 +5,7 @@ use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
-use dovahkiin::types::key_hash;
+use dovahkiin::types::{key_hash, Map};
 use std::collections::HashMap;
 use std::mem;
 

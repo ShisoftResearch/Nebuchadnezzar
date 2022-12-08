@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use lightning::map::{Map, PtrHashMap};
+use lightning::map::{Map as LFMap, PtrHashMap};
 use rayon::prelude::*;
 use std::{
     cmp::max,
@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use dovahkiin::types::SharedValue;
+use dovahkiin::types::{SharedValue, Map};
 
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},

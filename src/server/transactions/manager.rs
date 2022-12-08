@@ -5,8 +5,9 @@ use crate::ram::types::{Id, OwnedValue};
 use crate::server::NebServer;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
+use dovahkiin::types::Map;
 use itertools::Itertools;
-use lightning::map::{LiteHashMap, Map, PtrHashMap as LFMap};
+use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};

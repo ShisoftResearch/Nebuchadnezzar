@@ -1,5 +1,5 @@
 use crate::ram::{segs::SEGMENT_SIZE, types};
-
+use dovahkiin::types::Map;
 pub const CHUNK_SIZE: usize = SEGMENT_SIZE;
 
 macro_rules! test_nums {
