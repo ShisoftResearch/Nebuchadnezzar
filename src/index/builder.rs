@@ -5,6 +5,7 @@ use crate::ram::{
     cell::Cell,
     schema::{IndexType, Schema},
 };
+use crate::dovahkiin::types::Value;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use futures::FutureExt;
 use futures::{
@@ -227,7 +228,7 @@ impl IndexBuilder {
     }
 }
 
-pub fn probe_cell_indices(cell: &dyn Cell, schema: &Schema) -> Vec<IndexRes> {
+pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
     let mut res = vec![];
     schema.index_fields.iter().for_each(|(field_id, indices)| {
         if let Some(id_path) = schema.id_index.get(field_id) {

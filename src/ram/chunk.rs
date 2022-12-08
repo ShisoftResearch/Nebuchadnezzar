@@ -527,7 +527,7 @@ impl Chunk {
             .fetch_add(entry.content_length, Ordering::Relaxed);
     }
 
-    pub fn mark_dead_entry_with_cell(&self, addr: usize, cell: &dyn Cell) {
+    pub fn mark_dead_entry_with_cell<C: Cell>(&self, addr: usize, cell: &C) {
         let seg = self.locate_segment_ensured(addr, &cell.id());
         self.mark_dead_entry_with_seg(addr, &seg)
     }

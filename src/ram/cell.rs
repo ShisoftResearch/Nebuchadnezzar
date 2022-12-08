@@ -313,43 +313,47 @@ impl<'a> SharedCell<'a> {
 }
 
 pub trait Cell {
+    type Value: Value;
     fn id(&self) -> Id;
     fn header(&self) -> &CellHeader;
-    fn data(&self) -> &dyn Value;
+    fn data(&self) -> &Self::Value;
 }
 
 impl Cell for OwnedCell {
+    type Value = OwnedValue;
     fn id(&self) -> Id {
         OwnedCell::id(self)
     }
     fn header(&self) -> &CellHeader {
         &self.header
     }
-    fn data(&self) -> &dyn Value {
+    fn data(&self) -> &Self::Value {
         &self.data
     }
 }
 
 impl<'a> Cell for SharedCell<'a> {
+    type Value = SharedValue<'a>;
     fn id(&self) -> Id {
         self.inner.id()
     }
     fn header(&self) -> &CellHeader {
         &self.inner.header
     }
-    fn data(&self) -> &dyn Value {
+    fn data(&self) -> &Self::Value {
         &self.inner.data
     }
 }
 
 impl<'v> Cell for SharedCellData<'v> {
+    type Value = SharedValue<'v>;
     fn id(&self) -> Id {
         self.id()
     }
     fn header(&self) -> &CellHeader {
         &self.header
     }
-    fn data(&self) -> &dyn Value {
+    fn data(&self) -> &Self::Value {
         &self.data
     }
 }
