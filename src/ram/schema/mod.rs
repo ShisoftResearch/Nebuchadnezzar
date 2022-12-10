@@ -327,14 +327,14 @@ impl LocalSchemasCache {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NewSchemaError {
     NameExists(String),
     IdExists(u32),
     NotifyError(NotifyError),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelSchemaError {
     SchemaDoesNotExisted,
     NotifyError(NotifyError),
