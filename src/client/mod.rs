@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
-use crate::ram::schema::Schema;
+use crate::ram::schema::{Schema, DelSchemaError, NewSchemaError};
 use crate::ram::types::Id;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
@@ -258,13 +258,13 @@ impl AsyncClient {
     pub async fn new_schema_with_id(
         &self,
         schema: Schema,
-    ) -> Result<Result<(), NotifyError>, ExecError> {
+    ) -> Result<Result<(), NewSchemaError>, ExecError> {
         self.schema_client.new_schema(&schema).await
     }
     pub async fn new_schema(
         &self,
         mut schema: Schema,
-    ) -> Result<(u32, Option<NotifyError>), ExecError> {
+    ) -> Result<(u32, Option<NewSchemaError>), ExecError> {
         let schema_id = self.schema_client.next_id().await?;
         schema.id = schema_id;
         self.new_schema_with_id(schema).await.map(|r| {
@@ -275,7 +275,7 @@ impl AsyncClient {
             (schema_id, error)
         })
     }
-    pub async fn del_schema(&self, name: String) -> Result<Result<(), NotifyError>, ExecError> {
+    pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         self.schema_client.del_schema(&name).await
     }
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {

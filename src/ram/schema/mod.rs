@@ -1,4 +1,5 @@
 use bifrost::raft::client::RaftClient;
+use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
@@ -287,7 +288,7 @@ impl LocalSchemasCache {
             panic!("for debug only");
         }
         let m = &self.map;
-        m.new_schema(schema)
+        m.new_schema(schema).unwrap()
     }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         let m = &self.map;
@@ -326,6 +327,20 @@ impl LocalSchemasCache {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub enum NewSchemaError {
+    NameExists(String),
+    IdExists(u32),
+    NotifyError(NotifyError),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum DelSchemaError {
+    SchemaDoesNotExisted,
+    NotifyError(NotifyError),
+}
+
+
 impl SchemasMap {
     pub fn new() -> SchemasMap {
         debug!("Schema map created");
@@ -335,19 +350,28 @@ impl SchemasMap {
             id_counter: AtomicU32::new(0),
         }
     }
-    pub fn new_schema(&self, schema: Schema) {
+    pub fn new_schema(&self, schema: Schema) -> Result<(), NewSchemaError> {
         let name = &schema.name;
         let id = schema.id;
+        if self.name_map.contains_key(name) {
+            return Err(NewSchemaError::NameExists(name.clone()))
+        }
         self.name_map.insert(name.clone(), id);
+        if self.schema_map.contains_key(&id) {
+            return Err(NewSchemaError::IdExists(id));
+        }
         self.schema_map.insert(id, Arc::new(schema));
         debug!("Schema map inserted with id {}, tid {}", id, thread_id());
+        return Ok(())
     }
-    pub fn del_schema(&self, name: &str) -> Result<(), ()> {
+    pub fn del_schema(&self, name: &str) -> Result<(), DelSchemaError> {
         if let Some(id) = self.name_map.remove(&(name.to_owned())) {
             self.schema_map.remove(&id);
             debug!("Schema map removed {}", id);
+            Ok(())
+        } else {
+            Err(DelSchemaError::SchemaDoesNotExisted)
         }
-        Ok(())
     }
     pub fn get_by_name(&self, name: &str) -> Option<SchemaRef> {
         if let Some(id) = self.name_to_id(name) {

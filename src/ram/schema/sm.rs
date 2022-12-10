@@ -22,8 +22,8 @@ pub struct SchemasSM {
 raft_state_machine! {
     def qry get_all() -> Vec<Schema>;
     def qry get(id: u32) -> Option<Schema>;
-    def cmd new_schema(schema: Schema) -> Result<(), NotifyError>;
-    def cmd del_schema(name: String) -> Result<(), NotifyError>;
+    def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
+    def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd next_id() -> u32;
     def sub on_schema_added() -> Schema;
     def sub on_schema_deleted() -> String;
@@ -40,22 +40,24 @@ impl StateMachineCmds for SchemasSM {
         }))
         .boxed()
     }
-    fn new_schema(&mut self, schema: Schema) -> BoxFuture<Result<(), NotifyError>> {
-        self.map.new_schema(schema.clone());
+    fn new_schema(&mut self, schema: Schema) -> BoxFuture<Result<(), NewSchemaError>> {
         async move {
+            self.map.new_schema(schema.clone())?;
             self.callback
                 .notify(commands::on_schema_added::new(), schema)
-                .await?;
+                .await
+                .map_err(|e| NewSchemaError::NotifyError(e))?;
             Ok(())
         }
         .boxed()
     }
-    fn del_schema(&mut self, name: String) -> BoxFuture<Result<(), NotifyError>> {
-        self.map.del_schema(&name).unwrap();
+    fn del_schema(&mut self, name: String) -> BoxFuture<Result<(), DelSchemaError>> {
         async move {
+            self.map.del_schema(&name)?;
             self.callback
                 .notify(commands::on_schema_deleted::new(), name)
-                .await?;
+                .await
+                .map_err(|e| DelSchemaError::NotifyError(e))?;
             Ok(())
         }
         .boxed()
