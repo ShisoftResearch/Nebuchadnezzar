@@ -69,6 +69,7 @@ impl StateMachineCmds for SchemasSM {
         .boxed()
     }
     fn next_id(&mut self) -> BoxFuture<u32> {
+        self.id_count += 1;
         while self.map.schema_map.contains_key(&self.id_count) {
             self.id_count += 1;
         }
