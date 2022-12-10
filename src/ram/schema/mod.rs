@@ -230,14 +230,13 @@ impl Field {
     }
 }
 
-pub struct SchemasMap {
+pub struct LocalSchemasMap {
     schema_map: LFHashMap<u32, SchemaRef>,
     name_map: LFHashMap<String, u32>,
-    id_counter: AtomicU32,
 }
 
 pub struct LocalSchemasCache {
-    map: Arc<SchemasMap>,
+    map: Arc<LocalSchemasMap>,
 }
 
 impl LocalSchemasCache {
@@ -246,7 +245,7 @@ impl LocalSchemasCache {
         raft_client: &Arc<RaftClient>,
     ) -> Result<LocalSchemasCache, ExecError> {
         info!("Initializing local schema cache");
-        let map = Arc::new(SchemasMap::new());
+        let map = Arc::new(LocalSchemasMap::new());
         let m1 = map.clone();
         let m2 = map.clone();
         let sm = sm::client::SMClient::new(sm::generate_sm_id(group), raft_client);
@@ -268,7 +267,7 @@ impl LocalSchemasCache {
             .await?;
         let _ = sm
             .on_schema_deleted(move |schema| {
-                m2.del_schema(&schema).unwrap();
+                m2.del_schema(&schema);
                 future::ready(()).boxed()
             })
             .await?;
@@ -277,7 +276,7 @@ impl LocalSchemasCache {
         return Ok(schemas);
     }
     pub fn new_local(_group: &str) -> Self {
-        let map = Arc::new(SchemasMap::new());
+        let map = Arc::new(LocalSchemasMap::new());
         LocalSchemasCache { map }
     }
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
@@ -288,7 +287,7 @@ impl LocalSchemasCache {
             panic!("for debug only");
         }
         let m = &self.map;
-        m.new_schema(schema).unwrap()
+        m.new_schema(schema)
     }
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         let m = &self.map;
@@ -340,45 +339,22 @@ pub enum DelSchemaError {
     NotifyError(NotifyError),
 }
 
-
-impl SchemasMap {
-    pub fn new() -> SchemasMap {
+impl LocalSchemasMap {
+    pub fn new() -> Self {
         debug!("Schema map created");
-        SchemasMap {
+        Self {
             schema_map: LFHashMap::with_capacity(32),
             name_map: LFHashMap::with_capacity(32),
-            id_counter: AtomicU32::new(0),
         }
     }
-    pub fn new_schema(&self, schema: Schema) -> Result<(), NewSchemaError> {
-        let name = &schema.name;
-        let id = schema.id;
-        if self.name_map.contains_key(name) {
-            return Err(NewSchemaError::NameExists(name.clone()))
-        }
-        self.name_map.insert(name.clone(), id);
-        if self.schema_map.contains_key(&id) {
-            return Err(NewSchemaError::IdExists(id));
-        }
-        self.schema_map.insert(id, Arc::new(schema));
-        debug!("Schema map inserted with id {}, tid {}", id, thread_id());
-        return Ok(())
-    }
-    pub fn del_schema(&self, name: &str) -> Result<(), DelSchemaError> {
-        if let Some(id) = self.name_map.remove(&(name.to_owned())) {
-            self.schema_map.remove(&id);
-            debug!("Schema map removed {}", id);
-            Ok(())
-        } else {
-            Err(DelSchemaError::SchemaDoesNotExisted)
-        }
-    }
+
     pub fn get_by_name(&self, name: &str) -> Option<SchemaRef> {
         if let Some(id) = self.name_to_id(name) {
             return self.get(&id);
         }
         return None;
     }
+
     pub fn get(&self, id: &u32) -> Option<SchemaRef> {
         let res = self.schema_map.get(id);
         debug!(
@@ -388,27 +364,23 @@ impl SchemasMap {
         );
         return res;
     }
+
     pub fn name_to_id(&self, name: &str) -> Option<u32> {
         self.name_map.get(&name.to_string()).map(|id| id as u32)
     }
-    fn next_id(&mut self) -> u32 {
-        let mut id = self
-            .id_counter
-            .fetch_and(1, std::sync::atomic::Ordering::AcqRel);
-        while self.schema_map.contains_key(&id) {
-            id = self
-                .id_counter
-                .fetch_and(1, std::sync::atomic::Ordering::AcqRel)
-        }
-        id
+
+    fn new_schema(&self, schema: Schema) {
+        self.name_map.insert(schema.name.clone(), schema.id);
+        self.schema_map.insert(schema.id, Arc::new(schema));
     }
+
     fn get_all(&self) -> Vec<Schema> {
         let entries = self.schema_map.entries();
         entries
             .into_iter()
             .map(|(id, s_ref)| {
                 debug!(
-                    "Get all schema listed {}({}), tid {}",
+                    "Get all local schema listed {}({}), tid {}",
                     id,
                     s_ref.id,
                     thread_id()
@@ -418,12 +390,11 @@ impl SchemasMap {
             })
             .collect_vec()
     }
-    fn load_from_list(&mut self, data: Vec<Schema>) {
-        for schema in data {
-            let id = schema.id;
-            self.name_map.insert(schema.name.clone(), id);
-            self.schema_map.insert(id, Arc::new(schema));
-            debug!("Inserted listed schema {}", id);
+
+    fn del_schema(&self, name: &str) {
+        if let Some(id) = self.name_map.remove(&(name.to_owned())) {
+            self.schema_map.remove(&id);
+            debug!("Deleted local schema {} with id {}", name, id);
         }
     }
 }

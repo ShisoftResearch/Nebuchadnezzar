@@ -1,6 +1,6 @@
 use super::*;
 
-use bifrost::raft::state_machine::callback::server::{NotifyError, SMCallback};
+use bifrost::raft::state_machine::callback::server::SMCallback;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
 use bifrost::utils;
@@ -13,9 +13,15 @@ pub fn generate_sm_id(group: &str) -> u64 {
     hash_str(&format!("{}-{}", SM_ID_PREFIX, group))
 }
 
+struct SchemasMap {
+    schema_map: HashMap<u32, Schema>,
+    name_map: HashMap<String, u32>,
+}
+
 pub struct SchemasSM {
     callback: SMCallback,
     map: SchemasMap,
+    id_count: u32,
     sm_id: u64,
 }
 
@@ -34,7 +40,7 @@ impl StateMachineCmds for SchemasSM {
         future::ready(self.map.get_all()).boxed()
     }
     fn get(&self, id: u32) -> BoxFuture<Option<Schema>> {
-        future::ready(self.map.get(&id).map(|r| -> Schema {
+        future::ready(self.map.schema_map.get(&id).map(|r| -> Schema {
             let borrow: &Schema = r.borrow();
             borrow.clone()
         }))
@@ -63,7 +69,10 @@ impl StateMachineCmds for SchemasSM {
         .boxed()
     }
     fn next_id(&mut self) -> BoxFuture<u32> {
-        future::ready(self.map.next_id()).boxed()
+        while self.map.schema_map.contains_key(&self.id_count) {
+            self.id_count += 1;
+        }
+        future::ready(self.id_count).boxed()
     }
 }
 
@@ -88,7 +97,53 @@ impl SchemasSM {
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()).await,
             map: SchemasMap::new(),
+            id_count: 0,
             sm_id,
+        }
+    }
+}
+
+impl SchemasMap {
+    fn new() -> Self {
+        Self {
+            schema_map: HashMap::new(),
+            name_map: HashMap::new(),
+        }
+    }
+
+    fn get_all(&self) -> Vec<Schema> {
+        self.schema_map.values().map(|sr| sr.clone()).collect()
+    }
+
+    fn new_schema(&mut self, schema: Schema) -> Result<(), NewSchemaError> {
+        let name = &schema.name;
+        let id = schema.id;
+        if self.name_map.contains_key(name) {
+            return Err(NewSchemaError::NameExists(name.clone()));
+        }
+        self.name_map.insert(name.clone(), id);
+        if self.schema_map.contains_key(&id) {
+            return Err(NewSchemaError::IdExists(id));
+        }
+        self.schema_map.insert(id, schema);
+        debug!("Schema map inserted with id {}, tid {}", id, thread_id());
+        return Ok(());
+    }
+    fn del_schema(&mut self, name: &str) -> Result<(), DelSchemaError> {
+        if let Some(id) = self.name_map.remove(&(name.to_owned())) {
+            self.schema_map.remove(&id);
+            debug!("Schema map removed {}", id);
+            Ok(())
+        } else {
+            Err(DelSchemaError::SchemaDoesNotExisted)
+        }
+    }
+    fn load_from_list(&mut self, data: Vec<Schema>) {
+        for schema in data {
+            let id = schema.id;
+            self.name_map.insert(schema.name.clone(), id);
+            self.schema_map.insert(id, schema);
+            debug!("Inserted listed schema {}", id);
         }
     }
 }

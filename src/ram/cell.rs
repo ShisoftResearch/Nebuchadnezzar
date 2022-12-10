@@ -4,7 +4,7 @@ use crate::ram::entry::*;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
-use crate::ram::types::{Id, OwnedValue, RandValue, SharedValue, Value, Map};
+use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use lightning::map::WordMutexGuard;
 use serde::Serialize;

@@ -1,14 +1,14 @@
 use super::*;
+use crate::dovahkiin::types::Map;
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::{EntryContent, EntryType};
 use crate::ram::schema::Field;
 use crate::ram::schema::*;
 use crate::ram::types::*;
-use crate::dovahkiin::types::Map;
 use crate::server::ServerMeta;
 use env_logger;
-use lightning::map::{Map as LFMap};
+use lightning::map::Map as LFMap;
 use std;
 use std::collections::HashSet;
 use std::sync::Arc;

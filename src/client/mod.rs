@@ -18,7 +18,7 @@ use std::sync::Arc;
 use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
-use crate::ram::schema::{Schema, DelSchemaError, NewSchemaError};
+use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
@@ -267,9 +267,9 @@ impl AsyncClient {
     ) -> Result<Result<u32, NewSchemaError>, ExecError> {
         let schema_id = self.schema_client.next_id().await?;
         schema.id = schema_id;
-        self.new_schema_with_id(schema).await.map(|r| {
-            r.map(|_| schema_id)
-        })
+        self.new_schema_with_id(schema)
+            .await
+            .map(|r| r.map(|_| schema_id))
     }
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         self.schema_client.del_schema(&name).await

@@ -1,11 +1,11 @@
 use super::{EntryKey, Feature, IndexerClients};
+use crate::dovahkiin::types::Value;
 use crate::ram::cell::{OwnedCell, SharedCell};
 use crate::ram::types::Id;
 use crate::ram::{
     cell::Cell,
     schema::{IndexType, Schema},
 };
-use crate::dovahkiin::types::Value;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use futures::FutureExt;
 use futures::{

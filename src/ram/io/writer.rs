@@ -5,7 +5,7 @@ use crate::ram::types::OwnedValue;
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Type, Map};
+use dovahkiin::types::{key_hash, Map, Type};
 
 enum InstData<'a> {
     Ref(&'a OwnedValue),

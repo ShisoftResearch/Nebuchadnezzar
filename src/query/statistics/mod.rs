@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use dovahkiin::types::{SharedValue, Map};
+use dovahkiin::types::{Map, SharedValue};
 
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},
