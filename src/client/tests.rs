@@ -50,7 +50,7 @@ pub async fn general() {
         .await
         .unwrap(),
     );
-    let schema_id = client.new_schema(schema).await.unwrap().0;
+    let schema_id = client.new_schema(schema).await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
@@ -286,7 +286,7 @@ pub async fn write_skew() {
         .await
         .unwrap(),
     );
-    let schema_id = client.new_schema(schema).await.unwrap().0;
+    let schema_id = client.new_schema(schema).await.unwrap().unwrap();
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(100));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));

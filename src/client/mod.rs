@@ -264,15 +264,11 @@ impl AsyncClient {
     pub async fn new_schema(
         &self,
         mut schema: Schema,
-    ) -> Result<(u32, Option<NewSchemaError>), ExecError> {
+    ) -> Result<Result<u32, NewSchemaError>, ExecError> {
         let schema_id = self.schema_client.next_id().await?;
         schema.id = schema_id;
         self.new_schema_with_id(schema).await.map(|r| {
-            let error = match r {
-                Ok(_) => None,
-                Err(e) => Some(e),
-            };
-            (schema_id, error)
+            r.map(|_| schema_id)
         })
     }
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
