@@ -171,7 +171,7 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
     }
     if let Some(schema_fields) = &schema.fields.sub_fields {
         let mut res = Vec::with_capacity(fields.len()); // SharedMap::new();
-        // iterate all selected field ids
+                                                        // iterate all selected field ids
         for field in fields {
             // Get cached index path from ids
             if let Some(index_path) = schema.field_index.get(field) {

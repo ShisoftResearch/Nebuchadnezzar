@@ -142,7 +142,10 @@ pub fn cell_rw() {
             "cell {:?}",
             sel_cell.data
         );
-        assert_eq!(sel_cell.data.uni_array().unwrap()[1].string().unwrap(), "John");
+        assert_eq!(
+            sel_cell.data.uni_array().unwrap()[1].string().unwrap(),
+            "John"
+        );
     }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());
@@ -336,10 +339,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(
-            &partial_cell[0usize],
-            &cell["sub"]["sub4"]["sub4sub1"]
-        );
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub4"]["sub4sub1"]);
     }
     {
         // Selecting one deeper nullable array in nested map
@@ -348,10 +348,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(
-            &partial_cell[0usize],
-            &cell["sub"]["sub4"]["sub4sub3"]
-        );
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub4"]["sub4sub3"]);
     }
     {
         // Selecting multiple
@@ -368,10 +365,7 @@ pub fn complex_cell_sel_read() {
             .owned();
         assert_eq!(partial_cell.len().unwrap(), 2);
         assert_eq!(partial_cell[0usize], cell["sub"]["sub3"]);
-        assert_eq!(
-            partial_cell[1usize],
-            cell["sub"]["sub4"]["sub4sub3"]
-        );
+        assert_eq!(partial_cell[1usize], cell["sub"]["sub4"]["sub4sub3"]);
     }
 }
 
