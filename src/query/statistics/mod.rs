@@ -211,11 +211,7 @@ fn build_partitation_statistics(
                             select_from_chunk_raw(*loc, chunk, fields.as_slice())
                         {
                             let field_array = match partial_cell {
-                                SharedValue::Map(map) => fields
-                                    .iter()
-                                    .filter_map(|path_key| schema.id_index.get(path_key))
-                                    .map(|key| map.get_in_by_ids(key.iter()).clone())
-                                    .collect_vec(),
+                                SharedValue::Array(arr) => arr,
                                 _ => unreachable!(
                                     "Other data structure is not possible. Got {:?}",
                                     partial_cell

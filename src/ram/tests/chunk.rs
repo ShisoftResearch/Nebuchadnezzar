@@ -137,13 +137,12 @@ pub fn cell_rw() {
             .read_selected(&id2, &[hash_str("score"), hash_str("name")])
             .unwrap();
         assert_eq!(
-            sel_cell.data["score"].u64(),
+            sel_cell.data.uni_array().unwrap()[0].u64(),
             Some(&100),
-            "item {:?}, cell {:?}",
-            sel_cell.data[0usize],
+            "cell {:?}",
             sel_cell.data
         );
-        assert_eq!(sel_cell.data["name"].string().unwrap(), "John");
+        assert_eq!(sel_cell.data.uni_array().unwrap()[1].string().unwrap(), "John");
     }
     chunks.remove_cell(&id1).unwrap();
     assert!(chunks.read_cell(&id1).is_err());
@@ -291,8 +290,8 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(&partial_cell["id"], &cell["id"]);
-        assert_eq!(&partial_cell["num"], &cell["num"]);
+        assert_eq!(&partial_cell[0usize], &cell["id"]);
+        assert_eq!(&partial_cell[1usize], &cell["num"]);
     }
     {
         // Selecting one in nested map
@@ -301,7 +300,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(&partial_cell["sub"]["sub1"], &cell["sub"]["sub1"]);
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub1"]);
     }
     {
         // Selecting one array in nested map
@@ -310,7 +309,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(&partial_cell["sub"]["sub2"], &cell["sub"]["sub2"]);
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub2"]);
     }
     {
         // Selecting one string in nested map
@@ -319,7 +318,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(&partial_cell["sub"]["sub3"], &cell["sub"]["sub3"]);
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub3"]);
     }
     {
         // Selecting one map array in nested map
@@ -328,7 +327,7 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(&partial_cell["sub"]["sub4"], &cell["sub"]["sub4"]);
+        assert_eq!(&partial_cell[0usize], &cell["sub"]["sub4"]);
     }
     {
         // Selecting one deeper in nested map
@@ -338,7 +337,7 @@ pub fn complex_cell_sel_read() {
             .data
             .owned();
         assert_eq!(
-            &partial_cell["sub"]["sub4"]["sub4sub1"],
+            &partial_cell[0usize],
             &cell["sub"]["sub4"]["sub4sub1"]
         );
     }
@@ -350,7 +349,7 @@ pub fn complex_cell_sel_read() {
             .data
             .owned();
         assert_eq!(
-            &partial_cell["sub"]["sub4"]["sub4sub3"],
+            &partial_cell[0usize],
             &cell["sub"]["sub4"]["sub4sub3"]
         );
     }
@@ -367,12 +366,10 @@ pub fn complex_cell_sel_read() {
             .unwrap()
             .data
             .owned();
-        assert_eq!(partial_cell.len().unwrap(), 1);
-        assert_eq!(partial_cell["sub"].len().unwrap(), 2);
-        assert_eq!(partial_cell["sub"]["sub4"].len().unwrap(), 1);
-        assert_eq!(partial_cell["sub"]["sub3"], cell["sub"]["sub3"]);
+        assert_eq!(partial_cell.len().unwrap(), 2);
+        assert_eq!(partial_cell[0usize], cell["sub"]["sub3"]);
         assert_eq!(
-            partial_cell["sub"]["sub4"]["sub4sub3"],
+            partial_cell[1usize],
             cell["sub"]["sub4"]["sub4sub3"]
         );
     }

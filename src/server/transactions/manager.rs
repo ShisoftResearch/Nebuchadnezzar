@@ -159,15 +159,8 @@ impl Service for TransactionManager {
                                             index_path.iter().map(|id| *id as u64).collect_vec();
                                         trace!("Get into map for txn select {:?}", path);
                                         let val = map.get_in_by_ids(path.iter()).clone();
-                                        if fields.len() == 1 {
-                                            return Ok(TxnExecResult::Accepted(OwnedCell {
-                                                header: cell.header,
-                                                data: val,
-                                            }));
-                                        } else {
-                                            res.push(val);
-                                            continue 'SEARCH;
-                                        }
+                                        res.push(val);
+                                        continue 'SEARCH;
                                     }
                                     res.push(OwnedValue::Null);
                                 }

@@ -118,7 +118,7 @@ pub async fn general() {
                         .data;
                     let mut score = *cell.data["score"].u64().unwrap();
                     assert_eq!(
-                        selected.u64(),
+                        selected.uni_array().unwrap()[0].u64(),
                         Some(&score),
                         "Selected value {:?}",
                         selected
@@ -136,7 +136,7 @@ pub async fn general() {
                         .await?
                         .unwrap()
                         .data;
-                    assert_eq!(selected.u64().unwrap(), &score);
+                    assert_eq!(selected.uni_array().unwrap()[0].u64().unwrap(), &score);
 
                     let header = txn.head(cell.id()).await?.unwrap();
                     assert_eq!(header.id(), cell.id());
