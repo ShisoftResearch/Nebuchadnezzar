@@ -197,6 +197,26 @@ impl Index<u64> for OwnedCell {
     }
 }
 
+impl IndexMut<u64> for OwnedCell {
+    fn index_mut<'b>(&'b mut self, index: u64) -> &'b mut Self::Output {
+        &mut self.data[index]
+    }
+}
+
+impl Index<usize> for OwnedCell {
+    type Output = OwnedValue;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.data[index]
+    }
+}
+
+impl IndexMut<usize> for OwnedCell {
+    fn index_mut<'b>(&'b mut self, index: usize) -> &'b mut Self::Output {
+        &mut self.data[index]
+    }
+}
+
 impl<'a> Index<&'a str> for OwnedCell {
     type Output = OwnedValue;
 
@@ -207,12 +227,6 @@ impl<'a> Index<&'a str> for OwnedCell {
 
 impl<'a> IndexMut<&'a str> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
-        &mut self.data[index]
-    }
-}
-
-impl IndexMut<u64> for OwnedCell {
-    fn index_mut<'b>(&'b mut self, index: u64) -> &'b mut Self::Output {
         &mut self.data[index]
     }
 }
