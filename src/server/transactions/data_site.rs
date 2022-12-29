@@ -228,21 +228,19 @@ impl DataManager {
         let now = get_time();
         let mut cell_to_evict = Vec::new();
         let mut need_break = false;
-        for pair in self.cell_lru.iter() {
-            let kv = pair.deref().unwrap();
-            let (cell_id, timestamp) = kv.pair();
-            if let Some(cell_meta) = self.cells.get(cell_id) {
+        for (cell_id, timestamp) in self.cell_lru.iter() {
+            if let Some(cell_meta) = self.cells.get(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction
                     && meta.read < oldest_transaction
                     && now - timestamp > 5 * 60 * 1000
                 {
-                    cell_to_evict.push(*cell_id);
+                    cell_to_evict.push(cell_id);
                 } else {
                     need_break = true;
                 }
             } else {
-                cell_to_evict.push(*cell_id);
+                cell_to_evict.push(cell_id);
             }
             if need_break {
                 break;
