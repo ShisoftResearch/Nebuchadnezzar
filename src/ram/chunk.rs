@@ -86,7 +86,7 @@ impl Chunk {
         return chunk;
     }
 
-    fn get_head_seg_id(&self) -> u64 {
+    pub fn get_head_seg_id(&self) -> u64 {
         self.head_seg_id.load(Ordering::Acquire)
     }
 
