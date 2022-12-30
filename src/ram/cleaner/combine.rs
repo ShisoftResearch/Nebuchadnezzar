@@ -52,11 +52,23 @@ impl CombinedCleaner {
             return 0;
         }
 
+        let head_seg_id = chunk.get_head_seg_id();
+
+        // Remove the head segment from the candidate segments
+        // This should be done but head segment still in the list, need to investigate
+        let segments = segments
+            .iter()
+            .filter(|seg| seg.id != head_seg_id)
+            .collect_vec();
         let space_to_collect = segments
             .iter()
             .map(|seg| seg.used_spaces() as usize)
             .sum::<usize>();
-        let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
+        
+        let segment_ids_to_combine: HashSet<_> = segments
+            .iter()
+            .map(|seg| seg.id)
+            .collect();
 
         debug!("Combining segments, candidates {:?}, head seg {}", segment_ids_to_combine, chunk.get_head_seg_id());
 
