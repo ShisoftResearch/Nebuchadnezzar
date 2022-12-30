@@ -42,9 +42,17 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, segments: &Vec<Arc<Segment>>) -> usize {
+    pub fn combine_segments(chunk: &Chunk, selected_segments: &Vec<Arc<Segment>>) -> usize {
+        let head_seg_id = chunk.get_head_seg_id();
+        // Remove the head segment from the candidate segments
+        // This should be done but head segment still in the list, need to investigate
+        let segments = selected_segments
+            .iter()
+            .filter(|seg| seg.id != head_seg_id)
+            .collect_vec();
+
         if segments.len() < 2 {
-            trace!(
+            debug!(
                 "too few segments to combine, chunk {}, segments {}",
                 chunk.id,
                 segments.len()
@@ -52,14 +60,6 @@ impl CombinedCleaner {
             return 0;
         }
 
-        let head_seg_id = chunk.get_head_seg_id();
-
-        // Remove the head segment from the candidate segments
-        // This should be done but head segment still in the list, need to investigate
-        let segments = segments
-            .iter()
-            .filter(|seg| seg.id != head_seg_id)
-            .collect_vec();
         let space_to_collect = segments
             .iter()
             .map(|seg| seg.used_spaces() as usize)

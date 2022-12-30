@@ -185,6 +185,8 @@ pub fn full_clean_cycle() {
 
     // combine
     {
+        // Cleaner refused to work on head segment, set head segment to something else
+        chunk.head_seg_id.store(1234, std::sync::atomic::Ordering::Relaxed);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])
@@ -197,12 +199,12 @@ pub fn full_clean_cycle() {
                 }
             })
             .collect();
+        assert_eq!(survival_cells.len(), 8);
+        assert_eq!(chunk.segments().len(), 1);
+        assert_eq!(chunk.segments()[0].entry_iter().count(), 8);
         (0..8)
             .map(|n| n as u64 * 2 + 1)
             .for_each(|hash| assert!(survival_cells.contains(&hash)));
-        assert_eq!(chunk.segments().len(), 1);
-        assert_eq!(survival_cells.len(), 8);
-        assert_eq!(chunk.segments()[0].entry_iter().count(), 8);
     }
 
     // validate cells
