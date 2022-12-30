@@ -110,30 +110,26 @@ impl CombinedCleaner {
             // Simulate the combine process to determine the efficiency
             let mut pending_segments = Vec::with_capacity(segments.len());
             pending_segments.push(DummySegment::new());
-            let entries_num = entries.len();
-            for (index, entry_pair) in entries.iter_mut().enumerate() {
-                let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
-                let entry = &entry_pair.0;
-                let entry_size = entry.size;
-                if entry_pair.1 {
+            for (entry, is_claimed) in entries.iter_mut() {
+                let entry_size = entry.size;                    
+                if *is_claimed {
                     // entry claimed
                     continue;
-                } else if entry_size > segment_space_remains {
-                    if index == entries_num - 1 {
-                        // iterated to the last one, which means no more entries can be placed
-                        // in the segment, then create a new segment
+                }
+                {
+                    let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
+                    if entry_size > segment_space_remains {
                         pending_segments.push(DummySegment::new());
                     }
-                } else {
-                    let last_segment = pending_segments.last_mut().unwrap();
-                    last_segment.entries.push(entry.clone());
-
-                    // pump dummy segment head pointer
-                    last_segment.head += entry_size;
-
-                    // mark entry claimed
-                    entry_pair.1 = true;
                 }
+                let last_segment = pending_segments.last_mut().unwrap();
+                last_segment.entries.push(entry.clone());
+
+                // pump dummy segment head pointer
+                last_segment.head += entry_size;
+
+                // mark entry claimed
+                *is_claimed = true;
             }
 
             debug!("Checking combine feasibility");
@@ -145,6 +141,7 @@ impl CombinedCleaner {
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
                 );
+                return 0;
             }
 
             debug!(
