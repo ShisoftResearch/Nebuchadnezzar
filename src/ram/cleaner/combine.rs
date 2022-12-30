@@ -51,13 +51,14 @@ impl CombinedCleaner {
             );
             return 0;
         }
-        debug!("Combining segments");
 
         let space_to_collect = segments
             .iter()
             .map(|seg| seg.used_spaces() as usize)
             .sum::<usize>();
         let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
+
+        debug!("Combining segments, candidates {:?}, head seg {}", segment_ids_to_combine, chunk.get_head_seg_id());
 
         // Get all entries in segments to combine and order them by data temperature and size
         let nested_entries = segments
