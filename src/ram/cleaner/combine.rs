@@ -232,7 +232,7 @@ impl CombinedCleaner {
             debug!("No entries to work on, will remove all selected segments instead");
         }
 
-        debug!("Removing {} old segments", segments.len());
+        debug!("Removing {} old segments, {:?}", segments.len(), segment_ids_to_combine);
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop(chunk);
