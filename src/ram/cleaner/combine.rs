@@ -148,7 +148,7 @@ impl CombinedCleaner {
                 "Updating cell reference, pending segments {}",
                 pending_segments.len()
             );
-            pending_segments
+            let new_segs = pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
                     let new_seg = chunk
@@ -188,7 +188,7 @@ impl CombinedCleaner {
                     cleaned_total_live_space.fetch_add(new_seg.used_spaces() as usize, Relaxed);
                     return (new_seg, cell_mapping);
                 })
-                .for_each(|(segment, cells)| {
+                .map(|(segment, cells)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
                     segment.archive().unwrap();
                     let new_seg_id = segment.id as usize;
@@ -220,13 +220,16 @@ impl CombinedCleaner {
                             let _ = chunk.put_tombstone_by_cell_loc(new);
                         }
                     });
-                });
+                    new_seg_id
+                })
+                .collect::<Vec<_>>();
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(
-                "Combined {} segments to {}, total {} bytes",
+                "Combined {} segments to {}, total {} bytes, new segs {:?}",
                 segments_to_combine_len,
-                pending_segments.len(),
-                space_cleaned
+                new_segs.len(),
+                space_cleaned,
+                new_segs
             );
         } else {
             debug!("No entries to work on, will remove all selected segments instead");
