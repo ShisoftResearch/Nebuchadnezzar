@@ -104,6 +104,8 @@ impl CombinedCleaner {
             .group_by(|entry| entry.cell_hash)
             .into_iter()
             .map(|(hash, entry)| {
+                // combine entries have the same hash and then only keep the latest version
+                // for entries that does not have a hash, keep all of them
                 if hash.is_none() {
                     entry.into_iter().collect_vec()
                 } else {
