@@ -70,7 +70,7 @@ impl CombinedCleaner {
             .map(|seg| seg.id)
             .collect();
 
-        debug!("Combining segments, candidates {:?}, head seg {}", segment_ids_to_combine, chunk.get_head_seg_id());
+        debug!("Starting combining segments, candidates {:?}, head seg {}", segment_ids_to_combine, chunk.get_head_seg_id());
 
         // Get all entries in segments to combine and order them by data temperature and size
         let nested_entries = segments
@@ -248,11 +248,13 @@ impl CombinedCleaner {
             debug!("No entries to work on, will remove all selected segments instead");
         }
 
-        debug!("Removing {} old segments, {:?}, now head seg {}", segments.len(), segment_ids_to_combine, chunk.get_head_seg_id());
+        let len_cleaned_segments = segments.len();
+        debug!("Removing {} old segments, {:?}, now head seg {}", len_cleaned_segments, segment_ids_to_combine, chunk.get_head_seg_id());
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop(chunk);
         }
+        debug!("End combining segments, totally cleaned {} bytes, with {} segments.", space_cleaned, len_cleaned_segments);
         space_cleaned
     }
 }

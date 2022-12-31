@@ -461,7 +461,7 @@ impl Chunk {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
-            warn!(
+            error!(
                 "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?}",
                 cell_id,
                 addr,
