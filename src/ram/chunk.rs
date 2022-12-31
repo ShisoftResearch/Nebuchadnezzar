@@ -192,7 +192,7 @@ impl Chunk {
         }
     }
 
-    fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
+    pub (crate) fn head_cell(&self, hash: u64) -> Result<CellHeader, ReadError> {
         header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 

@@ -16,6 +16,7 @@ pub struct CombinedCleaner;
 struct DummyEntry {
     size: usize,
     addr: usize,
+    cell_ver: u64,
     cell_hash: Option<u64>,
     timestamp: u32,
 }
@@ -96,8 +97,19 @@ impl CombinedCleaner {
                     addr: entry_addr,
                     timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
                     cell_hash: cell_header.map(|h| h.hash),
+                    cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
                 }
             })
+            .group_by(|entry| entry.cell_hash)
+            .into_iter()
+            .map(|(hash, entry)| {
+                if hash.is_none() {
+                    entry.into_iter().collect_vec()
+                } else {
+                    vec![entry.into_iter().max_by_key(|e| e.cell_ver).unwrap()]
+                }
+            })
+            .flatten()
             .group_by(|entry| entry.timestamp / 10)
             .into_iter()
             .map(|(t, group)| {
@@ -192,7 +204,7 @@ impl CombinedCleaner {
                                 entry_addr,
                                 new_seg_id
                             );
-                            cell_mapping.push((seg_cursor, entry_addr, cell_hash));
+                            cell_mapping.push((seg_cursor, entry_addr, cell_hash, entry.cell_ver));
                         }
                         seg_cursor += entry.size;
                     }
@@ -207,24 +219,39 @@ impl CombinedCleaner {
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
-                    cells.into_par_iter().for_each(|(new, old, hash)| {
+                    cells.into_par_iter().for_each(|(new, old, hash, ver)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         let index = chunk.cell_index.lock(hash as usize);
                         if let Some(mut actual_addr) = index {
                             if *actual_addr == old {
                                 *actual_addr = new;
                                 trace!(
-                                    "Cell addr for hash {} set from {} to {} for combine",
+                                    "Cell addr for hash {} set from {} to {} for combine, ver {}",
                                     hash,
                                     old,
-                                    new
+                                    new,
+                                    ver
                                 );
                             } else {
+                                #[cfg(debug_assertions)]
+                                {
+                                    let current_header = chunk.head_cell(hash).unwrap();
+                                    assert!(
+                                        current_header.version > ver, 
+                                        "Cell {} with address {} changed to {} but version running backwards {} -> {}",
+                                        hash,
+                                        old,
+                                        *actual_addr,
+                                        ver,
+                                        current_header.version
+                                    );
+                                }
                                 trace!(
-                                    "cell {} with address {}, have been changed to {} on combine",
+                                    "cell {} with address {}, have been changed to {} on combine, ver {}",
                                     hash,
                                     old,
-                                    *actual_addr
+                                    *actual_addr,
+                                    ver
                                 );
                                 chunk.mark_dead_entry_with_seg(new, &new_seg);
                             }
