@@ -617,7 +617,7 @@ impl Chunk {
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<Arc<Segment>> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<(Arc<Segment>, f32)> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -631,8 +631,8 @@ impl Chunk {
                 *utilization < 50f32 && head_seg_id != seg.id && seg.no_references()
             })
             .collect();
-        mapping.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
-        return mapping.into_iter().map(|(seg, _)| seg).collect();
+        mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
+        return mapping;
     }
 
     pub fn check_and_archive_segments(&self) {

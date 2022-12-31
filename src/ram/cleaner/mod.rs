@@ -1,4 +1,5 @@
 use crate::ram::chunk::{Chunk, Chunks};
+use itertools::Itertools;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -92,12 +93,19 @@ impl Cleaner {
 
         {
             debug!("Starting combine {}", chunk.id);
-            let segments_candidates_for_combine: Vec<_> = chunk.segs_for_combine_cleaner();
+            let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
             let num_segments_candidates_for_combine = segments_candidates_for_combine.len();
-            let segments_for_combine: Vec<_> = segments_candidates_for_combine
-                .into_iter()
-                .take(segments_combine_per_turn)
-                .collect();
+            let mut segments_for_combine = vec![];
+            let mut combining_size = 0f32;
+            let max_combining_size = segments_combine_per_turn as f32;
+            for (seg, util) in segments_candidates_for_combine {
+                let new_size = combining_size + util;
+                if new_size > max_combining_size {
+                    break;
+                }
+                segments_for_combine.push(seg);
+                combining_size = new_size;
+            }
             if !segments_for_combine.is_empty() {
                 debug!(
                     "Have {} segments to combine, candidates {}",
