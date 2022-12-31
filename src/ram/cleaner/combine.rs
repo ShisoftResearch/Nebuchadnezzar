@@ -1,3 +1,4 @@
+use crate::ram::cell;
 use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
@@ -235,7 +236,7 @@ impl CombinedCleaner {
                             } else {
                                 #[cfg(debug_assertions)]
                                 {
-                                    let current_header = chunk.head_cell(hash).unwrap();
+                                    let (current_header, _, _) = cell::header_from_chunk_raw(*actual_addr).unwrap();
                                     assert!(
                                         current_header.version > ver, 
                                         "Cell {} with address {} changed to {} but version running backwards {} -> {}",
