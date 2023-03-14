@@ -152,7 +152,7 @@ where
             let first_key = node.keys.as_slice_immute()[0].clone();
             len += node.len;
             node.prev = prev_ref.clone();
-            let node_ref = NodeCellRef::new(Node::with_external(box node));
+            let node_ref = NodeCellRef::new(Node::with_external(Box::new(node)));
             if !prev_lock.is_ref_none() {
                 *prev_lock.right_bound_mut() = first_key.clone();
                 *prev_lock.right_ref_mut().unwrap() = node_ref.clone();

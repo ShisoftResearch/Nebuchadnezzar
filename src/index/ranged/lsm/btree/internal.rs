@@ -40,13 +40,13 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(len: usize, right_bound: EntryKey) -> Box<Self> {
-        box InNode {
+        Box::new(InNode {
             keys: KS::init(),
             ptrs: PS::init(),
             right: NodeCellRef::default(),
             right_bound,
             len,
-        }
+        })
     }
 
     pub fn key_pos_from_ptr_pos(&self, ptr_pos: usize) -> usize {
@@ -179,13 +179,13 @@ where
             }
         };
         let right_bound = mem::replace(&mut self.right_bound, pivot_key);
-        let node_2 = box InNode {
+        let node_2 = Box::new(InNode {
             len: keys_split.keys_2_len,
             keys: keys_split.keys_2,
             ptrs: ptr_split.ptrs_2,
             right: self.right.clone(),
             right_bound,
-        };
+        });
         debug_assert!(self.right_bound < node_2.right_bound);
         debug_assert!(self.right_bound <= node_2.keys.as_slice_immute()[0]);
         let node_2_ref = NodeCellRef::new(Node::with_internal(node_2));
@@ -295,10 +295,10 @@ where
             }
             left_extnode.next = right_extnode.next.clone();
         }
-        **right_node = NodeData::Empty(box EmptyNode {
+        **right_node = NodeData::Empty(Box::new(EmptyNode {
             left: Some(left_node_ref.clone()),
             right: left_node_ref.clone(),
-        });
+        }));
         trace!(
             "Removing merged node at {}, left {}, right {}, merged {}",
             right_ptr_pos,

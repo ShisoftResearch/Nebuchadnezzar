@@ -2,11 +2,11 @@ use super::*;
 
 macro_rules! bool_op {
     ($fn: ident, $in: expr) => {{
-        let mut last_res: Box<dyn Array> = box NullArray::new($in[0].len());
+        let mut last_res: Box<dyn Array> = Box::new(NullArray::new($in[0].len()));
         let mut x = $in[0];
         for i in 1..$in.len() {
             let y = $in[i];
-            last_res = box $fn(as_bool_arr(x)?, as_bool_arr(y)?)?;
+            last_res = Box::new($fn(as_bool_arr(x)?, as_bool_arr(y)?)?);
             x = &*last_res;
         }
         Ok(last_res.into())

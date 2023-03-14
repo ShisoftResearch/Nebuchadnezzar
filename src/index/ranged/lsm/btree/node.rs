@@ -574,7 +574,7 @@ where
             left: left_node,
             right: right_node,
         };
-        *data = NodeData::Empty(box empty)
+        *data = NodeData::Empty(Box::new(empty))
     }
 
     pub fn extnode_mut_no_persist(&mut self) -> &mut ExtNode<KS, PS> {

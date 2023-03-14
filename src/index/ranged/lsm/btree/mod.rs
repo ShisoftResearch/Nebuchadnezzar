@@ -381,7 +381,7 @@ where
     }
 
     fn seek_for(&self, key: &EntryKey, ordering: Ordering) -> Box<dyn Cursor> {
-        box self.seek(key, ordering)
+        Box::new(self.seek(key, ordering))
     }
 
     fn dump(&self, f: &str) {

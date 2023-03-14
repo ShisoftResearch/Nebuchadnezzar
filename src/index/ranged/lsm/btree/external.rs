@@ -53,7 +53,7 @@ where
     PS: Slice<NodeCellRef> + 'static,
 {
     pub fn new(id: Id, right_bound: EntryKey) -> Box<Self> {
-        box ExtNode {
+        Box::new(ExtNode {
             id,
             keys: KS::init(),
             next: Node::<KS, PS>::none_ref(),
@@ -61,7 +61,7 @@ where
             len: 0,
             right_bound,
             mark: PhantomData,
-        }
+        })
     }
 
     pub fn from_cell(cell: &OwnedCell) -> Box<IncubatingExtNode<KS, PS>> {
@@ -91,11 +91,11 @@ where
             right_bound: max_entry_key(), // UNDETERMINED
             mark: PhantomData,
         };
-        box IncubatingExtNode {
+        Box::new(IncubatingExtNode {
             node: ext_node,
             prev_id: *prev,
             next_id: *next,
-        }
+        })
     }
 
     pub fn to_cell(&self, deleted: &DeletionSet) -> OwnedCell {
@@ -174,7 +174,7 @@ where
             pos,
         );
         let pivot_key = keys_2.as_slice_immute()[0].clone();
-        let extnode_2: Box<ExtNode<KS, PS>> = box ExtNode {
+        let extnode_2: Box<ExtNode<KS, PS>> = Box::new(ExtNode {
             id: new_page_id,
             keys: keys_2,
             next: self.next.clone(),
@@ -182,7 +182,7 @@ where
             len: keys_2_len,
             right_bound: self.right_bound.clone(),
             mark: PhantomData,
-        };
+        });
         debug_assert!(
             pivot_key < self.right_bound,
             "pivot {:?}, right bound {:?}",

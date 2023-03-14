@@ -36,7 +36,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
-arrow = "28"
+arrow = "35"
 num = "*"
 
 [dev-dependencies]

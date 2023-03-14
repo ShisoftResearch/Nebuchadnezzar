@@ -1,4 +1,3 @@
-#![feature(box_syntax)]
 #![feature(test)]
 #![feature(async_closure)]
 #![feature(thread_id_value)]

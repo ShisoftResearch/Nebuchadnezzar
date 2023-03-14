@@ -48,9 +48,9 @@ impl LSMTree {
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
         neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
         Self {
-            mem_tree: Atomic::new(box tree_m),
+            mem_tree: Atomic::new(Box::new(tree_m)),
             trans_mem_tree: Atomic::null(),
-            disk_trees: [box tree_0, box tree_1],
+            disk_trees: [Box::new(tree_0), Box::new(tree_1)],
             deletion: deletion_ref,
         }
     }
@@ -72,9 +72,9 @@ impl LSMTree {
         debug!("Recovering level 1 tree {:?}", tree_1_id);
         let tree_1 = Level1Tree::from_head_id(tree_1_id, neb_client, &deletion_ref, 1).await;
         Self {
-            mem_tree: Atomic::new(box LevelMTree::new(&deletion_ref)),
+            mem_tree: Atomic::new(Box::new(LevelMTree::new(&deletion_ref))),
             trans_mem_tree: Atomic::null(),
-            disk_trees: [box tree_0, box tree_1],
+            disk_trees: [Box::new(tree_0), Box::new(tree_1)],
             deletion: deletion_ref,
         }
     }
@@ -113,7 +113,7 @@ impl LSMTree {
                 // Memory tree oversized
                 // Will construct a new tree and swap the old one to trans_mem_tree for query and move all
                 // keys in old tree to disk tree level 0
-                let new_mem_tree: Box<dyn LevelTree> = box LevelMTree::new(&self.deletion);
+                let new_mem_tree: Box<dyn LevelTree> = Box::new(LevelMTree::new(&self.deletion));
                 let new_mem_tree_ptr = Owned::new(new_mem_tree).into_shared(&guard);
                 self.trans_mem_tree.store(mem_tree_ptr, Release);
                 self.mem_tree.store(new_mem_tree_ptr, Release);
@@ -164,7 +164,7 @@ impl LSMTree {
         let guard = crossbeam_epoch::pin();
         let mem_tree_ptr = self.mem_tree.load(Acquire, &guard);
         let mem_tree = unsafe { mem_tree_ptr.as_ref().unwrap() };
-        let new_mem_tree: Box<dyn LevelTree> = box LevelMTree::new(&self.deletion);
+        let new_mem_tree: Box<dyn LevelTree> = Box::new(LevelMTree::new(&self.deletion));
         let new_mem_tree_ptr = Owned::new(new_mem_tree).into_shared(&guard);
         self.trans_mem_tree.store(mem_tree_ptr, Release);
         self.mem_tree.store(new_mem_tree_ptr, Release);
@@ -308,7 +308,7 @@ impl LSMTreeCursor {
             mem_tree.seek_for(key, ordering),
             disk_trees[0].seek_for(key, ordering),
             disk_trees[1].seek_for(key, ordering),
-            box DummyCursor, // for trans mem
+            Box::new(DummyCursor), // for trans mem
         ];
         if !trans_mem_tree_ptr.is_null() && trans_mem_tree_ptr != mem_tree_ptr {
             let trans_mem_tree = unsafe { trans_mem_tree_ptr.as_ref().unwrap() };

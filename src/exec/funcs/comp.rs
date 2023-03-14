@@ -18,10 +18,10 @@ macro_rules! str_cmp_op_fn {
             if y.len() == 1 {
                 // scalar
                 let y = y_prim.value(0);
-                res = box $str_scalar_fn(x_prim, y)?;
+                res = Box::new($str_scalar_fn(x_prim, y)?);
             } else {
                 // vector
-                res = box $str_vec_fn(x_prim, y_prim)?;
+                res = Box::new($str_vec_fn(x_prim, y_prim)?);
             }
             Ok(res.into())
         }
@@ -44,10 +44,10 @@ macro_rules! cmp_op {
             if y.len() == 1 {
                 // scalar
                 let y = y_prim.value(0);
-                res = box $scalar_fn::<T>(x_prim, y)?;
+                res = Box::new($scalar_fn::<T>(x_prim, y)?);
             } else {
                 // vector
-                res = box $vec_fn::<T>(x_prim, y_prim)?;
+                res = Box::new($vec_fn::<T>(x_prim, y_prim)?);
             }
             Ok(res.into())
         }

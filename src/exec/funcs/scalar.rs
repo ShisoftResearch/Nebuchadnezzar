@@ -16,11 +16,11 @@ macro_rules! scalar_op {
                 + Zero
                 + One,
         {
-            let mut last_res: Box<dyn Array> = box NullArray::new(input[0].len());
+            let mut last_res: Box<dyn Array> = Box::new(NullArray::new(input[0].len()));
             let mut x = input[0];
             for i in 1..input.len() {
                 let y = input[i];
-                last_res = box $fn::<T>(as_prim_arr(x)?, as_prim_arr(y)?)?;
+                last_res = Box::new($fn::<T>(as_prim_arr(x)?, as_prim_arr(y)?)?);
                 x = &*last_res;
             }
             Ok(last_res.into())

@@ -87,7 +87,7 @@ impl Entry {
             let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
             let entry_bytes_len = 0b0000_1111 & flag_byte;
             let entry_bytes_len_usize = entry_bytes_len as usize;
-            let raw_len_bytes = Box::into_raw(box [0u8; 4]);
+            let raw_len_bytes = Box::into_raw(Box::new([0u8; 4]));
             libc::memmove(
                 raw_len_bytes as *mut libc::c_void,
                 pos as *mut libc::c_void,

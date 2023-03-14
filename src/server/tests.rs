@@ -249,7 +249,7 @@ pub async fn txn() {
     let _ = env_logger::try_init();
     const DATA: &'static str = "DATA";
     let num = env::var("NEB_KV_TXN_TEST_ITEMS")
-        .unwrap_or("1000".to_string())
+        .unwrap_or("2000".to_string())
         .parse::<u64>()
         .unwrap();
     let server_addr = String::from("127.0.0.1:5303");

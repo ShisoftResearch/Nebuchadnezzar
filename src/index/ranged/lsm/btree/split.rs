@@ -92,7 +92,7 @@ fn retain_by_node<KS, PS>(
                 let node_id = node.ext_id();
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
                 num_removed_keys += node.len();
-                *node = NodeData::Empty(box Default::default());
+                *node = NodeData::Empty(Box::new(Default::default()));
                 make_deleted::<KS, PS>(&node_id);
             }
             tree.len.fetch_sub(num_removed_keys, Release);
@@ -126,7 +126,7 @@ fn retain_by_node<KS, PS>(
             while !right_node_ref.is_default() {
                 let mut node = write_node::<KS, PS>(&right_node_ref);
                 right_node_ref = mem::take(node.right_ref_mut().unwrap());
-                *node = NodeData::Empty(box Default::default());
+                *node = NodeData::Empty(Box::new(Default::default()));
             }
         }
         &NodeData::Empty(ref n) => {
