@@ -4,6 +4,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use libc;
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct EntryType: u8 {
         const UNDECIDED =   0b0000_0000;
         const CELL =        0b0001_0000;
@@ -52,7 +53,7 @@ impl Entry {
         W: Fn(usize),
     {
         debug_assert!(len_bytes_count.leading_zeros() >= 4);
-        let entry_type_bits = entry_type.bits;
+        let entry_type_bits = entry_type.bits();
         let len_bytes_count_usize = len_bytes_count as usize;
         let flag_byte = len_bytes_count | entry_type_bits;
         let mut len_bytes = [0u8; 4];

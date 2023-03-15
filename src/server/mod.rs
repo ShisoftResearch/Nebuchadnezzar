@@ -394,7 +394,7 @@ pub async fn init_ranged_indexer_service(
         .await;
     let mut tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash);
     tree_sm.try_initialize().await;
-    raft_svr.register_state_machine(box tree_sm).await;
+    raft_svr.register_state_machine(Box::new(tree_sm)).await;
 }
 
 fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
