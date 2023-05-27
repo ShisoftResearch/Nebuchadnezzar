@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
+use crate::ram::io::align_address;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
@@ -95,6 +96,7 @@ impl Segment {
                 {
                     continue;
                 } else {
+                    debug_assert_eq!(align_address(8, curr_last), curr_last, "Acquired address is not aligned");
                     return Some(curr_last);
                 }
             }

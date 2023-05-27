@@ -1,5 +1,6 @@
 use itertools::Itertools;
 
+use crate::ram::io::{align_ptr_addr, align_address};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
@@ -19,13 +20,11 @@ fn read_field<'v>(
     let field_offset = if is_var {
         // Is inside size variable field, read directly from the address
         tail_offset
-    } else if !field.is_var() {
-        // Is not inside var and field not var, read from the offset in field
-        &mut rec_field_offset
-    } else {
-        // Is not inside var and field is var, read the pointer and direct to it
+    } else if field.is_array {
         *tail_offset = *u32_io::read(base_ptr + field.offset.unwrap()) as usize;
         tail_offset
+    } else {
+        &mut rec_field_offset
     };
     trace!("Reading {} at offset {}", field.name, field_offset);
     if field.nullable {
@@ -36,14 +35,17 @@ fn read_field<'v>(
         }
     }
     if field.is_array {
+        let ty_align = types::align_of_type(field.data_type);
+        *field_offset = align_ptr_addr(*field_offset);
         let len = *u32_io::read(base_ptr + *field_offset);
         trace!("Field {} is array, length {}", field.name, len);
         let mut sub_field = field.clone();
         sub_field.is_array = false;
         *field_offset += u32_io::type_size();
+        let mut ptr = base_ptr + *field_offset;
         if field.sub_fields.is_none() {
             // maybe primitive array
-            let mut ptr = base_ptr + *field_offset;
+            ptr = align_address(ty_align, ptr);
             let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
             *field_offset = ptr - base_ptr;
             if let Some(prim_arr) = val {
@@ -74,8 +76,9 @@ fn read_field<'v>(
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         SharedValue::Map(map)
     } else {
-        let field_ptr = base_ptr + *field_offset;
-        *field_offset += types::get_size(field.data_type, field_ptr);
+        let ty_align = types::align_of_type(field.data_type);
+        let field_ptr = align_address(ty_align, base_ptr + *field_offset);
+        *field_offset = field_ptr + types::get_size(field.data_type, field_ptr) - base_ptr;
         let val = types::get_shared_val(field.data_type, field_ptr);
         trace!("Field {} is value: {:?}", field.name, val);
         val
@@ -103,6 +106,7 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
     *ptr += types::u8_io::type_size();
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
+        *ptr = align_ptr_addr(*ptr);
         let len_val = types::get_shared_val(Type::U32, *ptr);
         let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
@@ -123,6 +127,7 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
         }
     } else if *type_id == MAP_TYPE_ID {
         // Map
+        *ptr = align_ptr_addr(*ptr);
         let len_val = types::get_shared_val(Type::U32, *ptr);
         let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
@@ -149,6 +154,7 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
         return SharedValue::Null;
     } else {
         let ty = Type::from_id(*type_id);
+        *ptr = align_address(types::align_of_type(ty), *ptr);
         let value = types::get_shared_val(ty, *ptr);
         *ptr += types::get_size(ty, *ptr);
         return value;

@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::clock;
 use crate::ram::entry::*;
+use crate::ram::io::align_address;
 use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
@@ -142,8 +143,7 @@ impl OwnedCell {
             )?;
         }
         let entry_body_size = tail_offset + CELL_HEADER_SIZE;
-        let len_bytes = Entry::count_len_bytes(entry_body_size as u32);
-        let total_size = Entry::size(len_bytes, entry_body_size as u32);
+        let total_size = align_address(8, ENTRY_HEAD_SIZE + entry_body_size) as u32;
         if total_size > MAX_CELL_SIZE {
             return Err(WriteError::CellIsTooLarge(total_size as usize));
         }
@@ -159,11 +159,11 @@ impl OwnedCell {
             }
             Some(pending_entry) => {
                 let addr = pending_entry.addr;
+                debug_assert_eq!(align_address(8, addr), addr, "Entry address is not aligned");
                 Entry::encode_to(
                     addr,
                     EntryType::CELL,
                     entry_body_size as u32,
-                    len_bytes,
                     |content_addr| {
                         // write cell header
                         let header = &self.header;
@@ -174,7 +174,10 @@ impl OwnedCell {
                         cursor.write_u64::<Endian>(header.partition).unwrap();
                         cursor.write_u64::<Endian>(header.hash).unwrap();
                         release_cursor(cursor);
-                        writer::execute_plan(content_addr + CELL_HEADER_SIZE, &instructions);
+                        let data_base_addr = content_addr + CELL_HEADER_SIZE;
+                        debug_assert_eq!(align_address(8, content_addr), content_addr, "Content address is not aligned");
+                        debug_assert_eq!(align_address(8, data_base_addr), data_base_addr, "Data base address is not aligned");
+                        writer::execute_plan(data_base_addr, &instructions);
                     },
                 );
                 return Ok(addr);

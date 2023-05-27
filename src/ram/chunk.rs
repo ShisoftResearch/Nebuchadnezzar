@@ -2,7 +2,7 @@ use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatisti
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
-use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE, TOMBSTONE_SIZE};
+use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
 use crate::{index::builder::IndexBuilder, ram::cell::*};
@@ -475,7 +475,7 @@ impl Chunk {
     #[inline]
     fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &Arc<Segment>) {
         let pending_entry = (|| loop {
-            if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE) {
+            if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32) {
                 return pending_entry;
             }
             warn!(
@@ -561,7 +561,7 @@ impl Chunk {
                 let mut death_count = 0;
                 if
                 // have not much tombstones
-                (tombstones as f64) * (TOMBSTONE_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
+                (tombstones as f64) * (TOMBSTONE_ENTRY_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
                         // large partition have been scanned
                         (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
                         // have been scanned recently

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::AtomicU32;
 
+use crate::ram::io::align_address;
 use crate::utils::thread_id;
 
 use super::types;
@@ -22,6 +23,10 @@ use futures::FutureExt;
 use std::ops::Deref;
 
 pub mod sm;
+
+pub type FieldPtr = u32;
+
+pub const PTR_ALIGN: usize = mem::align_of::<u32>();
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
@@ -162,7 +167,7 @@ impl Field {
         field_path: Vec<usize>,
         id_path: Vec<u64>,
     ) {
-        const POINTER_SIZE: usize = mem::size_of::<u32>();
+        const POINTER_SIZE: usize = mem::size_of::<FieldPtr>();
         self.offset = Some(*offset);
         let is_field_var = self.is_var();
         let name_path_hash = hash_str(&name_path);
@@ -171,6 +176,7 @@ impl Field {
         }
         if self.is_array {
             // u32 as indication of the offset to the actual data
+            *offset = align_address(PTR_ALIGN, *offset);
             *offset += POINTER_SIZE;
         } else if let Some(ref mut subs) = self.sub_fields {
             let format_name = if name_path.is_empty() {
@@ -196,8 +202,11 @@ impl Field {
             });
         } else {
             if !is_field_var {
+                let ty_align = types::align_of_type(self.data_type);
+                *offset = align_address(ty_align, *offset);
                 *offset += types::size_of_type(self.data_type);
             } else {
+                *offset = align_address(PTR_ALIGN, *offset);
                 *offset += POINTER_SIZE;
             }
         }
@@ -220,7 +229,7 @@ impl Field {
         );
     }
     pub fn is_var(&self) -> bool {
-        self.is_array || !types::fixed_size(self.data_type)
+        self.is_array || (!types::fixed_size(self.data_type) && self.sub_fields.is_none())
     }
     pub fn field_by_name_id(&self, name_id: &u64) -> Option<&Field> {
         self.sub_fields_map.as_ref().and_then(|m| {

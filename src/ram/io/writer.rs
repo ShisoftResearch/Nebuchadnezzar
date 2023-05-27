@@ -1,4 +1,5 @@
-use crate::ram::cell::*;
+use crate::ram::io::align_ptr_addr;
+use crate::ram::{cell::*, io::align_address};
 use crate::ram::schema::Field;
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
@@ -126,6 +127,7 @@ pub fn plan_write_field<'a>(
             let mut sub_field = field.clone();
             sub_field.is_array = false;
             trace!("Pushing array len inst with {} at {}", len, *offset);
+            *offset = align_ptr_addr(*offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
@@ -140,6 +142,7 @@ pub fn plan_write_field<'a>(
             let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
             trace!("Pushing prim array len inst with {} at {}", len, *offset);
+            *offset = align_ptr_addr(*offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
@@ -151,6 +154,8 @@ pub fn plan_write_field<'a>(
                 value,
                 *offset
             );
+            let ty_align = types::align_of_type(field.data_type);
+            *offset = align_address(ty_align, *offset);
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
@@ -169,6 +174,8 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
         if !is_null {
+            let ty_align = types::align_of_type(field.data_type);
+            *offset = align_address(ty_align, *offset);
             let size = types::get_vsize(field.data_type, &value);
             ins.push(Instruction {
                 data_type: field.data_type,
