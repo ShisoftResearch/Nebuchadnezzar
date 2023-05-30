@@ -14,6 +14,8 @@ use std::path::Path;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
 
+use super::entry::ENTRY_HEAD_SIZE;
+
 pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
@@ -269,10 +271,9 @@ impl Iterator for SegmentEntryIter {
             return None;
         }
         let (_, entry_meta) = entry::Entry::decode_from(cursor, |body_pos, header| {
-            let entry_header_size = body_pos - cursor;
-            let entry_size = entry_header_size + header.content_length as usize;
-            trace!("Found body pos {}, entry header {:?}. Header size: {}, entry size: {}, entry pos: {}, content length {}, bound {}",
-                       body_pos, header, entry_header_size, entry_size, cursor, header.content_length, self.bound);
+            let entry_size = ENTRY_HEAD_SIZE + header.content_length as usize;
+            debug!("Found body pos {}. Header: {:?}, entry size: {}, entry pos: {}, content length {}, bound {}",
+                       body_pos, header, entry_size, cursor, header.content_length, self.bound);
             return EntryMeta {
                 body_pos,
                 entry_header: header,

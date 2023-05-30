@@ -1,3 +1,4 @@
+use std::panic;
 use std::{io::Cursor, mem};
 
 use crate::ram::cell::CellHeader;
@@ -55,8 +56,8 @@ impl Entry {
     {
         let entry_type_bits = entry_type.bits();
         let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut[u8; 8] as *mut [u8]) });
-        cursor.write_u32::<Endian>(entry_type_bits);
-        cursor.write_u32::<LittleEndian>(content_len);
+        cursor.write_u32::<Endian>(entry_type_bits).unwrap();
+        cursor.write_u32::<Endian>(content_len).unwrap();
         pos += ENTRY_HEAD_SIZE;
         write_content(pos);
         Box::into_raw(cursor.into_inner());
@@ -70,11 +71,14 @@ impl Entry {
         let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut[u8; 8] as *mut [u8]) });
         let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
         let content_length = cursor.read_u32::<Endian>().unwrap();
-        let entry_type = EntryType::from_bits(entry_type_bits).unwrap();
-        let entry = EntryHeader { entry_type, content_length };
-        pos += ENTRY_HEAD_SIZE;
-        Box::into_raw(cursor.into_inner());
-        (entry, content_read(pos, entry))
+        if let Some(entry_type) = EntryType::from_bits(entry_type_bits) {
+            let entry = EntryHeader { entry_type, content_length };
+            pos += ENTRY_HEAD_SIZE;
+            Box::into_raw(cursor.into_inner());
+            (entry, content_read(pos, entry))
+        } else {
+            panic!("Cannot decode entry header: {}", entry_type_bits);
+        }
     }
 }
 

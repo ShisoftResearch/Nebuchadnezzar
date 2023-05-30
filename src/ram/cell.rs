@@ -142,8 +142,8 @@ impl OwnedCell {
                 &mut instructions,
             )?;
         }
-        let entry_body_size = tail_offset + CELL_HEADER_SIZE;
-        let total_size = align_address(8, ENTRY_HEAD_SIZE + entry_body_size) as u32;
+        let entry_body_size = align_address(8, tail_offset + CELL_HEADER_SIZE);
+        let total_size = (ENTRY_HEAD_SIZE + entry_body_size) as u32;
         if total_size > MAX_CELL_SIZE {
             return Err(WriteError::CellIsTooLarge(total_size as usize));
         }
@@ -180,6 +180,7 @@ impl OwnedCell {
                         writer::execute_plan(data_base_addr, &instructions);
                     },
                 );
+                debug!("Written cell {:?} with total size {}", self.header, total_size);
                 return Ok(addr);
             }
         }
