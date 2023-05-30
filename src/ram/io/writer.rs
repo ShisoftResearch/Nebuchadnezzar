@@ -83,6 +83,8 @@ pub fn plan_write_field<'a>(
                 tail_offset,
                 schema_offset
             );
+            let ty_align = types::align_of_type(field.data_type);
+            *tail_offset = align_address(ty_align, *tail_offset);
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
@@ -174,8 +176,6 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
         if !is_null {
-            let ty_align = types::align_of_type(field.data_type);
-            *offset = align_address(ty_align, *offset);
             let size = types::get_vsize(field.data_type, &value);
             ins.push(Instruction {
                 data_type: field.data_type,

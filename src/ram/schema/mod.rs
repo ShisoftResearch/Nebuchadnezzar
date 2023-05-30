@@ -11,6 +11,7 @@ use std::mem;
 use std::sync::atomic::AtomicU32;
 
 use crate::ram::io::align_address;
+use crate::ram::io::align_ptr_addr;
 use crate::utils::thread_id;
 
 use super::types;
@@ -72,6 +73,7 @@ impl Schema {
             vec![],
             vec![],
         );
+        bound = align_ptr_addr(bound);
         trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
@@ -168,17 +170,18 @@ impl Field {
         id_path: Vec<u64>,
     ) {
         const POINTER_SIZE: usize = mem::size_of::<FieldPtr>();
-        self.offset = Some(*offset);
         let is_field_var = self.is_var();
         let name_path_hash = hash_str(&name_path);
+        let next_add;
         if self.nullable && !is_field_var {
             *offset += 1;
         }
         if self.is_array {
             // u32 as indication of the offset to the actual data
             *offset = align_address(PTR_ALIGN, *offset);
-            *offset += POINTER_SIZE;
+            next_add = POINTER_SIZE;
         } else if let Some(ref mut subs) = self.sub_fields {
+            next_add = 0; // Map add nothing
             let format_name = if name_path.is_empty() {
                 name_path
             } else {
@@ -204,10 +207,10 @@ impl Field {
             if !is_field_var {
                 let ty_align = types::align_of_type(self.data_type);
                 *offset = align_address(ty_align, *offset);
-                *offset += types::size_of_type(self.data_type);
+                next_add = types::size_of_type(self.data_type);
             } else {
                 *offset = align_address(PTR_ALIGN, *offset);
-                *offset += POINTER_SIZE;
+                next_add = POINTER_SIZE;
             }
         }
         if !field_path.is_empty() {
@@ -219,6 +222,8 @@ impl Field {
                 index_fields.insert(name_path_hash, self.indices.clone());
             }
         }
+        self.offset = Some(*offset);
+        *offset += next_add;
         trace!(
             "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
             self.name,

@@ -17,10 +17,11 @@ fn read_field<'v>(
     tail_offset: &mut usize,
 ) -> SharedValue<'v> {
     let mut rec_field_offset = field.offset.unwrap_or(0);
+    let field_is_var = field.is_var();
     let field_offset = if is_var {
         // Is inside size variable field, read directly from the address
         tail_offset
-    } else if field.is_array {
+    } else if field.is_array || field_is_var {
         *tail_offset = *u32_io::read(base_ptr + field.offset.unwrap()) as usize;
         tail_offset
     } else {
@@ -35,8 +36,6 @@ fn read_field<'v>(
         }
     }
     if field.is_array {
-        let ty_align = types::align_of_type(field.data_type);
-        *field_offset = align_ptr_addr(*field_offset);
         let len = *u32_io::read(base_ptr + *field_offset);
         trace!("Field {} is array, length {}", field.name, len);
         let mut sub_field = field.clone();
@@ -45,7 +44,6 @@ fn read_field<'v>(
         let mut ptr = base_ptr + *field_offset;
         if field.sub_fields.is_none() {
             // maybe primitive array
-            ptr = align_address(ty_align, ptr);
             let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
             *field_offset = ptr - base_ptr;
             if let Some(prim_arr) = val {
@@ -76,9 +74,11 @@ fn read_field<'v>(
         map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
         SharedValue::Map(map)
     } else {
-        let ty_align = types::align_of_type(field.data_type);
-        let field_ptr = align_address(ty_align, base_ptr + *field_offset);
-        *field_offset = field_ptr + types::get_size(field.data_type, field_ptr) - base_ptr;
+        let field_ptr = base_ptr + *field_offset;
+        if field_is_var {
+            let ty_align = types::align_of_type(field.data_type);
+            *field_offset = align_address(ty_align, *field_offset + types::get_size(field.data_type, field_ptr));
+        }
         let val = types::get_shared_val(field.data_type, field_ptr);
         trace!("Field {} is value: {:?}", field.name, val);
         val
