@@ -202,6 +202,7 @@ pub fn plan_write_dynamic_fields<'a>(
     value: &'a OwnedValue,
     ins: &mut Vec<Instruction<'a>>,
 ) -> Result<(), WriteError> {
+    *offset = align_ptr_addr(*offset);
     if let (OwnedValue::Map(data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();
         let dynamic_map: HashMap<_, _> = data_all
