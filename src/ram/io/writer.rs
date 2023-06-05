@@ -6,7 +6,8 @@ use crate::ram::{cell::*, io::align_address};
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Map, Type, ARRAY_LEN_TYPE};
+use dovahkiin::types::{key_hash, Map, Type, ARRAY_LEN_TYPE, OwnedMap, SharedValue, SharedMap};
+use itertools::Itertools;
 
 enum InstData<'a> {
     Ref(&'a OwnedValue),
@@ -209,7 +210,7 @@ pub fn plan_write_dynamic_fields<'a>(
             .map
             .iter()
             .filter(|(k, _v)| !schema_keys.contains(k))
-            .map(|(k, v)| (k, v))
+            .map(|(k, v)| (*k, v))
             .collect();
         let dynamic_names: Vec<_> = data_all
             .fields
@@ -218,49 +219,62 @@ pub fn plan_write_dynamic_fields<'a>(
                 let id = key_hash(&n);
                 dynamic_map.get(&id).map(|_| n)
             })
+            .cloned()
             .collect();
-        if !dynamic_map.is_empty() {}
-        plan_write_dynamic_map(offset, &dynamic_names, &dynamic_map, ins)?;
+        plan_write_dynamic_map(offset, dynamic_map, &dynamic_names, ins)?;
     }
     return Ok(());
 }
 
-pub const ARRAY_TYPE_MASK: u8 = !(!0 << 1 >> 1); // 1000000...
-pub const NULL_PLACEHOLDER: u8 = ARRAY_TYPE_MASK >> 1; // 1000000...
-
-pub fn plan_write_dynamic_map<'a>(
+fn plan_write_dynamic_map<'a>(    
     offset: &mut usize,
-    names: &Vec<&String>,
-    map: &HashMap<&u64, &'a OwnedValue>,
-    ins: &mut Vec<Instruction<'a>>,
+    map: HashMap<u64, &'a OwnedValue>,
+    fields: &[String],
+    ins: &mut Vec<Instruction<'a>>
 ) -> Result<(), WriteError> {
-    ins.push(Instruction {
-        data_type: types::TYPE_CODE_TYPE,
-        val: InstData::Val(OwnedValue::U8(Type::Map.id())),
-        offset: *offset,
+    *offset = align_address(types::align_of_type(ARRAY_LEN_TYPE), *offset);
+    ins.push(Instruction { 
+        data_type: ARRAY_LEN_TYPE, 
+        val: InstData::Val(OwnedValue::U32(map.len() as _)), 
+        offset: *offset
     });
-    *offset += types::u8_io::type_size();
-    // Write map size
-    ins.push(Instruction {
-        data_type: types::ARRAY_LEN_TYPE,
-        val: InstData::Val(OwnedValue::U32(names.len() as u32)),
-        offset: *offset,
-    });
-    *offset += types::u32_io::type_size();
-    for name in names {
-        let id = key_hash(name);
+    *offset += ARRAY_LEN_TYPE.size().unwrap();
+
+    let string_align = types::align_of_type(Type::String);
+    // Write types
+    let field_ids = fields.iter().map(|n| key_hash(&n)).collect_vec();
+    for (i, _name) in fields.iter().enumerate() {
+        let fid = &field_ids[i];
+        let val = map[fid];
+        ins.push(Instruction { 
+            data_type: Type::U8, 
+            val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
+            offset: *offset 
+        });
+        *offset += 1;
+    }
+    // Write field names
+    for name in fields {
         let name_value = OwnedValue::String((*name).to_owned());
         let name_size = types::get_vsize(name_value.base_type(), &name_value);
+        *offset = align_address(string_align, *offset);
         ins.push(Instruction {
             data_type: name_value.base_type(),
             val: InstData::Val(name_value),
             offset: *offset,
         });
         *offset += name_size;
-        plan_write_dynamic_value(offset, map.get(&id).unwrap(), ins)?;
     }
-    Ok(())
+    for (i, _name) in fields.iter().enumerate() {
+        let fid = &field_ids[i];
+        let val = map[fid];
+        plan_write_dynamic_value(offset, val, ins)?
+    }
+    return Ok(())
 }
+
+pub const ARRAY_TYPE_MASK: u8 = !(!0 << 1 >> 1); // 1000000...
+pub const NULL_PLACEHOLDER: u8 = ARRAY_TYPE_MASK >> 1; // 1000000...
 
 fn dyn_data_type_id<'a>(value: &'a OwnedValue) -> u8 {
     match &value {
@@ -277,8 +291,16 @@ fn plan_write_dynamic_value<'a>(
     value: &'a OwnedValue,
     ins: &mut Vec<Instruction<'a>>,
 ) -> Result<(), WriteError> {
-    if let Some(len) = value.len() {
+    if let &OwnedValue::Map(m) = &value {
+        return plan_write_dynamic_map(
+            offset, 
+            m.map.iter().map(|(k, v)| (*k, v)).collect(), 
+            &m.fields, 
+            ins
+        )
+    } else if let Some(len) = value.len() {
         // Record the length of the value if it is a compound
+        *offset = align_address(types::align_of_type(ARRAY_LEN_TYPE), *offset);
         ins.push(Instruction { 
             data_type: ARRAY_LEN_TYPE, 
             val: InstData::Val(OwnedValue::U32(len as _)), 
@@ -310,31 +332,6 @@ fn plan_write_dynamic_value<'a>(
                 *offset += 1;
             }  
         }
-        &OwnedValue::Map(map) => {
-            let string_align = types::align_of_type(Type::String);
-            // Write types
-            for name in &map.fields {
-                let val = map.get(&name);
-                ins.push(Instruction { 
-                    data_type: Type::U8, 
-                    val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
-                    offset: *offset 
-                });
-                *offset += 1;
-            }
-            // Write field names
-            for name in &map.fields {
-                let name_value = OwnedValue::String((*name).to_owned());
-                let name_size = types::get_vsize(name_value.base_type(), &name_value);
-                *offset = align_address(string_align, *offset);
-                ins.push(Instruction {
-                    data_type: name_value.base_type(),
-                    val: InstData::Val(name_value),
-                    offset: *offset,
-                });
-                *offset += name_size;
-            }
-        }
         &OwnedValue::PrimArray(_array) => {
             // Do noting for primary
         }
@@ -348,13 +345,6 @@ fn plan_write_dynamic_value<'a>(
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
             }  
-        }
-        &OwnedValue::Map(map) => {
-            // Write types
-            for name in &map.fields {
-                let val = map.get(&name);
-                plan_write_dynamic_value(offset, val, ins)?
-            }
         }
         &OwnedValue::PrimArray(array) => {
             let array_size = array.size();
