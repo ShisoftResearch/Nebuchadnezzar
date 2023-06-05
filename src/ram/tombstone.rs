@@ -1,7 +1,10 @@
 use super::mem_cursor::*;
 use crate::ram::entry::*;
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use std::{io::{Cursor, Write}, mem};
+use std::{
+    io::{Cursor, Write},
+    mem,
+};
 
 #[derive(Debug)]
 pub struct Tombstone {
@@ -26,21 +29,16 @@ def_raw_memory_cursor_for_size!(TOMBSTONE_SIZE, addr_to_cursor);
 
 impl Tombstone {
     pub fn write(&self, addr: usize) {
-        Entry::encode_to(
-            addr,
-            EntryType::TOMBSTONE,
-            TOMBSTONE_SIZE_U32,
-            |addr| {
-                let mut cursor = addr_to_cursor(addr);
-                {
-                    write_u64(&mut cursor, self.segment_id);
-                    write_u64(&mut cursor, self.version);
-                    write_u64(&mut cursor, self.partition);
-                    write_u64(&mut cursor, self.hash);
-                }
-                release_cursor(cursor);
-            },
-        )
+        Entry::encode_to(addr, EntryType::TOMBSTONE, TOMBSTONE_SIZE_U32, |addr| {
+            let mut cursor = addr_to_cursor(addr);
+            {
+                write_u64(&mut cursor, self.segment_id);
+                write_u64(&mut cursor, self.version);
+                write_u64(&mut cursor, self.partition);
+                write_u64(&mut cursor, self.hash);
+            }
+            release_cursor(cursor);
+        })
     }
 
     pub fn read_from_entry_content_addr(addr: usize) -> Tombstone {

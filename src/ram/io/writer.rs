@@ -1,12 +1,12 @@
 use crate::ram::io::align_ptr_addr;
-use crate::ram::{cell::*, io::align_address};
 use crate::ram::schema::Field;
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
+use crate::ram::{cell::*, io::align_address};
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Map, Type};
+use dovahkiin::types::{key_hash, Map, Type, ARRAY_LEN_TYPE};
 
 enum InstData<'a> {
     Ref(&'a OwnedValue),
@@ -262,90 +262,114 @@ pub fn plan_write_dynamic_map<'a>(
     Ok(())
 }
 
-pub fn plan_write_dynamic_value<'a>(
+fn dyn_data_type_id<'a>(value: &'a OwnedValue) -> u8 {
+    match &value {
+        &OwnedValue::Array(_) => ARRAY_TYPE_MASK,
+        &OwnedValue::PrimArray(_) => ARRAY_TYPE_MASK | value.base_type().id(),
+        &OwnedValue::Map(_) => Type::Map.id(),
+        &OwnedValue::Null | OwnedValue::NA => NULL_PLACEHOLDER,
+        _ => value.base_type().id()
+    }
+}
+
+fn plan_write_dynamic_value<'a>(
     offset: &mut usize,
     value: &'a OwnedValue,
     ins: &mut Vec<Instruction<'a>>,
 ) -> Result<(), WriteError> {
-    let base_type = value.base_type();
+    if let Some(len) = value.len() {
+        // Record the length of the value if it is a compound
+        ins.push(Instruction { 
+            data_type: ARRAY_LEN_TYPE, 
+            val: InstData::Val(OwnedValue::U32(len as _)), 
+            offset: *offset
+        });
+        *offset += ARRAY_LEN_TYPE.size().unwrap();
+    } else {
+        // Else just write the data
+        let ty = value.base_type();
+        let value_size = types::get_vsize(ty, &value);
+        *offset = align_address(types::align_of_type(ty), *offset);
+        ins.push(Instruction {
+            data_type: ty,
+            val: InstData::Ref(value),
+            offset: *offset,
+        });
+        *offset += value_size;
+        return Ok(()) // We are done here
+    }
+
     match &value {
         &OwnedValue::Array(array) => {
-            // Write type id
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK)), // Only put the mask cause we don't know the type
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let len = array.len();
-            // Write array length
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
+            for val in array {
+                ins.push(Instruction { 
+                    data_type: Type::U8, 
+                    val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
+                    offset: *offset 
+                });
+                *offset += 1;
+            }  
+        }
+        &OwnedValue::Map(map) => {
+            let string_align = types::align_of_type(Type::String);
+            // Write types
+            for name in &map.fields {
+                let val = map.get(&name);
+                ins.push(Instruction { 
+                    data_type: Type::U8, 
+                    val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
+                    offset: *offset 
+                });
+                *offset += 1;
+            }
+            // Write field names
+            for name in &map.fields {
+                let name_value = OwnedValue::String((*name).to_owned());
+                let name_size = types::get_vsize(name_value.base_type(), &name_value);
+                *offset = align_address(string_align, *offset);
+                ins.push(Instruction {
+                    data_type: name_value.base_type(),
+                    val: InstData::Val(name_value),
+                    offset: *offset,
+                });
+                *offset += name_size;
+            }
+        }
+        &OwnedValue::PrimArray(_array) => {
+            // Do noting for primary
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+    // Write actual data for each of the children in the container
+    match &value {
+        &OwnedValue::Array(array) => {
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
+            }  
+        }
+        &OwnedValue::Map(map) => {
+            // Write types
+            for name in &map.fields {
+                let val = map.get(&name);
+                plan_write_dynamic_value(offset, val, ins)?
             }
         }
         &OwnedValue::PrimArray(array) => {
-            // Write type id with array tag
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK | base_type.id())),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let len = array.len();
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
             let array_size = array.size();
             ins.push(Instruction {
-                data_type: base_type,
+                data_type: value.base_type(),
                 val: InstData::Ref(value),
                 offset: *offset,
             });
             *offset += array_size;
         }
-        &OwnedValue::Map(map) => plan_write_dynamic_map(
-            offset,
-            &map.fields.iter().collect(),
-            &map.map.iter().collect(),
-            ins,
-        )?,
-        &OwnedValue::Null | OwnedValue::NA => {
-            // Write a placeholder because mapping required
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(NULL_PLACEHOLDER)),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-        }
         _ => {
-            // Primitives
-            let ty = value.base_type();
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ty.id())),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let value_size = types::get_vsize(ty, &value);
-            ins.push(Instruction {
-                data_type: ty,
-                val: InstData::Ref(value),
-                offset: *offset,
-            });
-            *offset += value_size;
+            unreachable!()
         }
     }
-    Ok(())
+    return Ok(());
 }
 
 pub fn execute_plan(ptr: usize, instructions: &Vec<Instruction>) {

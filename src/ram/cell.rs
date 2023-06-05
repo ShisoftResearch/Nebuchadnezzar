@@ -175,12 +175,23 @@ impl OwnedCell {
                         cursor.write_u64::<Endian>(header.hash).unwrap();
                         release_cursor(cursor);
                         let data_base_addr = content_addr + CELL_HEADER_SIZE;
-                        debug_assert_eq!(align_address(8, content_addr), content_addr, "Content address is not aligned");
-                        debug_assert_eq!(align_address(8, data_base_addr), data_base_addr, "Data base address is not aligned");
+                        debug_assert_eq!(
+                            align_address(8, content_addr),
+                            content_addr,
+                            "Content address is not aligned"
+                        );
+                        debug_assert_eq!(
+                            align_address(8, data_base_addr),
+                            data_base_addr,
+                            "Data base address is not aligned"
+                        );
                         writer::execute_plan(data_base_addr, &instructions);
                     },
                 );
-                debug!("Written cell {:?} with total size {}", self.header, total_size);
+                debug!(
+                    "Written cell {:?} with total size {}",
+                    self.header, total_size
+                );
                 return Ok(addr);
             }
         }

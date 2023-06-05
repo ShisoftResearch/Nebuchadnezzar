@@ -98,7 +98,11 @@ impl Segment {
                 {
                     continue;
                 } else {
-                    debug_assert_eq!(align_address(8, curr_last), curr_last, "Acquired address is not aligned");
+                    debug_assert_eq!(
+                        align_address(8, curr_last),
+                        curr_last,
+                        "Acquired address is not aligned"
+                    );
                     return Some(curr_last);
                 }
             }

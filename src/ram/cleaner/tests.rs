@@ -72,8 +72,8 @@ pub fn full_clean_cycle() {
         assert_eq!(chunk.seg_count(), 2);
         assert_eq!(chunk.cell_count(), 16);
 
-        assert_eq!(chunk.segs.get(&0).unwrap().entry_iter().count(), 8); 
-        assert_eq!(chunk.segs.get(&1).unwrap().entry_iter().count(), 8); 
+        assert_eq!(chunk.segs.get(&0).unwrap().entry_iter().count(), 8);
+        assert_eq!(chunk.segs.get(&1).unwrap().entry_iter().count(), 8);
 
         for i in 0..8 {
             chunks.remove_cell(&Id::new(0, i * 2)).unwrap();
@@ -189,7 +189,9 @@ pub fn full_clean_cycle() {
     // combine
     {
         // Cleaner refused to work on head segment, set head segment to something else
-        chunk.head_seg_id.store(1234, std::sync::atomic::Ordering::Relaxed);
+        chunk
+            .head_seg_id
+            .store(1234, std::sync::atomic::Ordering::Relaxed);
         combine::CombinedCleaner::combine_segments(chunk, &chunk.segments());
         let survival_cells: HashSet<_> = chunk
             .live_entries(&chunk.segments()[0])

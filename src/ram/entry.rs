@@ -46,16 +46,12 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn encode_to<W>(
-        mut pos: usize,
-        entry_type: EntryType,
-        content_len: u32,
-        write_content: W,
-    ) where
+    pub fn encode_to<W>(mut pos: usize, entry_type: EntryType, content_len: u32, write_content: W)
+    where
         W: Fn(usize),
     {
         let entry_type_bits = entry_type.bits();
-        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut[u8; 8] as *mut [u8]) });
+        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
         cursor.write_u32::<Endian>(entry_type_bits).unwrap();
         cursor.write_u32::<Endian>(content_len).unwrap();
         pos += ENTRY_HEAD_SIZE;
@@ -68,11 +64,14 @@ impl Entry {
     where
         R: Fn(usize, EntryHeader) -> RR,
     {
-        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut[u8; 8] as *mut [u8]) });
+        let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
         let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
         let content_length = cursor.read_u32::<Endian>().unwrap();
         if let Some(entry_type) = EntryType::from_bits(entry_type_bits) {
-            let entry = EntryHeader { entry_type, content_length };
+            let entry = EntryHeader {
+                entry_type,
+                content_length,
+            };
             pos += ENTRY_HEAD_SIZE;
             Box::into_raw(cursor.into_inner());
             (entry, content_read(pos, entry))

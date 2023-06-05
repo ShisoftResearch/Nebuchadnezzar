@@ -1,6 +1,6 @@
 use itertools::Itertools;
 
-use crate::ram::io::{align_ptr_addr, align_address};
+use crate::ram::io::{align_address, align_ptr_addr};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
@@ -77,7 +77,10 @@ fn read_field<'v>(
         let field_ptr = base_ptr + *field_offset;
         if field_is_var {
             let ty_align = types::align_of_type(field.data_type);
-            *field_offset = align_address(ty_align, *field_offset + types::get_size(field.data_type, field_ptr));
+            *field_offset = align_address(
+                ty_align,
+                *field_offset + types::get_size(field.data_type, field_ptr),
+            );
         }
         let val = types::get_shared_val(field.data_type, field_ptr);
         trace!("Field {} is value: {:?}", field.name, val);
