@@ -1,3 +1,5 @@
+use dovahkiin::types::{self, Type};
+
 use super::schema::PTR_ALIGN;
 
 pub mod reader;
@@ -12,6 +14,11 @@ pub fn align_address(ty_align: usize, addr: usize) -> usize {
     } else {
         addr + alignment - misalign
     }
+}
+
+pub fn align_address_with_ty(ty: Type, addr: usize) -> usize {
+    let ty_align = types::align_of_type(ty);
+    align_address(ty_align, addr)
 }
 
 pub fn align_ptr_addr(addr: usize) -> usize {

@@ -2,11 +2,13 @@ use crate::ram::io::align_ptr_addr;
 use crate::ram::schema::Field;
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
-use crate::ram::{cell::*, io::align_address};
+use crate::ram::{cell::*, io::align_address_with_ty};
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Map, Type, ARRAY_LEN_TYPE, OwnedMap, SharedValue, SharedMap};
+use dovahkiin::types::{
+    key_hash, Map, OwnedMap, SharedMap, SharedValue, Type, ARRAY_LEN_TYPE, TYPE_CODE_TYPE,
+};
 use itertools::Itertools;
 
 enum InstData<'a> {
@@ -84,8 +86,7 @@ pub fn plan_write_field<'a>(
                 tail_offset,
                 schema_offset
             );
-            let ty_align = types::align_of_type(field.data_type);
-            *tail_offset = align_address(ty_align, *tail_offset);
+            *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
@@ -157,8 +158,7 @@ pub fn plan_write_field<'a>(
                 value,
                 *offset
             );
-            let ty_align = types::align_of_type(field.data_type);
-            *offset = align_address(ty_align, *offset);
+            *offset = align_address_with_ty(field.data_type, *offset);
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
@@ -226,30 +226,29 @@ pub fn plan_write_dynamic_fields<'a>(
     return Ok(());
 }
 
-fn plan_write_dynamic_map<'a>(    
+fn plan_write_dynamic_map<'a>(
     offset: &mut usize,
     map: HashMap<u64, &'a OwnedValue>,
     fields: &[String],
-    ins: &mut Vec<Instruction<'a>>
+    ins: &mut Vec<Instruction<'a>>,
 ) -> Result<(), WriteError> {
-    *offset = align_address(types::align_of_type(ARRAY_LEN_TYPE), *offset);
-    ins.push(Instruction { 
-        data_type: ARRAY_LEN_TYPE, 
-        val: InstData::Val(OwnedValue::U32(map.len() as _)), 
-        offset: *offset
+    *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
+    ins.push(Instruction {
+        data_type: ARRAY_LEN_TYPE,
+        val: InstData::Val(OwnedValue::U32(map.len() as _)),
+        offset: *offset,
     });
     *offset += ARRAY_LEN_TYPE.size().unwrap();
 
-    let string_align = types::align_of_type(Type::String);
     // Write types
     let field_ids = fields.iter().map(|n| key_hash(&n)).collect_vec();
     for (i, _name) in fields.iter().enumerate() {
         let fid = &field_ids[i];
         let val = map[fid];
-        ins.push(Instruction { 
-            data_type: Type::U8, 
-            val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
-            offset: *offset 
+        ins.push(Instruction {
+            data_type: Type::U8,
+            val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))),
+            offset: *offset,
         });
         *offset += 1;
     }
@@ -257,7 +256,7 @@ fn plan_write_dynamic_map<'a>(
     for name in fields {
         let name_value = OwnedValue::String((*name).to_owned());
         let name_size = types::get_vsize(name_value.base_type(), &name_value);
-        *offset = align_address(string_align, *offset);
+        *offset = align_address_with_ty(Type::String, *offset);
         ins.push(Instruction {
             data_type: name_value.base_type(),
             val: InstData::Val(name_value),
@@ -270,7 +269,7 @@ fn plan_write_dynamic_map<'a>(
         let val = map[fid];
         plan_write_dynamic_value(offset, val, ins)?
     }
-    return Ok(())
+    return Ok(());
 }
 
 pub const ARRAY_TYPE_MASK: u8 = !(!0 << 1 >> 1); // 1000000...
@@ -282,7 +281,7 @@ fn dyn_data_type_id<'a>(value: &'a OwnedValue) -> u8 {
         &OwnedValue::PrimArray(_) => ARRAY_TYPE_MASK | value.base_type().id(),
         &OwnedValue::Map(_) => Type::Map.id(),
         &OwnedValue::Null | OwnedValue::NA => NULL_PLACEHOLDER,
-        _ => value.base_type().id()
+        _ => value.base_type().id(),
     }
 }
 
@@ -293,44 +292,45 @@ fn plan_write_dynamic_value<'a>(
 ) -> Result<(), WriteError> {
     if let &OwnedValue::Map(m) = &value {
         return plan_write_dynamic_map(
-            offset, 
-            m.map.iter().map(|(k, v)| (*k, v)).collect(), 
-            &m.fields, 
-            ins
-        )
+            offset,
+            m.map.iter().map(|(k, v)| (*k, v)).collect(),
+            &m.fields,
+            ins,
+        );
     } else if let Some(len) = value.len() {
         // Record the length of the value if it is a compound
-        *offset = align_address(types::align_of_type(ARRAY_LEN_TYPE), *offset);
-        ins.push(Instruction { 
-            data_type: ARRAY_LEN_TYPE, 
-            val: InstData::Val(OwnedValue::U32(len as _)), 
-            offset: *offset
+        *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
+        ins.push(Instruction {
+            data_type: ARRAY_LEN_TYPE,
+            val: InstData::Val(OwnedValue::U32(len as _)),
+            offset: *offset,
         });
         *offset += ARRAY_LEN_TYPE.size().unwrap();
     } else {
         // Else just write the data
         let ty = value.base_type();
         let value_size = types::get_vsize(ty, &value);
-        *offset = align_address(types::align_of_type(ty), *offset);
+        *offset = align_address_with_ty(ty, *offset);
         ins.push(Instruction {
             data_type: ty,
             val: InstData::Ref(value),
             offset: *offset,
         });
         *offset += value_size;
-        return Ok(()) // We are done here
+        return Ok(()); // We are done here
     }
 
     match &value {
         &OwnedValue::Array(array) => {
             for val in array {
-                ins.push(Instruction { 
-                    data_type: Type::U8, 
-                    val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))), 
-                    offset: *offset 
+                let ty = dyn_data_type_id(val);
+                ins.push(Instruction {
+                    data_type: Type::U8,
+                    val: InstData::Val(OwnedValue::U8(ty)),
+                    offset: *offset,
                 });
                 *offset += 1;
-            }  
+            }
         }
         &OwnedValue::PrimArray(_array) => {
             // Do noting for primary
@@ -344,10 +344,11 @@ fn plan_write_dynamic_value<'a>(
         &OwnedValue::Array(array) => {
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
-            }  
+            }
         }
         &OwnedValue::PrimArray(array) => {
             let array_size = array.size();
+            *offset = align_address_with_ty(value.base_type(), *offset);
             ins.push(Instruction {
                 data_type: value.base_type(),
                 val: InstData::Ref(value),

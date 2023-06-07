@@ -5,8 +5,9 @@ use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
+use super::align_address_with_ty;
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
-use dovahkiin::types::{key_hash, Map};
+use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
 use std::collections::HashMap;
 use std::mem;
 
@@ -89,7 +90,8 @@ fn read_field<'v>(
 }
 
 pub fn read_attach_dynamic_part<'v>(mut tail_ptr: usize, dest: &mut SharedValue<'v>) {
-    let src = read_dynamic_value(&mut tail_ptr);
+    tail_ptr = align_ptr_addr(tail_ptr);
+    let src = read_dynamic_value(&mut tail_ptr, Type::Map.id());
     if let &mut SharedValue::Map(ref mut map_dest) = dest {
         if let SharedValue::Map(mut map_src) = src {
             map_dest.fields.append(&mut map_src.fields);
@@ -102,19 +104,31 @@ pub fn read_attach_dynamic_part<'v>(mut tail_ptr: usize, dest: &mut SharedValue<
 
 const MAP_TYPE_ID: u8 = Type::Map.id();
 
-fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
-    let type_id_val = types::get_shared_val(Type::U8, *ptr);
-    let type_id = type_id_val.u8().unwrap();
+fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v> {
     let is_array = type_id & ARRAY_TYPE_MASK == ARRAY_TYPE_MASK;
-    *ptr += types::u8_io::type_size();
     if is_array {
         let base_type = type_id & (!ARRAY_TYPE_MASK);
-        *ptr = align_ptr_addr(*ptr);
+        *ptr = align_address_with_ty(ARRAY_LEN_TYPE, *ptr);
         let len_val = types::get_shared_val(Type::U32, *ptr);
         let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
-        if base_type != MAP_TYPE_ID {
+        if type_id == ARRAY_TYPE_MASK {
+            // Dynamic typed array
+            let mut data_block_ptr = *ptr + *len as usize;
+            let arr = (0..*len)
+                .map(|i| {
+                    types::get_shared_val(Type::U8, *ptr + i as usize)
+                        .u8()
+                        .unwrap()
+                        .to_owned()
+                })
+                .map(|ty_id| read_dynamic_value(&mut data_block_ptr, ty_id))
+                .collect_vec();
+            *ptr = data_block_ptr;
+            return SharedValue::Array(arr);
+        } else {
             // Primitive array
+            *ptr = align_address_with_ty(Type::from_id(base_type), *ptr);
             if let Some(prim_arr) =
                 types::get_shared_prim_array_val(Type::from_id(base_type), *len as usize, ptr)
             {
@@ -123,41 +137,51 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize) -> SharedValue<'v> {
             } else {
                 panic!("Cannot read prim array for dynamic field");
             }
-        } else {
-            let array = (0..*len).map(|_| read_dynamic_value(ptr)).collect();
-            // ptr have been moved by recursion
-            return SharedValue::Array(array);
         }
-    } else if *type_id == MAP_TYPE_ID {
+    } else if type_id == MAP_TYPE_ID {
         // Map
-        *ptr = align_ptr_addr(*ptr);
+        *ptr = align_address_with_ty(ARRAY_LEN_TYPE, *ptr);
         let len_val = types::get_shared_val(Type::U32, *ptr);
         let len = len_val.u32().unwrap();
         *ptr += types::u32_io::type_size();
-        let field_value_pair = (0..*len)
+        let field_types = (0..*len)
             .map(|_| {
+                let ty = types::get_shared_val(Type::U8, *ptr)
+                    .u8()
+                    .unwrap()
+                    .to_owned();
+                *ptr += 1;
+                ty
+            })
+            .collect_vec();
+        let field_names = (0..*len)
+            .map(|_| {
+                *ptr = align_address_with_ty(Type::String, *ptr);
                 let name = types::get_shared_val(Type::String, *ptr)
                     .string()
                     .unwrap()
                     .to_owned();
                 *ptr += types::string_io::size_at(*ptr);
-                let value = read_dynamic_value(ptr);
-                (name, value)
+                name
             })
             .collect_vec();
-        let mut fields = Vec::with_capacity(field_value_pair.len());
-        let mut map = HashMap::with_capacity(field_value_pair.len());
-        for (name, value) in field_value_pair {
-            let id = key_hash(&name);
-            fields.push(name);
-            map.insert(id, value);
-        }
-        return SharedValue::Map(SharedMap { fields, map });
-    } else if *type_id == NULL_PLACEHOLDER {
+        let fields = field_types
+            .iter()
+            .map(|type_id| read_dynamic_value(ptr, *type_id));
+        let map = field_names
+            .iter()
+            .map(|n| key_hash(n))
+            .zip(fields)
+            .collect::<HashMap<_, _>>();
+        return SharedValue::Map(SharedMap {
+            fields: field_names,
+            map,
+        });
+    } else if type_id == NULL_PLACEHOLDER {
         return SharedValue::Null;
     } else {
-        let ty = Type::from_id(*type_id);
-        *ptr = align_address(types::align_of_type(ty), *ptr);
+        let ty = Type::from_id(type_id);
+        *ptr = align_address_with_ty(ty, *ptr);
         let value = types::get_shared_val(ty, *ptr);
         *ptr += types::get_size(ty, *ptr);
         return value;
