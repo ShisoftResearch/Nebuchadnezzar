@@ -19,24 +19,37 @@ fn read_field<'v>(
 ) -> SharedValue<'v> {
     let mut rec_field_offset = field.offset.unwrap_or(0);
     let field_is_var = field.is_var();
-    let field_offset = if is_var {
+    let field_offset = if field.nullable {
+        if is_var {
+            // read from tail var part
+            if *bool_io::read(base_ptr + *tail_offset) { // existing bit
+                // is null, return None
+                return SharedValue::Null
+            }
+             *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
+            tail_offset
+        } else {
+            // read the data pointer 
+            let rel_ptr = *u32_io::read(base_ptr + rec_field_offset) as usize;
+            if rel_ptr == 0 {
+                return SharedValue::Null
+            } else {
+                *tail_offset = rel_ptr;
+                tail_offset
+            }
+        }
+    } else if is_var {
         // Is inside size variable field, read directly from the address
         tail_offset
     } else if field.is_array || field_is_var {
-        *tail_offset = *u32_io::read(base_ptr + field.offset.unwrap()) as usize;
+        *tail_offset = *u32_io::read(base_ptr + rec_field_offset) as usize;
         tail_offset
     } else {
         &mut rec_field_offset
     };
     trace!("Reading {} at offset {}", field.name, field_offset);
-    if field.nullable {
-        let null_byte = *bool_io::read(base_ptr + *field_offset);
-        *field_offset += 1;
-        if null_byte {
-            return SharedValue::Null;
-        }
-    }
     if field.is_array {
+        *field_offset = align_address_with_ty(ARRAY_LEN_TYPE, *field_offset);
         let len = *u32_io::read(base_ptr + *field_offset);
         trace!("Field {} is array, length {}", field.name, len);
         let mut sub_field = field.clone();
@@ -45,6 +58,7 @@ fn read_field<'v>(
         let mut ptr = base_ptr + *field_offset;
         if field.sub_fields.is_none() {
             // maybe primitive array
+            *field_offset = align_address_with_ty(field.data_type, *field_offset);
             let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
             *field_offset = ptr - base_ptr;
             if let Some(prim_arr) = val {

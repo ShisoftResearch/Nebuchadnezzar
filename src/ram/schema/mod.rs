@@ -173,11 +173,9 @@ impl Field {
         let is_field_var = self.is_var();
         let name_path_hash = hash_str(&name_path);
         let next_add;
-        if self.nullable && !is_field_var {
-            *offset += 1;
-        }
-        if self.is_array {
+        if self.is_array || self.nullable {
             // u32 as indication of the offset to the actual data
+            // for nullable, it would be indicated as a pointer to the variable data area
             *offset = align_address(PTR_ALIGN, *offset);
             next_add = POINTER_SIZE;
         } else if let Some(ref mut subs) = self.sub_fields {

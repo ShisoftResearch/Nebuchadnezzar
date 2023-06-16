@@ -40,35 +40,44 @@ pub fn plan_write_field<'a>(
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
-    let offset = if let Some(ref subs) = field.sub_fields {
-        if let OwnedValue::Array(_) = value {
-            if !field.is_array {
-                return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+    let is_null = match value {
+        OwnedValue::Null | OwnedValue::NA => true,
+        _ => false
+    };
+    let offset = if field.nullable {
+        if !is_var {
+            let null_flag = is_null.then_some(*tail_offset).unwrap_or(0) as u32;
+            ins.push(Instruction {
+                data_type: Type::U32,
+                val: InstData::Val(OwnedValue::U32(null_flag)),
+                offset: schema_offset.unwrap(),
+            });
+        } else {
+            ins.push(Instruction {
+                data_type: Type::Bool,
+                val: InstData::Val(OwnedValue::Bool(is_null)),
+                offset: *tail_offset,
+            });
+            if !is_null {
+                *tail_offset = align_address_with_ty(value.base_type(), *tail_offset + 1);
             }
+        }
+        if is_null {
+            return Ok(());
+        } else {
+            tail_offset
+        }
+    } else if let Some(ref subs) = field.sub_fields {
+        if let (OwnedValue::Array(_), true) = (value, field.is_array) {
             if !is_var {
-                trace!(
-                    "Push jump tailing for map array with {} at {}",
-                    tail_offset,
-                    schema_offset.unwrap()
-                );
                 ins.push(Instruction {
                     data_type: Type::U32,
                     val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
                     offset: schema_offset.unwrap(),
                 });
             }
-            trace!(
-                "Taking tailing offset for array {} at {}",
-                field.name,
-                tail_offset
-            );
             tail_offset
         } else if let OwnedValue::Map(map) = value {
-            trace!(
-                "Writing map fields with for {} at {}",
-                field.name,
-                tail_offset
-            );
             for sub in subs {
                 let val = map.get_by_key_id(sub.name_id);
                 plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
@@ -112,19 +121,6 @@ pub fn plan_write_field<'a>(
         value,
         field
     );
-    if field.nullable {
-        let null_bit = match value {
-            OwnedValue::Null => true,
-            _ => false,
-        };
-        trace!("Push null bit inst with {} at {}", null_bit, *offset);
-        ins.push(Instruction {
-            data_type: Type::Bool,
-            val: InstData::Val(OwnedValue::Bool(null_bit)),
-            offset: *offset,
-        });
-        *offset += 1;
-    }
     if field.is_array {
         if let OwnedValue::Array(array) = value {
             let len = array.len();
@@ -169,30 +165,24 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else {
-        let is_null = match value {
-            OwnedValue::Null => true,
-            _ => false,
-        };
         if !field.nullable && is_null {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
-        if !is_null {
-            let size = types::get_vsize(field.data_type, &value);
-            ins.push(Instruction {
-                data_type: field.data_type,
-                val: InstData::Ref(value),
-                offset: *offset,
-            });
-            let new_offset = *offset + size;
-            trace!(
-                "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
-                value,
-                *offset,
-                size,
-                new_offset
-            );
-            *offset = new_offset;
-        }
+        let size = types::get_vsize(field.data_type, &value);
+        ins.push(Instruction {
+            data_type: field.data_type,
+            val: InstData::Ref(value),
+            offset: *offset,
+        });
+        let new_offset = *offset + size;
+        trace!(
+            "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
+            value,
+            *offset,
+            size,
+            new_offset
+        );
+        *offset = new_offset;
     }
     return Ok(());
 }
