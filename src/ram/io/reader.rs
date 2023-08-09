@@ -16,91 +16,254 @@ fn read_field<'v>(
     field: &Field,
     is_var: bool,
     tail_offset: &mut usize,
+    force_mono: bool,
 ) -> SharedValue<'v> {
-    let mut rec_field_offset = field.offset.unwrap_or(0);
-    let field_is_var = field.is_var();
-    let field_offset = if field.nullable {
-        if is_var {
-            // read from tail var part
-            if *bool_io::read(base_ptr + *tail_offset) { // existing bit
-                // is null, return None
-                return SharedValue::Null
-            }
-             *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
-            tail_offset
-        } else {
-            // read the data pointer 
-            let rel_ptr = *u32_io::read(base_ptr + rec_field_offset) as usize;
-            if rel_ptr == 0 {
-                return SharedValue::Null
+    let orig_tail_offset = *tail_offset;
+    let field_is_var = field.data_type.size().is_none();
+    let field_nullable = field.nullable;
+    let field_is_array = field.is_array && (!force_mono);
+    let (target_offset, tailing) = match (field.offset, field_is_var, field_nullable, is_var) {
+        (Some(schema_field_offset), false, false, false) => {
+            trace!("Using schema field offset for {}, offset {}", field.name, schema_field_offset);
+            (schema_field_offset, false)
+        },
+        (Some(schema_field_offset), true, _, false)
+        | (Some(schema_field_offset), _, true, false) => {
+            // Var or nullable schema field
+            let rel_offset = *u32_io::read(base_ptr + schema_field_offset) as usize;
+            if rel_offset == 0 {
+                return SharedValue::Null;
             } else {
-                *tail_offset = rel_ptr;
-                tail_offset
+                *tail_offset = rel_offset;
+                trace!("Using schema field recorded offset for {}, offset {}", field.name, tail_offset);
+                (*tail_offset, true)
             }
         }
-    } else if is_var {
-        // Is inside size variable field, read directly from the address
-        tail_offset
-    } else if field.is_array || field_is_var {
-        *tail_offset = *u32_io::read(base_ptr + rec_field_offset) as usize;
-        tail_offset
-    } else {
-        &mut rec_field_offset
+        (_, _, false, true) => {
+            // In-var fields, not nullable
+            *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
+            trace!("Using non-nullable aligned tail offset for {}, offset {}", field.name, tail_offset);
+            (*tail_offset, true)
+        }
+        (_, _, true, true) => {
+            // In-var fields, nullable
+            let is_null = *bool_io::read(base_ptr + *tail_offset) as bool;
+            if is_null {
+                return SharedValue::Null;
+            }
+            *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
+            trace!("Using nullable aligned tail offset for {}, offset {}", field.name, tail_offset);
+            (*tail_offset, true)
+        }
+        p => unreachable!("Do not accept target offset pattern: {:?}", p),
     };
-    trace!("Reading {} at offset {}", field.name, field_offset);
-    if field.is_array {
-        *field_offset = align_address_with_ty(ARRAY_LEN_TYPE, *field_offset);
-        let len = *u32_io::read(base_ptr + *field_offset);
-        trace!("Field {} is array, length {}", field.name, len);
-        let mut sub_field = field.clone();
-        sub_field.is_array = false;
-        *field_offset += u32_io::type_size();
-        let mut ptr = base_ptr + *field_offset;
-        if field.sub_fields.is_none() {
-            // maybe primitive array
-            *field_offset = align_address_with_ty(field.data_type, *field_offset);
-            let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
-            *field_offset = ptr - base_ptr;
-            if let Some(prim_arr) = val {
-                SharedValue::PrimArray(prim_arr)
+    let (val, size) = match (field_is_var, field_is_array, is_var, &field.sub_fields) {
+        (_, false, _, None) => {
+            // Simple typed fields
+            let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
+            let size = if field_is_var {
+                types::get_rsize(field.data_type, &val)
             } else {
+                types::size_of_type(field.data_type)
+            };
+            // Simple typed fields
+            let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
+            let size = if field_is_var {
+                types::get_rsize(field.data_type, &val)
+            } else {
+                types::size_of_type(field.data_type)
+            };
+            trace!(
+                "Reading schema field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
+                field.name,
+                val,
+                field.data_type,
+                size,
+                target_offset,
+                base_ptr
+            );
+            (val, size)
+        }
+        (false, true, _, None) => {
+            // Array of primitives
+            let array_ptr = base_ptr + target_offset;
+            let array_len = *types::get_shared_val(Type::U32, array_ptr).u32().unwrap();
+            let slice_offset =
+                align_address_with_ty(field.data_type, target_offset + types::u32_io::type_size());
+            let mut slice_ptr = base_ptr + slice_offset;
+            let prim_arr = types::get_shared_prim_array_val(
+                field.data_type,
+                array_len as usize,
+                &mut slice_ptr,
+            )
+            .unwrap_or_else(|| {
                 panic!(
                     "type cannot been convert to prim array: {:?}",
                     field.data_type
                 )
-            }
-        } else {
+            });
+            let val = SharedValue::PrimArray(prim_arr);
+            let size = slice_ptr - array_ptr;
+            trace!(
+                "Reading schema prim array field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
+                field.name,
+                val,
+                field.data_type,
+                size,
+                target_offset,
+                base_ptr
+            );
+            (val, size)
+        }
+        (true, true, _, _) => {
+            // Array of non-primitives (including maps)
+            let array_len = *types::get_shared_val(Type::U32, base_ptr + target_offset)
+                .u32()
+                .unwrap();
+            let slice_offset =
+                align_address_with_ty(field.data_type, target_offset + types::u32_io::type_size());
             let mut vals = Vec::<SharedValue>::new();
-            for _ in 0..len {
-                let nxt_val = read_field(base_ptr, &sub_field, true, field_offset);
+            trace!(
+                "Reading array body for {} from offset {}, array len {}, target offset {}, used to have tailing {}", 
+                field.name, slice_offset, array_len, target_offset, tail_offset,
+            );
+            *tail_offset = slice_offset;
+            for _ in 0..array_len {
+                let nxt_val = read_field(base_ptr, field, true, tail_offset, true);
                 vals.push(nxt_val);
             }
-            SharedValue::Array(vals)
-        }
-    } else if let Some(ref subs) = field.sub_fields {
-        trace!("Field {} is map", field.name);
-        let mut map = SharedMap::new();
-        for sub in subs {
-            map.insert_key_id(
-                sub.name_id,
-                read_field(base_ptr, &sub, is_var, field_offset),
+            let val = SharedValue::Array(vals);
+            trace!(
+                "Reading schema non-prim field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
+                field.name,
+                val,
+                field.data_type,
+                0,
+                target_offset,
+                base_ptr
             );
+            (val, 0) // Non-promitive array size will be reflected in `tail_offset`
         }
-        map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
-        SharedValue::Map(map)
-    } else {
-        let field_ptr = base_ptr + *field_offset;
-        if field_is_var {
-            let ty_align = types::align_of_type(field.data_type);
-            *field_offset = align_address(
-                ty_align,
-                *field_offset + types::get_size(field.data_type, field_ptr),
+        (_, false, _, Some(sub_fields)) => {
+            // Maps
+            let mut map = SharedMap::new();
+            trace!(
+                "Reading map body for {} from offset {}, used to have tailing {}", 
+                field.name, target_offset, tail_offset,
             );
+            for sub in sub_fields {
+                map.insert_key_id(
+                    sub.name_id,
+                    read_field(base_ptr, &sub, is_var, tail_offset, false),
+                );
+            }
+            map.fields = sub_fields.iter().map(|sub| &sub.name).cloned().collect();
+            let val = SharedValue::Map(map);
+            (val, 0) // Map size will be reflected in `tail_offset`
         }
-        let val = types::get_shared_val(field.data_type, field_ptr);
-        trace!("Field {} is value: {:?}", field.name, val);
-        val
+        p => unreachable!("Do not accept schema pattern {:?}", p),
+    };
+    if tailing {
+        *tail_offset += size
     }
+    return val;
+    // let field_offset = if field.nullable {
+    //     if is_var {
+    //         // read from tail var part
+    //         let val_null = *bool_io::read(base_ptr + *tail_offset);
+    //         *tail_offset += 1;
+    //         if val_null {
+    //             trace!("Skip field {} at {} for it is null. Now tail {}, base {}", field.name, orig_tail_offset, tail_offset, base_ptr);
+    //             return SharedValue::Null;
+    //         }
+    //         *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
+    //         trace!("Reading nullable var {} from tail_offset {}", field.name, tail_offset);
+    //         tail_offset
+    //     } else {
+    //         // read the data pointer
+    //         let rel_ptr = *u32_io::read(base_ptr + rec_field_offset) as usize;
+    //         if rel_ptr == 0 {
+    //             trace!("Reading nullable nonvar {} found null at base {}", field.name, base_ptr);
+    //             return SharedValue::Null;
+    //         } else {
+    //             trace!("Reading nullable nonvar {} from rel_ptr {}, tail was {}, base {}", field.name, rel_ptr, tail_offset, base_ptr);
+    //             *tail_offset = rel_ptr;
+    //             tail_offset
+    //         }
+    //     }
+    // } else if is_var {
+    //     // Is inside size variable field, read directly from the address
+    //     trace!("Reading var {} from tail_offset {}", field.name, tail_offset);
+    //     tail_offset
+    // } else if field.is_array || field_is_var {
+    //     let rel_ptr = *u32_io::read(base_ptr + rec_field_offset) as usize;
+    //     trace!("Reading array or var {} from rel_ptr {}, tail was {}, base {}", field.name, rel_ptr, tail_offset, base_ptr);
+    //     *tail_offset = rel_ptr;
+    //     tail_offset
+    // } else {
+    //     trace!("Reading {} from static offset {}, tail {}", field.name, rec_field_offset, tail_offset);
+    //     &mut rec_field_offset
+    // };
+    // trace!("Reading {} at offset {}, tail {}", field.name, field_offset, orig_tail_offset);
+    // let res = if field.is_array {
+    //     *field_offset = align_address_with_ty(ARRAY_LEN_TYPE, *field_offset);
+    //     let len = *u32_io::read(base_ptr + *field_offset);
+    //     let mut sub_field = field.clone();
+    //     sub_field.is_array = false;
+    //     *field_offset += u32_io::type_size();
+    //     trace!("Field {} is array, length {}, now at {}", field.name, len, field_offset);
+    //     let mut ptr = base_ptr + *field_offset;
+    //     if field.sub_fields.is_none() {
+    //         // maybe primitive array
+    //         *field_offset = align_address_with_ty(field.data_type, *field_offset);
+    //         let val = types::get_shared_prim_array_val(field.data_type, len as usize, &mut ptr);
+    //         let array_size = ptr - base_ptr;
+    //         trace!("Array size of {} is {}", field.name, array_size);
+    //         *field_offset += array_size;
+    //         if let Some(prim_arr) = val {
+    //             trace!("Read prim array {} now at {}, was at {}, value {:?}", field.name, field_offset, orig_tail_offset, prim_arr);
+    //             SharedValue::PrimArray(prim_arr)
+    //         } else {
+    //             panic!(
+    //                 "type cannot been convert to prim array: {:?}",
+    //                 field.data_type
+    //             )
+    //         }
+    //     } else {
+    //         let mut vals = Vec::<SharedValue>::new();
+    //         trace!("Reading array of maps for {} with num maps {}", field.name, len);
+    //         for _ in 0..len {
+    //             let nxt_val = read_field(base_ptr, &sub_field, true, field_offset);
+    //             vals.push(nxt_val);
+    //         }
+    //         SharedValue::Array(vals)
+    //     }
+    // } else if let Some(ref subs) = field.sub_fields {
+    //     trace!("Field {} is map", field.name);
+    //     let mut map = SharedMap::new();
+    //     for sub in subs {
+    //         map.insert_key_id(
+    //             sub.name_id,
+    //             read_field(base_ptr, &sub, is_var, field_offset),
+    //         );
+    //     }
+    //     map.fields = subs.iter().map(|sub| &sub.name).cloned().collect();
+    //     SharedValue::Map(map)
+    // } else {
+    //     let ty_align = types::align_of_type(field.data_type);
+    //     *field_offset = align_address(
+    //         ty_align,
+    //         types::get_size(field.data_type, *field_offset),
+    //     );
+    //     let field_ptr = base_ptr + *field_offset;
+    //     trace!("Reading field shared value {}, type {:?}, offset {}, base {}", field.name, field.data_type, field_offset, base_ptr);
+    //     let val = types::get_shared_val(field.data_type, field_ptr);
+    //     debug_assert!(types::fixed_size(field.data_type));
+    //     *field_offset += types::size_of_type(field.data_type);
+    //     val
+    // };
+    // trace!("Read {} with value {:?}, new offset {}, tail was {}, base {}", field.name, res, field_offset, orig_tail_offset, base_ptr);
+    // return res;
 }
 
 pub fn read_attach_dynamic_part<'v>(mut tail_ptr: usize, dest: &mut SharedValue<'v>) {
@@ -204,7 +367,7 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
 
 pub fn read_by_schema<'v>(ptr: usize, schema: &Schema) -> SharedValue<'v> {
     let mut tail_offset = schema.static_bound;
-    let mut schema_value = read_field(ptr, &schema.fields, false, &mut tail_offset);
+    let mut schema_value = read_field(ptr, &schema.fields, false, &mut tail_offset, false);
     if schema.is_dynamic {
         read_attach_dynamic_part(ptr + tail_offset, &mut schema_value)
     }
@@ -253,7 +416,7 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
                             }
                         }
                         // Insert the last level of field to the map
-                        let field_data = read_field(ptr, field, false, &mut tail_offset);
+                        let field_data = read_field(ptr, field, false, &mut tail_offset, false);
                         // inserting_map.map.insert(field.name_id, field_data);
                         // inserting_map.fields.push(field.name.clone());
                         res.push(field_data);

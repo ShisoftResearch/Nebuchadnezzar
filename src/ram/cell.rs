@@ -13,6 +13,7 @@ use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 
+use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
@@ -126,7 +127,7 @@ impl OwnedCell {
         schema: &Schema,
     ) -> Result<usize, WriteError> {
         let mut tail_offset: usize = schema.static_bound;
-        let mut instructions = Vec::<writer::Instruction>::new();
+        let mut instructions = WriteInstructions::new();
         writer::plan_write_field(
             &mut tail_offset,
             &schema.fields,

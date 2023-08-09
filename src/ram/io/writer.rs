@@ -11,6 +11,7 @@ use dovahkiin::types::{
 };
 use itertools::Itertools;
 
+#[derive(Debug)]
 enum InstData<'a> {
     Ref(&'a OwnedValue),
     Val(OwnedValue),
@@ -25,6 +26,22 @@ impl<'a> InstData<'a> {
     }
 }
 
+pub struct WriteInstructions<'a> {
+    inner: Vec<Instruction<'a>>,
+}
+
+impl<'a> WriteInstructions<'a> {
+    pub fn new() -> Self {
+        Self { inner: vec![] }
+    }
+
+    pub fn push(&mut self, inst: Instruction<'a>) {
+        trace!("Instruction push {:?}", inst);
+        self.inner.push(inst);
+    }
+}
+
+#[derive(Debug)]
 pub struct Instruction<'a> {
     data_type: Type,
     val: InstData<'a>,
@@ -35,14 +52,14 @@ pub fn plan_write_field<'a>(
     tail_offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
-    mut ins: &mut Vec<Instruction<'a>>,
+    mut ins: &mut WriteInstructions<'a>,
     is_var: bool,
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
     let is_null = match value {
         OwnedValue::Null | OwnedValue::NA => true,
-        _ => false
+        _ => false,
     };
     let offset = if field.nullable {
         if !is_var {
@@ -53,13 +70,15 @@ pub fn plan_write_field<'a>(
                 offset: schema_offset.unwrap(),
             });
         } else {
+            trace!("Push is null inst with {} at {:?}", is_null, *tail_offset);
             ins.push(Instruction {
                 data_type: Type::Bool,
                 val: InstData::Val(OwnedValue::Bool(is_null)),
                 offset: *tail_offset,
             });
+            *tail_offset += 1;
             if !is_null {
-                *tail_offset = align_address_with_ty(value.base_type(), *tail_offset + 1);
+                *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
             }
         }
         if is_null {
@@ -70,6 +89,11 @@ pub fn plan_write_field<'a>(
     } else if let Some(ref subs) = field.sub_fields {
         if let (OwnedValue::Array(_), true) = (value, field.is_array) {
             if !is_var {
+                trace!(
+                    "Push array jump tailing inst with {} at {:?}",
+                    tail_offset,
+                    schema_offset
+                );
                 ins.push(Instruction {
                     data_type: Type::U32,
                     val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
@@ -91,7 +115,7 @@ pub fn plan_write_field<'a>(
         if !is_var {
             // No need to jump to var region when it is var
             trace!(
-                "Push jump tailing inst with {} at {:?}",
+                "Push var field jump tailing inst with {} at {:?}",
                 tail_offset,
                 schema_offset
             );
@@ -169,6 +193,7 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
         let size = types::get_vsize(field.data_type, &value);
+        *offset = align_address_with_ty(field.data_type, *offset);
         ins.push(Instruction {
             data_type: field.data_type,
             val: InstData::Ref(value),
@@ -176,7 +201,8 @@ pub fn plan_write_field<'a>(
         });
         let new_offset = *offset + size;
         trace!(
-            "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
+            "Pushing value ref {} inst with {:?} at {}, size {}, new offset {}",
+            field.name,
             value,
             *offset,
             size,
@@ -191,7 +217,7 @@ pub fn plan_write_dynamic_fields<'a>(
     offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
-    ins: &mut Vec<Instruction<'a>>,
+    ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
     *offset = align_ptr_addr(*offset);
     if let (OwnedValue::Map(data_all), &Some(ref fields)) = (value, &field.sub_fields) {
@@ -220,7 +246,7 @@ fn plan_write_dynamic_map<'a>(
     offset: &mut usize,
     map: HashMap<u64, &'a OwnedValue>,
     fields: &[String],
-    ins: &mut Vec<Instruction<'a>>,
+    ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
     *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
     ins.push(Instruction {
@@ -278,7 +304,7 @@ fn dyn_data_type_id<'a>(value: &'a OwnedValue) -> u8 {
 fn plan_write_dynamic_value<'a>(
     offset: &mut usize,
     value: &'a OwnedValue,
-    ins: &mut Vec<Instruction<'a>>,
+    ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
     if let &OwnedValue::Map(m) = &value {
         return plan_write_dynamic_map(
@@ -353,8 +379,10 @@ fn plan_write_dynamic_value<'a>(
     return Ok(());
 }
 
-pub fn execute_plan(ptr: usize, instructions: &Vec<Instruction>) {
-    for ins in instructions {
-        types::set_val(ins.data_type, ins.val.val_ref(), ptr + ins.offset);
+pub fn execute_plan(ptr: usize, instructions: &WriteInstructions) {
+    for ins in &instructions.inner {
+        let target_addr = ptr + ins.offset;
+        trace!("Executing instruction {:?} at base {}", ins, ptr);
+        types::set_val(ins.data_type, ins.val.val_ref(), target_addr);
     }
 }

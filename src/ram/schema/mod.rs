@@ -5,10 +5,9 @@ use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
 use itertools::Itertools;
-use lightning::map::{LiteHashMap, Map, PtrHashMap as LFHashMap};
+use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::AtomicU32;
 
 use crate::ram::io::align_address;
 use crate::ram::io::align_ptr_addr;

@@ -6,6 +6,9 @@ pub mod reader;
 pub mod writer;
 
 pub fn align_address(ty_align: usize, addr: usize) -> usize {
+    if ty_align == 0 {
+        return addr;
+    }
     let alignment = ty_align;
     let mask = alignment - 1;
     let misalign = addr & mask;
