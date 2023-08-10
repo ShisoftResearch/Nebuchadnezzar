@@ -19,9 +19,10 @@ fn read_field<'v>(
     force_mono: bool,
 ) -> SharedValue<'v> {
     let orig_tail_offset = *tail_offset;
-    let field_is_var = field.data_type.size().is_none();
     let field_nullable = field.nullable;
     let field_is_array = field.is_array && (!force_mono);
+    let field_var_base_ty  = field.data_type.size().is_none();
+    let field_is_var = field_var_base_ty || field.is_array;
     let (target_offset, tailing) = match (field.offset, field_is_var, field_nullable, is_var) {
         (Some(schema_field_offset), false, false, false) => {
             trace!("Using schema field offset for {}, offset {}", field.name, schema_field_offset);
@@ -57,18 +58,18 @@ fn read_field<'v>(
         }
         p => unreachable!("Do not accept target offset pattern: {:?}", p),
     };
-    let (val, size) = match (field_is_var, field_is_array, is_var, &field.sub_fields) {
+    let (val, size) = match (field_var_base_ty, field_is_array, is_var, &field.sub_fields) {
         (_, false, _, None) => {
             // Simple typed fields
             let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
-            let size = if field_is_var {
+            let size = if field_var_base_ty {
                 types::get_rsize(field.data_type, &val)
             } else {
                 types::size_of_type(field.data_type)
             };
             // Simple typed fields
             let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
-            let size = if field_is_var {
+            let size = if field_var_base_ty {
                 types::get_rsize(field.data_type, &val)
             } else {
                 types::size_of_type(field.data_type)
