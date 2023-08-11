@@ -60,11 +60,13 @@ pub async fn general() {
     );
     let cell_1 = OwnedCell::new_with_id(schema_id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     client.write_cell(cell_1.clone()).await.unwrap().unwrap();
-    client
+    let read_cell = client
         .read_cell(cell_1.clone().id())
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(read_cell["score"].u64().unwrap(), &0);
+    assert_eq!(read_cell["id"].i64().unwrap(), &100);
     client
         .transaction(|ref mut _trans| {
             future::ready(Ok(())) // empty transaction

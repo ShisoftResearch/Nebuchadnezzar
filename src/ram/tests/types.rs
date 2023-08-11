@@ -231,6 +231,7 @@ mod uuid {
 mod string {
     use super::CHUNK_SIZE;
     use crate::ram::chunk::Chunks;
+    use crate::ram::io::align_address_with_ty;
     use crate::ram::types;
     use std::string::String;
     #[test]
@@ -246,6 +247,7 @@ mod string {
             assert_eq!(dec_str, test_str);
             println!("{}", dec_str);
             addr += len;
+            addr = align_address_with_ty(dovahkiin::types::Type::String, addr);
         }
         addr = chunk.segments()[0].addr;
         for d in test_data.clone() {
@@ -253,6 +255,7 @@ mod string {
             let len = types::string_io::size_at(addr);
             assert_eq!(types::string_io::read(addr), test_str);
             addr += len;
+            addr = align_address_with_ty(dovahkiin::types::Type::String, addr);
         }
     }
 }

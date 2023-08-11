@@ -5,11 +5,12 @@ use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
 use itertools::Itertools;
-use lightning::map::{LiteHashMap, Map, PtrHashMap as LFHashMap};
+use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::AtomicU32;
 
+use crate::ram::io::align_address;
+use crate::ram::io::align_ptr_addr;
 use crate::utils::thread_id;
 
 use super::types;
@@ -22,6 +23,10 @@ use futures::FutureExt;
 use std::ops::Deref;
 
 pub mod sm;
+
+pub type FieldPtr = u32;
+
+pub const PTR_ALIGN: usize = mem::align_of::<u32>();
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
@@ -67,6 +72,7 @@ impl Schema {
             vec![],
             vec![],
         );
+        bound = align_ptr_addr(bound);
         trace!("Schema {:?} has bound {}", fields, bound);
         Schema {
             id: 0,
@@ -162,17 +168,17 @@ impl Field {
         field_path: Vec<usize>,
         id_path: Vec<u64>,
     ) {
-        const POINTER_SIZE: usize = mem::size_of::<u32>();
-        self.offset = Some(*offset);
+        const POINTER_SIZE: usize = mem::size_of::<FieldPtr>();
         let is_field_var = self.is_var();
         let name_path_hash = hash_str(&name_path);
-        if self.nullable && !is_field_var {
-            *offset += 1;
-        }
-        if self.is_array {
+        let next_add;
+        if self.is_array || self.nullable {
             // u32 as indication of the offset to the actual data
-            *offset += POINTER_SIZE;
+            // for nullable, it would be indicated as a pointer to the variable data area
+            *offset = align_address(PTR_ALIGN, *offset);
+            next_add = POINTER_SIZE;
         } else if let Some(ref mut subs) = self.sub_fields {
+            next_add = 0; // Map add nothing
             let format_name = if name_path.is_empty() {
                 name_path
             } else {
@@ -196,9 +202,12 @@ impl Field {
             });
         } else {
             if !is_field_var {
-                *offset += types::size_of_type(self.data_type);
+                let ty_align = types::align_of_type(self.data_type);
+                *offset = align_address(ty_align, *offset);
+                next_add = types::size_of_type(self.data_type);
             } else {
-                *offset += POINTER_SIZE;
+                *offset = align_address(PTR_ALIGN, *offset);
+                next_add = POINTER_SIZE;
             }
         }
         if !field_path.is_empty() {
@@ -210,6 +219,8 @@ impl Field {
                 index_fields.insert(name_path_hash, self.indices.clone());
             }
         }
+        self.offset = Some(*offset);
+        *offset += next_add;
         trace!(
             "Assigned field {} to {:?}, now at {}, var {}, offset moved {}",
             self.name,
@@ -220,7 +231,7 @@ impl Field {
         );
     }
     pub fn is_var(&self) -> bool {
-        self.is_array || !types::fixed_size(self.data_type)
+        self.is_array || (!types::fixed_size(self.data_type) && self.sub_fields.is_none())
     }
     pub fn field_by_name_id(&self, name_id: &u64) -> Option<&Field> {
         self.sub_fields_map.as_ref().and_then(|m| {

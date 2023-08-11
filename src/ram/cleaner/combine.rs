@@ -66,13 +66,14 @@ impl CombinedCleaner {
             .iter()
             .map(|seg| seg.used_spaces() as usize)
             .sum::<usize>();
-        
-        let segment_ids_to_combine: HashSet<_> = segments
-            .iter()
-            .map(|seg| seg.id)
-            .collect();
 
-        debug!("Starting combining segments, candidates {:?}, head seg {}", segment_ids_to_combine, chunk.get_head_seg_id());
+        let segment_ids_to_combine: HashSet<_> = segments.iter().map(|seg| seg.id).collect();
+
+        debug!(
+            "Starting combining segments, candidates {:?}, head seg {}",
+            segment_ids_to_combine,
+            chunk.get_head_seg_id()
+        );
 
         // Get all entries in segments to combine and order them by data temperature and size
         let nested_entries = segments
@@ -139,13 +140,14 @@ impl CombinedCleaner {
             let mut pending_segments = Vec::with_capacity(segments.len());
             pending_segments.push(DummySegment::new());
             for (entry, is_claimed) in entries.iter_mut() {
-                let entry_size = entry.size;                    
+                let entry_size = entry.size;
                 if *is_claimed {
                     // entry claimed
                     continue;
                 }
                 {
-                    let segment_space_remains = SEGMENT_SIZE - pending_segments.last().unwrap().head;
+                    let segment_space_remains =
+                        SEGMENT_SIZE - pending_segments.last().unwrap().head;
                     if entry_size > segment_space_remains {
                         pending_segments.push(DummySegment::new());
                     }
@@ -279,12 +281,20 @@ impl CombinedCleaner {
         }
 
         let len_cleaned_segments = segments.len();
-        debug!("Removing {} old segments, {:?}, now head seg {}", len_cleaned_segments, segment_ids_to_combine, chunk.get_head_seg_id());
+        debug!(
+            "Removing {} old segments, {:?}, now head seg {}",
+            len_cleaned_segments,
+            segment_ids_to_combine,
+            chunk.get_head_seg_id()
+        );
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop(chunk);
         }
-        debug!("End combining segments, totally cleaned {} bytes, with {} segments.", space_cleaned, len_cleaned_segments);
+        debug!(
+            "End combining segments, totally cleaned {} bytes, with {} segments.",
+            space_cleaned, len_cleaned_segments
+        );
         space_cleaned
     }
 }

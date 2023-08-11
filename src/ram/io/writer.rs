@@ -1,12 +1,17 @@
-use crate::ram::cell::*;
+use crate::ram::io::align_ptr_addr;
 use crate::ram::schema::Field;
 use crate::ram::types;
 use crate::ram::types::OwnedValue;
+use crate::ram::{cell::*, io::align_address_with_ty};
 
 use std::collections::{HashMap, HashSet};
 
-use dovahkiin::types::{key_hash, Map, Type};
+use dovahkiin::types::{
+    key_hash, Map, OwnedMap, SharedMap, SharedValue, Type, ARRAY_LEN_TYPE, TYPE_CODE_TYPE,
+};
+use itertools::Itertools;
 
+#[derive(Debug)]
 enum InstData<'a> {
     Ref(&'a OwnedValue),
     Val(OwnedValue),
@@ -21,6 +26,22 @@ impl<'a> InstData<'a> {
     }
 }
 
+pub struct WriteInstructions<'a> {
+    inner: Vec<Instruction<'a>>,
+}
+
+impl<'a> WriteInstructions<'a> {
+    pub fn new() -> Self {
+        Self { inner: vec![] }
+    }
+
+    pub fn push(&mut self, inst: Instruction<'a>) {
+        trace!("Instruction push {:?}", inst);
+        self.inner.push(inst);
+    }
+}
+
+#[derive(Debug)]
 pub struct Instruction<'a> {
     data_type: Type,
     val: InstData<'a>,
@@ -31,21 +52,47 @@ pub fn plan_write_field<'a>(
     tail_offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
-    mut ins: &mut Vec<Instruction<'a>>,
+    mut ins: &mut WriteInstructions<'a>,
     is_var: bool,
 ) -> Result<(), WriteError> {
     let mut schema_offset = field.offset.clone();
     let is_field_var = field.is_var();
-    let offset = if let Some(ref subs) = field.sub_fields {
-        if let OwnedValue::Array(_) = value {
-            if !field.is_array {
-                return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+    let is_null = match value {
+        OwnedValue::Null | OwnedValue::NA => true,
+        _ => false,
+    };
+    let offset = if field.nullable {
+        if !is_var {
+            let null_flag = is_null.then_some(0).unwrap_or(*tail_offset) as u32;
+            ins.push(Instruction {
+                data_type: Type::U32,
+                val: InstData::Val(OwnedValue::U32(null_flag)),
+                offset: schema_offset.unwrap(),
+            });
+        } else {
+            trace!("Push is null inst with {} at {:?}", is_null, *tail_offset);
+            ins.push(Instruction {
+                data_type: Type::Bool,
+                val: InstData::Val(OwnedValue::Bool(is_null)),
+                offset: *tail_offset,
+            });
+            *tail_offset += 1;
+            if !is_null {
+                *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
             }
+        }
+        if is_null {
+            return Ok(());
+        } else {
+            tail_offset
+        }
+    } else if let Some(ref subs) = field.sub_fields {
+        if let (OwnedValue::Array(_), true) = (value, field.is_array) {
             if !is_var {
                 trace!(
-                    "Push jump tailing for map array with {} at {}",
+                    "Push array jump tailing inst with {} at {:?}",
                     tail_offset,
-                    schema_offset.unwrap()
+                    schema_offset
                 );
                 ins.push(Instruction {
                     data_type: Type::U32,
@@ -53,18 +100,8 @@ pub fn plan_write_field<'a>(
                     offset: schema_offset.unwrap(),
                 });
             }
-            trace!(
-                "Taking tailing offset for array {} at {}",
-                field.name,
-                tail_offset
-            );
             tail_offset
         } else if let OwnedValue::Map(map) = value {
-            trace!(
-                "Writing map fields with for {} at {}",
-                field.name,
-                tail_offset
-            );
             for sub in subs {
                 let val = map.get_by_key_id(sub.name_id);
                 plan_write_field(tail_offset, &sub, val, &mut ins, is_var)?;
@@ -78,10 +115,11 @@ pub fn plan_write_field<'a>(
         if !is_var {
             // No need to jump to var region when it is var
             trace!(
-                "Push jump tailing inst with {} at {:?}",
+                "Push var field jump tailing inst with {} at {:?}",
                 tail_offset,
                 schema_offset
             );
+            *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(*tail_offset as u32)),
@@ -107,25 +145,13 @@ pub fn plan_write_field<'a>(
         value,
         field
     );
-    if field.nullable {
-        let null_bit = match value {
-            OwnedValue::Null => true,
-            _ => false,
-        };
-        trace!("Push null bit inst with {} at {}", null_bit, *offset);
-        ins.push(Instruction {
-            data_type: Type::Bool,
-            val: InstData::Val(OwnedValue::Bool(null_bit)),
-            offset: *offset,
-        });
-        *offset += 1;
-    }
     if field.is_array {
         if let OwnedValue::Array(array) = value {
             let len = array.len();
             let mut sub_field = field.clone();
             sub_field.is_array = false;
             trace!("Pushing array len inst with {} at {}", len, *offset);
+            *offset = align_ptr_addr(*offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
@@ -140,6 +166,7 @@ pub fn plan_write_field<'a>(
             let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
             trace!("Pushing prim array len inst with {} at {}", len, *offset);
+            *offset = align_ptr_addr(*offset);
             ins.push(Instruction {
                 data_type: types::ARRAY_LEN_TYPE,
                 val: InstData::Val(OwnedValue::U32(len as u32)),
@@ -151,6 +178,7 @@ pub fn plan_write_field<'a>(
                 value,
                 *offset
             );
+            *offset = align_address_with_ty(field.data_type, *offset);
             ins.push(Instruction {
                 data_type: field.data_type,
                 val: InstData::Ref(value),
@@ -161,30 +189,26 @@ pub fn plan_write_field<'a>(
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
     } else {
-        let is_null = match value {
-            OwnedValue::Null => true,
-            _ => false,
-        };
         if !field.nullable && is_null {
             return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
         }
-        if !is_null {
-            let size = types::get_vsize(field.data_type, &value);
-            ins.push(Instruction {
-                data_type: field.data_type,
-                val: InstData::Ref(value),
-                offset: *offset,
-            });
-            let new_offset = *offset + size;
-            trace!(
-                "Pushing value ref inst with {:?} at {}, size {}, new offset {}",
-                value,
-                *offset,
-                size,
-                new_offset
-            );
-            *offset = new_offset;
-        }
+        let size = types::get_vsize(field.data_type, &value);
+        *offset = align_address_with_ty(field.data_type, *offset);
+        ins.push(Instruction {
+            data_type: field.data_type,
+            val: InstData::Ref(value),
+            offset: *offset,
+        });
+        let new_offset = *offset + size;
+        trace!(
+            "Pushing value ref {} inst with {:?} at {}, size {}, new offset {}",
+            field.name,
+            value,
+            *offset,
+            size,
+            new_offset
+        );
+        *offset = new_offset;
     }
     return Ok(());
 }
@@ -193,15 +217,16 @@ pub fn plan_write_dynamic_fields<'a>(
     offset: &mut usize,
     field: &Field,
     value: &'a OwnedValue,
-    ins: &mut Vec<Instruction<'a>>,
+    ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
+    *offset = align_ptr_addr(*offset);
     if let (OwnedValue::Map(data_all), &Some(ref fields)) = (value, &field.sub_fields) {
         let schema_keys: HashSet<u64> = fields.iter().map(|f| f.name_id).collect();
         let dynamic_map: HashMap<_, _> = data_all
             .map
             .iter()
             .filter(|(k, _v)| !schema_keys.contains(k))
-            .map(|(k, v)| (k, v))
+            .map(|(k, v)| (*k, v))
             .collect();
         let dynamic_names: Vec<_> = data_all
             .fields
@@ -210,9 +235,55 @@ pub fn plan_write_dynamic_fields<'a>(
                 let id = key_hash(&n);
                 dynamic_map.get(&id).map(|_| n)
             })
+            .cloned()
             .collect();
-        if !dynamic_map.is_empty() {}
-        plan_write_dynamic_map(offset, &dynamic_names, &dynamic_map, ins)?;
+        plan_write_dynamic_map(offset, dynamic_map, &dynamic_names, ins)?;
+    }
+    return Ok(());
+}
+
+fn plan_write_dynamic_map<'a>(
+    offset: &mut usize,
+    map: HashMap<u64, &'a OwnedValue>,
+    fields: &[String],
+    ins: &mut WriteInstructions<'a>,
+) -> Result<(), WriteError> {
+    *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
+    ins.push(Instruction {
+        data_type: ARRAY_LEN_TYPE,
+        val: InstData::Val(OwnedValue::U32(map.len() as _)),
+        offset: *offset,
+    });
+    *offset += ARRAY_LEN_TYPE.size().unwrap();
+
+    // Write types
+    let field_ids = fields.iter().map(|n| key_hash(&n)).collect_vec();
+    for (i, _name) in fields.iter().enumerate() {
+        let fid = &field_ids[i];
+        let val = map[fid];
+        ins.push(Instruction {
+            data_type: Type::U8,
+            val: InstData::Val(OwnedValue::U8(dyn_data_type_id(val))),
+            offset: *offset,
+        });
+        *offset += 1;
+    }
+    // Write field names
+    for name in fields {
+        let name_value = OwnedValue::String((*name).to_owned());
+        let name_size = types::get_vsize(name_value.base_type(), &name_value);
+        *offset = align_address_with_ty(Type::String, *offset);
+        ins.push(Instruction {
+            data_type: name_value.base_type(),
+            val: InstData::Val(name_value),
+            offset: *offset,
+        });
+        *offset += name_size;
+    }
+    for (i, _name) in fields.iter().enumerate() {
+        let fid = &field_ids[i];
+        let val = map[fid];
+        plan_write_dynamic_value(offset, val, ins)?
     }
     return Ok(());
 }
@@ -220,128 +291,98 @@ pub fn plan_write_dynamic_fields<'a>(
 pub const ARRAY_TYPE_MASK: u8 = !(!0 << 1 >> 1); // 1000000...
 pub const NULL_PLACEHOLDER: u8 = ARRAY_TYPE_MASK >> 1; // 1000000...
 
-pub fn plan_write_dynamic_map<'a>(
-    offset: &mut usize,
-    names: &Vec<&String>,
-    map: &HashMap<&u64, &'a OwnedValue>,
-    ins: &mut Vec<Instruction<'a>>,
-) -> Result<(), WriteError> {
-    ins.push(Instruction {
-        data_type: types::TYPE_CODE_TYPE,
-        val: InstData::Val(OwnedValue::U8(Type::Map.id())),
-        offset: *offset,
-    });
-    *offset += types::u8_io::type_size();
-    // Write map size
-    ins.push(Instruction {
-        data_type: types::ARRAY_LEN_TYPE,
-        val: InstData::Val(OwnedValue::U32(names.len() as u32)),
-        offset: *offset,
-    });
-    *offset += types::u32_io::type_size();
-    for name in names {
-        let id = key_hash(name);
-        let name_value = OwnedValue::String((*name).to_owned());
-        let name_size = types::get_vsize(name_value.base_type(), &name_value);
-        ins.push(Instruction {
-            data_type: name_value.base_type(),
-            val: InstData::Val(name_value),
-            offset: *offset,
-        });
-        *offset += name_size;
-        plan_write_dynamic_value(offset, map.get(&id).unwrap(), ins)?;
+fn dyn_data_type_id<'a>(value: &'a OwnedValue) -> u8 {
+    match &value {
+        &OwnedValue::Array(_) => ARRAY_TYPE_MASK,
+        &OwnedValue::PrimArray(_) => ARRAY_TYPE_MASK | value.base_type().id(),
+        &OwnedValue::Map(_) => Type::Map.id(),
+        &OwnedValue::Null | OwnedValue::NA => NULL_PLACEHOLDER,
+        _ => value.base_type().id(),
     }
-    Ok(())
 }
 
-pub fn plan_write_dynamic_value<'a>(
+fn plan_write_dynamic_value<'a>(
     offset: &mut usize,
     value: &'a OwnedValue,
-    ins: &mut Vec<Instruction<'a>>,
+    ins: &mut WriteInstructions<'a>,
 ) -> Result<(), WriteError> {
-    let base_type = value.base_type();
+    if let &OwnedValue::Map(m) = &value {
+        return plan_write_dynamic_map(
+            offset,
+            m.map.iter().map(|(k, v)| (*k, v)).collect(),
+            &m.fields,
+            ins,
+        );
+    } else if let Some(len) = value.len() {
+        // Record the length of the value if it is a compound
+        *offset = align_address_with_ty(ARRAY_LEN_TYPE, *offset);
+        ins.push(Instruction {
+            data_type: ARRAY_LEN_TYPE,
+            val: InstData::Val(OwnedValue::U32(len as _)),
+            offset: *offset,
+        });
+        *offset += ARRAY_LEN_TYPE.size().unwrap();
+    } else {
+        // Else just write the data
+        let ty = value.base_type();
+        let value_size = types::get_vsize(ty, &value);
+        *offset = align_address_with_ty(ty, *offset);
+        ins.push(Instruction {
+            data_type: ty,
+            val: InstData::Ref(value),
+            offset: *offset,
+        });
+        *offset += value_size;
+        return Ok(()); // We are done here
+    }
+
     match &value {
         &OwnedValue::Array(array) => {
-            // Write type id
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK)), // Only put the mask cause we don't know the type
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let len = array.len();
-            // Write array length
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
+            for val in array {
+                let ty = dyn_data_type_id(val);
+                ins.push(Instruction {
+                    data_type: Type::U8,
+                    val: InstData::Val(OwnedValue::U8(ty)),
+                    offset: *offset,
+                });
+                *offset += 1;
+            }
+        }
+        &OwnedValue::PrimArray(_array) => {
+            // Do noting for primary
+        }
+        _ => {
+            unreachable!()
+        }
+    }
+    // Write actual data for each of the children in the container
+    match &value {
+        &OwnedValue::Array(array) => {
             for val in array {
                 plan_write_dynamic_value(offset, val, ins)?;
             }
         }
         &OwnedValue::PrimArray(array) => {
-            // Write type id with array tag
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ARRAY_TYPE_MASK | base_type.id())),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let len = array.len();
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
             let array_size = array.size();
+            *offset = align_address_with_ty(value.base_type(), *offset);
             ins.push(Instruction {
-                data_type: base_type,
+                data_type: value.base_type(),
                 val: InstData::Ref(value),
                 offset: *offset,
             });
             *offset += array_size;
         }
-        &OwnedValue::Map(map) => plan_write_dynamic_map(
-            offset,
-            &map.fields.iter().collect(),
-            &map.map.iter().collect(),
-            ins,
-        )?,
-        &OwnedValue::Null | OwnedValue::NA => {
-            // Write a placeholder because mapping required
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(NULL_PLACEHOLDER)),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-        }
         _ => {
-            // Primitives
-            let ty = value.base_type();
-            ins.push(Instruction {
-                data_type: types::TYPE_CODE_TYPE,
-                val: InstData::Val(OwnedValue::U8(ty.id())),
-                offset: *offset,
-            });
-            *offset += types::u8_io::type_size();
-            let value_size = types::get_vsize(ty, &value);
-            ins.push(Instruction {
-                data_type: ty,
-                val: InstData::Ref(value),
-                offset: *offset,
-            });
-            *offset += value_size;
+            unreachable!()
         }
     }
-    Ok(())
+    return Ok(());
 }
 
-pub fn execute_plan(ptr: usize, instructions: &Vec<Instruction>) {
-    for ins in instructions {
-        types::set_val(ins.data_type, ins.val.val_ref(), ptr + ins.offset);
+pub fn execute_plan(ptr: usize, instructions: &WriteInstructions) {
+    for ins in &instructions.inner {
+        let target_addr = ptr + ins.offset;
+        trace!("Executing instruction {:?} at base {}", ins, ptr);
+        types::set_val(ins.data_type, ins.val.val_ref(), target_addr);
     }
 }
