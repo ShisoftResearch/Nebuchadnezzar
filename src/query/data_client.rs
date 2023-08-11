@@ -390,7 +390,7 @@ mod test {
                 assert_eq!(
                     id,
                     cell.id(),
-                    "Id does not match sequence. Exoecting {:?}, got {:?}",
+                    "Id does not match sequence. Expecting {:?}, got {:?}",
                     id,
                     cell.id()
                 );

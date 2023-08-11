@@ -63,7 +63,7 @@ pub fn plan_write_field<'a>(
     };
     let offset = if field.nullable {
         if !is_var {
-            let null_flag = is_null.then_some(*tail_offset).unwrap_or(0) as u32;
+            let null_flag = is_null.then_some(0).unwrap_or(*tail_offset) as u32;
             ins.push(Instruction {
                 data_type: Type::U32,
                 val: InstData::Val(OwnedValue::U32(null_flag)),

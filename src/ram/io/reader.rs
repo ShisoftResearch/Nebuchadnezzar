@@ -21,7 +21,7 @@ fn read_field<'v>(
     let orig_tail_offset = *tail_offset;
     let field_nullable = field.nullable;
     let field_is_array = field.is_array && (!force_mono);
-    let field_var_base_ty  = field.data_type.size().is_none();
+    let field_var_base_ty  = field.data_type.size().is_none() && field.sub_fields.is_none();
     let field_is_var = field_var_base_ty || field.is_array;
     let (target_offset, tailing) = match (field.offset, field_is_var, field_nullable, is_var) {
         (Some(schema_field_offset), false, false, false) => {
@@ -33,6 +33,7 @@ fn read_field<'v>(
             // Var or nullable schema field
             let rel_offset = *u32_io::read(base_ptr + schema_field_offset) as usize;
             if rel_offset == 0 {
+                trace!("Returing Null for nullable schema field {}, type {:?}, offset {}", field.name, field.data_type, schema_field_offset);
                 return SharedValue::Null;
             } else {
                 *tail_offset = rel_offset;
@@ -50,6 +51,7 @@ fn read_field<'v>(
             // In-var fields, nullable
             let is_null = *bool_io::read(base_ptr + *tail_offset) as bool;
             if is_null {
+                trace!("Returing Null for in-var nullable schema field {}, type {:?}, offset {}", field.name, field.data_type, tail_offset);
                 return SharedValue::Null;
             }
             *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
@@ -85,7 +87,7 @@ fn read_field<'v>(
             );
             (val, size)
         }
-        (false, true, _, None) => {
+        (_, true, _, None) => {
             // Array of primitives
             let array_ptr = base_ptr + target_offset;
             let array_len = *types::get_shared_val(Type::U32, array_ptr).u32().unwrap();
@@ -116,7 +118,7 @@ fn read_field<'v>(
             );
             (val, size)
         }
-        (true, true, _, _) => {
+        (_, true, _, _) => {
             // Array of non-primitives (including maps)
             let array_len = *types::get_shared_val(Type::U32, base_ptr + target_offset)
                 .u32()
