@@ -21,41 +21,67 @@ fn read_field<'v>(
     let orig_tail_offset = *tail_offset;
     let field_nullable = field.nullable;
     let field_is_array = field.is_array && (!force_mono);
-    let field_var_base_ty  = field.data_type.size().is_none() && field.sub_fields.is_none();
+    let field_var_base_ty = field.data_type.size().is_none() && field.sub_fields.is_none();
     let field_is_var = field_var_base_ty || field.is_array;
     let (target_offset, tailing) = match (field.offset, field_is_var, field_nullable, is_var) {
         (Some(schema_field_offset), false, false, false) => {
-            trace!("Using schema field offset for {}, offset {}", field.name, schema_field_offset);
+            trace!(
+                "Using schema field offset for {}, offset {}",
+                field.name,
+                schema_field_offset
+            );
             (schema_field_offset, false)
-        },
+        }
         (Some(schema_field_offset), true, _, false)
         | (Some(schema_field_offset), _, true, false) => {
             // Var or nullable schema field
             let rel_offset = *u32_io::read(base_ptr + schema_field_offset) as usize;
             if rel_offset == 0 {
-                trace!("Returing Null for nullable schema field {}, type {:?}, offset {}", field.name, field.data_type, schema_field_offset);
+                trace!(
+                    "Returing Null for nullable schema field {}, type {:?}, offset {}",
+                    field.name,
+                    field.data_type,
+                    schema_field_offset
+                );
                 return SharedValue::Null;
             } else {
                 *tail_offset = rel_offset;
-                trace!("Using schema field recorded offset for {}, offset {}", field.name, tail_offset);
+                trace!(
+                    "Using schema field recorded offset for {}, offset {}",
+                    field.name,
+                    tail_offset
+                );
                 (*tail_offset, true)
             }
         }
         (_, _, false, true) => {
             // In-var fields, not nullable
             *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
-            trace!("Using non-nullable aligned tail offset for {}, offset {}", field.name, tail_offset);
+            trace!(
+                "Using non-nullable aligned tail offset for {}, offset {}",
+                field.name,
+                tail_offset
+            );
             (*tail_offset, true)
         }
         (_, _, true, true) => {
             // In-var fields, nullable
             let is_null = *bool_io::read(base_ptr + *tail_offset) as bool;
             if is_null {
-                trace!("Returing Null for in-var nullable schema field {}, type {:?}, offset {}", field.name, field.data_type, tail_offset);
+                trace!(
+                    "Returing Null for in-var nullable schema field {}, type {:?}, offset {}",
+                    field.name,
+                    field.data_type,
+                    tail_offset
+                );
                 return SharedValue::Null;
             }
             *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
-            trace!("Using nullable aligned tail offset for {}, offset {}", field.name, tail_offset);
+            trace!(
+                "Using nullable aligned tail offset for {}, offset {}",
+                field.name,
+                tail_offset
+            );
             (*tail_offset, true)
         }
         p => unreachable!("Do not accept target offset pattern: {:?}", p),
@@ -151,8 +177,10 @@ fn read_field<'v>(
             // Maps
             let mut map = SharedMap::new();
             trace!(
-                "Reading map body for {} from offset {}, used to have tailing {}", 
-                field.name, target_offset, tail_offset,
+                "Reading map body for {} from offset {}, used to have tailing {}",
+                field.name,
+                target_offset,
+                tail_offset,
             );
             for sub in sub_fields {
                 map.insert_key_id(
