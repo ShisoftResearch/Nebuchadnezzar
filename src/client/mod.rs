@@ -110,7 +110,7 @@ impl AsyncClient {
     }
     pub async fn read_all_cells(
         &self,
-        ids: Vec<Id>,
+        ids: &Vec<Id>,
     ) -> Result<Vec<Result<OwnedCell, ReadError>>, RPCError> {
         let mut cells_by_client = ids
             .iter()

@@ -46,16 +46,17 @@ impl StateMachineCmds for MasterTreeSM {
     fn locate_key(&self, entry: EntryKey) -> BoxFuture<(EntryKey, TreePlacement, EntryKey)> {
         let (lower, tree) = self
             .tree
-            .range(..=entry.clone())
+            .range(..=&entry)
             .last()
-            .map(|(key, tree)| (key.clone(), tree.clone()))
+            .map(|(key, tree)| (key.to_owned(), tree.to_owned()))
             .unwrap();
         let upper = self
             .tree
             .range((Excluded(entry), Unbounded))
             .next()
-            .map(|(key, _)| key.clone())
-            .unwrap_or_else(|| EntryKey::max());
+            .map(|(key, _)| key)
+            .unwrap_or_else(|| &*MAX_ENTRY_KEY)
+            .to_owned();
         future::ready((lower, tree, upper)).boxed()
     }
 
