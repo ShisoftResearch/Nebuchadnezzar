@@ -2,7 +2,6 @@ use bifrost::conshash::{CHError, ConsistentHashing};
 use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
-use bifrost::raft::state_machine::callback::server::NotifyError;
 use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
 use futures::prelude::*;
@@ -122,7 +121,7 @@ impl AsyncClient {
             .map(|(server_id, ids)| async move {
                 if server_id > 0 {
                     let client = self.client_by_server_id(server_id).await.unwrap();
-                    (client.read_all_cells(ids.clone()).await, ids)
+                    (client.read_all_cells(&ids).await, ids)
                 } else {
                     (
                         Ok(vec![Err(ReadError::CellIdIsUnitId)]),

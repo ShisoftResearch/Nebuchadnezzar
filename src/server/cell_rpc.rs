@@ -20,8 +20,8 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 
 service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
-    rpc read_all_cells(keys: Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
-    rpc read_all_cells_selected(keys: Vec<Id>, colums: Vec<u64>) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells(keys: &Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -38,7 +38,7 @@ impl Service for NebRPCService {
     fn read_cell(&self, key: Id) -> BoxFuture<Result<OwnedCell, ReadError>> {
         future::ready(self.server.chunks.read_cell(&key).map(|c| c.to_owned())).boxed()
     }
-    fn read_all_cells(&self, keys: Vec<Id>) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
+    fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
                 .map(|id| self.server.chunks.read_cell(&id).map(|c| c.to_owned()))
@@ -48,8 +48,8 @@ impl Service for NebRPCService {
     }
     fn read_all_cells_selected(
         &self,
-        keys: Vec<Id>,
-        colums: Vec<u64>,
+        keys: &Vec<Id>,
+        colums: &Vec<u64>,
     ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
