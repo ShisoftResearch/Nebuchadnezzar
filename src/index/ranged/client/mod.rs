@@ -48,7 +48,7 @@ impl RangedQueryClient {
                     let range = range.clone();
                     async move {
                         client
-                            .seek(tree_id, range, pattern, buffer_size, epoch)
+                            .seek(tree_id, range, &pattern, buffer_size, epoch)
                             .await
                     }
                     .boxed()

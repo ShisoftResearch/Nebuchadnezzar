@@ -92,7 +92,7 @@ service! {
     rpc load_tree(id: Id, boundary: Boundary, epoch: u64);
     rpc insert(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
     rpc delete(id: Id, entry: EntryKey, epoch: u64) -> OpResult<bool>;
-    rpc seek(id: Id, range: Range, pattern: Option<Vec<u8>>, buffer_size: u16, epoch: u64)
+    rpc seek(id: Id, range: Range, pattern: &Option<Vec<u8>>, buffer_size: u16, epoch: u64)
         -> OpResult<ServBlock>;
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
@@ -162,7 +162,7 @@ impl Service for LSMTreeService {
         &self,
         id: Id,
         range: Range,
-        pattern: Option<Vec<u8>>,
+        pattern: &Option<Vec<u8>>,
         buffer_size: u16,
         epoch: u64,
     ) -> BoxFuture<OpResult<ServBlock>> {

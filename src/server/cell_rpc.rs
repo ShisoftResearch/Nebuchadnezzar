@@ -22,7 +22,7 @@ service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells(keys: Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_selected(keys: Vec<Id>, colums: Vec<u64>) -> Vec<Result<OwnedCell, ReadError>>;
-    rpc read_all_cells_proced(keys: Vec<Id>, colums: Vec<u64>, filter: Expr, proc: Expr) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -82,10 +82,10 @@ impl Service for NebRPCService {
 
     fn read_all_cells_proced(
         &self,
-        keys: Vec<Id>,
-        colums: Vec<u64>,
-        filter: Expr,
-        proc: Expr,
+        keys: &Vec<Id>,
+        colums: &Vec<u64>,
+        filter: &Expr,
+        proc: &Expr,
     ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
         let filter_empty = filter.is_empty();
         let proc_empty = proc.is_empty();
@@ -113,31 +113,18 @@ impl Service for NebRPCService {
                 }))
             });
             if !filter_empty {
-                let filter = filter.to_sexpr();
                 cells = cells
                     .into_iter()
                     .enumerate()
                     .map(|(i, cell_res)| {
                         cell_res.and_then(|cell| {
                             let exec = interpreters[i].as_mut().unwrap();
-                            let check_res = filter.clone().eval(exec.get_env());
+                            let check_res = filter.clone().to_sexpr().eval(exec.get_env());
                             match check_res {
                                 Ok(sexp) => {
                                     if is_true(&sexp) {
-                                        trace!(
-                                            "!!! Checked {:?} with filter {:?} got match, res {:?}",
-                                            cell.id(),
-                                            filter,
-                                            sexp
-                                        );
                                         Ok(cell)
                                     } else {
-                                        trace!(
-                                            "Checked {:?} with filter {:?} unmatch, res {:?}",
-                                            cell.id(),
-                                            filter,
-                                            sexp
-                                        );
                                         Err(ReadError::NotMatch)
                                     }
                                 }
@@ -148,14 +135,13 @@ impl Service for NebRPCService {
                     .collect();
             }
             if !proc_empty {
-                let proc = proc.to_sexpr();
                 let cells = cells
                     .into_iter()
                     .enumerate()
                     .map(|(i, cell_res)| {
                         let exec = interpreters[i].as_mut().unwrap();
                         cell_res.and_then(|cell| {
-                            let proc_res = proc.clone().eval(exec.get_env());
+                            let proc_res = proc.clone().to_sexpr().eval(exec.get_env());
                             match proc_res {
                                 Ok(sexp) => {
                                     let val = sexp.owned_val().unwrap_or(OwnedValue::NA);

@@ -137,7 +137,7 @@ impl ClientCursor {
                     .seek(
                         tree.id,
                         range,
-                        self.pattern.clone(),
+                        &self.pattern,
                         self.buffer_size,
                         tree.epoch,
                     )
