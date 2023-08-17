@@ -13,6 +13,7 @@ log = "*"
 lazy_static = "*"
 bifrost = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_plugins = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
+bifrost_proc_macro = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 bifrost_hasher = { git = "https://github.com/shisoft/bifrost", branch = "develop" }
 dovahkiin = { git = "https://github.com/ShisoftResearch/Dovahkiin.git", branch = "develop" }
 lightning-containers = { git = "ssh://git@192.168.10.134/shisoft-x/Lightning.git", branch = "develop" }
