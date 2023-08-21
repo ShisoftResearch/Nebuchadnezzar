@@ -267,7 +267,7 @@ impl NebServer {
         debug!("Prepare raft subscription");
         RaftClient::prepare_subscription(&rpc_server).await;
         debug!("Starting member service");
-        let member_service = MemberService::new(server_addr, &raft_client).await;
+        let member_service = MemberService::new(server_addr, &raft_client, &raft_service).await;
         debug!("Member join group: {}", group_name);
         member_service.join_group(group_name).await.unwrap();
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
