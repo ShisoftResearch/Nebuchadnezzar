@@ -1,10 +1,29 @@
+use dovahkiin::{types::SharedValue, expr::serde::Expr};
+
+use super::symbols::Symbol;
+
 mod simd;
 
-struct Row<const PS: usize> {
-
+pub struct CPU {
+    socket: u8,
+    cores: u8,
+    simd: bool,
 }
 
-trait DataFrame<const PS: usize> {
-    // fn from_cursor
-    fn next(&self) -> Row<PS>;
+pub struct GPU {
+   // To be defined
+}
+
+pub struct Remote {
+     uri: String
+}
+
+pub enum Device {
+    CPU(CPU),
+    GPU(GPU),
+    Remote(Remote)
+}
+
+struct Rows<'a> {
+    data: Vec<SharedValue<'a>>
 }
