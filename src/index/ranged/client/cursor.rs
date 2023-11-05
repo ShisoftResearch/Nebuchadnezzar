@@ -134,13 +134,7 @@ impl ClientCursor {
                     ordering: self.range.ordering,
                 };
                 let seek_res = tree_client
-                    .seek(
-                        tree.id,
-                        range,
-                        &self.pattern,
-                        self.buffer_size,
-                        tree.epoch,
-                    )
+                    .seek(tree.id, range, &self.pattern, self.buffer_size, tree.epoch)
                     .await?;
                 match seek_res {
                     OpResult::Successful(block) => {

@@ -17,13 +17,9 @@ struct DataFrame {
     dev: Device,
     rel: Vec<DataFrame>,
     syn: Symbol,
-    arg: Expr
+    arg: Expr,
 }
 
-impl DataFrame {
+impl DataFrame {}
 
-}
-
-trait Func {
-
-}
+trait Func {}

@@ -241,7 +241,9 @@ impl<'a> DataCursor<'a> {
                                 match client_by_server_name(sid, server_name).await {
                                     Ok(client) => {
                                         let read_res = client
-                                            .read_all_cells_proced(&ids, projection, selection, proc)
+                                            .read_all_cells_proced(
+                                                &ids, projection, selection, proc,
+                                            )
                                             .await
                                             .map(|v| v.into_iter().zip(idx).collect_vec());
                                         match read_res {

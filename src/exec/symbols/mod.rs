@@ -1,11 +1,11 @@
-use bifrost_hasher::hash_str;
-use lazy_static::*;
 use ::serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use bifrost_hasher::hash_str;
+use bifrost_plugins::hash_ident;
+use dovahkiin::expr::interpreter::Envorinment;
 use dovahkiin::expr::symbols::*;
 use dovahkiin::expr::SExpr;
-use dovahkiin::expr::interpreter::Envorinment;
-use bifrost_plugins::hash_ident;
+use lazy_static::*;
+use std::collections::HashMap;
 
 mod datasource;
 
@@ -36,7 +36,7 @@ macro_rules! defdbsymbols {
             Sys(SysSymbols),
             $(
                 $name,
-            )*    
+            )*
         }
         impl DBSymbols {
             pub fn from_id(id: u64) -> Self {
@@ -52,7 +52,7 @@ macro_rules! defdbsymbols {
                     Self::Sys(sys) => sys as u64,
                     $(
                         Self::$name => hash_ident!($sym),
-                    )*  
+                    )*
                 }
             }
         }

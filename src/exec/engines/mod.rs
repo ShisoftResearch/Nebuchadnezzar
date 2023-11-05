@@ -1,4 +1,4 @@
-use dovahkiin::{types::SharedValue, expr::serde::Expr};
+use dovahkiin::{expr::serde::Expr, types::SharedValue};
 
 use super::symbols::Symbol;
 
@@ -11,19 +11,19 @@ pub struct CPU {
 }
 
 pub struct GPU {
-   // To be defined
+    // To be defined
 }
 
 pub struct Remote {
-     uri: String
+    uri: String,
 }
 
 pub enum Device {
     CPU(CPU),
     GPU(GPU),
-    Remote(Remote)
+    Remote(Remote),
 }
 
 struct Rows<'a> {
-    data: Vec<SharedValue<'a>>
+    data: Vec<SharedValue<'a>>,
 }
