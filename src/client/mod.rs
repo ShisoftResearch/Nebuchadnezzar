@@ -193,7 +193,7 @@ impl AsyncClient {
     }
     pub async fn transaction<'a, TFN, TR, RF>(&self, func: TFN) -> Result<TR, TxnError>
     where
-        TFN: Fn(Transaction) -> RF + 'a,
+        TFN: Fn(&'static Transaction) -> RF + 'a,
         RF: Future<Output = Result<TR, TxnError>> + 'a,
     {
         //unimplemented!()
@@ -217,7 +217,9 @@ impl AsyncClient {
                 state: Arc::new(StdCell::new(txn_server::TxnState::Started)),
                 client: txn_client.clone(),
             };
-            let exec_result = func(txn.clone()).await;
+            // Erase the txn lifetime so it does not required to be carried with result
+            let fn_txn_ref = unsafe { &*((&txn) as *const _) };
+            let exec_result = func(fn_txn_ref).await;
             let mut exec_value = None;
             let mut txn_result = Ok(());
             match exec_result {
