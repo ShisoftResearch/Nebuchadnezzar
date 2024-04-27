@@ -19,6 +19,7 @@ use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
+use crate::server::transactions::TxnId;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
 
 use self::transaction::*;
@@ -205,17 +206,17 @@ impl AsyncClient {
             Ok(client) => client,
             Err(e) => return Err(TxnError::IoError(e)),
         };
-        let mut txn_id: txn_server::TxnId;
         let mut retried = 0;
+        let mut txn = Transaction {
+            tid: TxnId::new(),
+            state: StdCell::new(txn_server::TxnState::Started),
+            client: txn_client,
+        };
         while retried < TRANSACTION_MAX_RETRY {
-            txn_id = match txn_client.begin().await {
+            txn.state = StdCell::new(txn_server::TxnState::Started);
+            txn.tid = match txn.client.begin().await {
                 Ok(Ok(id)) => id,
                 _ => return Err(TxnError::CannotBegin),
-            };
-            let txn = Transaction {
-                tid: txn_id,
-                state: Arc::new(StdCell::new(txn_server::TxnState::Started)),
-                client: txn_client.clone(),
             };
             // Erase the txn lifetime so it does not required to be carried with result
             let fn_txn_ref = unsafe { &*((&txn) as *const _) };

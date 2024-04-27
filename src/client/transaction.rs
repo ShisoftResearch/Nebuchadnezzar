@@ -29,7 +29,7 @@ pub enum TxnError {
 #[derive(Clone)]
 pub struct Transaction {
     pub tid: TxnId,
-    pub state: Arc<StdCell<TxnState>>,
+    pub state: StdCell<TxnState>,
     pub client: Arc<manager::AsyncServiceClient>,
 }
 
