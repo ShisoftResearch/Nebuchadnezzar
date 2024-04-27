@@ -41,7 +41,7 @@ impl StateMachineCmds for SchemasSM {
     }
     fn get(&self, id: u32) -> BoxFuture<Option<Schema>> {
         future::ready(self.map.schema_map.get(&id).map(|r| -> Schema {
-            let borrow: &Schema = r.borrow();
+            let borrow: &Schema = r;
             borrow.clone()
         }))
         .boxed()

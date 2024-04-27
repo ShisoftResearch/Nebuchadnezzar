@@ -315,7 +315,7 @@ impl Service for TransactionManager {
                         );
                         Ok(TxnExecResult::Accepted(()))
                     } else {
-                        let mut data_obj = txn.data.get_mut(&id).unwrap();
+                        let data_obj = txn.data.get_mut(&id).unwrap();
                         if !data_obj.cell.is_none() {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
@@ -343,7 +343,7 @@ impl Service for TransactionManager {
                 Some(server_id) => {
                     let cell = cell.clone();
                     if txn.data.contains_key(&id) {
-                        let mut data_obj = txn.data.get_mut(&id).unwrap();
+                        let data_obj = txn.data.get_mut(&id).unwrap();
                         data_obj.cell = Some(cell);
                         data_obj.changed = true
                     } else {

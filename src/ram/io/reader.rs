@@ -1,6 +1,6 @@
 use itertools::Itertools;
 
-use crate::ram::io::{align_address, align_ptr_addr};
+use crate::ram::io::align_ptr_addr;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types;
 use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
@@ -18,7 +18,6 @@ fn read_field<'v>(
     tail_offset: &mut usize,
     force_mono: bool,
 ) -> SharedValue<'v> {
-    let orig_tail_offset = *tail_offset;
     let field_nullable = field.nullable;
     let field_is_array = field.is_array && (!force_mono);
     let field_var_base_ty = field.data_type.size().is_none() && field.sub_fields.is_none();
@@ -88,13 +87,6 @@ fn read_field<'v>(
     };
     let (val, size) = match (field_var_base_ty, field_is_array, is_var, &field.sub_fields) {
         (_, false, _, None) => {
-            // Simple typed fields
-            let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
-            let size = if field_var_base_ty {
-                types::get_rsize(field.data_type, &val)
-            } else {
-                types::size_of_type(field.data_type)
-            };
             // Simple typed fields
             let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
             let size = if field_var_base_ty {
@@ -192,7 +184,6 @@ fn read_field<'v>(
             let val = SharedValue::Map(map);
             (val, 0) // Map size will be reflected in `tail_offset`
         }
-        p => unreachable!("Do not accept schema pattern {:?}", p),
     };
     if tailing {
         *tail_offset += size
@@ -418,14 +409,12 @@ pub fn read_by_schema_selected<'v>(ptr: usize, schema: &Schema, fields: &[u64]) 
             if let Some(index_path) = schema.field_index.get(field) {
                 // Make sure the index path is valid
                 if !index_path.is_empty() {
-                    // Get the first level field from the index path
-                    let num_levels = index_path.len();
                     if let Some(mut field) = schema_fields.get(index_path[0]) {
                         // Iterate fields in each level, construct the result map and reach the selected field and value
                         // The map is initialized as res and woulf be updated when going to the next level
                         // ;;; let mut inserting_map = &mut res;
                         // Skip the first level field since we already have the first level
-                        for (l, fid) in index_path.iter().enumerate().skip(1) {
+                        for (_l, fid) in index_path.iter().enumerate().skip(1) {
                             if let Some(Some(sub_field)) =
                                 field.sub_fields.as_ref().map(|sub| sub.get(*fid))
                             {

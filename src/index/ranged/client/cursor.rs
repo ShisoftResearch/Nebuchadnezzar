@@ -1,4 +1,3 @@
-use super::super::lsm::btree::Ordering;
 use super::super::lsm::service::*;
 use crate::index::ranged::{
     client::RangedQueryClient,

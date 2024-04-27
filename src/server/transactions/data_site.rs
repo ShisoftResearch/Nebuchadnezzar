@@ -12,7 +12,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
-use lightning::map::{LiteHashMap, PtrHashMap as LFMap};
+use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};

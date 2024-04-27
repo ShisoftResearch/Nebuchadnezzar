@@ -43,7 +43,7 @@ impl RangedQueryClient {
         self_ref
             .run_on_destinated_tree(
                 key,
-                |key, client, tree_id, epoch| {
+                |_key, client, tree_id, epoch| {
                     let pattern = pattern.clone();
                     let range = range.clone();
                     async move {
@@ -53,7 +53,7 @@ impl RangedQueryClient {
                     }
                     .boxed()
                 },
-                |action_res, _tree_client, lower, _upper| {
+                |action_res, _tree_client, _lower, _upper| {
                     let pattern = pattern.clone();
                     let range = range.clone();
                     async move {

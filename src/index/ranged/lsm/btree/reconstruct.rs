@@ -66,7 +66,7 @@ where
                 // take a key and a ptr from current page to new page
                 // reset current page right bound to the taken key
                 // return the taken ptr
-                let mut node_innode = node_guard.innode_mut();
+                let node_innode = node_guard.innode_mut();
                 node_innode.len -= 1;
                 node_innode.right_bound = parent_right_bound.clone();
                 mem::replace(
@@ -88,7 +88,7 @@ where
             node_guard.right_ref_mut().map(|rn| *rn = new_node.clone());
             *node_guard = write_node::<KS, PS>(&new_node);
         } else {
-            let mut parent_innode = node_guard.innode_mut();
+            let parent_innode = node_guard.innode_mut();
             let new_len = if new_tree {
                 0
             } else {

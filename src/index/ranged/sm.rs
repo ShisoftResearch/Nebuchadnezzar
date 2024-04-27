@@ -114,7 +114,7 @@ impl StateMachineCmds for MasterTreeSM {
                 .insert(pivot.clone(), TreePlacement::new(new_tree));
             self.load_sub_tree(new_tree, &pivot, &upper_bound, INITIAL_TREE_EPOCH)
                 .await;
-            if let Some((_, mut prev_tree)) = self.tree.range_mut(..&pivot).last() {
+            if let Some((_, prev_tree)) = self.tree.range_mut(..&pivot).last() {
                 assert_eq!(prev_tree.id, src_tree);
                 prev_tree.epoch += 1;
             }

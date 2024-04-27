@@ -298,7 +298,7 @@ pub async fn client_by_server_name(
     server_name: String,
 ) -> Result<Arc<plain_server::AsyncServiceClient>, RPCError> {
     DEFAULT_CLIENT_POOL
-        .get_by_id(server_id, move |sid| server_name)
+        .get_by_id(server_id, move |_sid| server_name)
         .await
         .map_err(|e| RPCError::IOError(e))
         .map(|c| client_by_rpc_client(&c))

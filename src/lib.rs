@@ -32,7 +32,6 @@ extern crate serde;
 #[allow(unused_imports)]
 #[macro_use]
 extern crate itertools;
-#[macro_use]
 extern crate smallvec;
 extern crate serde_json;
 extern crate test;

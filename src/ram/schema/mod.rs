@@ -14,7 +14,6 @@ use crate::ram::io::align_ptr_addr;
 use crate::utils::thread_id;
 
 use super::types;
-use core::borrow::Borrow;
 use std::string::String;
 use std::sync::Arc;
 

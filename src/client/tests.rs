@@ -6,7 +6,6 @@ use crate::ram::tests::default_fields;
 use crate::ram::types;
 use crate::ram::types::*;
 use crate::server::*;
-use parking_lot::Mutex;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

@@ -128,7 +128,7 @@ impl NodeCellRef {
     }
 
     pub fn ptr_eq(&self, other: &Self) -> bool {
-        self.inner == other.inner
+        std::ptr::addr_eq(self.inner, other.inner)
     }
 
     pub fn num_references(&self) -> usize {

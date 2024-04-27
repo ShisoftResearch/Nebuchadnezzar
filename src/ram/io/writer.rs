@@ -7,7 +7,7 @@ use crate::ram::{cell::*, io::align_address_with_ty};
 use std::collections::{HashMap, HashSet};
 
 use dovahkiin::types::{
-    key_hash, Map, OwnedMap, SharedMap, SharedValue, Type, ARRAY_LEN_TYPE, TYPE_CODE_TYPE,
+    key_hash, Map, Type, ARRAY_LEN_TYPE
 };
 use itertools::Itertools;
 
