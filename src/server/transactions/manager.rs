@@ -634,7 +634,7 @@ impl TransactionManager {
             let self_server_id = server.server_id;
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
             let server_for_clock = server.clone();
-            let prepare_payload = data_site
+            let prepare_payload  = data_site
                 .prepare(
                     self_server_id,
                     server.txn_peer.clock.to_clock(),
@@ -695,7 +695,6 @@ impl TransactionManager {
         changed_objs: &AffectedObjs,
         data_sites: &DataSitesMap,
     ) -> Result<DMCommitResult, TMError> {
-        let this_clone = self.clone();
         let commit_futures: FuturesUnordered<_> = changed_objs
             .iter()
             .map(move |(ref server_id, ref objs)| {
@@ -718,7 +717,7 @@ impl TransactionManager {
                     .collect();
                 async move {
                     data_site
-                        .commit(this_clone.get_clock(), tid.to_owned(), ops)
+                        .commit(self.get_clock(), tid.to_owned(), ops)
                         .await
                 }
             })
@@ -765,7 +764,7 @@ impl TransactionManager {
                                 rollback_failures.append(&mut failures);
                             }
                         }
-                        _ => (return Ok(payload)),
+                        _ => return Ok(payload),
                     }
                 }
                 Err(_) => return Err(TMError::AssertionError),

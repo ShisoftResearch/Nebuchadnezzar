@@ -196,6 +196,7 @@ impl AsyncClient {
         TFN: Fn(Transaction) -> RF + 'a,
         RF: Future<Output = Result<TR, TxnError>> + 'a,
     {
+        //unimplemented!()
         let server_name = match self.conshash.rand_server() {
             Some(name) => name,
             None => return Err(TxnError::CannotFindAServer),

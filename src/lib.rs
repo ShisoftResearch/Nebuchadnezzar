@@ -1,5 +1,6 @@
 #![feature(test)]
 #![feature(async_closure)]
+#![feature(async_fn_traits)]
 #![feature(thread_id_value)]
 #![feature(is_sorted)]
 

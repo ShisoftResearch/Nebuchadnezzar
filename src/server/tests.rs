@@ -1,3 +1,4 @@
+use crate::client::transaction::Transaction;
 use crate::ram::schema::Field;
 use crate::ram::schema::Schema;
 use crate::ram::types::*;
@@ -305,12 +306,14 @@ pub async fn txn() {
 
     for _ in 0..num {
         client
-            .transaction(async move |txn| {
-                let id = Id::new(0, 1);
-                let mut value = OwnedValue::Map(OwnedMap::new());
-                value[DATA] = OwnedValue::U64(2);
-                let cell = OwnedCell::new_with_id(schema_id, &id, value);
-                txn.upsert(cell).await
+            .transaction(|txn| {
+                async move {
+                    let id = Id::new(0, 1);
+                    let mut value = OwnedValue::Map(OwnedMap::new());
+                    value[DATA] = OwnedValue::U64(2);
+                    let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                    txn.upsert(cell).await
+                }
             })
             .await
             .unwrap();
