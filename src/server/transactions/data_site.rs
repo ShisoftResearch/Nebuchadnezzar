@@ -409,7 +409,7 @@ impl Service for DataManager {
                 meta.owner = Some(tid.clone()) // set owner to lock this cell
             }
             txn.state = TxnState::Prepared;
-            txn.affected_cells = cell_ids.clone(); // for cell number check
+            txn.affected_cells = cell_ids; // for cell number check
             txn.last_activity = get_time(); // check if transaction timeout
             debug!("SITE PREPARE SUCCESSFUL FOR {:?}", tid);
             return self.response_with(DMPrepareResult::Success);
