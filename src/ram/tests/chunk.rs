@@ -121,7 +121,7 @@ pub fn cell_rw() {
                 OwnedValue::String(String::from("John")),
             );
             let data = OwnedValue::Map(data_map);
-            let mut cell = cell.to_owned();
+            let mut cell = (*cell).to_owned();
             cell.data = data;
             Some(cell)
         })

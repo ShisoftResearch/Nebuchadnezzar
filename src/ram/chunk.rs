@@ -199,7 +199,6 @@ impl Chunk {
     fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
         SharedCell::from_chunk_raw(self.location_for_read(hash)?, self)
             .map(|(c, _)| c)
-            .map_err(|(e, _)| e)
     }
 
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedCell, ReadError> {
@@ -340,48 +339,34 @@ impl Chunk {
 
     fn update_cell_by<U>(&self, hash: u64, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: Fn(SharedCell) -> Option<OwnedCell>,
+        U: FnOnce(&SharedCell) -> Option<OwnedCell>,
     {
-        let backoff = crossbeam::utils::Backoff::new();
-        loop {
-            let ((cell, schema), old_loc) = {
-                if let Some(cell_guard) = self.location_for_write(hash) {
-                    let loc = *cell_guard;
-                    match SharedCell::from_chunk_raw(cell_guard, self) {
-                        Ok(cell) => (cell, loc),
-                        Err((e, _)) => return Err(WriteError::ReadError(e)),
-                    }
-                } else {
-                    return Err(WriteError::CellDoesNotExisted);
-                }
-            };
-            let old_indices = self
-                .index_builder
-                .as_ref()
-                .map(|_| probe_cell_indices(&cell, &*schema));
-            let new_cell = update(cell);
-            if let Some(mut new_cell) = new_cell {
-                let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
-                if let Some(mut cell_guard) = self.location_for_write(hash) {
-                    // Ensure location unchanged
-                    if *cell_guard == old_loc {
-                        let old_location = *cell_guard;
-                        *cell_guard = new_cell_loc;
-                        drop(cell_guard);
+        if let Some(cell_guard) = self.location_for_write(hash) {
+            let old_loc = *cell_guard;
+            match SharedCell::from_chunk_raw(cell_guard, self) {
+                Ok((cell, schema)) => {
+                    let old_indices = self
+                        .index_builder
+                        .as_ref()
+                        .map(|_| probe_cell_indices(&cell, &*schema));
+                    let new_cell = update(&cell);
+                    if let Some(mut new_cell) = new_cell {
+                        let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
+                        *cell.into_guard() = new_cell_loc;
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
-                        self.mark_dead_entry_with_cell(old_location, &new_cell);
+                        self.mark_dead_entry_with_cell(old_loc, &new_cell);
                         self.refresh_statistics();
                         return Ok(new_cell);
+                    } else {
+                        return Err(WriteError::UserCanceledUpdate);
                     }
-                }
-                // Failed on check, cleanup and try. This may produce a lot of garbage.
-                self.mark_dead_entry_with_cell(new_cell_loc, &new_cell);
-                backoff.spin();
-            } else {
-                return Err(WriteError::UserCanceledUpdate);
+                },
+                Err(e) => return Err(WriteError::ReadError(e)),
             }
+        } else {
+            return Err(WriteError::CellDoesNotExisted);
         }
     }
 
@@ -389,16 +374,16 @@ impl Chunk {
         let hash_key = hash as usize;
         let guard_opt = self.cell_index.lock(hash_key);
         if let Some(mut guard) = guard_opt {
+            let cell_location = *guard;
             if let Some(indexer) = &self.index_builder {
                 match SharedCell::from_chunk_raw(guard, self) {
                     Ok((cell, schema)) => {
                         indexer.remove_indices(&cell, &*schema);
                         guard = cell.into_guard();
                     }
-                    Err((e, _)) => return Err(WriteError::ReadError(e)),
+                    Err(e) => return Err(WriteError::ReadError(e)),
                 }
             }
-            let cell_location = *guard;
             self.put_tombstone_by_cell_loc(cell_location)?;
             guard.remove();
             Ok(())
@@ -429,7 +414,7 @@ impl Chunk {
                         Err(WriteError::CellDoesNotExisted)
                     }
                 }
-                Err((e, _)) => Err(WriteError::ReadError(e)),
+                Err(e) => Err(WriteError::ReadError(e)),
             }
         } else {
             Err(WriteError::CellDoesNotExisted)
@@ -841,7 +826,7 @@ impl Chunks {
     }
     pub fn update_cell_by<U>(&self, key: &Id, update: U) -> Result<OwnedCell, WriteError>
     where
-        U: Fn(SharedCell) -> Option<OwnedCell>,
+        U: FnOnce(&SharedCell) -> Option<OwnedCell>,
     {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.update_cell_by(hash, update);

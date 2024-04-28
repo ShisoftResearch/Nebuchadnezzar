@@ -12,6 +12,8 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
 
 use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
@@ -83,6 +85,16 @@ pub const CELL_HEADER_SIZE_U32: u32 = CELL_HEADER_SIZE as u32;
 pub struct OwnedCell {
     pub header: CellHeader,
     pub data: OwnedValue,
+}
+
+struct OwnedCellRefInner {
+    cell: OwnedCell,
+    rc: AtomicUsize
+}
+
+#[derive(Debug)]
+pub struct OwnedCellRef {
+    inner: *mut OwnedCellRefInner,
 }
 
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
@@ -203,6 +215,13 @@ impl OwnedCell {
     pub fn set_id(&mut self, id: &Id) {
         self.header.set_id(id)
     }
+    pub fn into_ref(self) -> OwnedCellRef {
+        let inner = OwnedCellRefInner {
+            cell: self,
+            rc: AtomicUsize::new(1)
+        };
+        OwnedCellRef { inner: Box::into_raw(Box::new(inner)) }
+    }
 }
 
 impl Index<u64> for OwnedCell {
@@ -244,6 +263,50 @@ impl<'a> Index<&'a str> for OwnedCell {
 impl<'a> IndexMut<&'a str> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
         &mut self.data[index]
+    }
+}
+
+impl OwnedCellRef {
+    pub fn clone_cell(&self) -> OwnedCell {
+        let inner = unsafe {
+            &*self.inner
+        };
+        inner.cell.clone()
+    }
+}
+
+impl Deref for OwnedCellRef {
+    type Target = OwnedCell;
+
+    fn deref(&self) -> &Self::Target {
+        let inner = unsafe {
+            &*self.inner
+        };
+        &inner.cell
+    }
+}
+
+impl Clone for OwnedCellRef {
+    fn clone(&self) -> Self {
+        let inner = unsafe {
+            &*self.inner
+        };
+        inner.rc.fetch_add(1, Relaxed);
+        Self { inner: self.inner }
+    }
+}
+
+impl Drop for OwnedCellRef {
+    fn drop(&mut self) {
+        let inner = unsafe {
+            &*self.inner
+        };
+        let old_rc = inner.rc.fetch_sub(1, Relaxed);
+        if old_rc == 1 {
+            unsafe {
+                drop(Box::from_raw(self.inner));
+            }
+        }
     }
 }
 
@@ -309,6 +372,9 @@ impl<'a, T> SharedData<'a, T> {
     pub fn guard(&self) -> &WordMutexGuard {
         &self.guard
     }
+    pub fn guard_mut(&'a mut self) -> &'a mut WordMutexGuard {
+        &mut self.guard
+    }
     pub fn into_guard(self) -> WordMutexGuard<'a> {
         self.guard
     }
@@ -320,14 +386,14 @@ impl<'a> SharedCell<'a> {
     pub fn from_chunk_raw(
         guard: WordMutexGuard<'a>,
         chunk: &'a Chunk,
-    ) -> Result<(Self, SchemaRef), (ReadError, WordMutexGuard<'a>)> {
+    ) -> Result<(Self, SchemaRef), ReadError> {
         let ptr = *guard;
         match SharedCellData::from_chunk_raw(ptr, chunk) {
             Ok((data, schema)) => {
                 let cell = Self { guard, inner: data };
                 Ok((cell, schema))
             }
-            Err(e) => Err((e, guard)),
+            Err(e) => Err(e),
         }
     }
     pub fn select_from_chunk_raw(

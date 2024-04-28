@@ -3,7 +3,6 @@ use std::{io::Cursor, mem};
 
 use crate::ram::cell::CellHeader;
 use crate::ram::tombstone::Tombstone;
-use byteorder::{ByteOrder, LittleEndian};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use super::mem_cursor::Endian;

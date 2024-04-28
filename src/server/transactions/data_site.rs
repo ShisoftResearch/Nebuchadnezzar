@@ -1,4 +1,5 @@
 use super::*;
+use crate::ram::cell::OwnedCellRef;
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
@@ -43,12 +44,12 @@ struct Transaction {
 
 #[derive(Debug)]
 struct CellHistory {
-    cell: Option<OwnedCell>,
+    cell: Option<OwnedCellRef>,
     current_version: u64,
 }
 
 impl CellHistory {
-    pub fn new(cell: Option<OwnedCell>, current_ver: u64) -> CellHistory {
+    pub fn new(cell: Option<OwnedCellRef>, current_ver: u64) -> CellHistory {
         CellHistory {
             cell,
             current_version: current_ver,
@@ -168,7 +169,7 @@ impl DataManager {
                     .chunks
                     .update_cell_by(id, |cell_to_update| {
                         if cell_to_update.header.version == current_ver {
-                            cell.clone()
+                            cell.as_ref().map(|r| r.clone_cell())
                         } else {
                             None
                         }
@@ -176,7 +177,7 @@ impl DataManager {
                     .err()
             } else {
                 // the cell was removed, need to put back
-                let mut cell = cell.clone().unwrap();
+                let mut cell = cell.as_ref().unwrap().clone_cell();
                 self.server.chunks.write_cell(&mut cell).err()
             };
             if let Some(error) = error {
@@ -279,7 +280,7 @@ impl DataManager {
         if committing {
             // ts >= wt but committing, need to wait until it committed
             meta.waiting.insert((tid.clone(), *server_id));
-            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner.clone());
+            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner);
             return Err(self.response_with(TxnExecResult::Wait));
         }
         if &meta.read < tid {
@@ -452,14 +453,14 @@ impl Service for DataManager {
             for cell_op in cells {
                 match cell_op {
                     CommitOp::Read(_id, _version) => {}
-                    CommitOp::Write(ref cell) => {
-                        let mut cell = cell.clone();
+                    CommitOp::Write(mut cell) => {
+                        let cell_id = cell.id();
                         let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
                                 commit_history
-                                    .insert(cell.id(), CellHistory::new(None, header.version));
-                                self.update_cell_write(&cell.id(), &tid);
+                                    .insert(cell_id, CellHistory::new(None, header.version));
+                                self.update_cell_write(&cell_id, &tid);
                             }
                             Err(error) => {
                                 write_error = Some((cell.id(), error));
@@ -484,7 +485,7 @@ impl Service for DataManager {
                         match write_result {
                             Ok(()) => {
                                 commit_history
-                                    .insert(*cell_id, CellHistory::new(Some(original_cell), 0));
+                                    .insert(*cell_id, CellHistory::new(Some(original_cell.into_ref()), 0));
                                 self.update_cell_write(cell_id, &tid);
                             }
                             Err(error) => {
@@ -493,7 +494,7 @@ impl Service for DataManager {
                             }
                         }
                     }
-                    CommitOp::Update(ref cell) => {
+                    CommitOp::Update(cell) => {
                         let cell_id = cell.id();
                         let original_cell = {
                             match self.server.chunks.read_cell(&cell_id) {
@@ -510,7 +511,7 @@ impl Service for DataManager {
                                 .update_cell_by(&cell_id, |cell_to_update| {
                                     if cell_to_update.header.version == original_cell.header.version
                                     {
-                                        Some(cell.clone())
+                                        Some(cell)
                                     } else {
                                         None
                                     }
@@ -519,7 +520,7 @@ impl Service for DataManager {
                             Ok(cell) => {
                                 commit_history.insert(
                                     cell_id,
-                                    CellHistory::new(Some(original_cell), cell.header.version),
+                                    CellHistory::new(Some(original_cell.into_ref()), cell.header.version),
                                 );
                                 self.update_cell_write(&cell_id, &tid);
                             }
