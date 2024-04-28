@@ -484,8 +484,10 @@ impl Service for DataManager {
                         });
                         match write_result {
                             Ok(()) => {
-                                commit_history
-                                    .insert(*cell_id, CellHistory::new(Some(original_cell.into_ref()), 0));
+                                commit_history.insert(
+                                    *cell_id,
+                                    CellHistory::new(Some(original_cell.into_ref()), 0),
+                                );
                                 self.update_cell_write(cell_id, &tid);
                             }
                             Err(error) => {
@@ -520,7 +522,10 @@ impl Service for DataManager {
                             Ok(cell) => {
                                 commit_history.insert(
                                     cell_id,
-                                    CellHistory::new(Some(original_cell.into_ref()), cell.header.version),
+                                    CellHistory::new(
+                                        Some(original_cell.into_ref()),
+                                        cell.header.version,
+                                    ),
                                 );
                                 self.update_cell_write(&cell_id, &tid);
                             }

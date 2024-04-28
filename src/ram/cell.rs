@@ -89,7 +89,7 @@ pub struct OwnedCell {
 
 struct OwnedCellRefInner {
     cell: OwnedCell,
-    rc: AtomicUsize
+    rc: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -218,9 +218,11 @@ impl OwnedCell {
     pub fn into_ref(self) -> OwnedCellRef {
         let inner = OwnedCellRefInner {
             cell: self,
-            rc: AtomicUsize::new(1)
+            rc: AtomicUsize::new(1),
         };
-        OwnedCellRef { inner: Box::into_raw(Box::new(inner)) }
+        OwnedCellRef {
+            inner: Box::into_raw(Box::new(inner)),
+        }
     }
 }
 
@@ -268,9 +270,7 @@ impl<'a> IndexMut<&'a str> for OwnedCell {
 
 impl OwnedCellRef {
     pub fn clone_cell(&self) -> OwnedCell {
-        let inner = unsafe {
-            &*self.inner
-        };
+        let inner = unsafe { &*self.inner };
         inner.cell.clone()
     }
 }
@@ -279,18 +279,14 @@ impl Deref for OwnedCellRef {
     type Target = OwnedCell;
 
     fn deref(&self) -> &Self::Target {
-        let inner = unsafe {
-            &*self.inner
-        };
+        let inner = unsafe { &*self.inner };
         &inner.cell
     }
 }
 
 impl Clone for OwnedCellRef {
     fn clone(&self) -> Self {
-        let inner = unsafe {
-            &*self.inner
-        };
+        let inner = unsafe { &*self.inner };
         inner.rc.fetch_add(1, Relaxed);
         Self { inner: self.inner }
     }
@@ -298,9 +294,7 @@ impl Clone for OwnedCellRef {
 
 impl Drop for OwnedCellRef {
     fn drop(&mut self) {
-        let inner = unsafe {
-            &*self.inner
-        };
+        let inner = unsafe { &*self.inner };
         let old_rc = inner.rc.fetch_sub(1, Relaxed);
         if old_rc == 1 {
             unsafe {

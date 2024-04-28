@@ -634,7 +634,7 @@ impl TransactionManager {
             let self_server_id = server.server_id;
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
             let server_for_clock = server.clone();
-            let prepare_payload  = data_site
+            let prepare_payload = data_site
                 .prepare(
                     self_server_id,
                     server.txn_peer.clock.to_clock(),

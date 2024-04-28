@@ -197,8 +197,7 @@ impl Chunk {
     }
 
     fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
-        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self)
-            .map(|(c, _)| c)
+        SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
     fn read_selected(&self, hash: u64, fields: &[u64]) -> Result<SharedCell, ReadError> {
@@ -362,7 +361,7 @@ impl Chunk {
                     } else {
                         return Err(WriteError::UserCanceledUpdate);
                     }
-                },
+                }
                 Err(e) => return Err(WriteError::ReadError(e)),
             }
         } else {

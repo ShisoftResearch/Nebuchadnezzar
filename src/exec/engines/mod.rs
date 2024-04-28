@@ -1,8 +1,6 @@
 mod simd;
 
-struct Row<const PS: usize> {
-
-}
+struct Row<const PS: usize> {}
 
 trait DataFrame<const PS: usize> {
     // fn from_cursor

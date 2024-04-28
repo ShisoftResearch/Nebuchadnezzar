@@ -32,8 +32,8 @@ extern crate serde;
 #[allow(unused_imports)]
 #[macro_use]
 extern crate itertools;
-extern crate smallvec;
 extern crate serde_json;
+extern crate smallvec;
 extern crate test;
 
 pub mod utils;

@@ -305,14 +305,12 @@ pub async fn txn() {
 
     for _ in 0..num {
         client
-            .transaction(|txn| {
-                async move {
-                    let id = Id::new(0, 1);
-                    let mut value = OwnedValue::Map(OwnedMap::new());
-                    value[DATA] = OwnedValue::U64(2);
-                    let cell = OwnedCell::new_with_id(schema_id, &id, value);
-                    txn.upsert(cell).await
-                }
+            .transaction(|txn| async move {
+                let id = Id::new(0, 1);
+                let mut value = OwnedValue::Map(OwnedMap::new());
+                value[DATA] = OwnedValue::U64(2);
+                let cell = OwnedCell::new_with_id(schema_id, &id, value);
+                txn.upsert(cell).await
             })
             .await
             .unwrap();

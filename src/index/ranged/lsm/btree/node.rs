@@ -406,7 +406,10 @@ where
         let cc_num = cc.load(Acquire);
         let expected = cc_num & (!LATCH_FLAG);
         debug_assert_eq!(expected & LATCH_FLAG, 0);
-        if cc.compare_exchange_weak(expected, cc_num | LATCH_FLAG, AcqRel, Relaxed).is_ok() {
+        if cc
+            .compare_exchange_weak(expected, cc_num | LATCH_FLAG, AcqRel, Relaxed)
+            .is_ok()
+        {
             #[cfg(debug_assertions)]
             unsafe {
                 node.capture_backtrace();
