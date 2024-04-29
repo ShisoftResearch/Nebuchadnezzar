@@ -169,7 +169,7 @@ impl DataManager {
                     .chunks
                     .update_cell_by(id, |cell_to_update| {
                         if cell_to_update.header.version == current_ver {
-                            cell.as_ref().map(|r| r.clone_cell())
+                            cell.as_ref().map(|r| r.clone_referred())
                         } else {
                             None
                         }
@@ -177,7 +177,7 @@ impl DataManager {
                     .err()
             } else {
                 // the cell was removed, need to put back
-                let mut cell = cell.as_ref().unwrap().clone_cell();
+                let mut cell = cell.as_ref().unwrap().clone_referred();
                 self.server.chunks.write_cell(&mut cell).err()
             };
             if let Some(error) = error {

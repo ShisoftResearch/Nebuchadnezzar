@@ -6,6 +6,7 @@ use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
+use crate::utils::referred::ARef;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use lightning::map::WordMutexGuard;
 use serde::Serialize;
@@ -13,12 +14,13 @@ use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::Relaxed;
 
 use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
 
 pub const MAX_CELL_SIZE: u32 = 1 * 1024 * 1024;
+
+pub type OwnedCellRef = ARef<OwnedCell>;
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize, Default)]
 pub struct CellHeader {
@@ -85,16 +87,6 @@ pub const CELL_HEADER_SIZE_U32: u32 = CELL_HEADER_SIZE as u32;
 pub struct OwnedCell {
     pub header: CellHeader,
     pub data: OwnedValue,
-}
-
-struct OwnedCellRefInner {
-    cell: OwnedCell,
-    rc: AtomicUsize,
-}
-
-#[derive(Debug)]
-pub struct OwnedCellRef {
-    inner: *mut OwnedCellRefInner,
 }
 
 def_raw_memory_cursor_for_size!(CELL_HEADER_SIZE as usize, addr_to_header_cursor);
@@ -216,13 +208,7 @@ impl OwnedCell {
         self.header.set_id(id)
     }
     pub fn into_ref(self) -> OwnedCellRef {
-        let inner = OwnedCellRefInner {
-            cell: self,
-            rc: AtomicUsize::new(1),
-        };
-        OwnedCellRef {
-            inner: Box::into_raw(Box::new(inner)),
-        }
+        OwnedCellRef::new(self)
     }
 }
 
@@ -265,42 +251,6 @@ impl<'a> Index<&'a str> for OwnedCell {
 impl<'a> IndexMut<&'a str> for OwnedCell {
     fn index_mut<'b>(&'b mut self, index: &'a str) -> &'b mut Self::Output {
         &mut self.data[index]
-    }
-}
-
-impl OwnedCellRef {
-    pub fn clone_cell(&self) -> OwnedCell {
-        let inner = unsafe { &*self.inner };
-        inner.cell.clone()
-    }
-}
-
-impl Deref for OwnedCellRef {
-    type Target = OwnedCell;
-
-    fn deref(&self) -> &Self::Target {
-        let inner = unsafe { &*self.inner };
-        &inner.cell
-    }
-}
-
-impl Clone for OwnedCellRef {
-    fn clone(&self) -> Self {
-        let inner = unsafe { &*self.inner };
-        inner.rc.fetch_add(1, Relaxed);
-        Self { inner: self.inner }
-    }
-}
-
-impl Drop for OwnedCellRef {
-    fn drop(&mut self) {
-        let inner = unsafe { &*self.inner };
-        let old_rc = inner.rc.fetch_sub(1, Relaxed);
-        if old_rc == 1 {
-            unsafe {
-                drop(Box::from_raw(self.inner));
-            }
-        }
     }
 }
 
