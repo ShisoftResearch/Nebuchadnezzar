@@ -1,8 +1,8 @@
 use dovahkiin::types::{referred::OwnedValueRef, OwnedValue, SharedValue, ToTypped, Value};
 
-pub trait Mapper<I, O>: Sync + Send {
-    fn map(input: &[I]) -> Vec<O>;
-}
+use super::Function;
+
+pub trait Mapper<I, O>: Function<I, O> + Sync + Send {}
 
 pub trait ValueMapper<I: Value + ToTypped, O: Value + ToTypped>: Mapper<I, O> {}
 

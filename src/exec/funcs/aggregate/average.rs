@@ -1,21 +1,26 @@
 use std::ops::Add;
 
+use dovahkiin::types::Value;
+
 use super::Aggregator;
 
-pub struct Sum<T> {
-    accumlator: T
+pub struct Average<T> {
+    accumlator: T,
+    count: u64
 }
 
-impl <T: Clone + Add<Output = T>> Aggregator<T, T> for Sum<T> {
+impl <T: Value + Clone + Add<Output = T>> Aggregator<T, T> for Average<T> {
     fn collect(&mut self, value: T) {
         self.accumlator = self.accumlator.clone() + value;
+        self.count += 1;
     }
 
     fn fold(&mut self, other: &Self) {
         self.accumlator = self.accumlator.clone() + other.accumlator.clone();
+        self.count += other.count;
     }
 
     fn finish(self) -> Option<T> {
-        Some(self.accumlator)
+        unimplemented!()
     }
 }

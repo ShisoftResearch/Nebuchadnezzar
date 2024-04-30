@@ -11,8 +11,8 @@ impl Aggregator<OwnedValueRef, OwnedValue> for All {
         self.accumlator &= value.bool().unwrap();
     }
 
-    fn collect_internal(&mut self, internal: OwnedValue) {
-        self.accumlator &= internal.bool().unwrap()
+    fn fold(&mut self, other: &Self) {
+        self.accumlator &= other.accumlator
     }
 
     fn finish(self) -> Option<OwnedValue> {

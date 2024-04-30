@@ -11,9 +11,10 @@ impl Aggregator<OwnedValueRef, OwnedValue> for Any {
         self.accumlator |= value.bool().unwrap();
     }
 
-    fn collect_internal(&mut self, internal: OwnedValue) {
-        self.accumlator |= internal.bool().unwrap()
+    fn fold(&mut self, other: &Self) {
+        self.accumlator |= other.accumlator
     }
+
 
     fn finish(self) -> Option<OwnedValue> {
         Some(OwnedValue::Bool(self.accumlator))

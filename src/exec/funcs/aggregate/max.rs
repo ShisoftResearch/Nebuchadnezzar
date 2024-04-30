@@ -11,8 +11,8 @@ impl <T: Clone + Ord> Aggregator<T, T> for Max<T> {
         self.accumlator = max(self.accumlator.clone(), value);
     }
 
-    fn collect_internal(&mut self, internal: T) {
-        self.accumlator = max(self.accumlator.clone(), internal);
+    fn fold(&mut self, other: &Self) {
+        self.accumlator = max(self.accumlator.clone(), other.accumlator.clone())
     }
 
     fn finish(self) -> Option<T> {
