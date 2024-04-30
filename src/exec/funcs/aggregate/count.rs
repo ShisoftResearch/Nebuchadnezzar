@@ -1,15 +1,12 @@
-use std::marker::PhantomData;
-
 use dovahkiin::types::OwnedValue;
 
 use super::Aggregator;
 
-pub struct Count<T> {
+pub struct Count {
     accumlator: u64,
-    _marker: PhantomData<T>
 }
 
-impl <T> Aggregator<T, OwnedValue> for Count<T> {
+impl <T> Aggregator<T, OwnedValue> for Count {
     fn collect(&mut self, _value: T) {
         self.accumlator += 1;
     }
