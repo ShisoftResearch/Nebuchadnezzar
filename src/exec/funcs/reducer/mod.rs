@@ -6,7 +6,7 @@ pub mod group_by;
 pub trait ReduceCollector<K, V> 
 {
     fn reduce_with(&mut self, _key: K, _value: V);
-    fn into_iter(self) -> Box<dyn Iterator<Item = (K, Box<dyn Iterator<Item = V>>)>>;
+    fn into_iter(self) -> impl Iterator<Item = (K, impl Iterator<Item = V>)>;
     fn combine<C: ReduceCollector<K, V>>(&mut self, other: C);
     fn merge(&mut self, other: Self);
 }
@@ -28,12 +28,10 @@ impl <K: Hash + Eq + 'static, V: 'static> ReduceCollector<K, V> for LocalReduceC
     fn reduce_with(&mut self, key: K, value: V) {
         self.mapping.entry(key).or_insert_with(|| vec![]).push(value);
     } 
-    fn into_iter(self) -> Box<dyn Iterator<Item = (K, Box<dyn Iterator<Item = V>>)>> {
-        let res = self.mapping.into_iter().map(|(k, vs)| {
-            let val_iter: Box<dyn Iterator<Item = V>> = Box::new(vs.into_iter());
-            (k, val_iter)
-        });
-        Box::new(res)
+    fn into_iter(self) -> impl Iterator<Item = (K, impl Iterator<Item = V>)> {
+        self.mapping.into_iter().map(|(k, vs)| {
+            (k, vs.into_iter())
+        })
     }
     fn combine<C: ReduceCollector<K, V>>(&mut self, other_collector: C) {
         for (k, vs) in other_collector.into_iter() {
@@ -63,9 +61,10 @@ pub trait Reducer<K, V, O, KF, MF, C>
             collector.reduce_with(key, value.clone())
         }
     }
-    fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O> {
-        collector.into_iter().map(move |(k, vs)| {
-            func(k, vs)
-        })
+    fn map<'a>(&'a self, collector: C, func: MF) -> Box<Iterator<Item = O>> {
+        let iter = collector.into_iter().map(move |(k, vs)| {
+            func(k, Box::new(vs))
+        });
+        Box::new(iter)
     }
 }
