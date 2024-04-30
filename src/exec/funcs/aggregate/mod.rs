@@ -1,10 +1,10 @@
-pub mod sum;
+pub mod all;
+pub mod any;
+pub mod average;
+pub mod count;
 pub mod max;
 pub mod min;
-pub mod count;
-pub mod any;
-pub mod all;
-pub mod average;
+pub mod sum;
 
 pub trait Aggregator<I, O> {
     fn collect(&mut self, value: I);

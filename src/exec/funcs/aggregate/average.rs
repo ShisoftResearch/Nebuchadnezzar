@@ -6,10 +6,10 @@ use super::Aggregator;
 
 pub struct Average<T> {
     accumlator: T,
-    count: u64
+    count: u64,
 }
 
-impl <T: Value + Clone + Add<Output = T>> Aggregator<T, T> for Average<T> {
+impl<T: Value + Clone + Add<Output = T>> Aggregator<T, T> for Average<T> {
     fn collect(&mut self, value: T) {
         self.accumlator = self.accumlator.clone() + value;
         self.count += 1;

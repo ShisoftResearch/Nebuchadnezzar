@@ -3,8 +3,7 @@ use std::hash::Hash;
 
 pub mod group_by;
 
-pub trait ReduceCollector<K, V> 
-{
+pub trait ReduceCollector<K, V> {
     fn reduce_with(&mut self, _key: K, _value: V);
     fn into_iter(self) -> impl Iterator<Item = (K, impl Iterator<Item = V>)>;
     fn combine<C: ReduceCollector<K, V>>(&mut self, other: C);
@@ -15,7 +14,7 @@ pub struct LocalReduceCollector<K, V> {
     mapping: HashMap<K, Vec<V>>,
 }
 
-impl <K: Hash + Eq, V> LocalReduceCollector<K, V> {
+impl<K: Hash + Eq, V> LocalReduceCollector<K, V> {
     pub fn new() -> Self {
         Self {
             mapping: HashMap::new(),
@@ -23,15 +22,15 @@ impl <K: Hash + Eq, V> LocalReduceCollector<K, V> {
     }
 }
 
-impl <K: Hash + Eq + 'static, V: 'static> ReduceCollector<K, V> for LocalReduceCollector<K, V> 
-{
+impl<K: Hash + Eq + 'static, V: 'static> ReduceCollector<K, V> for LocalReduceCollector<K, V> {
     fn reduce_with(&mut self, key: K, value: V) {
-        self.mapping.entry(key).or_insert_with(|| vec![]).push(value);
-    } 
+        self.mapping
+            .entry(key)
+            .or_insert_with(|| vec![])
+            .push(value);
+    }
     fn into_iter(self) -> impl Iterator<Item = (K, impl Iterator<Item = V>)> {
-        self.mapping.into_iter().map(|(k, vs)| {
-            (k, vs.into_iter())
-        })
+        self.mapping.into_iter().map(|(k, vs)| (k, vs.into_iter()))
     }
     fn combine<C: ReduceCollector<K, V>>(&mut self, other_collector: C) {
         for (k, vs) in other_collector.into_iter() {
@@ -49,11 +48,12 @@ impl <K: Hash + Eq + 'static, V: 'static> ReduceCollector<K, V> for LocalReduceC
     }
 }
 
-pub trait Reducer<K, V, O, KF, MF, C> 
-    where 
-        KF: Fn(&V) -> K, C: ReduceCollector<K, V>,
-        MF: Fn(K, Box<dyn Iterator<Item = V>>) -> O,
-        V: Clone 
+pub trait Reducer<K, V, O, KF, MF, C>
+where
+    KF: Fn(&V) -> K,
+    C: ReduceCollector<K, V>,
+    MF: Fn(K, Box<dyn Iterator<Item = V>>) -> O,
+    V: Clone,
 {
     fn reduce(&self, data: &[V], key_func: KF, collector: &mut C) {
         for value in data {
@@ -62,9 +62,9 @@ pub trait Reducer<K, V, O, KF, MF, C>
         }
     }
     fn map<'a>(&'a self, collector: C, func: MF) -> Box<Iterator<Item = O>> {
-        let iter = collector.into_iter().map(move |(k, vs)| {
-            func(k, Box::new(vs))
-        });
+        let iter = collector
+            .into_iter()
+            .map(move |(k, vs)| func(k, Box::new(vs)));
         Box::new(iter)
     }
 }

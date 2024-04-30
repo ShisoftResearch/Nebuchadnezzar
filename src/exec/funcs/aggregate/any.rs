@@ -15,7 +15,6 @@ impl Aggregator<OwnedValueRef, OwnedValue> for Any {
         self.accumlator |= other.accumlator
     }
 
-
     fn finish(self) -> Option<OwnedValue> {
         Some(OwnedValue::Bool(self.accumlator))
     }
