@@ -22,7 +22,7 @@ impl<K: Hash + Eq, V> LocalReduceCollector<K, V> {
     }
 }
 
-impl<K: Hash + Eq + 'static, V: 'static> ReduceCollector<K, V> for LocalReduceCollector<K, V> {
+impl<K: Hash + Eq, V> ReduceCollector<K, V> for LocalReduceCollector<K, V> {
     fn reduce_with(&mut self, key: K, value: V) {
         self.mapping
             .entry(key)
@@ -52,8 +52,8 @@ pub trait Reducer<K, V, O, KF, MF, C>
 where
     KF: Fn(&V) -> K,
     C: ReduceCollector<K, V>,
-    MF: Fn(K, Box<dyn Iterator<Item = V>>) -> O,
-    V: Clone,
+    MF: Fn(K, Box<dyn Iterator<Item = V> + '_>) -> O,
+    V: Sized + Clone,
 {
     fn reduce(&self, data: &[V], key_func: KF, collector: &mut C) {
         for value in data {
@@ -61,10 +61,13 @@ where
             collector.reduce_with(key, value.clone())
         }
     }
-    fn map<'a>(&'a self, collector: C, func: MF) -> Box<Iterator<Item = O>> {
+    fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O> {
         let iter = collector
             .into_iter()
-            .map(move |(k, vs)| func(k, Box::new(vs)));
-        Box::new(iter)
+            .map(move |(k, vs)| {
+                let val_iter: Box<dyn Iterator<Item = V>> = Box::new(vs);
+                func(k, val_iter)
+            });
+        iter
     }
 }
