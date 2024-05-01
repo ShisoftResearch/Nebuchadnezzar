@@ -2,9 +2,10 @@ use std::collections::HashMap;
 use std::hash::Hash;
 
 pub mod group_by;
+pub mod join;
 
 pub trait ReduceCollector<K, V> {
-    fn reduce_with(&mut self, _key: K, _value: V);
+    fn reduce_with(&mut self, key: K, value: V);
     fn into_iter(self) -> impl Iterator<Item = (K, impl Iterator<Item = V>)>;
     fn combine<C: ReduceCollector<K, V>>(&mut self, other: C);
     fn merge(&mut self, other: Self);
@@ -48,26 +49,13 @@ impl<K: Hash + Eq, V> ReduceCollector<K, V> for LocalReduceCollector<K, V> {
     }
 }
 
-pub trait Reducer<K, V, O, KF, MF, C>
+pub trait Reducer<K, V, RV, O, KF, MF, MV, C>
 where
     KF: Fn(&V) -> K,
-    C: ReduceCollector<K, V>,
-    MF: Fn(K, Box<dyn Iterator<Item = V> + '_>) -> O,
+    C: ReduceCollector<K, RV>,
+    MF: Fn(K, Box<dyn Iterator<Item = MV> + '_>) -> O,
     V: Sized + Clone,
 {
-    fn reduce(&self, data: &[V], key_func: KF, collector: &mut C) {
-        for value in data {
-            let key = key_func(value);
-            collector.reduce_with(key, value.clone())
-        }
-    }
-    fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O> {
-        let iter = collector
-            .into_iter()
-            .map(move |(k, vs)| {
-                let val_iter: Box<dyn Iterator<Item = V>> = Box::new(vs);
-                func(k, val_iter)
-            });
-        iter
-    }
+    fn reduce(&self, data: impl Iterator<Item = V>, key_func: KF, collector: &mut C);
+    fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O>;
 }
