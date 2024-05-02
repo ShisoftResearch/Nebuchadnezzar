@@ -15,7 +15,7 @@ impl<T: Clone + Add<Output = T>> Aggregator<T, T, NoOp<Self>, (), ()> for Sum<T>
         self.accumlator = self.accumlator.clone() + other.accumlator;
     }
 
-    fn finish(self) -> Option<T> {
-        Some(self.accumlator)
+    fn finish(self) -> T {
+        self.accumlator
     }
 }

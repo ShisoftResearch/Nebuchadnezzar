@@ -15,7 +15,7 @@ impl<T: Clone + Ord> Aggregator<T, T, NoOp<Self>, (), ()>for Min<T> {
         self.accumlator = min(self.accumlator.clone(), other.accumlator)
     }
 
-    fn finish(self) -> Option<T> {
-        Some(self.accumlator)
+    fn finish(self) -> T {
+        self.accumlator
     }
 }

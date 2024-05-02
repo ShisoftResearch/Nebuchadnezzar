@@ -22,7 +22,7 @@ impl<T: Value, F> Aggregator<T, OwnedValue, F, T, bool> for Count<F>
         self.accumlator += other.accumlator
     }
 
-    fn finish(self) -> Option<OwnedValue> {
-        Some(OwnedValue::U64(self.accumlator))
+    fn finish(self) -> OwnedValue {
+        OwnedValue::U64(self.accumlator)
     }
 }

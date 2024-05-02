@@ -12,7 +12,7 @@ pub trait Aggregator<I, O, F, FI, FO>
 {
     fn collect(&mut self, value: I, func: F);
     fn fold(&mut self, other: Self);
-    fn finish(self) -> Option<O>;
+    fn finish(self) -> O;
 }
 
 pub type NoOp<S> = fn(&mut S, ());

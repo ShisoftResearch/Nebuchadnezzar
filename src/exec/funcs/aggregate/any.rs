@@ -20,7 +20,7 @@ impl <F> Aggregator<OwnedValueRef, OwnedValue, F, OwnedValueRef, bool> for Any<F
         self.accumlator |= other.accumlator
     }
 
-    fn finish(self) -> Option<OwnedValue> {
-        Some(OwnedValue::Bool(self.accumlator))
+    fn finish(self) -> OwnedValue {
+        OwnedValue::Bool(self.accumlator)
     }
 }
