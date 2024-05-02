@@ -5,9 +5,14 @@ pub mod count;
 pub mod max;
 pub mod min;
 pub mod sum;
+pub mod find;
 
-pub trait Aggregator<I, O> {
-    fn collect(&mut self, value: I);
-    fn fold(&mut self, other: &Self);
+pub trait Aggregator<I, O, F, FI, FO>
+    where F: Fn(&mut Self, FI) -> FO
+{
+    fn collect(&mut self, value: I, func: F);
+    fn fold(&mut self, other: Self);
     fn finish(self) -> Option<O>;
 }
+
+pub type NoOp<S> = fn(&mut S, ());

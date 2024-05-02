@@ -1,26 +1,28 @@
-use std::ops::Add;
+// TODO: Use a post processor
 
-use dovahkiin::types::Value;
+// use std::ops::Add;
 
-use super::Aggregator;
+// use dovahkiin::types::Value;
 
-pub struct Average<T> {
-    accumlator: T,
-    count: u64,
-}
+// use super::Aggregator;
 
-impl<T: Value + Clone + Add<Output = T>> Aggregator<T, T> for Average<T> {
-    fn collect(&mut self, value: T) {
-        self.accumlator = self.accumlator.clone() + value;
-        self.count += 1;
-    }
+// pub struct Average<T> {
+//     accumlator: T,
+//     count: u64,
+// }
 
-    fn fold(&mut self, other: &Self) {
-        self.accumlator = self.accumlator.clone() + other.accumlator.clone();
-        self.count += other.count;
-    }
+// impl<T: Value + Clone + Add<Output = T>> Aggregator<T, T> for Average<T> {
+//     fn collect(&mut self, value: T) {
+//         self.accumlator = self.accumlator.clone() + value;
+//         self.count += 1;
+//     }
 
-    fn finish(self) -> Option<T> {
-        unimplemented!()
-    }
-}
+//     fn fold(&mut self, other: &Self) {
+//         self.accumlator = self.accumlator.clone() + other.accumlator.clone();
+//         self.count += other.count;
+//     }
+
+//     fn finish(self) -> Option<T> {
+//         unimplemented!()
+//     }
+// }

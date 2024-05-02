@@ -3,6 +3,7 @@ use std::hash::Hash;
 
 pub mod group_by;
 pub mod join;
+pub mod reduce;
 
 pub trait ReduceCollector<K, V> {
     fn reduce_with(&mut self, key: K, value: V);

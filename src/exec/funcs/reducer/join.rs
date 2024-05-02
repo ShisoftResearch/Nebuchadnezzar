@@ -55,13 +55,13 @@ where
 
     fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O> {
         let iter = collector.into_iter().filter_map(move |(k, vs)| {
-            let groups = vs
-                .sorted_by_key(|(i, _)| *i)
-                .group_by(|(i, _)| *i);
+            let groups = vs.sorted_by_key(|(i, _)| *i).group_by(|(i, _)| *i);
             let mut grouped = groups
                 .into_iter()
                 .map(|(_id, group)| group.map(|(_, v)| v).collect::<Vec<_>>());
-            if let (Some(left), Some(right), None) = (grouped.next(), grouped.next(), grouped.next()) {
+            if let (Some(left), Some(right), None) =
+                (grouped.next(), grouped.next(), grouped.next()) // Assert 2-way join, for now
+            {
                 let product = left.into_iter().cartesian_product(right.into_iter());
                 let val_joined: Box<dyn Iterator<Item = (V, V)>> = Box::new(product);
                 Some(func(k, val_joined))

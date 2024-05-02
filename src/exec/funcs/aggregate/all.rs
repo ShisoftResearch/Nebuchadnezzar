@@ -1,17 +1,22 @@
+use std::marker::PhantomData;
+
 use dovahkiin::types::{referred::OwnedValueRef, OwnedValue};
 
 use super::Aggregator;
 
-pub struct All {
-    accumlator: bool,
+pub struct All<F> {
+    accumlator: bool, // init true
+    _marker: PhantomData<F>
 }
 
-impl Aggregator<OwnedValueRef, OwnedValue> for All {
-    fn collect(&mut self, value: OwnedValueRef) {
-        self.accumlator &= value.bool().unwrap();
+impl <F> Aggregator<OwnedValueRef, OwnedValue, F, OwnedValueRef, bool> for All<F>
+    where F: Fn(&mut Self, OwnedValueRef) -> bool
+{
+    fn collect(&mut self, value: OwnedValueRef, func: F) {
+        self.accumlator &= func(self, value);
     }
 
-    fn fold(&mut self, other: &Self) {
+    fn fold(&mut self, other: Self) {
         self.accumlator &= other.accumlator
     }
 
