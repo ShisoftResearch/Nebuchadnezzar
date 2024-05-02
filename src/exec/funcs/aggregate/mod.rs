@@ -16,3 +16,4 @@ pub trait Aggregator<I, O, F, FI, FO>
 }
 
 pub type NoOp<S> = fn(&mut S, ());
+

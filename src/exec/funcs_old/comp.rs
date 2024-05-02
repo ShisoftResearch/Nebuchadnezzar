@@ -17,7 +17,7 @@ macro_rules! str_cmp_op_fn {
                 .ok_or_else(|| ArrowError::InvalidArgumentError("Cannot cast".to_owned()))?;
             if y.len() == 1 {
                 // scalar
-                let y = y_prim.value(0);
+                let y = y_prim.value(0); 
                 res = Box::new($str_scalar_fn(x_prim, y)?);
             } else {
                 // vector
