@@ -1,3 +1,5 @@
+// This is the general representation of DAG
+
 use std::collections::HashMap;
 
 use dovahkiin::expr::serde::Expr;
