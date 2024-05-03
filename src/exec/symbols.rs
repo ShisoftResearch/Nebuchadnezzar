@@ -80,6 +80,7 @@ pub enum Symbol {
     Max,
     Min,
     Sum,
+    Find,
 
     // Scalars
     Add,
