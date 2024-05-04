@@ -1,4 +1,6 @@
 // This is the general representation of DAG
+// It can be used on local execution and distributed execution
+// depends on the model
 
 use std::collections::HashMap;
 

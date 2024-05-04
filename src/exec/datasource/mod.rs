@@ -1,0 +1,1 @@
+pub trait DataSource<T>: Iterator<Item = T> {}
