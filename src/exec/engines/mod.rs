@@ -12,5 +12,4 @@
 
 // In the DAG, first nodes must be a data source
 // Each data source can have only one backend
-// To transform one backend to the other, it can use
-// an adaptor to shifting from one backend to the other
+// To transform one backend to the other, it can use an `adaptor`
