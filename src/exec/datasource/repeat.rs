@@ -1,3 +1,5 @@
+use dovahkiin::expr::Value;
+
 use super::DataSource;
 
 pub struct Repeat<T: Clone> {
@@ -17,3 +19,5 @@ impl <T: Clone> Iterator for Repeat<T> {
         Some(self.data.clone())
     }
 }
+
+pub type RepeatValue<'a> = Repeat<Value<'a>>;
