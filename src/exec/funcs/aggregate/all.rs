@@ -6,11 +6,12 @@ use super::Aggregator;
 
 pub struct All<F> {
     accumlator: bool, // init true
-    _marker: PhantomData<F>
+    _marker: PhantomData<F>,
 }
 
-impl <F> Aggregator<OwnedValueRef, OwnedValue, F, OwnedValueRef, bool> for All<F>
-    where F: Fn(&mut Self, OwnedValueRef) -> bool
+impl<F> Aggregator<OwnedValueRef, OwnedValue, F, OwnedValueRef, bool> for All<F>
+where
+    F: Fn(&mut Self, OwnedValueRef) -> bool,
 {
     fn collect(&mut self, value: OwnedValueRef, func: F) {
         self.accumlator &= func(self, value);

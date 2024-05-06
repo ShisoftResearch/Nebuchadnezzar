@@ -4,11 +4,12 @@ use super::Aggregator;
 
 pub struct FindMap<I, O, F> {
     out: Option<O>,
-    _marker: PhantomData<(I, F)>
+    _marker: PhantomData<(I, F)>,
 }
 
 impl<I, O, F> Aggregator<I, Option<O>, F, I, Option<O>> for FindMap<I, O, F>
-    where F: Fn(&mut Self, I) -> Option<O>
+where
+    F: Fn(&mut Self, I) -> Option<O>,
 {
     fn collect(&mut self, value: I, func: F) {
         if self.out.is_none() {
@@ -29,11 +30,12 @@ impl<I, O, F> Aggregator<I, Option<O>, F, I, Option<O>> for FindMap<I, O, F>
 
 pub struct Find<I, F> {
     out: Option<I>,
-    _marker: PhantomData<(I, F)>
+    _marker: PhantomData<(I, F)>,
 }
 
 impl<I, F> Aggregator<I, Option<I>, F, &I, bool> for Find<I, F>
-    where F: Fn(&mut Self, &I) -> bool
+where
+    F: Fn(&mut Self, &I) -> bool,
 {
     fn collect(&mut self, value: I, func: F) {
         if self.out.is_none() && func(self, &value) {

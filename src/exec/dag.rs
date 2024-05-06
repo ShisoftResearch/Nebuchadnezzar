@@ -13,14 +13,14 @@ use super::symbols::Symbol;
 pub struct Node {
     id: u32,
     symbol: Symbol,
-    params: Expr
+    params: Expr,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct DAG {
     nodes: Vec<Node>,
     outlinks: HashMap<u32, Vec<u32>>,
-    inlinks: HashMap<u32, Vec<u32>>
+    inlinks: HashMap<u32, Vec<u32>>,
 }
 
 impl DAG {
@@ -34,9 +34,7 @@ impl DAG {
 
     pub fn push_node(&mut self, symbol: Symbol, params: Expr) -> &Node {
         let id = self.nodes.len() as u32;
-        let node = Node {
-            id, symbol, params
-        };
+        let node = Node { id, symbol, params };
         self.nodes.push(node.clone());
         self.nodes.last().unwrap()
     }
@@ -59,7 +57,8 @@ impl DAG {
         let mut in_degree = self.inlinks.clone();
 
         // Vector to store the nodes with zero in-degree (no incoming edges)
-        let mut queue: Vec<u32> = in_degree.iter()
+        let mut queue: Vec<u32> = in_degree
+            .iter()
             .filter(|(_, links)| links.is_empty())
             .map(|(node, _)| *node)
             .collect();

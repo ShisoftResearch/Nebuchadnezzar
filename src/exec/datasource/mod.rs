@@ -1,5 +1,8 @@
-pub mod repeat;
+use futures::Stream;
 
-pub trait DataSource<T, P>: Iterator<Item = T> {
+pub mod repeat;
+pub mod tree_index;
+
+pub trait DataSource<T, P>: Stream<Item = T> {
     fn init(params: P) -> Self;
 }

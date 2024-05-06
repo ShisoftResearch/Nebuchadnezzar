@@ -10,3 +10,5 @@ pub mod engines;
 pub mod datasource;
 
 pub mod adapter;
+
+pub mod streamer;

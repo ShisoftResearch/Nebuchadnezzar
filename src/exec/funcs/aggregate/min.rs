@@ -6,7 +6,7 @@ pub struct Min<T> {
     accumlator: T,
 }
 
-impl<T: Clone + Ord> Aggregator<T, T, NoOp<Self>, (), ()>for Min<T> {
+impl<T: Clone + Ord> Aggregator<T, T, NoOp<Self>, (), ()> for Min<T> {
     fn collect(&mut self, value: T, _fn: NoOp<Self>) {
         self.accumlator = min(self.accumlator.clone(), value);
     }

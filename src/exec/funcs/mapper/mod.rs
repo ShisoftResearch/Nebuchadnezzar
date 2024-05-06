@@ -1,10 +1,10 @@
-pub mod map;
 pub mod filter;
 pub mod filter_map;
+pub mod map;
 
-
-pub trait Mapper<I, O, F, FI, FO> 
-    where F: Fn(FI) -> FO 
+pub trait Mapper<I, O, F, FI, FO>
+where
+    F: Fn(FI) -> FO,
 {
     fn map(&self, input: impl Iterator<Item = I>, func: F) -> impl Iterator<Item = O>;
 }

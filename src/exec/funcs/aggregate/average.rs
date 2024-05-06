@@ -9,7 +9,9 @@ pub struct Average<T> {
     count: u64,
 }
 
-impl<T: Value + Clone + Add<Output = T>> Aggregator<T, (T, u64), NoOp<Self>, (), ()> for Average<T> {
+impl<T: Value + Clone + Add<Output = T>> Aggregator<T, (T, u64), NoOp<Self>, (), ()>
+    for Average<T>
+{
     fn collect(&mut self, value: T, _fn: NoOp<Self>) {
         self.accumlator = self.accumlator.clone() + value;
         self.count += 1;

@@ -6,11 +6,12 @@ use super::Aggregator;
 
 pub struct Count<F> {
     accumlator: u64,
-    _marker: PhantomData<F>
+    _marker: PhantomData<F>,
 }
 
 impl<T: Value, F> Aggregator<T, OwnedValue, F, T, bool> for Count<F>
-    where F: Fn(&mut Self, T) -> bool
+where
+    F: Fn(&mut Self, T) -> bool,
 {
     fn collect(&mut self, value: T, func: F) {
         if func(self, value) {
