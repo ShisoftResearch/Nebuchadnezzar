@@ -8,25 +8,29 @@ use std::{pin::Pin, vec};
 use futures::{Stream, StreamExt};
 use tokio::runtime::Handle;
 
-pub struct Streamer<T> {
+pub mod cell_id;
+
+pub trait Streamer<T>: Iterator<Item = T> {
+    fn new(stream: impl Stream<Item = T> + 'static) -> Self;
+}
+
+pub struct BufferedStreamer<T, const N: usize> {
     buffer: vec::IntoIter<T>,
-    capacity: usize,
     rt: Handle,
     stream: Pin<Box<dyn Stream<Item = T>>>,
 }
 
-impl<T> Streamer<T> {
-    pub fn new(stream: impl Stream<Item = T> + 'static, capacity: usize) -> Self {
+impl<T, const N: usize> Streamer<T> for BufferedStreamer<T, N> {
+    fn new(stream: impl Stream<Item = T> + 'static) -> Self {
         Self {
             buffer: Vec::new().into_iter(),
             rt: Handle::current(),
             stream: Box::pin(stream),
-            capacity,
         }
     }
 }
 
-impl<T> Iterator for Streamer<T> {
+impl<T, const N: usize> Iterator for BufferedStreamer<T, N> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -35,15 +39,39 @@ impl<T> Iterator for Streamer<T> {
         }
         let rt = &self.rt;
         let new_buffer = rt.block_on(async {
-            let mut buffer = Vec::with_capacity(self.capacity);
-            for _i in 0..self.capacity {
+            let mut buffer = Vec::with_capacity(N);
+            for _i in 0..N {
                 if let Some(item) = self.stream.next().await {
                     buffer.push(item);
+                } else {
+                    break;
                 }
             }
             buffer.into_iter()
         });
         self.buffer = new_buffer;
         return self.buffer.next();
+    }
+}
+
+pub struct PassthroughStreamer<T> {
+    rt: Handle,
+    stream: Pin<Box<dyn Stream<Item = T>>>,
+}
+
+impl<T> Streamer<T> for PassthroughStreamer<T> {
+    fn new(stream: impl Stream<Item = T> + 'static) -> Self {
+        Self {
+            rt: Handle::current(),
+            stream: Box::pin(stream),
+        }
+    }
+}
+
+impl<T> Iterator for PassthroughStreamer<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        return self.rt.block_on(self.stream.next())
     }
 }

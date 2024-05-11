@@ -4,17 +4,18 @@ use std::{
 };
 
 use dovahkiin::expr::Value;
-use futures::Stream;
+use futures::{Future, Stream};
 
 use super::DataSource;
+use futures::future;
 
 pub struct Repeat<T: Clone> {
     data: T,
 }
 
 impl<T: Clone> DataSource<T, T> for Repeat<T> {
-    fn init(params: T) -> Self {
-        Self { data: params }
+    fn init(params: T) -> impl Future<Output = Result<Self, String>> {
+        future::ready(Result::Ok(Self { data: params }))
     }
 }
 
