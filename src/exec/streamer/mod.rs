@@ -72,6 +72,6 @@ impl<T> Iterator for PassthroughStreamer<T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        return self.rt.block_on(self.stream.next())
+        return self.rt.block_on(self.stream.next());
     }
 }

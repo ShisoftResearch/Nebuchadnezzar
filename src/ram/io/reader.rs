@@ -7,8 +7,8 @@ use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
 use super::align_address_with_ty;
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
-use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
 use dovahkiin::ahash::HashMap;
+use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
 use std::mem;
 
 fn read_field<'v>(
