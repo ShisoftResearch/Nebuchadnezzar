@@ -12,3 +12,5 @@ pub mod datasource;
 pub mod adapter;
 
 pub mod streamer;
+
+pub mod partitioner;
