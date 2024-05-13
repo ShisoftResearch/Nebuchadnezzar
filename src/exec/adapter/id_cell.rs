@@ -32,8 +32,9 @@ impl <'a> Iterator for IdCell<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(id) = self.iter.next() {
-                if let Ok(res) = self.chunks.read_cell(&id) {
-                    return Some(res);
+                match self.chunks.read_cell(&id) {
+                    Ok(res) => return Some(res),
+                    Err(e) => error!("Error on reading cell with id {:?}, error {:?}", id, e)
                 }
             } else {
                 return None;
