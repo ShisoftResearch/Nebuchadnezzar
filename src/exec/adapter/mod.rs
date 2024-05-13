@@ -1,5 +1,6 @@
 pub mod id_cell;
 pub mod id_cell_select;
+pub mod owned_cell;
 pub mod take;
 
 pub trait Adapter<I, O, P>: Iterator<Item = O> + Sized {
