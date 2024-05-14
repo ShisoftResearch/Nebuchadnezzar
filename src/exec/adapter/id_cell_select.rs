@@ -1,5 +1,5 @@
-use dovahkiin::types::Id;
 use crate::ram::{cell::SharedCell, chunk::Chunks};
+use dovahkiin::types::Id;
 
 use super::Adapter;
 
@@ -23,13 +23,13 @@ impl<'a> Adapter<Id, SharedCell<'a>, IdCellSelectParams<'a>> for IdCellSelect<'a
         let r = Self {
             iter,
             chunks: params.chunks,
-            fields: params.fields
+            fields: params.fields,
         };
         return Ok(r);
     }
 }
 
-impl <'a> Iterator for IdCellSelect<'a> {
+impl<'a> Iterator for IdCellSelect<'a> {
     type Item = SharedCell<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -37,7 +37,7 @@ impl <'a> Iterator for IdCellSelect<'a> {
             if let Some(id) = self.iter.next() {
                 match self.chunks.read_selected(&id, &self.fields) {
                     Ok(res) => return Some(res),
-                    Err(e) => error!("Error on selecting cell with id {:?}, error {:?}", id, e)
+                    Err(e) => error!("Error on selecting cell with id {:?}, error {:?}", id, e),
                 }
             } else {
                 return None;
