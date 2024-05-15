@@ -7,6 +7,7 @@ pub mod id_cell;
 pub mod id_cell_select;
 pub mod owned_cell;
 pub mod proc_value;
+pub mod filter_value;
 pub mod referred_cell;
 pub mod take;
 
