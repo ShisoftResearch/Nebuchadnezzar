@@ -14,3 +14,5 @@ pub mod adapter;
 pub mod streamer;
 
 pub mod partitioner;
+
+pub mod scheduler;

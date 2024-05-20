@@ -1,9 +1,10 @@
+use super::Adapter;
 use dovahkiin::{
     expr::{interpreter::Interpreter, serde::Expr, SExpr},
     integrated::lisp,
-    parser::lisp::ParserExpr, types::{OwnedValue, SharedValue},
+    parser::lisp::ParserExpr,
+    types::{OwnedValue, SharedValue},
 };
-use super::Adapter;
 
 pub struct FilterSharedValue<'a> {
     filter: SExpr<'a>,
@@ -15,7 +16,9 @@ pub struct FilterSharedValueParams {
     filter: Expr,
 }
 
-impl<'a> Adapter<SharedValue<'a>, SharedValue<'a>, FilterSharedValueParams> for FilterSharedValue<'a> {
+impl<'a> Adapter<SharedValue<'a>, SharedValue<'a>, FilterSharedValueParams>
+    for FilterSharedValue<'a>
+{
     fn from(
         input: impl Iterator<Item = SharedValue<'a>> + 'static,
         params: FilterSharedValueParams,
@@ -39,13 +42,16 @@ impl<'a> Iterator for FilterSharedValue<'a> {
             if let Some(c) = self.iter.next() {
                 let filter = self.filter.clone();
                 self.interpreter.clear();
-                self.interpreter.bind("data", SExpr::shared_value(c.clone()));
+                self.interpreter
+                    .bind("data", SExpr::shared_value(c.clone()));
                 let res = filter.eval(self.interpreter.get_env());
                 match res {
                     Ok(expr) => {
                         let expr_res = expr.into_val();
                         let eval = match expr_res {
-                            Ok(OwnedValue::Bool(false)) | Ok(OwnedValue::Null) | Ok(OwnedValue::NA) => false,
+                            Ok(OwnedValue::Bool(false))
+                            | Ok(OwnedValue::Null)
+                            | Ok(OwnedValue::NA) => false,
                             Err(s) => {
                                 error!("malformed proc result, message {}", s);
                                 false
@@ -53,7 +59,7 @@ impl<'a> Iterator for FilterSharedValue<'a> {
                             _ => true,
                         };
                         if eval {
-                            return Some(c)
+                            return Some(c);
                         }
                     }
                     Err(s) => {
@@ -108,7 +114,9 @@ impl<'a> Iterator for FilterOwnedValue<'a> {
                     Ok(expr) => {
                         let expr_res = expr.into_val();
                         let eval = match expr_res {
-                            Ok(OwnedValue::Bool(false)) | Ok(OwnedValue::Null) | Ok(OwnedValue::NA) => false,
+                            Ok(OwnedValue::Bool(false))
+                            | Ok(OwnedValue::Null)
+                            | Ok(OwnedValue::NA) => false,
                             Err(s) => {
                                 error!("malformed proc result, message {}", s);
                                 false
@@ -116,7 +124,7 @@ impl<'a> Iterator for FilterOwnedValue<'a> {
                             _ => true,
                         };
                         if eval {
-                            return self.interpreter.unbind("data").unwrap().owned_val()
+                            return self.interpreter.unbind("data").unwrap().owned_val();
                         }
                     }
                     Err(s) => {

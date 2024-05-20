@@ -48,6 +48,8 @@ impl Iterator for OwnedCellValue {
     type Item = OwnedValue;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|c| owned_with_header(c.header, c.data))
+        self.iter
+            .next()
+            .map(|c| owned_with_header(c.header, c.data))
     }
 }

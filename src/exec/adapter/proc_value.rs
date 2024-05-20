@@ -1,9 +1,10 @@
+use super::Adapter;
 use dovahkiin::{
     expr::{interpreter::Interpreter, serde::Expr, SExpr},
     integrated::lisp,
-    parser::lisp::ParserExpr, types::{OwnedValue, SharedValue},
+    parser::lisp::ParserExpr,
+    types::{OwnedValue, SharedValue},
 };
-use super::Adapter;
 
 pub struct ProcSharedValue<'a> {
     proc: SExpr<'a>,

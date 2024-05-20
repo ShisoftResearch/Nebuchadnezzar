@@ -38,6 +38,7 @@ tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
 num = "*"
+core_affinity = "0.8.1"
 
 [dev-dependencies]
 env_logger = "*"

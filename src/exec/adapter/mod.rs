@@ -3,11 +3,11 @@ use dovahkiin::types::{Id, Map, OwnedMap, OwnedValue, SharedMap, SharedValue};
 use crate::ram::cell::CellHeader;
 
 pub mod cell_value;
+pub mod filter_value;
 pub mod id_cell;
 pub mod id_cell_select;
 pub mod owned_cell;
 pub mod proc_value;
-pub mod filter_value;
 pub mod referred_cell;
 pub mod take;
 
@@ -30,7 +30,10 @@ pub fn owned_with_header(header: CellHeader, mut value: OwnedValue) -> OwnedValu
     return value;
 }
 
-pub fn shared_with_header<'a>(header: &'a CellHeader, mut value: SharedValue<'a>) -> SharedValue<'a> {
+pub fn shared_with_header<'a>(
+    header: &'a CellHeader,
+    mut value: SharedValue<'a>,
+) -> SharedValue<'a> {
     let id_ptr = &header.partition as *const _ as usize as *const Id;
     unsafe {
         match &mut value {
