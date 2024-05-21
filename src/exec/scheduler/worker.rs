@@ -9,7 +9,7 @@ use std::{
 };
 use tokio::{sync::mpsc::*, task::LocalSet};
 
-use super::Stage;
+use super::{Stage, StageId};
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Task {
@@ -17,12 +17,6 @@ pub struct Task {
     host: u64,
     stage_id: u64,
     data_partition: u64,
-}
-
-#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
-pub struct StageId {
-    id: u64,
-    host: u64
 }
 
 type TaskMap = PtrHashMap<u64, Arc<Task>>;
@@ -86,12 +80,10 @@ impl Worker {
         self.execs[exec_id].push_task(new_id);
     }
 
-    fn new_stage(&self, stage: Stage, host: u64, id: u64) {
-        let stage_id = StageId::new(host, id);
+    fn new_stage(&self, stage: Stage, stage_id: StageId) {
         self.stages.insert_no_rt(stage_id, Arc::new(stage));
     }
-    fn obsolete(&self, host: u64, id: u64) {
-        let stage_id = StageId::new(host, id);
+    fn obsolete_stage(&self, stage_id: StageId) {
         self.stages.remove_rt_ref(&stage_id);
     }
 }
@@ -113,6 +105,7 @@ impl Executer {
     }
     async fn run(this: Arc<Self>, mut receiver: UnboundedReceiver<u64>) {
         while let Some(task_id) = receiver.recv().await {
+            this.current_task.store(task_id, Relaxed);
             let task = this.tasks.get_ref(&task_id).unwrap();
             unimplemented!()
         }
