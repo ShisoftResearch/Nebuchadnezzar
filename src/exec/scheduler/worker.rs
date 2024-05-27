@@ -17,6 +17,7 @@ pub struct Task {
     host: u64,
     stage_id: u64,
     data_partition: u64,
+    estimate_mem: u64,
 }
 
 type TaskMap = PtrHashMap<u64, Arc<Task>>;
@@ -122,4 +123,11 @@ impl StageId {
             host, id
         }
     }
+}
+
+pub struct WorkerDesc {
+    threads: u64,
+    in_queue: u64,
+    memory: u64,
+    mem_used: u64,
 }

@@ -2,7 +2,7 @@
 // It can be used on local execution and distributed execution
 // depends on the model
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use dovahkiin::expr::serde::Expr;
 use serde::{Deserialize, Serialize};
@@ -53,47 +53,189 @@ impl DAG {
     }
 
     pub fn topological_sort(&self) -> Result<Vec<u32>, String> {
-        // Create a copy of the inlinks to manipulate
-        let mut in_degree = self.inlinks.clone();
+        let mut in_degree: HashMap<u32, usize> = HashMap::new();
+        let mut zero_in_degree_queue: VecDeque<u32> = VecDeque::new();
+        let mut topo_sorted: Vec<u32> = Vec::new();
 
-        // Vector to store the nodes with zero in-degree (no incoming edges)
-        let mut queue: Vec<u32> = in_degree
-            .iter()
-            .filter(|(_, links)| links.is_empty())
-            .map(|(node, _)| *node)
-            .collect();
-
-        // If queue is initially empty, and there are nodes, there's a cycle
-        if queue.is_empty() && !self.nodes.is_empty() {
-            return Err("Graph has cycles, cannot perform topological sort".to_string());
+        // Initialize in-degree of all nodes to 0
+        for node in &self.nodes {
+            in_degree.insert(node.id, 0);
         }
 
-        let mut sorted = Vec::new();
+        // Calculate in-degrees based on the inlinks
+        for (node_id, dependencies) in &self.inlinks {
+            *in_degree.get_mut(node_id).unwrap() = dependencies.len();
+        }
 
-        while let Some(node) = queue.pop() {
-            sorted.push(node);
+        // Collect nodes with zero in-degree
+        for (&node_id, &deg) in &in_degree {
+            if deg == 0 {
+                zero_in_degree_queue.push_back(node_id);
+            }
+        }
 
-            // For each node `m` that `node` connects to...
-            if let Some(outgoing) = self.outlinks.get(&node) {
-                for &m in outgoing {
-                    // Remove the edge from the node to m
-                    if let Some(links) = in_degree.get_mut(&m) {
-                        links.retain(|&x| x != node);
+        // Process nodes with zero in-degree
+        while let Some(node_id) = zero_in_degree_queue.pop_front() {
+            topo_sorted.push(node_id);
 
-                        // If `m` has no other incoming edges, add it to the queue
-                        if links.is_empty() {
-                            queue.push(m);
-                        }
+            // Reduce in-degree of child nodes and add new zero in-degree nodes to the queue
+            if let Some(children) = self.outlinks.get(&node_id) {
+                for &child_id in children {
+                    let child_in_degree = in_degree.get_mut(&child_id).unwrap();
+                    *child_in_degree -= 1;
+                    if *child_in_degree == 0 {
+                        zero_in_degree_queue.push_back(child_id);
                     }
                 }
             }
         }
 
-        // Check if we've processed all nodes (sorted should have exactly the same number of nodes as in the original graph)
-        if sorted.len() == self.nodes.len() {
-            Ok(sorted)
+        //return Ok(topo_sorted);
+
+        // Check if topological sort was successful
+        if topo_sorted.len() == self.nodes.len() {
+            Ok(topo_sorted)
         } else {
             Err("Graph has cycles, cannot perform topological sort".to_string())
         }
+    }
+
+    pub fn group_into_stages(&self, topo_sorted: Vec<u32>) -> Vec<Vec<Vec<Node>>> {
+        let mut stages: Vec<Vec<Vec<Node>>> = Vec::new();
+        let mut node_to_stage: HashMap<u32, usize> = HashMap::new();
+        let mut node_map: HashMap<u32, Node> = HashMap::new();
+
+        // Create a map from node ID to Node for easy access
+        for node in &self.nodes {
+            node_map.insert(node.id, node.clone());
+        }
+
+        // Process each node in topologically sorted order
+        for &node_id in &topo_sorted {
+            let mut stage = 0;
+            let mut new_group = true;
+
+            // Determine the stage based on dependencies
+            if let Some(dependencies) = self.inlinks.get(&node_id) {
+                for &dep in dependencies {
+                    if let Some(&dep_stage) = node_to_stage.get(&dep) {
+                        // Ensure the node is placed in the next stage after its dependencies
+                        stage = stage.max(dep_stage + 1);
+                    }
+                }
+            }
+
+            // Ensure the stages vector has enough stages
+            if stages.len() <= stage {
+                stages.push(Vec::new());
+            }
+
+            // Check if this node can be added to an existing group in the same stage
+            if !stages[stage].is_empty() {
+                let last_group = stages[stage].last().unwrap();
+                let last_node = last_group.last().unwrap();
+
+                if let Some(dependencies) = self.inlinks.get(&node_id) {
+                    if dependencies.contains(&last_node.id) {
+                        // Add node to the last group if it's linearly dependent
+                        let last_group_index = stages[stage].len() - 1;
+                        stages[stage][last_group_index].push(node_map[&node_id].clone());
+                        new_group = false;
+                    }
+                }
+            }
+
+            // Create a new group if necessary
+            if new_group {
+                stages[stage].push(vec![node_map[&node_id].clone()]);
+            }
+
+            // Update the node to stage map
+            node_to_stage.insert(node_id, stage);
+        }
+
+        stages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_add_nodes_and_edges() {
+        let mut dag = DAG::new();
+        let node0 = dag.push_node(Symbol::Add, Expr::nothing()).id;
+        let node1 = dag.push_node(Symbol::All, Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::And, Expr::nothing()).id;
+
+        dag.link(node0, node1);
+        dag.link(node1, node2);
+
+        assert_eq!(dag.nodes.len(), 3);
+        assert_eq!(dag.outlinks[&node0], vec![node1]);
+        assert_eq!(dag.inlinks[&node1], vec![node0]);
+        assert_eq!(dag.outlinks[&node1], vec![node2]);
+        assert_eq!(dag.inlinks[&node2], vec![node1]);
+    }
+
+    #[test]
+    fn test_topological_sort() {
+        let mut dag = DAG::new();
+        let node0 = dag.push_node(Symbol::Add, Expr::nothing()).id;
+        let node1 = dag.push_node(Symbol::All, Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::And, Expr::nothing()).id;
+        let node3 = dag.push_node(Symbol::AndNot, Expr::nothing()).id;
+        let node4 = dag.push_node(Symbol::Any, Expr::nothing()).id;
+        let node5 = dag.push_node(Symbol::Average, Expr::nothing()).id;
+
+        dag.link(node0, node1);
+        dag.link(node0, node2);
+        dag.link(node1, node3);
+        dag.link(node2, node3);
+        dag.link(node3, node4);
+        dag.link(node4, node5);
+
+        let topo_sorted = dag.topological_sort().unwrap();
+        assert_eq!(topo_sorted, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_group_into_stages() {
+        let mut dag = DAG::new();
+        let node1 = dag.push_node(Symbol::Add, Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::All, Expr::nothing()).id;
+        let node3 = dag.push_node(Symbol::And, Expr::nothing()).id;
+        let node4 = dag.push_node(Symbol::AndNot, Expr::nothing()).id;
+        let node5 = dag.push_node(Symbol::Any, Expr::nothing()).id;
+        let node6 = dag.push_node(Symbol::Average, Expr::nothing()).id;
+
+        dag.link(node1, node2);
+        dag.link(node1, node3);
+        dag.link(node2, node4);
+        dag.link(node3, node4);
+        dag.link(node4, node5);
+        dag.link(node5, node6);
+
+        let topo_sorted = dag.topological_sort().unwrap();
+        let stages = dag.group_into_stages(topo_sorted);
+
+        assert_eq!(stages.len(), 5); // There should be 5 stages
+
+        assert_eq!(stages[0].len(), 1);
+        assert_eq!(stages[0][0][0].id, 1);
+
+        assert_eq!(stages[1].len(), 2);
+        assert_eq!(stages[1][0][0].id, 2);
+        assert_eq!(stages[1][1][0].id, 3);
+
+        assert_eq!(stages[2].len(), 1);
+        assert_eq!(stages[2][0][0].id, 4);
+
+        assert_eq!(stages[3].len(), 1);
+        assert_eq!(stages[3][0][0].id, 5);
+
+        assert_eq!(stages[4].len(), 1);
+        assert_eq!(stages[4][0][0].id, 6);
     }
 }
