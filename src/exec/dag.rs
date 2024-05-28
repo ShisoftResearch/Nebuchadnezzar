@@ -7,7 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use dovahkiin::expr::serde::Expr;
 use serde::{Deserialize, Serialize};
 
-use super::symbols::Symbol;
+use super::symbols::*;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
@@ -113,7 +113,6 @@ impl DAG {
         // Process each node in topologically sorted order
         for &node_id in &topo_sorted {
             let mut stage = 0;
-            let mut new_group = true;
 
             // Determine the stage based on dependencies
             if let Some(dependencies) = self.inlinks.get(&node_id) {
@@ -130,16 +129,13 @@ impl DAG {
                 stages.push(Vec::new());
             }
 
-            // Check if this node can be added to an existing group in the same stage
-            if !stages[stage].is_empty() {
-                let last_group = stages[stage].last().unwrap();
+            // Check if the node should start a new group or continue the last group in the stage
+            let mut new_group = true;
+            if let Some(last_group) = stages[stage].last_mut() {
                 let last_node = last_group.last().unwrap();
-
-                if let Some(dependencies) = self.inlinks.get(&node_id) {
-                    if dependencies.contains(&last_node.id) {
-                        // Add node to the last group if it's linearly dependent
-                        let last_group_index = stages[stage].len() - 1;
-                        stages[stage][last_group_index].push(node_map[&node_id].clone());
+                if let Some(children) = self.outlinks.get(&last_node.id) {
+                    if children.contains(&node_id) {
+                        last_group.push(node_map[&node_id].clone());
                         new_group = false;
                     }
                 }
@@ -165,9 +161,9 @@ mod tests {
     #[test]
     fn test_add_nodes_and_edges() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(Symbol::Add, Expr::nothing()).id;
-        let node1 = dag.push_node(Symbol::All, Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::And, Expr::nothing()).id;
+        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
 
         dag.link(node0, node1);
         dag.link(node1, node2);
@@ -182,12 +178,12 @@ mod tests {
     #[test]
     fn test_topological_sort() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(Symbol::Add, Expr::nothing()).id;
-        let node1 = dag.push_node(Symbol::All, Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::And, Expr::nothing()).id;
-        let node3 = dag.push_node(Symbol::AndNot, Expr::nothing()).id;
-        let node4 = dag.push_node(Symbol::Any, Expr::nothing()).id;
-        let node5 = dag.push_node(Symbol::Average, Expr::nothing()).id;
+        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node3 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node4 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node5 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
 
         dag.link(node0, node1);
         dag.link(node0, node2);
@@ -203,19 +199,19 @@ mod tests {
     #[test]
     fn test_group_into_stages() {
         let mut dag = DAG::new();
-        let node1 = dag.push_node(Symbol::Add, Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::All, Expr::nothing()).id;
-        let node3 = dag.push_node(Symbol::And, Expr::nothing()).id;
-        let node4 = dag.push_node(Symbol::AndNot, Expr::nothing()).id;
-        let node5 = dag.push_node(Symbol::Any, Expr::nothing()).id;
-        let node6 = dag.push_node(Symbol::Average, Expr::nothing()).id;
+        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node3 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node4 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node5 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
 
-        dag.link(node1, node2);
+        dag.link(node0, node1);
+        dag.link(node0, node2);
         dag.link(node1, node3);
-        dag.link(node2, node4);
+        dag.link(node2, node3);
         dag.link(node3, node4);
         dag.link(node4, node5);
-        dag.link(node5, node6);
 
         let topo_sorted = dag.topological_sort().unwrap();
         let stages = dag.group_into_stages(topo_sorted);
@@ -223,19 +219,19 @@ mod tests {
         assert_eq!(stages.len(), 5); // There should be 5 stages
 
         assert_eq!(stages[0].len(), 1);
-        assert_eq!(stages[0][0][0].id, 1);
+        assert_eq!(stages[0][0][0].id, 0);
 
         assert_eq!(stages[1].len(), 2);
-        assert_eq!(stages[1][0][0].id, 2);
-        assert_eq!(stages[1][1][0].id, 3);
+        assert_eq!(stages[1][0][0].id, 1);
+        assert_eq!(stages[1][1][0].id, 2);
 
         assert_eq!(stages[2].len(), 1);
-        assert_eq!(stages[2][0][0].id, 4);
+        assert_eq!(stages[2][0][0].id, 3);
 
         assert_eq!(stages[3].len(), 1);
-        assert_eq!(stages[3][0][0].id, 5);
+        assert_eq!(stages[3][0][0].id, 4);
 
         assert_eq!(stages[4].len(), 1);
-        assert_eq!(stages[4][0][0].id, 6);
+        assert_eq!(stages[4][0][0].id, 5);
     }
 }

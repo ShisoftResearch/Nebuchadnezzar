@@ -1,3 +1,4 @@
+use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
 // use super::funcs::*;
 // use crate::exec::funcs::agg::*;
 // use crate::exec::funcs::bool::*;
@@ -72,23 +73,13 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Symbol {
-    // Aggregations
-    All,
-    Any,
-    Count,
-    Average,
-    Max,
-    Min,
-    Sum,
-    Find,
+    Neb(NebSymbol),
+    Dov(DovSymbol),
+}
 
-    // Scalars
-    Add,
-    Subtract,
-    Divide,
-    Multiply,
-    Negate,
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NebSymbol {
+    
     // Comparators
     Equal,
     NotEqual,
@@ -131,11 +122,31 @@ pub enum Symbol {
     Cast,
     CanCast,
 
-    Concat,
+    //***** NARROW *****//
+    FilterMap,
     Filter,
+    Map,
+
+    // Final Iterater
+    Concat,
     Limit,
     Take,
 
+    //***** WIDE *****//
     SortByASC,
     SortByDESC,
+    GroupBy,
+    FullJoin,
+    NaturalJoin,
+    Reduce,
+
+    // Aggregations
+    All,
+    Any,
+    Count,
+    Average,
+    Max,
+    Min,
+    Sum,
+    Find,
 }
