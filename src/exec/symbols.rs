@@ -1,75 +1,96 @@
 use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
-// use super::funcs::*;
-// use crate::exec::funcs::agg::*;
-// use crate::exec::funcs::bool::*;
-// use crate::exec::funcs::comp::*;
-// use crate::exec::funcs::data_source::*;
-// use crate::exec::funcs::reduce::group_by::*;
-// use crate::exec::funcs::reduce::join::*;
-// use crate::exec::funcs::scalar::*;
-// use crate::exec::funcs::terraform::*;
-// use crate::exec::funcs::vectorization::*;
-// use bifrost_hasher::hash_str;
-// use lazy_static::*;
-// use serde::{Deserialize, Serialize};
-// use std::collections::HashMap;
+use bifrost_hasher::hash_str;
+use bifrost_plugins::hash_ident;
+use dovahkiin::ahash::HashMap;
+use dovahkiin::ahash::HashMapExt;
 
-// macro_rules! def_funcs {
-//     ($($func_name: expr => $func: ident;)*) => {
-//         lazy_static! {
-//             pub static ref FUNC_MAP: HashMap<u64, Box<dyn Function>> = {
-//                 let mut func_map = HashMap::new();
-//                 $({
-//                     let f = $func;
-//                     let box_f: Box<dyn Function> = Box::new(f);
-//                     func_map.insert(hash_str($func_name), box_f);
-//                 })*
-//                 func_map
-//             };
-//         }
-//     };
-// }
+macro_rules! def_symbols {
+    ($($func_name: expr => $symbol: ident,)*) => {
+        lazy_static! {
+            pub static ref NEB_SYMBOL_MAP: HashMap<u64, NebSymbol> = {
+                let mut sym_map = HashMap::new();
+                $({
+                    sym_map.insert(hash_str($func_name), NebSymbol::$symbol);
+                })*
+                sym_map
+            };
+        }
 
-// def_funcs! {
-//     "group-by" => GroupBy;
-//     "join-by" => JoinBy;
-//     "join" => NaturalJoin;
-//     "sum" => Sum;
-//     "max" => Max;
-//     "min" => Min;
-//     "all" => All;
-//     "any" => Any;
-//     "avg" => Average;
-//     "and" => And;
-//     "or" => Or;
-//     "not" => Not;
-//     "and-not" => AndNot;
-//     "xor" => Xor;
-//     "null?" => IsNull;
-//     "not-null?" => IsNotNull;
-//     "null-if" => NullIf;
-//     "=" => Equal;
-//     "not=" => NotEqual;
-//     ">" => Greater;
-//     ">=" => GreaterEqual;
-//     "<" => Less;
-//     "<=" => LessEqual;
-//     "like" => Like;
-//     "not-like" => NotLike;
-//     "repeat" => Repeat;
-//     "make-source" => MakeSource;
-//     "+" => Add;
-//     "-" => Subtract;
-//     "/" => Divide;
-//     "*" => Multiply;
-//     "~" => Negate;
-//     "limit" => Limit;
-//     "sort-asc" => SortAsc;
-//     "sort-desc" => SortDesc;
-//     "filter" => Filter;
-//     "to-vec" => ToVec;
-//     "col" => Col;
-// }
+        pub fn neb_symbol_id(symbol: NebSymbol) -> u64 {
+            symbol as u64
+        }
+
+        pub fn neb_id_symbol (symbol_id: u64) -> Option<NebSymbol> {
+            NEB_SYMBOL_MAP.get(&symbol_id).cloned()
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        pub enum NebSymbol {
+            $(
+                $symbol = hash_ident!($symbol),
+            )*      
+        }
+
+    };
+}
+
+def_symbols! {
+    // Comparators
+    "=" => Equal,
+    "!=" => NotEqual,
+    ">" => Greater,
+    ">=" => GreaterEqual,
+    "<" => Less,
+    "<=" => LessEqual,
+    "like" => Like,
+    "not-like" => NotLike,
+
+    // Boolean
+    "and" => And,
+    "and-not" => AndNot,
+    "not" => Not,
+    "or" => Or,
+    "xor" => Xor,
+    "not-null?" => NotNull,
+    "null?" => IsNull,
+
+    // Containment Tests
+    "regex-matches" => RegexMatches,
+    "is-in?" => IsIn,
+
+    "cast" => Cast,
+    "can-cast?" => CanCast,
+
+    //***** NARROW *****//
+    "filter-map" => FilterMap,
+    "filter" => Filter,
+    "map" => Map,
+
+    // Final Iterater
+    "concat" => Concat,
+    "limit" => Limit,
+    "take" => Take,
+
+    //***** WIDE *****//
+    "sort-by" => SortBy,
+    "sort-by-asc" => SortByASC,
+    "sort-by-desc" => SortByDESC,
+    "group-by" => GroupBy,
+    "join" => Join,
+    "full-join" => FullJoin,
+    "natural-join" => NaturalJoin,
+    "reduce" => Reduce,
+
+    // Aggregations
+    "all" => All,
+    "any" => Any,
+    "count" => Count,
+    "avg" => Average,
+    "max" => Max,
+    "min" => Min,
+    "sum" => Sum,
+    "find" => Find,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Symbol {
@@ -77,76 +98,12 @@ pub enum Symbol {
     Dov(DovSymbol),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NebSymbol {
-    
-    // Comparators
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterEqual,
-    Less,
-    LessEqual,
-    Like,
-    NotLike,
-
-    // Boolean
-    And,
-    AndNot,
-    Not,
-    Or,
-    Xor,
-    NotNull,
-    IsNull,
-    NullIf,
-
-    // Containment Tests
-    StringMatches,
-    IndexIn,
-    IsIn,
-
-    // String Predicates
-    StringIsDecimal,
-    StringIsDigit,
-    StringIsLowerCase,
-    StringIsUpperCase,
-    StringIsNumeric,
-    StringIsSpace,
-    SubString,
-
-    // String Transforms
-    StringToUpper,
-    StringToLower,
-    StringLength,
-
-    Cast,
-    CanCast,
-
-    //***** NARROW *****//
-    FilterMap,
-    Filter,
-    Map,
-
-    // Final Iterater
-    Concat,
-    Limit,
-    Take,
-
-    //***** WIDE *****//
-    SortByASC,
-    SortByDESC,
-    GroupBy,
-    FullJoin,
-    NaturalJoin,
-    Reduce,
-
-    // Aggregations
-    All,
-    Any,
-    Count,
-    Average,
-    Max,
-    Min,
-    Sum,
-    Find,
+pub fn symbol_from_id(id: u64) -> Option<Symbol> {
+    if let Some(neb_sym) = neb_id_symbol(id) {
+        Some(Symbol::Neb(neb_sym))
+    } else if let Some(dov_sym) = DovSymbol::from_id(id) {
+        Some(Symbol::Dov(dov_sym))
+    } else {
+        None
+    }
 }
