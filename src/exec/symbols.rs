@@ -5,12 +5,12 @@ use dovahkiin::ahash::HashMap;
 use dovahkiin::ahash::HashMapExt;
 
 macro_rules! def_symbols {
-    ($($func_name: expr => $symbol: ident,)*) => {
+    ($($sym_name: expr => $symbol: ident,)*) => {
         lazy_static! {
             pub static ref NEB_SYMBOL_MAP: HashMap<u64, NebSymbol> = {
                 let mut sym_map = HashMap::new();
                 $({
-                    sym_map.insert(hash_str($func_name), NebSymbol::$symbol);
+                    sym_map.insert(hash_str($sym_name), NebSymbol::$symbol);
                 })*
                 sym_map
             };
@@ -27,7 +27,7 @@ macro_rules! def_symbols {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
         pub enum NebSymbol {
             $(
-                $symbol = hash_ident!($symbol),
+                $symbol = hash_ident!($sym_name),
             )*      
         }
 
