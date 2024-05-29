@@ -10,7 +10,7 @@ macro_rules! def_symbols {
             pub static ref NEB_SYMBOL_MAP: HashMap<u64, NebSymbol> = {
                 let mut sym_map = HashMap::new();
                 $({
-                    sym_map.insert(hash_str($sym_name), NebSymbol::$symbol);
+                    sym_map.insert(hash_ident!($sym_name), NebSymbol::$symbol);
                 })*
                 sym_map
             };
@@ -69,7 +69,6 @@ def_symbols! {
     // Final Iterater
     "concat" => Concat,
     "limit" => Limit,
-    "take" => Take,
 
     //***** WIDE *****//
     "sort-by" => SortBy,
@@ -90,6 +89,27 @@ def_symbols! {
     "min" => Min,
     "sum" => Sum,
     "find" => Find,
+    
+    //*** Data source ***/
+    "cell-id-query" => CellIdQuery,
+    "repeat" => Repeat,
+
+    //*** Adapter  ***/
+    "id-cell" => IdCell,
+    "id-cell-sel" => IdCellSel,
+    "borrow-cell-value" => BorrowCellValue,
+    "owned-cell-value" => OwnedCellValue,
+    "filter-shared-value" => FilterSharedValue,
+    "filter-owned-value" => FilterOwnedValue,
+    "to-owned-cell" => ToOwnedCell,
+    "proc-shared-value" => ProcSharedValue,
+    "proc-owned-value" => ProcOwnedValue,
+    "ref-cell" => RefCell,
+    "take" => Take,
+
+    //*** Partitioner ***/
+    "hash-partition" => HashPartition,
+    "range-partition" => RangePartition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
