@@ -1,6 +1,6 @@
 use dovahkiin::expr::serde::Expr;
 
-use super::symbols::Symbol;
+use super::symbols::NebSymbol;
 
 pub mod coordinator;
 pub mod worker;
@@ -19,7 +19,7 @@ pub struct Stage {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Procedure{
-    symbol: Symbol,
+    symbol: NebSymbol,
     params: Vec<ProcParam>
 }
 

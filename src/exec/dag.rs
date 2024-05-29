@@ -12,7 +12,7 @@ use super::symbols::*;
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
     id: u32,
-    symbol: Symbol,
+    symbol: NebSymbol,
     params: Expr,
 }
 
@@ -32,7 +32,7 @@ impl DAG {
         }
     }
 
-    pub fn push_node(&mut self, symbol: Symbol, params: Expr) -> &Node {
+    pub fn push_node(&mut self, symbol: NebSymbol, params: Expr) -> &Node {
         let id = self.nodes.len() as u32;
         let node = Node { id, symbol, params };
         self.nodes.push(node.clone());
@@ -161,9 +161,9 @@ mod tests {
     #[test]
     fn test_add_nodes_and_edges() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
 
         dag.link(node0, node1);
         dag.link(node1, node2);
@@ -178,12 +178,12 @@ mod tests {
     #[test]
     fn test_topological_sort() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node3 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node4 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node5 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node3 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node4 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node5 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
 
         dag.link(node0, node1);
         dag.link(node0, node2);
@@ -199,12 +199,12 @@ mod tests {
     #[test]
     fn test_group_into_stages() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node1 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node2 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node3 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node4 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
-        let node5 = dag.push_node(Symbol::Neb(NebSymbol::All), Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node3 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node4 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node5 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
 
         dag.link(node0, node1);
         dag.link(node0, node2);

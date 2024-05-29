@@ -1,5 +1,4 @@
 use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
-use bifrost_hasher::hash_str;
 use bifrost_plugins::hash_ident;
 use dovahkiin::ahash::HashMap;
 use dovahkiin::ahash::HashMapExt;
