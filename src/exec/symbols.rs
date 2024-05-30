@@ -13,6 +13,14 @@ macro_rules! def_symbols {
                 })*
                 sym_map
             };
+            pub static ref NEB_SYMBOL_OBJS: HashMap<u64, Box<dyn SymbolObj>> = {
+                let mut sym_map = HashMap::new();
+                $({
+                    let boxed: Box<dyn SymbolObj> = Box::new(objs::$symbol);
+                    sym_map.insert(hash_ident!($sym_name), boxed);
+                })*
+                sym_map
+            };
         }
 
         pub fn neb_symbol_id(symbol: NebSymbol) -> u64 {
@@ -30,8 +38,16 @@ macro_rules! def_symbols {
             )*      
         }
 
+        pub mod objs {
+            $(
+                pub struct $symbol;
+                impl super::SymbolObj for $symbol {}
+            )* 
+        }
     };
 }
+
+pub trait SymbolObj: Sync {}
 
 def_symbols! {
     // Comparators
@@ -109,6 +125,12 @@ def_symbols! {
     //*** Partitioner ***/
     "hash-partition" => HashPartition,
     "range-partition" => RangePartition,
+
+    //*** Bindings ***/
+    "let" => Let,
+
+    //*** Macro ***/
+    "select-cell" => SelectCell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

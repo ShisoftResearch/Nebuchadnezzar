@@ -16,3 +16,5 @@ pub mod streamer;
 pub mod partitioner;
 
 pub mod scheduler;
+
+pub mod query;
