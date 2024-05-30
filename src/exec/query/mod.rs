@@ -21,4 +21,4 @@
 // With the coorsponding symbol behavior. If would decide if it should
 // continue with 'NebSymbol's, 'DovSymbol's or reject.
 
-mod expand;
+pub mod expand;

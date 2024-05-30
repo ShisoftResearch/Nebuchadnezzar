@@ -1,7 +1,10 @@
+use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
 use bifrost_plugins::hash_ident;
 use dovahkiin::ahash::HashMap;
 use dovahkiin::ahash::HashMapExt;
+
+use super::query::expand::Macro;
 
 macro_rules! def_symbols {
     ($($sym_name: expr => $symbol: ident,)*) => {
@@ -44,10 +47,22 @@ macro_rules! def_symbols {
                 impl super::SymbolObj for $symbol {}
             )* 
         }
+
+        pub fn neb_id_symbol_obj<'a>(symbol_id: u64) -> Option<&'a Box<dyn SymbolObj>> {
+            NEB_SYMBOL_OBJS.get(&symbol_id)
+        }
     };
 }
 
-pub trait SymbolObj: Sync {}
+pub trait SymbolObj: Sync {
+    fn macro_expand_func(&self) -> Option<fn(Expr) -> Expr> { None }
+}
+
+impl <S: Macro + Sync> SymbolObj for S {
+    fn macro_expand_func(&self) -> Option<fn(Expr) -> Expr> { 
+        Some(S::expand)
+    }
+}
 
 def_symbols! {
     // Comparators
