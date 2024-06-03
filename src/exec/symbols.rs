@@ -7,7 +7,21 @@ use dovahkiin::ahash::HashMapExt;
 use super::query::expand::Macro;
 
 macro_rules! def_symbols {
-    ($($sym_name: expr => $symbol: ident,)*) => {
+    ($sym_name:expr => $symbol:ident - M, $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - impl super::MacroPlaceholder for $symbol {},
+        }
+    };
+    
+    ($sym_name:expr => $symbol:ident, $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - impl super::SymbolObj for $symbol {},
+        }
+    };
+    
+    ($($sym_name: expr => $symbol: ident - $tr:item,)*) => {
         lazy_static! {
             pub static ref NEB_SYMBOL_MAP: HashMap<u64, NebSymbol> = {
                 let mut sym_map = HashMap::new();
@@ -42,25 +56,35 @@ macro_rules! def_symbols {
         }
 
         pub mod objs {
+            use dovahkiin::expr::serde::Expr;
+            use super::*;
             $(
                 pub struct $symbol;
-                impl super::SymbolObj for $symbol {}
+                $tr
+                impl $symbol {
+                    pub fn as_expr() -> Expr {
+                        Expr::Symbol(NebSymbol::$symbol as u64, $sym_name.to_string())
+                    }
+                }
             )* 
         }
 
-        pub fn neb_id_symbol_obj<'a>(symbol_id: u64) -> Option<&'a Box<dyn SymbolObj>> {
-            NEB_SYMBOL_OBJS.get(&symbol_id)
+        pub fn neb_id_symbol_obj<'a>(symbol_id: &u64) -> Option<&'a Box<dyn SymbolObj>> {
+            NEB_SYMBOL_OBJS.get(symbol_id)
         }
     };
 }
 
+trait MacroPlaceholder {}
+
 pub trait SymbolObj: Sync {
-    fn macro_expand_func(&self) -> Option<fn(Expr) -> Expr> { None }
+    fn macro_expand(&self, expr: Expr) -> Result<Expr, String> { Ok(expr) }
 }
 
-impl <S: Macro + Sync> SymbolObj for S {
-    fn macro_expand_func(&self) -> Option<fn(Expr) -> Expr> { 
-        Some(S::expand)
+impl <S: Macro> SymbolObj for S {
+    #[inline(always)]
+    fn macro_expand(&self, expr: Expr) -> Result<Expr, String> { 
+        self.expand(expr)
     }
 }
 
@@ -142,10 +166,10 @@ def_symbols! {
     "range-partition" => RangePartition,
 
     //*** Bindings ***/
-    "let" => Let,
+    "let" => Let - M,
 
     //*** Macro ***/
-    "select-cell" => SelectCell,
+    "select-cell" => SelectCell - M,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
