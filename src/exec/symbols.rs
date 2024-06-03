@@ -4,6 +4,7 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::ahash::HashMap;
 use dovahkiin::ahash::HashMapExt;
 
+use super::query::env::Environment;
 use super::query::expand::Macro;
 
 macro_rules! def_symbols {
@@ -78,13 +79,13 @@ macro_rules! def_symbols {
 trait MacroPlaceholder {}
 
 pub trait SymbolObj: Sync {
-    fn macro_expand(&self, expr: Expr) -> Result<Expr, String> { Ok(expr) }
+    fn macro_expand(&self, expr: Expr, env: &mut Environment) -> Result<Expr, String> { Ok(expr) }
 }
 
 impl <S: Macro> SymbolObj for S {
     #[inline(always)]
-    fn macro_expand(&self, expr: Expr) -> Result<Expr, String> { 
-        self.expand(expr)
+    fn macro_expand(&self, expr: Expr, env: &mut Environment) -> Result<Expr, String> { 
+        self.expand(expr, env)
     }
 }
 
@@ -167,6 +168,7 @@ def_symbols! {
 
     //*** Bindings ***/
     "let" => Let - M,
+    "bind" => Bind,
 
     //*** Macro ***/
     "select-cell" => SelectCell - M,
