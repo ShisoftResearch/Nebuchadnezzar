@@ -1,28 +1,134 @@
-use dovahkiin::expr::serde::Expr;
-use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
+use std::ptr;
+
 use bifrost_plugins::hash_ident;
 use dovahkiin::ahash::HashMap;
 use dovahkiin::ahash::HashMapExt;
+use dovahkiin::expr::serde::Expr;
+use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
 
+use super::partitioner::Partitioner;
 use super::query::env::Environment;
 use super::query::expand::Macro;
+use crate::exec::query::planner::Partitioning;
+
+macro_rules! macro_impl {
+    ($symbol:ident) => {
+        impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Macro
+            }
+            #[inline(always)]
+            fn macro_expand(&self, expr: Expr, env: &mut Environment) -> Result<Expr, String> {
+                self.expand(expr, env)
+            }
+            fn io_types(&self) -> (DataType, DataType) {
+                (DataType::NA, DataType::NA)
+            }
+        }
+    };
+}
+
+macro_rules! broadcasting_impl {
+    ($symbol:ident) => {
+        impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Broadcasting
+            }
+            fn io_types(&self) -> (DataType, DataType) {
+                unimplemented!()
+            }
+        }
+    };
+}
+
+macro_rules! partitioning_impl {
+    ($symbol:ident, $tinput:expr, $toutput:expr) => {
+        impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Partitioning
+            }
+            fn partition_init(
+                &self,
+                expr: &Expr,
+                env: &mut Environment,
+            ) -> Result<Option<Box<dyn Partitioner>>, String> {
+                self.get_partitioner(expr, env)
+            }
+            fn partition_data(
+                &self,
+                data_ptr: *mut (),
+                env: &mut Environment,
+                partitioner: &Box<dyn Partitioner>,
+            ) -> Option<u64> {
+                self.get_partition(data_ptr, env, partitioner)
+            }
+            fn io_types(&self) -> (DataType, DataType) {
+                ($tinput, $toutput)
+            }
+        }
+    };
+}
+
+macro_rules! compute_impl {
+    ($symbol:ident, $tinput:expr, $toutput:expr) => {
+        impl SymbolObj for $symbol {
+            fn io_types(&self) -> (DataType, DataType) {
+                ($tinput, $toutput)
+            }
+        }
+    };
+}
+
+macro_rules! aggregation_impl {
+    ($symbol:ident, $tinput:expr, $toutput:expr) => {
+        impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Aggregation
+            }
+            fn io_types(&self) -> (DataType, DataType) {
+                ($tinput, $toutput)
+            }
+        }
+    };
+}
 
 macro_rules! def_symbols {
-    ($sym_name:expr => $symbol:ident - M, $($rest:tt)*) => {
+    ($sym_name:expr => $symbol:ident - [M], $($rest:tt)*) => {
         def_symbols! {
             $($rest)*
-            $sym_name => $symbol - impl super::MacroPlaceholder for $symbol {},
+            $sym_name => $symbol - [macro_impl!($symbol);],
         }
     };
-    
-    ($sym_name:expr => $symbol:ident, $($rest:tt)*) => {
+
+    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr) - [P], $($rest:tt)*) => {
         def_symbols! {
             $($rest)*
-            $sym_name => $symbol - impl super::SymbolObj for $symbol {},
+            $sym_name => $symbol - [partitioning_impl!($symbol, $tinput, $toutput);],
         }
     };
-    
-    ($($sym_name: expr => $symbol: ident - $tr:item,)*) => {
+
+    ($sym_name:expr => $symbol:ident - [B], $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - [broadcasting_impl!($symbol);],
+        }
+    };
+
+    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr) - [A], $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - [aggregation_impl!($symbol, $tinput, $toutput);],
+        }
+    };
+
+    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr), $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - [compute_impl!($symbol, $tinput, $toutput);],
+        }
+    };
+
+    ($($sym_name: expr => $symbol: ident - [$tr:item],)*) => {
         lazy_static! {
             pub static ref NEB_SYMBOL_MAP: HashMap<u64, NebSymbol> = {
                 let mut sym_map = HashMap::new();
@@ -53,7 +159,7 @@ macro_rules! def_symbols {
         pub enum NebSymbol {
             $(
                 $symbol = hash_ident!($sym_name),
-            )*      
+            )*
         }
 
         pub mod objs {
@@ -67,7 +173,7 @@ macro_rules! def_symbols {
                         Expr::Symbol(NebSymbol::$symbol as u64, $sym_name.to_string())
                     }
                 }
-            )* 
+            )*
         }
 
         pub fn neb_id_symbol_obj<'a>(symbol_id: &u64) -> Option<&'a Box<dyn SymbolObj>> {
@@ -76,102 +182,154 @@ macro_rules! def_symbols {
     };
 }
 
-trait MacroPlaceholder {}
-
-pub trait SymbolObj: Sync {
-    fn macro_expand(&self, expr: Expr, env: &mut Environment) -> Result<Expr, String> { Ok(expr) }
+pub enum SymbolType {
+    Macro,
+    Partitioning, // Partition, then compute
+    Broadcasting,
+    Aggregation,
+    Compute, // Default, compute on bulk of data
 }
 
-impl <S: Macro> SymbolObj for S {
-    #[inline(always)]
-    fn macro_expand(&self, expr: Expr, env: &mut Environment) -> Result<Expr, String> { 
-        self.expand(expr, env)
+pub trait SymbolObj: Sync {
+    fn macro_expand(&self, expr: Expr, _env: &mut Environment) -> Result<Expr, String> {
+        Ok(expr)
     }
+    fn partition_init(
+        &self,
+        _expr: &Expr,
+        _env: &mut Environment,
+    ) -> Result<Option<Box<dyn Partitioner>>, String> {
+        Ok(None)
+    }
+    fn partition_data(
+        &self,
+        _data_ptr: *mut (),
+        _env: &mut Environment,
+        _partitioner: &Box<dyn Partitioner>,
+    ) -> Option<u64> {
+        unreachable!()
+    }
+    fn symbol_type(&self) -> SymbolType {
+        SymbolType::Compute
+    }
+    fn compute(&self, data: *mut ()) -> *mut () {
+        return ptr::null_mut();
+    }
+    fn io_types(&self) -> (DataType, DataType);
+}
+
+use BasicType::*;
+use DataType::*;
+pub enum DataType {
+    // For type checking only
+    NA,
+    Nothing,
+    Stream(BasicType),
+    Scala(BasicType),
+    Either(BasicType),
+    Type,
+}
+
+pub enum BasicType {
+    Expr,
+    OwnedValue,
+    OwnedValueRef,
+    SharedValue,
+    OwnedCell,
+    OwnedCellRef,
+    SharedCell,
+    Id,
+    Num,
+    U64,
+    F64,
+    Bool,
+    Str,
+    Dynamic,
+    Anything,
 }
 
 def_symbols! {
     // Comparators
-    "=" => Equal,
-    "!=" => NotEqual,
-    ">" => Greater,
-    ">=" => GreaterEqual,
-    "<" => Less,
-    "<=" => LessEqual,
-    "like" => Like,
-    "not-like" => NotLike,
+    "=" => Equal (Either(Dynamic) => Either(Bool)),
+    "!=" => NotEqual (Either(Dynamic) => Either(Bool)),
+    ">" => Greater (Either(Dynamic) => Either(Bool)),
+    ">=" => GreaterEqual (Either(Dynamic) => Either(Bool)),
+    "<" => Less  (Either(Dynamic) => Either(Bool)),
+    "<=" => LessEqual (Either(Dynamic) => Either(Bool)),
+    "like" => Like (Either(Dynamic) => Either(Bool)),
+    "not-like" => NotLike (Either(Dynamic) => Either(Bool)),
 
     // Boolean
-    "and" => And,
-    "and-not" => AndNot,
-    "not" => Not,
-    "or" => Or,
-    "xor" => Xor,
-    "not-null?" => NotNull,
-    "null?" => IsNull,
+    "and" => And (Either(Bool) => Either(Bool)),
+    "and-not" => AndNot (Either(Bool) => Either(Bool)),
+    "not" => Not (Either(Bool) => Either(Bool)),
+    "or" => Or (Either(Bool) => Either(Bool)),
+    "xor" => Xor (Either(Bool) => Either(Bool)),
+    "not-null?" => NotNull (Either(Dynamic) => Either(Bool)),
+    "null?" => IsNull (Either(Dynamic) => Either(Bool)),
 
     // Containment Tests
-    "regex-matches" => RegexMatches,
-    "is-in?" => IsIn,
+    "regex-matches" => RegexMatches (Either(Str) => Either(Bool)),
+    "is-in?" => IsIn (Either(Expr) => Either(Bool)),
 
-    "cast" => Cast,
-    "can-cast?" => CanCast,
+    "cast" => Cast (Either(Dynamic) => Either(Anything)),
+    "can-cast?" => CanCast (Either(Dynamic) => Either(Bool)),
 
     //***** NARROW *****//
-    "filter-map" => FilterMap,
-    "filter" => Filter,
-    "map" => Map,
+    "filter-map" => FilterMap (Stream(Dynamic) => Stream(Dynamic)),
+    "filter" => Filter (Stream(Dynamic) => Stream(Dynamic)),
+    "map" => Map (Stream(Dynamic) => Stream(Anything)),
 
     // Final Iterater
-    "concat" => Concat,
-    "limit" => Limit,
+    "concat" => Concat (Stream(Dynamic) => Stream(Dynamic)),
+    "limit" => Limit (Stream(Dynamic) => Stream(Dynamic)),
 
     //***** WIDE *****//
-    "sort-by" => SortBy,
-    "sort-by-asc" => SortByASC,
-    "sort-by-desc" => SortByDESC,
-    "group-by" => GroupBy,
-    "join" => Join,
-    "full-join" => FullJoin,
-    "natural-join" => NaturalJoin,
-    "reduce" => Reduce,
+    // "sort-by" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "sort-by-asc" => SortByASC (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "sort-by-desc" => SortByDESC (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "group-by" => GroupBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "join" => Join (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "full-join" => FullJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "natural-join" => NaturalJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "reduce" => Reduce (Stream(Dynamic) => Stream(Any)) - [P],
 
     // Aggregations
-    "all" => All,
-    "any" => Any,
-    "count" => Count,
-    "avg" => Average,
-    "max" => Max,
-    "min" => Min,
-    "sum" => Sum,
-    "find" => Find,
-    
+    "all" => All (Stream(Dynamic) => Scala(Bool)) - [A],
+    "any" => Any (Stream(Dynamic) => Scala(Bool)) - [A],
+    "count" => Count (Stream(Dynamic) => Scala(U64)) - [A],
+    "avg" => Average (Stream(Num) => Scala(F64)) - [A],
+    "max" => Max (Stream(Num) => Scala(Num)) - [A],
+    "min" => Min (Stream(Num) => Scala(Num)) - [A],
+    "sum" => Sum (Stream(Num) => Scala(Num)) - [A],
+    "find" => Find (Stream(Dynamic) => Scala(Dynamic)) - [A],
+
     //*** Data source ***/
-    "cell-id-query" => CellIdQuery,
-    "repeat" => Repeat,
+    "cell-id-query" => CellIdQuery (Nothing => Stream(Id)),
+    "repeat" => Repeat (Scala(Anything) => Stream(Dynamic)),
 
     //*** Adapter  ***/
-    "id-cell" => IdCell,
-    "id-cell-sel" => IdCellSel,
-    "borrow-cell-value" => BorrowCellValue,
-    "owned-cell-value" => OwnedCellValue,
-    "filter-shared-value" => FilterSharedValue,
-    "filter-owned-value" => FilterOwnedValue,
-    "to-owned-cell" => ToOwnedCell,
-    "proc-shared-value" => ProcSharedValue,
-    "proc-owned-value" => ProcOwnedValue,
-    "ref-cell" => RefCell,
-    "take" => Take,
+    "id-cell" => IdCell (Stream(Id) => Stream(SharedCell)) - [P],
+    "id-cell-sel" => IdCellSel (Stream(Id) => Stream(SharedCell)) - [P],
+    "borrow-cell-value" => BorrowCellValue (Stream(SharedCell) => Stream(SharedValue)),
+    "owned-cell-value" => OwnedCellValue (Stream(SharedCell) => Stream(OwnedValue)),
+    "filter-shared-value" => FilterSharedValue (Stream(SharedValue) => Stream(SharedValue)),
+    "filter-owned-value" => FilterOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)),
+    "to-owned-cell" => ToOwnedCell (Stream(SharedCell) => Stream(OwnedCell)),
+    "proc-shared-value" => ProcSharedValue (Stream(SharedValue) => Stream(SharedValue)),
+    "proc-owned-value" => ProcOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)),
+    "take" => Take (Stream(Anything) => Stream(Dynamic)),
 
-    //*** Partitioner ***/
-    "hash-partition" => HashPartition,
-    "range-partition" => RangePartition,
+    // //*** Partitioner ***/
+    // "hash-partition" => HashPartition,
+    // "range-partition" => RangePartition,
 
     //*** Bindings ***/
-    "let" => Let - M,
-    "bind" => Bind,
+    "let" => Let - [M],
+    "bind" => Bind (Nothing => Either(Anything)), // This is the final form
 
     //*** Macro ***/
-    "select-cell" => SelectCell - M,
+    "select-cell" => SelectCell - [M],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

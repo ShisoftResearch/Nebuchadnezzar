@@ -48,7 +48,12 @@ impl Worker {
             .into_iter()
             .map(|core_id| {
                 let (sender, receiver) = unbounded_channel();
-                let exec = Arc::new(Executer::new(sender, tasks.clone(), stages.clone(), core_id));
+                let exec = Arc::new(Executer::new(
+                    sender,
+                    tasks.clone(),
+                    stages.clone(),
+                    core_id,
+                ));
                 let exec_cpy = exec.clone();
                 thread::Builder::new()
                     .name(format!("QueryExec_{}", core_id.id))
@@ -119,9 +124,7 @@ impl Executer {
 
 impl StageId {
     fn new(host: u64, id: u64) -> Self {
-        StageId {
-            host, id
-        }
+        StageId { host, id }
     }
 }
 

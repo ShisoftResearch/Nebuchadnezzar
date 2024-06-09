@@ -1,5 +1,15 @@
-use crate::ram::{cell::SharedCell, chunk::Chunks};
-use dovahkiin::types::Id;
+use crate::{
+    exec::{
+        partitioner::Partitioner,
+        query::{
+            env::Environment,
+            planner::{get_cell_partitioner, get_id_partition, Partitioning},
+        },
+        symbols::{self, objs::IdCellSel},
+    },
+    ram::{cell::SharedCell, chunk::Chunks},
+};
+use dovahkiin::{expr::serde::Expr, types::Id};
 
 use super::Adapter;
 
@@ -43,5 +53,24 @@ impl<'a> Iterator for IdCellSelect<'a> {
                 return None;
             }
         }
+    }
+}
+
+impl Partitioning for symbols::objs::IdCellSel {
+    fn get_partitioner(
+        &self,
+        _expr: &Expr,
+        env: &mut Environment,
+    ) -> Result<Option<Box<dyn Partitioner>>, String> {
+        get_cell_partitioner(env)
+    }
+
+    fn get_partition(
+        &self,
+        data_ptr: *mut (),
+        _env: &mut Environment,
+        partitioner: &Box<dyn Partitioner>,
+    ) -> Option<u64> {
+        get_id_partition(data_ptr, partitioner)
     }
 }

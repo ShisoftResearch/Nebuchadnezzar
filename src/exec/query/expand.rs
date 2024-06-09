@@ -1,9 +1,7 @@
-use dovahkiin::expr::symbols;
+use crate::exec::symbols::neb_id_symbol_obj;
+use crate::exec::symbols::objs::*;
+use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::OwnedValue;
-use dovahkiin::{expr::serde::Expr};
-use crate::exec::symbols::{neb_id_symbol_obj};
-
-use crate::{exec::{symbols::objs::*}, ram::schema};
 
 use super::env::Environment;
 
@@ -25,10 +23,10 @@ impl Expand for Expr {
                         return expr_sym.macro_expand(self, env);
                     }
                 }
-            },
+            }
             _ => {}
         }
-        return Ok(self)
+        return Ok(self);
     }
 }
 
@@ -36,7 +34,7 @@ impl Macro for SelectCell {
     // (select-cell SCHEMA <FIELDS> <FILTER>)
     // Check if <FIELDS> is provided. If yes, use `id-cell-sel`
     // Check if <FILTER> is provided. If yes, use `filter-shared-value`
-    // Can expands to 
+    // Can expands to
     // (filter-shared-value
     //    (id-cell-sel
     //      (cell-id-query SCHEMA)
@@ -54,31 +52,21 @@ impl Macro for SelectCell {
                 return Err("Cannot accept more params".to_string());
             }
             let mut expr_res = if let Some(schema) = schema {
-                Expr::List(vec![
-                    CellIdQuery::as_expr(), 
-                    schema.expand(env)?
-                ])
+                Expr::List(vec![CellIdQuery::as_expr(), schema.expand(env)?])
             } else {
                 return Err("Schema is required".to_string());
             };
             if let Some(fields) = fields {
-                expr_res = Expr::List(vec![
-                    IdCellSel::as_expr(),
-                    expr_res,
-                    fields.expand(env)? 
-                ]);
+                expr_res = Expr::List(vec![IdCellSel::as_expr(), expr_res, fields.expand(env)?]);
             } else {
-                expr_res = Expr::List(vec![
-                    IdCell::as_expr(),
-                    expr_res,
-                ]);                
+                expr_res = Expr::List(vec![IdCell::as_expr(), expr_res]);
             }
             if let Some(filter) = filter {
                 expr_res = Expr::List(vec![
                     FilterSharedValue::as_expr(),
                     expr_res,
-                    filter.expand(env)?
-                ]); 
+                    filter.expand(env)?,
+                ]);
             }
             return Ok(expr_res);
         } else {
@@ -101,9 +89,9 @@ impl Macro for Let {
             if let (Some(Expr::Symbol(sym_id, _)), Some(bound_expr)) = (bound_expr, bound_sym) {
                 let expanded_expr = bound_expr.expand(env)?;
                 env.set_binding(sym_id, expanded_expr);
-                return Ok(Expr::Vec(vec![
+                return Ok(Expr::List(vec![
                     Bind::as_expr(),
-                    Expr::Value(OwnedValue::U64(sym_id))
+                    Expr::Value(OwnedValue::U64(sym_id)),
                 ]));
             } else {
                 return Err(format!("Cannot bind with non-symbol"));

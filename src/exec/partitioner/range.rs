@@ -14,21 +14,9 @@ pub struct RangePartitioner {
     num_parts: u64,
 }
 
-impl Partitioner<Feature, u64, RangePartitionParams> for RangePartitioner {
-    fn init(params: RangePartitionParams) -> Self {
-        let start_num = u64::from_le_bytes(params.start);
-        let ends_num = u64::from_le_bytes(params.ends);
-        let range = ends_num - start_num;
-        let part_size = range / params.num_parts;
-        Self {
-            part_size,
-            start: start_num,
-            num_parts: params.num_parts,
-        }
-    }
-
-    fn partition(&self, key: &Feature) -> Option<u64> {
-        let key_num = u64::from_le_bytes(key.clone());
+impl Partitioner for RangePartitioner {
+    fn partition(&self, key: u64) -> Option<u64> {
+        let key_num = key;
         if key_num < self.start {
             return None;
         }
@@ -38,5 +26,17 @@ impl Partitioner<Feature, u64, RangePartitionParams> for RangePartitioner {
             return None;
         }
         return Some(part_id);
+    }
+}
+
+pub fn init(params: RangePartitionParams) -> RangePartitioner {
+    let start_num = u64::from_le_bytes(params.start);
+    let ends_num = u64::from_le_bytes(params.ends);
+    let range = ends_num - start_num;
+    let part_size = range / params.num_parts;
+    RangePartitioner {
+        part_size,
+        start: start_num,
+        num_parts: params.num_parts,
     }
 }
