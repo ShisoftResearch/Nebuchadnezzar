@@ -100,54 +100,53 @@ impl DAG {
         }
     }
 
-    pub fn group_into_stages(&self, topo_sorted: Vec<u32>) -> Vec<Vec<Vec<Node>>> {
-        let mut stages: Vec<Vec<Vec<Node>>> = Vec::new();
-        let mut node_to_stage: HashMap<u32, usize> = HashMap::new();
-        let mut node_map: HashMap<u32, Node> = HashMap::new();
+    pub fn group_into_stages(&self, topo_sorted: Vec<u32>) -> Vec<Vec<Vec<u32>>> {
+        let mut stages: Vec<Vec<Vec<u32>>> = Vec::new();
+        let mut node_stage: Vec<i32> = vec![-1; self.nodes.len()];
 
-        // Create a map from node ID to Node for easy access
-        for node in &self.nodes {
-            node_map.insert(node.id, node.clone());
-        }
-
-        // Process each node in topologically sorted order
-        for &node_id in &topo_sorted {
-            let mut stage = 0;
-
-            // Determine the stage based on dependencies
-            if let Some(dependencies) = self.inlinks.get(&node_id) {
-                for &dep in dependencies {
-                    if let Some(&dep_stage) = node_to_stage.get(&dep) {
-                        // Ensure the node is placed in the next stage after its dependencies
-                        stage = stage.max(dep_stage + 1);
+        for &node_id in topo_sorted.iter() {
+            let parent = self.inlinks.get(&node_id);
+            let (parent_id, parent_stage) = parent
+                .map(|pids| {
+                    pids.iter()
+                        .map(|id| (*id as i32, node_stage[*id as usize]))
+                        .max_by_key(|(_, stage)| *stage)
+                        .unwrap()
+                })
+                .unwrap_or((-1, -1));
+            if let Some(node) = self.nodes.get(node_id as usize) {
+                if node.symbol.symbol_type() == SymbolType::Partitioning || parent_stage == -1 {
+                    // New stage
+                    let next_stage = parent_stage + 1;
+                    loop {
+                        if stages.len() as i32 <= next_stage {
+                            stages.push(vec![]);
+                        } else {
+                            break;
+                        }
                     }
+                    let current_stage = &mut stages[next_stage as usize];
+                    current_stage.push(vec![node_id]);
+                    node_stage[node_id as usize] = next_stage;
+                } else {
+                    // Add to old stage as where its parent in
+                    if parent_stage == -1 {
+                        
+                    }
+                    let current_stage = &mut stages[parent_stage as usize];
+                    // Search for the thread of its parent
+                    let thread = current_stage
+                        .iter_mut()
+                        .find(|th| *th.last().unwrap() as i32 == parent_id);
+                    if let Some(thread) = thread {
+                        thread.push(node_id);
+                    } else {
+                        // If cannot find one, assign to a new thread
+                        current_stage.push(vec![node_id]);
+                    }
+                    node_stage[node_id as usize] = parent_stage;
                 }
             }
-
-            // Ensure the stages vector has enough stages
-            if stages.len() <= stage {
-                stages.push(Vec::new());
-            }
-
-            // Check if the node should start a new group or continue the last group in the stage
-            let mut new_group = true;
-            if let Some(last_group) = stages[stage].last_mut() {
-                let last_node = last_group.last().unwrap();
-                if let Some(children) = self.outlinks.get(&last_node.id) {
-                    if children.contains(&node_id) {
-                        last_group.push(node_map[&node_id].clone());
-                        new_group = false;
-                    }
-                }
-            }
-
-            // Create a new group if necessary
-            if new_group {
-                stages[stage].push(vec![node_map[&node_id].clone()]);
-            }
-
-            // Update the node to stage map
-            node_to_stage.insert(node_id, stage);
         }
 
         stages
@@ -198,40 +197,39 @@ mod tests {
 
     #[test]
     fn test_group_into_stages() {
+        // In this case we will use a most typical cell query statement
+        // (filter-shared-value
+        //    (id-cell-sel
+        //      (cell-id-query SCHEMA)
+        //     FIELDS)
+        //   FILTER)
+        // The DAG of this statement would be linear with 2 stages
+        // Stage 1: Query cell ids from the index
+        // Stage 2: Partition cell ids with consistent hash and then --
+        //          Get cells of the ids, then
+        //          Filter the cells
+        // There would be one thread in both stages
+        // Stage 2 would have 2 operations, which is 'id-cell-sel' and 'filter-shared-value'
         let mut dag = DAG::new();
-        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node3 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node4 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node5 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::CellIdQuery, Expr::nothing()).id;
+        let node1 = dag.push_node(NebSymbol::IdCellSel, Expr::nothing()).id;
+        let node2 = dag.push_node(NebSymbol::FilterSharedValue, Expr::nothing()).id;
 
         dag.link(node0, node1);
-        dag.link(node0, node2);
-        dag.link(node1, node3);
-        dag.link(node2, node3);
-        dag.link(node3, node4);
-        dag.link(node4, node5);
+        dag.link(node1, node2);
 
         let topo_sorted = dag.topological_sort().unwrap();
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(stages.len(), 5); // There should be 5 stages
+        assert_eq!(stages.len(), 2); // There should be 5 stages
 
         assert_eq!(stages[0].len(), 1);
-        assert_eq!(stages[0][0][0].id, 0);
+        assert_eq!(stages[0][0].len(), 1);
+        assert_eq!(stages[0][0][0], 0);
 
-        assert_eq!(stages[1].len(), 2);
-        assert_eq!(stages[1][0][0].id, 1);
-        assert_eq!(stages[1][1][0].id, 2);
-
-        assert_eq!(stages[2].len(), 1);
-        assert_eq!(stages[2][0][0].id, 3);
-
-        assert_eq!(stages[3].len(), 1);
-        assert_eq!(stages[3][0][0].id, 4);
-
-        assert_eq!(stages[4].len(), 1);
-        assert_eq!(stages[4][0][0].id, 5);
+        assert_eq!(stages[1].len(), 1, "Having stages {:?}", stages);
+        assert_eq!(stages[1][0].len(), 2);
+        assert_eq!(stages[1][0][0], 1);
+        assert_eq!(stages[1][0][1], 2);
     }
 }

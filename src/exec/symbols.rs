@@ -161,7 +161,11 @@ macro_rules! def_symbols {
                 $symbol = hash_ident!($sym_name),
             )*
         }
-
+        impl NebSymbol {
+            pub fn symbol_type(&self) -> SymbolType {
+                NEB_SYMBOL_OBJS.get(&(*self as u64)).unwrap().symbol_type()
+            }
+        }
         pub mod objs {
             use dovahkiin::expr::serde::Expr;
             use super::*;
@@ -182,6 +186,7 @@ macro_rules! def_symbols {
     };
 }
 
+#[derive(PartialEq, Eq)]
 pub enum SymbolType {
     Macro,
     Partitioning, // Partition, then compute
