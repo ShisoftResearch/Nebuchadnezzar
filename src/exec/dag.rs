@@ -130,9 +130,7 @@ impl DAG {
                     node_stage[node_id as usize] = next_stage;
                 } else {
                     // Add to old stage as where its parent in
-                    if parent_stage == -1 {
-                        
-                    }
+                    if parent_stage == -1 {}
                     let current_stage = &mut stages[parent_stage as usize];
                     // Search for the thread of its parent
                     let thread = current_stage
@@ -213,7 +211,9 @@ mod tests {
         let mut dag = DAG::new();
         let node0 = dag.push_node(NebSymbol::CellIdQuery, Expr::nothing()).id;
         let node1 = dag.push_node(NebSymbol::IdCellSel, Expr::nothing()).id;
-        let node2 = dag.push_node(NebSymbol::FilterSharedValue, Expr::nothing()).id;
+        let node2 = dag
+            .push_node(NebSymbol::FilterSharedValue, Expr::nothing())
+            .id;
 
         dag.link(node0, node1);
         dag.link(node1, node2);
