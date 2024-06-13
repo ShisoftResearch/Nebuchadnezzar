@@ -118,12 +118,10 @@ impl DAG {
                 if node.symbol.symbol_type() == SymbolType::Partitioning || parent_stage == -1 {
                     // New stage
                     let next_stage = parent_stage + 1;
-                    loop {
-                        if stages.len() as i32 <= next_stage {
-                            stages.push(vec![]);
-                        } else {
-                            break;
-                        }
+                    if stages.len() as i32 <= next_stage {
+                        // No need a loop to ensure the stage exists
+                        // The new stage will always be the next one
+                        stages.push(vec![]);
                     }
                     let current_stage = &mut stages[next_stage as usize];
                     current_stage.push(vec![node_id]);
@@ -221,7 +219,7 @@ mod tests {
         let topo_sorted = dag.topological_sort().unwrap();
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(stages.len(), 2); // There should be 5 stages
+        assert_eq!(stages.len(), 2); // There should be 2 stages
 
         assert_eq!(stages[0].len(), 1);
         assert_eq!(stages[0][0].len(), 1);
