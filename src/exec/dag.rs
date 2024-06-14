@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use super::symbols::*;
 
+pub type Stages = Vec<Vec<Vec<u32>>>;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
     id: u32,
@@ -16,7 +18,7 @@ pub struct Node {
     params: Expr,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DAG {
     nodes: Vec<Node>,
     outlinks: HashMap<u32, Vec<u32>>,
@@ -52,7 +54,7 @@ impl DAG {
         &self.inlinks[&id]
     }
 
-    pub fn topological_sort(&self) -> Result<Vec<u32>, String> {
+    pub fn topological_sort(&self) -> Vec<u32> {
         let mut in_degree: HashMap<u32, usize> = HashMap::new();
         let mut zero_in_degree_queue: VecDeque<u32> = VecDeque::new();
         let mut topo_sorted: Vec<u32> = Vec::new();
@@ -89,18 +91,18 @@ impl DAG {
                 }
             }
         }
-
-        //return Ok(topo_sorted);
-
         // Check if topological sort was successful
-        if topo_sorted.len() == self.nodes.len() {
-            Ok(topo_sorted)
-        } else {
-            Err("Graph has cycles, cannot perform topological sort".to_string())
-        }
+        assert_eq!(topo_sorted.len(), self.nodes.len());
+        
+        return topo_sorted;
     }
 
-    pub fn group_into_stages(&self, topo_sorted: Vec<u32>) -> Vec<Vec<Vec<u32>>> {
+    pub fn stages(&self) -> Stages {
+        let topo_sorted = self.topological_sort();
+        return self.group_into_stages(topo_sorted)
+    }
+
+    pub fn group_into_stages(&self, topo_sorted: Vec<u32>) -> Stages {
         let mut stages: Vec<Vec<Vec<u32>>> = Vec::new();
         let mut node_stage: Vec<i32> = vec![-1; self.nodes.len()];
 
