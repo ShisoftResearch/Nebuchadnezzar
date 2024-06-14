@@ -93,7 +93,7 @@ impl DAG {
         }
         // Check if topological sort was successful
         assert_eq!(topo_sorted.len(), self.nodes.len());
-        
+
         return topo_sorted;
     }
 
@@ -189,7 +189,7 @@ mod tests {
         dag.link(node3, node4);
         dag.link(node4, node5);
 
-        let topo_sorted = dag.topological_sort().unwrap();
+        let topo_sorted = dag.topological_sort();
         assert_eq!(topo_sorted, vec![0, 1, 2, 3, 4, 5]);
     }
 
@@ -218,7 +218,7 @@ mod tests {
         dag.link(node0, node1);
         dag.link(node1, node2);
 
-        let topo_sorted = dag.topological_sort().unwrap();
+        let topo_sorted = dag.topological_sort();
         let stages = dag.group_into_stages(topo_sorted);
 
         assert_eq!(stages.len(), 2); // There should be 2 stages
