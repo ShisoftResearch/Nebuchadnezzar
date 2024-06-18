@@ -4,18 +4,23 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use dovahkiin::expr::serde::Expr;
+use dovahkiin::{expr::{serde::Expr, symbols}, parser::lisp::ParserExpr};
+use dovahkiin::types::OwnedValue;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::symbols::*;
+use super::{query::{env::Environment, expand::Expand}, symbols::*};
 
 pub type Stages = Vec<Vec<Vec<u32>>>;
+
+// LocDo symbol is the bridge of two connected nodes but requires some processing
+const LOC_DO_SID: u64 = NebSymbol::LocalDo as _;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
     id: u32,
     symbol: NebSymbol,
-    params: Expr,
+    params: Vec<Expr>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -34,11 +39,11 @@ impl DAG {
         }
     }
 
-    pub fn push_node(&mut self, symbol: NebSymbol, params: Expr) -> &Node {
+    pub fn push_node(&mut self, symbol: NebSymbol, params: Vec<Expr>) -> &mut Node {
         let id = self.nodes.len() as u32;
         let node = Node { id, symbol, params };
         self.nodes.push(node.clone());
-        self.nodes.last().unwrap()
+        self.nodes.last_mut().unwrap()
     }
 
     pub fn link(&mut self, from: u32, to: u32) {
@@ -149,6 +154,72 @@ impl DAG {
 
         stages
     }
+
+    pub fn from_expr(expr: Expr, env: &mut Environment) -> Result<Self, String> {
+        let mut dag = Self::new();
+        let expr = expr.expand(env)?; // Expand first
+        let mut id_counter = 0;
+        dag.construct_from_expr(0, expr, &mut id_counter)?;
+        return Ok(dag);
+    }
+
+    fn construct_from_expr(&mut self, prev_id: u32, expr: Expr, id_counter: &mut u32) -> Result<Expr, String> {
+        match expr {
+            Expr::List(ele) => {
+                if ele.is_empty() {
+                    return Ok(Expr::List(ele));
+                }
+                let mut neb_symbol = None;
+                let mut has_symbol = false;
+                {
+                    let first_expr = &ele[0];
+                    if let Expr::Symbol(sym_id, _) = first_expr {
+                        neb_symbol = neb_id_symbol(*sym_id);
+                        has_symbol = true;
+                    }
+                }
+                if let Some(neb_sym) = neb_symbol {
+                    let node_id = {
+                        self.push_node(neb_sym, vec![]).id
+                    };
+                    self.link(prev_id, node_id);
+                    let params_opts = ele.into_iter()
+                        .skip(1)
+                        .map(|pexpr|{
+                            self.construct_from_expr(node_id, pexpr, id_counter)
+                        })
+                        .collect_vec();
+                    let mut params = Vec::with_capacity(params_opts.capacity());
+                    for popt in params_opts {
+                        params.push(popt?);
+                    }
+                    let node = &mut self.nodes[node_id as usize];
+                    node.params = params;
+                    return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
+                } else if has_symbol {
+                    // Other symbol, need to use loc-do
+                    let node_id = {
+                        self.push_node(NebSymbol::LocalDo as _, vec![]).id
+                    };
+                    self.link(prev_id, node_id);
+                    let params_opts = ele.into_iter()
+                        .map(|pexpr|{
+                            self.construct_from_expr(node_id, pexpr, id_counter)
+                        })
+                        .collect_vec();
+                    let mut params = Vec::with_capacity(params_opts.capacity());
+                    for popt in params_opts {
+                        params.push(popt?);
+                    }
+                    let node = &mut self.nodes[node_id as usize];
+                    node.params = params;
+                    return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
+                }
+                return Ok(Expr::List(ele));
+            }
+            _ => return Ok(expr)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -158,9 +229,9 @@ mod tests {
     #[test]
     fn test_add_nodes_and_edges() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node1 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node2 = dag.push_node(NebSymbol::All, vec![]).id;
 
         dag.link(node0, node1);
         dag.link(node1, node2);
@@ -175,12 +246,12 @@ mod tests {
     #[test]
     fn test_topological_sort() {
         let mut dag = DAG::new();
-        let node0 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node1 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node2 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node3 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node4 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
-        let node5 = dag.push_node(NebSymbol::All, Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node1 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node2 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node3 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node4 = dag.push_node(NebSymbol::All, vec![]).id;
+        let node5 = dag.push_node(NebSymbol::All, vec![]).id;
 
         dag.link(node0, node1);
         dag.link(node0, node2);
@@ -209,10 +280,10 @@ mod tests {
         // There would be one thread in both stages
         // Stage 2 would have 2 operations, which is 'id-cell-sel' and 'filter-shared-value'
         let mut dag = DAG::new();
-        let node0 = dag.push_node(NebSymbol::CellIdQuery, Expr::nothing()).id;
-        let node1 = dag.push_node(NebSymbol::IdCellSel, Expr::nothing()).id;
+        let node0 = dag.push_node(NebSymbol::CellIdQuery, vec![]).id;
+        let node1 = dag.push_node(NebSymbol::IdCellSel, vec![]).id;
         let node2 = dag
-            .push_node(NebSymbol::FilterSharedValue, Expr::nothing())
+            .push_node(NebSymbol::FilterSharedValue, vec![])
             .id;
 
         dag.link(node0, node1);

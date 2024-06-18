@@ -335,6 +335,9 @@ def_symbols! {
 
     //*** Macro ***/
     "select-cell" => SelectCell - [M],
+
+    // Preprocess of parameters not in the NebSymbol list
+    "loc-do" => LocalDo (Either(Dynamic) => Either(Anything)),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
