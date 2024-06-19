@@ -1,10 +1,11 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::collections::VecDeque;
 
 use bifrost::conshash::ConsistentHashing;
 use dovahkiin::{
     ahash::{HashMap, HashMapExt},
     expr::serde::Expr,
 };
+use lightning::aarc::Arc;
 
 pub struct Environment {
     binding: VecDeque<HashMap<u64, Expr>>,

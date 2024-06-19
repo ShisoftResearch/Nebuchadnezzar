@@ -1,6 +1,5 @@
-use std::sync::Arc;
-
 use bifrost::conshash::ConsistentHashing;
+use lightning::aarc::Arc;
 
 use super::Partitioner;
 
