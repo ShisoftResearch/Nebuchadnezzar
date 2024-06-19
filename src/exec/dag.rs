@@ -335,6 +335,29 @@ mod tests {
         let topo_sorted = dag.rev_topological_sort();
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(stages.len(), 2); // There should be 2 stages
+        assert_eq!(dag.nodes[0].symbol, NebSymbol::FilterSharedValue);
+        assert_eq!(dag.nodes[1].symbol, NebSymbol::Equal);
+        assert_eq!(dag.nodes[2].symbol, NebSymbol::IdCellSel);
+        assert_eq!(dag.nodes[3].symbol, NebSymbol::LocalDo);
+        assert_eq!(dag.nodes[4].symbol, NebSymbol::CellIdQuery);
+
+        assert_eq!(dag.nodes[0].id, 1);
+        assert_eq!(dag.nodes[1].id, 2);
+        assert_eq!(dag.nodes[2].id, 3);
+        assert_eq!(dag.nodes[3].id, 4);
+        assert_eq!(dag.nodes[4].id, 5);
+
+        // There should be 2 stages
+        assert_eq!(stages.len(), 2);
+        // First stage should have all leaves
+        assert_eq!(stages[0].len(), 3);
+        assert_eq!(stages[0][0].len(), 1);
+        assert_eq!(stages[0][1].len(), 1);
+        assert_eq!(stages[0][2].len(), 1);
+        assert_eq!(stages[0][0][0], 2);
+        assert_eq!(stages[0][1][0], 4);
+        assert_eq!(stages[0][2][0], 5);
+        assert_eq!(stages[1][0][0], 3);
+        assert_eq!(stages[1][0][1], 1);
     }
 }
