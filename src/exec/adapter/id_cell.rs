@@ -3,7 +3,7 @@ use crate::{
         partitioner::Partitioner,
         query::{
             env::Environment,
-            planner::{get_cell_partitioner, get_id_partition, Partitioning},
+            partitioning::{get_hash_partitioner, get_id_partition, Partitioning},
         },
         symbols,
     },
@@ -59,7 +59,7 @@ impl Partitioning for symbols::objs::IdCell {
         _expr: &Expr,
         env: &mut Environment,
     ) -> Result<Option<Box<dyn Partitioner>>, String> {
-        get_cell_partitioner(env)
+        get_hash_partitioner(env)
     }
 
     fn get_partition(

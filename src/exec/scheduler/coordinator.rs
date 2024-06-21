@@ -7,14 +7,14 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 
-use crate::exec::dag::DAG;
+use crate::exec::dag::{Thread, DAG};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Task {
     id: u64,
     stage_id: u64,
     data_partition: u64,
-    dag_thread: Vec<u32>
+    dag_thread: Thread
 }
 
 #[derive(Serialize, Deserialize, Debug)]

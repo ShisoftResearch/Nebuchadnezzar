@@ -11,10 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{query::{env::Environment, expand::Expand}, symbols::*};
 
-pub type Stages = Vec<Vec<Vec<u32>>>;
-
-// LocDo symbol is the bridge of two connected nodes but requires some processing
-const LOC_DO_SID: u64 = NebSymbol::LocalDo as _;
+pub type Stages = Vec<Vec<Thread>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Node {
@@ -28,6 +25,12 @@ pub struct DAG {
     nodes: Vec<Node>,
     outlinks: HashMap<u32, Vec<u32>>,
     inlinks: HashMap<u32, Vec<u32>>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Thread {
+    nodes: Vec<u32>,
+    partitioned: bool,
 }
 
 impl DAG {
@@ -118,7 +121,7 @@ impl DAG {
     }
 
     pub fn group_into_stages(&self, rev_topo_sorted: Vec<u32>) -> Stages {
-        let mut stages: Vec<Vec<Vec<u32>>> = Vec::new();
+        let mut stages: Stages = vec![vec![]];
         let mut node_stage: Vec<i32> = vec![-1; self.nodes.len() + 1];
 
         for &node_id in rev_topo_sorted.iter() {
@@ -130,33 +133,41 @@ impl DAG {
                         .max_by_key(|(_, stage)| *stage)
                         .unwrap()
                 })
-                .unwrap_or((-1, -1));
+                .unwrap_or((0, 0));
             if let Some(node) = self.get_node(node_id) {
-                if node.symbol.symbol_type() == SymbolType::Partitioning || dep_stage == -1 {
-                    // New stage
-                    let next_stage = dep_stage + 1;
-                    if stages.len() as i32 <= next_stage {
-                        // No need a loop to ensure the stage exists
-                        // The new stage will always be the next one
+                let current_stage = &mut stages[dep_stage as usize];
+                // Search for the thread of its parent
+                let thread = current_stage
+                    .iter_mut()
+                    .find(|th| *th.nodes.last().unwrap() as i32 == dep_id);
+                let is_partitioner = node.symbol.symbol_type() == SymbolType::Partitioning;
+                let mut need_new_stage = false;
+                if let Some(thread) = thread {
+                    let thread_partitioned = thread.partitioned;
+                    if thread_partitioned && is_partitioner {
+                        // Only move to next stage for this lineage when 
+                        // The thread already have a partitioner
+                        need_new_stage = true;
+                    } else {
+                        thread.nodes.push(node_id);
+                        thread.partitioned = thread_partitioned | is_partitioner;
+                    }
+                } else {
+                    // If cannot find one, assign to a new thread
+                    current_stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner });
+                }
+                if need_new_stage {
+                    let partition_id = dep_stage + 1;
+                    if stages.len() <= partition_id as _ {
+                        // Need to init a new tage
                         stages.push(vec![]);
                     }
-                    let current_stage = &mut stages[next_stage as usize];
-                    current_stage.push(vec![node_id]);
-                    node_stage[node_id as usize] = next_stage;
+                    let stage = &mut stages[partition_id as usize];
+                    stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner });
+                    // Mark this node in the next stage of its predessor
+                    node_stage[node_id as usize] = partition_id;
                 } else {
-                    // Add to old stage as where its parent in
-                    if dep_stage == -1 {}
-                    let current_stage = &mut stages[dep_stage as usize];
-                    // Search for the thread of its parent
-                    let thread = current_stage
-                        .iter_mut()
-                        .find(|th| *th.last().unwrap() as i32 == dep_id);
-                    if let Some(thread) = thread {
-                        thread.push(node_id);
-                    } else {
-                        // If cannot find one, assign to a new thread
-                        current_stage.push(vec![node_id]);
-                    }
+                    // Mark this node in the same stage as its predessor
                     node_stage[node_id as usize] = dep_stage;
                 }
             }
@@ -314,16 +325,13 @@ mod tests {
         let topo_sorted = dag.rev_topological_sort();
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(stages.len(), 2); // There should be 2 stages
+        assert_eq!(stages.len(), 1); // There should be 1 stage
 
         assert_eq!(stages[0].len(), 1);
-        assert_eq!(stages[0][0].len(), 1);
-        assert_eq!(stages[0][0][0], 3);
-
-        assert_eq!(stages[1].len(), 1, "Having stages {:?}", stages);
-        assert_eq!(stages[1][0].len(), 2);
-        assert_eq!(stages[1][0][0], 2);
-        assert_eq!(stages[1][0][1], 1);
+        assert_eq!(stages[0][0].nodes.len(), 3);
+        assert_eq!(stages[0][0].nodes[0], 3);
+        assert_eq!(stages[0][0].nodes[1], 2);
+        assert_eq!(stages[0][0].nodes[2], 1);
     }
 
     #[test]
@@ -351,13 +359,13 @@ mod tests {
         assert_eq!(stages.len(), 2);
         // First stage should have all leaves
         assert_eq!(stages[0].len(), 3);
-        assert_eq!(stages[0][0].len(), 1);
-        assert_eq!(stages[0][1].len(), 1);
-        assert_eq!(stages[0][2].len(), 1);
-        assert_eq!(stages[0][0][0], 2);
-        assert_eq!(stages[0][1][0], 4);
-        assert_eq!(stages[0][2][0], 5);
-        assert_eq!(stages[1][0][0], 3);
-        assert_eq!(stages[1][0][1], 1);
+        assert_eq!(stages[0][0].nodes.len(), 1);
+        assert_eq!(stages[0][1].nodes.len(), 1);
+        assert_eq!(stages[0][2].nodes.len(), 1);
+        assert_eq!(stages[0][0].nodes[0], 2);
+        assert_eq!(stages[0][1].nodes[0], 4);
+        assert_eq!(stages[0][2].nodes[0], 5);
+        assert_eq!(stages[1][0].nodes[0], 3);
+        assert_eq!(stages[1][0].nodes[1], 1);
     }
 }

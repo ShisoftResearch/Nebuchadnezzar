@@ -40,8 +40,11 @@ impl<'a> Iterator for ProcSharedValue<'a> {
             if let Some(c) = self.iter.next() {
                 let processor = self.proc.clone();
                 self.interpreter.clear();
-                self.interpreter.bind("data", SExpr::shared_value(c));
+                unsafe {
+                    self.interpreter.unsafe_set_global_val(&c);
+                }
                 let res = processor.eval(self.interpreter.get_env());
+                self.interpreter.unset_global_val();
                 match res {
                     Ok(expr) => {
                         let expr_res = expr.into_val();
@@ -98,8 +101,11 @@ impl<'a> Iterator for ProcOwnedValue<'a> {
             if let Some(c) = self.iter.next() {
                 let processor = self.proc.clone();
                 self.interpreter.clear();
-                self.interpreter.bind("data", SExpr::owned_value(c));
+                unsafe {
+                    self.interpreter.unsafe_set_global_val(&c.shared());
+                };
                 let res = processor.eval(self.interpreter.get_env());
+                self.interpreter.unset_global_val();
                 match res {
                     Ok(expr) => {
                         let expr_res = expr.into_val();

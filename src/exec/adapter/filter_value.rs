@@ -42,9 +42,11 @@ impl<'a> Iterator for FilterSharedValue<'a> {
             if let Some(c) = self.iter.next() {
                 let filter = self.filter.clone();
                 self.interpreter.clear();
-                self.interpreter
-                    .bind("data", SExpr::shared_value(c.clone()));
+                unsafe {
+                    self.interpreter.unsafe_set_global_val(&c);
+                }
                 let res = filter.eval(self.interpreter.get_env());
+                self.interpreter.unset_global_val(); // Don't need
                 match res {
                     Ok(expr) => {
                         let expr_res = expr.into_val();
@@ -108,8 +110,11 @@ impl<'a> Iterator for FilterOwnedValue<'a> {
             if let Some(c) = self.iter.next() {
                 let filter = self.filter.clone();
                 self.interpreter.clear();
-                self.interpreter.bind("data", SExpr::owned_value(c));
+                unsafe {
+                    self.interpreter.unsafe_set_global_val(&c.shared());
+                }
                 let res = filter.eval(self.interpreter.get_env());
+                self.interpreter.unset_global_val();
                 match res {
                     Ok(expr) => {
                         let expr_res = expr.into_val();
@@ -124,7 +129,7 @@ impl<'a> Iterator for FilterOwnedValue<'a> {
                             _ => true,
                         };
                         if eval {
-                            return self.interpreter.unbind("data").unwrap().owned_val();
+                            return Some(c);
                         }
                     }
                     Err(s) => {

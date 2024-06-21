@@ -9,7 +9,7 @@ use dovahkiin::expr::symbols::SysSymbol as DovSymbol;
 use super::partitioner::Partitioner;
 use super::query::env::Environment;
 use super::query::expand::Macro;
-use crate::exec::query::planner::Partitioning;
+use crate::exec::query::partitioning::Partitioning;
 
 macro_rules! macro_impl {
     ($symbol:ident) => {

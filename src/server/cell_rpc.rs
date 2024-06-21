@@ -1,3 +1,4 @@
+use crate::ram::cell::Cell;
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
@@ -99,27 +100,18 @@ impl Service for NebRPCService {
                 .collect_vec()
         };
         if (!filter_empty) | (!proc_empty) {
-            let mut interpreters = Vec::with_capacity(cells.capacity());
-            cells.iter().for_each(|cell_res| {
-                interpreters.push(cell_res.as_ref().ok().map(|cell| {
-                    let mut interpreter = lisp::get_interpreter();
-                    if let &SharedValue::Map(ref map) = &cell.data {
-                        for (id, val) in &map.map {
-                            interpreter.bind_by_id(*id, SExpr::shared_value(val.clone()));
-                        }
-                    }
-                    interpreter.bind("data", SExpr::shared_value(cell.data.clone()));
-                    interpreter
-                }))
-            });
+            let mut interpreter = lisp::get_interpreter();
+            let filter = filter.clone().to_sexpr();
             if !filter_empty {
                 cells = cells
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, cell_res)| {
+                    .map(|cell_res| {
                         cell_res.and_then(|cell| {
-                            let exec = interpreters[i].as_mut().unwrap();
-                            let check_res = filter.clone().to_sexpr().eval(exec.get_env());
+                            unsafe {
+                                interpreter.unsafe_set_global_val(&cell.data);
+                            }
+                            let check_res = filter.clone().eval(interpreter.get_env());
+                            interpreter.unset_global_val();
                             match check_res {
                                 Ok(sexp) => {
                                     if is_true(&sexp) {
@@ -135,13 +127,16 @@ impl Service for NebRPCService {
                     .collect();
             }
             if !proc_empty {
+                let proc = proc.clone().to_sexpr();
                 let cells = cells
                     .into_iter()
-                    .enumerate()
-                    .map(|(i, cell_res)| {
-                        let exec = interpreters[i].as_mut().unwrap();
+                    .map(|cell_res| {
                         cell_res.and_then(|cell| {
-                            let proc_res = proc.clone().to_sexpr().eval(exec.get_env());
+                            unsafe {
+                                interpreter.unsafe_set_global_val(&cell.data);
+                            }
+                            let proc_res = proc.clone().eval(interpreter.get_env());
+                            interpreter.unset_global_val();
                             match proc_res {
                                 Ok(sexp) => {
                                     let val = sexp.owned_val().unwrap_or(OwnedValue::NA);
