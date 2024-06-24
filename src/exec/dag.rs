@@ -325,7 +325,8 @@ mod tests {
         let topo_sorted = dag.rev_topological_sort();
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(stages.len(), 1); // There should be 1 stage
+        // There should be 1 stages, cuz there is only one partition function
+        assert_eq!(stages.len(), 1);
 
         assert_eq!(stages[0].len(), 1);
         assert_eq!(stages[0][0].nodes.len(), 3);
@@ -355,17 +356,17 @@ mod tests {
         assert_eq!(dag.nodes[3].id, 4);
         assert_eq!(dag.nodes[4].id, 5);
 
-        // There should be 2 stages
-        assert_eq!(stages.len(), 2);
+        // There should be 1 stages, cuz there is only one partition function
+        assert_eq!(stages.len(), 1);
         // First stage should have all leaves
         assert_eq!(stages[0].len(), 3);
         assert_eq!(stages[0][0].nodes.len(), 1);
         assert_eq!(stages[0][1].nodes.len(), 1);
-        assert_eq!(stages[0][2].nodes.len(), 1);
+        assert_eq!(stages[0][2].nodes.len(), 3);
         assert_eq!(stages[0][0].nodes[0], 2);
         assert_eq!(stages[0][1].nodes[0], 4);
         assert_eq!(stages[0][2].nodes[0], 5);
-        assert_eq!(stages[1][0].nodes[0], 3);
-        assert_eq!(stages[1][0].nodes[1], 1);
+        assert_eq!(stages[0][2].nodes[1], 3);
+        assert_eq!(stages[0][2].nodes[2], 1);
     }
 }
