@@ -2,7 +2,7 @@
 // It can be used on local execution and distributed execution
 // depends on the model
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use dovahkiin::{expr::{serde::Expr, symbols}, parser::lisp::ParserExpr};
 use dovahkiin::types::OwnedValue;
@@ -29,8 +29,9 @@ pub struct DAG {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Thread {
-    nodes: Vec<u32>,
+    id: u32,
     partitioned: bool,
+    nodes: Vec<u32>,
 }
 
 impl DAG {
@@ -71,7 +72,7 @@ impl DAG {
     }
 
     pub fn rev_topological_sort(&self) -> Vec<u32> {
-        let mut out_degree: HashMap<u32, usize> = HashMap::new();
+        let mut out_degree: BTreeMap<u32, usize> = BTreeMap::new();
         let mut zero_out_degree_queue: VecDeque<u32> = VecDeque::new();
         let mut topo_sorted: Vec<u32> = Vec::new();
 
@@ -136,6 +137,7 @@ impl DAG {
                 .unwrap_or((0, 0));
             if let Some(node) = self.get_node(node_id) {
                 let current_stage = &mut stages[dep_stage as usize];
+                let num_threads = current_stage.len() as u32;
                 // Search for the thread of its parent
                 let thread = current_stage
                     .iter_mut()
@@ -154,7 +156,7 @@ impl DAG {
                     }
                 } else {
                     // If cannot find one, assign to a new thread
-                    current_stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner });
+                    current_stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner, id: num_threads });
                 }
                 if need_new_stage {
                     let partition_id = dep_stage + 1;
@@ -163,7 +165,7 @@ impl DAG {
                         stages.push(vec![]);
                     }
                     let stage = &mut stages[partition_id as usize];
-                    stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner });
+                    stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner, id: num_threads });
                     // Mark this node in the next stage of its predessor
                     node_stage[node_id as usize] = partition_id;
                 } else {
@@ -342,6 +344,8 @@ mod tests {
         let mut env = Environment::new(Arc::null());
         let dag = DAG::from_exprs(exprs, &mut env).unwrap();
         let topo_sorted = dag.rev_topological_sort();
+        assert_eq!(topo_sorted, vec![2, 4, 5, 3, 1]);
+
         let stages = dag.group_into_stages(topo_sorted);
 
         assert_eq!(dag.nodes[0].symbol, NebSymbol::FilterSharedValue);
@@ -361,8 +365,11 @@ mod tests {
         // First stage should have all leaves
         assert_eq!(stages[0].len(), 3);
         assert_eq!(stages[0][0].nodes.len(), 1);
+        assert!(!stages[0][0].partitioned);
         assert_eq!(stages[0][1].nodes.len(), 1);
+        assert!(!stages[0][1].partitioned);
         assert_eq!(stages[0][2].nodes.len(), 3);
+        assert!(stages[0][2].partitioned);
         assert_eq!(stages[0][0].nodes[0], 2);
         assert_eq!(stages[0][1].nodes[0], 4);
         assert_eq!(stages[0][2].nodes[0], 5);
