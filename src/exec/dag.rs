@@ -31,6 +31,7 @@ pub struct DAG {
 pub struct Thread {
     id: u32,
     partitioned: bool,
+    remote_src: bool,
     nodes: Vec<u32>,
 }
 
@@ -156,7 +157,12 @@ impl DAG {
                     }
                 } else {
                     // If cannot find one, assign to a new thread
-                    current_stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner, id: num_threads });
+                    current_stage.push(Thread { 
+                        nodes: vec![node_id], 
+                        partitioned: is_partitioner, 
+                        remote_src: dep_stage != 0,
+                        id: num_threads 
+                    });
                 }
                 if need_new_stage {
                     let partition_id = dep_stage + 1;
@@ -165,7 +171,12 @@ impl DAG {
                         stages.push(vec![]);
                     }
                     let stage = &mut stages[partition_id as usize];
-                    stage.push(Thread { nodes: vec![node_id], partitioned: is_partitioner, id: num_threads });
+                    stage.push(Thread { 
+                        nodes: vec![node_id], 
+                        partitioned: is_partitioner, 
+                        remote_src: true,
+                        id: num_threads 
+                    });
                     // Mark this node in the next stage of its predessor
                     node_stage[node_id as usize] = partition_id;
                 } else {
@@ -338,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn test_construct_from_expr() {
+    fn test_construct_from_expr_single_stage() {
         let str_expr = "(filter-shared-value  (= 1u32 :a) (id-cell-sel (rev [:a :b :c]) (cell-id-query 1u32)))";
         let exprs = parse_to_serde_expr(str_expr).unwrap();
         let mut env = Environment::new(Arc::null());
