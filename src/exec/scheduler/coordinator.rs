@@ -14,7 +14,7 @@ struct Task {
     id: u64,
     stage_id: u64,
     data_partition: u64,
-    dag_thread: Thread
+    dag_thread: Thread,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -27,7 +27,7 @@ struct Stage {
 struct Job {
     id: u64,
     stages: Vec<Stage>,
-    dag: DAG
+    dag: DAG,
 }
 
 struct Coordinator {
@@ -51,24 +51,22 @@ impl Coordinator {
                             id: task_id as _,
                             stage_id: stage_id as _,
                             dag_thread: task,
-                            data_partition: 0 // unassigned
+                            data_partition: 0, // unassigned
                         }
                     })
                     .collect_vec();
-                Stage{
+                Stage {
                     id: stage_id as _,
-                    tasks
-                }  
+                    tasks,
+                }
             })
             .collect_vec();
         let job = Job {
             id: job_id,
             stages,
-            dag
+            dag,
         };
         self.jobs.insert(job_id, Arc::new(job));
         return job_id;
     }
-
-    
 }

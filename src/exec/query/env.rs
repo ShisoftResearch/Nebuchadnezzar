@@ -13,12 +13,16 @@ pub struct Environment<'a> {
     chash: Arc<ConsistentHashing>,
 }
 
-impl <'a> Environment<'a> {
+impl<'a> Environment<'a> {
     pub fn new(chash: Arc<ConsistentHashing>) -> Self {
         let mut binding = VecDeque::new();
         let interpreter = Interpreter::new();
         binding.push_front(HashMap::new());
-        return Self { binding, chash, interpreter };
+        return Self {
+            binding,
+            chash,
+            interpreter,
+        };
     }
     pub fn set_binding(&mut self, sym_id: u64, expr: Expr) {
         self.binding.front_mut().unwrap().insert(sym_id, expr);
@@ -37,5 +41,5 @@ impl <'a> Environment<'a> {
     }
     pub fn get_interpreter(&mut self) -> &mut Interpreter<'a> {
         &mut self.interpreter
-    } 
+    }
 }

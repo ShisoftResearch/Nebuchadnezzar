@@ -4,12 +4,18 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use dovahkiin::{expr::{serde::Expr, symbols}, parser::lisp::ParserExpr};
 use dovahkiin::types::OwnedValue;
+use dovahkiin::{
+    expr::{serde::Expr, symbols},
+    parser::lisp::ParserExpr,
+};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::{query::{env::Environment, expand::Expand}, symbols::*};
+use super::{
+    query::{env::Environment, expand::Expand},
+    symbols::*,
+};
 
 pub type Stages = Vec<Vec<Thread>>;
 
@@ -116,10 +122,9 @@ impl DAG {
         return topo_sorted;
     }
 
-
     pub fn stages(&self) -> Stages {
         let topo_sorted = self.rev_topological_sort();
-        return self.group_into_stages(topo_sorted)
+        return self.group_into_stages(topo_sorted);
     }
 
     pub fn group_into_stages(&self, rev_topo_sorted: Vec<u32>) -> Stages {
@@ -148,7 +153,7 @@ impl DAG {
                 if let Some(thread) = thread {
                     let thread_partitioned = thread.partitioned;
                     if thread_partitioned && is_partitioner {
-                        // Only move to next stage for this lineage when 
+                        // Only move to next stage for this lineage when
                         // The thread already have a partitioner
                         need_new_stage = true;
                     } else {
@@ -157,11 +162,11 @@ impl DAG {
                     }
                 } else {
                     // If cannot find one, assign to a new thread
-                    current_stage.push(Thread { 
-                        nodes: vec![node_id], 
-                        partitioned: is_partitioner, 
+                    current_stage.push(Thread {
+                        nodes: vec![node_id],
+                        partitioned: is_partitioner,
                         remote_src: dep_stage != 0,
-                        id: num_threads 
+                        id: num_threads,
                     });
                 }
                 if need_new_stage {
@@ -171,11 +176,11 @@ impl DAG {
                         stages.push(vec![]);
                     }
                     let stage = &mut stages[partition_id as usize];
-                    stage.push(Thread { 
-                        nodes: vec![node_id], 
-                        partitioned: is_partitioner, 
+                    stage.push(Thread {
+                        nodes: vec![node_id],
+                        partitioned: is_partitioner,
                         remote_src: true,
-                        id: num_threads 
+                        id: num_threads,
                     });
                     // Mark this node in the next stage of its predessor
                     node_stage[node_id as usize] = partition_id;
@@ -199,7 +204,12 @@ impl DAG {
         return Ok(dag);
     }
 
-    fn construct_from_expr(&mut self, prev_id: u32, expr: Expr, id_counter: &mut u32) -> Result<Expr, String> {
+    fn construct_from_expr(
+        &mut self,
+        prev_id: u32,
+        expr: Expr,
+        id_counter: &mut u32,
+    ) -> Result<Expr, String> {
         match expr {
             Expr::List(ele) => {
                 if ele.is_empty() {
@@ -215,17 +225,14 @@ impl DAG {
                     }
                 }
                 if let Some(neb_sym) = neb_symbol {
-                    let node_id = {
-                        self.push_node(neb_sym, vec![]).id
-                    };
+                    let node_id = { self.push_node(neb_sym, vec![]).id };
                     if prev_id > 0 {
                         self.link(prev_id, node_id);
                     }
-                    let params_opts = ele.into_iter()
+                    let params_opts = ele
+                        .into_iter()
                         .skip(1)
-                        .map(|pexpr|{
-                            self.construct_from_expr(node_id, pexpr, id_counter)
-                        })
+                        .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
                         .collect_vec();
                     let mut params = Vec::with_capacity(params_opts.capacity());
                     for popt in params_opts {
@@ -236,16 +243,13 @@ impl DAG {
                     return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
                 } else if has_symbol {
                     // Other symbol, need to use loc-do
-                    let node_id = {
-                        self.push_node(NebSymbol::LocalDo as _, vec![]).id
-                    };
+                    let node_id = { self.push_node(NebSymbol::LocalDo as _, vec![]).id };
                     if prev_id > 0 {
                         self.link(prev_id, node_id);
                     }
-                    let params_opts = ele.into_iter()
-                        .map(|pexpr|{
-                            self.construct_from_expr(node_id, pexpr, id_counter)
-                        })
+                    let params_opts = ele
+                        .into_iter()
+                        .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
                         .collect_vec();
                     let mut params = Vec::with_capacity(params_opts.capacity());
                     for popt in params_opts {
@@ -257,7 +261,7 @@ impl DAG {
                 }
                 return Ok(Expr::List(ele));
             }
-            _ => return Ok(expr)
+            _ => return Ok(expr),
         }
     }
 }
@@ -328,9 +332,7 @@ mod tests {
         let mut dag = DAG::new();
         let node1 = dag.push_node(NebSymbol::CellIdQuery, vec![]).id;
         let node2 = dag.push_node(NebSymbol::IdCellSel, vec![]).id;
-        let node3 = dag
-            .push_node(NebSymbol::FilterSharedValue, vec![])
-            .id;
+        let node3 = dag.push_node(NebSymbol::FilterSharedValue, vec![]).id;
 
         dag.link(node1, node2);
         dag.link(node2, node3);
@@ -350,6 +352,46 @@ mod tests {
 
     #[test]
     fn test_construct_from_expr_single_stage() {
+        let str_expr = "(filter-shared-value  (= 1u32 :a) (id-cell-sel (rev [:a :b :c]) (cell-id-query 1u32)))";
+        let exprs = parse_to_serde_expr(str_expr).unwrap();
+        let mut env = Environment::new(Arc::null());
+        let dag = DAG::from_exprs(exprs, &mut env).unwrap();
+        let topo_sorted = dag.rev_topological_sort();
+        assert_eq!(topo_sorted, vec![2, 4, 5, 3, 1]);
+
+        let stages = dag.group_into_stages(topo_sorted);
+
+        assert_eq!(dag.nodes[0].symbol, NebSymbol::FilterSharedValue);
+        assert_eq!(dag.nodes[1].symbol, NebSymbol::Equal);
+        assert_eq!(dag.nodes[2].symbol, NebSymbol::IdCellSel);
+        assert_eq!(dag.nodes[3].symbol, NebSymbol::LocalDo);
+        assert_eq!(dag.nodes[4].symbol, NebSymbol::CellIdQuery);
+
+        assert_eq!(dag.nodes[0].id, 1);
+        assert_eq!(dag.nodes[1].id, 2);
+        assert_eq!(dag.nodes[2].id, 3);
+        assert_eq!(dag.nodes[3].id, 4);
+        assert_eq!(dag.nodes[4].id, 5);
+
+        // There should be 1 stages, cuz there is only one partition function
+        assert_eq!(stages.len(), 1);
+        // First stage should have all leaves
+        assert_eq!(stages[0].len(), 3);
+        assert_eq!(stages[0][0].nodes.len(), 1);
+        assert!(!stages[0][0].partitioned);
+        assert_eq!(stages[0][1].nodes.len(), 1);
+        assert!(!stages[0][1].partitioned);
+        assert_eq!(stages[0][2].nodes.len(), 3);
+        assert!(stages[0][2].partitioned);
+        assert_eq!(stages[0][0].nodes[0], 2);
+        assert_eq!(stages[0][1].nodes[0], 4);
+        assert_eq!(stages[0][2].nodes[0], 5);
+        assert_eq!(stages[0][2].nodes[1], 3);
+        assert_eq!(stages[0][2].nodes[2], 1);
+    }
+
+    #[test]
+    fn test_construct_from_expr_mult_stage() {
         let str_expr = "(filter-shared-value  (= 1u32 :a) (id-cell-sel (rev [:a :b :c]) (cell-id-query 1u32)))";
         let exprs = parse_to_serde_expr(str_expr).unwrap();
         let mut env = Environment::new(Arc::null());

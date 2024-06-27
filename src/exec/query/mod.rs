@@ -8,5 +8,5 @@
 
 pub mod env;
 pub mod expand;
-pub mod planner;
 pub mod partitioning;
+pub mod planner;

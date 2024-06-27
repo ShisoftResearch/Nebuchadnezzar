@@ -18,3 +18,5 @@ pub mod partitioner;
 pub mod scheduler;
 
 pub mod query;
+
+pub mod sort;

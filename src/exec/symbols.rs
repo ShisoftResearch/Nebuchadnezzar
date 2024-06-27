@@ -290,9 +290,9 @@ def_symbols! {
     "limit" => Limit (Stream(Dynamic) => Stream(Dynamic)),
 
     //***** WIDE *****//
-    // "sort-by" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "sort-by-asc" => SortByASC (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "sort-by-desc" => SortByDESC (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    // "sort" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    "sort-by-asc" => SortByASC (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    "sort-by-desc" => SortByDESC (Stream(SharedValue) => Stream(SharedValue)) - [P],
     // "group-by" => GroupBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
     // "join" => Join (Stream(SharedValue) => Stream(SharedValue)) - [P],
     // "full-join" => FullJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],

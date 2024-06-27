@@ -1,9 +1,10 @@
-use crossbeam_epoch::Shared;
-use dovahkiin::{expr::serde::Expr, types::{Id, SharedValue}};
+use dovahkiin::{
+    expr::serde::Expr,
+    types::Id,
+};
 
 use crate::exec::{
     partitioner::{hash, Partitioner},
-    symbols::objs::{IdCell, IdCellSel},
 };
 
 use super::env::Environment;
@@ -34,10 +35,3 @@ pub fn get_id_partition(data_ptr: *mut (), partitioner: &Box<dyn Partitioner>) -
     let key = id.higher;
     partitioner.partition(key)
 }
-
-pub fn get_shared_value_partition(data_ptr: *mut (), cond: &Expr, partitioner: &Box<dyn Partitioner>, env: &mut Environment) -> Option<u64> {
-    let value = unsafe { &*(data_ptr as *mut SharedValue) };
-    env.get_interpreter().set_global_val(value);
-    unimplemented!()
-}
-

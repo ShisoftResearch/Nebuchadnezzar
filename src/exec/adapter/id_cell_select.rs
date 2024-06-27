@@ -4,8 +4,7 @@ use crate::{
         query::{
             env::Environment,
             partitioning::{get_hash_partitioner, get_id_partition, Partitioning},
-        },
-        symbols::{self, objs::IdCellSel},
+        }, symbols,
     },
     ram::{cell::SharedCell, chunk::Chunks},
 };
