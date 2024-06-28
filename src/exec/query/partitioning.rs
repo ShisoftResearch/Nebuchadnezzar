@@ -3,9 +3,7 @@ use dovahkiin::{
     types::Id,
 };
 
-use crate::exec::{
-    partitioner::{hash, Partitioner},
-};
+use crate::exec::partitioner::{hash, Partitioner};
 
 use super::env::Environment;
 

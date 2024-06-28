@@ -4,14 +4,12 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use dovahkiin::types::OwnedValue;
-use dovahkiin::{
-    expr::{serde::Expr, symbols},
-    parser::lisp::ParserExpr,
-};
+use dovahkiin::{expr, types::OwnedValue};
+use dovahkiin::expr::serde::Expr;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
+use super::query::partitioning;
 use super::{
     query::{env::Environment, expand::Expand},
     symbols::*,
@@ -39,6 +37,29 @@ pub struct Thread {
     partitioned: bool,
     remote_src: bool,
     nodes: Vec<u32>,
+}
+
+struct ConstructRT {
+    expr: Expr,
+    staged: bool        
+}
+
+impl ConstructRT {
+    pub fn new(expr: Expr) -> Self {
+        Self {
+            expr, staged: false
+        }
+    }
+    pub fn staged(expr: Expr) -> Self {
+        Self {
+            expr, staged: true
+        }
+    }
+    pub fn with_staged(expr: Expr, staged: bool) -> Self {
+        Self {
+            expr, staged
+        }
+    }
 }
 
 impl DAG {
@@ -202,18 +223,18 @@ impl DAG {
             dag.construct_from_expr(0, expr, &mut id_counter)?;
         }
         return Ok(dag);
-    }
+    } 
 
     fn construct_from_expr(
         &mut self,
         prev_id: u32,
         expr: Expr,
         id_counter: &mut u32,
-    ) -> Result<Expr, String> {
+    ) -> Result<ConstructRT, String> {
         match expr {
             Expr::List(ele) => {
                 if ele.is_empty() {
-                    return Ok(Expr::List(ele));
+                    return Ok(ConstructRT::new(Expr::List(ele)));
                 }
                 let mut neb_symbol = None;
                 let mut has_symbol = false;
@@ -225,6 +246,7 @@ impl DAG {
                     }
                 }
                 if let Some(neb_sym) = neb_symbol {
+                    let mut is_partitioning = neb_sym.symbol_type() == SymbolType::Partitioning;
                     let node_id = { self.push_node(neb_sym, vec![]).id };
                     if prev_id > 0 {
                         self.link(prev_id, node_id);
@@ -236,11 +258,13 @@ impl DAG {
                         .collect_vec();
                     let mut params = Vec::with_capacity(params_opts.capacity());
                     for popt in params_opts {
-                        params.push(popt?);
+                        let construct_rt = popt?;
+                        is_partitioning |= construct_rt.staged;
+                        params.push(construct_rt.expr);
                     }
                     let node = self.get_node_mut(node_id).unwrap();
                     node.params = params;
-                    return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
+                    return Ok(ConstructRT::with_staged(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))), is_partitioning));
                 } else if has_symbol {
                     // Other symbol, need to use loc-do
                     let node_id = { self.push_node(NebSymbol::LocalDo as _, vec![]).id };
@@ -252,16 +276,19 @@ impl DAG {
                         .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
                         .collect_vec();
                     let mut params = Vec::with_capacity(params_opts.capacity());
+                    let mut partitioning = false;
                     for popt in params_opts {
-                        params.push(popt?);
+                        let construct_rt = popt?;
+                        partitioning |= construct_rt.staged;
+                        params.push(construct_rt.expr);
                     }
                     let node = self.get_node_mut(node_id).unwrap();
                     node.params = params;
-                    return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
+                    return Ok(ConstructRT::with_staged(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))), partitioning));
                 }
-                return Ok(Expr::List(ele));
+                return Ok(ConstructRT::new(Expr::List(ele)));
             }
-            _ => return Ok(expr),
+            _ => return Ok(ConstructRT::new(expr)),
         }
     }
 }
@@ -392,12 +419,12 @@ mod tests {
 
     #[test]
     fn test_construct_from_expr_mult_stage() {
-        let str_expr = "(filter-shared-value  (= 1u32 :a) (id-cell-sel (rev [:a :b :c]) (cell-id-query 1u32)))";
+        let str_expr = "(sort-by-asc (+ 3u32 data-field) (filter-shared-value  (= 2u32 :a) (id-cell-sel (rev [:a :b :c]) (cell-id-query 1u32))))";
         let exprs = parse_to_serde_expr(str_expr).unwrap();
         let mut env = Environment::new(Arc::null());
         let dag = DAG::from_exprs(exprs, &mut env).unwrap();
         let topo_sorted = dag.rev_topological_sort();
-        assert_eq!(topo_sorted, vec![2, 4, 5, 3, 1]);
+        assert_eq!(topo_sorted, vec![2, 4, 6, 7, 5, 3, 1]);
 
         let stages = dag.group_into_stages(topo_sorted);
 
