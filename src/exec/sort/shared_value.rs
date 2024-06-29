@@ -3,7 +3,14 @@ use dovahkiin::{
     types::SharedValue,
 };
 
-use crate::exec::{partitioner::{self, range, Partitioner}, query::{env::Environment, partitioning::{get_hash_partitioner, Partitioning}}, symbols};
+use crate::exec::{
+    partitioner::{self, range, Partitioner},
+    query::{
+        env::Environment,
+        partitioning::{get_hash_partitioner, Partitioning},
+    },
+    symbols,
+};
 
 use super::Sort;
 
@@ -19,7 +26,11 @@ pub struct SortBySharedValueDESC<'a> {
     expr: SExpr<'a>,
 }
 
-fn extract_shared_value<'a>(exec: &mut Interpreter<'a>, expr: &SExpr<'a>, x: SharedValue<'a>) -> Result<i64, String> {
+fn extract_shared_value<'a>(
+    exec: &mut Interpreter<'a>,
+    expr: &SExpr<'a>,
+    x: SharedValue<'a>,
+) -> Result<i64, String> {
     unsafe {
         exec.unsafe_set_global_val(&x);
     }
@@ -53,13 +64,18 @@ impl<'a> Sort<SharedValue<'a>> for SortBySharedValueDESC<'a> {
 }
 
 // Due to complexity, we are going to use hash partition on higher bits for now
-// The information for range partition exists in statistics and histogram but 
+// The information for range partition exists in statistics and histogram but
 // making use of them is less flexiable with filtering
-pub fn get_sorting_partitioner(env: &mut Environment) -> Result<Option<Box<dyn Partitioner>>, String> {
+pub fn get_sorting_partitioner(
+    env: &mut Environment,
+) -> Result<Option<Box<dyn Partitioner>>, String> {
     get_hash_partitioner(env)
 }
 
-pub fn get_sorting_partition(data_ptr: *mut (), partitioner: &Box<dyn crate::exec::partitioner::Partitioner>) -> Option<u64> {
+pub fn get_sorting_partition(
+    data_ptr: *mut (),
+    partitioner: &Box<dyn crate::exec::partitioner::Partitioner>,
+) -> Option<u64> {
     let (key, _) = unsafe { &*(data_ptr as *mut SortKeyValuePair) };
     partitioner.partition(*key as u64 >> 4)
 }

@@ -21,7 +21,7 @@ pub struct Procedure {
     symbol: NebSymbol,
     params: Vec<ProcParam>,
 }
-                                                                                                                                
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ProcParam {
     Expr(Expr),

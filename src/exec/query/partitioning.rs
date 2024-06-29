@@ -1,7 +1,4 @@
-use dovahkiin::{
-    expr::serde::Expr,
-    types::Id,
-};
+use dovahkiin::{expr::serde::Expr, types::Id};
 
 use crate::exec::partitioner::{hash, Partitioner};
 

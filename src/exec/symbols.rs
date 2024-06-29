@@ -215,7 +215,7 @@ pub enum SymbolType {
     Partitioning, // Partition, then compute
     Broadcasting,
     Aggregation,
-    Compute, // Default, compute on bulk of data
+    Compute,   // Default, compute on bulk of data
     Operation, // Operation embeded in computation
 }
 

@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use dovahkiin::{expr, types::OwnedValue};
 use dovahkiin::expr::serde::Expr;
+use dovahkiin::{expr, types::OwnedValue};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +21,7 @@ pub type Stages = Vec<Vec<Thread>>;
 pub struct Node {
     id: u32,
     symbol: NebSymbol,
-    
+
     params: Vec<Expr>,
 }
 
@@ -42,24 +42,21 @@ pub struct Thread {
 
 struct ConstructRT {
     expr: Expr,
-    staged: bool        
+    staged: bool,
 }
 
 impl ConstructRT {
     pub fn new(expr: Expr) -> Self {
         Self {
-            expr, staged: false
+            expr,
+            staged: false,
         }
     }
     pub fn staged(expr: Expr) -> Self {
-        Self {
-            expr, staged: true
-        }
+        Self { expr, staged: true }
     }
     pub fn with_staged(expr: Expr, staged: bool) -> Self {
-        Self {
-            expr, staged
-        }
+        Self { expr, staged }
     }
 }
 
@@ -224,7 +221,7 @@ impl DAG {
             dag.construct_from_expr(0, expr, &mut id_counter)?;
         }
         return Ok(dag);
-    } 
+    }
 
     fn construct_from_expr(
         &mut self,
@@ -265,7 +262,10 @@ impl DAG {
                     }
                     let node = self.get_node_mut(node_id).unwrap();
                     node.params = params;
-                    return Ok(ConstructRT::with_staged(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))), is_partitioning));
+                    return Ok(ConstructRT::with_staged(
+                        Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))),
+                        is_partitioning,
+                    ));
                 } else if has_symbol {
                     // Other symbol, need to use loc-do
                     let node_id = { self.push_node(NebSymbol::LocalDo as _, vec![]).id };
@@ -285,7 +285,10 @@ impl DAG {
                     }
                     let node = self.get_node_mut(node_id).unwrap();
                     node.params = params;
-                    return Ok(ConstructRT::with_staged(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))), partitioning));
+                    return Ok(ConstructRT::with_staged(
+                        Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))),
+                        partitioning,
+                    ));
                 }
                 return Ok(ConstructRT::new(Expr::List(ele)));
             }
