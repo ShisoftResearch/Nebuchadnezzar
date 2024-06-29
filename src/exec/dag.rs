@@ -21,6 +21,7 @@ pub type Stages = Vec<Vec<Thread>>;
 pub struct Node {
     id: u32,
     symbol: NebSymbol,
+    
     params: Vec<Expr>,
 }
 

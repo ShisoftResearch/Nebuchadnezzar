@@ -72,6 +72,22 @@ macro_rules! partitioning_impl {
 macro_rules! compute_impl {
     ($symbol:ident, $tinput:expr, $toutput:expr) => {
         impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Compute
+            }
+            fn io_types(&self) -> (DataType, DataType) {
+                ($tinput, $toutput)
+            }
+        }
+    };
+}
+
+macro_rules! operation_impl {
+    ($symbol:ident, $tinput:expr, $toutput:expr) => {
+        impl SymbolObj for $symbol {
+            fn symbol_type(&self) -> SymbolType {
+                SymbolType::Operation
+            }
             fn io_types(&self) -> (DataType, DataType) {
                 ($tinput, $toutput)
             }
@@ -118,6 +134,13 @@ macro_rules! def_symbols {
         def_symbols! {
             $($rest)*
             $sym_name => $symbol - [aggregation_impl!($symbol, $tinput, $toutput);],
+        }
+    };
+
+    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr) - [O], $($rest:tt)*) => {
+        def_symbols! {
+            $($rest)*
+            $sym_name => $symbol - [operation_impl!($symbol, $tinput, $toutput);],
         }
     };
 
@@ -193,6 +216,7 @@ pub enum SymbolType {
     Broadcasting,
     Aggregation,
     Compute, // Default, compute on bulk of data
+    Operation, // Operation embeded in computation
 }
 
 pub trait SymbolObj: Sync {
@@ -255,30 +279,30 @@ pub enum BasicType {
 
 def_symbols! {
     // Comparators
-    "=" => Equal (Either(Dynamic) => Either(Bool)),
-    "!=" => NotEqual (Either(Dynamic) => Either(Bool)),
-    ">" => Greater (Either(Dynamic) => Either(Bool)),
-    ">=" => GreaterEqual (Either(Dynamic) => Either(Bool)),
-    "<" => Less  (Either(Dynamic) => Either(Bool)),
-    "<=" => LessEqual (Either(Dynamic) => Either(Bool)),
-    "like" => Like (Either(Dynamic) => Either(Bool)),
-    "not-like" => NotLike (Either(Dynamic) => Either(Bool)),
+    "=" => Equal (Either(Dynamic) => Either(Bool)) - [O],
+    "!=" => NotEqual (Either(Dynamic) => Either(Bool)) - [O],
+    ">" => Greater (Either(Dynamic) => Either(Bool)) - [O],
+    ">=" => GreaterEqual (Either(Dynamic) => Either(Bool)) - [O],
+    "<" => Less  (Either(Dynamic) => Either(Bool)) - [O],
+    "<=" => LessEqual (Either(Dynamic) => Either(Bool)) - [O],
+    "like" => Like (Either(Dynamic) => Either(Bool)) - [O],
+    "not-like" => NotLike (Either(Dynamic) => Either(Bool)) - [O],
 
     // Boolean
-    "and" => And (Either(Bool) => Either(Bool)),
-    "and-not" => AndNot (Either(Bool) => Either(Bool)),
-    "not" => Not (Either(Bool) => Either(Bool)),
-    "or" => Or (Either(Bool) => Either(Bool)),
-    "xor" => Xor (Either(Bool) => Either(Bool)),
-    "not-null?" => NotNull (Either(Dynamic) => Either(Bool)),
-    "null?" => IsNull (Either(Dynamic) => Either(Bool)),
+    "and" => And (Either(Bool) => Either(Bool)) - [O],
+    "and-not" => AndNot (Either(Bool) => Either(Bool)) - [O],
+    "not" => Not (Either(Bool) => Either(Bool)) - [O],
+    "or" => Or (Either(Bool) => Either(Bool)) - [O],
+    "xor" => Xor (Either(Bool) => Either(Bool)) - [O],
+    "not-null?" => NotNull (Either(Dynamic) => Either(Bool)) - [O],
+    "null?" => IsNull (Either(Dynamic) => Either(Bool)) - [O],
 
     // Containment Tests
-    "regex-matches" => RegexMatches (Either(Str) => Either(Bool)),
-    "is-in?" => IsIn (Either(Expr) => Either(Bool)),
+    "regex-matches" => RegexMatches (Either(Str) => Either(Bool)) - [O],
+    "is-in?" => IsIn (Either(Expr) => Either(Bool)) - [O],
 
-    "cast" => Cast (Either(Dynamic) => Either(Anything)),
-    "can-cast?" => CanCast (Either(Dynamic) => Either(Bool)),
+    "cast" => Cast (Either(Dynamic) => Either(Anything)) - [O],
+    "can-cast?" => CanCast (Either(Dynamic) => Either(Bool)) - [O],
 
     //***** NARROW *****//
     "filter-map" => FilterMap (Stream(Dynamic) => Stream(Dynamic)),
