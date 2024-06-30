@@ -287,6 +287,7 @@ impl DAG {
 #[cfg(test)]
 mod tests {
     use dovahkiin::integrated::lisp::parse_to_serde_expr;
+    use dovahkiin::parser::lisp::ParserExpr;
     use lightning::aarc::Arc;
 
     use super::*;
@@ -375,37 +376,51 @@ mod tests {
         let mut env = Environment::new(Arc::null());
         let dag = DAG::from_exprs(exprs, &mut env).unwrap();
         let topo_sorted = dag.rev_topological_sort();
-        assert_eq!(topo_sorted, vec![2, 4, 5, 3, 1]);
+        assert_eq!(topo_sorted, vec![3, 2, 1]);
 
         let stages = dag.group_into_stages(topo_sorted);
 
         assert_eq!(dag.nodes[0].symbol, NebSymbol::FilterSharedValue);
-        assert_eq!(dag.nodes[1].symbol, NebSymbol::Equal);
-        assert_eq!(dag.nodes[2].symbol, NebSymbol::IdCellSel);
-        assert_eq!(dag.nodes[3].symbol, NebSymbol::LocalDo);
-        assert_eq!(dag.nodes[4].symbol, NebSymbol::CellIdQuery);
+        assert_eq!(dag.nodes[1].symbol, NebSymbol::IdCellSel);
+        assert_eq!(dag.nodes[2].symbol, NebSymbol::CellIdQuery);
 
         assert_eq!(dag.nodes[0].id, 1);
         assert_eq!(dag.nodes[1].id, 2);
         assert_eq!(dag.nodes[2].id, 3);
-        assert_eq!(dag.nodes[3].id, 4);
-        assert_eq!(dag.nodes[4].id, 5);
+
+        assert_eq!(dag.nodes[0].params, vec![
+            Expr::List(vec![
+                Expr::symbol("=".to_string()),
+                Expr::owned_val(OwnedValue::U32(1)),
+                Expr::keyword("a".to_string())
+            ]),
+            Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
+        ]);
+
+        assert_eq!(dag.nodes[1].params, vec![
+            Expr::List(vec![
+                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                Expr::symbol("rev".to_string()),
+                Expr::Vec(vec![
+                    Expr::keyword("a".to_string()),
+                    Expr::keyword("b".to_string()),
+                    Expr::keyword("c".to_string())
+                ])
+            ]),
+            Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
+        ]);
+
+        assert_eq!(dag.nodes[2].params, vec![
+            Expr::owned_val(OwnedValue::U32(1)),
+        ]);
 
         // There should be 1 stages, cuz there is only one partition function
         assert_eq!(stages.len(), 1);
-        // First stage should have all leaves
-        assert_eq!(stages[0].len(), 3);
-        assert_eq!(stages[0][0].nodes.len(), 1);
-        assert!(!stages[0][0].partitioned);
-        assert_eq!(stages[0][1].nodes.len(), 1);
-        assert!(!stages[0][1].partitioned);
-        assert_eq!(stages[0][2].nodes.len(), 3);
-        assert!(stages[0][2].partitioned);
-        assert_eq!(stages[0][0].nodes[0], 2);
-        assert_eq!(stages[0][1].nodes[0], 4);
-        assert_eq!(stages[0][2].nodes[0], 5);
-        assert_eq!(stages[0][2].nodes[1], 3);
-        assert_eq!(stages[0][2].nodes[2], 1);
+        // The stage would have all transformers
+        assert_eq!(stages[0].len(), 1);
+        assert_eq!(stages[0][0].nodes.len(), 3);
+        assert!(stages[0][0].partitioned);
+        assert_eq!(stages[0][0].nodes, vec![3, 2, 1]);
     }
 
     #[test]
@@ -415,36 +430,63 @@ mod tests {
         let mut env = Environment::new(Arc::null());
         let dag = DAG::from_exprs(exprs, &mut env).unwrap();
         let topo_sorted = dag.rev_topological_sort();
-        assert_eq!(topo_sorted, vec![2, 4, 6, 7, 5, 3, 1]);
+        assert_eq!(topo_sorted, vec![4, 3, 2, 1]);
 
         let stages = dag.group_into_stages(topo_sorted);
 
-        assert_eq!(dag.nodes[0].symbol, NebSymbol::FilterSharedValue);
-        assert_eq!(dag.nodes[1].symbol, NebSymbol::Equal);
+        assert_eq!(dag.nodes[0].symbol, NebSymbol::SortByASC);
+        assert_eq!(dag.nodes[1].symbol, NebSymbol::FilterSharedValue);
         assert_eq!(dag.nodes[2].symbol, NebSymbol::IdCellSel);
-        assert_eq!(dag.nodes[3].symbol, NebSymbol::LocalDo);
-        assert_eq!(dag.nodes[4].symbol, NebSymbol::CellIdQuery);
+        assert_eq!(dag.nodes[3].symbol, NebSymbol::CellIdQuery);
 
         assert_eq!(dag.nodes[0].id, 1);
         assert_eq!(dag.nodes[1].id, 2);
         assert_eq!(dag.nodes[2].id, 3);
         assert_eq!(dag.nodes[3].id, 4);
-        assert_eq!(dag.nodes[4].id, 5);
 
-        // There should be 1 stages, cuz there is only one partition function
-        assert_eq!(stages.len(), 1);
-        // First stage should have all leaves
-        assert_eq!(stages[0].len(), 3);
-        assert_eq!(stages[0][0].nodes.len(), 1);
-        assert!(!stages[0][0].partitioned);
-        assert_eq!(stages[0][1].nodes.len(), 1);
-        assert!(!stages[0][1].partitioned);
-        assert_eq!(stages[0][2].nodes.len(), 3);
-        assert!(stages[0][2].partitioned);
-        assert_eq!(stages[0][0].nodes[0], 2);
-        assert_eq!(stages[0][1].nodes[0], 4);
-        assert_eq!(stages[0][2].nodes[0], 5);
-        assert_eq!(stages[0][2].nodes[1], 3);
-        assert_eq!(stages[0][2].nodes[2], 1);
+        assert_eq!(dag.nodes[0].params, vec![
+            Expr::List(vec![
+                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                Expr::symbol("+".to_string()),
+                Expr::owned_val(OwnedValue::U32(3)),
+                Expr::symbol("data-field".to_string())
+            ]),
+            Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
+        ]);
+
+        assert_eq!(dag.nodes[1].params, vec![
+            Expr::List(vec![
+                Expr::symbol("=".to_string()),
+                Expr::owned_val(OwnedValue::U32(2)),
+                Expr::keyword("a".to_string())
+            ]),
+            Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
+        ]);
+
+        assert_eq!(dag.nodes[2].params, vec![
+            Expr::List(vec![
+                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                Expr::symbol("rev".to_string()),
+                Expr::Vec(vec![
+                    Expr::keyword("a".to_string()),
+                    Expr::keyword("b".to_string()),
+                    Expr::keyword("c".to_string())
+                ])
+            ]),
+            Expr::META(Box::new(Expr::Value(OwnedValue::U32(4))))
+        ]);
+
+        assert_eq!(dag.nodes[3].params, vec![
+            Expr::owned_val(OwnedValue::U32(1)),
+        ]);
+
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].len(), 1);
+        assert!(stages[0][0].partitioned);
+        assert_eq!(stages[0][0].nodes, vec![4, 3, 2]);
+
+        assert_eq!(stages[0].len(), 1);
+        assert!(stages[1][0].partitioned);
+        assert_eq!(stages[1][0].nodes, vec![1]);
     }
 }
