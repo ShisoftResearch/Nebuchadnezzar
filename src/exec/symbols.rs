@@ -69,11 +69,11 @@ macro_rules! partitioning_impl {
     };
 }
 
-macro_rules! compute_impl {
+macro_rules! transformer_impl {
     ($symbol:ident, $tinput:expr, $toutput:expr) => {
         impl SymbolObj for $symbol {
             fn symbol_type(&self) -> SymbolType {
-                SymbolType::Compute
+                SymbolType::Transformer
             }
             fn io_types(&self) -> (DataType, DataType) {
                 ($tinput, $toutput)
@@ -144,10 +144,10 @@ macro_rules! def_symbols {
         }
     };
 
-    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr), $($rest:tt)*) => {
+    ($sym_name:expr => $symbol:ident ($tinput:expr => $toutput:expr) - [T], $($rest:tt)*) => {
         def_symbols! {
             $($rest)*
-            $sym_name => $symbol - [compute_impl!($symbol, $tinput, $toutput);],
+            $sym_name => $symbol - [transformer_impl!($symbol, $tinput, $toutput);],
         }
     };
 
@@ -215,7 +215,7 @@ pub enum SymbolType {
     Partitioning, // Partition, then compute
     Broadcasting,
     Aggregation,
-    Compute,   // Default, compute on bulk of data
+    Transformer,   // Default, compute on bulk of data
     Operation, // Operation embeded in computation
 }
 
@@ -238,10 +238,8 @@ pub trait SymbolObj: Sync {
     ) -> Option<u64> {
         unreachable!()
     }
-    fn symbol_type(&self) -> SymbolType {
-        SymbolType::Compute
-    }
-    fn compute(&self, data: *mut ()) -> *mut () {
+    fn symbol_type(&self) -> SymbolType;
+    fn compute(&self, _data: *mut ()) -> *mut () {
         return ptr::null_mut();
     }
     fn io_types(&self) -> (DataType, DataType);
@@ -305,13 +303,13 @@ def_symbols! {
     "can-cast?" => CanCast (Either(Dynamic) => Either(Bool)) - [O],
 
     //***** NARROW *****//
-    "filter-map" => FilterMap (Stream(Dynamic) => Stream(Dynamic)),
-    "filter" => Filter (Stream(Dynamic) => Stream(Dynamic)),
-    "map" => Map (Stream(Dynamic) => Stream(Anything)),
+    "filter-map" => FilterMap (Stream(Dynamic) => Stream(Dynamic)) - [T],
+    "filter" => Filter (Stream(Dynamic) => Stream(Dynamic)) - [T],
+    "map" => Map (Stream(Dynamic) => Stream(Anything)) - [T],
 
     // Final Iterater
-    "concat" => Concat (Stream(Dynamic) => Stream(Dynamic)),
-    "limit" => Limit (Stream(Dynamic) => Stream(Dynamic)),
+    "concat" => Concat (Stream(Dynamic) => Stream(Dynamic)) - [T],
+    "limit" => Limit (Stream(Dynamic) => Stream(Dynamic)) - [T],
 
     //***** WIDE *****//
     // "sort" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
@@ -334,20 +332,20 @@ def_symbols! {
     "find" => Find (Stream(Dynamic) => Scala(Dynamic)) - [A],
 
     //*** Data source ***/
-    "cell-id-query" => CellIdQuery (Nothing => Stream(Id)),
-    "repeat" => Repeat (Scala(Anything) => Stream(Dynamic)),
+    "cell-id-query" => CellIdQuery (Nothing => Stream(Id)) - [T],
+    "repeat" => Repeat (Scala(Anything) => Stream(Dynamic)) - [T],
 
     //*** Adapter  ***/
     "id-cell" => IdCell (Stream(Id) => Stream(SharedCell)) - [P],
     "id-cell-sel" => IdCellSel (Stream(Id) => Stream(SharedCell)) - [P],
-    "borrow-cell-value" => BorrowCellValue (Stream(SharedCell) => Stream(SharedValue)),
-    "owned-cell-value" => OwnedCellValue (Stream(SharedCell) => Stream(OwnedValue)),
-    "filter-shared-value" => FilterSharedValue (Stream(SharedValue) => Stream(SharedValue)),
-    "filter-owned-value" => FilterOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)),
-    "to-owned-cell" => ToOwnedCell (Stream(SharedCell) => Stream(OwnedCell)),
-    "proc-shared-value" => ProcSharedValue (Stream(SharedValue) => Stream(SharedValue)),
-    "proc-owned-value" => ProcOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)),
-    "take" => Take (Stream(Anything) => Stream(Dynamic)),
+    "borrow-cell-value" => BorrowCellValue (Stream(SharedCell) => Stream(SharedValue)) - [T],
+    "owned-cell-value" => OwnedCellValue (Stream(SharedCell) => Stream(OwnedValue)) - [T],
+    "filter-shared-value" => FilterSharedValue (Stream(SharedValue) => Stream(SharedValue)) - [T],
+    "filter-owned-value" => FilterOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)) - [T],
+    "to-owned-cell" => ToOwnedCell (Stream(SharedCell) => Stream(OwnedCell)) - [T],
+    "proc-shared-value" => ProcSharedValue (Stream(SharedValue) => Stream(SharedValue)) - [T],
+    "proc-owned-value" => ProcOwnedValue (Stream(OwnedValue) => Stream(OwnedValue)) - [T],
+    "take" => Take (Stream(Anything) => Stream(Dynamic)) - [T],
 
     // //*** Partitioner ***/
     // "hash-partition" => HashPartition,
@@ -355,13 +353,13 @@ def_symbols! {
 
     //*** Bindings ***/
     "let" => Let - [M],
-    "bind" => Bind (Nothing => Either(Anything)), // This is the final form
+    "bind" => Bind (Nothing => Either(Anything)) - [O], // This is the final form
 
     //*** Macro ***/
     "select-cell" => SelectCell - [M],
 
     // Preprocess of parameters not in the NebSymbol list
-    "loc-do" => LocalDo (Either(Dynamic) => Either(Anything)),
+    "loc-do" => LocalDo (Either(Dynamic) => Either(Anything)) - [O],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

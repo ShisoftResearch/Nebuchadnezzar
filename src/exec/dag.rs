@@ -9,7 +9,6 @@ use dovahkiin::{expr, types::OwnedValue};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
-use super::query::partitioning;
 use super::{
     query::{env::Environment, expand::Expand},
     symbols::*,
@@ -38,26 +37,6 @@ pub struct Thread {
     partitioned: bool,
     remote_src: bool,
     nodes: Vec<u32>,
-}
-
-struct ConstructRT {
-    expr: Expr,
-    staged: bool,
-}
-
-impl ConstructRT {
-    pub fn new(expr: Expr) -> Self {
-        Self {
-            expr,
-            staged: false,
-        }
-    }
-    pub fn staged(expr: Expr) -> Self {
-        Self { expr, staged: true }
-    }
-    pub fn with_staged(expr: Expr, staged: bool) -> Self {
-        Self { expr, staged }
-    }
 }
 
 impl DAG {
@@ -228,11 +207,11 @@ impl DAG {
         prev_id: u32,
         expr: Expr,
         id_counter: &mut u32,
-    ) -> Result<ConstructRT, String> {
+    ) -> Result<Expr, String> {
         match expr {
             Expr::List(ele) => {
                 if ele.is_empty() {
-                    return Ok(ConstructRT::new(Expr::List(ele)));
+                    return Ok(Expr::List(ele));
                 }
                 let mut neb_symbol = None;
                 let mut has_symbol = false;
@@ -244,55 +223,63 @@ impl DAG {
                     }
                 }
                 if let Some(neb_sym) = neb_symbol {
-                    let mut is_partitioning = neb_sym.symbol_type() == SymbolType::Partitioning;
-                    let node_id = { self.push_node(neb_sym, vec![]).id };
-                    if prev_id > 0 {
-                        self.link(prev_id, node_id);
+                    let symbol_type = neb_sym.symbol_type();
+                    match symbol_type {
+                        SymbolType::Transformer | SymbolType::Partitioning | SymbolType::Broadcasting | SymbolType::Aggregation => {
+                            let node_id = self.push_node(neb_sym, vec![]).id;
+                            if prev_id > 0 {
+                                self.link(prev_id, node_id);
+                            }
+                            // Recursively construst (potential) nested nodes
+                            // Skip the first element for the symbol is included in the node
+                            let params_opts = ele
+                                .into_iter()
+                                .skip(1)
+                                .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
+                                .collect_vec();
+                            let mut params = Vec::with_capacity(params_opts.capacity());
+                            for popt in params_opts {
+                                let construct_rt = popt?;
+                                params.push(construct_rt);
+                            }
+                            let node = self.get_node_mut(node_id).unwrap();
+                            node.params = params;
+                            return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
+                        },
+                        SymbolType::Operation => {
+                            // Recursively construst (potential) nested nodes
+                            let params_opts = ele
+                                .into_iter()
+                                .map(|pexpr| self.construct_from_expr(prev_id, pexpr, id_counter))
+                                .collect_vec();
+                            let mut eles = Vec::with_capacity(params_opts.len());
+                            for popt in params_opts {
+                                eles.push(popt?);
+                            }
+                            // Does not create a new node for each operations
+                            // Instead, return the original expr list
+                            return Ok(Expr::List(eles))
+                        },
+                        SymbolType::Macro => unreachable!(),
                     }
-                    let params_opts = ele
-                        .into_iter()
-                        .skip(1)
-                        .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
-                        .collect_vec();
-                    let mut params = Vec::with_capacity(params_opts.capacity());
-                    for popt in params_opts {
-                        let construct_rt = popt?;
-                        is_partitioning |= construct_rt.staged;
-                        params.push(construct_rt.expr);
-                    }
-                    let node = self.get_node_mut(node_id).unwrap();
-                    node.params = params;
-                    return Ok(ConstructRT::with_staged(
-                        Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))),
-                        is_partitioning,
-                    ));
                 } else if has_symbol {
-                    // Other symbol, need to use loc-do
-                    let node_id = { self.push_node(NebSymbol::LocalDo as _, vec![]).id };
-                    if prev_id > 0 {
-                        self.link(prev_id, node_id);
-                    }
-                    let params_opts = ele
-                        .into_iter()
-                        .map(|pexpr| self.construct_from_expr(node_id, pexpr, id_counter))
-                        .collect_vec();
-                    let mut params = Vec::with_capacity(params_opts.capacity());
-                    let mut partitioning = false;
-                    for popt in params_opts {
-                        let construct_rt = popt?;
-                        partitioning |= construct_rt.staged;
-                        params.push(construct_rt.expr);
-                    }
-                    let node = self.get_node_mut(node_id).unwrap();
-                    node.params = params;
-                    return Ok(ConstructRT::with_staged(
-                        Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))),
-                        partitioning,
-                    ));
+                        // Other symbol, need to use loc-do
+                        let params_opts = ele
+                            .into_iter()
+                            .map(|pexpr| self.construct_from_expr(prev_id, pexpr, id_counter))
+                            .collect_vec();
+                        let mut eles = Vec::with_capacity(params_opts.len() + 1);
+                        // Rewrite the list into a new one prefix with local-do symbol
+                        eles.push(Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()));
+                        for popt in params_opts {
+                            eles.push(popt?);
+                        }
+                        // Return the original expr list with local-do as prefix
+                        return Ok(Expr::List(eles))
                 }
-                return Ok(ConstructRT::new(Expr::List(ele)));
+                return Ok(Expr::List(ele));
             }
-            _ => return Ok(ConstructRT::new(expr)),
+            _ => return Ok(expr),
         }
     }
 }
