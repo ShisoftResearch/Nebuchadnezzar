@@ -341,13 +341,6 @@ mod tests {
         //      (cell-id-query SCHEMA)
         //     FIELDS)
         //   FILTER)
-        // The DAG of this statement would be linear with 2 stages
-        // Stage 1: Query cell ids from the index
-        // Stage 2: Partition cell ids with consistent hash and then --
-        //          Get cells of the ids, then
-        //          Filter the cells
-        // There would be one thread in both stages
-        // Stage 2 would have 2 operations, which is 'id-cell-sel' and 'filter-shared-value'
         let mut dag = DAG::new();
         let node1 = dag.push_node(NebSymbol::CellIdQuery, vec![]).id;
         let node2 = dag.push_node(NebSymbol::IdCellSel, vec![]).id;
