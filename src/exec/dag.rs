@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use dovahkiin::expr::serde::Expr;
-use dovahkiin::{expr, types::OwnedValue};
+use dovahkiin::types::OwnedValue;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
