@@ -6,14 +6,13 @@ use crate::ram::io::{reader, writer};
 use crate::ram::mem_cursor::*;
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedValue, RandValue, SharedValue, Value};
-use crate::utils::referred::ARef;
 use byteorder::{ReadBytesExt, WriteBytesExt};
+use dovahkiin::types::referred::ARef;
 use lightning::map::WordMutexGuard;
 use serde::Serialize;
 use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
-use std::sync::atomic::AtomicUsize;
 
 use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;

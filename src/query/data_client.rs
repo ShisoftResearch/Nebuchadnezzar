@@ -26,18 +26,19 @@ use crate::{
 
 const SCAN_BUFFER_SIZE: u16 = 64;
 
+#[derive(Clone)]
 pub struct IndexedDataClient {
     conshash: Arc<ConsistentHashing>,
     index_clients: Arc<IndexerClients>,
 }
 
-pub struct DataCursor<'a> {
+pub struct DataCursor {
     index_cursor: Option<ClientCursor>,
     buffer: Vec<OwnedCell>,
     projection: Vec<u64>,
     selection: Expr,
     proc: Expr,
-    client: &'a IndexedDataClient,
+    client: IndexedDataClient,
     pos: usize,
 }
 
@@ -123,7 +124,7 @@ impl IndexedDataClient {
         selection: Expr,      // Checker expression
         proc: Expr,
         ordering: Ordering,
-    ) -> Result<DataCursor<'a>, RPCError> {
+    ) -> Result<DataCursor, RPCError> {
         let range = range.to_key_range(schema, field, ordering);
         let index_cursor = self
             .index_clients
@@ -140,7 +141,7 @@ impl IndexedDataClient {
         selection: Expr,      // Checker expression
         proc: Expr,
         ordering: Ordering,
-    ) -> Result<DataCursor<'a>, RPCError> {
+    ) -> Result<DataCursor, RPCError> {
         let key = EntryKey::for_schema(schema);
         let index_cursor = self
             .index_clients
@@ -160,13 +161,13 @@ impl IndexedDataClient {
         projection: Vec<u64>,
         selection: Expr,
         proc: Expr,
-    ) -> DataCursor<'a> {
+    ) -> DataCursor {
         let mut cursor = DataCursor {
             index_cursor,
             projection,
             selection,
             proc,
-            client: self,
+            client: self.clone(),
             buffer: vec![],
             pos: 0,
         };
@@ -175,7 +176,7 @@ impl IndexedDataClient {
     }
 }
 
-impl<'a> DataCursor<'a> {
+impl DataCursor {
     pub async fn next(&mut self) -> Result<Option<OwnedCell>, RPCError> {
         if self.buffer.len() <= self.pos {
             if self.next_block().await? {

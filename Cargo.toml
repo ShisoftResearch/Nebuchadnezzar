@@ -37,8 +37,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 crossbeam = "*"
 crossbeam-epoch = "*"
-arrow = "35"
 num = "*"
+core_affinity = "0.8.1"
 
 [dev-dependencies]
 env_logger = "*"
