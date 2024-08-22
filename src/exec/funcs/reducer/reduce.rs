@@ -2,7 +2,11 @@ use std::marker::PhantomData;
 
 use dovahkiin::expr::serde::Expr;
 
-use crate::exec::{partitioner::Partitioner, query::{self, partitioning::Partitioning}, symbols::objs};
+use crate::exec::{
+    partitioner::Partitioner,
+    query::{self, partitioning::Partitioning},
+    symbols::objs,
+};
 
 use super::{get_join_partitioner, PartitioningKeyValuePair, ReduceCollector, Reducer};
 

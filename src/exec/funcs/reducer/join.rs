@@ -10,7 +10,7 @@ use crate::exec::{
         self,
         partitioning::{get_hash_partitioner, Partitioning},
     },
-    symbols::objs
+    symbols::objs,
 };
 
 use super::{get_join_partitioner, ReduceCollector, Reducer};
