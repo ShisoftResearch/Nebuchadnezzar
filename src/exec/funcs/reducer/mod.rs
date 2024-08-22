@@ -78,15 +78,15 @@ fn get_join_partitioner(
 }
 
 pub trait KeyExtraction<T> {
-    fn extract_key<'i>(item: &'i T, query: SExpr<'i>, env: &mut query::env::Environment<'i>) -> Result<u64, String>;
+    fn extract_key<'i>(item: &'i T, query: Vec<SExpr<'i>>, env: &mut query::env::Environment<'i>) -> Result<u64, String>;
 }
 
 pub struct SharedValueKeyExtraction;
 
 impl <'a> KeyExtraction<SharedValue<'a>> for SharedValueKeyExtraction {
-    fn extract_key<'i>(item: &'i SharedValue<'a>, query: SExpr<'i>, env: &mut query::env::Environment<'i>) -> Result<u64, String> {
+    fn extract_key<'i>(item: &'i SharedValue<'a>, query: Vec<SExpr<'i>>, env: &mut query::env::Environment<'i>) -> Result<u64, String> {
         env.get_interpreter().set_global_val(item);
-        let res = env.get_interpreter().eval(vec![query])?;
+        let res = env.get_interpreter().eval(query)?;
         let owned_val = res.owned_val().ok_or_else(|| format!("Cannot extract key by compute a value"))?;
         let val_feature = owned_val.feature();
         let key = u64::from_le_bytes(val_feature);
