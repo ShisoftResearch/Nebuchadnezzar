@@ -215,8 +215,8 @@ pub enum SymbolType {
     Partitioning, // Partition, then compute
     Broadcasting,
     Aggregation,
-    Transformer,   // Default, compute on bulk of data
-    Operation, // Operation embeded in computation
+    Transformer, // Default, compute on bulk of data
+    Operation,   // Operation embeded in computation
 }
 
 pub trait SymbolObj: Sync {
@@ -315,11 +315,10 @@ def_symbols! {
     // "sort" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
     "sort-by-asc" => SortByASC (Stream(SharedValue) => Stream(SharedValue)) - [P],
     "sort-by-desc" => SortByDESC (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "group-by" => GroupBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "join" => Join (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "full-join" => FullJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "natural-join" => NaturalJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    // "reduce" => Reduce (Stream(Dynamic) => Stream(Any)) - [P],
+    "join" => Join (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    "natural-join" => NaturalJoin (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    "group-by" => GroupBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
+    "reduce" => Reduce (Stream(Dynamic) => Stream(Anything)) - [P],
 
     // Aggregations
     "all" => All (Stream(Dynamic) => Scala(Bool)) - [A],

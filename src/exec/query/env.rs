@@ -1,11 +1,14 @@
 use std::collections::VecDeque;
 
 use bifrost::conshash::ConsistentHashing;
+use bifrost_plugins::hash_ident;
 use dovahkiin::{
     ahash::{HashMap, HashMapExt},
     expr::{interpreter::Interpreter, serde::Expr},
 };
 use lightning::aarc::Arc;
+
+const PARAMS_SYM_ID: u64 = hash_ident!(__PARAMS_SYM_ID);
 
 pub struct Environment<'a> {
     binding: VecDeque<HashMap<u64, Expr>>,
@@ -23,6 +26,12 @@ impl<'a> Environment<'a> {
             chash,
             interpreter,
         };
+    }
+    pub fn set_params(&mut self, expr: &Expr) {
+        self.set_binding(PARAMS_SYM_ID, expr.clone())
+    }
+    pub fn get_params(&self) -> &Expr {
+        self.get_binding(&PARAMS_SYM_ID).unwrap()
     }
     pub fn set_binding(&mut self, sym_id: u64, expr: Expr) {
         self.binding.front_mut().unwrap().insert(sym_id, expr);

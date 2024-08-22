@@ -1,6 +1,10 @@
 use std::marker::PhantomData;
 
-use super::{ReduceCollector, Reducer};
+use dovahkiin::expr::serde::Expr;
+
+use crate::exec::{partitioner::Partitioner, query::{self, partitioning::Partitioning}, symbols::objs};
+
+use super::{get_join_partitioner, PartitioningKeyValuePair, ReduceCollector, Reducer};
 
 pub struct Reduce<K, V, O, KF, MF, C> {
     _marker: PhantomData<(K, V, O, KF, MF, C)>,
@@ -26,5 +30,25 @@ where
             func(k, vals)
         });
         iter
+    }
+}
+
+impl Partitioning for objs::Reduce {
+    fn get_partitioner(
+        &self,
+        _expr: &Expr,
+        env: &mut query::env::Environment,
+    ) -> Result<Option<Box<dyn crate::exec::partitioner::Partitioner>>, String> {
+        get_join_partitioner(env)
+    }
+
+    fn get_partition(
+        &self,
+        data_ptr: *mut (),
+        _env: &mut query::env::Environment,
+        partitioner: &Box<dyn Partitioner>,
+    ) -> Option<u64> {
+        let (key, _) = unsafe { &*(data_ptr as *mut PartitioningKeyValuePair) };
+        partitioner.partition(*key)
     }
 }

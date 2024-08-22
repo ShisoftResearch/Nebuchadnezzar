@@ -4,6 +4,7 @@ use dovahkiin::{
 };
 
 use crate::exec::{
+    funcs::reducer::PartitioningKeyValuePair,
     partitioner::{self, range, Partitioner},
     query::{
         env::Environment,
@@ -14,7 +15,7 @@ use crate::exec::{
 
 use super::Sort;
 
-pub type SortKeyValuePair<'a> = (i64, SharedValue<'a>);
+pub type SortKeyValuePair<'a> = PartitioningKeyValuePair<'a>;
 
 pub struct SortBySharedValueASC<'a> {
     exec: Interpreter<'a>,
@@ -77,7 +78,7 @@ pub fn get_sorting_partition(
     partitioner: &Box<dyn crate::exec::partitioner::Partitioner>,
 ) -> Option<u64> {
     let (key, _) = unsafe { &*(data_ptr as *mut SortKeyValuePair) };
-    partitioner.partition(*key as u64 >> 4)
+    partitioner.partition(*key >> 4)
 }
 
 impl Partitioning for symbols::objs::SortByASC {

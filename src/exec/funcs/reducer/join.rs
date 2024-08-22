@@ -1,8 +1,19 @@
 use std::marker::PhantomData;
 
+use dovahkiin::expr::serde::Expr;
 use itertools::Itertools;
 
-use super::{ReduceCollector, Reducer};
+use crate::exec::{
+    funcs::reducer::PartitioningKeyValuePair,
+    partitioner::Partitioner,
+    query::{
+        self,
+        partitioning::{get_hash_partitioner, Partitioning},
+    },
+    symbols::objs
+};
+
+use super::{get_join_partitioner, ReduceCollector, Reducer};
 
 pub struct FullJoin<K, V, O, KF, MF, C> {
     _marker: PhantomData<(K, V, O, KF, MF, C)>,
@@ -71,5 +82,45 @@ where
             }
         });
         iter
+    }
+}
+
+impl Partitioning for objs::Join {
+    fn get_partitioner(
+        &self,
+        _expr: &Expr,
+        env: &mut query::env::Environment,
+    ) -> Result<Option<Box<dyn crate::exec::partitioner::Partitioner>>, String> {
+        get_join_partitioner(env)
+    }
+
+    fn get_partition(
+        &self,
+        data_ptr: *mut (),
+        _env: &mut query::env::Environment,
+        partitioner: &Box<dyn Partitioner>,
+    ) -> Option<u64> {
+        let (key, _) = unsafe { &*(data_ptr as *mut PartitioningKeyValuePair) };
+        partitioner.partition(*key)
+    }
+}
+
+impl Partitioning for objs::NaturalJoin {
+    fn get_partitioner(
+        &self,
+        _expr: &Expr,
+        env: &mut query::env::Environment,
+    ) -> Result<Option<Box<dyn crate::exec::partitioner::Partitioner>>, String> {
+        get_join_partitioner(env)
+    }
+
+    fn get_partition(
+        &self,
+        data_ptr: *mut (),
+        _env: &mut query::env::Environment,
+        partitioner: &Box<dyn Partitioner>,
+    ) -> Option<u64> {
+        let (key, _) = unsafe { &*(data_ptr as *mut PartitioningKeyValuePair) };
+        partitioner.partition(*key)
     }
 }

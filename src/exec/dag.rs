@@ -225,7 +225,10 @@ impl DAG {
                 if let Some(neb_sym) = neb_symbol {
                     let symbol_type = neb_sym.symbol_type();
                     match symbol_type {
-                        SymbolType::Transformer | SymbolType::Partitioning | SymbolType::Broadcasting | SymbolType::Aggregation => {
+                        SymbolType::Transformer
+                        | SymbolType::Partitioning
+                        | SymbolType::Broadcasting
+                        | SymbolType::Aggregation => {
                             let node_id = self.push_node(neb_sym, vec![]).id;
                             if prev_id > 0 {
                                 self.link(prev_id, node_id);
@@ -245,7 +248,7 @@ impl DAG {
                             let node = self.get_node_mut(node_id).unwrap();
                             node.params = params;
                             return Ok(Expr::META(Box::new(Expr::Value(OwnedValue::U32(node_id)))));
-                        },
+                        }
                         SymbolType::Operation => {
                             // Recursively construst (potential) nested nodes
                             let params_opts = ele
@@ -258,24 +261,27 @@ impl DAG {
                             }
                             // Does not create a new node for each operations
                             // Instead, return the original expr list
-                            return Ok(Expr::List(eles))
-                        },
+                            return Ok(Expr::List(eles));
+                        }
                         SymbolType::Macro => unreachable!(),
                     }
                 } else if has_symbol {
-                        // Other symbol, need to use loc-do
-                        let params_opts = ele
-                            .into_iter()
-                            .map(|pexpr| self.construct_from_expr(prev_id, pexpr, id_counter))
-                            .collect_vec();
-                        let mut eles = Vec::with_capacity(params_opts.len() + 1);
-                        // Rewrite the list into a new one prefix with local-do symbol
-                        eles.push(Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()));
-                        for popt in params_opts {
-                            eles.push(popt?);
-                        }
-                        // Return the original expr list with local-do as prefix
-                        return Ok(Expr::List(eles))
+                    // Other symbol, need to use loc-do
+                    let params_opts = ele
+                        .into_iter()
+                        .map(|pexpr| self.construct_from_expr(prev_id, pexpr, id_counter))
+                        .collect_vec();
+                    let mut eles = Vec::with_capacity(params_opts.len() + 1);
+                    // Rewrite the list into a new one prefix with local-do symbol
+                    eles.push(Expr::Symbol(
+                        neb_symbol_id(NebSymbol::LocalDo),
+                        String::new(),
+                    ));
+                    for popt in params_opts {
+                        eles.push(popt?);
+                    }
+                    // Return the original expr list with local-do as prefix
+                    return Ok(Expr::List(eles));
                 }
                 return Ok(Expr::List(ele));
             }
@@ -381,31 +387,38 @@ mod tests {
         assert_eq!(dag.nodes[1].id, 2);
         assert_eq!(dag.nodes[2].id, 3);
 
-        assert_eq!(dag.nodes[0].params, vec![
-            Expr::List(vec![
-                Expr::symbol("=".to_string()),
-                Expr::owned_val(OwnedValue::U32(1)),
-                Expr::keyword("a".to_string())
-            ]),
-            Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
-        ]);
+        assert_eq!(
+            dag.nodes[0].params,
+            vec![
+                Expr::List(vec![
+                    Expr::symbol("=".to_string()),
+                    Expr::owned_val(OwnedValue::U32(1)),
+                    Expr::keyword("a".to_string())
+                ]),
+                Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
+            ]
+        );
 
-        assert_eq!(dag.nodes[1].params, vec![
-            Expr::List(vec![
-                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
-                Expr::symbol("rev".to_string()),
-                Expr::Vec(vec![
-                    Expr::keyword("a".to_string()),
-                    Expr::keyword("b".to_string()),
-                    Expr::keyword("c".to_string())
-                ])
-            ]),
-            Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
-        ]);
+        assert_eq!(
+            dag.nodes[1].params,
+            vec![
+                Expr::List(vec![
+                    Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                    Expr::symbol("rev".to_string()),
+                    Expr::Vec(vec![
+                        Expr::keyword("a".to_string()),
+                        Expr::keyword("b".to_string()),
+                        Expr::keyword("c".to_string())
+                    ])
+                ]),
+                Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
+            ]
+        );
 
-        assert_eq!(dag.nodes[2].params, vec![
-            Expr::owned_val(OwnedValue::U32(1)),
-        ]);
+        assert_eq!(
+            dag.nodes[2].params,
+            vec![Expr::owned_val(OwnedValue::U32(1)),]
+        );
 
         // There should be 1 stages, cuz there is only one partition function
         assert_eq!(stages.len(), 1);
@@ -437,41 +450,51 @@ mod tests {
         assert_eq!(dag.nodes[2].id, 3);
         assert_eq!(dag.nodes[3].id, 4);
 
-        assert_eq!(dag.nodes[0].params, vec![
-            Expr::List(vec![
-                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
-                Expr::symbol("+".to_string()),
-                Expr::owned_val(OwnedValue::U32(3)),
-                Expr::symbol("data-field".to_string())
-            ]),
-            Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
-        ]);
+        assert_eq!(
+            dag.nodes[0].params,
+            vec![
+                Expr::List(vec![
+                    Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                    Expr::symbol("+".to_string()),
+                    Expr::owned_val(OwnedValue::U32(3)),
+                    Expr::symbol("data-field".to_string())
+                ]),
+                Expr::META(Box::new(Expr::Value(OwnedValue::U32(2))))
+            ]
+        );
 
-        assert_eq!(dag.nodes[1].params, vec![
-            Expr::List(vec![
-                Expr::symbol("=".to_string()),
-                Expr::owned_val(OwnedValue::U32(2)),
-                Expr::keyword("a".to_string())
-            ]),
-            Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
-        ]);
+        assert_eq!(
+            dag.nodes[1].params,
+            vec![
+                Expr::List(vec![
+                    Expr::symbol("=".to_string()),
+                    Expr::owned_val(OwnedValue::U32(2)),
+                    Expr::keyword("a".to_string())
+                ]),
+                Expr::META(Box::new(Expr::Value(OwnedValue::U32(3))))
+            ]
+        );
 
-        assert_eq!(dag.nodes[2].params, vec![
-            Expr::List(vec![
-                Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
-                Expr::symbol("rev".to_string()),
-                Expr::Vec(vec![
-                    Expr::keyword("a".to_string()),
-                    Expr::keyword("b".to_string()),
-                    Expr::keyword("c".to_string())
-                ])
-            ]),
-            Expr::META(Box::new(Expr::Value(OwnedValue::U32(4))))
-        ]);
+        assert_eq!(
+            dag.nodes[2].params,
+            vec![
+                Expr::List(vec![
+                    Expr::Symbol(neb_symbol_id(NebSymbol::LocalDo), String::new()),
+                    Expr::symbol("rev".to_string()),
+                    Expr::Vec(vec![
+                        Expr::keyword("a".to_string()),
+                        Expr::keyword("b".to_string()),
+                        Expr::keyword("c".to_string())
+                    ])
+                ]),
+                Expr::META(Box::new(Expr::Value(OwnedValue::U32(4))))
+            ]
+        );
 
-        assert_eq!(dag.nodes[3].params, vec![
-            Expr::owned_val(OwnedValue::U32(1)),
-        ]);
+        assert_eq!(
+            dag.nodes[3].params,
+            vec![Expr::owned_val(OwnedValue::U32(1)),]
+        );
 
         assert_eq!(stages.len(), 2);
         assert_eq!(stages[0].len(), 1);

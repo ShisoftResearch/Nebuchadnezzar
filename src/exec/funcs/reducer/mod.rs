@@ -1,6 +1,14 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+use dovahkiin::types::SharedValue;
+
+use crate::exec::partitioner::Partitioner;
+use crate::exec::query;
+use crate::exec::query::partitioning::get_hash_partitioner;
+
+pub type PartitioningKeyValuePair<'a> = (u64, SharedValue<'a>);
+
 pub mod group_by;
 pub mod join;
 pub mod reduce;
@@ -59,4 +67,10 @@ where
 {
     fn reduce(&self, data: impl Iterator<Item = V>, key_func: KF, collector: &mut C);
     fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O>;
+}
+
+fn get_join_partitioner(
+    env: &mut query::env::Environment,
+) -> Result<Option<Box<dyn Partitioner>>, String> {
+    get_hash_partitioner(env)
 }
