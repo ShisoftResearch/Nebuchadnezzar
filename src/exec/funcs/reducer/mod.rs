@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use dovahkiin::expr::interpreter;
+use dovahkiin::expr::{interpreter, SExpr};
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::SharedValue;
 
@@ -78,17 +78,16 @@ fn get_join_partitioner(
 }
 
 pub trait KeyExtraction<T> {
-    fn extract_key<'i>(item: &'i T, query: &Expr, env: &'i mut query::env::Environment<'i>) -> Result<u64, String>;
+    fn extract_key<'i>(item: &'i T, query: SExpr<'i>, env: &mut query::env::Environment<'i>) -> Result<u64, String>;
 }
 
 pub struct SharedValueKeyExtraction;
 
 impl <'a> KeyExtraction<SharedValue<'a>> for SharedValueKeyExtraction {
-    fn extract_key<'i>(item: &'i SharedValue<'a>, query: &Expr, env: &'i mut query::env::Environment<'i>) -> Result<u64, String> {
+    fn extract_key<'i>(item: &'i SharedValue<'a>, query: SExpr<'i>, env: &mut query::env::Environment<'i>) -> Result<u64, String> {
         env.get_interpreter().set_global_val(item);
-        let sexpr = query.clone().to_sexpr();
-        let res = env.get_interpreter().eval(vec![sexpr])?;
-        let owned_val = res.owned_val().ok_or_else(|| format!("Cannot extract key"))?;
+        let res = env.get_interpreter().eval(vec![query])?;
+        let owned_val = res.owned_val().ok_or_else(|| format!("Cannot extract key by compute a value"))?;
         let val_feature = owned_val.feature();
         let key = u64::from_le_bytes(val_feature);
         return Ok(key)
