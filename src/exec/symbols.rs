@@ -237,12 +237,12 @@ pub enum DataType {
     Stream(BasicType),
     Scala(BasicType),
     Either(BasicType),
-    TupleStream(BasicType),
+    Array(BasicType),
     Type,
+    Expr,
 }
 
 pub enum BasicType {
-    Expr,
     OwnedValue,
     OwnedValueRef,
     SharedValue,
@@ -257,34 +257,35 @@ pub enum BasicType {
     Str,
     Dynamic,
     Anything,
+    Array
 }
 
 def_symbols! {
     // Comparators
-    "=" => Equal ([Either(Dynamic)] => Either(Bool)) - [O],
-    "!=" => NotEqual ([Either(Dynamic)] => Either(Bool)) - [O],
-    ">" => Greater ([Either(Dynamic)] => Either(Bool)) - [O],
-    ">=" => GreaterEqual ([Either(Dynamic)] => Either(Bool)) - [O],
-    "<" => Less  ([Either(Dynamic)] => Either(Bool)) - [O],
-    "<=" => LessEqual ([Either(Dynamic)] => Either(Bool)) - [O],
+    "=" => Equal ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
+    "!=" => NotEqual ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
+    ">" => Greater ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
+    ">=" => GreaterEqual ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
+    "<" => Less  ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
+    "<=" => LessEqual ([Either(Dynamic), Either(Dynamic)] => Either(Bool)) - [O],
     "like" => Like ([Either(Dynamic)] => Either(Bool)) - [O],
     "not-like" => NotLike ([Either(Dynamic)] => Either(Bool)) - [O],
 
     // Boolean
-    "and" => And ([Either(Bool)] => Either(Bool)) - [O],
-    "and-not" => AndNot ([Either(Bool)] => Either(Bool)) - [O],
+    "and" => And ([Either(Bool), Either(Bool)] => Either(Bool)) - [O],
+    "and-not" => AndNot ([Either(Bool), Either(Bool)] => Either(Bool)) - [O],
     "not" => Not ([Either(Bool)] => Either(Bool)) - [O],
-    "or" => Or ([Either(Bool)] => Either(Bool)) - [O],
-    "xor" => Xor ([Either(Bool)] => Either(Bool)) - [O],
+    "or" => Or ([Either(Bool), Either(Bool)] => Either(Bool)) - [O],
+    "xor" => Xor ([Either(Bool), Either(Bool)] => Either(Bool)) - [O],
     "not-null?" => NotNull ([Either(Dynamic)] => Either(Bool)) - [O],
     "null?" => IsNull ([Either(Dynamic)] => Either(Bool)) - [O],
 
     // Containment Tests
-    "regex-matches" => RegexMatches ([Either(Str)] => Either(Bool)) - [O],
-    "is-in?" => IsIn ([Either(Expr)] => Either(Bool)) - [O],
+    "regex-matches" => RegexMatches ([Scala(Str), Either(Str)] => Either(Bool)) - [O],
+    "is-in?" => IsIn ([Either(Bool), Either(BasicType::Array)] => Either(Bool)) - [O],
 
-    "cast" => Cast ([Either(Dynamic)] => Either(Anything)) - [O],
-    "can-cast?" => CanCast ([Either(Dynamic)] => Either(Bool)) - [O],
+    "cast" => Cast ([Type, Either(Dynamic)] => Either(Anything)) - [O],
+    "can-cast?" => CanCast ([Type, Either(Dynamic)] => Either(Bool)) - [O],
 
     //***** NARROW *****//
     "filter-map" => FilterMap ([Stream(Dynamic)] => Stream(Dynamic)) - [T],
@@ -292,43 +293,43 @@ def_symbols! {
     "map" => Map ([Stream(Dynamic)] => Stream(Anything)) - [T],
 
     // Final Iterater
-    "concat" => Concat ([Stream(Dynamic)] => Stream(Dynamic)) - [T],
-    "limit" => Limit ([Stream(Dynamic)] => Stream(Dynamic)) - [T],
+    "concat" => Concat ([Stream(Dynamic), Stream(Dynamic)] => Stream(Dynamic)) - [T],
+    "limit" => Limit ([Scala(Num), Stream(Dynamic)] => Stream(Dynamic)) - [T],
 
     //***** WIDE *****//
     // "sort" => SortBy (Stream(SharedValue) => Stream(SharedValue)) - [P],
-    "sort-by-asc" => SortByASC ([Stream(SharedValue)] => Stream(SharedValue)) - [P],
-    "sort-by-desc" => SortByDESC ([Stream(SharedValue)] => Stream(SharedValue)) - [P],
-    "join" => Join ([TupleStream(SharedValue)] => Stream(SharedValue)) - [P],
-    "full-join" => FullJoin ([TupleStream(SharedValue)] => Stream(SharedValue)) - [P],
-    "group-by" => GroupBy ([Stream(SharedValue)] => Stream(SharedValue)) - [P],
-    "reduce" => Reduce ([Stream(Dynamic)] => Stream(Anything)) - [P],
+    "sort-by-asc" => SortByASC ([Stream(Num), Stream(SharedValue)] => Stream(SharedValue)) - [P],
+    "sort-by-desc" => SortByDESC ([Stream(Num), Stream(SharedValue)] => Stream(SharedValue)) - [P],
+    "join" => Join ([Expr, Stream(SharedValue), Stream(SharedValue)] => Stream(SharedValue)) - [P],
+    "full-join" => FullJoin ([Expr, Stream(SharedValue)] => Stream(SharedValue)) - [P],
+    "group-by" => GroupBy ([Expr, Stream(SharedValue)] => Stream(SharedValue)) - [P],
+    "reduce" => Reduce ([Expr, Stream(Dynamic)] => Stream(Anything)) - [P],
 
     // Aggregations
-    "all" => All ([Stream(Dynamic)] => Scala(Bool)) - [A],
-    "any" => Any ([Stream(Dynamic)] => Scala(Bool)) - [A],
+    "all" => All ([Stream(Bool), Stream(Dynamic)] => Scala(Bool)) - [A],
+    "any" => Any ([Stream(Bool), Stream(Dynamic)] => Scala(Bool)) - [A],
     "count" => Count ([Stream(Dynamic)] => Scala(U64)) - [A],
     "avg" => Average ([Stream(Num)] => Scala(F64)) - [A],
     "max" => Max ([Stream(Num)] => Scala(Num)) - [A],
     "min" => Min ([Stream(Num)] => Scala(Num)) - [A],
     "sum" => Sum ([Stream(Num)] => Scala(Num)) - [A],
-    "find" => Find ([Stream(Dynamic)] => Scala(Dynamic)) - [A],
+    "find" => Find ([Stream(Bool), Stream(Dynamic)] => Scala(Dynamic)) - [A],
 
     //*** Data source ***/
-    "cell-id-query" => CellIdQuery ([] => Stream(Id)) - [T],
-    "repeat" => Repeat ([Scala(Anything)] => Stream(Dynamic)) - [T],
+    "cell-id-query" => CellIdQuery ([Expr] => Stream(Id)) - [T],
+    "repeat" => Repeat ([Scala(Num), Scala(Anything)] => Stream(Dynamic)) - [T],
 
     //*** Adapter  ***/
     "id-cell" => IdCell ([Stream(Id)] => Stream(SharedCell)) - [P],
-    "id-cell-sel" => IdCellSel ([Stream(Id)] => Stream(SharedCell)) - [P],
+    "id-cell-sel" => IdCellSel ([Expr, Stream(Id)] => Stream(SharedCell)) - [P],
     "borrow-cell-value" => BorrowCellValue ([Stream(SharedCell)] => Stream(SharedValue)) - [T],
     "owned-cell-value" => OwnedCellValue ([Stream(SharedCell)] => Stream(OwnedValue)) - [T],
-    "filter-shared-value" => FilterSharedValue ([Stream(SharedValue)] => Stream(SharedValue)) - [T],
-    "filter-owned-value" => FilterOwnedValue ([Stream(OwnedValue)] => Stream(OwnedValue)) - [T],
+    "filter-shared-value" => FilterSharedValue ([Expr, Stream(SharedValue)] => Stream(SharedValue)) - [T],
+    "filter-owned-value" => FilterOwnedValue ([Expr, Stream(OwnedValue)] => Stream(OwnedValue)) - [T],
     "to-owned-cell" => ToOwnedCell ([Stream(SharedCell)] => Stream(OwnedCell)) - [T],
-    "proc-shared-value" => ProcSharedValue ([Stream(SharedValue)] => Stream(SharedValue)) - [T],
-    "proc-owned-value" => ProcOwnedValue ([Stream(OwnedValue)] => Stream(OwnedValue)) - [T],
-    "take" => Take ([Stream(Anything)] => Stream(Dynamic)) - [T],
+    "proc-shared-value" => ProcSharedValue ([Expr, Stream(SharedValue)] => Stream(SharedValue)) - [T],
+    "proc-owned-value" => ProcOwnedValue ([Expr, Stream(OwnedValue)] => Stream(OwnedValue)) - [T],
+    "take" => Take ([Scala(Num), Stream(Anything)] => Stream(Dynamic)) - [T],
 
     // //*** Partitioner ***/
     // "hash-partition" => HashPartition,
@@ -336,13 +337,13 @@ def_symbols! {
 
     //*** Bindings ***/
     "let" => Let - [M],
-    "bind" => Bind ([] => Either(Anything)) - [O], // This is the final form
+    "bind" => Bind ([Expr] => Either(Anything)) - [O], // This is the final form
 
     //*** Macro ***/
     "select-cell" => SelectCell - [M],
 
     // Preprocess of parameters not in the NebSymbol list
-    "loc-do" => LocalDo ([Either(Dynamic)] => Either(Anything)) - [O],
+    "loc-do" => LocalDo ([Expr, Either(Dynamic)] => Either(Anything)) - [O],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
