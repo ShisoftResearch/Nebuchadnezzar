@@ -2,7 +2,7 @@
 // It can be used on local execution and distributed execution
 // depends on the model
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::{any::Any, collections::{BTreeMap, HashMap, VecDeque}};
 
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::OwnedValue;
@@ -287,6 +287,18 @@ impl DAG {
             }
             _ => return Ok(expr),
         }
+    }
+
+    // 
+    fn static_type_check(&self, stages: &Stages) -> Result<(), String> {
+        // for &node_id in rev_topo_sorted.iter() {
+        //     let dependences = self.outlinks.get(&node_id);
+        //     if let Some(node) = self.get_node(node_id) {
+        //         let (in_ty, out_ty) = node.symbol.symbol_obj().io_types();
+                
+        //     }
+        // }
+        unimplemented!()
     }
 }
 

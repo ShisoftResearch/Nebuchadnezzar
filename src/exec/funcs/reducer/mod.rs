@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
-use dovahkiin::expr::serde::Expr;
-use dovahkiin::expr::{interpreter, SExpr};
+use dovahkiin::expr::SExpr;
 use dovahkiin::types::SharedValue;
 
 use crate::exec::partitioner::Partitioner;

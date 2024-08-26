@@ -105,7 +105,7 @@ impl Partitioning for objs::Join {
     }
 }
 
-impl Partitioning for objs::NaturalJoin {
+impl Partitioning for objs::FullJoin {
     fn get_partitioner(
         &self,
         _expr: &Expr,
