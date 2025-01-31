@@ -289,15 +289,25 @@ impl DAG {
         }
     }
 
-    // 
-    fn static_type_check(&self, stages: &Stages) -> Result<(), String> {
-        // for &node_id in rev_topo_sorted.iter() {
-        //     let dependences = self.outlinks.get(&node_id);
-        //     if let Some(node) = self.get_node(node_id) {
-        //         let (in_ty, out_ty) = node.symbol.symbol_obj().io_types();
-                
-        //     }
-        // }
+
+
+    pub fn static_type_check(&self, rev_topo_sorted: &Vec<u32>) -> Result<(), String> {
+        for &node_id in rev_topo_sorted.iter() {
+            let dependences = self.outlinks.get(&node_id);
+            if let Some(node) = self.get_node(node_id) {
+                let (in_tys, out_ty) = node.symbol.symbol_obj().io_types();
+                let in_links = self.inlinks(node.id);
+                if in_links.len() != in_tys.len() {
+                    return Err(format!(
+                        "Number of parameters does not match for {}, expecting {} but got {}", 
+                        node.symbol.symbol_name(), in_tys.len(), in_links.len()
+                    ));
+                }
+                for in_ty in in_tys {
+                    
+                }
+            }
+        }
         unimplemented!()
     }
 }

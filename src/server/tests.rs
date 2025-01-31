@@ -5,8 +5,7 @@ use crate::server::*;
 use crate::{client, ram::cell::OwnedCell};
 use dovahkiin::types::custom_types::id::Id;
 use futures::stream::FuturesUnordered;
-use rand::rngs::SmallRng;
-use rand::{Rng, SeedableRng};
+use rand::prelude::*;
 use std::env;
 use std::sync::Arc;
 use test::Bencher;
@@ -207,7 +206,7 @@ pub async fn smoke_test_parallel() {
         info!("Schduling test task {}", i);
         tasks.push(tokio::spawn(async move {
             let id = Id::new(1, i as u64);
-            let mut rng = SmallRng::from_entropy();
+            let mut rng = SmallRng::from_rng(&mut rand::rng());
             for j in 0..num {
                 debug!("Smoke test i {}, j {}", i, j);
                 if j > 1 && rng.gen_range(0..8) == 4 {

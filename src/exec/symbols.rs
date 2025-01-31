@@ -171,6 +171,13 @@ macro_rules! def_symbols {
             pub fn symbol_obj(&self) -> &Box<dyn SymbolObj> {
                 &NEB_SYMBOL_OBJS[&(*self as u64)]
             }
+            pub fn symbol_name(&self) -> &'static str {
+                match self {
+                    $(
+                        Self::$symbol =>  $sym_name
+                    ),*
+                }
+            }
         }
         pub mod objs {
             use dovahkiin::expr::serde::Expr;
@@ -257,7 +264,7 @@ pub enum BasicType {
     Str,
     Dynamic,
     Anything,
-    Array
+    Array,
 }
 
 def_symbols! {
@@ -288,9 +295,9 @@ def_symbols! {
     "can-cast?" => CanCast ([Type, Either(Dynamic)] => Either(Bool)) - [O],
 
     //***** NARROW *****//
-    "filter-map" => FilterMap ([Stream(Dynamic)] => Stream(Dynamic)) - [T],
-    "filter" => Filter ([Stream(Dynamic)] => Stream(Dynamic)) - [T],
-    "map" => Map ([Stream(Dynamic)] => Stream(Anything)) - [T],
+    "filter-map" => FilterMap ([Expr, Stream(Dynamic), Stream(Dynamic)] => Stream(Dynamic)) - [T],
+    "filter" => Filter ([Expr, Stream(Bool), Stream(Dynamic)] => Stream(Dynamic)) - [T],
+    "map" => Map ([Expr, Stream(Dynamic)] => Stream(Anything)) - [T],
 
     // Final Iterater
     "concat" => Concat ([Stream(Dynamic), Stream(Dynamic)] => Stream(Dynamic)) - [T],
