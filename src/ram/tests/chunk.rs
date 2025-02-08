@@ -183,24 +183,10 @@ pub fn simple_cell_rw() {
 pub fn array_dyn_map() {
     let _ = env_logger::try_init();
     let id1 = Id::new(1, 1);
-    let fields = Field::new(
-        &String::from("*"),
-        Type::Map,
-        false,
-        false,
-        Some(vec![
-            Field::new(
-                &String::from("fixed"),
-                Type::U32,
-                false,
-                false,
-                None,
-                vec![],
-            ),
-            dyn_map_field("dynamic"),
-        ]),
-        vec![],
-    );
+    let fields = Field::new_schema(vec![
+        Field::new_unindexed("fixed", Type::U32),
+        dyn_map_field("dynamic"),
+    ]);
     let schema = Schema::new("array_dyn_map", None, fields, false, true);
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());

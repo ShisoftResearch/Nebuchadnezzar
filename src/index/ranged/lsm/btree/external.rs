@@ -407,26 +407,11 @@ pub fn page_schema() -> Schema {
         *PAGE_SCHEMA_ID,
         &String::from(PAGE_SCHEMA),
         None,
-        Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(NEXT_FIELD, Type::Id, false, false, None, vec![]),
-                Field::new(PREV_FIELD, Type::Id, false, false, None, vec![]),
-                Field::new(
-                    KEYS_FIELD,
-                    // The small bytes is for keys
-                    Type::SmallBytes,
-                    false,
-                    true,
-                    None,
-                    vec![],
-                ),
-            ]),
-            vec![],
-        ),
+        Field::new_schema(vec![
+            Field::new_unindexed(NEXT_FIELD, Type::Id),
+            Field::new_unindexed(PREV_FIELD, Type::Id),
+            Field::new_unindexed_array(KEYS_FIELD, Type::SmallBytes),
+        ]),
         false,
         false,
     )

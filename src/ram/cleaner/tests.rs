@@ -25,16 +25,11 @@ fn default_cell(id: &Id) -> OwnedCell {
 }
 
 fn default_fields() -> Field {
-    Field::new(
-        "*",
-        Type::Map,
-        false,
-        false,
-        Some(vec![
-            Field::new("id", Type::I32, false, false, None, vec![]),
-            Field::new("data", Type::U8, false, true, None, vec![]),
-        ]),
-        vec![],
+    Field::new_schema(
+        vec![
+            Field::new_unindexed("id", Type::I32),
+            Field::new_unindexed_array("data", Type::U8),
+        ]
     )
 }
 

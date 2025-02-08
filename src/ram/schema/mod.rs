@@ -157,6 +157,40 @@ impl Field {
             offset: None,
         }
     }
+    pub fn new_map(name: &str, sub_fields: Vec<Field>) -> Field {
+        Self::new(name, Type::Map, false, false, Some(sub_fields), vec![])
+    }
+    pub fn new_map_array(name: &str, sub_fields: Vec<Field>) -> Field {
+        Self::new(name, Type::Map, false, true, Some(sub_fields), vec![])
+    }
+    pub fn new_schema(fields: Vec<Field>) -> Field {
+        Self::new_map("*", fields)
+    }
+    pub fn new_unindexed(name: &str, data_type: Type) -> Field {
+        Self::new(name, data_type, false, false, None, vec![])
+    }
+    pub fn new_indexed(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
+        Self::new(name, data_type, false, false, None, indices)
+    }
+    pub fn new_unindexed_nullable(name: &str, data_type: Type) -> Field {
+        Self::new(name, data_type, true, false, None, vec![])
+    }
+    pub fn new_indexed_nullable(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
+        Self::new(name, data_type, true, false, None, indices)
+    }
+    pub fn new_unindexed_array(name: &str, data_type: Type) -> Field {
+        Self::new(name, data_type, false, true, None, vec![])
+    }
+    pub fn new_indexed_array(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
+        Self::new(name, data_type, false, true, None, indices)
+    }
+    pub fn new_indexed_array_nullable(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
+        Self::new(name, data_type, true, true, None, indices)
+    }
+    pub fn new_unindexed_array_nullable(name: &str, data_type: Type) -> Field {
+        Self::new(name, data_type, true, true, None, vec![])
+    }
+    
     fn assign_offsets(
         &mut self,
         offset: &mut usize,

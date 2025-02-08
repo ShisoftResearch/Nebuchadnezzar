@@ -372,17 +372,10 @@ fn lsm_treee_schema() -> Schema {
         *LSM_TREE_SCHEMA_ID,
         &String::from(LSM_TREE_SCHEMA_NAME),
         None,
-        Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(LSM_TREE_LEVELS_NAME, Type::Id, false, true, None, vec![]),
-                Field::new(LSM_TREE_MIGRATION_NAME, Type::Id, true, false, None, vec![]),
-            ]),
-            vec![],
-        ),
+        Field::new_schema(vec![
+            Field::new_unindexed_array(LSM_TREE_LEVELS_NAME, Type::Id),
+            Field::new_unindexed_nullable(LSM_TREE_MIGRATION_NAME, Type::Id),
+        ]),
         false,
         false,
     )

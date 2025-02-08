@@ -327,24 +327,14 @@ mod test {
         )
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
-        let fields = Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(
-                    DATA_1,
-                    Type::U64,
-                    false,
-                    false,
-                    None,
-                    vec![IndexType::Ranged],
-                ),
-                Field::new(DATA_2, Type::U32, false, false, None, vec![]),
-            ]),
-            vec![],
-        );
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(
+                DATA_1,
+                Type::U64,
+                vec![IndexType::Ranged],
+            ),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
         let schema_id_1 = 123;
         let schema_id_2 = 234;
         let schema_1 = Schema::new_with_id(
@@ -561,28 +551,18 @@ mod test {
         )
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
-        let fields = Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(
-                    DATA_1,
-                    Type::U64,
-                    false,
-                    false,
-                    None,
-                    vec![IndexType::Ranged],
-                ),
-                Field::new(DATA_2, Type::U32, false, false, None, vec![]),
-            ]),
-            vec![],
-        );
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(
+                DATA_1,
+                Type::U64,
+                vec![IndexType::Ranged],
+            ),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
         let schema_id_1 = 123;
         let schema_1 = Schema::new_with_id(
             schema_id_1,
-            &String::from("schema_1"),
+            "schema_1",
             None,
             fields.clone(),
             false,

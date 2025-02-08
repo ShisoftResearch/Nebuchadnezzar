@@ -79,21 +79,10 @@ pub async fn smoke_test() {
         schema_id,
         &String::from("schema"),
         None,
-        Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![Field::new(
-                DATA,
-                Type::U64,
-                false,
-                false,
-                None,
-                vec![],
-            )]),
-            vec![],
-        ),
+        Field::new_schema(vec![Field::new_unindexed(
+            DATA,
+            Type::U64,
+        )]),
         false,
         false,
     );
@@ -167,19 +156,12 @@ pub async fn smoke_test_parallel() {
     let schema_id = 123;
     let schema = Schema::new_with_id(
         schema_id,
-        &String::from("schema"),
+        "schema",
         None,
-        Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(DATA, Type::U64, false, false, None, vec![]),
-                Field::new(ARRAY, Type::U64, false, true, None, vec![]),
-            ]),
-            vec![],
-        ),
+        Field::new_schema(vec![
+            Field::new_unindexed(DATA, Type::U64),
+            Field::new_unindexed_array(ARRAY, Type::U64),
+        ]),
         false,
         false,
     );
@@ -271,21 +253,10 @@ pub async fn txn() {
         schema_id,
         &String::from("schema"),
         None,
-        Field::new(
-            "*",
-            Type::Map,
-            false,
-            false,
-            Some(vec![Field::new(
-                DATA,
-                Type::U64,
-                false,
-                false,
-                None,
-                vec![],
-            )]),
-            vec![],
-        ),
+        Field::new_schema(vec![Field::new_unindexed(
+            DATA,
+            Type::U64,
+        )]),
         false,
         false,
     );

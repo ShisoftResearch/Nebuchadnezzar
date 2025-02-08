@@ -174,21 +174,7 @@ mod tests {
             11,
             &String::from("test"),
             None,
-            Field::new(
-                "*",
-                Type::Id,
-                false,
-                false,
-                Some(vec![Field::new(
-                    "data",
-                    Type::U8,
-                    false,
-                    false,
-                    None,
-                    vec![],
-                )]),
-                vec![],
-            ),
+            Field::new_schema(vec![Field::new_unindexed("data", Type::U8)]),
             false,
             false,
         )

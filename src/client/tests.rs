@@ -411,34 +411,13 @@ pub async fn server_isolation() {
     );
     let schema2 = Schema::new_with_id(
         2,
-        &String::from("test"),
+        "test",
         None,
-        Field::new(
-            &String::from("*"),
-            Type::Map,
-            false,
-            false,
-            Some(vec![
-                Field::new(&String::from("-id"), Type::U32, false, false, None, vec![]),
-                Field::new(
-                    &String::from("-name"),
-                    Type::String,
-                    false,
-                    false,
-                    None,
-                    vec![],
-                ),
-                Field::new(
-                    &String::from("-score"),
-                    Type::U8,
-                    false,
-                    false,
-                    None,
-                    vec![],
-                ),
-            ]),
-            vec![],
-        ),
+        Field::new_schema(vec![
+            Field::new_unindexed("-id", Type::U32),
+            Field::new_unindexed("-name", Type::String),
+            Field::new_unindexed("-score", Type::U8),
+        ]),
         false,
         false,
     );
