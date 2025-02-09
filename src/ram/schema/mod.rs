@@ -205,9 +205,33 @@ impl Field {
         vector_size: u16,
         indices: Vec<IndexType>,
     ) -> Field {
+        Self::new_vector(name, data_type, vector_size, indices, false)
+    }
+    pub fn new_indexed_vector_nullable(
+        name: &str,
+        data_type: Type,
+        vector_size: u16,
+        indices: Vec<IndexType>,
+    ) -> Field {
+        Self::new_vector(name, data_type, vector_size, indices, true)
+    }
+    pub fn new_unindexed_vector_nullable(
+        name: &str,
+        data_type: Type,
+        vector_size: u16,
+    ) -> Field {
+        Self::new_vector(name, data_type, vector_size, vec![], true)
+    }
+    pub fn new_vector(
+        name: &str,
+        data_type: Type,
+        vector_size: u16,
+        indices: Vec<IndexType>,
+        nullable: bool,
+    ) -> Field {
         Field {
             data_type,
-            nullable: false,
+            nullable,
             is_array: false,
             vector_size: Some(vector_size),
             sub_fields: None,

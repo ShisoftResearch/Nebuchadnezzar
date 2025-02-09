@@ -23,6 +23,8 @@ pub fn complex_fields() -> Field {
         Field::new_unindexed("id", Type::I64),
         Field::new_unindexed_array("strings", Type::String),
         Field::new_unindexed("num", Type::U64),
+        Field::new_unindexed_vector("vec1", Type::F64, 16),
+        Field::new_unindexed_vector_nullable("vec2", Type::F32, 8),
         Field::new_unindexed_array_nullable("nums", Type::U64),
         Field::new_map(
             "sub",

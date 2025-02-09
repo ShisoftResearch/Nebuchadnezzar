@@ -143,7 +143,7 @@ pub fn plan_write_field<'a>(
         value,
         field
     );
-    if field.is_array {
+    if field.is_array || field.vector_size.is_some() {
         if let OwnedValue::Array(array) = value {
             let len = array.len();
             let mut sub_field = field.clone();

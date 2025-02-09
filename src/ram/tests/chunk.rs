@@ -237,6 +237,12 @@ pub fn complex_cell_sel_read() {
             String::from("cccc")
         ])),
         num: OwnedValue::U64(256),
+        vec1: OwnedValue::PrimArray(OwnedPrimArray::F64(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0
+        ])),
+        vec2: OwnedValue::PrimArray(OwnedPrimArray::F32(vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0
+        ])),
         nums: OwnedValue::PrimArray(OwnedPrimArray::U64(vec![
             512, 1024, 2048
         ])),
@@ -335,6 +341,24 @@ pub fn complex_cell_sel_read() {
             .data
             .owned();
         assert_eq!(&partial_cell[0usize], &cell["sub"]["sub4"]["sub4sub3"]);
+    }
+    {
+        // Selecting vector
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("vec1")]))
+            .unwrap()
+            .data
+            .owned();
+        assert_eq!(&partial_cell[0usize], &cell["vec1"]);
+    }
+    {
+        // Selecting nullable vector
+        let partial_cell = chunks
+            .read_selected(&id1, &key_hashes(&vec![String::from("vec2")]))
+            .unwrap()
+            .data
+            .owned();
+        assert_eq!(&partial_cell[0usize], &cell["vec2"]);
     }
     {
         // Selecting multiple
