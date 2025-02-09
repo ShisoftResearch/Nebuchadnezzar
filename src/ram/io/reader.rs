@@ -11,6 +11,17 @@ use dovahkiin::ahash::HashMap;
 use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
 use std::mem;
 
+/// Reads a field from memory at the given base pointer according to the field's schema.
+/// 
+/// # Arguments
+/// * `base_ptr` - Base memory address to read from
+/// * `field` - Schema field definition containing type and layout information
+/// * `is_var` - Whether this field is part of a variable-sized region
+/// * `tail_offset` - Current offset into variable-sized region, updated as fields are read
+/// * `force_mono` - If true, treats array fields as single values
+///
+/// # Returns
+/// A SharedValue containing the field's data read from memory
 fn read_field<'v>(
     base_ptr: usize,
     field: &Field,
@@ -18,11 +29,19 @@ fn read_field<'v>(
     tail_offset: &mut usize,
     force_mono: bool,
 ) -> SharedValue<'v> {
-    let field_nullable = field.nullable;
-    let field_is_array = field.is_array && (!force_mono);
-    let field_var_base_ty = field.data_type.size().is_none() && field.sub_fields.is_none();
-    let field_is_var = field_var_base_ty || field.is_array;
+    // Determine key properties of the field that affect how we read it
+    let field_nullable = field.nullable;  // Can the field be null?
+    let field_is_array_or_vec = (field.is_array || field.vector_size.is_some()) && (!force_mono);  // Is it an array/vector and not forced to be treated as single value?
+    let field_var_base_ty = field.data_type.size().is_none() && field.sub_fields.is_none();  // Does the field have variable size but no sub-fields?
+    let field_is_var = field_var_base_ty || field.is_array || field.vector_size.is_some();  // Is the field variable-sized in any way?
+
+    // Calculate where to read from and whether we need to update tail_offset after reading
+    // This complex match handles all combinations of:
+    // - Schema-defined vs variable region offsets
+    // - Nullable vs non-nullable fields
+    // - Variable vs fixed-size fields
     let (target_offset, tailing) = match (field.offset, field_is_var, field_nullable, is_var) {
+        // Case 1: Fixed-size, non-nullable field in schema region - use direct offset
         (Some(schema_field_offset), false, false, false) => {
             trace!(
                 "Using schema field offset for {}, offset {}",
@@ -31,11 +50,12 @@ fn read_field<'v>(
             );
             (schema_field_offset, false)
         }
+        // Case 2: Variable-sized or nullable field in schema region - read indirect offset
         (Some(schema_field_offset), true, _, false)
         | (Some(schema_field_offset), _, true, false) => {
-            // Var or nullable schema field
+            // Read the offset value stored at the schema offset
             let rel_offset = *u32_io::read(base_ptr + schema_field_offset) as usize;
-            if rel_offset == 0 {
+            if rel_offset == 0 {  // Zero offset indicates null for nullable fields
                 trace!(
                     "Returing Null for nullable schema field {}, type {:?}, offset {}",
                     field.name,
@@ -44,7 +64,7 @@ fn read_field<'v>(
                 );
                 return SharedValue::Null;
             } else {
-                *tail_offset = rel_offset;
+                *tail_offset = rel_offset;  // Update tail_offset to the indirect location
                 trace!(
                     "Using schema field recorded offset for {}, offset {}",
                     field.name,
@@ -53,9 +73,9 @@ fn read_field<'v>(
                 (*tail_offset, true)
             }
         }
+        // Case 3: Non-nullable field in variable region - align and use tail_offset
         (_, _, false, true) => {
-            // In-var fields, not nullable
-            *tail_offset = align_address_with_ty(field.data_type, *tail_offset);
+            *tail_offset = align_address_with_ty(field.data_type, *tail_offset);  // Ensure proper alignment
             trace!(
                 "Using non-nullable aligned tail offset for {}, offset {}",
                 field.name,
@@ -63,9 +83,9 @@ fn read_field<'v>(
             );
             (*tail_offset, true)
         }
+        // Case 4: Nullable field in variable region - check null flag then align
         (_, _, true, true) => {
-            // In-var fields, nullable
-            let is_null = *bool_io::read(base_ptr + *tail_offset) as bool;
+            let is_null = *bool_io::read(base_ptr + *tail_offset) as bool;  // Read null flag
             if is_null {
                 trace!(
                     "Returing Null for in-var nullable schema field {}, type {:?}, offset {}",
@@ -75,6 +95,7 @@ fn read_field<'v>(
                 );
                 return SharedValue::Null;
             }
+            // Skip null flag and align for data
             *tail_offset = align_address_with_ty(field.data_type, *tail_offset + 1);
             trace!(
                 "Using nullable aligned tail offset for {}, offset {}",
@@ -85,33 +106,35 @@ fn read_field<'v>(
         }
         p => unreachable!("Do not accept target offset pattern: {:?}", p),
     };
-    let (val, size) = match (field_var_base_ty, field_is_array, is_var, &field.sub_fields) {
+
+    // Read the actual field value based on its type and structure
+    let (val, size) = match (field_var_base_ty, field_is_array_or_vec, is_var, &field.sub_fields) {
+        // Case 1: Simple typed fields (primitives) - direct read
         (_, false, _, None) => {
-            // Simple typed fields
             let val = types::get_shared_val(field.data_type, base_ptr + target_offset);
             let size = if field_var_base_ty {
-                types::get_rsize(field.data_type, &val)
+                types::get_rsize(field.data_type, &val)  // Calculate size for variable-sized types
             } else {
-                types::size_of_type(field.data_type)
+                types::size_of_type(field.data_type)     // Use fixed size for fixed types
             };
             trace!(
                 "Reading schema field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
-                field.name,
-                val,
-                field.data_type,
-                size,
-                target_offset,
-                base_ptr
+                field.name, val, field.data_type, size, target_offset, base_ptr
             );
             (val, size)
         }
+        // Case 2: Array of primitives - read length then contiguous data block
         (_, true, _, None) => {
-            // Array of primitives
             let array_ptr = base_ptr + target_offset;
-            let array_len = *types::get_shared_val(Type::U32, array_ptr).u32().unwrap();
-            let slice_offset =
-                align_address_with_ty(field.data_type, target_offset + types::u32_io::type_size());
+            // If vector_size is set, use it as the array length, otherwise read from memory
+            let (array_len, raw_slice_offset) = field.vector_size.map(|v| (v as u32, target_offset)).unwrap_or_else(|| {
+                let array_len = *types::get_shared_val(Type::U32, base_ptr + target_offset).u32().unwrap();
+                let raw_slice_offset = target_offset + types::u32_io::type_size();
+                (array_len, raw_slice_offset)
+            });
+            let slice_offset = align_address_with_ty(field.data_type, raw_slice_offset);
             let mut slice_ptr = base_ptr + slice_offset;
+            // Read the entire primitive array at once
             let prim_arr = types::get_shared_prim_array_val(
                 field.data_type,
                 array_len as usize,
@@ -124,31 +147,28 @@ fn read_field<'v>(
                 )
             });
             let val = SharedValue::PrimArray(prim_arr);
-            let size = slice_ptr - array_ptr;
+            let size = slice_ptr - array_ptr;  // Calculate total size including length and data
             trace!(
                 "Reading schema prim array field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
-                field.name,
-                val,
-                field.data_type,
-                size,
-                target_offset,
-                base_ptr
+                field.name, val, field.data_type, size, target_offset, base_ptr
             );
             (val, size)
         }
+        // Case 3: Array of non-primitives - read length then each element recursively
         (_, true, _, _) => {
-            // Array of non-primitives (including maps)
-            let array_len = *types::get_shared_val(Type::U32, base_ptr + target_offset)
-                .u32()
-                .unwrap();
-            let slice_offset =
-                align_address_with_ty(field.data_type, target_offset + types::u32_io::type_size());
+            let (array_len, raw_slice_offset) = field.vector_size.map(|v| (v as u32, target_offset)).unwrap_or_else(|| {
+                let array_len = *types::get_shared_val(Type::U32, base_ptr + target_offset).u32().unwrap();
+                let raw_slice_offset = target_offset + types::u32_io::type_size();
+                (array_len, raw_slice_offset)
+            });
+            let slice_offset = align_address_with_ty(field.data_type, raw_slice_offset);
             let mut vals = Vec::<SharedValue>::new();
             trace!(
                 "Reading array body for {} from offset {}, array len {}, target offset {}, used to have tailing {}", 
                 field.name, slice_offset, array_len, target_offset, tail_offset,
             );
             *tail_offset = slice_offset;
+            // Recursively read each array element
             for _ in 0..array_len {
                 let nxt_val = read_field(base_ptr, field, true, tail_offset, true);
                 vals.push(nxt_val);
@@ -156,35 +176,32 @@ fn read_field<'v>(
             let val = SharedValue::Array(vals);
             trace!(
                 "Reading schema non-prim field {} shared value {:?}, type {:?}, size {}, offset {}, base {}",
-                field.name,
-                val,
-                field.data_type,
-                0,
-                target_offset,
-                base_ptr
+                field.name, val, field.data_type, 0, target_offset, base_ptr
             );
-            (val, 0) // Non-promitive array size will be reflected in `tail_offset`
+            (val, 0)  // Size is tracked through tail_offset for non-primitive arrays
         }
+        // Case 4: Maps - read each sub-field recursively
         (_, false, _, Some(sub_fields)) => {
-            // Maps
             let mut map = SharedMap::new();
             trace!(
                 "Reading map body for {} from offset {}, used to have tailing {}",
-                field.name,
-                target_offset,
-                tail_offset,
+                field.name, target_offset, tail_offset,
             );
+            // Read each sub-field recursively
             for sub in sub_fields {
                 map.insert_key_id(
                     sub.name_id,
                     read_field(base_ptr, &sub, is_var, tail_offset, false),
                 );
             }
+            // Store field names for later use
             map.fields = sub_fields.iter().map(|sub| &sub.name).cloned().collect();
             let val = SharedValue::Map(map);
-            (val, 0) // Map size will be reflected in `tail_offset`
+            (val, 0)  // Size is tracked through tail_offset for maps
         }
     };
+
+    // Update tail_offset if we're reading from variable region
     if tailing {
         *tail_offset += size
     }

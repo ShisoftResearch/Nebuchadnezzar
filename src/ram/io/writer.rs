@@ -149,13 +149,7 @@ pub fn plan_write_field<'a>(
             let mut sub_field = field.clone();
             sub_field.is_array = false;
             trace!("Pushing array len inst with {} at {}", len, *offset);
-            *offset = align_ptr_addr(*offset);
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
+            plan_write_array_len(len, offset, &sub_field, value, &mut ins)?;
             for val in array {
                 plan_write_field(offset, &sub_field, val, &mut ins, true)?;
             }
@@ -164,13 +158,7 @@ pub fn plan_write_field<'a>(
             let size = array.size();
             // for prim array, just clone it and push into the instruction list with length
             trace!("Pushing prim array len inst with {} at {}", len, *offset);
-            *offset = align_ptr_addr(*offset);
-            ins.push(Instruction {
-                data_type: types::ARRAY_LEN_TYPE,
-                val: InstData::Val(OwnedValue::U32(len as u32)),
-                offset: *offset,
-            });
-            *offset += types::u32_io::type_size();
+            plan_write_array_len(len, offset, field, value, &mut ins)?;
             trace!(
                 "Pushing prim array ref inst with {:?} at {}",
                 value,
@@ -207,6 +195,29 @@ pub fn plan_write_field<'a>(
             new_offset
         );
         *offset = new_offset;
+    }
+    return Ok(());
+}
+
+fn plan_write_array_len<'a>(
+    len: usize,
+    offset: &mut usize,
+    field: &Field,
+    value: &'a OwnedValue,
+    ins: &mut WriteInstructions<'a>,
+) -> Result<(), WriteError> {
+    *offset = align_ptr_addr(*offset);
+    if let Some(vector_size) = field.vector_size {
+        if vector_size as usize != len {
+            return Err(WriteError::DataMismatchSchema(field.clone(), value.clone()));
+        }
+    } else {
+        ins.push(Instruction {
+            data_type: types::ARRAY_LEN_TYPE,
+            val: InstData::Val(OwnedValue::U32(len as u32)),
+            offset: *offset,
+        });
+        *offset += types::u32_io::type_size();
     }
     return Ok(());
 }

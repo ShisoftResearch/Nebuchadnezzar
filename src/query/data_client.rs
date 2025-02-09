@@ -328,11 +328,7 @@ mod test {
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
         let fields = Field::new_schema(vec![
-            Field::new_indexed(
-                DATA_1,
-                Type::U64,
-                vec![IndexType::Ranged],
-            ),
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id_1 = 123;
@@ -552,11 +548,7 @@ mod test {
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
         let fields = Field::new_schema(vec![
-            Field::new_indexed(
-                DATA_1,
-                Type::U64,
-                vec![IndexType::Ranged],
-            ),
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Ranged]),
             Field::new_unindexed(DATA_2, Type::U32),
         ]);
         let schema_id_1 = 123;

@@ -121,6 +121,7 @@ pub struct Field {
     pub data_type: Type,
     pub nullable: bool,
     pub is_array: bool,
+    pub vector_size: Option<u16>,
     pub sub_fields: Option<Vec<Field>>,
     pub sub_fields_map: Option<HashMap<u64, usize>>,
     pub name: String,
@@ -155,6 +156,7 @@ impl Field {
             sub_fields_map,
             indices,
             offset: None,
+            vector_size: None,
         }
     }
     pub fn new_map(name: &str, sub_fields: Vec<Field>) -> Field {
@@ -184,13 +186,38 @@ impl Field {
     pub fn new_indexed_array(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
         Self::new(name, data_type, false, true, None, indices)
     }
-    pub fn new_indexed_array_nullable(name: &str, data_type: Type, indices: Vec<IndexType>) -> Field {
+    pub fn new_indexed_array_nullable(
+        name: &str,
+        data_type: Type,
+        indices: Vec<IndexType>,
+    ) -> Field {
         Self::new(name, data_type, true, true, None, indices)
     }
     pub fn new_unindexed_array_nullable(name: &str, data_type: Type) -> Field {
         Self::new(name, data_type, true, true, None, vec![])
     }
-    
+    pub fn new_unindexed_vector(name: &str, data_type: Type, vector_size: u16) -> Field {
+        Self::new_indexed_vector(name, data_type, vector_size, vec![])
+    }
+    pub fn new_indexed_vector(
+        name: &str,
+        data_type: Type,
+        vector_size: u16,
+        indices: Vec<IndexType>,
+    ) -> Field {
+        Field {
+            data_type,
+            nullable: false,
+            is_array: false,
+            vector_size: Some(vector_size),
+            sub_fields: None,
+            sub_fields_map: None,
+            name: name.to_string(),
+            name_id: types::key_hash(name),
+            indices,
+            offset: None,
+        }
+    }
     fn assign_offsets(
         &mut self,
         offset: &mut usize,
@@ -264,7 +291,9 @@ impl Field {
         );
     }
     pub fn is_var(&self) -> bool {
-        self.is_array || (!types::fixed_size(self.data_type) && self.sub_fields.is_none())
+        self.is_array
+            || self.vector_size.is_some()
+            || (!types::fixed_size(self.data_type) && self.sub_fields.is_none())
     }
     pub fn field_by_name_id(&self, name_id: &u64) -> Option<&Field> {
         self.sub_fields_map.as_ref().and_then(|m| {

@@ -25,12 +25,10 @@ fn default_cell(id: &Id) -> OwnedCell {
 }
 
 fn default_fields() -> Field {
-    Field::new_schema(
-        vec![
-            Field::new_unindexed("id", Type::I32),
-            Field::new_unindexed_array("data", Type::U8),
-        ]
-    )
+    Field::new_schema(vec![
+        Field::new_unindexed("id", Type::I32),
+        Field::new_unindexed_array("data", Type::U8),
+    ])
 }
 
 #[test]

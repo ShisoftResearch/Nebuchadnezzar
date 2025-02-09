@@ -79,10 +79,7 @@ pub async fn smoke_test() {
         schema_id,
         &String::from("schema"),
         None,
-        Field::new_schema(vec![Field::new_unindexed(
-            DATA,
-            Type::U64,
-        )]),
+        Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
         false,
         false,
     );
@@ -253,10 +250,7 @@ pub async fn txn() {
         schema_id,
         &String::from("schema"),
         None,
-        Field::new_schema(vec![Field::new_unindexed(
-            DATA,
-            Type::U64,
-        )]),
+        Field::new_schema(vec![Field::new_unindexed(DATA, Type::U64)]),
         false,
         false,
     );

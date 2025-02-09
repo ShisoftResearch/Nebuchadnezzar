@@ -2,7 +2,10 @@
 // It can be used on local execution and distributed execution
 // depends on the model
 
-use std::{any::Any, collections::{BTreeMap, HashMap, VecDeque}};
+use std::{
+    any::Any,
+    collections::{BTreeMap, HashMap, VecDeque},
+};
 
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::OwnedValue;
@@ -289,8 +292,6 @@ impl DAG {
         }
     }
 
-
-
     pub fn static_type_check(&self, rev_topo_sorted: &Vec<u32>) -> Result<(), String> {
         for &node_id in rev_topo_sorted.iter() {
             let dependences = self.outlinks.get(&node_id);
@@ -299,13 +300,13 @@ impl DAG {
                 let in_links = self.inlinks(node.id);
                 if in_links.len() != in_tys.len() {
                     return Err(format!(
-                        "Number of parameters does not match for {}, expecting {} but got {}", 
-                        node.symbol.symbol_name(), in_tys.len(), in_links.len()
+                        "Number of parameters does not match for {}, expecting {} but got {}",
+                        node.symbol.symbol_name(),
+                        in_tys.len(),
+                        in_links.len()
                     ));
                 }
-                for in_ty in in_tys {
-                    
-                }
+                for in_ty in in_tys {}
             }
         }
         unimplemented!()
