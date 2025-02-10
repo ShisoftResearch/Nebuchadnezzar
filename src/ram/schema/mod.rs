@@ -46,7 +46,6 @@ pub struct Schema {
 pub enum IndexType {
     Ranged,
     Hashed,
-    Vectorized,
     Statistics,
 }
 
