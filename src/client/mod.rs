@@ -14,7 +14,7 @@ use std::io;
 use std::mem;
 use std::sync::Arc;
 
-use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
+use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
@@ -280,6 +280,10 @@ impl AsyncClient {
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await
     }
+}
+
+pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
+    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
 }
 
 pub async fn client_by_server_id(

@@ -17,6 +17,16 @@ impl RandValue for Id {
     }
 }
 
+pub trait RandId: RandValue {
+    fn rand_lower() -> Self;
+}
+
+impl RandId for Id {
+    fn rand_lower() -> Self {
+        Id::new(0, RAND_GEN.rand() as u64)
+    }
+}
+
 pub trait FromHeader {
     fn from_header(header: &CellHeader) -> Self;
 }
