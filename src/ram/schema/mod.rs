@@ -213,11 +213,7 @@ impl Field {
     ) -> Field {
         Self::new_vector(name, data_type, vector_size, indices, true)
     }
-    pub fn new_unindexed_vector_nullable(
-        name: &str,
-        data_type: Type,
-        vector_size: u16,
-    ) -> Field {
+    pub fn new_unindexed_vector_nullable(name: &str, data_type: Type, vector_size: u16) -> Field {
         Self::new_vector(name, data_type, vector_size, vec![], true)
     }
     pub fn new_vector(
