@@ -14,7 +14,6 @@ use crate::{
 use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
-use itertools::Itertools;
 use lightning::linked_map::LinkedHashMap;
 use lightning::map::*;
 use lightning::ttl_cache::TTLCache;
@@ -98,7 +97,7 @@ impl Chunk {
                 panic!(
                     "Cannot get header segment with id: {}, have ids {:?}",
                     head_seg_id,
-                    self.segs.iter_front_keys().collect_vec()
+                    self.segs.iter_front_keys().collect::<Vec<_>>()
                 );
             });
             match head.try_acquire(size) {
@@ -450,7 +449,7 @@ impl Chunk {
                 cell_id,
                 addr,
                 seg_id,
-                self.segs.iter_front_keys().collect_vec()
+                self.segs.iter_front_keys().collect::<Vec<_>>()
             );
         }
         return res;
@@ -858,7 +857,7 @@ impl Chunks {
         self.list
             .iter()
             .map(|c| c.statistics.schemas.get(&schema_id))
-            .collect_vec()
+            .collect()
     }
     pub fn ensure_statistics(&self) {
         self.list

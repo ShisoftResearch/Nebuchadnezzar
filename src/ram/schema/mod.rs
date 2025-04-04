@@ -4,7 +4,6 @@ use bifrost::raft::state_machine::master::ExecError;
 use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
-use itertools::Itertools;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
 use std::collections::HashMap;
 use std::mem;
@@ -484,7 +483,7 @@ impl LocalSchemasMap {
                 debug_assert_eq!(id, s_ref.id);
                 (&*s_ref).clone()
             })
-            .collect_vec()
+            .collect::<Vec<_>>()
     }
 
     fn del_schema(&self, name: &str) {

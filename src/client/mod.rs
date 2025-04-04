@@ -42,10 +42,6 @@ pub struct AsyncClient {
     pub schema_client: SchemaClient,
 }
 
-pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
-}
-
 impl AsyncClient {
     pub async fn new<'a>(
         subscription_server: &Arc<RPCServer>,
