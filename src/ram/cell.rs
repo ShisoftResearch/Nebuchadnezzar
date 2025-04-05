@@ -105,23 +105,27 @@ impl OwnedCell {
         Id::from_obj(&(schema_id, value))
     }
 
-    pub fn new(schema: &Schema, value: OwnedValue) -> Option<Self> {
-        let schema_id = schema.id;
-        let id = if let OwnedValue::Map(ref data) = value {
-            match schema.key_field {
+    pub fn default_id(schema_id: u32, value: &OwnedValue, schema: &Schema) -> Id {
+        let key_field = &schema.key_field;
+        if let OwnedValue::Map(ref data) = value {
+            match key_field {
                 Some(ref keys) => {
                     let value = data.get_in_by_ids(keys.iter());
                     match value {
-                        &OwnedValue::Null => return None,
-                        _ => Self::encode_cell_key(schema_id, value),
+                        &OwnedValue::Null => {},
+                        _ => return Self::encode_cell_key(schema_id, value),
                     }
                 }
-                None => Id::rand(),
+                None => {},
             }
-        } else {
-            Id::rand()
-        };
-        Some(Self::new_with_id(schema_id, &id, value))
+        }
+        return Id::rand();
+    }
+
+    pub fn new(schema: &Schema, value: OwnedValue) -> Self {
+        let schema_id = schema.id;
+        let id = Self::default_id(schema_id, &value, schema);
+        Self::new_with_id(schema_id, &id, value)
     }
 
     pub fn write_to_chunk_with_schema(
