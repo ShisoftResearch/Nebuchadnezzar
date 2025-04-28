@@ -27,7 +27,7 @@ pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
-    pub segs: LinkedHashMap<usize, Arc<Segment>, 64>,
+    pub segs: LinkedHashMap<usize, Arc<Segment>>,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,

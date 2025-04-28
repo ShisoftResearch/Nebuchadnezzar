@@ -59,7 +59,7 @@ impl CellHistory {
 
 pub struct DataManager {
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
-    cell_lru: LRUCache<Id, i64, LRU_PAGE_SIZE>,
+    cell_lru: LRUCache<Id, i64>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
     managers: LFMap<u64, Arc<manager::AsyncServiceClient>>,
