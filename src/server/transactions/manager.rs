@@ -599,10 +599,12 @@ impl TransactionManager {
     fn generate_affected_objs(&self, txn: &mut TxnGuard) {
         let mut affected_objs = AffectedObjs::new();
         for (id, data_obj) in txn.data.drain() {
-            affected_objs
-                .entry(data_obj.server)
-                .or_insert_with(|| BTreeMap::new())
-                .insert(id, data_obj);
+            if data_obj.changed {
+                affected_objs
+                    .entry(data_obj.server)
+                    .or_insert_with(|| BTreeMap::new())
+                    .insert(id, data_obj);
+            }
         }
         txn.affected_objects = affected_objs;
     }
