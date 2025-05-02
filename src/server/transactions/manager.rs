@@ -491,15 +491,14 @@ impl TransactionManager {
                 Ok(dsr) => {
                     self.merge_clock(&dsr.clock);
                     let payload = dsr.payload;
-                    let payload_out = payload.clone();
-                    match payload {
+                    match &payload {
                         TxnExecResult::Accepted(cell) => {
                             txn.data.insert(
                                 id.clone(),
                                 DataObject {
                                     server: server_id,
                                     version: Some(cell.header.version),
-                                    cell: Some(cell),
+                                    cell: Some(cell.clone()),
                                     new: false,
                                     changed: false,
                                 },
@@ -511,7 +510,7 @@ impl TransactionManager {
                         }
                         _ => {}
                     }
-                    return Ok(payload_out);
+                    return Ok(payload);
                 }
                 Err(e) => {
                     error!("{:?}", e);
