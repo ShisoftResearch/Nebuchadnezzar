@@ -9,6 +9,7 @@ use super::align_address_with_ty;
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
 use dovahkiin::ahash::HashMap;
 use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
+use std::collections::BTreeMap;
 use std::mem;
 
 /// Reads a field from memory at the given base pointer according to the field's schema.
@@ -314,7 +315,7 @@ fn read_dynamic_value<'a, 'v>(ptr: &'a mut usize, type_id: u8) -> SharedValue<'v
             .iter()
             .map(|n| key_hash(n))
             .zip(fields)
-            .collect::<HashMap<_, _>>();
+            .collect();
         return SharedValue::Map(SharedMap {
             fields: field_names,
             map,
