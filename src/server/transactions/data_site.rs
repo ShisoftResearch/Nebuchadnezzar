@@ -11,6 +11,7 @@ use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use lightning::linked_list::LinkedList;
 use lightning::linked_map::LinkedHashMap;
 use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
@@ -60,8 +61,8 @@ impl CellHistory {
 
 pub struct DataManager {
     cells: LFMap<Id, Arc<Mutex<CellMeta>>>,
-    cell_lru: LinkedHashMap<Id, i64>,
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
+    cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
     managers: LFMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
@@ -92,8 +93,8 @@ impl DataManager {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             cells: LFMap::with_capacity(256),
-            cell_lru: LinkedHashMap::with_capacity(256),
             txns: LFMap::with_capacity(128),
+            cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
             managers: LFMap::with_capacity(16),
             server: server.clone(),
@@ -133,11 +134,8 @@ impl DataManager {
         }
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        {
-            let lru = &self.cell_lru;
-            lru.insert_back(*id, get_time());
-        }
         self.cells.get_or_insert(*id, || {
+            self.cell_list.push_back(*id);
             Arc::new(Mutex::new(CellMeta {
                 read: TxnId::new(),
                 write: TxnId::new(),
@@ -230,27 +228,27 @@ impl DataManager {
         let now = get_time();
         let mut cell_to_evict = Vec::new();
         let mut need_break = false;
-        for (cell_id, timestamp) in self.cell_lru.iter_front() {
+        for cell_id_ref in self.cell_list.iter_front() {
+            let cell_id = cell_id_ref.deref();
             if let Some(cell_meta) = self.cells.get(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction
                     && meta.read < oldest_transaction
-                    && now - timestamp > 5 * 60 * 1000
                 {
-                    cell_to_evict.push(cell_id);
+                    cell_to_evict.push(cell_id_ref);
                 } else {
                     need_break = true;
                 }
             } else {
-                cell_to_evict.push(cell_id);
+                cell_to_evict.push(cell_id_ref);
             }
             if need_break {
                 break;
             }
         }
         for evicted_cell in &cell_to_evict {
-            self.cells.remove(evicted_cell);
-            self.cell_lru.remove(evicted_cell);
+            self.cells.remove(&evicted_cell.deref());
+            evicted_cell.remove();
         }
     }
     fn prepare_read<T: Send>(
