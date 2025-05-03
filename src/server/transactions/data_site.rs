@@ -225,7 +225,6 @@ impl DataManager {
                 .cloned()
                 .unwrap_or(self.server.txn_peer.clock.to_clock())
         };
-        let now = get_time();
         let mut cell_to_evict = Vec::new();
         let mut need_break = false;
         for cell_id_ref in self.cell_list.iter_front() {

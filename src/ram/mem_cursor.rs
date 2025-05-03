@@ -17,5 +17,5 @@ macro_rules! def_raw_memory_cursor_for_size {
 }
 
 pub fn release_cursor(cursor: RawMemCursor) {
-    Box::into_raw(cursor.into_inner());
+    let _ = Box::into_raw(cursor.into_inner());
 }

@@ -5,7 +5,7 @@ use crate::ram::cell::CellHeader;
 use crate::ram::tombstone::Tombstone;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
-use super::mem_cursor::Endian;
+use super::mem_cursor::{release_cursor, Endian};
 
 bitflags! {
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -55,7 +55,7 @@ impl Entry {
         cursor.write_u32::<Endian>(content_len).unwrap();
         pos += ENTRY_HEAD_SIZE;
         write_content(pos);
-        Box::into_raw(cursor.into_inner());
+        release_cursor(cursor);
     }
 
     // Returns the entry header reader returns
@@ -72,7 +72,7 @@ impl Entry {
                 content_length,
             };
             pos += ENTRY_HEAD_SIZE;
-            Box::into_raw(cursor.into_inner());
+            release_cursor(cursor);
             (entry, content_read(pos, entry))
         } else {
             panic!("Cannot decode entry header: {}", entry_type_bits);
