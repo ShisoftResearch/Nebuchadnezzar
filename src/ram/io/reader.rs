@@ -219,7 +219,7 @@ fn read_field<'v>(
                 );
             }
             // Store field names for later use
-            map.fields = sub_fields.iter().map(|sub| &sub.name).cloned().collect();
+            // map.fields = sub_fields.iter().map(|sub| &sub.name).cloned().collect();
             let val = SharedValue::Map(map);
             (val, 0) // Size is tracked through tail_offset for maps
         }
