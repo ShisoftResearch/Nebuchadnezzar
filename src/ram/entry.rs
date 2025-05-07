@@ -8,7 +8,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use super::mem_cursor::{release_cursor, Endian};
 
 bitflags! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
     pub struct EntryType: u32 {
         const UNDECIDED =   0b0000;
         const CELL =        0b0001;
@@ -18,7 +18,7 @@ bitflags! {
 
 pub const ENTRY_HEAD_SIZE: usize = mem::size_of::<u64>();
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct EntryHeader {
     pub entry_type: EntryType,
     pub content_length: u32,

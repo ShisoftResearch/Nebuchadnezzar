@@ -45,7 +45,7 @@ impl<'a> Iterator for IdCellSelect<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if let Some(id) = self.iter.next() {
-                match self.chunks.read_selected(&id, &self.fields) {
+                match self.chunks.read_selected(&id, &self.fields, true) {
                     Ok(res) => return Some(res),
                     Err(e) => error!("Error on selecting cell with id {:?}, error {:?}", id, e),
                 }

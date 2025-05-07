@@ -320,7 +320,7 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_selected(&id, &fields[..]) {
+        match self.server.chunks.read_selected(&id, &fields[..], true) { // Need header for version check
             Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }

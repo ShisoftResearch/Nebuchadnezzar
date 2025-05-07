@@ -208,7 +208,7 @@ fn build_partitation_statistics(
                     if !fields.is_empty() {
                         trace!("Schema {} has fields {:?}", schema_id, fields);
                         if let Ok((partial_cell, _)) =
-                            select_from_chunk_raw(*loc, chunk, fields.as_slice())
+                            select_from_chunk_raw(*loc, chunk, fields.as_slice(), true)
                         {
                             let field_array = match partial_cell {
                                 SharedValue::Array(arr) => arr,

@@ -22,7 +22,7 @@ pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_CELL_RPC_SERVICE) as u64;
 service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells(keys: &Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
-    rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>, need_header: bool) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -51,13 +51,14 @@ impl Service for NebRPCService {
         &self,
         keys: &Vec<Id>,
         colums: &Vec<u64>,
+        need_header: bool,
     ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
                 .map(|id| {
                     self.server
                         .chunks
-                        .read_selected(&id, colums.as_slice())
+                        .read_selected(&id, colums.as_slice(), need_header)
                         .map(|c| c.to_owned())
                 })
                 .collect(),
@@ -96,7 +97,7 @@ impl Service for NebRPCService {
                 .collect_vec()
         } else {
             keys.iter()
-                .map(|id| self.server.chunks.read_selected(id, colums.as_slice()))
+                .map(|id| self.server.chunks.read_selected(id, colums.as_slice(), true))
                 .collect_vec()
         };
         if (!filter_empty) | (!proc_empty) {

@@ -347,8 +347,9 @@ impl<'a> SharedCell<'a> {
         ptr: WordMutexGuard<'a>,
         chunk: &'a Chunk,
         fields: &[u64],
+        need_header: bool,
     ) -> Result<SharedCell<'a>, ReadError> {
-        select_from_chunk_raw(*ptr, chunk, fields).map(|(val, hdr)| SharedData {
+        select_from_chunk_raw(*ptr, chunk, fields, need_header).map(|(val, hdr)| SharedData {
             guard: ptr,
             inner: SharedCellData::from_data(hdr, val),
         })
@@ -426,12 +427,28 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHead
     Ok(header)
 }
 
+pub fn entry_header_from_chunk_raw(ptr: usize) -> Result<(usize, EntryHeader), ReadError> {
+    if ptr == 0 {
+        return Err(ReadError::CellIdIsUnitId);
+    }
+    let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
+        (addr + CELL_HEADER_SIZE, entry_header)
+    });
+    Ok(header)
+}
+
 pub fn select_from_chunk_raw<'v>(
     ptr: usize,
     chunk: &Chunk,
     fields: &[u64],
+    need_header: bool,
 ) -> Result<(SharedValue<'v>, CellHeader), ReadError> {
-    let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
+    let (header, data_ptr, _) = if need_header {
+        header_from_chunk_raw(ptr)?
+    } else {
+        let (data_ptr, entry_header) = entry_header_from_chunk_raw(ptr)?;
+        (CellHeader::default(), data_ptr, entry_header)
+    };
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {
         Ok((
