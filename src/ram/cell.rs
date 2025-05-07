@@ -267,7 +267,7 @@ pub struct SharedCellData<'v> {
 impl<'v> SharedCellData<'v> {
     //TODO: check or set checksum from crc32c cell content
     pub fn from_chunk_raw(ptr: usize, chunk: &Chunk) -> Result<(Self, SchemaRef), ReadError> {
-        let (header, data_ptr, _) = header_from_chunk_raw(ptr)?;
+        let (header, data_ptr) = header_from_chunk_raw(ptr)?;
         let schema_id = &header.schema;
         if let Some(schema) = chunk.meta.schemas.get(schema_id) {
             let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
@@ -403,7 +403,7 @@ impl<'v> Cell for SharedCellData<'v> {
     }
 }
 
-pub fn cell_header_from_entry_content_addr(addr: usize, _entry_header: &EntryHeader) -> CellHeader {
+pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {
     let mut cursor = addr_to_header_cursor(addr);
     let header = CellHeader {
         version: cursor.read_u64::<Endian>().unwrap(),
@@ -416,31 +416,26 @@ pub fn cell_header_from_entry_content_addr(addr: usize, _entry_header: &EntryHea
     return header;
 }
 
-pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHeader), ReadError> {
+pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
     }
-    let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
-        assert_eq!(entry_header.entry_type, EntryType::CELL);
-        let header = cell_header_from_entry_content_addr(addr, &entry_header);
-        (header, addr + CELL_HEADER_SIZE, entry_header)
-    });
-    Ok(header)
+    let addr = Entry::content_pos(ptr);
+    let header = cell_header_from_entry_content_addr(addr);
+    Ok((header, addr + CELL_HEADER_SIZE))
 }
 
-pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHeader), ReadError> {
+pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
     }
-    let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
-        let mut header = CellHeader::default();
-        let schema = unsafe {
-            ptr::read((addr + 8 + 4) as *const u32)
-        };
-        header.schema = schema;
-        (header, addr + CELL_HEADER_SIZE, entry_header)
-    });
-    Ok(header)
+    let mut header = CellHeader::default();
+    let addr = Entry::content_pos(ptr);
+    let schema = unsafe {
+        ptr::read((addr + 8 + 4) as *const u32)
+    };
+    header.schema = schema;
+    Ok((header, addr + CELL_HEADER_SIZE))
 }
 
 pub fn select_from_chunk_raw<'v>(
@@ -449,7 +444,7 @@ pub fn select_from_chunk_raw<'v>(
     fields: &[u64],
     need_header: bool,
 ) -> Result<(SharedValue<'v>, CellHeader), ReadError> {
-    let (header, data_ptr, _) = if need_header {
+    let (header, data_ptr) = if need_header {
         header_from_chunk_raw(ptr)?
     } else {
         minimal_header_from_chunk_raw(ptr)?

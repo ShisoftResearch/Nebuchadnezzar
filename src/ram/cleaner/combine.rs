@@ -240,7 +240,7 @@ impl CombinedCleaner {
                             } else {
                                 #[cfg(debug_assertions)]
                                 {
-                                    let (current_header, _, _) = cell::header_from_chunk_raw(*actual_addr).unwrap();
+                                    let (current_header, _) = cell::header_from_chunk_raw(*actual_addr).unwrap();
                                     assert!(
                                         current_header.version > ver, 
                                         "Cell {} with address {} changed to {} but version running backwards {} -> {}",

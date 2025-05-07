@@ -58,6 +58,10 @@ impl Entry {
         release_cursor(cursor);
     }
 
+    pub fn content_pos(pos: usize) -> usize {
+        pos + ENTRY_HEAD_SIZE
+    }
+
     // Returns the entry header reader returns
     pub fn decode_from<R, RR>(mut pos: usize, content_read: R) -> (EntryHeader, RR)
     where
@@ -71,7 +75,7 @@ impl Entry {
                 entry_type,
                 content_length,
             };
-            pos += ENTRY_HEAD_SIZE;
+            pos = Self::content_pos(pos);
             release_cursor(cursor);
             (entry, content_read(pos, entry))
         } else {

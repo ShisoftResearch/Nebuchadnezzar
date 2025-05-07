@@ -653,8 +653,7 @@ impl Chunk {
                     EntryType::CELL => {
                         trace!("Entry at {} is a cell", entry_meta.entry_pos);
                         let cell_header =
-                            cell_header_from_entry_content_addr(
-                                entry_meta.body_pos, &entry_header);
+                            cell_header_from_entry_content_addr(entry_meta.body_pos);
                         trace!("Cell header read, id is {:?}", cell_header.id());
                         let expect = Some(entry_meta.entry_pos);
                         let actual = chunk_index.get_from_mutex(&(cell_header.hash as usize));

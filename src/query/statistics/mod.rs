@@ -16,7 +16,7 @@ use dovahkiin::types::{Map, SharedValue};
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},
     chunk::Chunk,
-    clock::now,
+    clock::now, entry::Entry,
 };
 
 #[derive(Debug, Default)]
@@ -199,8 +199,9 @@ fn build_partitation_statistics(
             continue;
         };
         match header_from_chunk_raw(*loc) {
-            Ok((header, _, entry_header)) => {
-                let cell_size = entry_header.content_length as usize;
+            Ok((header, _)) => {
+                let (entry_hdr, _) = Entry::decode_from(*loc, |_, _| ());
+                let cell_size = entry_hdr.content_length as usize;
                 let cell_seg = chunk.allocator.id_by_addr(*loc);
                 let schema_id = header.schema;
                 if let Some(schema) = chunk.meta.schemas.get(&schema_id) {
