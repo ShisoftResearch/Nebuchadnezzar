@@ -5,6 +5,7 @@ use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
@@ -32,9 +33,9 @@ pub struct Schema {
     pub name: String,
     pub key_field: Option<Vec<u64>>,
     pub str_key_field: Option<Vec<String>>,
-    pub field_index: HashMap<u64, Vec<usize>>,
-    pub id_index: HashMap<u64, Vec<u64>>,
-    pub index_fields: HashMap<u64, Vec<IndexType>>,
+    pub field_index: BTreeMap<u64, Vec<usize>>,
+    pub id_index: BTreeMap<u64, Vec<u64>>,
+    pub index_fields: BTreeMap<u64, Vec<IndexType>>,
     pub fields: Field,
     pub static_bound: usize,
     pub is_dynamic: bool,
@@ -57,9 +58,9 @@ impl Schema {
         is_scannable: bool,
     ) -> Schema {
         let mut bound = 0;
-        let mut field_index = HashMap::new();
-        let mut id_index = HashMap::new();
-        let mut index_fields = HashMap::new();
+        let mut field_index = BTreeMap::new();
+        let mut id_index = BTreeMap::new();
+        let mut index_fields = BTreeMap::new();
         fields.assign_offsets(
             &mut bound,
             &mut field_index,
@@ -239,9 +240,9 @@ impl Field {
     fn assign_offsets(
         &mut self,
         offset: &mut usize,
-        field_index: &mut HashMap<u64, Vec<usize>>,
-        id_index: &mut HashMap<u64, Vec<u64>>,
-        index_fields: &mut HashMap<u64, Vec<IndexType>>,
+        field_index: &mut BTreeMap<u64, Vec<usize>>,
+        id_index: &mut BTreeMap<u64, Vec<u64>>,
+        index_fields: &mut BTreeMap<u64, Vec<IndexType>>,
         name_path: String,
         field_path: Vec<usize>,
         id_path: Vec<u64>,
