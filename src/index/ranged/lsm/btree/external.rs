@@ -356,7 +356,9 @@ where
         self.len = pos;
         debug_assert_eq!(self_len_before_merge, left_pos);
         debug_assert_eq!(right.len(), right_pos);
-        debug_assert_eq!(self.len, self_len_before_merge + right.len());
+        if cfg!(debug_assertions) && self.len != self_len_before_merge + right.len() {
+            error!("Merge sort failed, left len {}, right len {}, self len {}, self len before merge {}", self.len, right.len(), self_len_before_merge, self_len_before_merge);
+        }
         trace!(
             "Merge sorted page have keys: {:?}",
             &self.keys.as_slice_immute()[..self.len]
