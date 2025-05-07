@@ -13,6 +13,7 @@ use serde::Serialize;
 use std::io::Cursor;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
+use std::ptr;
 
 use super::io::writer::WriteInstructions;
 use super::schema::SchemaRef;
@@ -427,12 +428,17 @@ pub fn header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHead
     Ok(header)
 }
 
-pub fn entry_header_from_chunk_raw(ptr: usize) -> Result<(usize, EntryHeader), ReadError> {
+pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize, EntryHeader), ReadError> {
     if ptr == 0 {
         return Err(ReadError::CellIdIsUnitId);
     }
     let (_, header) = Entry::decode_from(ptr, |addr, entry_header| {
-        (addr + CELL_HEADER_SIZE, entry_header)
+        let mut header = CellHeader::default();
+        let schema = unsafe {
+            ptr::read((addr + 8 + 4) as *const u32)
+        };
+        header.schema = schema;
+        (header, addr + CELL_HEADER_SIZE, entry_header)
     });
     Ok(header)
 }
@@ -446,8 +452,7 @@ pub fn select_from_chunk_raw<'v>(
     let (header, data_ptr, _) = if need_header {
         header_from_chunk_raw(ptr)?
     } else {
-        let (data_ptr, entry_header) = entry_header_from_chunk_raw(ptr)?;
-        (CellHeader::default(), data_ptr, entry_header)
+        minimal_header_from_chunk_raw(ptr)?
     };
     let schema_id = &header.schema;
     if let Some(schema) = chunk.meta.schemas.get(schema_id) {

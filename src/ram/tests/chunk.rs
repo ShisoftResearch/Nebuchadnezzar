@@ -290,6 +290,28 @@ pub fn complex_cell_sel_read() {
         assert_eq!(&partial_cell[1usize], &cell["num"]);
     }
     {
+        // Verify schema id
+        let partial_cell = chunks
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![String::from("id"), String::from("num")]),
+                true,
+            )
+            .unwrap();
+        assert_eq!(partial_cell.header.schema, schema.id);
+    }
+    {
+        // Verify schema id with minimal header
+        let partial_cell = chunks
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![String::from("id"), String::from("num")]),
+                false,
+            )
+            .unwrap();
+        assert_eq!(partial_cell.header.schema, schema.id);
+    }
+    {
         // Selecting one in nested map
         let partial_cell = chunks
             .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub1")]), true)
