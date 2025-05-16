@@ -3,7 +3,7 @@ use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL};
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
@@ -279,7 +279,7 @@ impl AsyncClient {
 }
 
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<plain_server::AsyncServiceClient> {
-    plain_server::AsyncServiceClient::new(plain_server::DEFAULT_SERVICE_ID, rpc)
+    plain_server::AsyncServiceClient::new(rpc)
 }
 
 pub async fn client_by_server_id(

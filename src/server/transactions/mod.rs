@@ -1,7 +1,7 @@
 use crate::ram::cell::{OwnedCell, WriteError};
 use crate::ram::types::Id;
 use crate::server::Peer;
-use bifrost::rpc::{RPCError, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{RPCError, ServiceClient, ServiceClientWithId, DEFAULT_CLIENT_POOL};
 use bifrost::vector_clock::StandardVectorClock;
 use std::io;
 use std::sync::Arc;
@@ -140,8 +140,5 @@ pub enum TMError {
 
 pub async fn new_async_client(address: &String) -> io::Result<Arc<manager::AsyncServiceClient>> {
     let client = DEFAULT_CLIENT_POOL.get(address).await?;
-    Ok(manager::AsyncServiceClient::new(
-        manager::DEFAULT_SERVICE_ID,
-        &client,
-    ))
+    Ok(manager::AsyncServiceClient::new(&client))
 }

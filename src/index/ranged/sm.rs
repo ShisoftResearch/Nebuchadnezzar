@@ -6,7 +6,7 @@ use crate::ram::types::RandValue;
 use bifrost::conshash::ConsistentHashing;
 use bifrost::raft::state_machine::StateMachineCtl;
 use bifrost::raft::RaftService;
-use bifrost::rpc::RPCError;
+use bifrost::rpc::{RPCError, ServiceClient};
 use bifrost::utils;
 use bifrost_plugins::hash_ident;
 use futures::prelude::*;

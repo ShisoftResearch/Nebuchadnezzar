@@ -55,6 +55,8 @@ service! {
 
 dispatch_rpc_service_functions!(TransactionManager);
 
+service_with_id!(TransactionManager, DEFAULT_SERVICE_ID);
+
 pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: LFMap<TxnId, TxnMutex>,
@@ -441,7 +443,7 @@ impl TransactionManager {
         if !self.data_sites.contains_key(&server_id) {
             let client = self.server.get_member_by_server_id(server_id).await?;
             return Ok(self.data_sites.get_or_insert(server_id, || {
-                data_site::AsyncServiceClient::new(data_site::DEFAULT_SERVICE_ID, &client)
+                data_site::AsyncServiceClient::new(&client)
             }));
         }
         Ok(self.data_sites.get(&server_id).unwrap())

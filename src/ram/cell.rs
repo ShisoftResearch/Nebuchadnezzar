@@ -113,11 +113,11 @@ impl OwnedCell {
                 Some(ref keys) => {
                     let value = data.get_in_by_ids(keys.iter());
                     match value {
-                        &OwnedValue::Null => {},
+                        &OwnedValue::Null => {}
                         _ => return Self::encode_cell_key(schema_id, value),
                     }
                 }
-                None => {},
+                None => {}
             }
         }
         return Id::rand();
@@ -431,9 +431,7 @@ pub fn minimal_header_from_chunk_raw(ptr: usize) -> Result<(CellHeader, usize), 
     }
     let mut header = CellHeader::default();
     let addr = Entry::content_pos(ptr);
-    let schema = unsafe {
-        ptr::read((addr + 8 + 4) as *const u32)
-    };
+    let schema = unsafe { ptr::read((addr + 8 + 4) as *const u32) };
     header.schema = schema;
     Ok((header, addr + CELL_HEADER_SIZE))
 }

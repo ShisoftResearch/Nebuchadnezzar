@@ -16,7 +16,8 @@ use dovahkiin::types::{Map, SharedValue};
 use crate::ram::{
     cell::{header_from_chunk_raw, select_from_chunk_raw},
     chunk::Chunk,
-    clock::now, entry::Entry,
+    clock::now,
+    entry::Entry,
 };
 
 #[derive(Debug, Default)]

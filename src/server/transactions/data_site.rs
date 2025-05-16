@@ -88,6 +88,8 @@ service! {
 
 dispatch_rpc_service_functions!(DataManager);
 
+service_with_id!(DataManager, DEFAULT_SERVICE_ID);
+
 impl DataManager {
     pub fn new(server: &Arc<NebServer>) -> Arc<Self> {
         let cleanup_signal = Arc::new(AtomicBool::new(false));
@@ -201,7 +203,7 @@ impl DataManager {
             if !self.managers.contains_key(&server_id) {
                 let client = self.server.get_member_by_server_id(server_id).await?;
                 return Ok(self.managers.get_or_insert(server_id, || {
-                    manager::AsyncServiceClient::new(manager::DEFAULT_SERVICE_ID, &client)
+                    manager::AsyncServiceClient::new(&client)
                 }));
             } else {
                 if let Some(manager) = self.managers.get(&server_id) {
@@ -231,9 +233,7 @@ impl DataManager {
             let cell_id = cell_id_ref.deref();
             if let Some(cell_meta) = self.cells.get(&cell_id) {
                 let meta = cell_meta.lock();
-                if meta.write < oldest_transaction
-                    && meta.read < oldest_transaction
-                {
+                if meta.write < oldest_transaction && meta.read < oldest_transaction {
                     cell_to_evict.push(cell_id_ref);
                 } else {
                     need_break = true;
@@ -320,7 +320,8 @@ impl Service for DataManager {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
-        match self.server.chunks.read_selected(&id, &fields[..], true) { // Need header for version check
+        match self.server.chunks.read_selected(&id, &fields[..], true) {
+            // Need header for version check
             Ok(values) => self.response_with(TxnExecResult::Accepted(values.to_owned())),
             Err(read_error) => self.response_with(TxnExecResult::Error(read_error)),
         }

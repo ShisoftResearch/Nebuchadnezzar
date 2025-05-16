@@ -199,7 +199,12 @@ impl Chunk {
         SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
-    fn read_selected(&self, hash: u64, fields: &[u64], need_header: bool) -> Result<SharedCell, ReadError> {
+    fn read_selected(
+        &self,
+        hash: u64,
+        fields: &[u64],
+        need_header: bool,
+    ) -> Result<SharedCell, ReadError> {
         let loc = self.location_for_read(hash)?;
         let (val, hdr) = select_from_chunk_raw(*loc, self, fields, need_header)?;
         Ok(SharedCell::compose(
@@ -792,7 +797,12 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
-    pub fn read_selected(&self, key: &Id, fields: &[u64], need_header: bool) -> Result<SharedCell, ReadError> {
+    pub fn read_selected(
+        &self,
+        key: &Id,
+        fields: &[u64],
+        need_header: bool,
+    ) -> Result<SharedCell, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields, need_header);
     }

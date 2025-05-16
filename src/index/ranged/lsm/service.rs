@@ -97,6 +97,8 @@ service! {
     rpc stat(id: Id) -> OpResult<LSMTreeStat>;
 }
 
+service_with_id!(LSMTreeService, DEFAULT_SERVICE_ID);
+
 pub struct LSMTreeService {
     client: Arc<AsyncClient>,
     trees: Arc<HashMap<Id, Arc<DistLSMTree>>>,
@@ -498,7 +500,7 @@ unsafe impl Send for DistLSMTree {}
 unsafe impl Sync for DistLSMTree {}
 
 pub fn client_by_rpc_client(rpc: &Arc<RPCClient>) -> Arc<AsyncServiceClient> {
-    AsyncServiceClient::new(DEFAULT_SERVICE_ID, rpc)
+    AsyncServiceClient::new(rpc)
 }
 
 pub async fn locate_tree_server_from_conshash(

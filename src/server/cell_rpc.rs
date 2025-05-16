@@ -31,6 +31,8 @@ service! {
     rpc count() -> u64;
 }
 
+service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
+
 pub struct NebRPCService {
     server: Arc<NebServer>,
 }
@@ -97,7 +99,11 @@ impl Service for NebRPCService {
                 .collect_vec()
         } else {
             keys.iter()
-                .map(|id| self.server.chunks.read_selected(id, colums.as_slice(), true))
+                .map(|id| {
+                    self.server
+                        .chunks
+                        .read_selected(id, colums.as_slice(), true)
+                })
                 .collect_vec()
         };
         if (!filter_empty) | (!proc_empty) {

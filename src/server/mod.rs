@@ -228,7 +228,7 @@ impl NebServer {
             service_id: raft::DEFAULT_SERVICE_ID,
         });
         rpc_server
-            .register_service(raft::DEFAULT_SERVICE_ID, &raft_service)
+            .register_service(&raft_service)
             .await;
         Server::listen_and_resume(&rpc_server).await;
         debug!("RPC server created, starting Raft service");
@@ -342,7 +342,6 @@ impl Peer {
 pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
         .register_service(
-            cell_rpc::DEFAULT_SERVICE_ID,
             &cell_rpc::NebRPCService::new(&neb_server),
         )
         .await;
@@ -351,13 +350,11 @@ pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<Ne
 pub async fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
         .register_service(
-            transactions::manager::DEFAULT_SERVICE_ID,
             &transactions::manager::TransactionManager::new(&neb_server),
         )
         .await;
     rpc_server
         .register_service(
-            transactions::data_site::DEFAULT_SERVICE_ID,
             &transactions::data_site::DataManager::new(&neb_server),
         )
         .await;
@@ -386,7 +383,6 @@ pub async fn init_ranged_indexer_service(
     ));
     rpc_server
         .register_service(
-            ranged::lsm::service::DEFAULT_SERVICE_ID,
             &Arc::new(ranged::lsm::service::LSMTreeService::new(
                 neb_client, &sm_client,
             )),

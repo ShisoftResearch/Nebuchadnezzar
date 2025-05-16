@@ -350,7 +350,11 @@ pub fn complex_cell_sel_read() {
     {
         // Selecting one deeper in nested map
         let partial_cell = chunks
-            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub1")]), false)
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![String::from("sub|sub4|sub4sub1")]),
+                false,
+            )
             .unwrap()
             .data
             .owned();
@@ -359,7 +363,11 @@ pub fn complex_cell_sel_read() {
     {
         // Selecting one deeper nullable array in nested map
         let partial_cell = chunks
-            .read_selected(&id1, &key_hashes(&vec![String::from("sub|sub4|sub4sub3")]), true)
+            .read_selected(
+                &id1,
+                &key_hashes(&vec![String::from("sub|sub4|sub4sub3")]),
+                true,
+            )
             .unwrap()
             .data
             .owned();
