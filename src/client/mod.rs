@@ -105,6 +105,12 @@ impl AsyncClient {
         let client = self.locate_plain_server(id).await?;
         client.read_cell(id).await
     }
+
+    pub async fn read_cell_select(&self, id: Id, fields: &Vec<u64>, need_header: bool) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+        let client = self.locate_plain_server(id).await?;
+        client.read_cell_select(id, fields, need_header).await
+    }
+
     pub async fn read_all_cells(
         &self,
         ids: &Vec<Id>,

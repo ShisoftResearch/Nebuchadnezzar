@@ -23,6 +23,7 @@ service! {
     rpc read_cell(key: Id) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells(keys: &Vec<Id>) -> Vec<Result<OwnedCell, ReadError>>;
     rpc read_all_cells_selected(keys: &Vec<Id>, colums: &Vec<u64>, need_header: bool) -> Vec<Result<OwnedCell, ReadError>>;
+    rpc read_cell_select(id: Id, fields: &Vec<u64>, need_header: bool) -> Result<OwnedCell, ReadError>;
     rpc read_all_cells_proced(keys: &Vec<Id>, colums: &Vec<u64>, filter: &Expr, proc: &Expr) -> Vec<Result<OwnedCell, ReadError>>;
     rpc write_cell(cell:OwnedCell) -> Result<CellHeader, WriteError>;
     rpc update_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
@@ -66,6 +67,9 @@ impl Service for NebRPCService {
                 .collect(),
         )
         .boxed()
+    }
+    fn read_cell_select(&self, id: Id, fields: &Vec<u64>, need_header: bool) -> BoxFuture<Result<OwnedCell, ReadError>> {
+        future::ready(self.server.chunks.read_selected(&id, fields.as_slice(), need_header).map(|c| c.to_owned())).boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.write_cell(&mut cell))
