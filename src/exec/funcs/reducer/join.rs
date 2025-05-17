@@ -66,7 +66,7 @@ where
 
     fn map(&self, collector: C, func: MF) -> impl Iterator<Item = O> {
         let iter = collector.into_iter().filter_map(move |(k, vs)| {
-            let groups = vs.sorted_by_key(|(i, _)| *i).group_by(|(i, _)| *i);
+            let groups = vs.sorted_by_key(|(i, _)| *i).chunk_by(|(i, _)| *i);
             let mut grouped = groups
                 .into_iter()
                 .map(|(_id, group)| group.map(|(_, v)| v).collect::<Vec<_>>());

@@ -118,9 +118,11 @@ impl AsyncClient {
         let mut cells_by_client = ids
             .iter()
             .dedup()
-            .group_by(|id| self.locate_server_id(&id).unwrap())
+            .map(|id| (self.locate_server_id(&id).unwrap(), id))
+            .sorted_by_key(|(server_id, _)| *server_id)
+            .chunk_by(|(server_id, _)| *server_id)
             .into_iter()
-            .map(|(server_id, ids)| (server_id, ids.map(|id| *id).collect_vec()))
+            .map(|(server_id, ids)| (server_id, ids.map(|(_, id)| *id).collect_vec()))
             .map(|(server_id, ids)| async move {
                 if server_id > 0 {
                     let client = self.client_by_server_id(server_id).await.unwrap();

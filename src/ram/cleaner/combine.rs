@@ -102,7 +102,8 @@ impl CombinedCleaner {
                     cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
                 }
             })
-            .group_by(|entry| entry.cell_hash)
+            .sorted_by_key(|entry| entry.cell_hash)
+            .chunk_by(|entry| entry.cell_hash)
             .into_iter()
             .map(|(hash, entry)| {
                 // combine entries have the same hash and then only keep the latest version
@@ -114,7 +115,8 @@ impl CombinedCleaner {
                 }
             })
             .flatten()
-            .group_by(|entry| entry.timestamp / 10)
+            .sorted_by_key(|entry| entry.timestamp)
+            .chunk_by(|entry| entry.timestamp / 10)
             .into_iter()
             .map(|(t, group)| {
                 let mut group: Vec<_> = group.collect();

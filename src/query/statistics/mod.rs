@@ -400,7 +400,8 @@ pub fn merge_statistics(all_stats: Vec<Arc<SchemaStatistics>>) -> Option<SchemaS
                 .map(move |(field, keys)| (field, keys, s_count))
         })
         .flatten()
-        .group_by(|(field, _, _)| **field)
+        .sorted_by_key(|(field, _, _)| **field)
+        .chunk_by(|(field, _, _)| **field)
         .into_iter()
         .map(|(field, parts)| {
             let parts = parts

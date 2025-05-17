@@ -225,7 +225,8 @@ impl DataCursor {
                                 .get_server_id_by(id)
                                 .map(|sid| (i, sid, id))
                         })
-                        .group_by(|(_i, sid, _id)| *sid)
+                        .sorted_by_key(|(_i, sid, _id)| *sid)
+                        .chunk_by(|(_i, sid, _id)| *sid)
                         .into_iter()
                         .map(|(sid, pairs)| {
                             let mut ids = vec![];
