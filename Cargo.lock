@@ -245,7 +245,7 @@ dependencies = [
 [[package]]
 name = "bifrost"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#62fc88cfe88b61b15be6f016c49610e289e296c9"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#2b8baf5f2f1798485b0eabe6af0fe7d15ad54755"
 dependencies = [
  "async-std",
  "bifrost_hasher",
@@ -275,7 +275,7 @@ dependencies = [
 [[package]]
 name = "bifrost_hasher"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#62fc88cfe88b61b15be6f016c49610e289e296c9"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#2b8baf5f2f1798485b0eabe6af0fe7d15ad54755"
 dependencies = [
  "twox-hash",
 ]
@@ -283,7 +283,7 @@ dependencies = [
 [[package]]
 name = "bifrost_plugins"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#62fc88cfe88b61b15be6f016c49610e289e296c9"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#2b8baf5f2f1798485b0eabe6af0fe7d15ad54755"
 dependencies = [
  "bifrost_hasher",
  "quote",
@@ -293,7 +293,7 @@ dependencies = [
 [[package]]
 name = "bifrost_proc_macro"
 version = "0.1.0"
-source = "git+https://github.com/shisoft/bifrost?branch=develop#62fc88cfe88b61b15be6f016c49610e289e296c9"
+source = "git+https://github.com/shisoft/bifrost?branch=develop#2b8baf5f2f1798485b0eabe6af0fe7d15ad54755"
 dependencies = [
  "proc-macro2",
  "quote",
