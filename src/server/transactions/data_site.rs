@@ -136,8 +136,8 @@ impl DataManager {
         }
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
+        self.cell_list.push_back(*id);
         self.cells.get_or_insert(*id, || {
-            self.cell_list.push_back(*id);
             Arc::new(Mutex::new(CellMeta {
                 read: TxnId::new(),
                 write: TxnId::new(),
