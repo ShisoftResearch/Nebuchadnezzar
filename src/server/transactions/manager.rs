@@ -854,6 +854,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
+    // Do not use the lock-free map here, allocating LFMap for all transactions is too expensive
     map: parking_lot::Mutex<HashMap<u64, Arc<AwaitingServer>>>,
 }
 
