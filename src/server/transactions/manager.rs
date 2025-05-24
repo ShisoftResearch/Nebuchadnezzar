@@ -854,7 +854,7 @@ struct AwaitManager {
 }
 
 struct TxnAwaits {
-    map: LFMap<u64, Arc<AwaitingServer>>,
+    map: parking_lot::Mutex<HashMap<u64, Arc<AwaitingServer>>>,
 }
 
 impl AwaitManager {
@@ -872,12 +872,14 @@ impl AwaitManager {
 impl TxnAwaits {
     pub fn new_ref() -> Arc<Self> {
         Arc::new(Self {
-            map: LFMap::with_capacity(8),
+            map: parking_lot::Mutex::new(HashMap::new()),
         })
     }
     pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {
-        self.map
-            .get_or_insert(server_id, || Arc::new(AwaitingServer::new()))
+        let mut map = self.map.lock();
+        map.entry(server_id)
+            .or_insert_with(|| Arc::new(AwaitingServer::new()))
+            .clone()
     }
     pub async fn send(&self, server_id: u64) {
         debug!("Will sending to wakeup from {}", server_id);
