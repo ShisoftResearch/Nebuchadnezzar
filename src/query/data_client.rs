@@ -177,7 +177,7 @@ impl IndexedDataClient {
         get_hash_id_from_value(schema, field, value)
     }
 
-    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
+    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         self.index_clients.hashed_query(index_id, field_id, value).await
     }
 }

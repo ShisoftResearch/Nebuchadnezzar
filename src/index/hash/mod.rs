@@ -86,8 +86,9 @@ impl HashIndexer {
         .await
     }
 
-    pub async fn query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
+    pub async fn query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let read_res = self.neb_client.read_cell(index_id).await;
+        let mut result = Vec::new();
         if let Ok(Ok(cell)) = &read_res {
             let cell_ids_val = &cell[*HASH_INDEX_FIELD_ID];
             if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = cell_ids_val {
@@ -98,13 +99,13 @@ impl HashIndexer {
                     if let Ok(Ok(cell)) = &cell_res {
                         let field_val = &cell[field_id];
                         if field_val == value {
-                            return Ok(Ok(*id));
+                            result.push(*id);
                         }
                     }
                 }
             }
         }
-        return read_res.map(|v| v.map(|_| Id::unit_id()));
+        return read_res.map(|v| v.map(|_| result));
     }
 }
 
@@ -137,7 +138,7 @@ impl HashedQueryClient {
         Ok(())
     }
 
-    pub async fn query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
+    pub async fn query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         self.indexer.query(index_id, field_id, value).await
     }
 }
