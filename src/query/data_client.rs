@@ -3,13 +3,13 @@ use std::{mem, sync::Arc};
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
 use dovahkiin::{
     expr::serde::Expr,
-    types::{Id, SharedValue},
+    types::{Id, OwnedValue, SharedValue},
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::{client_by_server_name, AsyncClient},
+    client::{client_by_server_name, transaction::TxnError, AsyncClient},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
         ranged::{
@@ -21,7 +21,7 @@ use crate::{
         },
         EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
-    ram::cell::OwnedCell, server::cell_rpc::AsyncServiceClient,
+    ram::cell::{OwnedCell, ReadError}, server::cell_rpc::AsyncServiceClient,
 };
 
 const SCAN_BUFFER_SIZE: u16 = 64;
@@ -173,6 +173,10 @@ impl IndexedDataClient {
         };
         cursor.refresh_batch().await;
         cursor
+    }
+
+    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
+        self.index_clients.hashed_query(index_id, field_id, value).await
     }
 }
 
