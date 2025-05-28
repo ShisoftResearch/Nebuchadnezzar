@@ -11,15 +11,13 @@ use itertools::Itertools;
 use crate::{
     client::{client_by_server_name, transaction::TxnError, AsyncClient},
     index::{
-        entry::{MAX_FEATURE, MIN_FEATURE},
-        ranged::{
+        entry::{MAX_FEATURE, MIN_FEATURE}, hash::get_hash_id_from_value, ranged::{
             client::cursor::ClientCursor,
             lsm::{
                 btree::Ordering,
                 service::{Range, RangeTerm},
             },
-        },
-        EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
+        }, EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE
     },
     ram::cell::{OwnedCell, ReadError}, server::cell_rpc::AsyncServiceClient,
 };
@@ -173,6 +171,10 @@ impl IndexedDataClient {
         };
         cursor.refresh_batch().await;
         cursor
+    }
+
+    pub fn hashed_index_id(schema: u32, field: u64, value: &OwnedValue) -> Id {
+        get_hash_id_from_value(schema, field, value)
     }
 
     pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
