@@ -1,5 +1,8 @@
+use super::hash::get_hash_id;
 // Import required dependencies
 use super::{EntryKey, Feature, IndexerClients};
+use crate::client::transaction::TxnError;
+use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
 use crate::ram::cell::{OwnedCell, SharedCell};
 use crate::ram::types::Id;
@@ -53,6 +56,12 @@ pub enum IndexComps {
     Hashed(Feature),
 }
 
+#[derive(Debug)]
+pub enum IndexError {
+    TxnError(TxnError),
+    RPCError(RPCError),
+}
+
 // Struct holding a collection of index metadata
 pub struct IndexRes {
     meta: Vec<IndexMeta>,
@@ -74,26 +83,30 @@ impl IndexRes {
 
 impl IndexMeta {
     // Insert an index into the indexer clients
-    async fn insert(&self, indexers: &IndexerClients) -> Result<(), RPCError> {
+    async fn insert(&self, indexers: &IndexerClients) -> Result<(), IndexError> {
         match self {
             &IndexMeta::Ranged(ref meta) => {
-                indexers.ranged_client.insert(&meta.key).await?;
+                indexers.ranged_client.insert(&meta.key).await
+                    .map_err(|e| IndexError::RPCError(e))?;
             }
-            &IndexMeta::Hashed(ref _meta) => {
-                unimplemented!();
+            &IndexMeta::Hashed(ref meta) => {
+                indexers.hashed_client.insert(&meta.hash_id, &meta.cell_id).await
+                    .map_err(|e| IndexError::TxnError(e))?;
             }
         }
         Ok(())
     }
 
     // Remove an index from the indexer clients
-    async fn remove(&self, indexers: &IndexerClients) -> Result<(), RPCError> {
+    async fn remove(&self, indexers: &IndexerClients) -> Result<(), IndexError> {
         match self {
             &IndexMeta::Ranged(ref meta) => {
-                indexers.ranged_client.delete(&meta.key).await?;
+                indexers.ranged_client.delete(&meta.key).await
+                    .map_err(|e| IndexError::RPCError(e))?;
             }
-            &IndexMeta::Hashed(ref _meta) => {
-                unimplemented!();
+            &IndexMeta::Hashed(ref meta) => {
+                let _ = indexers.hashed_client.indexer.remove_index(&meta.cell_id, &meta.hash_id).await
+                    .map_err(|e| IndexError::TxnError(e))?;
             }
         }
         Ok(())
@@ -102,7 +115,7 @@ impl IndexMeta {
 
 // Thread local storage for pending index tasks
 thread_local! {
-    pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), RPCError>>>> = RefCell::new(Vec::new());
+    pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>> = RefCell::new(Vec::new());
 }
 
 // Main struct for building and managing indices
@@ -112,9 +125,10 @@ pub struct IndexBuilder {
 
 impl IndexBuilder {
     // Create a new IndexBuilder instance
-    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub async fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+        let _ = IndexerClients::init_index_schema(neb_client).await;
         Self {
-            clients: Arc::new(IndexerClients::new(conshash, raft_client)),
+            clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client)),
         }
     }
 
@@ -147,7 +161,8 @@ impl IndexBuilder {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
         let task = tokio::spawn(async move {
-            indexers.ranged_client.insert(&key).await?;
+            indexers.ranged_client.insert(&key).await
+                .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
         });
         PENDING_INDEX_TASKS.with(|task_list| {
@@ -173,7 +188,8 @@ impl IndexBuilder {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
         let task = tokio::spawn(async move {
-            indexers.ranged_client.delete(&key).await?;
+            indexers.ranged_client.delete(&key).await
+                .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
         });
         PENDING_INDEX_TASKS.with(|task_list| {
@@ -182,7 +198,7 @@ impl IndexBuilder {
     }
 
     // Wait for all pending index tasks to complete
-    pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), RPCError>, JoinError>>> {
+    pub fn await_indices<'a>() -> BoxFuture<'a, Vec<Result<Result<(), IndexError>, JoinError>>> {
         PENDING_INDEX_TASKS
             .with(|task_list| {
                 let tasks = std::mem::take(&mut *task_list.borrow_mut());
@@ -196,9 +212,9 @@ impl IndexBuilder {
     async fn remove_indices_(
         indices: Vec<IndexRes>,
         indexers: Arc<IndexerClients>,
-    ) -> Result<(), RPCError> {
+    ) -> Result<(), IndexError> {
         for index in indices.into_iter().flat_map(|res| res.meta) {
-            index.remove(&indexers).await?;
+            index.remove(&indexers).await?
         }
         Ok(())
     }
@@ -208,7 +224,7 @@ impl IndexBuilder {
         new_indices: Vec<IndexRes>,
         old_indices: Option<Vec<IndexRes>>,
         indexers: Arc<IndexerClients>,
-    ) -> Result<(), RPCError> {
+    ) -> Result<(), IndexError> {
         // Convert indices to hash maps for efficient comparison
         let mut index_of_old_index = old_indices
             .unwrap_or_default()
@@ -290,7 +306,7 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                         if feat == UNSETTLED {
                             continue;
                         }
-                        let hash_id = Id::from_obj(&(schema.id, field_id, feat));
+                        let hash_id = get_hash_id(schema.id, *field_id, feat);
                         metas.push(IndexMeta::Hashed(HashedIndexMeta { hash_id, cell_id }));
                     }
                     IndexComps::Ranged(feat) => {

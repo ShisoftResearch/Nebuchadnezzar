@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::client_by_server_name,
+    client::{client_by_server_name, AsyncClient},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
         ranged::{
@@ -21,7 +21,7 @@ use crate::{
         },
         EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
-    ram::cell::OwnedCell,
+    ram::cell::OwnedCell, server::cell_rpc::AsyncServiceClient,
 };
 
 const SCAN_BUFFER_SIZE: u16 = 64;
@@ -109,10 +109,10 @@ impl ValueRangeTerm {
 }
 
 impl IndexedDataClient {
-    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         Self {
             conshash: conshash.clone(),
-            index_clients: Arc::new(IndexerClients::new(conshash, raft_client)),
+            index_clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client)),
         }
     }
     pub async fn range_index_scan<'a>(

@@ -14,7 +14,6 @@ use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
-use itertools::Itertools;
 // use crate::index::lsmtree;
 use crate::index::ranged;
 use crate::ram::chunk::Chunks;
@@ -81,6 +80,7 @@ pub struct NebServer {
     pub cleaner: Cleaner,
     pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
+    pub neb_client: Arc<AsyncClient>,
 }
 
 pub async fn init_conshash(
@@ -145,7 +145,7 @@ impl NebServer {
                 .unwrap(),
         );
         let index_builder = if opts.index_enabled {
-            Some(Arc::new(IndexBuilder::new(&conshasing, &raft_client)))
+            Some(Arc::new(IndexBuilder::new(&neb_client, &conshasing, &raft_client).await))
         } else {
             None
         };
@@ -172,6 +172,7 @@ impl NebServer {
             server_id: rpc_server.server_id,
             indexer: index_builder,
             group_name: group_name.clone(),
+            neb_client: neb_client.clone(),
         });
         let servs = proc_services(&opts.services);
         for service in servs {
@@ -310,7 +311,7 @@ impl NebServer {
         &*self.raft_client
     }
     pub fn indexed_data_client(&self) -> IndexedDataClient {
-        IndexedDataClient::new(&self.consh, &self.raft_client)
+        IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
     }
     pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
         AsyncClient::new(&self.rpc, &self.membership, members, &self.group_name).await
@@ -401,7 +402,7 @@ fn proc_services(svrs: &Vec<Service>) -> Vec<Service> {
     if res_set.contains(&Service::Query) {
         res_set.insert(Service::RangedIndexer);
     }
-    let mut res = res_set.into_iter().collect_vec();
+    let mut res = res_set.into_iter().collect::<Vec<_>>();
     res.sort(); // Sort by service priority
     res
 }

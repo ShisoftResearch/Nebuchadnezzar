@@ -13,11 +13,18 @@ pub const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
 
 use std::sync::Arc;
 
+use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
+use dovahkiin::types::{Id, OwnedValue};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
 use futures::Future;
+use hash::{hash_index_schema, HashIndexer, HashedQueryClient};
+
+use crate::client::AsyncClient;
+use crate::ram::cell::ReadError;
+use crate::server::cell_rpc::AsyncServiceClient;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedQueryClient;
@@ -27,13 +34,19 @@ pub type Feature = [u8; FEATURE_SIZE];
 
 pub struct IndexerClients {
     ranged_client: Arc<RangedQueryClient>,
+    hashed_client: Arc<HashedQueryClient>,
 }
 
 impl IndexerClients {
-    pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         IndexerClients {
             ranged_client: Arc::new(RangedQueryClient::new(conshash, raft_client)),
+            hashed_client: Arc::new(HashedQueryClient::new(neb_client)),
         }
+    }
+    pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
+        let hash_index_schema = hash_index_schema();
+        let _ = neb_client.new_schema_with_id(hash_index_schema).await;
     }
     pub fn range_seek<'a>(
         &'a self,
@@ -47,5 +60,9 @@ impl IndexerClients {
             key.as_slice()[..n].to_vec()
         });
         RangedQueryClient::seek(&self.ranged_client, range, buffer_size, pattern)
+    }
+
+    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Id, ReadError>, RPCError> {
+        HashedQueryClient::query(&self.hashed_client, index_id, field_id, value).await
     }
 }
