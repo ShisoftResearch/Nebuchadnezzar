@@ -177,7 +177,8 @@ impl IndexedDataClient {
         get_hash_id_from_value(schema, field, value)
     }
 
-    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+    pub async fn hashed_query(&self, schema: u32, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+        let index_id = Self::hashed_index_id(schema, field_id, value);
         self.index_clients.hashed_query(index_id, field_id, value).await
     }
 }
@@ -303,7 +304,7 @@ impl DataCursor {
 mod test {
     use crate::{
         index::ranged::lsm::btree::Ordering,
-        query::data_client::{ValueRange, ValueRangeTerm},
+        query::data_client::{IndexedDataClient, ValueRange, ValueRangeTerm},
         ram::{
             cell::OwnedCell,
             schema::{Field, IndexType, Schema},
@@ -606,6 +607,182 @@ mod test {
         let out_of_range_item = cursor.next().await.unwrap();
         if let Some(cell) = out_of_range_item {
             panic!("Should not have any more cell. Got id {:?}", cell.id());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hashed_query_test() {
+        const DATA_1: &'static str = "DATA_1";
+        const DATA_2: &'static str = "DATA_2";
+        let _ = env_logger::try_init();
+        let server_addr = String::from("127.0.0.1:6703");
+        let server_group = String::from("hashed_query_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 8,
+                memory_size: 512 * 1024 * 1024,
+                backup_storage: None,
+                wal_storage: None,
+                index_enabled: true,
+                services: vec![Service::Cell, Service::Query],
+            },
+            &server_addr,
+            &server_group,
+        )
+        .await;
+        
+        // Create schema with hashed index on DATA_1
+        let fields = Field::new_schema(vec![
+            Field::new_indexed(DATA_1, Type::U64, vec![IndexType::Hashed]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id_1 = 125;
+        let schema_1 = Schema::new_with_id(
+            schema_id_1,
+            "hashed_schema_1",
+            None,
+            fields,
+            false,
+            false, // Not scannable for hashed index
+        );
+        
+        let client = server.data_client(&vec![server_addr]).await.unwrap();
+        client.new_schema_with_id(schema_1).await.unwrap().unwrap();
+        
+        let num = 100;
+        let target_value = 42u64;
+        let mut expected_ids = vec![];
+
+        // Start with a single cell
+        let single_case_id = Id::new(88888, 99999);
+        let mut value = OwnedValue::Map(OwnedMap::new());
+        value[DATA_1] = OwnedValue::U64(target_value);
+        value[DATA_2] = OwnedValue::U32(0);
+        let cell = OwnedCell::new_with_id(schema_id_1, &single_case_id, value);
+        client.write_cell(cell).await.unwrap().unwrap();
+        let idx_data_client = server.indexed_data_client();
+        let single_case_result = idx_data_client.hashed_query(schema_id_1, hash_str(DATA_1), &OwnedValue::U64(target_value)).await.unwrap().unwrap();
+        assert_eq!(single_case_result.len(), 1);
+        assert_eq!(single_case_result[0], single_case_id);
+        
+        // Insert test data
+        for i in 0..num {
+            let id = Id::new(1, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            // Use target_value for some records and other values for others
+            let data1_value = if i % 10 == 0 { target_value } else { i };
+            value[DATA_1] = OwnedValue::U64(data1_value);
+            value[DATA_2] = OwnedValue::U32((i * 2) as u32);
+            
+            if data1_value == target_value {
+                expected_ids.push(id);
+            }
+            
+            let cell = OwnedCell::new_with_id(schema_id_1, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+        
+        
+        // Test hashed query
+        let query_value = OwnedValue::U64(target_value);
+        let field_id = hash_str(DATA_1);
+        
+        let query_result = idx_data_client
+            .hashed_query(schema_id_1, field_id, &query_value)
+            .await
+            .unwrap()
+            .unwrap();
+        
+        info!("Expected IDs: {:?}", expected_ids);
+        info!("Query result IDs: {:?}", query_result);
+        
+        // Verify that we got the expected number of results
+        assert_eq!(query_result.len(), expected_ids.len());
+        
+        // Verify that all returned IDs are in the expected set
+        for returned_id in &query_result {
+            assert!(
+                expected_ids.contains(returned_id),
+                "Unexpected ID {:?} in query results", 
+                returned_id
+            );
+        }
+        
+        // Verify that all expected IDs are in the results
+        for expected_id in &expected_ids {
+            assert!(
+                query_result.contains(expected_id),
+                "Expected ID {:?} not found in query results", 
+                expected_id
+            );
+        }
+        
+        // Test query for value that doesn't exist
+        let non_existent_value = OwnedValue::U64(9999u64);
+        
+        let empty_result = idx_data_client
+            .hashed_query(schema_id_1, field_id, &non_existent_value)
+            .await
+            .unwrap()
+            .unwrap();
+        
+        assert!(empty_result.is_empty(), "Query for non-existent value should return empty results");
+        
+        // Test with different data types - string values
+        let string_field_name = "STRING_FIELD";
+        let fields_with_string = Field::new_schema(vec![
+            Field::new_indexed(string_field_name, Type::String, vec![IndexType::Hashed]),
+            Field::new_unindexed(DATA_2, Type::U32),
+        ]);
+        let schema_id_2 = 126;
+        let schema_2 = Schema::new_with_id(
+            schema_id_2,
+            "hashed_schema_2",
+            None,
+            fields_with_string,
+            false,
+            false,
+        );
+        
+        client.new_schema_with_id(schema_2).await.unwrap().unwrap();
+        
+        let target_string = "test_string".to_string();
+        let mut string_expected_ids = vec![];
+        
+        // Insert string data
+        for i in 0..50 {
+            let id = Id::new(2, i);
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            let string_value = if i % 5 == 0 { target_string.clone() } else { format!("other_{}", i) };
+            value[string_field_name] = OwnedValue::String(string_value.clone());
+            value[DATA_2] = OwnedValue::U32((i * 3) as u32);
+            
+            if string_value == target_string {
+                string_expected_ids.push(id);
+            }
+            
+            let cell = OwnedCell::new_with_id(schema_id_2, &id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+        
+        // Test string hashed query
+        let string_query_value = OwnedValue::String(target_string);
+        let string_field_id = hash_str(string_field_name);
+        
+        let string_query_result = idx_data_client
+            .hashed_query(schema_id_2, string_field_id, &string_query_value)
+            .await
+            .unwrap()
+            .unwrap();
+        
+        assert_eq!(string_query_result.len(), string_expected_ids.len());
+        
+        for returned_id in &string_query_result {
+            assert!(
+                string_expected_ids.contains(returned_id),
+                "Unexpected ID {:?} in string query results", 
+                returned_id
+            );
         }
     }
 }

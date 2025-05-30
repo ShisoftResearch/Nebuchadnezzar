@@ -32,7 +32,9 @@ impl HashIndexer {
         index_id: &Id,
     ) -> Result<(), TxnError> {
         self.neb_client.transaction(|txn| {
+            debug!("Tempting to add index for cell_id: {:?}, index_id: {:?}", cell_id, index_id);
             async move {
+                debug!("Adding index for cell_id: {:?}, index_id: {:?}", cell_id, index_id);
                 match txn.read(*index_id).await? {
                     Some(mut cell) => {
                         let ids_val = &mut cell[*HASH_INDEX_FIELD_ID];

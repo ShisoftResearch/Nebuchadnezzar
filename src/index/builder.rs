@@ -17,6 +17,7 @@ use futures::{
     stream::{FuturesUnordered, StreamExt},
 };
 use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::{cell::RefCell, sync::Arc};
 use tokio::task::{JoinError, JoinHandle};
@@ -118,6 +119,12 @@ thread_local! {
     pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>> = RefCell::new(Vec::new());
 }
 
+fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static)  {
+    let tokio_task = tokio::spawn(task);
+    PENDING_INDEX_TASKS.with(|task_list| {
+        task_list.borrow_mut().push(tokio_task);
+    });
+}
 // Main struct for building and managing indices
 pub struct IndexBuilder {
     clients: Arc<IndexerClients>,
@@ -147,11 +154,8 @@ impl IndexBuilder {
         // Get new indices for the cell
         let new_indices = probe_cell_indices(cell, schema);
         if !new_indices.is_empty() {
-            let task = tokio::spawn(async move {
+            new_index_task(async move {
                 Self::ensure_indices_(new_indices, old_indices, indexers).await
-            });
-            PENDING_INDEX_TASKS.with(|task_list| {
-                task_list.borrow_mut().push(task);
             });
         }
     }
@@ -160,13 +164,10 @@ impl IndexBuilder {
     fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
-        let task = tokio::spawn(async move {
+        new_index_task(async move {
             indexers.ranged_client.insert(&key).await
                 .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
-        });
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
         });
     }
 
@@ -177,23 +178,17 @@ impl IndexBuilder {
             self.remove_scannable(cell, &indexers);
         }
         let indices = probe_cell_indices(cell, schema);
-        let task = tokio::spawn(async move { Self::remove_indices_(indices, indexers).await });
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
-        });
+        new_index_task(async move { Self::remove_indices_(indices, indexers).await });
     }
 
     // Remove scannable indices
     fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
-        let task = tokio::spawn(async move {
+        new_index_task(async move {
             indexers.ranged_client.delete(&key).await
                 .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
-        });
-        PENDING_INDEX_TASKS.with(|task_list| {
-            task_list.borrow_mut().push(task);
         });
     }
 
@@ -264,7 +259,7 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
             let mut components = vec![];
 
             // Handle array data
-            if let Some(array_data_size) = value.prim_array_data_size() {
+            if let Some(_array_data_size) = value.prim_array_data_size() {
                 for index in indices {
                     match index {
                         // Generate ranged indices for array elements
