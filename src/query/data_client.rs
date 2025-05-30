@@ -306,7 +306,7 @@ mod test {
         index::ranged::lsm::btree::Ordering,
         query::data_client::{IndexedDataClient, ValueRange, ValueRangeTerm},
         ram::{
-            cell::OwnedCell,
+            cell::{OwnedCell, ReadError},
             schema::{Field, IndexType, Schema},
         },
         server::*,
@@ -664,7 +664,12 @@ mod test {
         let idx_data_client = server.indexed_data_client();
         let single_case_result = idx_data_client.hashed_query(schema_id_1, hash_str(DATA_1), &OwnedValue::U64(target_value)).await.unwrap().unwrap();
         assert_eq!(single_case_result.len(), 1);
-        assert_eq!(single_case_result[0], single_case_id);
+        assert_eq!(single_case_result, vec![single_case_id]);
+
+        // Testing delete
+        client.remove_cell(single_case_id).await.unwrap().unwrap();
+        let single_case_result = idx_data_client.hashed_query(schema_id_1, hash_str(DATA_1), &OwnedValue::U64(target_value)).await.unwrap();
+        assert_eq!(single_case_result, Ok(vec![]));
         
         // Insert test data
         for i in 0..num {

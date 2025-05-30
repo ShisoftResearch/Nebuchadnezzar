@@ -91,23 +91,36 @@ impl HashIndexer {
     pub async fn query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         let read_res = self.neb_client.read_cell(index_id).await;
         let mut result = Vec::new();
-        if let Ok(Ok(cell)) = &read_res {
-            let cell_ids_val = &cell[*HASH_INDEX_FIELD_ID];
-            if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = cell_ids_val {
-                for id in ids {
-                    // Now we need to check each of the cell id that they have
-                    // a field matching the field id and have exact the same value
-                    let cell_res = self.neb_client.read_cell_select(*id, &vec![field_id], false).await;
-                    if let Ok(Ok(cell)) = &cell_res {
-                        let field_val = &cell[field_id];
-                        if field_val == value {
-                            result.push(*id);
+        match read_res {
+            Ok(Ok(cell)) => {
+                let cell_ids_val = &cell[*HASH_INDEX_FIELD_ID];
+                if let OwnedValue::PrimArray(OwnedPrimArray::Id(ids)) = cell_ids_val {
+                    for id in ids {
+                        // Now we need to check each of the cell id that they have
+                        // a field matching the field id and have exact the same value
+                        let cell_res = self.neb_client.read_cell_select(*id, &vec![field_id], false).await;
+                        if let Ok(Ok(cell)) = &cell_res {
+                            let field_val = &cell[0usize];
+                            if field_val == value {
+                                result.push(*id);
+                            } else {
+                                debug!("Cell {:?} has field {:?} with value {:?}, but expected {:?}", id, field_id, field_val, value);
+                            }
                         }
                     }
                 }
+                return Ok(Ok(result));
+            }
+            Ok(Err(ReadError::CellDoesNotExisted)) => {
+                return Ok(Ok(vec![]));
+            }
+            Ok(Err(e)) => {
+                return Ok(Err(e));
+            }
+            Err(e) => {
+                return Err(e);
             }
         }
-        return read_res.map(|v| v.map(|_| result));
     }
 }
 
