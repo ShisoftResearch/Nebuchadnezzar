@@ -285,6 +285,7 @@ impl Service for TransactionManager {
             )
             .is_some()
         {
+            error!("Transaction id existed: {:?}", id);
             future::ready(Err(TMError::TransactionIdExisted)).boxed()
         } else {
             future::ready(Ok(id)).boxed()

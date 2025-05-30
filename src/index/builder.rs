@@ -32,20 +32,20 @@ const UNSETTLED: Feature = [0u8; 8];
 // Index on nested fields are allowed
 
 // Metadata struct for ranged indices
-#[derive(Hash)]
+#[derive(Hash, Debug)]
 pub struct RangedIndexMeta {
     key: EntryKey,
 }
 
 // Metadata struct for hashed indices
-#[derive(Hash)]
+#[derive(Hash, Debug)]
 pub struct HashedIndexMeta {
     hash_id: Id,
     cell_id: Id,
 }
 
 // Enum containing all possible index metadata types
-#[derive(Hash)]
+#[derive(Hash, Debug)]
 pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
@@ -64,6 +64,7 @@ pub enum IndexError {
 }
 
 // Struct holding a collection of index metadata
+#[derive(Debug)]
 pub struct IndexRes {
     meta: Vec<IndexMeta>,
 }
@@ -154,8 +155,11 @@ impl IndexBuilder {
         // Get new indices for the cell
         let new_indices = probe_cell_indices(cell, schema);
         if !new_indices.is_empty() {
+            debug!("New indices: {:?}", new_indices);
             new_index_task(async move {
-                Self::ensure_indices_(new_indices, old_indices, indexers).await
+                let res = Self::ensure_indices_(new_indices, old_indices, indexers).await;
+                debug!("Ensure indices result: {:?}", res);
+                res
             });
         }
     }
@@ -240,12 +244,17 @@ impl IndexBuilder {
         }
 
         // Insert new indices and remove old ones
+        debug!("Inserting new indices: {:?}", index_of_new_index);
         for new_index in index_of_new_index.values() {
+            debug!("Inserting new index: {:?}", new_index);
             new_index.insert(&*indexers).await?;
         }
+        debug!("Removing old indices: {:?}", index_of_old_index);
         for old_index in index_of_old_index.values() {
+            debug!("Removing old index: {:?}", old_index);
             old_index.remove(&*indexers).await?;
         }
+        debug!("Indices updated: {:?}", index_of_new_index);
         Ok(())
     }
 }

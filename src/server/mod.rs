@@ -59,7 +59,8 @@ pub enum Service {
     Cell = 0,
     Transaction = 1,
     RangedIndexer = 2,
-    Query = 3,
+    HashIndexer = 3,
+    Query = 4,
 }
 
 pub struct ServerMeta {
@@ -178,7 +179,7 @@ impl NebServer {
         for service in servs {
             match service {
                 Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
-                Service::Transaction => init_txn_service(rpc_server, &server).await,
+                Service::Transaction | Service::HashIndexer => init_txn_service(rpc_server, &server).await,
                 Service::RangedIndexer => {
                     init_ranged_indexer_service(
                         rpc_server,

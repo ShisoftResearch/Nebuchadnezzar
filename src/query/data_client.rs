@@ -624,7 +624,7 @@ mod test {
                 backup_storage: None,
                 wal_storage: None,
                 index_enabled: true,
-                services: vec![Service::Cell, Service::Query],
+                services: vec![Service::Cell, Service::Query, Service::HashIndexer],
             },
             &server_addr,
             &server_group,
@@ -660,6 +660,7 @@ mod test {
         value[DATA_2] = OwnedValue::U32(0);
         let cell = OwnedCell::new_with_id(schema_id_1, &single_case_id, value);
         client.write_cell(cell).await.unwrap().unwrap();
+        info!("Single case cell written id: {:?}", single_case_id);
         let idx_data_client = server.indexed_data_client();
         let single_case_result = idx_data_client.hashed_query(schema_id_1, hash_str(DATA_1), &OwnedValue::U64(target_value)).await.unwrap().unwrap();
         assert_eq!(single_case_result.len(), 1);

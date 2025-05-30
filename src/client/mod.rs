@@ -220,7 +220,14 @@ impl AsyncClient {
             txn.state = StdCell::new(txn_server::TxnState::Started);
             txn.tid = match txn.client.begin().await {
                 Ok(Ok(id)) => id,
-                _ => return Err(TxnError::CannotBegin),
+                Ok(Err(e)) => return {
+                    error!("Transaction {:?} cannot begin, manager error: {:?}", txn.tid, e);
+                    Err(TxnError::CannotBegin)
+                },
+                Err(e) => {
+                    error!("Transaction {:?} cannot begin, manager RPC error: {:?}", txn.tid, e);
+                    return Err(TxnError::CannotBegin)
+                },
             };
             // Erase the txn lifetime so it does not required to be carried with result
             let fn_txn_ref = unsafe { &*((&txn) as *const _) };
