@@ -51,28 +51,24 @@ pub trait VectorIndexerCore: Send + Sync {
 
     fn new_index(
         &self,
-        cell_id: &Id,
         schema_id: u32,
         field_id: u64,
-        metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>>;
     fn delete_index(
         &self,
-        cell_id: &Id,
         schema_id: u32,
         field_id: u64,
-        metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>>;
 }
 
 pub struct VectorIndexClient {
-    core: Arc<dyn VectorIndexerCore>,
+    core: Option<Arc<dyn VectorIndexerCore>,>
 }
 
 impl VectorIndexClient {
     pub fn new() -> Self {
-        let core = get_vector_index_core().expect(NO_CORE_ERROR);
-        Self { core: core.clone() }
+        let core = get_vector_index_core();
+        Self { core: core.cloned() }
     }
 
     pub fn insert(
@@ -83,6 +79,8 @@ impl VectorIndexClient {
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
         self.core
+            .as_ref()
+            .expect(NO_CORE_ERROR)
             .insert(cell_id, schema_id, field_id, metric_encoding)
     }
 
@@ -94,34 +92,28 @@ impl VectorIndexClient {
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
         self.core
+            .as_ref()
+            .expect(NO_CORE_ERROR)
             .remove(cell_id, schema_id, field_id, metric_encoding)
     }
 }
 
-pub fn new_index(
-    cell_id: &Id,
+pub fn new_index<'a>(
     schema_id: u32,
     field_id: u64,
-    metric_encoding: MetricEncoding,
-) -> BoxFuture<Result<(), IndexError>> {
+) -> BoxFuture<'a, Result<(), IndexError>> {
     get_vector_index_core().expect(NO_CORE_ERROR).new_index(
-        cell_id,
         schema_id,
         field_id,
-        metric_encoding,
     )
 }
 
-pub fn delete_index(
-    cell_id: &Id,
+pub fn delete_index<'a>(
     schema_id: u32,
     field_id: u64,
-    metric_encoding: MetricEncoding,
-) -> BoxFuture<Result<(), IndexError>> {
+) -> BoxFuture<'a, Result<(), IndexError>> {
     get_vector_index_core().expect(NO_CORE_ERROR).delete_index(
-        cell_id,
         schema_id,
         field_id,
-        metric_encoding,
     )
 }

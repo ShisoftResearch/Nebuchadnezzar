@@ -28,6 +28,8 @@ pub struct SchemasSM {
 raft_state_machine! {
     def qry get_all() -> Vec<Schema>;
     def qry get(id: u32) -> Option<Schema>;
+    def qry get_by_name(name: String) -> Option<Schema>;
+    def qry id_of_name(name: String) -> Option<u32>;
     def cmd new_schema(schema: Schema) -> Result<(), NewSchemaError>;
     def cmd del_schema(name: String) -> Result<(), DelSchemaError>;
     def cmd next_id() -> u32;
@@ -45,6 +47,17 @@ impl StateMachineCmds for SchemasSM {
             borrow.clone()
         }))
         .boxed()
+    }
+    fn id_of_name(&self, name: String) -> BoxFuture<Option<u32>> {
+        future::ready(self.map.id_of_name(&name)).boxed()
+    }
+    fn get_by_name(&self, name: String) -> BoxFuture<Option<Schema>> {
+        let id = self.map.id_of_name(&name);
+        if let Some(id) = id {
+            self.get(id)
+        } else {
+            future::ready(None).boxed()
+        }
     }
     fn new_schema(&mut self, schema: Schema) -> BoxFuture<Result<(), NewSchemaError>> {
         async move {
@@ -146,5 +159,8 @@ impl SchemasMap {
             self.schema_map.insert(id, schema);
             debug!("Inserted listed schema {}", id);
         }
+    }
+    fn id_of_name(&self, name: &str) -> Option<u32> {
+        self.name_map.get(name).cloned()
     }
 }

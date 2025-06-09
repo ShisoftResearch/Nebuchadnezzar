@@ -5,10 +5,12 @@ use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
+use serde_json::value::Index;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
+use crate::index::vector;
 use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
 use crate::ram::io::align_ptr_addr;
@@ -425,12 +427,14 @@ pub enum NewSchemaError {
     NameExists(String),
     IdExists(u32),
     NotifyError(NotifyError),
+    PostProcessError(String)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelSchemaError {
     SchemaDoesNotExisted,
     NotifyError(NotifyError),
+    PostProcessError(String)
 }
 
 impl LocalSchemasMap {
@@ -506,4 +510,32 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     fn deref(&self) -> &T {
         unsafe { &*self.reference }
     }
+}
+
+pub async fn post_schema_add(schema: &Schema) -> Result<(), String> {
+    for (field, indices) in &schema.index_fields {
+        for index in indices {
+            if let IndexType::Vector(_metric_encoding) = index {
+                let field_id = *field;
+                let schema_id = schema.id;
+                vector::new_index(schema_id, field_id).await
+                    .map_err(|e| format!("Vector index create error {:?}", e))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn post_schema_delete(schema: &Schema) -> Result<(), String> {
+    for (field, indices) in &schema.index_fields {
+        for index in indices {
+            if let IndexType::Vector(_metric_encoding) = index {
+                let field_id = *field;
+                let schema_id = schema.id;
+                vector::delete_index(schema_id, field_id).await
+                    .map_err(|e| format!("Vector index create error {:?}", e))?;
+            }
+        }
+    }
+    Ok(())
 }
