@@ -46,7 +46,6 @@ pub trait VectorIndexerCore: Send + Sync {
         cell_id: &Id,
         schema_id: u32,
         field_id: u64,
-        metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>>;
 
     fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>>;
@@ -85,13 +84,11 @@ impl VectorIndexClient {
         cell_id: &Id,
         schema_id: u32,
         field_id: u64,
-        metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
         self.core.as_ref().expect(NO_CORE_ERROR).remove(
             cell_id,
             schema_id,
             field_id,
-            metric_encoding,
         )
     }
 }

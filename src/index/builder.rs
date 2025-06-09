@@ -153,7 +153,6 @@ impl IndexMeta {
                         &meta.cell_id,
                         meta.schema_id,
                         meta.field_id,
-                        meta.metric_encoding,
                     )
                     .await?;
             }
