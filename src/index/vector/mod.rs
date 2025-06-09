@@ -49,26 +49,20 @@ pub trait VectorIndexerCore: Send + Sync {
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>>;
 
-    fn new_index(
-        &self,
-        schema_id: u32,
-        field_id: u64,
-    ) -> BoxFuture<Result<(), IndexError>>;
-    fn delete_index(
-        &self,
-        schema_id: u32,
-        field_id: u64,
-    ) -> BoxFuture<Result<(), IndexError>>;
+    fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>>;
+    fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>>;
 }
 
 pub struct VectorIndexClient {
-    core: Option<Arc<dyn VectorIndexerCore>,>
+    core: Option<Arc<dyn VectorIndexerCore>>,
 }
 
 impl VectorIndexClient {
     pub fn new() -> Self {
         let core = get_vector_index_core();
-        Self { core: core.cloned() }
+        Self {
+            core: core.cloned(),
+        }
     }
 
     pub fn insert(
@@ -78,10 +72,12 @@ impl VectorIndexClient {
         field_id: u64,
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
-        self.core
-            .as_ref()
-            .expect(NO_CORE_ERROR)
-            .insert(cell_id, schema_id, field_id, metric_encoding)
+        self.core.as_ref().expect(NO_CORE_ERROR).insert(
+            cell_id,
+            schema_id,
+            field_id,
+            metric_encoding,
+        )
     }
 
     pub fn remove(
@@ -91,29 +87,23 @@ impl VectorIndexClient {
         field_id: u64,
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
-        self.core
-            .as_ref()
-            .expect(NO_CORE_ERROR)
-            .remove(cell_id, schema_id, field_id, metric_encoding)
+        self.core.as_ref().expect(NO_CORE_ERROR).remove(
+            cell_id,
+            schema_id,
+            field_id,
+            metric_encoding,
+        )
     }
 }
 
-pub fn new_index<'a>(
-    schema_id: u32,
-    field_id: u64,
-) -> BoxFuture<'a, Result<(), IndexError>> {
-    get_vector_index_core().expect(NO_CORE_ERROR).new_index(
-        schema_id,
-        field_id,
-    )
+pub fn new_index<'a>(schema_id: u32, field_id: u64) -> BoxFuture<'a, Result<(), IndexError>> {
+    get_vector_index_core()
+        .expect(NO_CORE_ERROR)
+        .new_index(schema_id, field_id)
 }
 
-pub fn delete_index<'a>(
-    schema_id: u32,
-    field_id: u64,
-) -> BoxFuture<'a, Result<(), IndexError>> {
-    get_vector_index_core().expect(NO_CORE_ERROR).delete_index(
-        schema_id,
-        field_id,
-    )
+pub fn delete_index<'a>(schema_id: u32, field_id: u64) -> BoxFuture<'a, Result<(), IndexError>> {
+    get_vector_index_core()
+        .expect(NO_CORE_ERROR)
+        .delete_index(schema_id, field_id)
 }

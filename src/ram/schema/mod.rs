@@ -427,14 +427,14 @@ pub enum NewSchemaError {
     NameExists(String),
     IdExists(u32),
     NotifyError(NotifyError),
-    PostProcessError(String)
+    PostProcessError(String),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelSchemaError {
     SchemaDoesNotExisted,
     NotifyError(NotifyError),
-    PostProcessError(String)
+    PostProcessError(String),
 }
 
 impl LocalSchemasMap {
@@ -518,7 +518,8 @@ pub async fn post_schema_add(schema: &Schema) -> Result<(), String> {
             if let IndexType::Vector(_metric_encoding) = index {
                 let field_id = *field;
                 let schema_id = schema.id;
-                vector::new_index(schema_id, field_id).await
+                vector::new_index(schema_id, field_id)
+                    .await
                     .map_err(|e| format!("Vector index create error {:?}", e))?;
             }
         }
@@ -532,7 +533,8 @@ pub async fn post_schema_delete(schema: &Schema) -> Result<(), String> {
             if let IndexType::Vector(_metric_encoding) = index {
                 let field_id = *field;
                 let schema_id = schema.id;
-                vector::delete_index(schema_id, field_id).await
+                vector::delete_index(schema_id, field_id)
+                    .await
                     .map_err(|e| format!("Vector index create error {:?}", e))?;
             }
         }

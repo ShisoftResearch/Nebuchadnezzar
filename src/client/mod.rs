@@ -19,7 +19,9 @@ use std::sync::Arc;
 use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
-use crate::ram::schema::{post_schema_add, post_schema_delete, DelSchemaError, NewSchemaError, Schema};
+use crate::ram::schema::{
+    post_schema_add, post_schema_delete, DelSchemaError, NewSchemaError, Schema,
+};
 use crate::ram::types::Id;
 use crate::server::transactions::TxnId;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
@@ -288,16 +290,16 @@ impl AsyncClient {
         &self,
         schema: Schema,
     ) -> Result<Result<(), NewSchemaError>, ExecError> {
-        match self.schema_client.new_schema(&schema).await{
+        match self.schema_client.new_schema(&schema).await {
             Ok(r) => {
                 if r.is_ok() {
                     if let Err(e) = post_schema_add(&schema).await {
-                        return Ok(Err(NewSchemaError::PostProcessError(e))) 
+                        return Ok(Err(NewSchemaError::PostProcessError(e)));
                     }
                 }
                 return Ok(r);
             }
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
     pub async fn new_schema(
