@@ -137,15 +137,15 @@ pub fn hash_index_schema() -> Schema {
     )
 }
 
-pub struct HashedQueryClient {
+pub struct HashedIndexClient {
     pub client: Arc<AsyncClient>,
     pub indexer: HashIndexer,
 }
 
-impl HashedQueryClient {
+impl HashedIndexClient {
     pub fn new(client: &Arc<AsyncClient>) -> Self {
         let indexer = HashIndexer::new(&client);
-        HashedQueryClient { client: client.clone(), indexer }
+        HashedIndexClient { client: client.clone(), indexer }
     }
 
     pub async fn insert(&self, hash_id: &Id, cell_id: &Id) -> Result<(), TxnError> {

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
+use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
 use crate::ram::io::align_ptr_addr;
 use crate::utils::thread_id;
@@ -46,6 +47,7 @@ pub struct Schema {
 pub enum IndexType {
     Ranged,
     Hashed,
+    Vector(MetricEncoding),
     Statistics,
 }
 

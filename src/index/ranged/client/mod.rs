@@ -17,13 +17,13 @@ use std::time::Duration;
 
 pub mod cursor;
 
-pub struct RangedQueryClient {
+pub struct RangedIndexerClient {
     conshash: Arc<ConsistentHashing>,
     sm: Arc<SMClient>,
     placement: RwLock<BTreeMap<EntryKey, (TreePlacement, EntryKey)>>,
 }
 
-impl RangedQueryClient {
+impl RangedIndexerClient {
     pub fn new(conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         let sm = SMClient::new(crate::index::ranged::sm::DEFAULT_SM_ID, raft_client);
         Self {

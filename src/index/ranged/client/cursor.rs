@@ -1,6 +1,6 @@
 use super::super::lsm::service::*;
 use crate::index::ranged::{
-    client::RangedQueryClient,
+    client::RangedIndexerClient,
     trees::{max_entry_key, min_entry_key},
 };
 use crate::index::EntryKey;
@@ -12,7 +12,7 @@ use std::time::Duration;
 pub struct ClientCursor {
     pub ids: Vec<Id>,
     next: Option<EntryKey>,
-    query_client: Arc<RangedQueryClient>,
+    query_client: Arc<RangedIndexerClient>,
     pub pos: usize,
     buffer_size: u16,
     pattern: Option<Vec<u8>>,
@@ -23,7 +23,7 @@ impl ClientCursor {
     pub async fn new(
         block: ServBlock,
         range: Range,
-        query_client: Arc<RangedQueryClient>,
+        query_client: Arc<RangedIndexerClient>,
         buffer_size: u16,
         pattern: Option<Vec<u8>>,
     ) -> Result<Self, RPCError> {
@@ -75,7 +75,7 @@ impl ClientCursor {
             res,
             next_key.id()
         );
-        let next_cursor = RangedQueryClient::seek(
+        let next_cursor = RangedIndexerClient::seek(
             &self.query_client,
             self.range.clone().move_to(next_key.clone()),
             self.buffer_size,

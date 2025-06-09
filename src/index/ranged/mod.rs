@@ -52,7 +52,7 @@ mod tests {
             .await
             .unwrap(),
         );
-        let index_client = Arc::new(client::RangedQueryClient::new(
+        let index_client = Arc::new(client::RangedIndexerClient::new(
             &server.consh,
             &server.raft_client,
         ));
@@ -92,7 +92,7 @@ mod tests {
                 trace!("Seeking Id at {}, index {}", num, i);
                 let id = Id::new(1, num as u64);
                 let key = EntryKey::from_id(&id);
-                let rt_cursor = client::RangedQueryClient::seek(
+                let rt_cursor = client::RangedIndexerClient::seek(
                     &index_client,
                     Range::new_inclusive_opened(key, Ordering::Forward),
                     1,
@@ -117,7 +117,7 @@ mod tests {
         );
         info!("Scanning forward...");
         let start_id = Id::new(1, 0);
-        let mut rt_cursor = client::RangedQueryClient::seek(
+        let mut rt_cursor = client::RangedIndexerClient::seek(
             &index_client,
             Range::new_inclusive_opened(EntryKey::from_id(&start_id), Ordering::Forward),
             128,

@@ -21,28 +21,31 @@ use dovahkiin::types::{Id, OwnedValue};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
 use futures::Future;
-use hash::{hash_index_schema, HashIndexer, HashedQueryClient};
+use hash::{hash_index_schema, HashIndexer, HashedIndexClient};
 
 use crate::client::AsyncClient;
+use crate::index::vector::VectorIndexClient;
 use crate::ram::cell::ReadError;
 use crate::server::cell_rpc::AsyncServiceClient;
 
 use self::ranged::client::cursor::ClientCursor;
-use self::ranged::client::RangedQueryClient;
+use self::ranged::client::RangedIndexerClient;
 use self::ranged::lsm::service::Range;
 
 pub type Feature = [u8; FEATURE_SIZE];
 
 pub struct IndexerClients {
-    ranged_client: Arc<RangedQueryClient>,
-    hashed_client: Arc<HashedQueryClient>,
+    ranged_client: Arc<RangedIndexerClient>,
+    hashed_client: Arc<HashedIndexClient>,
+    vector_client: Arc<VectorIndexClient>,
 }
 
 impl IndexerClients {
     pub fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
         IndexerClients {
-            ranged_client: Arc::new(RangedQueryClient::new(conshash, raft_client)),
-            hashed_client: Arc::new(HashedQueryClient::new(neb_client)),
+            ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
+            hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
+            vector_client: Arc::new(VectorIndexClient::new()),
         }
     }
     pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
@@ -60,10 +63,10 @@ impl IndexerClients {
             let n = n as usize;
             key.as_slice()[..n].to_vec()
         });
-        RangedQueryClient::seek(&self.ranged_client, range, buffer_size, pattern)
+        RangedIndexerClient::seek(&self.ranged_client, range, buffer_size, pattern)
     }
 
     pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
-        HashedQueryClient::query(&self.hashed_client, index_id, field_id, value).await
+        HashedIndexClient::query(&self.hashed_client, index_id, field_id, value).await
     }
 }

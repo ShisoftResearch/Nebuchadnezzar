@@ -4,6 +4,7 @@ use super::{EntryKey, Feature, IndexerClients};
 use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
+use crate::index::vector::MetricEncoding;
 use crate::ram::cell::{OwnedCell, SharedCell};
 use crate::ram::types::Id;
 use crate::ram::{
@@ -11,6 +12,7 @@ use crate::ram::{
     schema::{IndexType, Schema},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
+use dovahkiin::types::OwnedValue;
 use futures::FutureExt;
 use futures::{
     future::BoxFuture,
@@ -44,17 +46,27 @@ pub struct HashedIndexMeta {
     cell_id: Id,
 }
 
+#[derive(Hash, Debug)]
+pub struct VectorIndexMeta {
+    cell_id: Id,
+    schema_id: u32,
+    field_id: u64,
+    metric_encoding: MetricEncoding,
+}
+
 // Enum containing all possible index metadata types
 #[derive(Hash, Debug)]
 pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
+    Vector(VectorIndexMeta),
 }
 
 // Enum for different types of index components
 pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
+    Vector(Id, u32, u64, MetricEncoding)
 }
 
 #[derive(Debug)]
@@ -95,6 +107,9 @@ impl IndexMeta {
                 indexers.hashed_client.insert(&meta.hash_id, &meta.cell_id).await
                     .map_err(|e| IndexError::TxnError(e))?;
             }
+            &IndexMeta::Vector(ref meta) => {
+                indexers.vector_client.insert(&meta.cell_id, meta.schema_id, meta.field_id, meta.metric_encoding).await?;
+            }
         }
         Ok(())
     }
@@ -109,6 +124,9 @@ impl IndexMeta {
             &IndexMeta::Hashed(ref meta) => {
                 let _ = indexers.hashed_client.indexer.remove_index(&meta.cell_id, &meta.hash_id).await
                     .map_err(|e| IndexError::TxnError(e))?;
+            }
+            &IndexMeta::Vector(ref meta) => {
+                indexers.vector_client.remove(&meta.cell_id, meta.schema_id, meta.field_id, meta.metric_encoding).await?;
             }
         }
         Ok(())
@@ -268,7 +286,7 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
             let mut components = vec![];
 
             // Handle array data
-            if let Some(_array_data_size) = value.prim_array_data_size() {
+            if value.is_prime_array() { // Index each element of the array
                 for index in indices {
                     match index {
                         // Generate ranged indices for array elements
@@ -287,6 +305,9 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                                 .map(|vec| IndexComps::Hashed(vec))
                                 .collect(),
                         ),
+                        // For vector, only provide its property
+                        &IndexType::Vector(metric_encoding) => components
+                            .push(IndexComps::Vector(cell.id(), schema.id, *field_id, metric_encoding)),
                         &IndexType::Statistics => {}
                     }
                 }
@@ -295,7 +316,8 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                 for index in indices {
                     match index {
                         &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
-                        &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                            &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                            &IndexType::Vector(_metric_encoding) => {}
                         &IndexType::Statistics => {}
                     }
                 }
@@ -319,6 +341,9 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                         }
                         let key = EntryKey::from_props(&cell_id, &feat, *field_id, schema.id);
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
+                    }
+                    IndexComps::Vector(cell_id, schema_id, field_id, metric_encoding) => {
+                        metas.push(IndexMeta::Vector(VectorIndexMeta { cell_id, schema_id, field_id, metric_encoding }));
                     }
                 }
             }
