@@ -202,9 +202,9 @@ impl DataManager {
         loop {
             if !self.managers.contains_key(&server_id) {
                 let client = self.server.get_member_by_server_id(server_id).await?;
-                return Ok(self.managers.get_or_insert(server_id, || {
-                    manager::AsyncServiceClient::new(&client)
-                }));
+                return Ok(self
+                    .managers
+                    .get_or_insert(server_id, || manager::AsyncServiceClient::new(&client)));
             } else {
                 if let Some(manager) = self.managers.get(&server_id) {
                     return Ok(manager.clone());

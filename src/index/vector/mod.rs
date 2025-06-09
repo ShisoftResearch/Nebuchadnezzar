@@ -4,7 +4,6 @@
 // By default, the implementation is Morpheus, it sets the index core to its implementation,
 // Nebuchadnezzar will use it to index vectors.
 
-
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -13,7 +12,8 @@ use futures::future::BoxFuture;
 
 use crate::index::builder::IndexError;
 
-const NO_CORE_ERROR: &str = "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
+const NO_CORE_ERROR: &str =
+    "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
 
 /// Encodings to allow metric serialization and conversion.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
@@ -34,11 +34,35 @@ pub fn get_vector_index_core() -> Option<&'static Arc<dyn VectorIndexerCore>> {
 }
 
 pub trait VectorIndexerCore: Send + Sync {
-    fn insert(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>>;
-    fn remove(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>>;
+    fn insert(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>>;
+    fn remove(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>>;
 
-    fn new_index(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>>;
-    fn delete_index(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>>;
+    fn new_index(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>>;
+    fn delete_index(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>>;
 }
 
 pub struct VectorIndexClient {
@@ -48,24 +72,56 @@ pub struct VectorIndexClient {
 impl VectorIndexClient {
     pub fn new() -> Self {
         let core = get_vector_index_core().expect(NO_CORE_ERROR);
-        Self {
-            core: core.clone(),
-        }
+        Self { core: core.clone() }
     }
 
-    pub fn insert(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>> {
-        self.core.insert(cell_id, schema_id, field_id, metric_encoding)
+    pub fn insert(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>> {
+        self.core
+            .insert(cell_id, schema_id, field_id, metric_encoding)
     }
 
-    pub fn remove(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>> {
-        self.core.remove(cell_id, schema_id, field_id, metric_encoding)
+    pub fn remove(
+        &self,
+        cell_id: &Id,
+        schema_id: u32,
+        field_id: u64,
+        metric_encoding: MetricEncoding,
+    ) -> BoxFuture<Result<(), IndexError>> {
+        self.core
+            .remove(cell_id, schema_id, field_id, metric_encoding)
     }
+}
 
-    pub fn new_index(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>> {
-        self.core.new_index(cell_id, schema_id, field_id, metric_encoding)
-    }
+pub fn new_index(
+    cell_id: &Id,
+    schema_id: u32,
+    field_id: u64,
+    metric_encoding: MetricEncoding,
+) -> BoxFuture<Result<(), IndexError>> {
+    get_vector_index_core().expect(NO_CORE_ERROR).new_index(
+        cell_id,
+        schema_id,
+        field_id,
+        metric_encoding,
+    )
+}
 
-    pub fn delete_index(&self, cell_id: &Id, schema_id: u32, field_id: u64, metric_encoding: MetricEncoding) -> BoxFuture<Result<(), IndexError>> {
-        self.core.delete_index(cell_id, schema_id, field_id, metric_encoding)
-    }
+pub fn delete_index(
+    cell_id: &Id,
+    schema_id: u32,
+    field_id: u64,
+    metric_encoding: MetricEncoding,
+) -> BoxFuture<Result<(), IndexError>> {
+    get_vector_index_core().expect(NO_CORE_ERROR).delete_index(
+        cell_id,
+        schema_id,
+        field_id,
+        metric_encoding,
+    )
 }

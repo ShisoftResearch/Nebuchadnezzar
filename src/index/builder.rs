@@ -66,7 +66,7 @@ pub enum IndexMeta {
 pub enum IndexComps {
     Ranged(Feature),
     Hashed(Feature),
-    Vector(Id, u32, u64, MetricEncoding)
+    Vector(Id, u32, u64, MetricEncoding),
 }
 
 #[derive(Debug)]
@@ -100,15 +100,29 @@ impl IndexMeta {
     async fn insert(&self, indexers: &IndexerClients) -> Result<(), IndexError> {
         match self {
             &IndexMeta::Ranged(ref meta) => {
-                indexers.ranged_client.insert(&meta.key).await
+                indexers
+                    .ranged_client
+                    .insert(&meta.key)
+                    .await
                     .map_err(|e| IndexError::RPCError(e))?;
             }
             &IndexMeta::Hashed(ref meta) => {
-                indexers.hashed_client.insert(&meta.hash_id, &meta.cell_id).await
+                indexers
+                    .hashed_client
+                    .insert(&meta.hash_id, &meta.cell_id)
+                    .await
                     .map_err(|e| IndexError::TxnError(e))?;
             }
             &IndexMeta::Vector(ref meta) => {
-                indexers.vector_client.insert(&meta.cell_id, meta.schema_id, meta.field_id, meta.metric_encoding).await?;
+                indexers
+                    .vector_client
+                    .insert(
+                        &meta.cell_id,
+                        meta.schema_id,
+                        meta.field_id,
+                        meta.metric_encoding,
+                    )
+                    .await?;
             }
         }
         Ok(())
@@ -118,15 +132,30 @@ impl IndexMeta {
     async fn remove(&self, indexers: &IndexerClients) -> Result<(), IndexError> {
         match self {
             &IndexMeta::Ranged(ref meta) => {
-                indexers.ranged_client.delete(&meta.key).await
+                indexers
+                    .ranged_client
+                    .delete(&meta.key)
+                    .await
                     .map_err(|e| IndexError::RPCError(e))?;
             }
             &IndexMeta::Hashed(ref meta) => {
-                let _ = indexers.hashed_client.indexer.remove_index(&meta.cell_id, &meta.hash_id).await
+                let _ = indexers
+                    .hashed_client
+                    .indexer
+                    .remove_index(&meta.cell_id, &meta.hash_id)
+                    .await
                     .map_err(|e| IndexError::TxnError(e))?;
             }
             &IndexMeta::Vector(ref meta) => {
-                indexers.vector_client.remove(&meta.cell_id, meta.schema_id, meta.field_id, meta.metric_encoding).await?;
+                indexers
+                    .vector_client
+                    .remove(
+                        &meta.cell_id,
+                        meta.schema_id,
+                        meta.field_id,
+                        meta.metric_encoding,
+                    )
+                    .await?;
             }
         }
         Ok(())
@@ -138,7 +167,7 @@ thread_local! {
     pub static PENDING_INDEX_TASKS: RefCell<Vec<JoinHandle<Result<(), IndexError>>>> = RefCell::new(Vec::new());
 }
 
-fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static)  {
+fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 'static) {
     let tokio_task = tokio::spawn(task);
     PENDING_INDEX_TASKS.with(|task_list| {
         task_list.borrow_mut().push(tokio_task);
@@ -151,7 +180,11 @@ pub struct IndexBuilder {
 
 impl IndexBuilder {
     // Create a new IndexBuilder instance
-    pub async fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub async fn new(
+        neb_client: &Arc<AsyncClient>,
+        conshash: &Arc<ConsistentHashing>,
+        raft_client: &Arc<RaftClient>,
+    ) -> Self {
         let _ = IndexerClients::init_index_schema(neb_client).await;
         Self {
             clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client)),
@@ -187,7 +220,10 @@ impl IndexBuilder {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
         new_index_task(async move {
-            indexers.ranged_client.insert(&key).await
+            indexers
+                .ranged_client
+                .insert(&key)
+                .await
                 .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
         });
@@ -208,7 +244,10 @@ impl IndexBuilder {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
         let indexers = indexers.to_owned();
         new_index_task(async move {
-            indexers.ranged_client.delete(&key).await
+            indexers
+                .ranged_client
+                .delete(&key)
+                .await
                 .map_err(|e| IndexError::RPCError(e))?;
             Ok(())
         });
@@ -286,7 +325,8 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
             let mut components = vec![];
 
             // Handle array data
-            if value.is_prime_array() { // Index each element of the array
+            if value.is_prime_array() {
+                // Index each element of the array
                 for index in indices {
                     match index {
                         // Generate ranged indices for array elements
@@ -306,8 +346,12 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                                 .collect(),
                         ),
                         // For vector, only provide its property
-                        &IndexType::Vector(metric_encoding) => components
-                            .push(IndexComps::Vector(cell.id(), schema.id, *field_id, metric_encoding)),
+                        &IndexType::Vector(metric_encoding) => components.push(IndexComps::Vector(
+                            cell.id(),
+                            schema.id,
+                            *field_id,
+                            metric_encoding,
+                        )),
                         &IndexType::Statistics => {}
                     }
                 }
@@ -316,8 +360,8 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                 for index in indices {
                     match index {
                         &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
-                            &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
-                            &IndexType::Vector(_metric_encoding) => {}
+                        &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
+                        &IndexType::Vector(_metric_encoding) => {}
                         &IndexType::Statistics => {}
                     }
                 }
@@ -343,7 +387,12 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                         metas.push(IndexMeta::Ranged(RangedIndexMeta { key }));
                     }
                     IndexComps::Vector(cell_id, schema_id, field_id, metric_encoding) => {
-                        metas.push(IndexMeta::Vector(VectorIndexMeta { cell_id, schema_id, field_id, metric_encoding }));
+                        metas.push(IndexMeta::Vector(VectorIndexMeta {
+                            cell_id,
+                            schema_id,
+                            field_id,
+                            metric_encoding,
+                        }));
                     }
                 }
             }

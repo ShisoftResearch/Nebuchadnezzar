@@ -146,7 +146,9 @@ impl NebServer {
                 .unwrap(),
         );
         let index_builder = if opts.index_enabled {
-            Some(Arc::new(IndexBuilder::new(&neb_client, &conshasing, &raft_client).await))
+            Some(Arc::new(
+                IndexBuilder::new(&neb_client, &conshasing, &raft_client).await,
+            ))
         } else {
             None
         };
@@ -179,7 +181,9 @@ impl NebServer {
         for service in servs {
             match service {
                 Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
-                Service::Transaction | Service::HashIndexer => init_txn_service(rpc_server, &server).await,
+                Service::Transaction | Service::HashIndexer => {
+                    init_txn_service(rpc_server, &server).await
+                }
                 Service::RangedIndexer => {
                     init_ranged_indexer_service(
                         rpc_server,
@@ -229,9 +233,7 @@ impl NebServer {
             address: server_addr.to_owned(),
             service_id: raft::DEFAULT_SERVICE_ID,
         });
-        rpc_server
-            .register_service(&raft_service)
-            .await;
+        rpc_server.register_service(&raft_service).await;
         Server::listen_and_resume(&rpc_server).await;
         debug!("RPC server created, starting Raft service");
         raft::RaftService::start(&raft_service).await;
@@ -343,22 +345,16 @@ impl Peer {
 
 pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
-        .register_service(
-            &cell_rpc::NebRPCService::new(&neb_server),
-        )
+        .register_service(&cell_rpc::NebRPCService::new(&neb_server))
         .await;
 }
 
 pub async fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
-        .register_service(
-            &transactions::manager::TransactionManager::new(&neb_server),
-        )
+        .register_service(&transactions::manager::TransactionManager::new(&neb_server))
         .await;
     rpc_server
-        .register_service(
-            &transactions::data_site::DataManager::new(&neb_server),
-        )
+        .register_service(&transactions::data_site::DataManager::new(&neb_server))
         .await;
 }
 
@@ -384,11 +380,9 @@ pub async fn init_ranged_indexer_service(
         raft_client,
     ));
     rpc_server
-        .register_service(
-            &Arc::new(ranged::lsm::service::LSMTreeService::new(
-                neb_client, &sm_client,
-            )),
-        )
+        .register_service(&Arc::new(ranged::lsm::service::LSMTreeService::new(
+            neb_client, &sm_client,
+        )))
         .await;
     let mut tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash);
     tree_sm.try_initialize().await;

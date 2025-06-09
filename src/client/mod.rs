@@ -3,7 +3,9 @@ use bifrost::membership::client::ObserverClient;
 use bifrost::raft;
 use bifrost::raft::client::{ClientError, RaftClient};
 use bifrost::raft::state_machine::master::ExecError;
-use bifrost::rpc::{RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL};
+use bifrost::rpc::{
+    RPCClient, RPCError, Server as RPCServer, ServiceClientWithId, DEFAULT_CLIENT_POOL,
+};
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
@@ -106,7 +108,12 @@ impl AsyncClient {
         client.read_cell(id).await
     }
 
-    pub async fn read_cell_select(&self, id: Id, fields: &Vec<u64>, need_header: bool) -> Result<Result<OwnedCell, ReadError>, RPCError> {
+    pub async fn read_cell_select(
+        &self,
+        id: Id,
+        fields: &Vec<u64>,
+        need_header: bool,
+    ) -> Result<Result<OwnedCell, ReadError>, RPCError> {
         let client = self.locate_plain_server(id).await?;
         client.read_cell_select(id, fields, need_header).await
     }
@@ -220,14 +227,22 @@ impl AsyncClient {
             txn.state = StdCell::new(txn_server::TxnState::Started);
             txn.tid = match txn.client.begin().await {
                 Ok(Ok(id)) => id,
-                Ok(Err(e)) => return {
-                    error!("Transaction {:?} cannot begin, manager error: {:?}", txn.tid, e);
-                    Err(TxnError::CannotBegin)
-                },
+                Ok(Err(e)) => {
+                    return {
+                        error!(
+                            "Transaction {:?} cannot begin, manager error: {:?}",
+                            txn.tid, e
+                        );
+                        Err(TxnError::CannotBegin)
+                    }
+                }
                 Err(e) => {
-                    error!("Transaction {:?} cannot begin, manager RPC error: {:?}", txn.tid, e);
-                    return Err(TxnError::CannotBegin)
-                },
+                    error!(
+                        "Transaction {:?} cannot begin, manager RPC error: {:?}",
+                        txn.tid, e
+                    );
+                    return Err(TxnError::CannotBegin);
+                }
             };
             // Erase the txn lifetime so it does not required to be carried with result
             let fn_txn_ref = unsafe { &*((&txn) as *const _) };

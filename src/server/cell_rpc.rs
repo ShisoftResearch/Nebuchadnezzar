@@ -68,8 +68,19 @@ impl Service for NebRPCService {
         )
         .boxed()
     }
-    fn read_cell_select(&self, id: Id, fields: &Vec<u64>, need_header: bool) -> BoxFuture<Result<OwnedCell, ReadError>> {
-        future::ready(self.server.chunks.read_selected(&id, fields.as_slice(), need_header).map(|c| c.to_owned())).boxed()
+    fn read_cell_select(
+        &self,
+        id: Id,
+        fields: &Vec<u64>,
+        need_header: bool,
+    ) -> BoxFuture<Result<OwnedCell, ReadError>> {
+        future::ready(
+            self.server
+                .chunks
+                .read_selected(&id, fields.as_slice(), need_header)
+                .map(|c| c.to_owned()),
+        )
+        .boxed()
     }
     fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.write_cell(&mut cell))

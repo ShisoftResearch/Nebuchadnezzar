@@ -41,7 +41,11 @@ pub struct IndexerClients {
 }
 
 impl IndexerClients {
-    pub fn new(neb_client: &Arc<AsyncClient>, conshash: &Arc<ConsistentHashing>, raft_client: &Arc<RaftClient>) -> Self {
+    pub fn new(
+        neb_client: &Arc<AsyncClient>,
+        conshash: &Arc<ConsistentHashing>,
+        raft_client: &Arc<RaftClient>,
+    ) -> Self {
         IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
@@ -66,7 +70,12 @@ impl IndexerClients {
         RangedIndexerClient::seek(&self.ranged_client, range, buffer_size, pattern)
     }
 
-    pub async fn hashed_query(&self, index_id: Id, field_id: u64, value: &OwnedValue) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
+    pub async fn hashed_query(
+        &self,
+        index_id: Id,
+        field_id: u64,
+        value: &OwnedValue,
+    ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         HashedIndexClient::query(&self.hashed_client, index_id, field_id, value).await
     }
 }
