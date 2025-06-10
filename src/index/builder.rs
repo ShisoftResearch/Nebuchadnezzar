@@ -73,6 +73,7 @@ pub enum IndexComps {
 pub enum IndexError {
     TxnError(TxnError),
     RPCError(RPCError),
+    Other(String),
 }
 
 // Struct holding a collection of index metadata
