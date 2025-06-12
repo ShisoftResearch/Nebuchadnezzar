@@ -25,8 +25,9 @@ pub enum MetricEncoding {
 }
 
 pub static VECTOR_INDEX_CORE: OnceLock<Arc<dyn VectorIndexerCore>> = OnceLock::new();
-pub fn set_vector_index_core<C: VectorIndexerCore + 'static>(core: C) {
-    VECTOR_INDEX_CORE.get_or_init(move || Arc::new(core));
+pub fn set_vector_index_core<C: VectorIndexerCore + 'static>(core: C) -> bool {
+    let res = VECTOR_INDEX_CORE.set(Arc::new(core));
+    return res.is_ok();
 }
 
 pub fn get_vector_index_core() -> Option<&'static Arc<dyn VectorIndexerCore>> {
