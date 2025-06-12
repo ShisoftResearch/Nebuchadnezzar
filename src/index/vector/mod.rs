@@ -57,16 +57,11 @@ pub trait VectorIndexerCore: Send + Sync {
     fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>>;
 }
 
-pub struct VectorIndexClient {
-    core: Option<Arc<dyn VectorIndexerCore>>,
-}
+pub struct VectorIndexClient;
 
 impl VectorIndexClient {
     pub fn new() -> Self {
-        let core = get_vector_index_core();
-        Self {
-            core: core.cloned(),
-        }
+        Self
     }
 
     pub fn insert(
@@ -76,7 +71,7 @@ impl VectorIndexClient {
         field_id: u64,
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<Result<(), IndexError>> {
-        self.core.as_ref().expect(NO_CORE_ERROR).insert(
+        get_vector_index_core().expect(NO_CORE_ERROR).insert(
             cell_id,
             schema_id,
             field_id,
@@ -90,7 +85,7 @@ impl VectorIndexClient {
         schema_id: u32,
         field_id: u64,
     ) -> BoxFuture<Result<(), IndexError>> {
-        self.core.as_ref().expect(NO_CORE_ERROR).remove(
+        get_vector_index_core().expect(NO_CORE_ERROR).remove(
             cell_id,
             schema_id,
             field_id,
