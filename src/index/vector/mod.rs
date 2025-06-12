@@ -34,6 +34,10 @@ pub fn get_vector_index_core() -> Option<&'static Arc<dyn VectorIndexerCore>> {
     VECTOR_INDEX_CORE.get()
 }
 
+pub fn is_vector_index_core_set() -> bool {
+    VECTOR_INDEX_CORE.get().is_some()
+}
+
 pub trait VectorIndexerCore: Send + Sync {
     fn insert(
         &self,
