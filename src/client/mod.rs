@@ -19,9 +19,7 @@ use std::sync::Arc;
 use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
-use crate::ram::schema::{
-    DelSchemaError, NewSchemaError, Schema,
-};
+use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
 use crate::ram::types::Id;
 use crate::server::transactions::TxnId;
 use crate::server::{cell_rpc as plain_server, transactions as txn_server, CONS_HASH_ID};
@@ -294,7 +292,7 @@ impl AsyncClient {
     pub async fn schema_by_id(&self, id: u32) -> Result<Option<Schema>, ExecError> {
         self.schema_client.get(&id).await
     }
-    
+
     pub async fn new_schema_with_id(
         &self,
         schema: Schema,
@@ -303,19 +301,27 @@ impl AsyncClient {
         let schema_id = schema.id;
         match res {
             Ok(Ok(_)) => {
-                if let Some (server_id) = self.conshash.rand_server_id() {
+                if let Some(server_id) = self.conshash.rand_server_id() {
                     match self.client_by_server_id(server_id).await {
                         Ok(client) => {
                             if let Err(e) = client.post_schema_add(schema_id).await {
-                                return Ok(Err(NewSchemaError::PostProcessError(format!("Post process error: {:?}", e))))
+                                return Ok(Err(NewSchemaError::PostProcessError(format!(
+                                    "Post process error: {:?}",
+                                    e
+                                ))));
                             }
                         }
                         Err(e) => {
-                            return Ok(Err(NewSchemaError::PostProcessError(format!("Connecting error for post process: {:?}", e))))
+                            return Ok(Err(NewSchemaError::PostProcessError(format!(
+                                "Connecting error for post process: {:?}",
+                                e
+                            ))))
                         }
                     }
                 } else {
-                    return Ok(Err(NewSchemaError::PostProcessError("Cannot find server for post process".to_string())))
+                    return Ok(Err(NewSchemaError::PostProcessError(
+                        "Cannot find server for post process".to_string(),
+                    )));
                 }
             }
             _ => {}
@@ -340,19 +346,27 @@ impl AsyncClient {
         } else {
             return Ok(Err(DelSchemaError::SchemaDoesNotExisted));
         };
-        if let Some (server_id) = self.conshash.rand_server_id() {
+        if let Some(server_id) = self.conshash.rand_server_id() {
             match self.client_by_server_id(server_id).await {
                 Ok(client) => {
                     if let Err(e) = client.post_schema_delete(schema_id).await {
-                        return Ok(Err(DelSchemaError::PostProcessError(format!("Post process error: {:?}", e))))
+                        return Ok(Err(DelSchemaError::PostProcessError(format!(
+                            "Post process error: {:?}",
+                            e
+                        ))));
                     }
                 }
                 Err(e) => {
-                    return Ok(Err(DelSchemaError::PostProcessError(format!("Connecting error for post process: {:?}", e))))
+                    return Ok(Err(DelSchemaError::PostProcessError(format!(
+                        "Connecting error for post process: {:?}",
+                        e
+                    ))))
                 }
             }
         } else {
-            return Ok(Err(DelSchemaError::PostProcessError("Cannot find server for post process".to_string())))
+            return Ok(Err(DelSchemaError::PostProcessError(
+                "Cannot find server for post process".to_string(),
+            )));
         }
         // Need to do the post processing before deleting the schema from the schema client
         return self.schema_client.del_schema(&name).await;

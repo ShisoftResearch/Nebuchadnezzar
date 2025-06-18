@@ -520,7 +520,11 @@ pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Re
                 let field_id = *field;
                 let schema_id = schema.id;
                 if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer.clients.vector_client.new_index(schema_id, field_id).await
+                    let _ = indexer
+                        .clients
+                        .vector_client
+                        .new_index(schema_id, field_id)
+                        .await
                         .map_err(|e| format!("Error creating vector index: {:?}", e))?;
                 } else {
                     return Err(format!("Indexing not enabled"));
@@ -541,7 +545,11 @@ pub async fn post_schema_delete(
                 let field_id = *field;
                 let schema_id = schema.id;
                 if let Some(indexer) = &neb_server.indexer {
-                    let _ = indexer.clients.vector_client.delete_index(schema_id, field_id).await
+                    let _ = indexer
+                        .clients
+                        .vector_client
+                        .delete_index(schema_id, field_id)
+                        .await
                         .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
                 } else {
                     return Err(format!("Indexing not enabled"));

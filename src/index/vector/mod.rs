@@ -12,7 +12,6 @@ use futures::future::BoxFuture;
 
 use crate::index::builder::IndexError;
 
-
 pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
 
@@ -75,12 +74,8 @@ impl VectorIndexClient {
         field_id: u64,
         metric_encoding: MetricEncoding,
     ) -> BoxFuture<'a, Result<(), IndexError>> {
-        self.get_vector_index_core().insert(
-            cell_id,
-            schema_id,
-            field_id,
-            metric_encoding,
-        )
+        self.get_vector_index_core()
+            .insert(cell_id, schema_id, field_id, metric_encoding)
     }
 
     pub fn remove<'a>(
@@ -94,8 +89,7 @@ impl VectorIndexClient {
     }
 
     pub fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>> {
-        self.get_vector_index_core()
-            .new_index(schema_id, field_id)
+        self.get_vector_index_core().new_index(schema_id, field_id)
     }
 
     pub fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>> {

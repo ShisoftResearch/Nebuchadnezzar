@@ -184,29 +184,45 @@ impl Service for NebRPCService {
             .collect();
         return future::ready(res).boxed();
     }
-    
-    fn post_schema_add<'a>(&'a self,schema_id:u32) ->  BoxFuture<'a, Result<(), String>>  {
+
+    fn post_schema_add<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
-            let schema = self.server.neb_client.schema_by_id(schema_id).await
+            let schema = self
+                .server
+                .neb_client
+                .schema_by_id(schema_id)
+                .await
                 .map_err(|e| e.to_string())?;
             if let Some(schema) = schema {
                 post_schema_add(&schema, &self.server).await
             } else {
-                Err(format!("Schema not found for post_schema_add {}", schema_id))
+                Err(format!(
+                    "Schema not found for post_schema_add {}",
+                    schema_id
+                ))
             }
-        }.boxed()
+        }
+        .boxed()
     }
-    
-    fn post_schema_delete<'a>(&'a self,schema_id:u32) ->  BoxFuture<'a, Result<(), String>>  {
+
+    fn post_schema_delete<'a>(&'a self, schema_id: u32) -> BoxFuture<'a, Result<(), String>> {
         async move {
-            let schema = self.server.neb_client.schema_by_id(schema_id).await
+            let schema = self
+                .server
+                .neb_client
+                .schema_by_id(schema_id)
+                .await
                 .map_err(|e| e.to_string())?;
             if let Some(schema) = schema {
                 post_schema_delete(&schema, &self.server).await
             } else {
-                Err(format!("Schema not found for post_schema_delete {}", schema_id))
+                Err(format!(
+                    "Schema not found for post_schema_delete {}",
+                    schema_id
+                ))
             }
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
