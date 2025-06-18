@@ -12,7 +12,6 @@ use crate::ram::{
     schema::{IndexType, Schema},
 };
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient, rpc::RPCError};
-use dovahkiin::types::OwnedValue;
 use futures::FutureExt;
 use futures::{
     future::BoxFuture,
@@ -150,11 +149,7 @@ impl IndexMeta {
             &IndexMeta::Vector(ref meta) => {
                 indexers
                     .vector_client
-                    .remove(
-                        &meta.cell_id,
-                        meta.schema_id,
-                        meta.field_id,
-                    )
+                    .remove(&meta.cell_id, meta.schema_id, meta.field_id)
                     .await?;
             }
         }
@@ -175,7 +170,7 @@ fn new_index_task(task: impl Future<Output = Result<(), IndexError>> + Send + 's
 }
 // Main struct for building and managing indices
 pub struct IndexBuilder {
-    clients: Arc<IndexerClients>,
+    pub clients: Arc<IndexerClients>,
 }
 
 impl IndexBuilder {
@@ -198,7 +193,7 @@ impl IndexBuilder {
         schema: &Schema,
         old_indices: Option<Vec<IndexRes>>,
     ) {
-        let indexers = self.clients.to_owned();
+        let indexers = self.clients.clone();
         // Handle scannable indices if needed
         if schema.is_scannable {
             self.ensure_scannable(cell, &indexers);

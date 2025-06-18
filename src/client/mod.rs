@@ -20,7 +20,7 @@ use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::{
-    post_schema_add, post_schema_delete, DelSchemaError, NewSchemaError, Schema,
+    DelSchemaError, NewSchemaError, Schema,
 };
 use crate::ram::types::Id;
 use crate::server::transactions::TxnId;
@@ -286,22 +286,43 @@ impl AsyncClient {
         }
         Err(TxnError::TooManyRetry)
     }
+
+    pub async fn schema_by_name(&self, name: &String) -> Result<Option<Schema>, ExecError> {
+        self.schema_client.get_by_name(name).await
+    }
+
+    pub async fn schema_by_id(&self, id: u32) -> Result<Option<Schema>, ExecError> {
+        self.schema_client.get(&id).await
+    }
+    
     pub async fn new_schema_with_id(
         &self,
         schema: Schema,
     ) -> Result<Result<(), NewSchemaError>, ExecError> {
-        match self.schema_client.new_schema(&schema).await {
-            Ok(r) => {
-                if r.is_ok() {
-                    if let Err(e) = post_schema_add(&schema).await {
-                        return Ok(Err(NewSchemaError::PostProcessError(e)));
+        let res = self.schema_client.new_schema(&schema).await;
+        let schema_id = schema.id;
+        match res {
+            Ok(Ok(_)) => {
+                if let Some (server_id) = self.conshash.rand_server_id() {
+                    match self.client_by_server_id(server_id).await {
+                        Ok(client) => {
+                            if let Err(e) = client.post_schema_add(schema_id).await {
+                                return Ok(Err(NewSchemaError::PostProcessError(format!("Post process error: {:?}", e))))
+                            }
+                        }
+                        Err(e) => {
+                            return Ok(Err(NewSchemaError::PostProcessError(format!("Connecting error for post process: {:?}", e))))
+                        }
                     }
+                } else {
+                    return Ok(Err(NewSchemaError::PostProcessError("Cannot find server for post process".to_string())))
                 }
-                return Ok(r);
             }
-            Err(e) => Err(e),
+            _ => {}
         }
+        return res;
     }
+
     pub async fn new_schema(
         &self,
         mut schema: Schema,
@@ -314,12 +335,27 @@ impl AsyncClient {
     }
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         let schema = self.schema_client.get_by_name(&name).await?;
-        if let Some(schema) = schema {
-            if let Err(e) = post_schema_delete(&schema).await {
-                return Ok(Err(DelSchemaError::PostProcessError(e)));
+        let schema_id = if let Some(schema) = schema {
+            schema.id
+        } else {
+            return Ok(Err(DelSchemaError::SchemaDoesNotExisted));
+        };
+        if let Some (server_id) = self.conshash.rand_server_id() {
+            match self.client_by_server_id(server_id).await {
+                Ok(client) => {
+                    if let Err(e) = client.post_schema_delete(schema_id).await {
+                        return Ok(Err(DelSchemaError::PostProcessError(format!("Post process error: {:?}", e))))
+                    }
+                }
+                Err(e) => {
+                    return Ok(Err(DelSchemaError::PostProcessError(format!("Connecting error for post process: {:?}", e))))
+                }
             }
+        } else {
+            return Ok(Err(DelSchemaError::PostProcessError("Cannot find server for post process".to_string())))
         }
-        self.schema_client.del_schema(&name).await
+        // Need to do the post processing before deleting the schema from the schema client
+        return self.schema_client.del_schema(&name).await;
     }
     pub async fn get_all_schema(&self) -> Result<Vec<Schema>, ExecError> {
         self.schema_client.get_all().await

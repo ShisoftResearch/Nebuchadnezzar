@@ -1,4 +1,5 @@
 use crate::ram::cell::Cell;
+use crate::ram::schema::{post_schema_add, post_schema_delete};
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
@@ -30,6 +31,8 @@ service! {
     rpc upsert_cell(cell: OwnedCell) -> Result<CellHeader, WriteError>;
     rpc remove_cell(key: Id) -> Result<(), WriteError>;
     rpc count() -> u64;
+    rpc post_schema_add(schema_id: u32) -> Result<(), String>;
+    rpc post_schema_delete(schema: u32) -> Result<(), String>;
 }
 
 service_with_id!(NebRPCService, DEFAULT_SERVICE_ID);
@@ -180,6 +183,30 @@ impl Service for NebRPCService {
             .map(|row| row.map(|cell| cell.to_owned()))
             .collect();
         return future::ready(res).boxed();
+    }
+    
+    fn post_schema_add<'a>(&'a self,schema_id:u32) ->  BoxFuture<'a, Result<(), String>>  {
+        async move {
+            let schema = self.server.neb_client.schema_by_id(schema_id).await
+                .map_err(|e| e.to_string())?;
+            if let Some(schema) = schema {
+                post_schema_add(&schema, &self.server).await
+            } else {
+                Err(format!("Schema not found for post_schema_add {}", schema_id))
+            }
+        }.boxed()
+    }
+    
+    fn post_schema_delete<'a>(&'a self,schema_id:u32) ->  BoxFuture<'a, Result<(), String>>  {
+        async move {
+            let schema = self.server.neb_client.schema_by_id(schema_id).await
+                .map_err(|e| e.to_string())?;
+            if let Some(schema) = schema {
+                post_schema_delete(&schema, &self.server).await
+            } else {
+                Err(format!("Schema not found for post_schema_delete {}", schema_id))
+            }
+        }.boxed()
     }
 }
 

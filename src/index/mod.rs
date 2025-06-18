@@ -12,21 +12,21 @@ pub const KEY_SIZE: usize = ID_SIZE + FEATURE_SIZE + 8; // 8 is the estimate len
 pub const SCHEMA_SCAN_PATT_SIZE: u8 = (FEATURE_SIZE + 8) as u8;
 pub const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use bifrost::raft::state_machine::master::ExecError;
 use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
 use dovahkiin::types::{Id, OwnedValue};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
+use futures::future::BoxFuture;
 use futures::Future;
-use hash::{hash_index_schema, HashIndexer, HashedIndexClient};
+use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::vector::VectorIndexClient;
+use crate::index::builder::IndexError;
+use crate::index::vector::{VectorIndexClient, VectorIndexerCore};
 use crate::ram::cell::ReadError;
-use crate::server::cell_rpc::AsyncServiceClient;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedIndexerClient;
@@ -35,9 +35,9 @@ use self::ranged::lsm::service::Range;
 pub type Feature = [u8; FEATURE_SIZE];
 
 pub struct IndexerClients {
-    ranged_client: Arc<RangedIndexerClient>,
-    hashed_client: Arc<HashedIndexClient>,
-    vector_client: Arc<VectorIndexClient>,
+    pub ranged_client: Arc<RangedIndexerClient>,
+    pub hashed_client: Arc<HashedIndexClient>,
+    pub vector_client: Arc<VectorIndexClient>,
 }
 
 impl IndexerClients {

@@ -12,7 +12,8 @@ use futures::future::BoxFuture;
 
 use crate::index::builder::IndexError;
 
-const NO_CORE_ERROR: &str =
+
+pub const NO_VECTOR_CORE_ERROR: &str =
     "Vector indexer core is not set. Should call `set_vector_index_core` to set it.";
 
 /// Encodings to allow metric serialization and conversion.
@@ -22,20 +23,6 @@ pub enum MetricEncoding {
     Cosine,
     Manhattan,
     Chebyshev,
-}
-
-pub static VECTOR_INDEX_CORE: OnceLock<Arc<dyn VectorIndexerCore>> = OnceLock::new();
-pub fn set_vector_index_core<C: VectorIndexerCore + 'static>(core: C) -> bool {
-    let res = VECTOR_INDEX_CORE.set(Arc::new(core));
-    return res.is_ok();
-}
-
-pub fn get_vector_index_core() -> Option<&'static Arc<dyn VectorIndexerCore>> {
-    VECTOR_INDEX_CORE.get()
-}
-
-pub fn is_vector_index_core_set() -> bool {
-    VECTOR_INDEX_CORE.get().is_some()
 }
 
 pub trait VectorIndexerCore: Send + Sync {
@@ -57,21 +44,38 @@ pub trait VectorIndexerCore: Send + Sync {
     fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>>;
 }
 
-pub struct VectorIndexClient;
+pub struct VectorIndexClient {
+    vector_core: OnceLock<Arc<dyn VectorIndexerCore>>,
+}
 
 impl VectorIndexClient {
     pub fn new() -> Self {
-        Self
+        Self {
+            vector_core: OnceLock::new(),
+        }
     }
 
-    pub fn insert(
-        &self,
+    pub fn set_vector_index_core<C: VectorIndexerCore + 'static>(&self, core: C) -> bool {
+        let res = self.vector_core.set(Arc::new(core));
+        return res.is_ok();
+    }
+
+    pub fn get_vector_index_core(&self) -> &Arc<dyn VectorIndexerCore> {
+        self.vector_core.get().expect(NO_VECTOR_CORE_ERROR)
+    }
+
+    pub fn is_vector_index_core_set(&self) -> bool {
+        self.vector_core.get().is_some()
+    }
+
+    pub fn insert<'a>(
+        &'a self,
         cell_id: &Id,
         schema_id: u32,
         field_id: u64,
         metric_encoding: MetricEncoding,
-    ) -> BoxFuture<Result<(), IndexError>> {
-        get_vector_index_core().expect(NO_CORE_ERROR).insert(
+    ) -> BoxFuture<'a, Result<(), IndexError>> {
+        self.get_vector_index_core().insert(
             cell_id,
             schema_id,
             field_id,
@@ -79,28 +83,23 @@ impl VectorIndexClient {
         )
     }
 
-    pub fn remove(
-        &self,
+    pub fn remove<'a>(
+        &'a self,
         cell_id: &Id,
         schema_id: u32,
         field_id: u64,
-    ) -> BoxFuture<Result<(), IndexError>> {
-        get_vector_index_core().expect(NO_CORE_ERROR).remove(
-            cell_id,
-            schema_id,
-            field_id,
-        )
+    ) -> BoxFuture<'a, Result<(), IndexError>> {
+        self.get_vector_index_core()
+            .remove(cell_id, schema_id, field_id)
     }
-}
 
-pub fn new_index<'a>(schema_id: u32, field_id: u64) -> BoxFuture<'a, Result<(), IndexError>> {
-    get_vector_index_core()
-        .expect(NO_CORE_ERROR)
-        .new_index(schema_id, field_id)
-}
+    pub fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>> {
+        self.get_vector_index_core()
+            .new_index(schema_id, field_id)
+    }
 
-pub fn delete_index<'a>(schema_id: u32, field_id: u64) -> BoxFuture<'a, Result<(), IndexError>> {
-    get_vector_index_core()
-        .expect(NO_CORE_ERROR)
-        .delete_index(schema_id, field_id)
+    pub fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<Result<(), IndexError>> {
+        self.get_vector_index_core()
+            .delete_index(schema_id, field_id)
+    }
 }

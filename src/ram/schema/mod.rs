@@ -14,6 +14,7 @@ use crate::index::vector;
 use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
 use crate::ram::io::align_ptr_addr;
+use crate::server::NebServer;
 use crate::utils::thread_id;
 
 use super::types;
@@ -512,30 +513,39 @@ impl<O, T: ?Sized> Deref for ReadingRef<O, T> {
     }
 }
 
-pub async fn post_schema_add(schema: &Schema) -> Result<(), String> {
+pub async fn post_schema_add(schema: &Schema, neb_server: &Arc<NebServer>) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
             if let IndexType::Vector(_metric_encoding) = index {
                 let field_id = *field;
                 let schema_id = schema.id;
-                vector::new_index(schema_id, field_id)
-                    .await
-                    .map_err(|e| format!("Vector index create error {:?}", e))?;
+                if let Some(indexer) = &neb_server.indexer {
+                    let _ = indexer.clients.vector_client.new_index(schema_id, field_id).await
+                        .map_err(|e| format!("Error creating vector index: {:?}", e))?;
+                } else {
+                    return Err(format!("Indexing not enabled"));
+                }
             }
         }
     }
     Ok(())
 }
 
-pub async fn post_schema_delete(schema: &Schema) -> Result<(), String> {
+pub async fn post_schema_delete(
+    schema: &Schema,
+    neb_server: &Arc<NebServer>,
+) -> Result<(), String> {
     for (field, indices) in &schema.index_fields {
         for index in indices {
             if let IndexType::Vector(_metric_encoding) = index {
                 let field_id = *field;
                 let schema_id = schema.id;
-                vector::delete_index(schema_id, field_id)
-                    .await
-                    .map_err(|e| format!("Vector index create error {:?}", e))?;
+                if let Some(indexer) = &neb_server.indexer {
+                    let _ = indexer.clients.vector_client.delete_index(schema_id, field_id).await
+                        .map_err(|e| format!("Error deleting vector index: {:?}", e))?;
+                } else {
+                    return Err(format!("Indexing not enabled"));
+                }
             }
         }
     }
