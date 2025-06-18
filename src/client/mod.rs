@@ -301,6 +301,10 @@ impl AsyncClient {
         let schema_id = schema.id;
         match res {
             Ok(Ok(_)) => {
+                if schema.index_fields.is_empty() {
+                    // Nothing to process
+                    return res;
+                }
                 if let Some(server_id) = self.conshash.rand_server_id() {
                     match self.client_by_server_id(server_id).await {
                         Ok(client) => {
@@ -341,32 +345,36 @@ impl AsyncClient {
     }
     pub async fn del_schema(&self, name: String) -> Result<Result<(), DelSchemaError>, ExecError> {
         let schema = self.schema_client.get_by_name(&name).await?;
+        let has_index_fields;
         let schema_id = if let Some(schema) = schema {
+            has_index_fields = !schema.index_fields.is_empty();
             schema.id
         } else {
             return Ok(Err(DelSchemaError::SchemaDoesNotExisted));
         };
-        if let Some(server_id) = self.conshash.rand_server_id() {
-            match self.client_by_server_id(server_id).await {
-                Ok(client) => {
-                    if let Err(e) = client.post_schema_delete(schema_id).await {
+        if has_index_fields {
+            if let Some(server_id) = self.conshash.rand_server_id() {
+                match self.client_by_server_id(server_id).await {
+                    Ok(client) => {
+                        if let Err(e) = client.post_schema_delete(schema_id).await {
+                            return Ok(Err(DelSchemaError::PostProcessError(format!(
+                                "Post process error: {:?}",
+                                e
+                            ))));
+                        }
+                    }
+                    Err(e) => {
                         return Ok(Err(DelSchemaError::PostProcessError(format!(
-                            "Post process error: {:?}",
+                            "Connecting error for post process: {:?}",
                             e
-                        ))));
+                        ))))
                     }
                 }
-                Err(e) => {
-                    return Ok(Err(DelSchemaError::PostProcessError(format!(
-                        "Connecting error for post process: {:?}",
-                        e
-                    ))))
-                }
-            }
-        } else {
-            return Ok(Err(DelSchemaError::PostProcessError(
-                "Cannot find server for post process".to_string(),
-            )));
+            } else {
+                return Ok(Err(DelSchemaError::PostProcessError(
+                    "Cannot find server for post process".to_string(),
+                )));
+            }   
         }
         // Need to do the post processing before deleting the schema from the schema client
         return self.schema_client.del_schema(&name).await;
