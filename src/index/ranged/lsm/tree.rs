@@ -90,7 +90,7 @@ impl LSMTree {
     pub fn delete(&self, entry: &EntryKey) -> bool {
         if let Some(k) = self.seek(entry, Ordering::Forward).current() {
             if k == entry {
-                self.deletion.insert(entry);
+                self.deletion.insert(entry.clone());
                 return true;
             }
         }
