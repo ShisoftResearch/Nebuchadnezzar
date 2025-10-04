@@ -24,6 +24,7 @@ pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 #[derive(Default)]
 pub struct Segment {
     pub id: u64,
+    pub seq_id: u64,
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
@@ -42,6 +43,7 @@ pub struct Segment {
 impl Segment {
     pub fn new(
         id: u64,
+        seq_id: u64,
         buffer_ptr: usize,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
@@ -51,7 +53,7 @@ impl Segment {
         let size = SEGMENT_SIZE;
         if let Some(wal_storage) = wal_storage {
             create_dir_all(wal_storage).unwrap();
-            let file_name = format!("{}/{}.nlog", wal_storage, id);
+            let file_name = format!("{}/{}-{}.nlog", wal_storage, id, seq_id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
                 File::create(&file_name).unwrap(),
@@ -60,12 +62,13 @@ impl Segment {
             wal_file = Some(parking_lot::Mutex::new(file));
         }
         debug!(
-            "Creating new segment with id {}, size {}, address {}",
-            id, size, buffer_ptr
+            "Creating new segment with id {}, seq_id {}, size {}, address {}",
+            id, seq_id, size, buffer_ptr
         );
         Segment {
             addr: buffer_ptr,
             id,
+            seq_id,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
@@ -75,7 +78,7 @@ impl Segment {
             references: AtomicUsize::new(0),
             backup_file_name: backup_storage
                 .clone()
-                .map(|path| format!("{}/{}.nbackup", path, id)),
+                .map(|path| format!("{}/{}-{}.nbackup", path, id, seq_id)),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             wal_file,
@@ -301,6 +304,7 @@ pub struct SegmentAllocator {
     limit: usize,
     gc_threshold: usize,
     free: LinkedRingBufferList<usize, 64>,
+    next_seq_id: AtomicUsize,
 }
 
 impl SegmentAllocator {
@@ -326,6 +330,7 @@ impl SegmentAllocator {
             limit: aligned_addr + chunk_size,
             gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: LinkedRingBufferList::new(),
+            next_seq_id: AtomicUsize::new(0),
         }
     }
 
@@ -359,7 +364,8 @@ impl SegmentAllocator {
             })
             .map(|addr| {
                 let id = self.id_by_addr(addr);
-                Segment::new(id as u64, addr, backup_storage, wal_storage)
+                let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
+                Segment::new(id as u64, seq_id as u64, addr, backup_storage, wal_storage)
             })
     }
 
