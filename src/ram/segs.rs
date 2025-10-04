@@ -7,7 +7,7 @@ use libc::*;
 use lightning::list::LinkedRingBufferList;
 use parking_lot;
 use std::fs::{copy, create_dir_all, remove_file, File};
-use std::io;
+use std::{io, slice};
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
@@ -51,7 +51,7 @@ impl Segment {
         let size = SEGMENT_SIZE;
         if let Some(wal_storage) = wal_storage {
             create_dir_all(wal_storage).unwrap();
-            let file_name = format!("{}/{}.log", wal_storage, id);
+            let file_name = format!("{}/{}.nlog", wal_storage, id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
                 File::create(&file_name).unwrap(),
@@ -75,7 +75,7 @@ impl Segment {
             references: AtomicUsize::new(0),
             backup_file_name: backup_storage
                 .clone()
-                .map(|path| format!("{}/{}.backup", path, id)),
+                .map(|path| format!("{}/{}.nbackup", path, id)),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             wal_file,
@@ -192,8 +192,14 @@ impl Segment {
                 if let Some(ref file_mutex) = self.wal_file {
                     // this should be redundant but I don't want to take the chance
                     // obtain the writer lock before continue
-                    let _ = file_mutex.lock();
+                    let mut writer = file_mutex.lock();
+                    writer.flush()?;
+                    writer.get_ref().sync_all()?;
+                    drop(writer);
                     copy(wal_file, backup_file)?;
+                    // Sync the backup file after copy
+                    let backup_file_handle = File::open(backup_file_path)?;
+                    backup_file_handle.sync_all()?;
                     remove_file(wal_file)?;
                 } else {
                     panic!()
@@ -203,13 +209,11 @@ impl Segment {
                 let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
                 let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
                 unsafe {
-                    for offset in 0..seg_size {
-                        let ptr = (self.addr + offset) as *const u8;
-                        let byte = *ptr;
-                        buffer.write(&[byte])?;
-                    }
+                    let data_block = slice::from_raw_parts(self.addr as *const u8, seg_size);
+                    buffer.write(data_block)?;
                 }
                 buffer.flush()?;
+                buffer.get_ref().sync_all()?;
                 return Ok(true);
             }
         }
@@ -220,13 +224,11 @@ impl Segment {
         if let Some(ref wal_file) = self.wal_file {
             let mut file = wal_file.lock();
             unsafe {
-                for offset in 0..size as usize {
-                    let ptr = (addr + offset) as *const u8;
-                    let byte = *ptr;
-                    file.write(&[byte])?;
-                }
+                let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
+                file.write(data_block)?;
             }
             file.flush()?;
+            file.get_ref().sync_data()?;
         }
         return Ok(());
     }
