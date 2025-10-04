@@ -44,6 +44,7 @@ impl Segment {
     pub fn new(
         id: u64,
         seq_id: u64,
+        chunk_id: usize,
         buffer_ptr: usize,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
@@ -51,9 +52,12 @@ impl Segment {
         let mut wal_file_name = None;
         let mut wal_file = None;
         let size = SEGMENT_SIZE;
+        if let Some(backup_storage) = backup_storage {
+            create_dir_all(backup_storage).unwrap();
+        }
         if let Some(wal_storage) = wal_storage {
             create_dir_all(wal_storage).unwrap();
-            let file_name = format!("{}/{}-{}.nlog", wal_storage, id, seq_id);
+            let file_name = format!("{}/{}-{}-{}.nlog", wal_storage, chunk_id, id, seq_id);
             let file = BufWriter::with_capacity(
                 4096, // most common disk block size
                 File::create(&file_name).unwrap(),
@@ -62,8 +66,8 @@ impl Segment {
             wal_file = Some(parking_lot::Mutex::new(file));
         }
         debug!(
-            "Creating new segment with id {}, seq_id {}, size {}, address {}",
-            id, seq_id, size, buffer_ptr
+            "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
+            chunk_id, id, seq_id, size, buffer_ptr
         );
         Segment {
             addr: buffer_ptr,
@@ -78,7 +82,7 @@ impl Segment {
             references: AtomicUsize::new(0),
             backup_file_name: backup_storage
                 .clone()
-                .map(|path| format!("{}/{}-{}.nbackup", path, id, seq_id)),
+                .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             wal_file,
@@ -204,6 +208,7 @@ impl Segment {
                     let backup_file_handle = File::open(backup_file_path)?;
                     backup_file_handle.sync_all()?;
                     remove_file(wal_file)?;
+                    return Ok(true);
                 } else {
                     panic!()
                 }
@@ -250,29 +255,17 @@ impl Segment {
         }
     }
 
-    // remove the backup and WAL files if they exist
+    // remove the backup if it have one
     pub fn dispense(&self) {
-        debug!("Dispensing segment {}", self.id);
-        // Remove WAL file
-        if let Some(ref wal_file_name) = self.wal_file_name {
-            let path = Path::new(wal_file_name);
+        debug!("dispense segment {}", self.id);
+        if let &Some(ref backup_storage) = &self.backup_file_name {
+            let path = Path::new(backup_storage);
             if path.exists() {
-                if let Err(e) = remove_file(path) {
-                    error!("Cannot reclaim WAL file {} on dispense: {:?}", wal_file_name, e);
-                } else {
-                    debug!("Dispensed WAL file {}", wal_file_name);
+                if let Err(_e) = remove_file(path) {
+                    error!("cannot reclaim segment file on dispense {}", backup_storage)
                 }
-            }
-        }
-        // Remove backup file
-        if let Some(ref backup_file_name) = self.backup_file_name {
-            let path = Path::new(backup_file_name);
-            if path.exists() {
-                if let Err(e) = remove_file(path) {
-                    error!("Cannot reclaim backup file {} on dispense: {:?}", backup_file_name, e);
-                } else {
-                    debug!("Dispensed backup file {}", backup_file_name);
-                }
+            } else {
+                error!("cannot find segment backup to dispense {}", backup_storage)
             }
         }
     }
@@ -316,11 +309,12 @@ pub struct SegmentAllocator {
     limit: usize,
     gc_threshold: usize,
     free: LinkedRingBufferList<usize, 64>,
-    next_seq_id: AtomicUsize,
+    pub next_seq_id: AtomicUsize,
+    chunk_id: usize,
 }
 
 impl SegmentAllocator {
-    pub fn new(chunk_size: usize) -> Self {
+    pub fn new(chunk_id: usize, chunk_size: usize) -> Self {
         let overflow = SEGMENT_SIZE - PAGE_SIZE;
         let aligned_size = chunk_size + overflow;
         let ptr = unsafe {
@@ -343,6 +337,7 @@ impl SegmentAllocator {
             gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: LinkedRingBufferList::new(),
             next_seq_id: AtomicUsize::new(0),
+            chunk_id,
         }
     }
 
@@ -377,7 +372,7 @@ impl SegmentAllocator {
             .map(|addr| {
                 let id = self.id_by_addr(addr);
                 let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
-                Segment::new(id as u64, seq_id as u64, addr, backup_storage, wal_storage)
+                Segment::new(id as u64, seq_id as u64, self.chunk_id, addr, backup_storage, wal_storage)
             })
     }
 

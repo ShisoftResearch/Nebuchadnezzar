@@ -52,6 +52,7 @@ pub struct ServerOptions {
     pub wal_storage: Option<String>,
     pub services: Vec<Service>,
     pub index_enabled: bool,
+    pub enable_recovery: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -152,13 +153,14 @@ impl NebServer {
         } else {
             None
         };
-        let chunks = Chunks::new(
+        let chunks = Chunks::new_with_recovery(
             opts.chunk_count,
             opts.memory_size,
             meta_rc.clone(),
             index_builder.clone(),
             opts.backup_storage.clone(),
             opts.wal_storage.clone(),
+            opts.enable_recovery,
         );
         let cleaner = Cleaner::new_and_start(chunks.clone());
         let server = Arc::new(NebServer {

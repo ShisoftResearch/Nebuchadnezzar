@@ -6,6 +6,7 @@ pub mod chunk;
 pub mod cleaner;
 pub mod entry;
 pub mod io;
+pub mod recovery;
 pub mod schema;
 pub mod segs;
 pub mod tombstone;

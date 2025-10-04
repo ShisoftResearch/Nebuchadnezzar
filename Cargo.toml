@@ -44,3 +44,4 @@ ndarray = "0.16.1"
 [dev-dependencies]
 env_logger = "*"
 rayon = "*"
+tempfile = "*"

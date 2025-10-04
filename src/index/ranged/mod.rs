@@ -37,6 +37,7 @@ mod tests {
                 wal_storage: None,
                 index_enabled: false, // We don't use the high level index builder here
                 services: vec![Service::Cell, Service::RangedIndexer],
+                enable_recovery: false,
             },
             &server_addr,
             server_group,

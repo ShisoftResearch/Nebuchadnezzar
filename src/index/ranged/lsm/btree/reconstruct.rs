@@ -208,6 +208,7 @@ mod test {
                 wal_storage: None,
                 index_enabled: false,
                 services: vec![Service::Cell],
+                enable_recovery: false,
             },
             &server_addr,
             &server_group,

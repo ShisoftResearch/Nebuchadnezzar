@@ -50,7 +50,7 @@ impl Chunk {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Chunk {
-        let allocator = SegmentAllocator::new(size);
+        let allocator = SegmentAllocator::new(id, size);
         let bootstrap_segment = allocator
             .alloc_seg(&backup_storage, &wal_storage)
             .expect(&format!("No space left for first segment in chunk {}", id));
@@ -748,6 +748,18 @@ impl Chunks {
         backup_storage: Option<String>,
         wal_storage: Option<String>,
     ) -> Arc<Chunks> {
+        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, false)
+    }
+    
+    pub fn new_with_recovery(
+        count: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        enable_recovery: bool,
+    ) -> Arc<Chunks> {
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
@@ -769,10 +781,37 @@ impl Chunks {
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
-        Arc::new(Chunks {
+        let chunks_arc = Arc::new(Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
-        })
+        });
+        
+        // Attempt recovery if enabled
+        if enable_recovery {
+            info!("Recovery enabled, attempting to recover from storage");
+            
+            let config = crate::ram::recovery::RecoveryConfig {
+                num_chunks: count,
+                chunk_size,
+            };
+            
+            match crate::ram::recovery::recover_chunks(
+                &config,
+                &backup_storage,
+                &wal_storage,
+                &chunks_arc.list,
+            ) {
+                Ok(()) => {
+                    info!("Recovery completed successfully");
+                }
+                Err(e) => {
+                    error!("Recovery failed: {:?}", e);
+                    error!("Starting with fresh storage");
+                }
+            }
+        }
+        
+        chunks_arc
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
         Chunks::new(
