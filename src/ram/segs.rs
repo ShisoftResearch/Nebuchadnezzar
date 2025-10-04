@@ -250,17 +250,29 @@ impl Segment {
         }
     }
 
-    // remove the backup if it have one
+    // remove the backup and WAL files if they exist
     pub fn dispense(&self) {
-        debug!("dispense segment {}", self.id);
-        if let &Some(ref backup_storage) = &self.backup_file_name {
-            let path = Path::new(backup_storage);
+        debug!("Dispensing segment {}", self.id);
+        // Remove WAL file
+        if let Some(ref wal_file_name) = self.wal_file_name {
+            let path = Path::new(wal_file_name);
             if path.exists() {
-                if let Err(_e) = remove_file(path) {
-                    error!("cannot reclaim segment file on dispense {}", backup_storage)
+                if let Err(e) = remove_file(path) {
+                    error!("Cannot reclaim WAL file {} on dispense: {:?}", wal_file_name, e);
+                } else {
+                    debug!("Dispensed WAL file {}", wal_file_name);
                 }
-            } else {
-                error!("cannot find segment backup to dispense {}", backup_storage)
+            }
+        }
+        // Remove backup file
+        if let Some(ref backup_file_name) = self.backup_file_name {
+            let path = Path::new(backup_file_name);
+            if path.exists() {
+                if let Err(e) = remove_file(path) {
+                    error!("Cannot reclaim backup file {} on dispense: {:?}", backup_file_name, e);
+                } else {
+                    debug!("Dispensed backup file {}", backup_file_name);
+                }
             }
         }
     }
