@@ -12,12 +12,10 @@ use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use lightning::linked_list::LinkedList;
-use lightning::linked_map::LinkedHashMap;
-use lightning::lru_cache::LRUCache;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -27,7 +25,6 @@ type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 
-const LRU_PAGE_SIZE: usize = 32;
 
 #[derive(Debug)]
 pub struct CellMeta {
@@ -42,6 +39,8 @@ struct Transaction {
     affected_cells: Vec<Id>,
     last_activity: i64,
     history: CommitHistory,
+    /// Track segments that are protected during this transaction for undo operations
+    protected_segments: HashSet<u64>,
 }
 
 #[derive(Debug)]
@@ -127,6 +126,7 @@ impl DataManager {
                     affected_cells: Vec::new(),
                     last_activity: get_time(),
                     history: BTreeMap::new(),
+                    protected_segments: HashSet::new(),
                 }));
                 if self.txns.insert(tid.clone(), txn.clone()).is_none() {
                     self.txns_sorted.lock().insert(tid.clone());
@@ -151,6 +151,39 @@ impl DataManager {
         T: 'static,
     {
         future::ready(DataSiteResponse::new(&self.server.txn_peer, data)).boxed()
+    }
+
+    /// Protect a segment for undo operations during transaction commit
+    fn protect_segment_for_undo(&self, segment_id: u64) {
+        // Find which chunk contains this segment and protect it
+        for chunk in &self.server.chunks.list {
+            if let Some(_) = chunk.segs.get(&(segment_id as usize)) {
+                chunk.protect_segment(segment_id);
+                debug!("Protected segment {} for transaction undo", segment_id);
+                return;
+            }
+        }
+        warn!("Could not find chunk for segment {} to protect", segment_id);
+    }
+
+    /// Release protection for a segment after transaction completion
+    fn release_segment_protection(&self, segment_id: u64) {
+        // Find which chunk contains this segment and release protection
+        for chunk in &self.server.chunks.list {
+            if let Some(_) = chunk.segs.get(&(segment_id as usize)) {
+                chunk.release_segment_protection(segment_id);
+                debug!("Released protection for segment {} after transaction", segment_id);
+                return;
+            }
+        }
+        warn!("Could not find chunk for segment {} to release protection", segment_id);
+    }
+
+    /// Release all segment protections for a transaction
+    fn release_all_segment_protections(&self, protected_segments: &HashSet<u64>) {
+        for &segment_id in protected_segments {
+            self.release_segment_protection(segment_id);
+        }
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures: Vec<RollbackFailure> = Vec::new();
@@ -448,16 +481,16 @@ impl Service for DataManager {
         }
         let mut write_error: Option<(Id, WriteError)> = None;
         {
-            let commit_history = &mut txn.history; // for rollback in case of write error
             for cell_op in cells {
                 match cell_op {
                     CommitOp::Read(_id, _version) => {}
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
+                        // For new cells, no segment protection needed (no old version to undo)
                         let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
-                                commit_history
+                                txn.history
                                     .insert(cell_id, CellHistory::new(None, header.version));
                                 self.update_cell_write(&cell_id, &tid);
                             }
@@ -477,19 +510,31 @@ impl Service for DataManager {
                                 }
                             }
                         };
+                        
+                        // Protect the segment containing the old cell for undo
+                        let cell_addr_guard = self.server.chunks.location_for_read(cell_id).unwrap();
+                        let cell_addr = *cell_addr_guard;
+                        drop(cell_addr_guard); // Release the guard
+                        let (segment_id, _seq_id) = self.server.chunks.list[0].get_cell_segment_info(cell_addr);
+                        self.protect_segment_for_undo(segment_id);
+                        txn.protected_segments.insert(segment_id);
+                        
                         let write_result = self.server.chunks.remove_cell_by(cell_id, |cell| {
                             let version = cell.header.version;
                             version == original_cell.header.version
                         });
                         match write_result {
                             Ok(()) => {
-                                commit_history.insert(
+                                txn.history.insert(
                                     *cell_id,
                                     CellHistory::new(Some(original_cell.into_ref()), 0),
                                 );
                                 self.update_cell_write(cell_id, &tid);
                             }
                             Err(error) => {
+                                // Remove protection if operation failed
+                                txn.protected_segments.remove(&segment_id);
+                                self.release_segment_protection(segment_id);
                                 write_error = Some((*cell_id, error));
                                 break;
                             }
@@ -506,6 +551,15 @@ impl Service for DataManager {
                                 }
                             }
                         };
+                        
+                        // Protect the segment containing the old cell for undo
+                        let cell_addr_guard = self.server.chunks.location_for_read(&cell_id).unwrap();
+                        let cell_addr = *cell_addr_guard;
+                        drop(cell_addr_guard); // Release the guard
+                        let (segment_id, _seq_id) = self.server.chunks.list[0].get_cell_segment_info(cell_addr);
+                        self.protect_segment_for_undo(segment_id);
+                        txn.protected_segments.insert(segment_id);
+                        
                         let write_result =
                             self.server
                                 .chunks
@@ -519,7 +573,7 @@ impl Service for DataManager {
                                 });
                         match write_result {
                             Ok(cell) => {
-                                commit_history.insert(
+                                txn.history.insert(
                                     cell_id,
                                     CellHistory::new(
                                         Some(original_cell.into_ref()),
@@ -529,6 +583,9 @@ impl Service for DataManager {
                                 self.update_cell_write(&cell_id, &tid);
                             }
                             Err(error) => {
+                                // Remove protection if operation failed
+                                txn.protected_segments.remove(&segment_id);
+                                self.release_segment_protection(segment_id);
                                 write_error = Some((cell_id, error));
                                 break;
                             }
@@ -543,6 +600,11 @@ impl Service for DataManager {
         txn.last_activity = get_time();
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
+            // Release all segment protections on failure
+            let protected_segments = txn.protected_segments.clone();
+            drop(txn); // Release the lock before calling release_all_segment_protections
+            self.release_all_segment_protections(&protected_segments);
+            
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
                     // in this case, we can inform transaction manager to try again
@@ -554,7 +616,7 @@ impl Service for DataManager {
                 }
             }
         } else {
-            // all set, able to commit
+            // all set, able to commit - segments remain protected until transaction ends
             txn.state = TxnState::Committed;
             // Commit all indices
             let response = DataSiteResponse::new(&self.server.txn_peer, DMCommitResult::Success);
@@ -573,6 +635,10 @@ impl Service for DataManager {
         if txn.state == TxnState::Aborted {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
+        
+        // Release all segment protections on abort
+        let protected_segments = txn.protected_segments.clone();
+        
         let rollback_failures = {
             debug!(
                 ">>>>>>>>>> ROLLING BACK FOR {:?} CELLS {:?}",
@@ -588,6 +654,11 @@ impl Service for DataManager {
         };
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
+        
+        // Release segment protections after marking as aborted
+        drop(txn); // Release the lock before calling release_all_segment_protections
+        self.release_all_segment_protections(&protected_segments);
+        
         self.response_with(AbortResult::Success(rollback_failures))
     }
     fn end(
@@ -663,6 +734,15 @@ impl Service for DataManager {
         }
         async move {
             let _wake_up_res: Vec<_> = wake_up_futures.collect().await;
+            
+            // Release all segment protections before wiping out transaction
+            let protected_segments = {
+                let txn_lock = self.get_transaction(&tid);
+                let txn = txn_lock.lock();
+                txn.protected_segments.clone()
+            };
+            self.release_all_segment_protections(&protected_segments);
+            
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);
             if released_locks == affected_cells {
