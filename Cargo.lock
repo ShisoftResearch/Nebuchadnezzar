@@ -800,7 +800,7 @@ checksum = "58f929b4d672ea937a23a1ab494143d968337a5f47e56d0815df1e0890ddf174"
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#9b3e96c34e9d782c25ada2d56bf0aa8f85a1e5d0"
+source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#74d820093fa24224557c59989db8500e396c1a61"
 dependencies = [
  "affinity",
  "ahash",
@@ -1251,9 +1251,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.5.17"
+version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5407465600fb0548f1442edf71dd20683c6ed326200ace4b1ef0763521bb3b77"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
 ]

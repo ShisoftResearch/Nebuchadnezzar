@@ -39,6 +39,9 @@ pub struct Chunk {
     pub alloc_lock: Mutex<()>,
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
+    /// Maps segment_id to count of incomplete transactions that have cells in this segment
+    /// Used to prevent cleaner from cleaning segments that contain undo data
+    pub protected_segments: PtrHashMap<u64, usize>,
 }
 
 impl Chunk {
@@ -80,6 +83,7 @@ impl Chunk {
             gc_lock: Mutex::new(()),
             alloc_lock: Mutex::new(()), // TODO: optimize this
             statistics: ChunkStatistics::new(),
+            protected_segments: PtrHashMap::with_capacity(64),
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -599,7 +603,11 @@ impl Chunk {
             .filter(|(_, utilization)| *utilization < 90f32);
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
-            .filter(|(seg, _)| seg.id != head_seg_id && seg.no_references())
+            .filter(|(seg, _)| {
+                seg.id != head_seg_id 
+                && seg.no_references()
+                && !self.is_segment_protected(seg.id) // Don't clean protected segments
+            })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
@@ -616,7 +624,10 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 50f32 && head_seg_id != seg.id && seg.no_references()
+                *utilization < 50f32 
+                && head_seg_id != seg.id 
+                && seg.no_references()
+                && !self.is_segment_protected(seg.id) // Don't clean protected segments
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
@@ -632,15 +643,63 @@ impl Chunk {
             } // never archive head segments
             let seg_key = seg_id as usize;
             if let Some(segment) = self.segs.get(&seg_key) {
-                if !segment
+                if segment
                     .archived
-                    .compare_and_swap(false, true, Ordering::Relaxed)
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
                 {
                     if let Err(e) = segment.archive() {
                         error!("cannot archive segment {}, reason:{:?}", self.id, e)
                     }
                 }
             }
+        }
+    }
+
+    /// Protect a segment from being cleaned by the garbage collector.
+    /// This is used when a transaction has cells in this segment that might need to be undone.
+    /// The segment_id is the key, and the value tracks how many incomplete transactions reference it.
+    pub fn protect_segment(&self, segment_id: u64) {
+        if let Ok((mut guard, _count)) = self.protected_segments.locked_with_upsert(segment_id, 1) {
+            *guard += 1;
+            debug!("Protected segment {} for undo, count: {}", segment_id, *guard);
+        }
+    }
+
+    /// Release protection for a segment when a transaction completes.
+    /// This decrements the reference count and removes the entry if count reaches zero.
+    pub fn release_segment_protection(&self, segment_id: u64) {
+        if let Some(mut guard) = self.protected_segments.lock(&segment_id) {
+            if *guard > 1 {
+                *guard -= 1;
+                debug!("Released protection for segment {}, count: {}", segment_id, *guard);
+            } else {
+                // Count is 1, remove the entry
+                guard.remove();
+            }
+        } else {
+            warn!("Attempted to release protection for unprotected segment {}", segment_id);
+        }
+    }
+
+    /// Check if a segment is protected from cleaning due to incomplete transactions.
+    pub fn is_segment_protected(&self, segment_id: u64) -> bool {
+        self.protected_segments.contains_key(&segment_id)
+    }
+
+    /// Get the number of incomplete transactions that reference this segment.
+    pub fn get_segment_protection_count(&self, segment_id: u64) -> usize {
+        self.protected_segments.get(&segment_id).unwrap_or(0)
+    }
+
+    /// Get segment information for a cell based on its memory address.
+    /// Returns (segment_id, seq_id) for the segment containing the cell.
+    pub fn get_cell_segment_info(&self, cell_addr: usize) -> (u64, u64) {
+        let segment_id = self.allocator.id_by_addr(cell_addr) as u64;
+        if let Some(segment) = self.segs.get(&(segment_id as usize)) {
+            (segment.id, segment.seq_id)
+        } else {
+            panic!("Cannot find segment for cell at address {}", cell_addr);
         }
     }
 
