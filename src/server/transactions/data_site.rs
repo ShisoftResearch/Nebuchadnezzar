@@ -116,22 +116,35 @@ impl DataManager {
     fn update_clock(&self, clock: &StandardVectorClock) {
         self.server.txn_peer.clock.merge_with(clock);
     }
+    #[inline]
     fn get_transaction(&self, tid: &TxnId) -> TxnMutex {
+        // Fast path: transaction already exists
+        if let Some(txn) = self.txns.get(tid) {
+            return txn;
+        }
+        
+        // Slow path: create new transaction
+        self.create_transaction(tid)
+    }
+    
+    #[cold]
+    fn create_transaction(&self, tid: &TxnId) -> TxnMutex {
         loop {
             if let Some(txn) = self.txns.get(tid) {
                 return txn;
-            } else {
-                let txn = Arc::new(Mutex::new(Transaction {
-                    state: TxnState::Started,
-                    affected_cells: Vec::new(),
-                    last_activity: get_time(),
-                    history: BTreeMap::new(),
-                    protected_segments: HashSet::new(),
-                }));
-                if self.txns.insert(tid.clone(), txn.clone()).is_none() {
-                    self.txns_sorted.lock().insert(tid.clone());
-                    return txn;
-                }
+            }
+            
+            let txn = Arc::new(Mutex::new(Transaction {
+                state: TxnState::Started,
+                affected_cells: Vec::with_capacity(8), // Pre-allocate for common case
+                last_activity: get_time(),
+                history: BTreeMap::new(),
+                protected_segments: HashSet::with_capacity(4), // Pre-allocate for common case
+            }));
+            
+            if self.txns.insert(tid.clone(), txn.clone()).is_none() {
+                self.txns_sorted.lock().insert(tid.clone());
+                return txn;
             }
         }
     }
@@ -187,7 +200,7 @@ impl DataManager {
         }
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
-        let mut failures: Vec<RollbackFailure> = Vec::new();
+        let mut failures = Vec::new();
         for (id, history) in history.iter() {
             debug!("ROLLING BACK {:?} - {:?}", id, history);
             let cell = &history.cell;
@@ -196,7 +209,7 @@ impl DataManager {
                 // the cell was created, need to remove
                 self.server
                     .chunks
-                    .remove_cell_by(&id, |cell| cell.header.version == current_ver)
+                    .remove_cell_by(id, |cell| cell.header.version == current_ver)
                     .err()
             } else if current_ver > 0 {
                 // the cell was updated, need to update back
@@ -218,12 +231,13 @@ impl DataManager {
             if let Some(error) = error {
                 failures.push(RollbackFailure {
                     id: *id,
-                    error: error,
+                    error,
                 });
             }
         }
         failures
     }
+    #[inline]
     fn update_cell_write(&self, cell_id: &Id, tid: &TxnId) {
         let meta_ref = self.cell_meta_mutex(cell_id);
         let mut meta = meta_ref.lock();
@@ -246,6 +260,7 @@ impl DataManager {
             }
         }
     }
+    #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
         if let Some(txn) = self.txns.lock(tid) {
             txn.remove();
@@ -259,10 +274,9 @@ impl DataManager {
                 .iter()
                 .next()
                 .cloned()
-                .unwrap_or(self.server.txn_peer.clock.to_clock())
+                .unwrap_or_else(|| self.server.txn_peer.clock.to_clock())
         };
         let mut cell_to_evict = Vec::new();
-        let mut need_break = false;
         for cell_id_ref in self.cell_list.iter_front() {
             let cell_id = cell_id_ref.deref();
             if let Some(cell_meta) = self.cells.get(&cell_id) {
@@ -270,13 +284,11 @@ impl DataManager {
                 if meta.write < oldest_transaction && meta.read < oldest_transaction {
                     cell_to_evict.push(cell_id_ref);
                 } else {
-                    need_break = true;
+                    // Cells are ordered by activity, stop at first active one
+                    break;
                 }
             } else {
                 cell_to_evict.push(cell_id_ref);
-            }
-            if need_break {
-                break;
             }
         }
         for evicted_cell in &cell_to_evict {
@@ -503,20 +515,22 @@ impl Service for DataManager {
                         };
                     }
                     CommitOp::Remove(ref cell_id) => {
-                        let original_cell = {
-                            match self.server.chunks.read_cell(cell_id) {
-                                Ok(cell) => cell.to_owned(),
+                        // Read cell and extract information while holding lock
+                        let (cell_addr, orig_version, old_cell_ref) = {
+                            let shared_cell = match self.server.chunks.read_cell(cell_id) {
+                                Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((*cell_id, WriteError::ReadError(re)));
                                     break;
                                 }
-                            }
-                        };
+                            };
+                            let addr = **shared_cell.guard();
+                            let version = shared_cell.header.version;
+                            let cell_ref = shared_cell.to_owned().into_ref();
+                            (addr, version, cell_ref)
+                        }; // SharedCell dropped here, lock released
                         
-                        // Protect the segment containing the old cell for undo
-                        let cell_addr_guard = self.server.chunks.location_for_read(cell_id).unwrap();
-                        let cell_addr = *cell_addr_guard;
-                        drop(cell_addr_guard); // Release the guard
+                        // Now protect the segment without holding cell lock
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
@@ -524,14 +538,13 @@ impl Service for DataManager {
                         txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         let write_result = self.server.chunks.remove_cell_by(cell_id, |cell| {
-                            let version = cell.header.version;
-                            version == original_cell.header.version
+                            cell.header.version == orig_version
                         });
                         match write_result {
                             Ok(()) => {
                                 txn.history.insert(
                                     *cell_id,
-                                    CellHistory::new(Some(original_cell.into_ref()), 0),
+                                    CellHistory::new(Some(old_cell_ref), 0),
                                 );
                                 self.update_cell_write(cell_id, &tid);
                             }
@@ -546,20 +559,22 @@ impl Service for DataManager {
                     }
                     CommitOp::Update(cell) => {
                         let cell_id = cell.id();
-                        let original_cell = {
-                            match self.server.chunks.read_cell(&cell_id) {
-                                Ok(cell) => cell.to_owned(),
+                        // Read cell and extract information while holding lock
+                        let (cell_addr, orig_version, old_cell_ref) = {
+                            let shared_cell = match self.server.chunks.read_cell(&cell_id) {
+                                Ok(cell) => cell,
                                 Err(re) => {
                                     write_error = Some((cell_id, WriteError::ReadError(re)));
                                     break;
                                 }
-                            }
-                        };
+                            };
+                            let addr = **shared_cell.guard();
+                            let version = shared_cell.header.version;
+                            let cell_ref = shared_cell.to_owned().into_ref();
+                            (addr, version, cell_ref)
+                        }; // SharedCell dropped here, lock released
                         
-                        // Protect the segment containing the old cell for undo
-                        let cell_addr_guard = self.server.chunks.location_for_read(&cell_id).unwrap();
-                        let cell_addr = *cell_addr_guard;
-                        drop(cell_addr_guard); // Release the guard
+                        // Now protect the segment without holding cell lock
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
@@ -570,8 +585,7 @@ impl Service for DataManager {
                             self.server
                                 .chunks
                                 .update_cell_by(&cell_id, |cell_to_update| {
-                                    if cell_to_update.header.version == original_cell.header.version
-                                    {
+                                    if cell_to_update.header.version == orig_version {
                                         Some(cell)
                                     } else {
                                         None
@@ -582,7 +596,7 @@ impl Service for DataManager {
                                 txn.history.insert(
                                     cell_id,
                                     CellHistory::new(
-                                        Some(original_cell.into_ref()),
+                                        Some(old_cell_ref),
                                         cell.header.version,
                                     ),
                                 );

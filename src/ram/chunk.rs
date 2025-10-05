@@ -660,8 +660,12 @@ impl Chunk {
     /// This is used when a transaction has cells in this segment that might need to be undone.
     /// The segment_id is the key, and the value tracks how many incomplete transactions reference it.
     pub fn protect_segment(&self, segment_id: u64) {
-        if let Ok((mut guard, _count)) = self.protected_segments.locked_with_upsert(segment_id, 1) {
-            *guard += 1;
+        if let Ok((mut guard, old_count)) = self.protected_segments.locked_with_upsert(segment_id, 1) {
+            if old_count > 0 {
+                // Entry already existed, increment count
+                *guard += 1;
+            }
+            // If old_count == 0, locked_with_upsert already inserted 1, no need to increment
             debug!("Protected segment {} for undo, count: {}", segment_id, *guard);
         }
     }
