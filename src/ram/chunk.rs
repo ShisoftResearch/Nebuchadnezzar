@@ -884,7 +884,7 @@ impl Chunks {
             None,
         )
     }
-    fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {
+    pub fn locate_chunk_by_partition(&self, partition: u64) -> &Chunk {
         let chunk_id = partition as usize % self.list.len();
         return &self.list[chunk_id];
     }

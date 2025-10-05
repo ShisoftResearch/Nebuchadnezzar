@@ -39,8 +39,8 @@ struct Transaction {
     affected_cells: Vec<Id>,
     last_activity: i64,
     history: CommitHistory,
-    /// Track segments that are protected during this transaction for undo operations
-    protected_segments: HashSet<u64>,
+    /// Track (chunk_index, segment_id) pairs protected during this transaction
+    protected_segments: HashSet<(usize, u64)>,
 }
 
 #[derive(Debug)]
@@ -154,35 +154,36 @@ impl DataManager {
     }
 
     /// Protect a segment for undo operations during transaction commit
-    fn protect_segment_for_undo(&self, segment_id: u64) {
-        // Find which chunk contains this segment and protect it
-        for chunk in &self.server.chunks.list {
-            if let Some(_) = chunk.segs.get(&(segment_id as usize)) {
+    #[inline]
+    fn protect_segment_for_undo(&self, chunk_idx: usize, segment_id: u64) {
+        if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
+            if chunk.segs.get(&(segment_id as usize)).is_some() {
                 chunk.protect_segment(segment_id);
-                debug!("Protected segment {} for transaction undo", segment_id);
+                debug!("Protected segment {} in chunk {} for transaction undo", segment_id, chunk_idx);
                 return;
             }
         }
-        warn!("Could not find chunk for segment {} to protect", segment_id);
+        warn!("Could not find segment {} in chunk {} to protect", segment_id, chunk_idx);
     }
 
     /// Release protection for a segment after transaction completion
-    fn release_segment_protection(&self, segment_id: u64) {
-        // Find which chunk contains this segment and release protection
-        for chunk in &self.server.chunks.list {
-            if let Some(_) = chunk.segs.get(&(segment_id as usize)) {
+    #[inline]
+    fn release_segment_protection(&self, chunk_idx: usize, segment_id: u64) {
+        if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
+            if chunk.segs.get(&(segment_id as usize)).is_some() {
                 chunk.release_segment_protection(segment_id);
-                debug!("Released protection for segment {} after transaction", segment_id);
+                debug!("Released protection for segment {} in chunk {} after transaction", segment_id, chunk_idx);
                 return;
             }
         }
-        warn!("Could not find chunk for segment {} to release protection", segment_id);
+        warn!("Could not find segment {} in chunk {} to release protection", segment_id, chunk_idx);
     }
 
     /// Release all segment protections for a transaction
-    fn release_all_segment_protections(&self, protected_segments: &HashSet<u64>) {
-        for &segment_id in protected_segments {
-            self.release_segment_protection(segment_id);
+    #[inline]
+    fn release_all_segment_protections(&self, protected_segments: &HashSet<(usize, u64)>) {
+        for &(chunk_idx, segment_id) in protected_segments {
+            self.release_segment_protection(chunk_idx, segment_id);
         }
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
@@ -479,6 +480,7 @@ impl Service for DataManager {
                 CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
             ));
         }
+        // Pre-allocate small temporaries to reduce reallocations
         let mut write_error: Option<(Id, WriteError)> = None;
         {
             for cell_op in cells {
@@ -515,9 +517,11 @@ impl Service for DataManager {
                         let cell_addr_guard = self.server.chunks.location_for_read(cell_id).unwrap();
                         let cell_addr = *cell_addr_guard;
                         drop(cell_addr_guard); // Release the guard
-                        let (segment_id, _seq_id) = self.server.chunks.list[0].get_cell_segment_info(cell_addr);
-                        self.protect_segment_for_undo(segment_id);
-                        txn.protected_segments.insert(segment_id);
+                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk_idx = chunk.id;
+                        let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        self.protect_segment_for_undo(chunk_idx, segment_id);
+                        txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         let write_result = self.server.chunks.remove_cell_by(cell_id, |cell| {
                             let version = cell.header.version;
@@ -533,8 +537,8 @@ impl Service for DataManager {
                             }
                             Err(error) => {
                                 // Remove protection if operation failed
-                                txn.protected_segments.remove(&segment_id);
-                                self.release_segment_protection(segment_id);
+                                txn.protected_segments.remove(&(chunk_idx, segment_id));
+                                self.release_segment_protection(chunk_idx, segment_id);
                                 write_error = Some((*cell_id, error));
                                 break;
                             }
@@ -556,9 +560,11 @@ impl Service for DataManager {
                         let cell_addr_guard = self.server.chunks.location_for_read(&cell_id).unwrap();
                         let cell_addr = *cell_addr_guard;
                         drop(cell_addr_guard); // Release the guard
-                        let (segment_id, _seq_id) = self.server.chunks.list[0].get_cell_segment_info(cell_addr);
-                        self.protect_segment_for_undo(segment_id);
-                        txn.protected_segments.insert(segment_id);
+                        let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
+                        let chunk_idx = chunk.id;
+                        let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        self.protect_segment_for_undo(chunk_idx, segment_id);
+                        txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         let write_result =
                             self.server
@@ -584,8 +590,8 @@ impl Service for DataManager {
                             }
                             Err(error) => {
                                 // Remove protection if operation failed
-                                txn.protected_segments.remove(&segment_id);
-                                self.release_segment_protection(segment_id);
+                                txn.protected_segments.remove(&(chunk_idx, segment_id));
+                                self.release_segment_protection(chunk_idx, segment_id);
                                 write_error = Some((cell_id, error));
                                 break;
                             }
@@ -601,7 +607,7 @@ impl Service for DataManager {
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
             // Release all segment protections on failure
-            let protected_segments = txn.protected_segments.clone();
+            let protected_segments = std::mem::take(&mut txn.protected_segments);
             drop(txn); // Release the lock before calling release_all_segment_protections
             self.release_all_segment_protections(&protected_segments);
             
@@ -637,7 +643,7 @@ impl Service for DataManager {
         }
         
         // Release all segment protections on abort
-        let protected_segments = txn.protected_segments.clone();
+        let protected_segments = std::mem::take(&mut txn.protected_segments);
         
         let rollback_failures = {
             debug!(
@@ -683,10 +689,12 @@ impl Service for DataManager {
                 txn.state,
                 tid
             );
-            affected_cells = txn.affected_cells.len();
+            let affected_len = txn.affected_cells.len();
+            affected_cells = affected_len;
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
-            let mut cell_mutices = Vec::new();
-            let mut cell_guards = Vec::new();
+            // Reserve to avoid reallocations when many cells are touched
+            let mut cell_mutices = Vec::with_capacity(affected_len);
+            let mut cell_guards = Vec::with_capacity(affected_len);
             {
                 for cell_id in &txn.affected_cells {
                     if let Some(meta) = self.cells.get(cell_id) {
@@ -738,8 +746,8 @@ impl Service for DataManager {
             // Release all segment protections before wiping out transaction
             let protected_segments = {
                 let txn_lock = self.get_transaction(&tid);
-                let txn = txn_lock.lock();
-                txn.protected_segments.clone()
+                let mut txn = txn_lock.lock();
+                std::mem::take(&mut txn.protected_segments)
             };
             self.release_all_segment_protections(&protected_segments);
             
