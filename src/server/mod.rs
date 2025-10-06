@@ -84,7 +84,7 @@ pub struct NebServer {
     pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
     pub neb_client: Arc<AsyncClient>,
-    pub undo_log: Option<Arc<transactions::undo_log::UndoLog>>,
+    pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
 }
 
 pub async fn init_conshash(
@@ -168,7 +168,7 @@ impl NebServer {
         
         // Initialize undo log if storage path is provided
         let undo_log = if let Some(ref undo_log_path) = opts.undo_log_storage {
-            match transactions::undo_log::UndoLog::new(undo_log_path.clone()) {
+            match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
                 Ok(log) => {
                     if let Err(e) = log.recover() {
                         error!("Failed to recover undo log: {:?}", e);

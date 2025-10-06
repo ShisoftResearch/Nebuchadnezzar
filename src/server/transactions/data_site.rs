@@ -518,10 +518,22 @@ impl Service for DataManager {
                     CommitOp::Read(_id, _version) => {}
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
-                        // For new cells, no segment protection needed (no old version to undo)
                         let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
+                                // Log the new cell creation with its version for rollback
+                                // During recovery, if cell exists with this version, it will be deleted
+                                if let Some(ref undo_log) = self.server.undo_log {
+                                    let undo_entry = super::undo_log::UndoLogEntry::new_write(
+                                        tid.clone(),
+                                        cell_id,
+                                        header.version,
+                                    );
+                                    if let Err(e) = undo_log.write_undo_entry(undo_entry) {
+                                        error!("Failed to write undo log entry for new cell: {:?}", e);
+                                    }
+                                }
+                                
                                 txn.history
                                     .insert(cell_id, CellHistory::new(None, header.version));
                                 self.update_cell_write(&cell_id, &tid);
@@ -557,9 +569,10 @@ impl Service for DataManager {
                         
                         // Write undo log entry before performing the remove
                         if let Some(ref undo_log) = self.server.undo_log {
-                            let undo_entry = super::undo_log::UndoLogEntry::new(
+                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 *cell_id,
+                                super::undo_log::UndoOpType::Remove,
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
@@ -616,9 +629,10 @@ impl Service for DataManager {
                         
                         // Write undo log entry before performing the update
                         if let Some(ref undo_log) = self.server.undo_log {
-                            let undo_entry = super::undo_log::UndoLogEntry::new(
+                            let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 cell_id,
+                                super::undo_log::UndoOpType::Update,
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
