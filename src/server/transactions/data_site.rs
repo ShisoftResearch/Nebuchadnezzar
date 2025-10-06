@@ -511,6 +511,11 @@ impl Service for DataManager {
                 CheckError::CellNumberDoesNotMatch(prepared_cells_num, arrived_cells_num),
             ));
         }
+        
+        // Set transaction context to skip fsync during writes
+        // Segments will be synced at the end of commit instead
+        crate::ram::chunk::set_transaction_context(true);
+        
         // Pre-allocate small temporaries to reduce reallocations
         let mut write_error: Option<(Id, WriteError)> = None;
         {
@@ -697,6 +702,10 @@ impl Service for DataManager {
             }
         }
         txn.last_activity = get_time();
+        
+        // Clear transaction context before returning
+        crate::ram::chunk::set_transaction_context(false);
+        
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
             // Release all segment protections on failure

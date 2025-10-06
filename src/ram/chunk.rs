@@ -24,6 +24,22 @@ use std::sync::Arc;
 pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
 
+// Thread-local flag to indicate if we're currently in a transaction
+// When true, WAL writes will skip fsync (will be synced at commit instead)
+thread_local! {
+    static IN_TRANSACTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set the transaction context for the current thread
+pub fn set_transaction_context(in_txn: bool) {
+    IN_TRANSACTION.with(|flag| flag.set(in_txn));
+}
+
+/// Check if the current thread is in a transaction context
+pub fn is_in_transaction() -> bool {
+    IN_TRANSACTION.with(|flag| flag.get())
+}
+
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
@@ -118,6 +134,7 @@ impl Chunk {
                         addr,
                         seg: head,
                         size,
+                        skip_sync: is_in_transaction(), // Skip sync if in transaction
                     });
                 }
                 None => {
@@ -787,12 +804,13 @@ pub struct PendingEntry {
     pub seg: Arc<Segment>,
     pub addr: usize,
     pub size: u32,
+    pub skip_sync: bool, // Skip fsync if part of a transaction (will be synced at commit)
 }
 
 impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
-        self.seg.write_wal(self.addr, self.size).unwrap();
+        self.seg.write_wal(self.addr, self.size, self.skip_sync).unwrap();
         self.seg.references.fetch_sub(1, Ordering::Relaxed);
     }
 }

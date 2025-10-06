@@ -228,7 +228,7 @@ impl Segment {
         return Ok(false);
     }
 
-    pub fn write_wal(&self, addr: usize, size: u32) -> io::Result<()> {
+    pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
         if let Some(ref wal_file) = self.wal_file {
             let mut file = wal_file.lock();
             unsafe {
@@ -236,7 +236,13 @@ impl Segment {
                 file.write(data_block)?;
             }
             file.flush()?;
-            file.get_ref().sync_data()?;
+            // Skip fsync for transactional writes - they will be synced during commit
+            if !skip_sync {
+                file.get_ref().sync_data()?;
+                trace!("WAL synced for segment {} (non-transactional write)", self.id);
+            } else {
+                trace!("WAL sync skipped for segment {} (transactional write, will sync at commit)", self.id);
+            }
         }
         return Ok(());
     }
