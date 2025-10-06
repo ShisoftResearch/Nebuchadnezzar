@@ -568,11 +568,13 @@ impl Service for DataManager {
                         txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         // Write undo log entry before performing the remove
+                        // Store old version for verification during recovery
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 *cell_id,
                                 super::undo_log::UndoOpType::Remove,
+                                orig_version,
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
@@ -628,11 +630,13 @@ impl Service for DataManager {
                         txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         // Write undo log entry before performing the update
+                        // Store old version for verification during recovery
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
                                 cell_id,
                                 super::undo_log::UndoOpType::Update,
+                                orig_version,
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
