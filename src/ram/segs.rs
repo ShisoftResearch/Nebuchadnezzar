@@ -194,6 +194,12 @@ impl Segment {
                 );
                 return Ok(false);
             }
+            
+            // Ensure parent directory exists before creating backup file
+            if let Some(parent) = backup_file_path.parent() {
+                create_dir_all(parent)?;
+            }
+            
             if let Some(ref wal_file) = self.wal_file_name {
                 // if there is a WAL file ready, copy this file to backup
                 if let Some(ref file_mutex) = self.wal_file {
