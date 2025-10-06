@@ -801,12 +801,120 @@ mod tests {
         assert_eq!(entries[2].seq_id, 750);
     }
 
+    /// Test if TxnId (StandardVectorClock) equality works after JSON serialization
+    #[test]
+    fn test_txn_id_serialization_equality() {
+        let txn1 = TxnId::new();
+        
+        // Serialize and deserialize
+        let json = serde_json::to_vec(&txn1).unwrap();
+        let txn2: TxnId = serde_json::from_slice(&json).unwrap();
+        
+        println!("Original TxnId: {:?}", txn1);
+        println!("Deserialized TxnId: {:?}", txn2);
+        println!("Are they equal? {}", txn1 == txn2);
+        println!("Hash original: {:?}", {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            txn1.hash(&mut hasher);
+            hasher.finish()
+        });
+        println!("Hash deserialized: {:?}", {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            txn2.hash(&mut hasher);
+            hasher.finish()
+        });
+        
+        // Test HashMap lookup
+        let mut map = std::collections::HashMap::new();
+        map.insert(txn1.clone(), vec![1, 2, 3]);
+        
+        assert!(map.contains_key(&txn2), "HashMap should find deserialized key");
+        assert_eq!(map.get(&txn2).unwrap(), &vec![1, 2, 3]);
+    }
+
+    /// Debug test: Understand why commit markers aren't being processed during recovery
+    #[test]
+    fn test_debug_commit_marker_processing() {
+        use std::io::Read;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path().to_str().unwrap().to_string();
+
+        let txn = TxnId::new();
+        
+        // Write entry and commit marker
+        {
+            let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
+            let entry = UndoLogEntry::new_write(txn.clone(), Id { higher: 1, lower: 1 }, 1);
+            undo_log.write_undo_entry(entry).unwrap();
+            println!("After write: {} entries for txn", undo_log.get_undo_entries(&txn).len());
+            
+            undo_log.write_commit_marker(&txn).unwrap();
+            println!("After commit marker: {} entries for txn", undo_log.get_undo_entries(&txn).len());
+        }
+        
+        // Read the log file directly to see what's in it
+        let log_files: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "nlog").unwrap_or(false))
+            .collect();
+            
+        println!("Found {} log files", log_files.len());
+        for file_entry in &log_files {
+            let path = file_entry.path();
+            println!("Log file: {:?}", path);
+            let mut file = std::fs::File::open(&path).unwrap();
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).unwrap();
+            println!("File size: {} bytes", contents.len());
+            
+            // Parse entries manually
+            let mut offset = 0;
+            let mut entry_count = 0;
+            while offset < contents.len() {
+                if contents.len() < offset + 5 {
+                    break;
+                }
+                let entry_type = contents[offset];
+                let txn_id_len = u32::from_le_bytes([
+                    contents[offset + 1],
+                    contents[offset + 2],
+                    contents[offset + 3],
+                    contents[offset + 4],
+                ]) as usize;
+                
+                println!("Entry {}: type={}, txn_id_len={}", entry_count, entry_type, txn_id_len);
+                entry_count += 1;
+                
+                // Skip to next entry (approximate)
+                match entry_type {
+                    1 => offset += 5 + txn_id_len + 49, // UNDO entry
+                    2 | 3 => offset += 5 + txn_id_len,  // COMMIT/ABORT marker
+                    _ => break,
+                }
+            }
+        }
+        
+        // Now recover and see what happens
+        let undo_log = UndoLogger::new(log_dir).unwrap();
+        println!("Before recovery: {} entries", undo_log.get_undo_entries(&txn).len());
+        undo_log.recover().unwrap();
+        println!("After recovery: {} entries", undo_log.get_undo_entries(&txn).len());
+        
+        assert_eq!(undo_log.get_undo_entries(&txn).len(), 0, "Should have 0 entries after recovery");
+    }
+
     /// Test end-to-end: Mixed transactions (committed, aborted, incomplete)
     /// Verifies that recovery correctly handles different transaction states
-    /// TODO: This test is currently failing - needs investigation into recovery logic
     #[test]
-    #[ignore]
     fn test_e2e_mixed_transactions() {
+        use std::io::Read;
+        
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
@@ -839,22 +947,47 @@ mod tests {
             let entry3 = UndoLogEntry::new_write(txn_incomplete.clone(), Id { higher: 3, lower: 1 }, 3);
             undo_log.write_undo_entry(entry3).unwrap();
             // No commit/abort marker
-            
-            // Note: Committed and aborted transactions will be filtered out during recovery
-            // based on their markers in the log file
         } // undo_log dropped and files flushed
 
-        // Recover after "crash"
-        let undo_log = UndoLogger::new(log_dir).unwrap();
+        // Debug: Check what log files exist before creating new instance
+        println!("\n=== After first UndoLogger dropped ===");
+        let log_files_before: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "nlog").unwrap_or(false))
+            .collect();
+        println!("Log files: {}", log_files_before.len());
+        for (i, file_entry) in log_files_before.iter().enumerate() {
+            let path = file_entry.path();
+            let mut file = std::fs::File::open(&path).unwrap();
+            let mut contents = Vec::new();
+            file.read_to_end(&mut contents).unwrap();
+            println!("File {}: {:?}, size: {} bytes", i, path.file_name(), contents.len());
+        }
+
+        // Recover after "crash" - this creates undo-1.nlog before calling recover()
+        let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
+        
+        // Debug: Check what log files exist after creating new instance
+        println!("\n=== After second UndoLogger::new() ===");
+        let log_files_after: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().map(|ext| ext == "nlog").unwrap_or(false))
+            .collect();
+        println!("Log files: {}", log_files_after.len());
+        
+        // Now call recover
+        println!("\n=== Calling recover() ===");
         undo_log.recover().unwrap();
 
         // After recovery, only incomplete transaction should be present
-        // Committed/aborted transactions are filtered out during recovery
         let committed_entries = undo_log.get_undo_entries(&txn_committed);
         let aborted_entries = undo_log.get_undo_entries(&txn_aborted);
         let incomplete_entries = undo_log.get_undo_entries(&txn_incomplete);
         
-        println!("After recovery - committed: {}, aborted: {}, incomplete: {}", 
+        println!("\n=== After recovery ===");
+        println!("committed: {}, aborted: {}, incomplete: {}", 
                  committed_entries.len(), aborted_entries.len(), incomplete_entries.len());
         
         assert_eq!(incomplete_entries.len(), 1, "Incomplete txn should be recovered");
