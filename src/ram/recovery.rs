@@ -429,14 +429,19 @@ pub fn recover_chunks(
             ));
         }
         
-        // Allocate segment memory
-        // Note: We can't control which address we get, so recovered seg_id might differ
+        // Allocate segment memory with the ORIGINAL seq_id from the file
+        // This ensures undo log references remain valid after recovery
         debug!(
-            "About to allocate segment, current next_seq_id = {}",
+            "About to allocate segment with original seq_id {}, current next_seq_id = {}",
+            file_info.seq_id,
             chunk.allocator.next_seq_id.load(Ordering::Acquire)
         );
-        eprintln!("[RECOVERY] Allocating segment...");
-        let seg_opt = chunk.allocator.alloc_seg(&chunk.backup_storage, &chunk.wal_storage);
+        eprintln!("[RECOVERY] Allocating segment with original seq_id {}...", file_info.seq_id);
+        let seg_opt = chunk.allocator.alloc_seg_with_seq_id(
+            file_info.seq_id,
+            &chunk.backup_storage,
+            &chunk.wal_storage
+        );
         
         let segment = match seg_opt {
             Some(seg) => {

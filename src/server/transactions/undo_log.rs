@@ -519,11 +519,30 @@ impl UndoLogger {
         // Get the chunk and find the segment in memory
         let chunk = &chunks.list[entry.chunk_id as usize];
         
+        // For Remove operations, verify the cell is actually gone before restoring
+        // For Update operations, we'll verify version matches in read_cell_from_address
+        if entry.op_type == UndoOpType::Remove {
+            // Check if cell exists in the index by trying to read it
+            if let Ok(cell_ref) = chunks.read_cell(&entry.cell_id) {
+                drop(cell_ref); // Release the read lock immediately
+                debug!(
+                    "Cell {:?} still exists after Remove operation - skipping restore (might have been re-created)",
+                    entry.cell_id
+                );
+                return Ok(());
+            }
+            // Cell doesn't exist (or read error), proceed with restore
+        }
+        
         // Find the segment by seq_id (segments are already loaded in memory after recovery)
-        // We need to scan through all segments to find the one with matching seq_id
+        // Note: seg_id in the undo log is the OLD segment ID from before recovery,
+        // so we can only rely on seq_id which is stable across recoveries.
+        // If multiple segments have the same seq_id (e.g., bootstrap segment + recovered segment),
+        // prefer the one with actual data (non-zero append_header offset)
         let segment = chunk.segments()
             .into_iter()
-            .find(|seg| seg.seq_id == entry.seq_id)
+            .filter(|seg| seg.seq_id == entry.seq_id)
+            .max_by_key(|seg| seg.append_header.load(Ordering::Acquire) - seg.addr) // Prefer segment with more data
             .ok_or_else(|| io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Segment with seq_id {} not found in chunk {}", entry.seq_id, entry.chunk_id)
@@ -536,15 +555,16 @@ impl UndoLogger {
         
         // Directly read the old cell from the specified offset (no scanning needed!)
         let cell_addr = segment.addr + entry.cell_offset as usize;
-        let old_cell = self.read_cell_from_address(cell_addr, chunk, &entry.cell_id, entry.version)?;
+        // For Remove operations, skip hash/version verification (cell is gone)
+        // For Update operations, verify version matches
+        let verify = entry.op_type != UndoOpType::Remove;
+        let old_cell = self.read_cell_from_address(cell_addr, chunk, &entry.cell_id, entry.version, verify)?;
         
         // Restore the old cell's DATA with a NEW version number
-        // This approach is simpler: we don't need to check versions, just restore the data
         // The upsert will automatically assign a new, higher version
         match entry.op_type {
             UndoOpType::Remove => {
                 // Cell was removed by the transaction - restore it with its old data but new version
-                // Use upsert_cell to handle the case where cell might have been re-created
                 debug!(
                     "Restoring removed cell {:?} (old data with new version)",
                     entry.cell_id
@@ -571,35 +591,53 @@ impl UndoLogger {
     }
 
     /// Read a cell directly from a memory address (using stored offset, no scanning!)
+    /// 
+    /// # Arguments
+    /// * `cell_addr` - Memory address of the entry (not content address)
+    /// * `chunk` - The chunk containing the cell
+    /// * `cell_id` - Expected cell ID (for verification)
+    /// * `expected_version` - Expected cell version (for verification if verify=true)
+    /// * `verify` - If true, verify hash and version match; if false, skip verification
     fn read_cell_from_address(
         &self,
         cell_addr: usize,
         chunk: &crate::ram::chunk::Chunk,
         cell_id: &Id,
         expected_version: u64,
+        verify: bool,
     ) -> io::Result<OwnedCell> {
         // Read cell header from the entry content address
         let content_addr = Entry::content_pos(cell_addr);
         let cell_header = cell_header_from_entry_content_addr(content_addr);
         
-        // Verify this is the correct cell
-        if cell_header.hash != cell_id.lower {
+        // Check if segment has been cleaned (hash=0 indicates freed/cleaned segment)
+        if cell_header.hash == 0 {
             return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Cell hash mismatch at offset: expected {}, found {}", cell_id.lower, cell_header.hash)
+                io::ErrorKind::NotFound,
+                format!("Cell at offset {} has been cleaned (hash=0)", cell_addr)
             ));
         }
         
-        if cell_header.version != expected_version {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Cell version mismatch at offset: expected {}, found {}", expected_version, cell_header.version)
-            ));
+        // Verify cell identity if requested (skip for Remove operations)
+        if verify {
+            if cell_header.hash != cell_id.lower {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cell hash mismatch at offset: expected {}, found {}", cell_id.lower, cell_header.hash)
+                ));
+            }
+            
+            if cell_header.version != expected_version {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Cell version mismatch at offset: expected {}, found {}", expected_version, cell_header.version)
+                ));
+            }
         }
         
         debug!(
-            "Reading cell from offset: hash={}, version={}, schema={}",
-            cell_header.hash, cell_header.version, cell_header.schema
+            "Reading cell from offset: hash={}, version={}, schema={}, verify={}",
+            cell_header.hash, cell_header.version, cell_header.schema, verify
         );
         
         // Get schema to deserialize data
@@ -1545,7 +1583,7 @@ mod tests {
         
         // Get cell location for undo log
         let chunk = chunks.locate_chunk_by_partition(cell_id.higher);
-        let (cell_addr, seg_id, seq_id, cell_offset) = {
+        let (_cell_addr, seg_id, seq_id, cell_offset) = {
             // Scope the guard so it's dropped immediately after we extract the info
             let guard = chunk.location_for_read(cell_id.lower).unwrap();
             let addr = *guard;

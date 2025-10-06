@@ -277,7 +277,7 @@ impl Segment {
                     error!("cannot reclaim segment file on dispense {}", backup_storage)
                 }
             } else {
-                error!("cannot find segment backup to dispense {}", backup_storage)
+                warn!("cannot find segment backup to dispense {}", backup_storage)
             }
         }
     }
@@ -385,6 +385,40 @@ impl SegmentAllocator {
                 let id = self.id_by_addr(addr);
                 let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
                 Segment::new(id as u64, seq_id as u64, self.chunk_id, addr, backup_storage, wal_storage)
+            })
+    }
+
+    /// Allocate a segment with a specific seq_id (for recovery purposes)
+    /// This preserves the original seq_id from recovered files
+    pub fn alloc_seg_with_seq_id(
+        &self,
+        seq_id: u64,
+        backup_storage: &Option<String>,
+        wal_storage: &Option<String>,
+    ) -> Option<Segment> {
+        // First allocate the address
+        self.free
+            .pop_front()
+            .or_else(|| loop {
+                debug!("Allocate segment by bump pointer (recovery)");
+                let addr = self.offset.load(Relaxed);
+                let new_addr = addr + SEGMENT_SIZE;
+                if new_addr > self.limit {
+                    return None;
+                } else {
+                    if self
+                        .offset
+                        .compare_exchange(addr, new_addr, AcqRel, Relaxed)
+                        .is_ok()
+                    {
+                        return Some(addr);
+                    }
+                }
+            })
+            .map(|addr| {
+                let id = self.id_by_addr(addr);
+                // Use the provided seq_id instead of fetching a new one
+                Segment::new(id as u64, seq_id, self.chunk_id, addr, backup_storage, wal_storage)
             })
     }
 
