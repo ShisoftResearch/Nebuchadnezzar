@@ -813,7 +813,6 @@ impl Service for DataManager {
                 tid
             );
             let affected_len = txn.affected_cells.len();
-            affected_cells = affected_len;
             let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
             // Reserve to avoid reallocations when many cells are touched
             let mut cell_mutices = Vec::with_capacity(affected_len);
@@ -822,9 +821,15 @@ impl Service for DataManager {
                 for cell_id in &txn.affected_cells {
                     if let Some(meta) = self.cells.get(cell_id) {
                         cell_mutices.push(meta.clone());
+                    } else {
+                        // Cell metadata not found - might have been cleaned up
+                        // This is OK, just means we don't need to release a lock for it
+                        debug!("Cell {:?} in affected_cells but not in cells map", cell_id);
                     }
                 }
             }
+            // Use the actual number of cells we found metadata for, not affected_len
+            affected_cells = cell_mutices.len();
             for cell_mutex in &cell_mutices {
                 cell_guards.push(cell_mutex.lock()); // lock all affected cells on by on
             }
