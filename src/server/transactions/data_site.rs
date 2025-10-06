@@ -16,6 +16,7 @@ use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -564,11 +565,16 @@ impl Service for DataManager {
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        
+                        // Calculate cell offset within segment for fast recovery
+                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                        let cell_offset = (cell_addr - segment_base_addr) as u64;
+                        
                         self.protect_segment_for_undo(chunk_idx, segment_id);
                         txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         // Write undo log entry before performing the remove
-                        // Store old version for verification during recovery
+                        // Store old version and exact offset for verification during recovery
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
@@ -578,6 +584,7 @@ impl Service for DataManager {
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
+                                cell_offset,
                             );
                             if let Err(e) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", e);
@@ -626,11 +633,16 @@ impl Service for DataManager {
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
                         let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        
+                        // Calculate cell offset within segment for fast recovery
+                        let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
+                        let cell_offset = (cell_addr - segment_base_addr) as u64;
+                        
                         self.protect_segment_for_undo(chunk_idx, segment_id);
                         txn.protected_segments.insert((chunk_idx, segment_id));
                         
                         // Write undo log entry before performing the update
-                        // Store old version for verification during recovery
+                        // Store old version and exact offset for verification during recovery
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
@@ -640,6 +652,7 @@ impl Service for DataManager {
                                 chunk_idx as u64,
                                 segment_id,
                                 seq_id,
+                                cell_offset,
                             );
                             if let Err(e) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", e);
@@ -704,6 +717,27 @@ impl Service for DataManager {
         } else {
             // all set, able to commit - segments remain protected until transaction ends
             txn.state = TxnState::Committed;
+            
+            // Sync all segments that were written to during this transaction
+            // This ensures durability - data is persisted to disk before commit succeeds
+            for (chunk_idx, seg_id) in &txn.protected_segments {
+                let chunk = &self.server.chunks.list[*chunk_idx];
+                if let Some(segment) = chunk.segs.get(&(*seg_id as usize)) {
+                    if let Some(ref wal_file_mutex) = segment.wal_file {
+                        if let Err(e) = (|| -> io::Result<()> {
+                            let mut writer = wal_file_mutex.lock();
+                            (*writer).flush()?;
+                            (*writer).get_ref().sync_all()?;
+                            Ok(())
+                        })() {
+                            error!("Failed to sync WAL for segment {} during commit: {:?}", seg_id, e);
+                        } else {
+                            debug!("Synced segment {} (chunk {}) WAL to disk for transaction commit", seg_id, chunk_idx);
+                        }
+                    }
+                }
+            }
+            
             // Commit all indices
             let response = DataSiteResponse::new(&self.server.txn_peer, DMCommitResult::Success);
             return IndexBuilder::await_indices().map(|_| response).boxed();

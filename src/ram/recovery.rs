@@ -392,9 +392,14 @@ pub fn recover_chunks(
     
     // Phase 2: Allocate segments and load data
     info!("Phase 2: Allocating segments and loading data...");
+    eprintln!("[RECOVERY] Phase 2: Allocating segments and loading data...");
+    eprintln!("[RECOVERY] Files to process: {}", files.len());
     let mut allocated_segments: Vec<(usize, Arc<Segment>)> = Vec::new();
     
     for file_info in &files {
+        eprintln!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
+            file_info.chunk_id, file_info.seg_id, file_info.seq_id, file_info.path.display());
+        
         let chunk = &chunks[file_info.chunk_id];
         
         info!(
@@ -407,7 +412,9 @@ pub fn recover_chunks(
         );
         
         // Load file data
+        eprintln!("[RECOVERY] Loading file data...");
         let file_data = load_file_to_memory(&file_info.path)?;
+        eprintln!("[RECOVERY] Loaded {} bytes", file_data.len());
         
         if file_data.len() > SEGMENT_SIZE {
             error!(
@@ -428,11 +435,16 @@ pub fn recover_chunks(
             "About to allocate segment, current next_seq_id = {}",
             chunk.allocator.next_seq_id.load(Ordering::Acquire)
         );
+        eprintln!("[RECOVERY] Allocating segment...");
         let seg_opt = chunk.allocator.alloc_seg(&chunk.backup_storage, &chunk.wal_storage);
         
         let segment = match seg_opt {
-            Some(seg) => seg,
+            Some(seg) => {
+                eprintln!("[RECOVERY] Segment allocated: id={}, seq_id={}, addr={:#x}", seg.id, seg.seq_id, seg.addr);
+                seg
+            },
             None => {
+                eprintln!("[RECOVERY] FAILED to allocate segment!");
                 error!(
                     "Failed to allocate segment for chunk {} during recovery",
                     file_info.chunk_id

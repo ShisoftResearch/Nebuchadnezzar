@@ -388,6 +388,11 @@ impl SegmentAllocator {
         let id = offset >> SEGMENT_BITS_SHIFT;
         id
     }
+    
+    #[inline]
+    pub fn addr_by_id(&self, id: usize) -> usize {
+        self.base + (id << SEGMENT_BITS_SHIFT)
+    }
 }
 
 #[cfg(target_os = "linux")]

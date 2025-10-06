@@ -164,15 +164,26 @@ impl NebServer {
             opts.wal_storage.clone(),
             opts.enable_recovery,
         );
-        let cleaner = Cleaner::new_and_start(chunks.clone());
         
-        // Initialize undo log if storage path is provided
+        // Initialize undo log if storage path is provided and perform rollback
+        // This must happen AFTER segment recovery but BEFORE cleaner starts
         let undo_log = if let Some(ref undo_log_path) = opts.undo_log_storage {
             match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
                 Ok(log) => {
-                    if let Err(e) = log.recover() {
-                        error!("Failed to recover undo log: {:?}", e);
+                    // Recover undo log from disk and get incomplete transactions
+                    match log.recover() {
+                        Ok(txn_index) => {
+                            // Perform rollback for incomplete transactions
+                            // Segments are already in memory, so we can read directly from them
+                            if let Err(e) = log.rollback_incomplete_transactions(txn_index, &chunks) {
+                                error!("Failed to rollback incomplete transactions: {:?}", e);
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to recover undo log: {:?}", e);
+                        }
                     }
+                    
                     Some(log)
                 }
                 Err(e) => {
@@ -183,6 +194,10 @@ impl NebServer {
         } else {
             None
         };
+        
+        // Start cleaner AFTER all recovery (segments + transactions) is complete
+        // This ensures segments with old cell data needed for rollback aren't cleaned
+        let cleaner = Cleaner::new_and_start(chunks.clone());
         
         let server = Arc::new(NebServer {
             chunks,
