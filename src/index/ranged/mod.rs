@@ -38,6 +38,7 @@ mod tests {
                 index_enabled: false, // We don't use the high level index builder here
                 services: vec![Service::Cell, Service::RangedIndexer],
                 enable_recovery: false,
+                undo_log_storage: None,
             },
             &server_addr,
             server_group,

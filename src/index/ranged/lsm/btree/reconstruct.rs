@@ -209,6 +209,7 @@ mod test {
                 index_enabled: false,
                 services: vec![Service::Cell],
                 enable_recovery: false,
+                undo_log_storage: None,
             },
             &server_addr,
             &server_group,

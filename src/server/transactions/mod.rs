@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 pub mod data_site;
 pub mod manager;
+pub mod undo_log;
 #[cfg(test)]
 mod tests;
 

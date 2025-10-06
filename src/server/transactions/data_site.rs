@@ -111,6 +111,24 @@ impl DataManager {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
+        
+        // Spawn undo log trimming task if undo log is enabled
+        if server.undo_log.is_some() {
+            let server_clone = server.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(300)).await; // Trim every 5 minutes
+                    if let Some(ref undo_log) = server_clone.undo_log {
+                        if let Err(e) = undo_log.trim_old_logs() {
+                            error!("Failed to trim undo logs: {:?}", e);
+                        } else {
+                            debug!("Successfully trimmed old undo logs");
+                        }
+                    }
+                }
+            });
+        }
+        
         return manager;
     }
     fn update_clock(&self, clock: &StandardVectorClock) {
@@ -533,9 +551,24 @@ impl Service for DataManager {
                         // Now protect the segment without holding cell lock
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
-                        let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         self.protect_segment_for_undo(chunk_idx, segment_id);
                         txn.protected_segments.insert((chunk_idx, segment_id));
+                        
+                        // Write undo log entry before performing the remove
+                        if let Some(ref undo_log) = self.server.undo_log {
+                            let undo_entry = super::undo_log::UndoLogEntry::new(
+                                tid.clone(),
+                                *cell_id,
+                                chunk_idx as u64,
+                                segment_id,
+                                seq_id,
+                            );
+                            if let Err(e) = undo_log.write_undo_entry(undo_entry) {
+                                error!("Failed to write undo log entry: {:?}", e);
+                                // Continue anyway - segment protection will prevent data loss
+                            }
+                        }
                         
                         let write_result = self.server.chunks.remove_cell_by(cell_id, |cell| {
                             cell.header.version == orig_version
@@ -577,9 +610,24 @@ impl Service for DataManager {
                         // Now protect the segment without holding cell lock
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
                         let chunk_idx = chunk.id;
-                        let (segment_id, _seq_id) = chunk.get_cell_segment_info(cell_addr);
+                        let (segment_id, seq_id) = chunk.get_cell_segment_info(cell_addr);
                         self.protect_segment_for_undo(chunk_idx, segment_id);
                         txn.protected_segments.insert((chunk_idx, segment_id));
+                        
+                        // Write undo log entry before performing the update
+                        if let Some(ref undo_log) = self.server.undo_log {
+                            let undo_entry = super::undo_log::UndoLogEntry::new(
+                                tid.clone(),
+                                cell_id,
+                                chunk_idx as u64,
+                                segment_id,
+                                seq_id,
+                            );
+                            if let Err(e) = undo_log.write_undo_entry(undo_entry) {
+                                error!("Failed to write undo log entry: {:?}", e);
+                                // Continue anyway - segment protection will prevent data loss
+                            }
+                        }
                         
                         let write_result =
                             self.server
@@ -758,12 +806,24 @@ impl Service for DataManager {
             let _wake_up_res: Vec<_> = wake_up_futures.collect().await;
             
             // Release all segment protections before wiping out transaction
-            let protected_segments = {
+            let (protected_segments, txn_state) = {
                 let txn_lock = self.get_transaction(&tid);
                 let mut txn = txn_lock.lock();
-                std::mem::take(&mut txn.protected_segments)
+                (std::mem::take(&mut txn.protected_segments), txn.state)
             };
             self.release_all_segment_protections(&protected_segments);
+            
+            // Write commit/abort marker to undo log based on transaction state
+            if let Some(ref undo_log) = self.server.undo_log {
+                let log_result = match txn_state {
+                    TxnState::Committed => undo_log.write_commit_marker(&tid),
+                    TxnState::Aborted => undo_log.write_abort_marker(&tid),
+                    _ => Ok(()), // No marker needed for other states
+                };
+                if let Err(e) = log_result {
+                    error!("Failed to write transaction completion marker: {:?}", e);
+                }
+            }
             
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);

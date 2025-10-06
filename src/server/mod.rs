@@ -50,6 +50,7 @@ pub struct ServerOptions {
     pub memory_size: usize,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
+    pub undo_log_storage: Option<String>,
     pub services: Vec<Service>,
     pub index_enabled: bool,
     pub enable_recovery: bool,
@@ -83,6 +84,7 @@ pub struct NebServer {
     pub indexer: Option<Arc<IndexBuilder>>,
     pub group_name: String,
     pub neb_client: Arc<AsyncClient>,
+    pub undo_log: Option<Arc<transactions::undo_log::UndoLog>>,
 }
 
 pub async fn init_conshash(
@@ -163,6 +165,25 @@ impl NebServer {
             opts.enable_recovery,
         );
         let cleaner = Cleaner::new_and_start(chunks.clone());
+        
+        // Initialize undo log if storage path is provided
+        let undo_log = if let Some(ref undo_log_path) = opts.undo_log_storage {
+            match transactions::undo_log::UndoLog::new(undo_log_path.clone()) {
+                Ok(log) => {
+                    if let Err(e) = log.recover() {
+                        error!("Failed to recover undo log: {:?}", e);
+                    }
+                    Some(log)
+                }
+                Err(e) => {
+                    error!("Failed to initialize undo log: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
         let server = Arc::new(NebServer {
             chunks,
             cleaner,
@@ -178,6 +199,7 @@ impl NebServer {
             indexer: index_builder,
             group_name: group_name.clone(),
             neb_client: neb_client.clone(),
+            undo_log,
         });
         let servs = proc_services(&opts.services);
         for service in servs {
