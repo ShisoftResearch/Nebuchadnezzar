@@ -16,11 +16,14 @@ use std::sync::Arc;
 pub type TxnId = StandardVectorClock;
 
 /// Undo log entry stored in the log file
-/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][version: u64][chunk_id: u64][seg_id: u64][seq_id: u64]
+/// Format: [entry_type: u8][txn_id_len: u32][txn_id: bytes][cell_id: Id][op_type: u8][version: u64][chunk_id: u64][seq_id: u64][cell_offset: u64]
 /// 
 /// All operations store version for verification during recovery:
 /// - Write: version = new cell version (to verify cell unchanged before deletion)
 /// - Update/Remove: version = old cell version (to verify we're restoring the right version)
+/// 
+/// Note: seg_id is NOT stored because it's address-derived and changes across recoveries.
+/// Only seq_id is stable across recoveries and sufficient for segment lookup.
 #[derive(Debug, Clone)]
 pub struct UndoLogEntry {
     pub txn_id: TxnId,
@@ -32,9 +35,8 @@ pub struct UndoLogEntry {
     pub version: u64,
     /// For Update/Remove: chunk_id where old cell is located (0 for Write)
     pub chunk_id: u64,
-    /// For Update/Remove: segment_id where old cell is located (0 for Write)
-    pub seg_id: u64,
     /// For Update/Remove: seq_id of segment where old cell is located (0 for Write)
+    /// Note: seq_id is stable across recoveries, unlike seg_id which is address-derived
     pub seq_id: u64,
     /// For Update/Remove: offset within segment where old cell is located (0 for Write)
     pub cell_offset: u64,
@@ -68,14 +70,13 @@ const ENTRY_TYPE_ABORT: u8 = 3;
 
 impl UndoLogEntry {
     /// Create a new undo log entry
-    pub fn new(txn_id: TxnId, cell_id: Id, op_type: UndoOpType, version: u64, chunk_id: u64, seg_id: u64, seq_id: u64, cell_offset: u64) -> Self {
+    pub fn new(txn_id: TxnId, cell_id: Id, op_type: UndoOpType, version: u64, chunk_id: u64, seq_id: u64, cell_offset: u64) -> Self {
         Self {
             txn_id,
             cell_id,
             op_type,
             version,
             chunk_id,
-            seg_id,
             seq_id,
             cell_offset,
         }
@@ -84,14 +85,15 @@ impl UndoLogEntry {
     /// Helper to create a Write entry (for new cells)
     /// Only needs version since there's no old segment to restore from
     pub fn new_write(txn_id: TxnId, cell_id: Id, version: u64) -> Self {
-        Self::new(txn_id, cell_id, UndoOpType::Write, version, 0, 0, 0, 0)
+        Self::new(txn_id, cell_id, UndoOpType::Write, version, 0, 0, 0)
     }
     
-    /// Helper to create an Update/Remove entry (with old cell version, segment location, and offset)
+    /// Helper to create an Update/Remove entry (with old cell version, segment seq_id, and offset)
     /// Stores both the old version for verification and exact segment location for fast restoration
-    pub fn new_restore(txn_id: TxnId, cell_id: Id, op_type: UndoOpType, old_version: u64, chunk_id: u64, seg_id: u64, seq_id: u64, cell_offset: u64) -> Self {
+    /// Note: only seq_id is stored, not seg_id, because seg_id changes across recoveries
+    pub fn new_restore(txn_id: TxnId, cell_id: Id, op_type: UndoOpType, old_version: u64, chunk_id: u64, seq_id: u64, cell_offset: u64) -> Self {
         debug_assert!(op_type != UndoOpType::Write, "Use new_write for Write operations");
-        Self::new(txn_id, cell_id, op_type, old_version, chunk_id, seg_id, seq_id, cell_offset)
+        Self::new(txn_id, cell_id, op_type, old_version, chunk_id, seq_id, cell_offset)
     }
     
     /// Serialize entry to bytes
@@ -100,7 +102,8 @@ impl UndoLogEntry {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let txn_id_len = txn_id_bytes.len() as u32;
 
-        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 16 + 1 + 8 + 8 + 8 + 8 + 8);
+        // Removed seg_id field (8 bytes)
+        let mut bytes = Vec::with_capacity(1 + 4 + txn_id_bytes.len() + 16 + 1 + 8 + 8 + 8 + 8);
         bytes.push(ENTRY_TYPE_UNDO);
         bytes.extend_from_slice(&txn_id_len.to_le_bytes());
         bytes.extend_from_slice(&txn_id_bytes);
@@ -109,7 +112,6 @@ impl UndoLogEntry {
         bytes.push(self.op_type as u8);
         bytes.extend_from_slice(&self.version.to_le_bytes());
         bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
-        bytes.extend_from_slice(&self.seg_id.to_le_bytes());
         bytes.extend_from_slice(&self.seq_id.to_le_bytes());
         bytes.extend_from_slice(&self.cell_offset.to_le_bytes());
 
@@ -134,7 +136,8 @@ impl UndoLogEntry {
         }
 
         let txn_id_len = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        if bytes.len() < 5 + txn_id_len + 57 {  // +1 for op_type, +8 for version, +8 for chunk_id, +8 for seg_id, +8 for seq_id, +8 for cell_offset = 41 + 16 (cell_id) = 57
+        // Removed seg_id field: +1 for op_type, +8 for version, +8 for chunk_id, +8 for seq_id, +8 for cell_offset = 33 + 16 (cell_id) = 49
+        if bytes.len() < 5 + txn_id_len + 49 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Not enough bytes for full entry",
@@ -196,17 +199,7 @@ impl UndoLogEntry {
         ]);
         offset += 8;
 
-        let seg_id = u64::from_le_bytes([
-            bytes[offset],
-            bytes[offset + 1],
-            bytes[offset + 2],
-            bytes[offset + 3],
-            bytes[offset + 4],
-            bytes[offset + 5],
-            bytes[offset + 6],
-            bytes[offset + 7],
-        ]);
-        offset += 8;
+        // Removed seg_id field deserialization
 
         let seq_id = u64::from_le_bytes([
             bytes[offset],
@@ -244,7 +237,6 @@ impl UndoLogEntry {
                 op_type,
                 version,
                 chunk_id,
-                seg_id,
                 seq_id,
                 cell_offset,
             },
@@ -512,8 +504,8 @@ impl UndoLogger {
     /// Rollback an Update or Remove operation by restoring the old cell from segment memory
     fn rollback_restore(&self, entry: &UndoLogEntry, chunks: &Arc<Chunks>) -> io::Result<()> {
         debug!(
-            "Rolling back {:?}: cell_id={:?}, version={}, from chunk={}, seg={}, seq={}, offset={}",
-            entry.op_type, entry.cell_id, entry.version, entry.chunk_id, entry.seg_id, entry.seq_id, entry.cell_offset
+            "Rolling back {:?}: cell_id={:?}, version={}, from chunk={}, seq={}, offset={}",
+            entry.op_type, entry.cell_id, entry.version, entry.chunk_id, entry.seq_id, entry.cell_offset
         );
         
         // Get the chunk and find the segment in memory
@@ -868,7 +860,8 @@ mod tests {
     fn test_undo_entry_serialization() {
         let txn_id = TxnId::new();
         let cell_id = Id { higher: 1, lower: 2 };
-        let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 5, 0, 100, 1000, 50);
+        // Removed seg_id parameter (was 100)
+        let entry = UndoLogEntry::new(txn_id, cell_id, UndoOpType::Update, 5, 0, 1000, 50);
 
         let bytes = entry.to_bytes().unwrap();
         let (recovered, size) = UndoLogEntry::from_bytes(&bytes).unwrap();
@@ -878,7 +871,6 @@ mod tests {
         assert_eq!(recovered.op_type, entry.op_type);
         assert_eq!(recovered.version, entry.version);
         assert_eq!(recovered.chunk_id, entry.chunk_id);
-        assert_eq!(recovered.seg_id, entry.seg_id);
         assert_eq!(recovered.seq_id, entry.seq_id);
     }
 
@@ -891,7 +883,8 @@ mod tests {
 
         let txn_id = TxnId::new();
         let cell_id = Id { higher: 1, lower: 2 };
-        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Update, 3, 0, 100, 1000, 50);
+        // Removed seg_id parameter (was 100)
+        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Update, 3, 0, 1000, 50);
 
         undo_log.write_undo_entry(entry.clone()).unwrap();
 
@@ -914,7 +907,8 @@ mod tests {
 
         let txn_id = TxnId::new();
         let cell_id = Id { higher: 1, lower: 2 };
-        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Remove, 2, 0, 100, 1000, 50);
+        // Removed seg_id parameter (was 100)
+        let entry = UndoLogEntry::new(txn_id.clone(), cell_id, UndoOpType::Remove, 2, 0, 1000, 50);
 
         {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
@@ -942,8 +936,9 @@ mod tests {
         let cell_id1 = Id { higher: 1, lower: 2 };
         let cell_id2 = Id { higher: 3, lower: 4 };
         
-        let entry1 = UndoLogEntry::new(txn_id.clone(), cell_id1, UndoOpType::Write, 1, 0, 0, 0, 0);
-        let entry2 = UndoLogEntry::new(txn_id.clone(), cell_id2, UndoOpType::Update, 4, 0, 200, 2000, 100);
+        // Removed seg_id parameters
+        let entry1 = UndoLogEntry::new(txn_id.clone(), cell_id1, UndoOpType::Write, 1, 0, 0, 0);
+        let entry2 = UndoLogEntry::new(txn_id.clone(), cell_id2, UndoOpType::Update, 4, 0, 2000, 100);
 
         undo_log.write_undo_entry(entry1).unwrap();
         undo_log.write_undo_entry(entry2).unwrap();
@@ -1007,7 +1002,8 @@ mod tests {
         
         // Write, Update, and Remove operations
         let entry1 = UndoLogEntry::new_write(txn.clone(), cell_id1, 1);
-        let entry2 = UndoLogEntry::new_restore(txn.clone(), cell_id2, UndoOpType::Update, 5, 0, 100, 1000, 50);
+        // Removed seg_id parameter (was 100)
+        let entry2 = UndoLogEntry::new_restore(txn.clone(), cell_id2, UndoOpType::Update, 5, 0, 1000, 50);
         
         undo_log.write_undo_entry(entry1).unwrap();
         undo_log.write_undo_entry(entry2).unwrap();
@@ -1049,8 +1045,9 @@ mod tests {
             
             // Write multiple operations
             let entry1 = UndoLogEntry::new_write(txn_incomplete.clone(), cell_id1, 1);
-            let entry2 = UndoLogEntry::new_restore(txn_incomplete.clone(), cell_id2, UndoOpType::Update, 3, 0, 50, 500, 25);
-            let entry3 = UndoLogEntry::new_restore(txn_incomplete.clone(), cell_id3, UndoOpType::Remove, 7, 1, 75, 750, 37);
+            // Removed seg_id parameters (were 50 and 75)
+            let entry2 = UndoLogEntry::new_restore(txn_incomplete.clone(), cell_id2, UndoOpType::Update, 3, 0, 500, 25);
+            let entry3 = UndoLogEntry::new_restore(txn_incomplete.clone(), cell_id3, UndoOpType::Remove, 7, 1, 750, 37);
             
             undo_log.write_undo_entry(entry1).unwrap();
             undo_log.write_undo_entry(entry2).unwrap();
@@ -1076,14 +1073,14 @@ mod tests {
         assert_eq!(entries[1].op_type, UndoOpType::Update);
         assert_eq!(entries[1].version, 3);
         assert_eq!(entries[1].chunk_id, 0);
-        assert_eq!(entries[1].seg_id, 50);
+        // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 500);
         
         assert_eq!(entries[2].cell_id, cell_id3);
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
         assert_eq!(entries[2].version, 7);
         assert_eq!(entries[2].chunk_id, 1);
-        assert_eq!(entries[2].seg_id, 75);
+        // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 750);
     }
 
@@ -1389,26 +1386,26 @@ mod tests {
         undo_log.write_undo_entry(write_entry).unwrap();
 
         // Update operation: version is the old cell's version
+        // Removed seg_id parameter
         let update_entry = UndoLogEntry::new_restore(
             txn.clone(),
             Id { higher: 1, lower: 2 },
             UndoOpType::Update,
             20, // old version
             0,  // chunk_id
-            100, // seg_id
             1000, // seq_id
             50, // cell_offset
         );
         undo_log.write_undo_entry(update_entry).unwrap();
 
         // Remove operation: version is the old cell's version
+        // Removed seg_id parameter
         let remove_entry = UndoLogEntry::new_restore(
             txn.clone(),
             Id { higher: 1, lower: 3 },
             UndoOpType::Remove,
             30, // old version
             1,  // chunk_id
-            200, // seg_id
             2000, // seq_id
             100, // cell_offset
         );
@@ -1424,21 +1421,21 @@ mod tests {
         assert_eq!(entries[0].op_type, UndoOpType::Write);
         assert_eq!(entries[0].version, 10);
         assert_eq!(entries[0].chunk_id, 0);
-        assert_eq!(entries[0].seg_id, 0);
+        // Removed seg_id assertions
         assert_eq!(entries[0].seq_id, 0);
         
         // Verify Update entry
         assert_eq!(entries[1].op_type, UndoOpType::Update);
         assert_eq!(entries[1].version, 20);
         assert_eq!(entries[1].chunk_id, 0);
-        assert_eq!(entries[1].seg_id, 100);
+        // Removed seg_id assertion
         assert_eq!(entries[1].seq_id, 1000);
         
         // Verify Remove entry
         assert_eq!(entries[2].op_type, UndoOpType::Remove);
         assert_eq!(entries[2].version, 30);
         assert_eq!(entries[2].chunk_id, 1);
-        assert_eq!(entries[2].seg_id, 200);
+        // Removed seg_id assertion
         assert_eq!(entries[2].seq_id, 2000);
     }
 
@@ -1598,13 +1595,13 @@ mod tests {
         // Simulate incomplete transaction that updated the cell
         let mut txn_id = TxnId::new();
         txn_id.inc(1);
+        // Removed seg_id parameter
         let undo_entry = UndoLogEntry::new_restore(
             txn_id.clone(),
             cell_id,
             UndoOpType::Update,
             initial_version, // old version before transaction
             chunk.id as u64,
-            seg_id,
             seq_id,
             cell_offset,
         );

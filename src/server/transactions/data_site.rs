@@ -580,6 +580,7 @@ impl Service for DataManager {
                         
                         // Write undo log entry before performing the remove
                         // Store old version and exact offset for verification during recovery
+                        // Note: only seq_id is stored, not seg_id (which changes across recoveries)
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
@@ -587,7 +588,6 @@ impl Service for DataManager {
                                 super::undo_log::UndoOpType::Remove,
                                 orig_version,
                                 chunk_idx as u64,
-                                segment_id,
                                 seq_id,
                                 cell_offset,
                             );
@@ -648,6 +648,7 @@ impl Service for DataManager {
                         
                         // Write undo log entry before performing the update
                         // Store old version and exact offset for verification during recovery
+                        // Note: only seq_id is stored, not seg_id (which changes across recoveries)
                         if let Some(ref undo_log) = self.server.undo_log {
                             let undo_entry = super::undo_log::UndoLogEntry::new_restore(
                                 tid.clone(),
@@ -655,7 +656,6 @@ impl Service for DataManager {
                                 super::undo_log::UndoOpType::Update,
                                 orig_version,
                                 chunk_idx as u64,
-                                segment_id,
                                 seq_id,
                                 cell_offset,
                             );
