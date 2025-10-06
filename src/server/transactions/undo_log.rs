@@ -548,7 +548,7 @@ impl UndoLogger {
                     ENTRY_TYPE_UNDO => {
                         if let Ok((entry, size)) = UndoLogEntry::from_bytes(&buffer[offset..]) {
                             txn_index
-                                .entry(txn_id)
+                                .entry(txn_id.clone())
                                 .or_insert_with(Vec::new)
                                 .push(entry);
                             offset += size;
@@ -913,14 +913,19 @@ mod tests {
     /// Verifies that recovery correctly handles different transaction states
     #[test]
     fn test_e2e_mixed_transactions() {
-        use std::io::Read;
-        
         let temp_dir = TempDir::new().unwrap();
         let log_dir = temp_dir.path().to_str().unwrap().to_string();
 
-        let txn_committed = TxnId::new();
-        let txn_aborted = TxnId::new();
-        let txn_incomplete = TxnId::new();
+        // Create unique transaction IDs by incrementing them
+        // (in real system, each would have different server_id in vector clock)
+        let mut txn_committed = TxnId::new();
+        txn_committed.inc(1); // server_id=1
+        
+        let mut txn_aborted = TxnId::new();
+        txn_aborted.inc(2); // server_id=2
+        
+        let mut txn_incomplete = TxnId::new();
+        txn_incomplete.inc(3); // server_id=3
 
         {
             let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
@@ -928,13 +933,9 @@ mod tests {
             // Transaction 1: Will be committed
             let entry1 = UndoLogEntry::new_write(txn_committed.clone(), Id { higher: 1, lower: 1 }, 1);
             undo_log.write_undo_entry(entry1).unwrap();
-            
-            // Verify entry exists before commit
             assert_eq!(undo_log.get_undo_entries(&txn_committed).len(), 1, "Entry should exist before commit");
             
             undo_log.write_commit_marker(&txn_committed).unwrap();
-            
-            // Verify in-memory index is cleared immediately after commit
             assert_eq!(undo_log.get_undo_entries(&txn_committed).len(), 0, "Entry should be cleared after commit");
 
             // Transaction 2: Will be aborted
@@ -949,50 +950,14 @@ mod tests {
             // No commit/abort marker
         } // undo_log dropped and files flushed
 
-        // Debug: Check what log files exist before creating new instance
-        println!("\n=== After first UndoLogger dropped ===");
-        let log_files_before: Vec<_> = std::fs::read_dir(&log_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "nlog").unwrap_or(false))
-            .collect();
-        println!("Log files: {}", log_files_before.len());
-        for (i, file_entry) in log_files_before.iter().enumerate() {
-            let path = file_entry.path();
-            let mut file = std::fs::File::open(&path).unwrap();
-            let mut contents = Vec::new();
-            file.read_to_end(&mut contents).unwrap();
-            println!("File {}: {:?}, size: {} bytes", i, path.file_name(), contents.len());
-        }
-
-        // Recover after "crash" - this creates undo-1.nlog before calling recover()
-        let undo_log = UndoLogger::new(log_dir.clone()).unwrap();
-        
-        // Debug: Check what log files exist after creating new instance
-        println!("\n=== After second UndoLogger::new() ===");
-        let log_files_after: Vec<_> = std::fs::read_dir(&log_dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map(|ext| ext == "nlog").unwrap_or(false))
-            .collect();
-        println!("Log files: {}", log_files_after.len());
-        
-        // Now call recover
-        println!("\n=== Calling recover() ===");
+        // Recover after "crash"
+        let undo_log = UndoLogger::new(log_dir).unwrap();
         undo_log.recover().unwrap();
 
         // After recovery, only incomplete transaction should be present
-        let committed_entries = undo_log.get_undo_entries(&txn_committed);
-        let aborted_entries = undo_log.get_undo_entries(&txn_aborted);
-        let incomplete_entries = undo_log.get_undo_entries(&txn_incomplete);
-        
-        println!("\n=== After recovery ===");
-        println!("committed: {}, aborted: {}, incomplete: {}", 
-                 committed_entries.len(), aborted_entries.len(), incomplete_entries.len());
-        
-        assert_eq!(incomplete_entries.len(), 1, "Incomplete txn should be recovered");
-        assert_eq!(committed_entries.len(), 0, "Committed txn should not be recovered");
-        assert_eq!(aborted_entries.len(), 0, "Aborted txn should not be recovered");
+        assert_eq!(undo_log.get_undo_entries(&txn_incomplete).len(), 1, "Incomplete txn should be recovered");
+        assert_eq!(undo_log.get_undo_entries(&txn_committed).len(), 0, "Committed txn should not be recovered");
+        assert_eq!(undo_log.get_undo_entries(&txn_aborted).len(), 0, "Aborted txn should not be recovered");
     }
 
     /// Test end-to-end: Log trimming removes old completed transactions
