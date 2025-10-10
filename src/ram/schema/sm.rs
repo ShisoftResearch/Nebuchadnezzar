@@ -82,6 +82,13 @@ impl StateMachineCmds for SchemasSM {
         .boxed()
     }
     fn next_id(&mut self) -> BoxFuture<u32> {
+        // Always start from max existing ID to handle WAL replay scenarios
+        // where schemas were added with explicit IDs
+        let max_existing = self.map.schema_map.keys().max().copied().unwrap_or(0);
+        if self.id_count < max_existing {
+            self.id_count = max_existing;
+        }
+        
         self.id_count += 1;
         while self.map.schema_map.contains_key(&self.id_count) {
             self.id_count += 1;
@@ -95,19 +102,45 @@ impl StateMachineCtl for SchemasSM {
     fn id(&self) -> u64 {
         self.sm_id
     }
-    fn snapshot(&self) -> Option<Vec<u8>> {
-        Some(utils::serde::serialize(&self.map.get_all()))
+    fn snapshot(&self) -> Vec<u8> {
+        utils::serde::serialize(&self.map.get_all())
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
-        let schemas: Vec<Schema> = utils::serde::deserialize(&data).unwrap();
-        self.map.load_from_list(schemas);
+        trace!("========== SchemasSM::recover() CALLED ==========");
+        trace!("Received {} bytes of snapshot data", data.len());
+        
+        let schemas: Vec<Schema> = match utils::serde::deserialize::<Vec<Schema>>(&data) {
+            Some(s) => {
+                trace!("Successfully deserialized {} schemas", s.len());
+                s
+            },
+            None => {
+                trace!("Failed to deserialize schemas from snapshot data");
+                return future::ready(()).boxed();
+            }
+        };
+        
+        trace!("Loading {} schemas into map...", schemas.len());
+        self.map.load_from_list(schemas.clone());
+        trace!("Schemas loaded into map");
+        
+        // Calculate id_count from max schema ID to prevent duplicate IDs after recovery
+        self.id_count = schemas.iter().map(|s| s.id).max().unwrap_or(0);
+        trace!("Set id_count to {}", self.id_count);
+        trace!("========== SchemasSM::recover() COMPLETE ==========");
+        
         future::ready(()).boxed()
+    }
+
+    fn recoverable(&self) -> bool {
+        true
     }
 }
 
 impl SchemasSM {
     pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
         let sm_id = generate_sm_id(group);
+        trace!("Creating SchemasSM for group '{}' with SM ID: {}", group, sm_id);
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()).await,
             map: SchemasMap::new(),
@@ -153,12 +186,16 @@ impl SchemasMap {
         }
     }
     fn load_from_list(&mut self, data: Vec<Schema>) {
-        for schema in data {
+        error!("load_from_list: Loading {} schemas", data.len());
+        for (idx, schema) in data.into_iter().enumerate() {
             let id = schema.id;
             self.name_map.insert(schema.name.clone(), id);
             self.schema_map.insert(id, schema);
-            debug!("Inserted listed schema {}", id);
+            if idx % 100 == 0 {
+                error!("load_from_list: Loaded {} schemas so far", idx);
+            }
         }
+        error!("load_from_list: All schemas loaded");
     }
     fn id_of_name(&self, name: &str) -> Option<u32> {
         self.name_map.get(name).cloned()

@@ -21,6 +21,7 @@ pub async fn workspace_wr() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             undo_log_storage: None,
+            raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
         "test",
@@ -161,6 +162,7 @@ pub async fn data_site_wr() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             undo_log_storage: None,
+            raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
         "test",
@@ -258,6 +260,7 @@ pub async fn multi_transaction() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             undo_log_storage: None,
+            raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
         "test",
@@ -366,6 +369,7 @@ pub async fn smoke_rw() {
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             undo_log_storage: None,
+            raft_storage: None, // No persistence for regular tests
         },
         &server_addr,
         "test",

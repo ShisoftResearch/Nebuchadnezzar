@@ -1660,6 +1660,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -1729,6 +1730,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -1779,6 +1781,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -1864,6 +1867,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -1910,6 +1914,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -1987,6 +1992,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -2031,6 +2037,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",
@@ -2092,6 +2099,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
+                raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
             "test",

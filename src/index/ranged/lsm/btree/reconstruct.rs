@@ -206,10 +206,11 @@ mod test {
                 memory_size: 16 * 12024 * 1024,
                 backup_storage: None,
                 wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None, // No persistence for regular tests
                 index_enabled: false,
                 services: vec![Service::Cell],
                 enable_recovery: false,
-                undo_log_storage: None,
             },
             &server_addr,
             &server_group,

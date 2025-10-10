@@ -128,13 +128,17 @@ impl StateMachineCtl for MasterTreeSM {
     fn id(&self) -> u64 {
         DEFAULT_SM_ID
     }
-    fn snapshot(&self) -> Option<Vec<u8>> {
-        Some(utils::serde::serialize(&self.tree))
+    fn snapshot(&self) -> Vec<u8> {
+        utils::serde::serialize(&self.tree)
     }
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
         let tree = utils::serde::deserialize(&data).unwrap();
         self.tree = tree;
         future::ready(()).boxed()
+    }
+
+    fn recoverable(&self) -> bool {
+        true
     }
 }
 

@@ -8,6 +8,7 @@ use bifrost::membership::member::MemberService;
 use bifrost::membership::server::Membership;
 use bifrost::raft;
 use bifrost::raft::client::RaftClient;
+use bifrost::raft::disk::DiskOptions;
 use bifrost::raft::state_machine::master as sm_master;
 use bifrost::rpc;
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
@@ -23,6 +24,7 @@ use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use std::collections::HashSet;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 pub mod cell_rpc;
@@ -31,6 +33,23 @@ mod tests;
 pub mod transactions;
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
+
+/// Check if Raft state exists on disk at the given path
+fn has_existing_raft_state(raft_storage: &Option<String>) -> bool {
+    if let Some(ref path) = raft_storage {
+        let raft_path = Path::new(path);
+        let log_file = raft_path.join("log.dat");
+        let snapshot_file = raft_path.join("snapshot.dat");
+        
+        // Consider state exists if either log or snapshot file exists and is non-empty
+        let has_logs = log_file.exists() && log_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        let has_snapshot = snapshot_file.exists() && snapshot_file.metadata().map(|m| m.len() > 0).unwrap_or(false);
+        
+        has_logs || has_snapshot
+    } else {
+        false
+    }
+}
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -51,6 +70,7 @@ pub struct ServerOptions {
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
     pub undo_log_storage: Option<String>,
+    pub raft_storage: Option<String>,
     pub services: Vec<Service>,
     pub index_enabled: bool,
     pub enable_recovery: bool,
@@ -125,12 +145,10 @@ impl NebServer {
             "Creating key-value server instance, group name {}",
             group_name
         );
-        raft_service
-            .register_state_machine(Box::new(
-                schema_sm::SchemasSM::new(group_name, raft_service).await,
-            ))
-            .await;
-        Weights::new_with_id(CONS_HASH_ID, raft_service).await;
+        // State machines are already registered before RaftService::start()
+        // in new_cluster_from_opts() to allow WAL replay during recovery
+        
+        // Now we can query the state machine to build the local cache
         let schemas = LocalSchemasCache::new(group_name, raft_client)
             .await
             .unwrap();
@@ -267,21 +285,67 @@ impl NebServer {
             .filter(|n| *n != server_addr)
             .cloned()
             .collect();
+        let storage = if let Some(ref raft_path) = opts.raft_storage {
+            raft::Storage::DISK(DiskOptions {
+                path: raft_path.clone(),
+                take_snapshots: true,
+                append_logs: true,
+                trim_logs: true,
+                snapshot_log_threshold: 1000,
+                log_compaction_threshold: 2000,
+            })
+        } else {
+            raft::Storage::MEMORY
+        };
         let raft_service = raft::RaftService::new(raft::Options {
-            storage: raft::Storage::MEMORY,
+            storage,
             address: server_addr.to_owned(),
             service_id: raft::DEFAULT_SERVICE_ID,
         });
+        
+        // Register state machines BEFORE starting Raft so WAL replay can apply to them
+        // This is critical: any SM registered after start() won't receive replayed WAL entries
+        debug!("Registering state machines before Raft start for WAL replay");
+        raft_service
+            .register_state_machine(Box::new(
+                schema_sm::SchemasSM::new(group_name, &raft_service).await,
+            ))
+            .await;
+        Weights::new_with_id(CONS_HASH_ID, &raft_service).await;
+        
+        // TODO: If RangedIndexer service is enabled, MasterTreeSM should also be
+        // registered here before start() to enable WAL replay recovery
+        
         rpc_server.register_service(&raft_service).await;
         Server::listen_and_resume(&rpc_server).await;
-        debug!("RPC server created, starting Raft service");
+        
+        // Register Membership service BEFORE Raft start for WAL replay
+        debug!("Registering Membership service before Raft start");
+        Membership::new(&rpc_server, &raft_service).await;
+        
+        debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service).await;
-        if meta_members.is_empty() {
-            debug!("No other members in the cluster, will bootstrap");
+        
+        // Check if we have existing Raft state on disk
+        let has_existing_state = has_existing_raft_state(&opts.raft_storage);
+        
+        if has_existing_state {
+            // Existing state found - Raft will automatically resume from disk
+            info!("Resuming from existing Raft state on disk");
+            // Don't bootstrap or join - let Raft recover automatically
+            // Give Raft time to elect leader if this is a single-server resumed cluster
+            if meta_members.is_empty() {
+                info!("Single-server resumed cluster, waiting for leader election and state recovery...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+        } else if meta_members.is_empty() {
+            // Fresh start, no other members - bootstrap a new cluster
+            debug!("No existing state and no other members, bootstrapping new cluster");
             raft_service.bootstrap().await;
         } else {
+            // Fresh start with other members - join the cluster
             debug!(
-                "Raft service started, joining with members: {:?}",
+                "No existing state, joining cluster with members: {:?}",
                 &meta_members
             );
             match raft_service.join(&meta_members).await {
@@ -301,11 +365,15 @@ impl NebServer {
                 }
             }
         }
-        debug!("Joined with members, starting membership services");
-        Membership::new(&rpc_server, &raft_service).await;
+        debug!("Joined with members, membership service already started before Raft start");
         debug!("Starting raft client");
         let raft_client = RaftClient::new(meta_servers, raft::DEFAULT_SERVICE_ID)
             .await
+            .map_err(|e| {
+                error!("Failed to create Raft client: {:?}", e);
+                error!("This may happen if resuming from disk without proper cluster state");
+                e
+            })
             .unwrap();
         debug!("Prepare raft subscription");
         RaftClient::prepare_subscription(&rpc_server).await;

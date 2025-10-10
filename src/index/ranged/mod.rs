@@ -35,10 +35,11 @@ mod tests {
                 memory_size: 32 * 1024 * 1024 * 1024, // G
                 backup_storage: None,
                 wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None, // No persistence for regular tests
                 index_enabled: false, // We don't use the high level index builder here
                 services: vec![Service::Cell, Service::RangedIndexer],
                 enable_recovery: false,
-                undo_log_storage: None,
             },
             &server_addr,
             server_group,
