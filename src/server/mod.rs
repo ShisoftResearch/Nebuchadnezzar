@@ -263,7 +263,7 @@ impl NebServer {
         Ok(server)
     }
 
-    pub async fn new_from_opts<'a, F: FnOnce(&raft::RaftService)>(
+    pub async fn new_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
         group_name: &'a str,
@@ -273,7 +273,7 @@ impl NebServer {
             .await
     }
 
-    pub async fn new_cluster_from_opts<'a, F: FnOnce(&raft::RaftService)>(
+    pub async fn new_cluster_from_opts<'a, F: AsyncFnOnce(&Arc<raft::RaftService>)>(
         opts: &ServerOptions,
         server_addr: &'a str,
         meta_servers: &Vec<String>,
@@ -329,7 +329,7 @@ impl NebServer {
         Membership::new(&rpc_server, &raft_service).await;
 
         debug!("Preparing raft service");
-        prepare_raft_service(&raft_service);
+        prepare_raft_service(&raft_service).await;
         
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service, true).await;
