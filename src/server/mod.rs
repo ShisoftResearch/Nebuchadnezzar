@@ -327,7 +327,7 @@ impl NebServer {
         Membership::new(&rpc_server, &raft_service).await;
         
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
-        raft::RaftService::start(&raft_service).await;
+        raft::RaftService::start(&raft_service, true).await;
         
         // Check if we have existing Raft state on disk
         let has_existing_state = has_existing_raft_state(&opts.raft_storage);

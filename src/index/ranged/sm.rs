@@ -433,7 +433,7 @@ mod tests {
         rpc_server.register_service(&raft_service).await;
         Server::listen_and_resume(&rpc_server).await;
         Membership::new(&rpc_server, &raft_service).await;
-        raft::RaftService::start(&raft_service).await;
+        raft::RaftService::start(&raft_service, false).await;
         raft_service.bootstrap().await;
 
         let raft_client = RaftClient::new(&vec![server_addr.to_string()], raft::DEFAULT_SERVICE_ID)
