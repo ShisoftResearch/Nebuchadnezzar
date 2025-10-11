@@ -24,7 +24,7 @@ use crate::ram::schema::LocalSchemasCache;
 use crate::ram::types::Id;
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod cell_rpc;
@@ -242,12 +242,15 @@ impl NebServer {
                     init_txn_service(rpc_server, &server).await
                 }
                 Service::RangedIndexer => {
+                    // Use raft storage path for tree persistence if available
+                    let tree_path = opts.raft_storage.as_ref().map(|p| format!("{}/master_tree.dat", p));
                     init_ranged_indexer_service(
                         rpc_server,
                         &neb_client,
                         raft_service,
                         raft_client,
                         &conshasing,
+                        tree_path,
                     )
                     .await
                 }
@@ -471,6 +474,7 @@ pub async fn init_ranged_indexer_service(
     raft_svr: &Arc<raft::RaftService>,
     raft_client: &Arc<RaftClient>,
     cons_hash: &Arc<ConsistentHashing>,
+    tree_persistence_path: Option<String>,
 ) {
     info!("Initializing range indexer service");
     // TODO: create the schema only when it does not exists
@@ -491,7 +495,14 @@ pub async fn init_ranged_indexer_service(
             neb_client, &sm_client,
         )))
         .await;
-    let mut tree_sm = ranged::sm::MasterTreeSM::new(raft_svr, cons_hash);
+    
+    // Create MasterTreeSM with persistence support
+    let persistence_path = tree_persistence_path.map(PathBuf::from);
+    let mut tree_sm = ranged::sm::MasterTreeSM::new_with_persistence(
+        raft_svr,
+        cons_hash,
+        persistence_path,
+    );
     tree_sm.try_initialize().await;
     raft_svr.register_state_machine(Box::new(tree_sm)).await;
 }
