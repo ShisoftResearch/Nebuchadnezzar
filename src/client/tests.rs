@@ -32,7 +32,7 @@ pub async fn general() {
         },
         &server_addr,
         &server_group,
-        |_| {},
+        async |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -182,7 +182,7 @@ pub async fn multi_cell_update() {
         },
         &server_addr,
         server_group,
-        |_| {},
+        async |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -280,7 +280,7 @@ pub async fn write_skew() {
         },
         &server_addr,
         server_group,
-        |_| {},
+        async |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -379,7 +379,7 @@ pub async fn server_isolation() {
         },
         server_address_1,
         server_1_group,
-        |_| {},
+        async |_| {},
     )
     .await;
     let client1 = Arc::new(
@@ -407,7 +407,7 @@ pub async fn server_isolation() {
         },
         server_address_2,
         server_2_group,
-        |_| {},
+        async |_| {},
     )
     .await;
     let client2 = Arc::new(

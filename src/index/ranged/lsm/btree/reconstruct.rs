@@ -214,7 +214,7 @@ mod test {
             },
             &server_addr,
             &server_group,
-            |_| {},
+            async |_| {},
         )
         .await;
         let client = Arc::new(

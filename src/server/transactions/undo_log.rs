@@ -1664,7 +1664,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -1735,7 +1735,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -1787,7 +1787,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -1874,7 +1874,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -1922,7 +1922,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -2001,7 +2001,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -2047,7 +2047,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
@@ -2110,7 +2110,7 @@ mod tests {
             },
             &server_addr,
             "test",
-            |_| {},
+            async |_| {},
         )
         .await;
 
