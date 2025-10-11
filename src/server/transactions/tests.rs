@@ -25,6 +25,7 @@ pub async fn workspace_wr() {
         },
         &server_addr,
         "test",
+        |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -166,6 +167,7 @@ pub async fn data_site_wr() {
         },
         &server_addr,
         "test",
+        |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -264,6 +266,7 @@ pub async fn multi_transaction() {
         },
         &server_addr,
         "test",
+        |_| {},
     )
     .await;
     let schema = Schema::new_with_id(
@@ -373,6 +376,7 @@ pub async fn smoke_rw() {
         },
         &server_addr,
         "test",
+        |_| {},
     )
     .await;
     let schema = Schema::new_with_id(

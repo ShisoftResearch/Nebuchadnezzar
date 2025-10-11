@@ -1664,6 +1664,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -1734,6 +1735,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -1785,6 +1787,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -1871,6 +1874,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -1918,6 +1922,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -1996,6 +2001,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -2041,6 +2047,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 
@@ -2103,6 +2110,7 @@ mod tests {
             },
             &server_addr,
             "test",
+            |_| {},
         )
         .await;
 

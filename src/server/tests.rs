@@ -49,6 +49,7 @@ pub async fn init() {
         },
         &String::from("127.0.0.1:5100"),
         &String::from("test"),
+        |_| {},
     )
     .await;
 }
@@ -77,6 +78,7 @@ pub async fn smoke_test() {
         },
         &server_addr,
         &server_group,
+        |_| {},
     )
     .await;
     let schema_id = 123;
@@ -156,6 +158,7 @@ pub async fn smoke_test_parallel() {
         },
         &server_addr,
         &server_group,
+        |_| {},
     )
     .await;
     let schema_id = 123;
@@ -254,6 +257,7 @@ pub async fn txn() {
         },
         &server_addr,
         &server_group,
+        |_| {},
     )
     .await;
     let schema_id = 123;
@@ -324,6 +328,7 @@ pub async fn schema_wal_recovery_test() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         
@@ -420,6 +425,7 @@ pub async fn schema_wal_recovery_test() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         
@@ -496,6 +502,7 @@ pub async fn schema_snapshot_recovery_test() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         
@@ -605,6 +612,7 @@ pub async fn schema_snapshot_recovery_test() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         
@@ -700,6 +708,7 @@ pub async fn schema_persistence_multiple_restarts() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         
@@ -769,6 +778,7 @@ pub async fn schema_persistence_multiple_restarts() {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         

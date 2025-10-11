@@ -350,6 +350,7 @@ mod test {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
@@ -573,6 +574,7 @@ mod test {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
         // Require schema to be scannable to insert special scan key to the range indexer
@@ -652,6 +654,7 @@ mod test {
             },
             &server_addr,
             &server_group,
+            |_| {},
         )
         .await;
 

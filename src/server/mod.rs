@@ -263,20 +263,22 @@ impl NebServer {
         Ok(server)
     }
 
-    pub async fn new_from_opts<'a>(
+    pub async fn new_from_opts<'a, F: FnOnce(&raft::RaftService)>(
         opts: &ServerOptions,
         server_addr: &'a str,
         group_name: &'a str,
+        prepare_raft_service: F,
     ) -> Arc<NebServer> {
-        Self::new_cluster_from_opts(opts, server_addr, &vec![server_addr.to_owned()], group_name)
+        Self::new_cluster_from_opts(opts, server_addr, &vec![server_addr.to_owned()], group_name, prepare_raft_service)
             .await
     }
 
-    pub async fn new_cluster_from_opts<'a>(
+    pub async fn new_cluster_from_opts<'a, F: FnOnce(&raft::RaftService)>(
         opts: &ServerOptions,
         server_addr: &'a str,
         meta_servers: &Vec<String>,
         group_name: &'a str,
+        prepare_raft_service: F,
     ) -> Arc<NebServer> {
         debug!("Creating key-value server from options");
         let group_name = &String::from(group_name);
@@ -325,6 +327,9 @@ impl NebServer {
         // Register Membership service BEFORE Raft start for WAL replay
         debug!("Registering Membership service before Raft start");
         Membership::new(&rpc_server, &raft_service).await;
+
+        debug!("Preparing raft service");
+        prepare_raft_service(&raft_service);
         
         debug!("RPC server created, starting Raft service (will replay WAL to registered SMs)");
         raft::RaftService::start(&raft_service, true).await;

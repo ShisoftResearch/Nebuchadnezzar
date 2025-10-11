@@ -43,6 +43,7 @@ mod tests {
             },
             &server_addr,
             server_group,
+            |_| {},
         )
         .await;
         let client = Arc::new(
