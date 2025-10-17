@@ -16,28 +16,74 @@ LinkedHashMap<K, V>
                     └─> Node<K> has next/prev pointers forming a circular linked list
 ```
 
-### The Problem
+### The Problem: Circular Arc References During Drop
 
-1. When `LinkedHashMap` is dropped, `PtrHashMap::drop` is called
-2. `PtrHashMap::drop` iterates through its internal buckets and drops each `(V, NodePtr<K>)` pair
-3. When `NodePtr<K>` is dropped, it drops the `Arc<SpinLock<Node<K>>>`
-4. The `Node<K>` structure contains pointers to other nodes in a circular doubly-linked list
-5. During `Arc::drop`, the reference count is decremented using `atomic_sub`
-6. However, due to the circular structure, some `Arc` objects may have already been freed
-7. This causes **heap-use-after-free** when trying to access the atomic reference counter
+The `LinkedHashMap` maintains a doubly-linked list of nodes using `Arc` smart pointers:
+
+```
+Node1 ←→ Node2 ←→ Node3 ←→ Node4 (circular)
+  ↑                           ↓
+  └──────────────────────────┘
+```
+
+Each node is wrapped in `Arc<SpinLock<Node<K>>>`, and each node has pointers to `next` and `prev` nodes.
+
+**What happens during drop:**
+
+1. `LinkedHashMap::drop` is called
+2. `PtrHashMap::drop` iterates through buckets and drops each `(V, NodePtr<K>)` pair
+3. Let's say it drops `NodePtr` for Node2 first:
+   - `Arc<SpinLock<Node2>>::drop` is called
+   - Reference count reaches 0, memory is **freed**
+4. Later, it tries to drop `NodePtr` for Node1:
+   - Node1 internally holds a reference to Node2 (as `next` pointer)
+   - When dropping Node1's `Arc`, it tries to access Node2's Arc
+   - But Node2's memory was already freed! ❌
+   - **heap-use-after-free** when trying to call `atomic_sub` on the freed Arc counter
+
+### Why This Happens
+
+The `LinkedHashMap` doesn't properly unlink the circular references before dropping the `Arc` pointers. A correct implementation would need to:
+
+1. First, break all the circular links (set `next`/`prev` to `None`)
+2. Then, drop the `Arc` pointers
+
+But the current implementation drops everything at once, causing the circular Arcs to access each other's freed memory.
+
+## Understanding the "Drop Invoked Twice" Message
+
+The AddressSanitizer output shows two drop locations at "L35" (line 35):
+
+1. **First occurrence**: `neb::ram::cleaner::tests::full_clean_cycle::{{closure}}` at line 35:26
+   - This is the test **closure** that wraps the entire test function
+   - The test framework creates this closure when running the test
+
+2. **Second occurrence**: `neb::ram::cleaner::tests::full_clean_cycle` at line 214:1
+   - This is the **end of the function** where `chunks` goes out of scope
+   - Line 214 is the closing brace `}` of the function
+
+**These are NOT actually two separate drops!** They represent the same drop operation viewed at different stack frame levels:
+- The outer closure frame (created by the test framework)
+- The inner function frame (where the actual drop happens)
+
+The real issue is that within this single drop operation, the `LinkedHashMap` internal cleanup causes circular Arc references to access each other's freed memory.
 
 ## AddressSanitizer Output
 
 ```
-==ERROR: AddressSanitizer: heap-use-after-free on address 0x... at pc 0x...
+==ERROR: AddressSanitizer: heap-use-after-free on address 0x79d8827e3150
 WRITE of size 8 at 0x... thread T1
-    #0 in core::sync::atomic::atomic_sub
+    #0 in core::sync::atomic::atomic_sub         ← Trying to decrement Arc counter
     #1 in core::sync::atomic::AtomicUsize::fetch_sub
-    #2 in alloc::sync::Arc<T>::drop
-    #3 in lightning::linked_map::NodePtr::drop
+    #2 in alloc::sync::Arc<T>::drop               ← Arc::drop for ALREADY FREED Arc
+    #3 in lightning::linked_map::NodePtr::drop    ← Dropping NodePtr that references freed node
     #4 in lightning::map::ptr_map::PtrHashMap::drop
     #5 in lightning::linked_map::LinkedHashMap::drop
 ```
+
+The stack trace shows:
+1. **Freed by thread T1 here**: When first `NodePtr` is dropped, it frees an `Arc<SpinLock<Node>>`
+2. **WRITE error occurs**: When second `NodePtr` tries to drop, it accesses the already-freed Arc's atomic counter
 
 ## Affected Code
 
@@ -126,4 +172,5 @@ This prevents the `LinkedHashMap` destructor from running, avoiding the bug.
 - Lightning crate: https://github.com/shisoft/Lightning
 - LinkedHashMap source: https://github.com/shisoft/Lightning/blob/master/src/linked_map.rs
 - AddressSanitizer documentation: https://github.com/google/sanitizers/wiki/AddressSanitizer
+
 
