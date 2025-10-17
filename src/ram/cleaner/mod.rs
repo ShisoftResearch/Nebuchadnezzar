@@ -15,6 +15,7 @@ mod tests;
 pub struct Cleaner {
     chunks: Arc<Chunks>,
     stopped: Arc<AtomicBool>,
+    _handle: Option<std::thread::JoinHandle<()>>,
 }
 
 // The two-level cleaner
@@ -22,10 +23,6 @@ impl Cleaner {
     pub fn new_and_start(chunks: Arc<Chunks>) -> Cleaner {
         debug!("Starting cleaner for {} chunks", chunks.list.len());
         let stop_tag = Arc::new(AtomicBool::new(false));
-        let cleaner = Cleaner {
-            chunks: chunks.clone(),
-            stopped: stop_tag.clone(),
-        };
         let stop_tag_ref_clone = stop_tag.clone();
         let checks_ref_clone = chunks.clone();
         let sleep_interval_ms = env::var("NEB_CLEANER_SLEEP_INTERVAL_MS")
@@ -33,7 +30,7 @@ impl Cleaner {
             .parse::<u64>()
             .unwrap();
         // Put follwing procedures in separate threads for real-time scheduling
-        thread::Builder::new()
+        let handle = thread::Builder::new()
             .name("Cleaner main".into())
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
@@ -45,6 +42,12 @@ impl Cleaner {
                 warn!("Cleaner main thread stopped");
             })
             .unwrap();
+        
+        let cleaner = Cleaner {
+            chunks: chunks.clone(),
+            stopped: stop_tag.clone(),
+            _handle: Some(handle),
+        };
         return cleaner;
     }
     pub fn clean(chunk: &Chunk, full: bool) {
@@ -122,5 +125,21 @@ impl Cleaner {
         debug!("Archiving segments");
         chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
+    }
+    
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Cleaner {
+    fn drop(&mut self) {
+        // Signal the cleaner thread to stop
+        self.stopped.store(true, Ordering::Relaxed);
+        
+        // Wait for the thread to finish
+        if let Some(handle) = self._handle.take() {
+            let _ = handle.join();
+        }
     }
 }
