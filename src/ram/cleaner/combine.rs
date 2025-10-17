@@ -226,7 +226,11 @@ impl CombinedCleaner {
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();
-                    cells.into_par_iter().for_each(|(new, old, hash, ver)| {
+                    // Sort cells by hash to ensure consistent lock ordering across parallel threads
+                    // This prevents deadlocks when multiple threads acquire locks in different orders
+                    let mut sorted_cells = cells;
+                    sorted_cells.sort_by_key(|(_, _, hash, _)| *hash);
+                    sorted_cells.into_par_iter().for_each(|(new, old, hash, ver)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         let index = chunk.cell_index.lock(hash as usize);
                         if let Some(mut actual_addr) = index {
@@ -244,7 +248,7 @@ impl CombinedCleaner {
                                 {
                                     let (current_header, _) = cell::header_from_chunk_raw(*actual_addr).unwrap();
                                     assert!(
-                                        current_header.version > ver, 
+                                        current_header.version > ver,
                                         "Cell {} with address {} changed to {} but version running backwards {} -> {}",
                                         hash,
                                         old,
