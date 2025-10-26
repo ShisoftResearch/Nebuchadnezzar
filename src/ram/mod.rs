@@ -13,6 +13,7 @@ pub mod tombstone;
 pub mod types;
 
 pub mod clock;
+pub mod tiered;
 
 #[cfg(test)]
 pub mod tests;

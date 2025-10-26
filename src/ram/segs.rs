@@ -12,7 +12,7 @@ use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
@@ -38,6 +38,10 @@ pub struct Segment {
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
+    // Tiered memory fields
+    pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
+    pub reference_bit: AtomicBool, // For CLOCK eviction algorithm
+    pub promoting: AtomicBool,      // True when promotion is in progress
 }
 
 impl Segment {
@@ -87,6 +91,9 @@ impl Segment {
             dropped: AtomicBool::new(false),
             wal_file,
             wal_file_name,
+            cold_file_fd: AtomicI32::new(-1),  // Start as hot
+            reference_bit: AtomicBool::new(false),
+            promoting: AtomicBool::new(false),
         }
     }
 
@@ -184,6 +191,12 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
+        // Skip archiving if segment is already cold (already backed by file)
+        if self.is_cold() {
+            debug!("Skipping archive for already-cold segment {}", self.id);
+            return Ok(false);
+        }
+        
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
@@ -280,6 +293,38 @@ impl Segment {
                 warn!("cannot find segment backup to dispense {}", backup_storage)
             }
         }
+    }
+    
+    // Tiered memory helper methods
+    
+    /// Check if segment is hot (in anonymous memory)
+    #[inline]
+    pub fn is_hot(&self) -> bool {
+        self.cold_file_fd.load(Ordering::Relaxed) == -1
+    }
+    
+    /// Check if segment is cold (backed by file mmap)
+    #[inline]
+    pub fn is_cold(&self) -> bool {
+        self.cold_file_fd.load(Ordering::Relaxed) >= 0
+    }
+    
+    /// Mark segment as recently accessed (for CLOCK algorithm)
+    #[inline]
+    pub fn mark_referenced(&self) {
+        self.reference_bit.store(true, Ordering::Relaxed);
+    }
+    
+    /// Clear reference bit and return old value (for CLOCK algorithm)
+    #[inline]
+    pub fn clear_reference_bit(&self) -> bool {
+        self.reference_bit.swap(false, Ordering::Relaxed)
+    }
+    
+    /// Get current reference bit value without clearing
+    #[inline]
+    pub fn get_reference_bit(&self) -> bool {
+        self.reference_bit.load(Ordering::Relaxed)
     }
 }
 

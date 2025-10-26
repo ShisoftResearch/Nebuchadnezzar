@@ -58,6 +58,8 @@ pub struct Chunk {
     /// Maps segment_id to count of incomplete transactions that have cells in this segment
     /// Used to prevent cleaner from cleaning segments that contain undo data
     pub protected_segments: PtrHashMap<u64, usize>,
+    /// Tiered memory manager for eviction/promotion
+    pub tiered_manager: Option<crate::ram::tiered::manager::TieredMemoryManager>,
 }
 
 impl Chunk {
@@ -68,6 +70,8 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        enable_tiered_memory: bool,
+        tiered_memory_threshold: Option<f32>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(id, size);
         let bootstrap_segment = allocator
@@ -84,6 +88,14 @@ impl Chunk {
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = LinkedHashMap::with_capacity(upper_power_of_2(num_segs));
         let index = WordMap::with_capacity(64);
+        // Create tiered memory manager if enabled
+        let tiered_manager = if enable_tiered_memory {
+            let threshold = tiered_memory_threshold.unwrap_or(0.8);
+            Some(crate::ram::tiered::manager::TieredMemoryManager::new(threshold))
+        } else {
+            None
+        };
+        
         let chunk = Chunk {
             id,
             segs,
@@ -100,6 +112,7 @@ impl Chunk {
             alloc_lock: Mutex::new(()), // TODO: optimize this
             statistics: ChunkStatistics::new(),
             protected_segments: PtrHashMap::with_capacity(64),
+            tiered_manager,
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -183,6 +196,43 @@ impl Chunk {
                     warn!("Cannot find cell with hash {} for index is zero", hash);
                     return Err(ReadError::CellDoesNotExisted);
                 }
+                
+                // Tiered memory: Check if segment is cold or being promoted
+                let cell_addr = *index;
+                let seg_id = self.allocator.id_by_addr(cell_addr);
+                if let Some(segment) = self.segs.get(&seg_id) {
+                    // Check if segment is being promoted by another thread
+                    if segment.promoting.load(std::sync::atomic::Ordering::Acquire) {
+                        // Drop lock and wait for promotion to complete
+                        drop(index);
+                        while segment.promoting.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::yield_now();
+                        }
+                        // Retry the read after promotion completes
+                        return self.location_for_read(hash);
+                    }
+                    
+                    // Check if segment is cold and needs promotion
+                    if segment.is_cold() {
+                        // Drop the cell lock before promotion
+                        drop(index);
+                        
+                        // Promote segment to hot storage
+                        if let Some(ref tiered_manager) = self.tiered_manager {
+                            if let Err(e) = tiered_manager.promote(&segment, self) {
+                                error!("Failed to promote segment {}: {}", segment.id, e);
+                                return Err(ReadError::CellDoesNotExisted);
+                            }
+                        }
+                        
+                        // Retry the read after promotion
+                        return self.location_for_read(hash);
+                    }
+                    
+                    // Mark segment as referenced for CLOCK algorithm
+                    segment.mark_referenced();
+                }
+                
                 return Ok(index);
             }
             None => {
@@ -624,6 +674,7 @@ impl Chunk {
                 seg.id != head_seg_id 
                 && seg.no_references()
                 && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -645,6 +696,7 @@ impl Chunk {
                 && head_seg_id != seg.id 
                 && seg.no_references()
                 && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
@@ -841,6 +893,26 @@ impl Chunks {
         wal_storage: Option<String>,
         enable_recovery: bool,
     ) -> Arc<Chunks> {
+        // Read tiered memory configuration from environment variables
+        let enable_tiered_memory = std::env::var("NEB_TIERED_MEMORY_ENABLED")
+            .map(|v| v == "1" || v.to_lowercase() == "true")
+            .unwrap_or(false);
+        
+        let tiered_memory_threshold = if enable_tiered_memory {
+            std::env::var("NEB_TIERED_MEMORY_THRESHOLD")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+        } else {
+            None
+        };
+        
+        if enable_tiered_memory {
+            info!(
+                "Tiered memory enabled with threshold: {}",
+                tiered_memory_threshold.unwrap_or(0.8)
+            );
+        }
+        
         let chunk_size = size / count;
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
@@ -859,6 +931,8 @@ impl Chunks {
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
+                enable_tiered_memory,
+                tiered_memory_threshold,
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -895,6 +969,7 @@ impl Chunks {
         chunks_arc
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
+        // Dummy doesn't use tiered memory or recovery
         Chunks::new(
             count,
             size,
