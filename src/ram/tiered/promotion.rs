@@ -69,13 +69,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         if entry_meta.entry_header.entry_type == EntryType::CELL {
             let cell_header = cell_header_from_entry_content_addr(entry_meta.body_pos);
             let hash = cell_header.hash as usize;
-            
-            // Verify this cell is still in the index and points to this segment
-            if let Some(addr) = chunk.cell_index.get_from_mutex(&hash) {
-                if addr == entry_meta.entry_pos {
-                    cell_hashes.push(hash);
-                }
-            }
+            cell_hashes.push(hash);
         }
     }
     
@@ -96,9 +90,12 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
                     // Successfully locked this cell
                     locks.push(lock);
                 }
-                Some(None) | None => {
+                Some(None) => {
                     // Couldn't lock (busy or doesn't exist), try again in next iteration
                     still_unlocked.push(idx);
+                }
+                None => {
+                    error!("Cell {} not found in chunk {} index during promotion", hash, chunk.id);
                 }
             }
         }
