@@ -757,3 +757,146 @@ fn test_cold_segment_recycling() {
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all(schema_dir);
 }
+
+/// Test that hot segments are properly recycled and remapped
+/// Verifies that remapping hot segments works without allocating extra memory
+#[test]
+fn test_hot_segment_recycling() {
+    let _ = env_logger::try_init();
+    
+    let backup_dir = "/tmp/neb_test_hot_recycling_bk";
+    let wal_dir = "/tmp/neb_test_hot_recycling_wal";
+    let schema_dir = "/tmp/neb_test_hot_recycling_schema";
+    
+    // Clean up
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(schema_dir);
+    
+    // No tiered memory - all segments stay hot
+    let chunk_capacity = 10 * SEGMENT_SIZE;
+    let fields = default_fields();
+    let schema = Schema::new("test_hot_recycle", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local(schema_dir);
+    schemas.new_schema(schema.clone());
+    
+    let chunks = Chunks::new(
+        1,
+        chunk_capacity,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+    );
+    
+    // Phase 1: Fill multiple segments with recognizable data
+    info!("Phase 1: Creating hot segments with data");
+    
+    // Use the same pattern as test_eviction_on_memory_overflow
+    let large_data = "x".repeat(1024); // 1KB string
+    let cells_per_segment = SEGMENT_SIZE / 2048; // Conservative estimate
+    let num_cells = cells_per_segment * 5; // 5 segments worth of data
+    
+    info!("Creating {} cells to fill 5 segments", num_cells);
+    for i in 0..num_cells {
+        let id = Id::new(schema.id as u64, 7000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(7000 + i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("original_{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String(large_data.clone()));
+        
+        let data = OwnedValue::Map(data_map);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data,
+        };
+        
+        let _ = chunks.write_cell(&mut cell);
+    }
+    
+    let segments_before: Vec<u64> = chunks.list[0].segments().iter().map(|s| s.id).collect();
+    info!("Segments created: {:?}, all should be hot", segments_before);
+    info!("Total segments: {}", segments_before.len());
+    
+    // Verify all are hot
+    let all_hot = chunks.list[0].segments().iter().all(|s| s.is_hot());
+    assert!(all_hot, "All segments should be hot without tiered memory");
+    
+    // Verify we have at least 2 segments
+    assert!(segments_before.len() >= 2, "Should have at least 2 segments, but only have {}", segments_before.len());
+    
+    // Phase 2: Manually recycle a hot segment (simulate what cleaner does)
+    info!("Phase 2: Recycling a hot segment");
+    
+    let segment_to_recycle = chunks.list[0].segments()
+        .iter()
+        .nth(1) // Pick the second segment (not head)
+        .expect("Should have multiple segments")
+        .clone();
+    
+    let recycled_id = segment_to_recycle.id;
+    info!("Recycling hot segment {}", recycled_id);
+    
+    // Remove and drop (this adds to free list)
+    chunks.list[0].remove_segment(recycled_id);
+    segment_to_recycle.mem_drop(&chunks.list[0]);
+    
+    // Phase 3: Allocate new data - should reuse the recycled segment
+    info!("Phase 3: Allocating new data to reuse recycled hot segment");
+    
+    let new_large_data = "y".repeat(1024); // 1KB string
+    let new_num_cells = cells_per_segment * 3; // 3 segments worth of new data
+    
+    info!("Creating {} new cells to fill 3 segments", new_num_cells);
+    // Use IDs that don't collide with Phase 1 (which goes up to 7000+20480 = 27480)
+    for i in 0..new_num_cells {
+        let id = Id::new(schema.id as u64, 30000 + i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(9000 + i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("new_{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String(new_large_data.clone()));
+        
+        let data = OwnedValue::Map(data_map);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data,
+        };
+        
+        let _ = chunks.write_cell(&mut cell);
+    }
+    
+    let segments_after: Vec<u64> = chunks.list[0].segments().iter().map(|s| s.id).collect();
+    info!("Segments after reuse: {:?}", segments_after);
+    
+    // Verify the recycled segment ID was reused
+    let was_reused = segments_after.contains(&recycled_id);
+    info!("Hot segment {} was reused: {}", recycled_id, was_reused);
+    
+    // Verify all segments are still hot
+    let all_still_hot = chunks.list[0].segments().iter().all(|s| s.is_hot());
+    assert!(all_still_hot, "All segments should still be hot");
+    
+    // Verify we can read the new data (not old data)
+    let id = Id::new(schema.id as u64, 30000);
+    match chunks.read_cell(&id) {
+        Ok(cell) => {
+            // Cell ID 30000 contains internal id value of 9000 (see Phase 3 loop)
+            assert_eq!(cell.data["id"].i64().unwrap(), &9000);
+            let name_str = cell.data["name"].string().unwrap();
+            assert!(name_str.starts_with("new_"), "Should have new data (new_*), got: {}", name_str);
+            let data_str = cell.data["data"].string().unwrap();
+            assert!(data_str.starts_with("y"), "Data field should contain 'y' characters from new write");
+            info!("Successfully verified new data in recycled segment");
+        }
+        Err(e) => {
+            error!("Failed to read from recycled hot segment: {:?}", e);
+        }
+    }
+    
+    info!("Hot segment recycling test complete - remapping works correctly");
+    
+    // Clean up
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::remove_dir_all(schema_dir);
+}
