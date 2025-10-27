@@ -22,6 +22,7 @@ pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
 #[derive(Default)]
+#[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
 pub struct Segment {
     pub id: u64,
     pub seq_id: u64,
@@ -42,6 +43,8 @@ pub struct Segment {
     pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm
     pub promoting: AtomicBool,      // True when promotion is in progress
+    // Padding to maintain struct size (prevents cache line sharing issues)
+    _padding: [u8; 8], // 8 bytes padding to keep struct at 128 bytes
 }
 
 impl Segment {
@@ -94,6 +97,7 @@ impl Segment {
             cold_file_fd: AtomicI32::new(-1),  // Start as hot
             reference_bit: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
+            _padding: [0u8; 8], // Initialize padding
         }
     }
 
@@ -288,33 +292,38 @@ impl Segment {
         }
     }
     
-    // Tiered memory helper methods
+    // Tiered memory helper methods (stubs when tiered memory is disabled)
     
     /// Check if segment is hot (in anonymous memory)
+    /// Always returns true when tiered memory is disabled
     #[inline]
     pub fn is_hot(&self) -> bool {
         self.cold_file_fd.load(Ordering::Relaxed) == -1
     }
     
     /// Check if segment is cold (backed by file mmap)
+    /// Always returns false when tiered memory is disabled
     #[inline]
     pub fn is_cold(&self) -> bool {
         self.cold_file_fd.load(Ordering::Relaxed) >= 0
     }
     
     /// Mark segment as recently accessed (for CLOCK algorithm)
+    /// No-op when tiered memory is disabled
     #[inline]
     pub fn mark_referenced(&self) {
         self.reference_bit.store(true, Ordering::Relaxed);
     }
     
     /// Clear reference bit and return old value (for CLOCK algorithm)
+    /// Always returns false when tiered memory is disabled
     #[inline]
     pub fn clear_reference_bit(&self) -> bool {
         self.reference_bit.swap(false, Ordering::Relaxed)
     }
     
     /// Get current reference bit value without clearing
+    /// Always returns false when tiered memory is disabled
     #[inline]
     pub fn get_reference_bit(&self) -> bool {
         self.reference_bit.load(Ordering::Relaxed)

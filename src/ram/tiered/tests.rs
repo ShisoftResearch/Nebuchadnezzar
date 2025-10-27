@@ -759,7 +759,7 @@ fn test_cold_segment_recycling() {
         chunks.list[0].remove_segment(seg_to_recycle.id);
         
         // This should unmap the file-backed memory, remap as anonymous, and add to free list
-        seg_to_recycle.recycle(&chunks.list[0]);
+        seg_to_recycle.mem_drop(&chunks.list[0]);
         
         info!("Successfully recycled cold segment {}", cold_segment_id);
     }
@@ -888,7 +888,7 @@ fn test_hot_segment_recycling() {
     
     // Remove and drop (this adds to free list)
     chunks.list[0].remove_segment(recycled_id);
-    segment_to_recycle.recycle(&chunks.list[0]);
+    segment_to_recycle.mem_drop(&chunks.list[0]);
     
     // Phase 3: Allocate new data - should reuse the recycled segment
     info!("Phase 3: Allocating new data to reuse recycled hot segment");
