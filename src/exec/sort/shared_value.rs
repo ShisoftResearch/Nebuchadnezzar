@@ -5,7 +5,7 @@ use dovahkiin::{
 
 use crate::exec::{
     funcs::reducer::PartitioningKeyValuePair,
-    partitioner::{self, range, Partitioner},
+    partitioner::Partitioner,
     query::{
         env::Environment,
         partitioning::{get_hash_partitioner, Partitioning},

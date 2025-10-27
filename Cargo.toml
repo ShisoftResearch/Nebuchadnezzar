@@ -20,7 +20,8 @@ lightning-containers = { git = "ssh://git@192.168.10.134/shisoft-x/Lightning.git
 rayon = "*"
 serde = "*"
 serde_derive = "*"
-bincode = "*"
+bincode = "2"
+bincode_derive = "2"
 byteorder = "*"
 parking_lot = "*"
 rand = { version = "*", features = ["small_rng"] }

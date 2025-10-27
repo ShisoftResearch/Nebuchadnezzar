@@ -1,6 +1,6 @@
-use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell, ReadError, SharedCell, WriteError};
+use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell};
 use crate::ram::chunk::Chunks;
-use crate::ram::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
+use crate::ram::entry::Entry;
 use crate::ram::io::reader;
 use crate::ram::types::Id;
 use bifrost::vector_clock::StandardVectorClock;
@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 

@@ -4,7 +4,7 @@ use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// Manages tiered memory for a chunk
 /// 

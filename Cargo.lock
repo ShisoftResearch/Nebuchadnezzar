@@ -850,6 +850,7 @@ dependencies = [
  "bifrost_plugins",
  "bifrost_proc_macro",
  "bincode",
+ "bincode_derive",
  "bitflags",
  "byteorder",
  "core_affinity",

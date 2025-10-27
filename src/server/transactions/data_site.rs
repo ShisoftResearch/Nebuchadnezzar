@@ -178,7 +178,7 @@ impl DataManager {
             }))
         })
     }
-    fn response_with<T: Send>(&self, data: T) -> BoxFuture<DataSiteResponse<T>>
+    fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
         T: 'static,
     {
@@ -321,7 +321,7 @@ impl DataManager {
         clock: &StandardVectorClock,
         tid: &TxnId,
         id: &Id,
-    ) -> Result<(), BoxFuture<DataSiteResponse<TxnExecResult<T, ReadError>>>>
+    ) -> Result<(), BoxFuture<'_, DataSiteResponse<TxnExecResult<T, ReadError>>>>
     where
         T: 'static + Clone,
     {
@@ -364,7 +364,7 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             r
         } else {
@@ -381,7 +381,7 @@ impl Service for DataManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
@@ -397,7 +397,7 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
@@ -415,7 +415,7 @@ impl Service for DataManager {
         id: Id,
         offset: usize,
         len: usize,
-    ) -> BoxFuture<DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
+    ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
         if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
             return r;
         }
@@ -430,7 +430,7 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         cell_ids: Vec<Id>,
-    ) -> BoxFuture<DataSiteResponse<DMPrepareResult>> {
+    ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
         // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
         // It will also check if write are realizable. If not, transaction manager should retry with new id
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
@@ -484,7 +484,7 @@ impl Service for DataManager {
         clock: StandardVectorClock,
         tid: TxnId,
         cells: Vec<CommitOp>,
-    ) -> BoxFuture<DataSiteResponse<DMCommitResult>> {
+    ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         self.update_clock(&clock);
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
@@ -756,7 +756,7 @@ impl Service for DataManager {
         &self,
         clock: StandardVectorClock,
         tid: TxnId,
-    ) -> BoxFuture<DataSiteResponse<AbortResult>> {
+    ) -> BoxFuture<'_, DataSiteResponse<AbortResult>> {
         debug!(">> ABORT {:?}", tid);
         self.update_clock(&clock);
         let txn_lock = self.get_transaction(&tid);
@@ -794,7 +794,7 @@ impl Service for DataManager {
         &self,
         clock: StandardVectorClock,
         tid: TxnId,
-    ) -> BoxFuture<DataSiteResponse<EndResult>> {
+    ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         self.update_clock(&clock);
         let wake_up_futures = FuturesUnordered::new();

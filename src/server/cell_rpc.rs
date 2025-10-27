@@ -9,9 +9,8 @@ use crate::{
 use bifrost::rpc::*;
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::expr::symbols::utils::is_true;
-use dovahkiin::expr::SExpr;
 use dovahkiin::integrated::lisp;
-use dovahkiin::types::{OwnedValue, SharedValue};
+use dovahkiin::types::OwnedValue;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 
@@ -42,10 +41,10 @@ pub struct NebRPCService {
 }
 
 impl Service for NebRPCService {
-    fn read_cell(&self, key: Id) -> BoxFuture<Result<OwnedCell, ReadError>> {
+    fn read_cell(&self, key: Id) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         future::ready(self.server.chunks.read_cell(&key).map(|c| c.to_owned())).boxed()
     }
-    fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
+    fn read_all_cells(&self, keys: &Vec<Id>) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
                 .map(|id| self.server.chunks.read_cell(&id).map(|c| c.to_owned()))
@@ -58,7 +57,7 @@ impl Service for NebRPCService {
         keys: &Vec<Id>,
         colums: &Vec<u64>,
         need_header: bool,
-    ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
+    ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         future::ready(
             keys.into_iter()
                 .map(|id| {
@@ -76,7 +75,7 @@ impl Service for NebRPCService {
         id: Id,
         fields: &Vec<u64>,
         need_header: bool,
-    ) -> BoxFuture<Result<OwnedCell, ReadError>> {
+    ) -> BoxFuture<'_, Result<OwnedCell, ReadError>> {
         future::ready(
             self.server
                 .chunks
@@ -85,20 +84,20 @@ impl Service for NebRPCService {
         )
         .boxed()
     }
-    fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn write_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.write_cell(&mut cell))
     }
 
-    fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn update_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.update_cell(&mut cell))
     }
-    fn remove_cell(&self, key: Id) -> BoxFuture<Result<(), WriteError>> {
+    fn remove_cell(&self, key: Id) -> BoxFuture<'_, Result<(), WriteError>> {
         self.with_indices_ensured(self.server.chunks.remove_cell(&key))
     }
-    fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<Result<CellHeader, WriteError>> {
+    fn upsert_cell(&self, mut cell: OwnedCell) -> BoxFuture<'_, Result<CellHeader, WriteError>> {
         self.with_indices_ensured(self.server.chunks.upsert_cell(&mut cell))
     }
-    fn count(&self) -> BoxFuture<u64> {
+    fn count(&self) -> BoxFuture<'_, u64> {
         future::ready(self.server.chunks.count() as u64).boxed()
     }
 
@@ -108,7 +107,7 @@ impl Service for NebRPCService {
         colums: &Vec<u64>,
         filter: &Expr,
         proc: &Expr,
-    ) -> BoxFuture<Vec<Result<OwnedCell, ReadError>>> {
+    ) -> BoxFuture<'_, Vec<Result<OwnedCell, ReadError>>> {
         let filter_empty = filter.is_empty();
         let proc_empty = proc.is_empty();
         let mut cells = if colums.is_empty() {
@@ -234,7 +233,7 @@ impl NebRPCService {
             server: server.clone(),
         })
     }
-    fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<R>
+    fn with_indices_ensured<'a, R>(&'a self, res: R) -> BoxFuture<'a, R>
     where
         R: Send + 'a,
     {

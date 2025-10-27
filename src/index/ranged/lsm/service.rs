@@ -105,7 +105,7 @@ pub struct LSMTreeService {
 }
 
 impl Service for LSMTreeService {
-    fn crate_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<()> {
+    fn crate_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<'_, ()> {
         async move {
             if self.trees.contains_key(&id) {
                 return;
@@ -119,7 +119,7 @@ impl Service for LSMTreeService {
         .boxed()
     }
 
-    fn load_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<()> {
+    fn load_tree(&self, id: Id, boundary: Boundary, epoch: u64) -> BoxFuture<'_, ()> {
         async move {
             if self.trees.contains_key(&id) {
                 debug!("Tree loaded, skip {:?}", id);
@@ -140,7 +140,7 @@ impl Service for LSMTreeService {
         .boxed()
     }
 
-    fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
+    fn insert(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, &entry, epoch, |entry, tree| {
             if tree.insert(&entry) {
                 OpResult::Successful(true)
@@ -150,7 +150,7 @@ impl Service for LSMTreeService {
         })
     }
 
-    fn delete(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<OpResult<bool>> {
+    fn delete(&self, id: Id, entry: EntryKey, epoch: u64) -> BoxFuture<'_, OpResult<bool>> {
         self.apply_in_ranged_tree(id, &entry, epoch, |entry, tree| {
             if tree.delete(&entry) {
                 OpResult::Successful(true)
@@ -167,7 +167,7 @@ impl Service for LSMTreeService {
         pattern: &Option<Vec<u8>>,
         buffer_size: u16,
         epoch: u64,
-    ) -> BoxFuture<OpResult<ServBlock>> {
+    ) -> BoxFuture<'_, OpResult<ServBlock>> {
         let entry = range.key();
         let ordering = range.ordering;
         self.apply_in_ranged_tree(id, entry, epoch, |entry, tree| {
@@ -272,7 +272,7 @@ impl Service for LSMTreeService {
         })
     }
 
-    fn stat(&self, id: Id) -> BoxFuture<OpResult<LSMTreeStat>> {
+    fn stat(&self, id: Id) -> BoxFuture<'_, OpResult<LSMTreeStat>> {
         future::ready(if let Some(tree) = self.trees.get(&id) {
             OpResult::Successful(LSMTreeStat {
                 id,
@@ -399,7 +399,7 @@ impl LSMTreeService {
         entry: &EntryKey,
         epoch: u64,
         func: F,
-    ) -> BoxFuture<OpResult<R>>
+    ) -> BoxFuture<'_, OpResult<R>>
     where
         F: Fn(&EntryKey, &LSMTree) -> OpResult<R>,
         R: Send + 'static,

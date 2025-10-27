@@ -83,7 +83,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -113,7 +113,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<CellHeader, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
@@ -143,7 +143,7 @@ impl Service for TransactionManager {
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
-    ) -> BoxFuture<Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<OwnedCell, ReadError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let txn = txn_mutex.lock().await;
@@ -201,7 +201,7 @@ impl Service for TransactionManager {
         .boxed()
     }
 
-    fn prepare(&self, tid: TxnId) -> BoxFuture<Result<TMPrepareResult, TMError>> {
+    fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
             let conclusion = {
                 let txn_mutex = self.get_transaction(&tid)?;
@@ -236,7 +236,7 @@ impl Service for TransactionManager {
         }
         .boxed()
     }
-    fn commit(&self, tid: TxnId) -> BoxFuture<Result<EndResult, TMError>> {
+    fn commit(&self, tid: TxnId) -> BoxFuture<'_, Result<EndResult, TMError>> {
         async move {
             let result = {
                 let txn_lock = self.get_transaction(&tid)?;
@@ -251,7 +251,7 @@ impl Service for TransactionManager {
         }
         .boxed()
     }
-    fn abort(&self, tid: TxnId) -> BoxFuture<Result<AbortResult, TMError>> {
+    fn abort(&self, tid: TxnId) -> BoxFuture<'_, Result<AbortResult, TMError>> {
         debug!("TXN ABORT IN MGR {:?}", &tid);
         async move {
             let result = {
@@ -271,7 +271,7 @@ impl Service for TransactionManager {
         }
         .boxed()
     }
-    fn begin(&self) -> BoxFuture<Result<TxnId, TMError>> {
+    fn begin(&self) -> BoxFuture<'_, Result<TxnId, TMError>> {
         let id = self.server.txn_peer.clock.inc();
         if self
             .transactions
@@ -296,7 +296,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         cell: OwnedCell,
-    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -336,7 +336,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         cell: OwnedCell,
-    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_mutex = self.get_transaction(&tid)?;
             let mut txn = txn_mutex.lock().await;
@@ -372,7 +372,7 @@ impl Service for TransactionManager {
         &self,
         tid: TxnId,
         id: Id,
-    ) -> BoxFuture<Result<TxnExecResult<(), WriteError>, TMError>> {
+    ) -> BoxFuture<'_, Result<TxnExecResult<(), WriteError>, TMError>> {
         async move {
             let txn_lock = self.get_transaction(&tid)?;
             let mut txn = txn_lock.lock().await;
@@ -415,7 +415,7 @@ impl Service for TransactionManager {
         }
         .boxed()
     }
-    fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<()> {
+    fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<'_, ()> {
         debug!(
             "=> TM WAKE UP TXN from {} for {} txn",
             server_id,

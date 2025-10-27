@@ -192,7 +192,7 @@ impl Chunk {
         }
     }
 
-    pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
+    pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard<'_>, ReadError> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -224,7 +224,7 @@ impl Chunk {
         }
     }
 
-    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
+    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard<'_>> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -241,7 +241,7 @@ impl Chunk {
         header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 
-    fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
+    fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
@@ -250,7 +250,7 @@ impl Chunk {
         hash: u64,
         fields: &[u64],
         need_header: bool,
-    ) -> Result<SharedCell, ReadError> {
+    ) -> Result<SharedCell<'_>, ReadError> {
         let loc = self.location_for_read(hash)?;
         let (val, hdr) = select_from_chunk_raw(*loc, self, fields, need_header)?;
         Ok(SharedCell::compose(
@@ -973,7 +973,7 @@ impl Chunks {
     fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
         return (self.locate_chunk_by_partition(key.higher), key.lower);
     }
-    pub fn read_cell(&self, key: &Id) -> Result<SharedCell, ReadError> {
+    pub fn read_cell(&self, key: &Id) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
@@ -982,7 +982,7 @@ impl Chunks {
         key: &Id,
         fields: &[u64],
         need_header: bool,
-    ) -> Result<SharedCell, ReadError> {
+    ) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields, need_header);
     }
@@ -999,7 +999,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
-    pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard, ReadError> {
+    pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }

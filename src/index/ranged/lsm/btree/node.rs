@@ -335,7 +335,7 @@ pub trait AnyNode: Any + Send + Sync + 'static {
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
-    ) -> BoxFuture<()>;
+    ) -> BoxFuture<'_, ()>;
     unsafe fn take_all_refs(&self) -> Vec<NodeCellRef>;
 }
 
@@ -624,7 +624,7 @@ where
         node_ref: &NodeCellRef,
         deletion: &DeletionSet,
         neb: &Arc<crate::client::AsyncClient>,
-    ) -> BoxFuture<()> {
+    ) -> BoxFuture<'_, ()> {
         let guard = write_node::<KS, PS>(node_ref);
         let guard_ref = &*guard;
         let cell = match guard_ref {

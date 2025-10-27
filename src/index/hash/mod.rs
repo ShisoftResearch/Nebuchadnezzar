@@ -1,5 +1,5 @@
 use crate::client::transaction::TxnError;
-use crate::ram::cell::{CellHeader, ReadError, WriteError};
+use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::schema::{Field, Schema};
 use crate::ram::types::*;
 use crate::{client::AsyncClient, ram::cell::OwnedCell};
