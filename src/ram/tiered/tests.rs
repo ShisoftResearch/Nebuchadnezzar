@@ -520,15 +520,20 @@ fn test_recovery_loads_segments_as_cold() {
             Some(wal_dir.to_string()),
         );
         
-        // Write enough data to create 5 segments
-        // Use larger cells to fill segments faster
-        let num_cells = (SEGMENT_SIZE / 4096) * 6; // ~6 segments worth with 4KB cells
+        // Write enough data to create at least 5 segments
+        // Use the same pattern as working tests: 1KB cells, conservative estimate
+        let large_data = "x".repeat(1024);
+        let cells_per_segment = SEGMENT_SIZE / 2048;
+        let num_cells = cells_per_segment * 10; // 10 segments worth to ensure we get at least 5
+        
+        info!("Writing {} cells to create 5+ segments", num_cells);
+        
         for i in 0..num_cells {
             let id = Id::new(schema.id as u64, 5000 + i as u64);
             let mut data_map = OwnedMap::new();
             data_map.insert(&String::from("id"), OwnedValue::I64(5000 + i as i64));
             data_map.insert(&String::from("name"), OwnedValue::String(format!("cold_recovery_{}", i)));
-            data_map.insert(&String::from("data"), OwnedValue::String("x".repeat(3000))); // ~3KB of data
+            data_map.insert(&String::from("data"), OwnedValue::String(large_data.clone()));
             
             let data = OwnedValue::Map(data_map);
             let mut cell = OwnedCell {
@@ -539,7 +544,8 @@ fn test_recovery_loads_segments_as_cold() {
             let _ = chunks.write_cell(&mut cell);
         }
         
-        info!("Wrote {} cells to {} segments", num_cells, chunks.list[0].segs.len());
+        let segments_created = chunks.list[0].segs.len();
+        info!("Wrote {} cells creating {} segments", num_cells, segments_created);
         
         // Archive all segments
         for chunk in &chunks.list {
@@ -658,13 +664,17 @@ fn test_cold_segment_recycling() {
     
     // Phase 1: Fill multiple segments with data and trigger eviction
     info!("Phase 1: Creating 3+ segments and evicting to cold");
-    let large_data = "x".repeat(3000); // 3KB cells
-    let cells_per_segment = SEGMENT_SIZE / 4096;
+    let large_data = "x".repeat(1024); // 1KB cells (matching working tests)
+    let cells_per_segment = SEGMENT_SIZE / 2048; // Conservative estimate
+    let num_cells = cells_per_segment * 5; // 5 segments worth (more than 1-segment limit)
     
-    for i in 0..(cells_per_segment * 4) {
+    info!("Filling with {} cells to create 5 segments (limit is 1 segment)", num_cells);
+    
+    for i in 0..num_cells {
         let id = Id::new(schema.id as u64, 6000 + i as u64);
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(6000 + i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("test_{}", i)));
         data_map.insert(&String::from("data"), OwnedValue::String(large_data.clone()));
         
         let data = OwnedValue::Map(data_map);
@@ -675,11 +685,19 @@ fn test_cold_segment_recycling() {
         
         let _ = chunks.write_cell(&mut cell);
         
-        // Trigger eviction
-        if i % 100 == 0 && i > 0 {
+        // Trigger eviction more frequently
+        if i > 0 && i % (cells_per_segment / 2) == 0 {
             for chunk in &chunks.list {
                 if let Some(ref manager) = chunk.tiered_manager {
-                    let _ = manager.check_and_evict(chunk);
+                    match manager.check_and_evict(chunk) {
+                        Ok(evicted) if evicted > 0 => {
+                            info!("Evicted {} segments at cell {}", evicted, i);
+                        }
+                        Err(e) => {
+                            warn!("Eviction check failed: {:?}", e);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
