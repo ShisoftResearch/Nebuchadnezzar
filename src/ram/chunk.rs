@@ -72,6 +72,7 @@ impl Chunk {
         wal_storage: Option<String>,
         enable_tiered_memory: bool,
         tiered_memory_threshold: Option<f32>,
+        tiered_physical_memory_limit: Option<usize>,
     ) -> Chunk {
         let allocator = SegmentAllocator::new(id, size);
         let bootstrap_segment = allocator
@@ -91,7 +92,10 @@ impl Chunk {
         // Create tiered memory manager if enabled
         let tiered_manager = if enable_tiered_memory {
             let threshold = tiered_memory_threshold.unwrap_or(0.8);
-            Some(crate::ram::tiered::manager::TieredMemoryManager::new(threshold))
+            Some(crate::ram::tiered::manager::TieredMemoryManager::new(
+                tiered_physical_memory_limit,
+                threshold,
+            ))
         } else {
             None
         };
@@ -906,10 +910,19 @@ impl Chunks {
             None
         };
         
+        let tiered_physical_memory_limit = if enable_tiered_memory {
+            std::env::var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+        } else {
+            None
+        };
+        
         if enable_tiered_memory {
             info!(
-                "Tiered memory enabled with threshold: {}",
-                tiered_memory_threshold.unwrap_or(0.8)
+                "Tiered memory enabled with threshold: {}, physical memory limit: {} bytes",
+                tiered_memory_threshold.unwrap_or(0.8),
+                tiered_physical_memory_limit.map(|l| format!("{}", l)).unwrap_or("None (use chunk capacity)".to_string())
             );
         }
         
@@ -933,6 +946,7 @@ impl Chunks {
                 wal_storage,
                 enable_tiered_memory,
                 tiered_memory_threshold,
+                tiered_physical_memory_limit,
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
