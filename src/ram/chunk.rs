@@ -201,49 +201,10 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 
-                // Tiered memory: Check if segment is cold or being promoted
+                // Tiered memory: Mark segment as referenced for CLOCK algorithm
                 let cell_addr = *index;
                 let seg_id = self.allocator.id_by_addr(cell_addr);
                 if let Some(segment) = self.segs.get(&seg_id) {
-                    // Check if segment is being promoted by another thread
-                    if segment.promoting.load(std::sync::atomic::Ordering::Acquire) {
-                        // Drop lock and wait for promotion to complete
-                        drop(index);
-                        while segment.promoting.load(std::sync::atomic::Ordering::Acquire) {
-                            std::thread::yield_now();
-                        }
-                        // Retry the read after promotion completes
-                        return self.location_for_read(hash);
-                    }
-                    
-                    // Check if segment is cold and needs promotion
-                    if segment.is_cold() {
-                        // Check if promotion is disabled (e.g., for benchmarking)
-                        let should_promote = self.tiered_manager
-                            .as_ref()
-                            .map(|tm| !tm.disable_promotion.load(std::sync::atomic::Ordering::Relaxed))
-                            .unwrap_or(false);
-                        
-                        if should_promote {
-                            // Drop the cell lock before promotion
-                            drop(index);
-                            
-                            // Promote segment to hot storage
-                            if let Some(ref tiered_manager) = self.tiered_manager {
-                                if let Err(e) = tiered_manager.promote(&segment, self) {
-                                    error!("Failed to promote segment {}: {}", segment.id, e);
-                                    return Err(ReadError::CellDoesNotExisted);
-                                }
-                            }
-                            
-                            // Retry the read after promotion
-                            return self.location_for_read(hash);
-                        }
-                        // If promotion is disabled, continue with cold read
-                        // (segment stays as mmap'd file)
-                    }
-                    
-                    // Mark segment as referenced for CLOCK algorithm
                     segment.mark_referenced();
                 }
                 

@@ -92,7 +92,18 @@ impl Cleaner {
                     .sum::<usize>();
             }
         }
-
+        
+        // Handle tiered memory operations in cleaner thread to avoid race conditions
+        if let Some(ref tiered_manager) = chunk.tiered_manager {
+            // Check for memory pressure and evict if needed
+            if let Err(e) = tiered_manager.check_and_evict(chunk) {
+                error!("Tiered memory eviction failed in cleaner: {:?}", e);
+            }
+            
+            // Promote cold segments that have been referenced
+            Self::handle_promotion_requests(chunk, tiered_manager);
+        }
+        
         {
             debug!("Starting combine {}", chunk.id);
             let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
@@ -125,6 +136,41 @@ impl Cleaner {
         debug!("Archiving segments");
         chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
+    }
+    
+    /// Handle promotion requests in the cleaner thread to avoid race conditions
+    /// 
+    /// This method scans for cold segments that have been referenced (accessed)
+    /// and promotes them to hot storage. This eliminates the race condition
+    /// where user threads would promote segments while cleaners are iterating.
+    fn handle_promotion_requests(
+        chunk: &Chunk, 
+        tiered_manager: &crate::ram::tiered::manager::TieredMemoryManager
+    ) {
+        // Skip if promotion is disabled (e.g., for benchmarking)
+        if tiered_manager.disable_promotion.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        
+        // Find cold segments that have been referenced (accessed)
+        let segments_to_promote: Vec<_> = chunk.segments()
+            .iter()
+            .filter(|seg| seg.is_cold() && seg.get_reference_bit())
+            .cloned()
+            .collect();
+
+        if !segments_to_promote.is_empty() {
+            debug!(
+                "Cleaner promoting {} cold segments in chunk {}",
+                segments_to_promote.len(),
+                chunk.id
+            );
+            for segment in segments_to_promote {
+                if let Err(e) = tiered_manager.promote(&segment, chunk) {
+                    error!("Tiered memory promotion failed in cleaner: {:?}", e);
+                }
+            }
+        }
     }
     
     pub fn stop(&self) {
