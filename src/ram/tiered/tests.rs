@@ -58,13 +58,13 @@ fn test_eviction_on_memory_overflow() {
     let has_tiered_manager = chunks.list.iter().any(|c| c.tiered_manager.is_some());
     assert!(has_tiered_manager, "Tiered memory manager should be enabled");
     
-    // Fill with enough data to exceed the physical memory limit
+    // Fill with enough data to exceed the physical memory limit (3 segments = 24MB)
     // Each cell will be ~1KB (plus overhead), so we need multiple segments worth
     let large_data = "x".repeat(1024); // 1KB string
     let cells_per_segment = SEGMENT_SIZE / 2048; // Conservative estimate
-    let num_cells = cells_per_segment * 5; // 5 segments worth of data
+    let num_cells = cells_per_segment * 6; // 6 segments worth to ensure we exceed 3-segment limit
     
-    info!("Filling with {} cells to trigger eviction", num_cells);
+    info!("Filling with {} cells to exceed 3-segment limit", num_cells);
     
     for i in 0..num_cells {
         let id = Id::new(schema.id as u64, i as u64);
@@ -101,6 +101,22 @@ fn test_eviction_on_memory_overflow() {
             Err(e) => {
                 warn!("Write failed at cell {} (may be expected if virtual capacity full): {:?}", i, e);
                 break;
+            }
+        }
+    }
+    
+    // Final eviction check to ensure memory limit is respected
+    info!("Final eviction check");
+    for chunk in &chunks.list {
+        if let Some(ref manager) = chunk.tiered_manager {
+            match manager.check_and_evict(chunk) {
+                Ok(evicted) if evicted > 0 => {
+                    info!("Final eviction: evicted {} segments", evicted);
+                }
+                Err(e) => {
+                    error!("Final eviction failed: {:?}", e);
+                }
+                _ => {}
             }
         }
     }
