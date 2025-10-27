@@ -276,7 +276,39 @@ impl Segment {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_ok()
         {
+            // If this is a cold segment, unmap the file-backed memory and close fd
+            // DON'T remap as anonymous here - that would use physical memory!
+            // The address will be remapped when it's reused in alloc_seg
+            if self.is_cold() {
+                debug!("Freeing cold segment {} for recycling", self.id);
+                
+                let fd = self.cold_file_fd.load(Ordering::Acquire);
+                
+                // Unmap the file-backed memory
+                // This frees the virtual address space without using physical memory
+                unsafe {
+                    let result = munmap(self.addr as *mut c_void, SEGMENT_SIZE);
+                    if result != 0 {
+                        error!("Failed to unmap cold segment {} for recycling: {}", 
+                              self.id, io::Error::last_os_error());
+                    } else {
+                        debug!("Unmapped cold segment {} at address {:#x}", self.id, self.addr);
+                    }
+                }
+                
+                // Close the file descriptor
+                if fd >= 0 {
+                    unsafe {
+                        close(fd);
+                    }
+                    debug!("Closed file descriptor {} for recycled segment {}", fd, self.id);
+                }
+            }
+            
+            // Add address to free list for recycling
+            // The address is now unmapped and available for reuse
             chunk.allocator.free(self.addr);
+            debug!("Segment {} freed and ready for recycling", self.id);
         }
     }
 
@@ -330,20 +362,25 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        // Check if segment was already mem_dropped (recycled)
+        if self.dropped.load(Ordering::Acquire) {
+            // Already handled by mem_drop, nothing to do
+            return;
+        }
+        
         // Mark as dropped
         self.dropped.store(true, Ordering::Release);
         
         // Close cold segment file descriptor if it exists
-        // Note: We don't munmap here because segments are part of a larger
-        // contiguous memory allocation managed by SegmentAllocator.
-        // Unmapping individual segments would create holes in the chunk's memory.
-        // The OS will clean up all mappings when the process exits.
+        // Note: We don't munmap here because either:
+        // 1. Segment was recycled via mem_drop (already unmapped/remapped)
+        // 2. Segment is being dropped at process exit (OS will clean up)
         let fd = self.cold_file_fd.load(Ordering::Acquire);
         if fd >= 0 {
             unsafe {
                 close(fd);
             }
-            debug!("Closed file descriptor {} for cold segment {}", fd, self.id);
+            debug!("Closed file descriptor {} for cold segment {} at process exit", fd, self.id);
         }
     }
 }
@@ -429,6 +466,30 @@ impl SegmentAllocator {
     ) -> Option<Segment> {
         self.free
             .pop_front()
+            .map(|addr| {
+                // Address from free list might be unmapped (from recycled cold segment)
+                // Remap it as anonymous before using it
+                debug!("Reusing recycled segment address {:#x}, remapping as anonymous", addr);
+                unsafe {
+                    let new_addr = mmap(
+                        addr as *mut c_void,
+                        SEGMENT_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
+                        -1,
+                        0,
+                    );
+                    
+                    if new_addr == libc::MAP_FAILED {
+                        error!("Failed to remap recycled segment at {:#x}: {}", 
+                              addr, io::Error::last_os_error());
+                        // Skip this address, try next allocation
+                        return None;
+                    }
+                }
+                Some(addr)
+            })
+            .flatten()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer");
                 let addr = self.offset.load(Relaxed);
@@ -464,6 +525,29 @@ impl SegmentAllocator {
         // First allocate the address
         self.free
             .pop_front()
+            .map(|addr| {
+                // Address from free list might be unmapped (from recycled cold segment)
+                // Remap it as anonymous before using it
+                debug!("Reusing recycled segment address {:#x} for recovery, remapping as anonymous", addr);
+                unsafe {
+                    let new_addr = mmap(
+                        addr as *mut c_void,
+                        SEGMENT_SIZE,
+                        PROT_READ | PROT_WRITE,
+                        MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
+                        -1,
+                        0,
+                    );
+                    
+                    if new_addr == libc::MAP_FAILED {
+                        error!("Failed to remap recycled segment at {:#x} for recovery: {}", 
+                              addr, io::Error::last_os_error());
+                        return None;
+                    }
+                }
+                Some(addr)
+            })
+            .flatten()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer (recovery)");
                 let addr = self.offset.load(Relaxed);
