@@ -154,9 +154,8 @@ impl Cleaner {
         
         // Find cold segments that have been referenced (accessed)
         let segments_to_promote: Vec<_> = chunk.segments()
-            .iter()
+            .into_iter()
             .filter(|seg| seg.is_cold() && seg.get_reference_bit())
-            .cloned()
             .collect();
 
         if !segments_to_promote.is_empty() {
