@@ -3,6 +3,7 @@ use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
 use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
+use libc::{c_void, mmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -396,6 +397,10 @@ pub fn recover_chunks(
     eprintln!("[RECOVERY] Files to process: {}", files.len());
     let mut allocated_segments: Vec<(usize, Arc<Segment>)> = Vec::new();
     
+    // Track hot memory usage per chunk for tiered memory
+    // Strategy: Fill hot memory first, overflow to cold
+    let mut hot_memory_used: HashMap<usize, usize> = HashMap::new();
+    
     for file_info in &files {
         eprintln!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
             file_info.chunk_id, file_info.seg_id, file_info.seq_id, file_info.path.display());
@@ -461,18 +466,96 @@ pub fn recover_chunks(
             }
         };
         
-        // Copy file data to segment memory
-        unsafe {
-            let src_ptr = file_data.as_ptr();
-            let dst_ptr = segment.addr as *mut u8;
-            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
-        }
+        // Check if we should recover this segment as cold
+        // Strategy: Fill hot memory first, then overflow to cold
+        // Recover as cold if:
+        // 1. Tiered memory is enabled with physical memory limit
+        // 2. This is a backup file (not WAL)
+        // 3. Hot memory for this chunk would exceed limit
+        let should_recover_as_cold = if let Some(ref tiered_manager) = chunk.tiered_manager {
+            if let Some(physical_limit) = tiered_manager.physical_memory_limit {
+                let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
+                let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
+                
+                let recover_as_cold = file_info.is_backup && would_exceed_limit;
+                
+                debug!(
+                    "Recovery decision for segment {}: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
+                    segment.id,
+                    chunk_hot_used / (1024 * 1024),
+                    physical_limit / (1024 * 1024),
+                    would_exceed_limit,
+                    recover_as_cold
+                );
+                
+                recover_as_cold
+            } else {
+                false // No physical limit, recover all as hot
+            }
+        } else {
+            false // Tiered memory not enabled
+        };
         
-        debug!(
-            "Copied {} bytes to segment memory at address {:#x}",
-            file_data.len(),
-            segment.addr
-        );
+        if should_recover_as_cold {
+            info!(
+                "Recovering segment {} as COLD (tiered memory enabled)",
+                segment.id
+            );
+            
+            // mmap the backup file directly instead of copying to memory
+            let c_path = std::ffi::CString::new(file_info.path.to_str().unwrap()).unwrap();
+            let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
+            
+            if fd < 0 {
+                error!("Failed to open backup file for cold recovery: {:?}", io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
+            }
+            
+            // Use MAP_FIXED to replace the anonymous mapping with file-backed
+            let mmap_addr = unsafe {
+                mmap(
+                    segment.addr as *mut c_void,
+                    SEGMENT_SIZE,
+                    PROT_READ,
+                    MAP_PRIVATE | MAP_FIXED,
+                    fd,
+                    0,
+                )
+            };
+            
+            if mmap_addr == libc::MAP_FAILED {
+                unsafe { libc::close(fd); }
+                error!("Failed to mmap backup file for cold recovery: {:?}", io::Error::last_os_error());
+                return Err(io::Error::last_os_error());
+            }
+            
+            // Mark segment as cold
+            segment.cold_file_fd.store(fd, Ordering::Release);
+            segment.archived.store(true, Ordering::Release); // Already archived (it's the backup file!)
+            
+            info!(
+                "Recovered segment {} as COLD from {} (saved {} bytes of hot memory)",
+                segment.id,
+                file_info.path.display(),
+                file_data.len()
+            );
+        } else {
+            // Traditional hot recovery - copy data to memory
+            unsafe {
+                let src_ptr = file_data.as_ptr();
+                let dst_ptr = segment.addr as *mut u8;
+                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
+            }
+            
+            debug!(
+                "Copied {} bytes to segment memory at address {:#x} (HOT recovery)",
+                file_data.len(),
+                segment.addr
+            );
+            
+            // Update hot memory tracking
+            *hot_memory_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
+        }
         
         // Set append_header based on actual data
         let append_header = find_append_header(segment.addr, file_data.len());
