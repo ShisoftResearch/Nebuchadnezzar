@@ -512,7 +512,7 @@ fn test_recovery_loads_segments_as_cold() {
     let _ = std::fs::remove_dir_all(schema_dir);
     
     // Configure tiered memory with limit of 2 segments (16MB)
-    // We'll create 5 segments, so 3 should be recovered as cold
+    // We'll create 7+ segments, so at least 3 should be recovered as cold (2 hot + 1 head = 3 hot max)
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
     std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.8");
     std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", 2 * SEGMENT_SIZE)); // Only 2 segments fit in hot
@@ -540,9 +540,9 @@ fn test_recovery_loads_segments_as_cold() {
         // Use the same pattern as working tests: 1KB cells, conservative estimate
         let large_data = "x".repeat(1024);
         let cells_per_segment = SEGMENT_SIZE / 2048;
-        let num_cells = cells_per_segment * 12; // 12 segments worth to ensure we get at least 6
+        let num_cells = cells_per_segment * 15; // 15 segments worth to ensure we get at least 7
         
-        info!("Writing {} cells to create 6+ segments", num_cells);
+        info!("Writing {} cells to create 7+ segments", num_cells);
         
         for i in 0..num_cells {
             let id = Id::new(schema.id as u64, 5000 + i as u64);

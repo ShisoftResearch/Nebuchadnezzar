@@ -1,4 +1,6 @@
 use crate::ram::chunk::Chunk;
+use crate::ram::cell::cell_header_from_entry_content_addr;
+use crate::ram::entry::EntryType;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use libc::{c_void, close, mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use std::io;
@@ -8,27 +10,25 @@ use std::thread;
 
 /// Promote a cold segment to hot (anonymous memory)
 /// 
-/// **CRITICAL**: This function uses atomic state to serialize promotions and prevent 
+/// **CRITICAL**: This function locks ALL cells in the segment during promotion to prevent 
 /// concurrent access during the "empty window" created by MAP_FIXED remapping.
 /// 
-/// Why protection is required:
+/// Why cell locking is required:
 /// - MAP_FIXED with MAP_ANONYMOUS creates a new zero-filled anonymous mapping
 /// - Between the mmap call and memcpy completion, the segment contains zeros
-/// - The promoting flag prevents concurrent promotions and signals readers to wait
-/// - location_for_read() checks is_cold() OR promoting and blocks/waits
+/// - All cells in the segment must be locked to prevent reads during this window
 /// 
 /// Process:
-/// 1. Set promoting flag (serializes promotions, signals readers)
-/// 2. Wait for active references to drain
+/// 1. Scan segment to find all cells (like the cleaner does)
+/// 2. Lock all cells iteratively using try_lock (retry those that fail)
 /// 3. Copy data to temp buffer (while file is still mapped)
-/// 4. Remap as anonymous with MAP_FIXED (creates empty window - protected by promoting flag!)
+/// 4. Remap as anonymous with MAP_FIXED (creates empty window - cells are locked!)
 /// 5. Copy data back to anonymous mapping (fills empty window)
 /// 6. Close file descriptor and mark as hot
-/// 7. Clear promoting flag (allow reads again)
+/// 7. Unlock all cells
 ///
-/// Note: Individual cell locking was considered but WordMap doesn't expose iteration.
-/// This approach is simpler and equally safe - the promoting flag prevents all access.
-pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error> {
+/// The iterative locking ensures we eventually lock all cells without deadlock.
+pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     // Sanity check: don't promote if already hot
     if segment.is_hot() {
         warn!("Attempted to promote already-hot segment {}", segment.id);
@@ -61,17 +61,62 @@ pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Erro
     
     debug!("Promoting segment {} to hot storage", segment.id);
     
-    let segment_start = segment.addr;
+    // Step 1: Scan segment to collect all cell hashes (like the cleaner does)
+    debug!("Scanning segment {} to find all cells", segment.id);
+    let mut cell_hashes: Vec<usize> = Vec::new();
     
-    // Step 1: Wait for all active references to drain
-    // This ensures no one is actively dereferencing pointers into this segment
-    debug!("Waiting for active references to drain for segment {}", segment.id);
-    while !segment.no_references() {
-        thread::yield_now();
+    for entry_meta in segment.entry_iter() {
+        if entry_meta.entry_header.entry_type == EntryType::CELL {
+            let cell_header = cell_header_from_entry_content_addr(entry_meta.body_pos);
+            let hash = cell_header.hash as usize;
+            
+            // Verify this cell is still in the index and points to this segment
+            if let Some(addr) = chunk.cell_index.get_from_mutex(&hash) {
+                if addr == entry_meta.entry_pos {
+                    cell_hashes.push(hash);
+                }
+            }
+        }
     }
     
-    // Step 2: Copy data to temp buffer BEFORE unmapping
-    // The file is still mapped at this point, so reads are safe
+    debug!("Found {} cells in segment {} to lock", cell_hashes.len(), segment.id);
+    
+    // Step 2: Lock all cells iteratively using try_lock
+    // Keep trying to lock cells that couldn't be locked until all are locked
+    let mut locks: Vec<lightning::map::WordMutexGuard> = Vec::with_capacity(cell_hashes.len());
+    let mut unlocked_indices: Vec<usize> = (0..cell_hashes.len()).collect();
+    
+    while !unlocked_indices.is_empty() {
+        let mut still_unlocked = Vec::new();
+        
+        for &idx in &unlocked_indices {
+            let hash = cell_hashes[idx];
+            match chunk.cell_index.try_lock(hash) {
+                Some(Some(lock)) => {
+                    // Successfully locked this cell
+                    locks.push(lock);
+                }
+                Some(None) | None => {
+                    // Couldn't lock (busy or doesn't exist), try again in next iteration
+                    still_unlocked.push(idx);
+                }
+            }
+        }
+        
+        unlocked_indices = still_unlocked;
+        
+        if !unlocked_indices.is_empty() {
+            // Some cells still locked by others, yield and retry
+            thread::yield_now();
+        }
+    }
+    
+    debug!("Successfully locked all {} cells in segment {}", locks.len(), segment.id);
+    
+    let segment_start = segment.addr;
+    
+    // Step 3: Copy data to temp buffer BEFORE unmapping
+    // All cells are now locked, safe to copy
     debug!("Copying segment {} data to temp buffer", segment.id);
     let mut data = vec![0u8; SEGMENT_SIZE];
     unsafe {
@@ -82,12 +127,12 @@ pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Erro
         );
     }
     
-    // Step 3: Remap as anonymous with MAP_FIXED
+    // Step 4: Remap as anonymous with MAP_FIXED
     // ⚠️ CRITICAL SECTION: This creates an "empty window"
-    // The segment now points to zeros until step 4 completes
-    // The promoting flag prevents concurrent access during this window
+    // The segment now points to zeros until step 5 completes
+    // All cells are locked so no concurrent reads can happen
     debug!(
-        "Remapping segment {} as anonymous (empty window protected by promoting flag)",
+        "Remapping segment {} as anonymous (empty window protected by cell locks)",
         segment.id
     );
     let result = unsafe {
@@ -102,8 +147,9 @@ pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Erro
     };
     
     if result == libc::MAP_FAILED {
-        // Failed to remap - clear promoting flag and return error
+        // Failed to remap - clear promoting flag and drop locks
         segment.promoting.store(false, Ordering::Release);
+        drop(locks);
         return Err(io::Error::last_os_error());
     }
     
@@ -114,13 +160,14 @@ pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Erro
             segment_start, result as usize
         );
         segment.promoting.store(false, Ordering::Release);
+        drop(locks);
         return Err(io::Error::new(
             io::ErrorKind::Other,
             "MAP_FIXED returned unexpected address during promotion",
         ));
     }
     
-    // Step 4: Copy data back to new anonymous mapping
+    // Step 5: Copy data back to new anonymous mapping
     // This fills the empty window - segment now contains correct data again
     debug!("Copying data back to segment {} anonymous mapping", segment.id);
     unsafe {
@@ -131,17 +178,21 @@ pub fn promote_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Erro
         );
     }
     
-    // Step 5: Close file descriptor and mark segment as hot
+    // Step 6: Close file descriptor and mark segment as hot
     let fd = segment.cold_file_fd.load(Ordering::Acquire);
     if fd >= 0 {
         unsafe { close(fd) };
     }
     segment.cold_file_fd.store(-1, Ordering::Release);
     
-    // Step 6: Clear promoting flag - segment is now hot and accessible
+    // Step 7: Clear promoting flag
     segment.promoting.store(false, Ordering::Release);
     
-    info!("Successfully promoted segment {} to hot storage", segment.id);
+    // Step 8: Drop all locks - cells are now accessible again
+    drop(locks);
+    
+    info!("Successfully promoted segment {} to hot storage (locked {} cells during promotion)", 
+          segment.id, cell_hashes.len());
     
     Ok(())
 }
