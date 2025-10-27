@@ -329,45 +329,34 @@ impl RecoveryConfig {
     }
 }
 
-/// Main recovery coordinator
-pub fn recover_chunks(
-    config: &RecoveryConfig,
+/// Phase 1: Discover segment files
+fn phase1_discover_files(
     backup_storage: &Option<String>,
     wal_storage: &Option<String>,
-    chunks: &[Chunk],
-) -> io::Result<()> {
-    info!("Starting recovery from storage directories");
-    
-    // Phase 1: Discover and sort files
+) -> io::Result<Vec<SegmentFileInfo>> {
     info!("Phase 1: Discovering segment files...");
     let files = discover_segment_files(backup_storage, wal_storage)?;
     
     if files.is_empty() {
         info!("No segment files found, starting fresh");
         eprintln!("[RECOVERY] No segment files found, starting fresh");
-        return Ok(());
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "No segment files found",
+        ));
     }
     
     info!("Discovered {} segment files", files.len());
     eprintln!("[RECOVERY] Discovered {} segment files", files.len());
     
-    // Check if configuration can fit all segments
-    let can_fit = config.can_fit(&files);
-    if !can_fit {
-        error!(
-            "Recovery configuration mismatch: {} chunks x {} bytes cannot fit all segments",
-            config.num_chunks, config.chunk_size
-        );
-        error!("You may need to adjust chunk count or size, or manually migrate data");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Configuration cannot fit recovered segments",
-        ));
-    }
-    
-    // Phase 1.5: Pre-set next_seq_id for each chunk BEFORE allocating segments
+    Ok(files)
+}
+
+/// Phase 1.5: Set initial next_seq_id values for each chunk
+fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
     info!("Phase 1.5: Setting initial next_seq_id values...");
     eprintln!("[RECOVERY] Phase 1.5: Setting initial next_seq_id values...");
+    
     for chunk in chunks {
         // Find max seq_id for this chunk from discovered files
         let max_seq_id = files
@@ -390,18 +379,110 @@ pub fn recover_chunks(
         );
         eprintln!("[RECOVERY] Chunk {} initial next_seq_id set to {}", chunk.id, max_seq_id + 1);
     }
+}
+
+/// Check if we should recover this segment as cold based on tiered memory settings
+fn should_recover_as_cold(
+    chunk: &Chunk,
+    file_info: &SegmentFileInfo,
+    hot_memory_used: &HashMap<usize, usize>,
+) -> bool {
+    if let Some(ref tiered_manager) = chunk.tiered_manager {
+        if let Some(physical_limit) = tiered_manager.physical_memory_limit {
+            let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
+            let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
+            
+            let recover_as_cold = file_info.is_backup && would_exceed_limit;
+            
+            debug!(
+                "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
+                chunk_hot_used / (1024 * 1024),
+                physical_limit / (1024 * 1024),
+                would_exceed_limit,
+                recover_as_cold
+            );
+            
+            recover_as_cold
+        } else {
+            false // No physical limit, recover all as hot
+        }
+    } else {
+        false // Tiered memory not enabled
+    }
+}
+
+/// Recover a segment as cold by mmapping the backup file directly
+fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io::Result<()> {
+    info!("Recovering segment {} as COLD (tiered memory enabled)", segment.id);
     
-    // Phase 2: Allocate segments and load data
+    // mmap the backup file directly instead of copying to memory
+    let c_path = std::ffi::CString::new(file_info.path.to_str().unwrap()).unwrap();
+    let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
+    
+    if fd < 0 {
+        error!("Failed to open backup file for cold recovery: {:?}", io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
+    }
+    
+    // Use MAP_FIXED to replace the anonymous mapping with file-backed
+    let mmap_addr = unsafe {
+        mmap(
+            segment.addr as *mut c_void,
+            SEGMENT_SIZE,
+            PROT_READ,
+            MAP_PRIVATE | MAP_FIXED,
+            fd,
+            0,
+        )
+    };
+    
+    if mmap_addr == libc::MAP_FAILED {
+        unsafe { libc::close(fd); }
+        error!("Failed to mmap backup file for cold recovery: {:?}", io::Error::last_os_error());
+        return Err(io::Error::last_os_error());
+    }
+    
+    // Mark segment as cold
+    segment.cold_file_fd.store(fd, Ordering::Release);
+    segment.archived.store(true, Ordering::Release); // Already archived (it's the backup file!)
+    
+    info!(
+        "Recovered segment {} as COLD from {}",
+        segment.id,
+        file_info.path.display()
+    );
+    
+    Ok(())
+}
+
+/// Recover a segment as hot by copying file data to memory
+fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
+    // Traditional hot recovery - copy data to memory
+    unsafe {
+        let src_ptr = file_data.as_ptr();
+        let dst_ptr = segment.addr as *mut u8;
+        std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
+    }
+    
+    debug!(
+        "Copied {} bytes to segment memory at address {:#x} (HOT recovery)",
+        file_data.len(),
+        segment.addr
+    );
+}
+
+/// Phase 2: Allocate segments and load data
+fn phase2_allocate_and_load(
+    files: &[SegmentFileInfo],
+    chunks: &[Chunk],
+    allocated_segments: &mut Vec<(usize, Arc<Segment>)>,
+    hot_memory_used: &mut HashMap<usize, usize>,
+) -> io::Result<()> {
     info!("Phase 2: Allocating segments and loading data...");
     eprintln!("[RECOVERY] Phase 2: Allocating segments and loading data...");
     eprintln!("[RECOVERY] Files to process: {}", files.len());
-    let mut allocated_segments: Vec<(usize, Arc<Segment>)> = Vec::new();
     
-    // Track hot memory usage per chunk for tiered memory
-    // Strategy: Fill hot memory first, overflow to cold
-    let mut hot_memory_used: HashMap<usize, usize> = HashMap::new();
-    
-    for file_info in &files {
+    for file_info in files {
         eprintln!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
             file_info.chunk_id, file_info.seg_id, file_info.seq_id, file_info.path.display());
         
@@ -466,93 +547,13 @@ pub fn recover_chunks(
             }
         };
         
-        // Check if we should recover this segment as cold
-        // Strategy: Fill hot memory first, then overflow to cold
-        // Recover as cold if:
-        // 1. Tiered memory is enabled with physical memory limit
-        // 2. This is a backup file (not WAL)
-        // 3. Hot memory for this chunk would exceed limit
-        let should_recover_as_cold = if let Some(ref tiered_manager) = chunk.tiered_manager {
-            if let Some(physical_limit) = tiered_manager.physical_memory_limit {
-                let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
-                let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
-                
-                let recover_as_cold = file_info.is_backup && would_exceed_limit;
-                
-                debug!(
-                    "Recovery decision for segment {}: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
-                    segment.id,
-                    chunk_hot_used / (1024 * 1024),
-                    physical_limit / (1024 * 1024),
-                    would_exceed_limit,
-                    recover_as_cold
-                );
-                
-                recover_as_cold
-            } else {
-                false // No physical limit, recover all as hot
-            }
-        } else {
-            false // Tiered memory not enabled
-        };
+        // Determine if this segment should be recovered as cold
+        let should_recover_as_cold = should_recover_as_cold(chunk, file_info, hot_memory_used);
         
         if should_recover_as_cold {
-            info!(
-                "Recovering segment {} as COLD (tiered memory enabled)",
-                segment.id
-            );
-            
-            // mmap the backup file directly instead of copying to memory
-            let c_path = std::ffi::CString::new(file_info.path.to_str().unwrap()).unwrap();
-            let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
-            
-            if fd < 0 {
-                error!("Failed to open backup file for cold recovery: {:?}", io::Error::last_os_error());
-                return Err(io::Error::last_os_error());
-            }
-            
-            // Use MAP_FIXED to replace the anonymous mapping with file-backed
-            let mmap_addr = unsafe {
-                mmap(
-                    segment.addr as *mut c_void,
-                    SEGMENT_SIZE,
-                    PROT_READ,
-                    MAP_PRIVATE | MAP_FIXED,
-                    fd,
-                    0,
-                )
-            };
-            
-            if mmap_addr == libc::MAP_FAILED {
-                unsafe { libc::close(fd); }
-                error!("Failed to mmap backup file for cold recovery: {:?}", io::Error::last_os_error());
-                return Err(io::Error::last_os_error());
-            }
-            
-            // Mark segment as cold
-            segment.cold_file_fd.store(fd, Ordering::Release);
-            segment.archived.store(true, Ordering::Release); // Already archived (it's the backup file!)
-            
-            info!(
-                "Recovered segment {} as COLD from {} (saved {} bytes of hot memory)",
-                segment.id,
-                file_info.path.display(),
-                file_data.len()
-            );
+            recover_segment_as_cold(&segment, file_info)?;
         } else {
-            // Traditional hot recovery - copy data to memory
-            unsafe {
-                let src_ptr = file_data.as_ptr();
-                let dst_ptr = segment.addr as *mut u8;
-                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
-            }
-            
-            debug!(
-                "Copied {} bytes to segment memory at address {:#x} (HOT recovery)",
-                file_data.len(),
-                segment.addr
-            );
-            
+            recover_segment_as_hot(&segment, &file_data);
             // Update hot memory tracking
             *hot_memory_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
         }
@@ -582,13 +583,19 @@ pub fn recover_chunks(
         allocated_segments.push((file_info.chunk_id, Arc::new(segment)));
     }
     
-    // Phase 3: Rebuild cell indices
+    Ok(())
+}
+
+/// Phase 3: Rebuild cell indices from recovered segments
+fn phase3_rebuild_indices(
+    allocated_segments: &[(usize, Arc<Segment>)],
+    chunks: &[Chunk],
+    global_cell_index: &mut HashMap<u64, CellIndexEntry>,
+) -> u32 {
     info!("Phase 3: Rebuilding cell indices...");
-    let mut global_cell_index: HashMap<u64, CellIndexEntry> = HashMap::new();
-    let mut total_cells = 0;
     let mut total_tombstones = 0;
     
-    for (chunk_id, segment) in &allocated_segments {
+    for (chunk_id, segment) in allocated_segments {
         let chunk = &chunks[*chunk_id];
         
         debug!(
@@ -601,7 +608,7 @@ pub fn recover_chunks(
         
         // Rebuild index from this segment
         let (dead_space, tombstone_count) =
-            rebuild_cell_index_from_segment(chunk, segment, &mut global_cell_index);
+            rebuild_cell_index_from_segment(chunk, segment, global_cell_index);
         
         // Update segment metadata
         segment.dead_space.store(dead_space, Ordering::Release);
@@ -615,9 +622,20 @@ pub fn recover_chunks(
         );
     }
     
-    // Phase 4: Update chunk cell_index WordMaps
+    total_tombstones
+}
+
+/// Phase 4: Populate chunk cell indices
+fn phase4_populate_chunk_indices(
+    global_cell_index: &HashMap<u64, CellIndexEntry>,
+    config: &RecoveryConfig,
+    chunks: &[Chunk],
+) -> usize {
     info!("Phase 4: Populating chunk cell indices...");
     eprintln!("[RECOVERY] Phase 4: global_cell_index has {} entries", global_cell_index.len());
+    
+    let mut total_cells = 0;
+    
     for (hash, entry) in global_cell_index.iter() {
         // Find which chunk this cell belongs to using partition
         let chunk_id = (entry.partition as usize) % config.num_chunks;
@@ -634,16 +652,13 @@ pub fn recover_chunks(
         }
     }
     
-    info!(
-        "Recovery complete: {} cells, {} tombstones across {} segments",
-        total_cells,
-        total_tombstones,
-        allocated_segments.len()
-    );
-    
-    // Phase 5: Clean up old files
+    total_cells
+}
+
+/// Phase 5: Clean up old segment files
+fn phase5_cleanup_old_files(files: &[SegmentFileInfo]) {
     info!("Phase 5: Cleaning up old segment files...");
-    for file_info in &files {
+    for file_info in files {
         if let Err(e) = fs::remove_file(&file_info.path) {
             warn!(
                 "Failed to remove old file {}: {:?}",
@@ -654,6 +669,66 @@ pub fn recover_chunks(
             debug!("Removed old file {}", file_info.path.display());
         }
     }
+}
+
+/// Main recovery coordinator
+pub fn recover_chunks(
+    config: &RecoveryConfig,
+    backup_storage: &Option<String>,
+    wal_storage: &Option<String>,
+    chunks: &[Chunk],
+) -> io::Result<()> {
+    info!("Starting recovery from storage directories");
+    
+    // Phase 1: Discover files
+    let files = match phase1_discover_files(backup_storage, wal_storage) {
+        Ok(files) => files,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            info!("No segment files found, starting fresh");
+            return Ok(());
+        },
+        Err(e) => return Err(e),
+    };
+    
+    // Check if configuration can fit all segments
+    let can_fit = config.can_fit(&files);
+    if !can_fit {
+        error!(
+            "Recovery configuration mismatch: {} chunks x {} bytes cannot fit all segments",
+            config.num_chunks, config.chunk_size
+        );
+        error!("You may need to adjust chunk count or size, or manually migrate data");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Configuration cannot fit recovered segments",
+        ));
+    }
+    
+    // Phase 1.5: Pre-set next_seq_id for each chunk BEFORE allocating segments
+    phase1_5_set_initial_seq_ids(chunks, &files);
+    
+    // Phase 2: Allocate segments and load data
+    let mut allocated_segments: Vec<(usize, Arc<Segment>)> = Vec::new();
+    let mut hot_memory_used: HashMap<usize, usize> = HashMap::new();
+    
+    phase2_allocate_and_load(&files, chunks, &mut allocated_segments, &mut hot_memory_used)?;
+    
+    // Phase 3: Rebuild cell indices
+    let mut global_cell_index: HashMap<u64, CellIndexEntry> = HashMap::new();
+    let total_tombstones = phase3_rebuild_indices(&allocated_segments, chunks, &mut global_cell_index);
+    
+    // Phase 4: Update chunk cell_index WordMaps
+    let total_cells = phase4_populate_chunk_indices(&global_cell_index, config, chunks);
+    
+    info!(
+        "Recovery complete: {} cells, {} tombstones across {} segments",
+        total_cells,
+        total_tombstones,
+        allocated_segments.len()
+    );
+    
+    // Phase 5: Clean up old files
+    phase5_cleanup_old_files(&files);
     
     info!("Recovery completed successfully");
     Ok(())
