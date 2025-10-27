@@ -328,6 +328,26 @@ impl Segment {
     }
 }
 
+impl Drop for Segment {
+    fn drop(&mut self) {
+        // Mark as dropped
+        self.dropped.store(true, Ordering::Release);
+        
+        // Close cold segment file descriptor if it exists
+        // Note: We don't munmap here because segments are part of a larger
+        // contiguous memory allocation managed by SegmentAllocator.
+        // Unmapping individual segments would create holes in the chunk's memory.
+        // The OS will clean up all mappings when the process exits.
+        let fd = self.cold_file_fd.load(Ordering::Acquire);
+        if fd >= 0 {
+            unsafe {
+                close(fd);
+            }
+            debug!("Closed file descriptor {} for cold segment {}", fd, self.id);
+        }
+    }
+}
+
 pub struct SegmentEntryIter {
     bound: usize,
     cursor: usize,
