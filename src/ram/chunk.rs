@@ -218,19 +218,29 @@ impl Chunk {
                     
                     // Check if segment is cold and needs promotion
                     if segment.is_cold() {
-                        // Drop the cell lock before promotion
-                        drop(index);
+                        // Check if promotion is disabled (e.g., for benchmarking)
+                        let should_promote = self.tiered_manager
+                            .as_ref()
+                            .map(|tm| !tm.disable_promotion.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(false);
                         
-                        // Promote segment to hot storage
-                        if let Some(ref tiered_manager) = self.tiered_manager {
-                            if let Err(e) = tiered_manager.promote(&segment, self) {
-                                error!("Failed to promote segment {}: {}", segment.id, e);
-                                return Err(ReadError::CellDoesNotExisted);
+                        if should_promote {
+                            // Drop the cell lock before promotion
+                            drop(index);
+                            
+                            // Promote segment to hot storage
+                            if let Some(ref tiered_manager) = self.tiered_manager {
+                                if let Err(e) = tiered_manager.promote(&segment, self) {
+                                    error!("Failed to promote segment {}: {}", segment.id, e);
+                                    return Err(ReadError::CellDoesNotExisted);
+                                }
                             }
+                            
+                            // Retry the read after promotion
+                            return self.location_for_read(hash);
                         }
-                        
-                        // Retry the read after promotion
-                        return self.location_for_read(hash);
+                        // If promotion is disabled, continue with cold read
+                        // (segment stays as mmap'd file)
                     }
                     
                     // Mark segment as referenced for CLOCK algorithm

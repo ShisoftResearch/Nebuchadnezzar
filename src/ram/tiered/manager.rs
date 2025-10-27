@@ -4,6 +4,7 @@ use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Manages tiered memory for a chunk
 /// 
@@ -23,6 +24,10 @@ pub struct TieredMemoryManager {
     
     /// Whether tiered memory is enabled
     enabled: bool,
+    
+    /// Whether to disable promotion (for benchmarking cold reads)
+    /// When true, cold segments remain cold even when accessed
+    pub disable_promotion: AtomicBool,
 }
 
 impl TieredMemoryManager {
@@ -37,6 +42,7 @@ impl TieredMemoryManager {
             eviction_threshold_percent: eviction_threshold_percent.clamp(0.0, 1.0),
             clock_policy: ClockEvictionPolicy::new(),
             enabled: true,
+            disable_promotion: AtomicBool::new(false),
         }
     }
     

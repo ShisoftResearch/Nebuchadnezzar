@@ -189,7 +189,7 @@ fn bench_hot_segment_reads() {
     
     // Benchmark: Sequential reads
     let mut latencies = Vec::new();
-    let num_reads = 10000;
+    let num_reads = 100000;
     
     info!("Running {} sequential reads...", num_reads);
     
@@ -213,13 +213,13 @@ fn bench_hot_segment_reads() {
     let _ = std::fs::remove_dir_all(schema_dir);
 }
 
-/// Benchmark: Reading from cold segments (with promotion)
+/// Benchmark: Reading from cold segments (pure mmap reads, no promotion)
 #[test]
 #[ignore] // Run with --ignored
 fn bench_cold_segment_reads() {
     let _ = env_logger::try_init();
     
-    info!("=== Benchmark: Cold Segment Reads (with Promotion) ===");
+    info!("=== Benchmark: Cold Segment Reads (mmap, no promotion) ===");
     
     let backup_dir = "/tmp/neb_bench_cold";
     let wal_dir = "/tmp/neb_bench_cold_wal";
@@ -284,11 +284,20 @@ fn bench_cold_segment_reads() {
     let cold_count = chunks.list[0].segments().iter().filter(|s| s.is_cold()).count();
     info!("Created {} cold segments (out of {})", cold_count, chunks.list[0].segments().len());
     
-    // Benchmark: Reading from cold segments (first access triggers promotion)
-    let mut latencies = Vec::new();
-    let num_reads = 1000; // Fewer reads since promotion is expensive
+    // Disable promotion to measure pure cold segment read performance
+    // (reads from mmap'd files without copying to anonymous memory)
+    for chunk in &chunks.list {
+        if let Some(ref manager) = chunk.tiered_manager {
+            manager.disable_promotion.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    info!("Disabled promotion for pure cold segment read benchmark");
     
-    info!("Running {} reads (including promotions)...", num_reads);
+    // Benchmark: Reading from cold segments (WITHOUT promotion)
+    let mut latencies = Vec::new();
+    let num_reads = 100000;
+    
+    info!("Running {} reads from cold segments (mmap reads, no promotion)...", num_reads);
     
     let mut rng = rand::thread_rng();
     for _ in 0..num_reads {
@@ -302,8 +311,11 @@ fn bench_cold_segment_reads() {
         latencies.push(elapsed);
     }
     
-    let result = BenchResult::from_latencies("Cold Segment Reads".to_string(), latencies);
+    let result = BenchResult::from_latencies("Cold Segment Reads (mmap, no promotion)".to_string(), latencies);
     result.print();
+    
+    let final_cold = chunks.list[0].segments().iter().filter(|s| s.is_cold()).count();
+    info!("After benchmark: {} segments remain cold (no promotion occurred)", final_cold);
     
     // Clean up
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
@@ -388,7 +400,7 @@ fn bench_mixed_uniform() {
     
     // Benchmark: Uniform random access
     let mut latencies = Vec::new();
-    let num_reads = 10000;
+    let num_reads = 100000;
     
     info!("Running {} uniform random reads...", num_reads);
     
@@ -495,7 +507,7 @@ fn bench_mixed_zipf() {
     // Benchmark: Zipf distributed access (s=0.99 - realistic for caching workloads)
     let zipf = ZipfGenerator::new(num_cells, 0.99);
     let mut latencies = Vec::new();
-    let num_reads = 10000;
+    let num_reads = 100000;
     
     info!("Running {} Zipf-distributed reads (s=0.99)...", num_reads);
     info!("(Zipf means: ~20% of keys get ~80% of accesses)");
