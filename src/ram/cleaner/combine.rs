@@ -295,7 +295,7 @@ impl CombinedCleaner {
         );
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
-            old_seg.mem_drop(chunk);
+            old_seg.recycle(chunk);
         }
         debug!(
             "End combining segments, totally cleaned {} bytes, with {} segments.",

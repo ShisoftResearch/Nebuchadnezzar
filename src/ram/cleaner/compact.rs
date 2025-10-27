@@ -53,7 +53,7 @@ impl CompactCleaner {
             .collect_vec();
         if entries.len() == 0 {
             chunk.remove_segment(seg.id);
-            seg.mem_drop(chunk);
+            seg.recycle(chunk);
             debug!(
                 "Compact segment {} leades to remove the segment for it is empty",
                 seg.id

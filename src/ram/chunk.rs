@@ -487,6 +487,7 @@ impl Chunk {
             self.id, segment_id
         );
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
+            debug_assert!(seg.is_hot());
             seg.dispense();
         }
     }

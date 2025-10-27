@@ -37,7 +37,6 @@ pub struct Segment {
     pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
-    pub dropped: AtomicBool,
     // Tiered memory fields
     pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm
@@ -88,7 +87,6 @@ impl Segment {
                 .clone()
                 .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
             archived: AtomicBool::new(false),
-            dropped: AtomicBool::new(false),
             wal_file,
             wal_file_name,
             cold_file_fd: AtomicI32::new(-1),  // Start as hot
@@ -270,16 +268,9 @@ impl Segment {
         self.references.load(Ordering::Relaxed) == 0
     }
 
-    pub fn mem_drop(&self, chunk: &Chunk) {
-        if self
-            .dropped
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            chunk.allocator.free(self.addr);
-        }
+    pub fn recycle(&self, chunk: &Chunk) {
+        chunk.allocator.free(self.addr);
     }
-
     // remove the backup if it have one
     pub fn dispense(&self) {
         debug!("dispense segment {}", self.id);
@@ -325,31 +316,6 @@ impl Segment {
     #[inline]
     pub fn get_reference_bit(&self) -> bool {
         self.reference_bit.load(Ordering::Relaxed)
-    }
-}
-
-impl Drop for Segment {
-    fn drop(&mut self) {
-        // Check if segment was already mem_dropped (recycled)
-        if self.dropped.load(Ordering::Acquire) {
-            // Already handled by mem_drop, nothing to do
-            return;
-        }
-        
-        // Mark as dropped
-        self.dropped.store(true, Ordering::Release);
-        
-        // Close cold segment file descriptor if it exists
-        // Note: We don't munmap here because either:
-        // 1. Segment was recycled via mem_drop (already unmapped/remapped)
-        // 2. Segment is being dropped at process exit (OS will clean up)
-        let fd = self.cold_file_fd.load(Ordering::Acquire);
-        if fd >= 0 {
-            unsafe {
-                close(fd);
-            }
-            debug!("Closed file descriptor {} for cold segment {} at process exit", fd, self.id);
-        }
     }
 }
 
