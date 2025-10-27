@@ -335,6 +335,86 @@ Potential improvements:
 - Consider prefetching if access pattern is predictable
 - Increase physical memory limit to keep more data hot
 
+## Benchmarks
+
+Comprehensive benchmarks are available to measure tiered memory performance across different workloads.
+
+### Available Benchmarks
+
+1. **Hot Segment Reads** (`bench_hot_segment_reads`)
+   - Baseline performance for pure in-memory reads
+   - No tiered memory overhead
+   
+2. **Cold Segment Reads** (`bench_cold_segment_reads`)
+   - Measures promotion overhead when accessing cold segments
+   - Worst-case performance scenario
+
+3. **Mixed Uniform** (`bench_mixed_uniform`)
+   - Random access across hot and cold segments
+   - Uniform distribution across all keys
+
+4. **Mixed Zipf** (`bench_mixed_zipf`)
+   - Realistic workload with Zipf distribution (s=0.99)
+   - ~20% of keys receive ~80% of accesses
+   - Tests effectiveness of CLOCK eviction policy
+
+### Running Benchmarks
+
+Run individual benchmark:
+```bash
+RUST_LOG=info cargo test --lib tiered::bench::bench_hot_segment_reads \
+    -- --nocapture --ignored --test-threads=1
+```
+
+Run all benchmarks:
+```bash
+RUST_LOG=info cargo test --lib tiered::bench::bench_all \
+    -- --nocapture --ignored --test-threads=1
+```
+
+List all benchmarks:
+```bash
+cargo test --lib tiered::bench -- --ignored --list
+```
+
+### Example Output
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║ Benchmark: Hot Segment Reads                                 ║
+╠══════════════════════════════════════════════════════════════╣
+║ Total Operations:         10000                              ║
+║ Total Duration:            0.05 s                            ║
+║ Throughput:           215480.50 ops/s                        ║
+╠══════════════════════════════════════════════════════════════╣
+║ Latency Statistics:                                          ║
+║   Average:                 4.64 μs                           ║
+║   p50 (median):            4.00 μs                           ║
+║   p95:                     5.00 μs                           ║
+║   p99:                     5.00 μs                           ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Benchmark Interpretation
+
+**Hot Segment Performance**:
+- Baseline for comparison
+- Typical: 200K-300K ops/s, <10 μs latency
+
+**Cold Segment Performance**:
+- Includes promotion overhead (mmap, copy)
+- Expected: 10-100x slower than hot on first access
+- Subsequent accesses after promotion: back to hot performance
+
+**Mixed Workloads**:
+- Uniform: Mix of hot/cold performance, depends on eviction rate
+- Zipf: Should approach hot performance as CLOCK keeps popular data hot
+
+**Good Performance Indicators**:
+- Zipf performance close to hot baseline (means eviction policy works)
+- p99 latency not too far from average (consistent performance)
+- Cold segments decrease over time under Zipf (hot data stays hot)
+
 ## License
 
 Same as Nebuchadnezzar project.
