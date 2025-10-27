@@ -189,12 +189,7 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
-        // Skip archiving if segment is already cold (already backed by file)
-        if self.is_cold() {
-            debug!("Skipping archive for already-cold segment {}", self.id);
-            return Ok(false);
-        }
-        
+        debug_assert!(self.is_hot());
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
