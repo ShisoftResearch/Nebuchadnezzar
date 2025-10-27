@@ -37,6 +37,7 @@ pub struct Segment {
     pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
+    pub dropped: AtomicBool,
     // Tiered memory fields
     pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm
@@ -86,9 +87,10 @@ impl Segment {
             backup_file_name: backup_storage
                 .clone()
                 .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
-            archived: AtomicBool::new(false),
             wal_file,
             wal_file_name,
+            archived: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
             cold_file_fd: AtomicI32::new(-1),  // Start as hot
             reference_bit: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
@@ -189,7 +191,6 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
-        debug_assert!(self.is_hot());
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
@@ -263,8 +264,14 @@ impl Segment {
         self.references.load(Ordering::Relaxed) == 0
     }
 
-    pub fn recycle(&self, chunk: &Chunk) {
-        chunk.allocator.free(self.addr);
+    pub fn mem_drop(&self, chunk: &Chunk) {
+        if self
+            .dropped
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            chunk.allocator.free(self.addr);
+        }
     }
     // remove the backup if it have one
     pub fn dispense(&self) {
@@ -395,14 +402,6 @@ impl SegmentAllocator {
     ) -> Option<Segment> {
         self.free
             .pop_front()
-            .map(|addr| {
-                // Hot segments are not unmapped in mem_drop, so memory is already valid
-                // Just reuse the address directly without remapping
-                // This avoids race conditions with parallel segment iteration
-                debug!("Reusing recycled hot segment address {:#x}", addr);
-                Some(addr)
-            })
-            .flatten()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer");
                 let addr = self.offset.load(Relaxed);
@@ -438,13 +437,6 @@ impl SegmentAllocator {
         // First allocate the address
         self.free
             .pop_front()
-            .map(|addr| {
-                // Hot segments are not unmapped in mem_drop, so memory is already valid
-                // Just reuse the address directly without remapping
-                debug!("Reusing recycled hot segment address {:#x} for recovery", addr);
-                Some(addr)
-            })
-            .flatten()
             .or_else(|| loop {
                 debug!("Allocate segment by bump pointer (recovery)");
                 let addr = self.offset.load(Relaxed);

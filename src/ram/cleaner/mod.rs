@@ -34,10 +34,8 @@ impl Cleaner {
             .name("Cleaner main".into())
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
-                    checks_ref_clone.list.iter().for_each(|chunk| { // Can use par_iter
-                        // Self::pre_clean(chunk);
+                    checks_ref_clone.list.par_iter().for_each(|chunk| {
                         Self::clean(chunk, false);
-                        // Self::post_clean(chunk);
                     });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
