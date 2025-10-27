@@ -540,9 +540,9 @@ fn test_recovery_loads_segments_as_cold() {
         // Use the same pattern as working tests: 1KB cells, conservative estimate
         let large_data = "x".repeat(1024);
         let cells_per_segment = SEGMENT_SIZE / 2048;
-        let num_cells = cells_per_segment * 10; // 10 segments worth to ensure we get at least 5
+        let num_cells = cells_per_segment * 12; // 12 segments worth to ensure we get at least 6
         
-        info!("Writing {} cells to create 5+ segments", num_cells);
+        info!("Writing {} cells to create 6+ segments", num_cells);
         
         for i in 0..num_cells {
             let id = Id::new(schema.id as u64, 5000 + i as u64);
@@ -682,9 +682,9 @@ fn test_cold_segment_recycling() {
     info!("Phase 1: Creating 3+ segments and evicting to cold");
     let large_data = "x".repeat(1024); // 1KB cells (matching working tests)
     let cells_per_segment = SEGMENT_SIZE / 2048; // Conservative estimate
-    let num_cells = cells_per_segment * 5; // 5 segments worth (more than 1-segment limit)
+    let num_cells = cells_per_segment * 7; // 7 segments worth to ensure we exceed 1-segment limit
     
-    info!("Filling with {} cells to create 5 segments (limit is 1 segment)", num_cells);
+    info!("Filling with {} cells to exceed 1-segment limit", num_cells);
     
     for i in 0..num_cells {
         let id = Id::new(schema.id as u64, 6000 + i as u64);
