@@ -12,6 +12,10 @@ use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
 use std::sync::Arc;
+use std::sync::Mutex;
+
+// Global mutex to prevent test interference
+static TEST_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Helper to create default test fields
 fn default_fields() -> Field {
@@ -26,6 +30,7 @@ fn default_fields() -> Field {
 /// Test automatic eviction when physical memory limit is exceeded
 #[test]
 fn test_eviction_on_memory_overflow() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     // Configure tiered memory with a small physical memory limit
@@ -173,6 +178,7 @@ fn test_eviction_on_memory_overflow() {
 /// Test that reads from cold segments trigger promotion and data is still intact
 #[test]
 fn test_cold_segment_promotion() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     // Configure with tight memory limit
@@ -279,6 +285,7 @@ fn test_cold_segment_promotion() {
 /// Test that cleaners skip cold segments
 #[test]
 fn test_cleaner_ignores_cold_segments() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
@@ -368,6 +375,7 @@ fn test_cleaner_ignores_cold_segments() {
 /// Test tiered memory with recovery enabled from the start
 #[test]
 fn test_tiered_memory_with_recovery_enabled() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     let backup_dir = "/tmp/neb_test_recovery_enabled_bk";
@@ -500,16 +508,19 @@ fn test_tiered_memory_with_recovery_enabled() {
 /// This saves physical memory by mmapping backup files directly instead of loading into RAM
 #[test]
 fn test_recovery_loads_segments_as_cold() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
-    let backup_dir = "/tmp/neb_test_cold_recovery_bk";
-    let wal_dir = "/tmp/neb_test_cold_recovery_wal";
-    let schema_dir = "/tmp/neb_test_cold_recovery_schema";
+    // Use unique directory names to avoid conflicts with other tests
+    let test_id = std::thread::current().id();
+    let backup_dir = format!("/tmp/neb_test_cold_recovery_bk_{:?}", test_id);
+    let wal_dir = format!("/tmp/neb_test_cold_recovery_wal_{:?}", test_id);
+    let schema_dir = format!("/tmp/neb_test_cold_recovery_schema_{:?}", test_id);
     
     // Clean up
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
     
     // Configure tiered memory with limit of 2 segments (16MB)
     // We'll create 7+ segments, so at least 3 should be recovered as cold (2 hot + 1 head = 3 hot max)
@@ -517,10 +528,10 @@ fn test_recovery_loads_segments_as_cold() {
     std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.8");
     std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", 2 * SEGMENT_SIZE)); // Only 2 segments fit in hot
     
-    let chunk_capacity = 10 * SEGMENT_SIZE;
+    let chunk_capacity = 30 * SEGMENT_SIZE; // Need enough capacity for 20+ segments
     let fields = default_fields();
     let schema = Schema::new("test_cold_recovery", None, fields, false, false);
-    let schemas = LocalSchemasCache::new_local(schema_dir);
+    let schemas = LocalSchemasCache::new_local(&schema_dir);
     schemas.new_schema(schema.clone());
     
     // Phase 1: Create data and archive it (without recovery)
@@ -536,13 +547,13 @@ fn test_recovery_loads_segments_as_cold() {
             Some(wal_dir.to_string()),
         );
         
-        // Write enough data to create at least 5 segments
+        // Write enough data to create at least 20 segments
         // Use the same pattern as working tests: 1KB cells, conservative estimate
         let large_data = "x".repeat(1024);
         let cells_per_segment = SEGMENT_SIZE / 2048;
-        let num_cells = cells_per_segment * 15; // 15 segments worth to ensure we get at least 7
+        let num_cells = cells_per_segment * 25; // 25 segments worth to ensure we get at least 20
         
-        info!("Writing {} cells to create 7+ segments", num_cells);
+        info!("Writing {} cells to create 25+ segments", num_cells);
         
         for i in 0..num_cells {
             let id = Id::new(schema.id as u64, 5000 + i as u64);
@@ -577,7 +588,7 @@ fn test_recovery_loads_segments_as_cold() {
     {
         info!("Phase 2: Recovering with tiered memory (should load as cold)");
         
-        let schemas_recovery = LocalSchemasCache::new_local(schema_dir);
+        let schemas_recovery = LocalSchemasCache::new_local(&schema_dir);
         schemas_recovery.new_schema(schema.clone());
         
         let chunks = Chunks::new_with_recovery(
@@ -595,7 +606,9 @@ fn test_recovery_loads_segments_as_cold() {
         let mut hot_count = 0;
         
         for chunk in &chunks.list {
+            info!("Chunk {} has {} total segments in segs map", chunk.id, chunk.segs.len());
             for segment in chunk.segments() {
+                info!("Processing segment {}", segment.id);
                 if segment.is_cold() {
                     cold_count += 1;
                     info!("Segment {} recovered as COLD", segment.id);
@@ -609,10 +622,10 @@ fn test_recovery_loads_segments_as_cold() {
             }
         }
         
-        info!("After recovery: {} cold segments, {} hot segments (expected 3 cold, 2 hot)", cold_count, hot_count);
+        info!("After recovery: {} cold segments, {} hot segments (expected 10+ cold, 3 hot)", cold_count, hot_count);
         
-        // With tiered memory enabled and 16MB limit, 3 out of 5 segments should be cold
-        assert!(cold_count >= 3, "Expected at least 3 segments to be recovered as cold (limit is 2 segments = 16MB)");
+        // With tiered memory enabled and 16MB limit, most segments should be cold
+        assert!(cold_count >= 10, "Expected at least 10 segments to be recovered as cold (limit is 2 segments = 16MB)");
         
         // Verify we can still read data from cold segments (triggers promotion)
         for i in 0..10 {
@@ -634,15 +647,16 @@ fn test_recovery_loads_segments_as_cold() {
     std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
     std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
-    let _ = std::fs::remove_dir_all(backup_dir);
-    let _ = std::fs::remove_dir_all(wal_dir);
-    let _ = std::fs::remove_dir_all(schema_dir);
+    let _ = std::fs::remove_dir_all(&backup_dir);
+    let _ = std::fs::remove_dir_all(&wal_dir);
+    let _ = std::fs::remove_dir_all(&schema_dir);
 }
 
 /// Test that cold segments are properly recycled after cleaning
 /// This prevents address space bloating
 #[test]
 fn test_cold_segment_recycling() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     let backup_dir = "/tmp/neb_test_recycling_bk";
@@ -796,6 +810,7 @@ fn test_cold_segment_recycling() {
 /// Verifies that remapping hot segments works without allocating extra memory
 #[test]
 fn test_hot_segment_recycling() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
     
     let backup_dir = "/tmp/neb_test_hot_recycling_bk";
