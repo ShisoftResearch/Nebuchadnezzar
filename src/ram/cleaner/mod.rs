@@ -34,8 +34,10 @@ impl Cleaner {
             .name("Cleaner main".into())
             .spawn(move || {
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
-                    checks_ref_clone.list.par_iter().for_each(|chunk| {
+                    checks_ref_clone.list.iter().for_each(|chunk| { // Can use par_iter
+                        Self::pre_clean(chunk);
                         Self::clean(chunk, false);
+                        Self::post_clean(chunk);
                     });
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
@@ -92,18 +94,6 @@ impl Cleaner {
                     .sum::<usize>();
             }
         }
-        
-        // Handle tiered memory operations in cleaner thread to avoid race conditions
-        if let Some(ref tiered_manager) = chunk.tiered_manager {
-            // Check for memory pressure and evict if needed
-            if let Err(e) = tiered_manager.check_and_evict(chunk) {
-                error!("Tiered memory eviction failed in cleaner: {:?}", e);
-            }
-            
-            // Promote cold segments that have been referenced
-            Self::handle_promotion_requests(chunk, tiered_manager);
-        }
-        
         {
             debug!("Starting combine {}", chunk.id);
             let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
@@ -136,6 +126,22 @@ impl Cleaner {
         debug!("Archiving segments");
         chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
+    }
+
+    fn pre_clean(chunk: &Chunk) {
+        if let Some(ref tiered_manager) = chunk.tiered_manager {
+            // Promote cold segments that have been referenced
+            Self::handle_promotion_requests(chunk, tiered_manager);
+        }
+    }
+
+    fn post_clean(chunk: &Chunk) {
+        if let Some(ref tiered_manager) = chunk.tiered_manager {
+            // Check for memory pressure and evict if needed
+            if let Err(e) = tiered_manager.check_and_evict(chunk) {
+                error!("Tiered memory eviction failed in cleaner: {:?}", e);
+            }
+        }
     }
     
     /// Handle promotion requests in the cleaner thread to avoid race conditions
