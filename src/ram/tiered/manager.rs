@@ -73,6 +73,16 @@ impl TieredMemoryManager {
         let memory_limit = self.physical_memory_limit.unwrap_or(chunk.capacity);
         let threshold_bytes = (memory_limit as f32 * self.eviction_threshold_percent) as usize;
         
+        debug!(
+            "check_and_evict: hot_segments={}, hot_memory={}MB, limit={}MB, threshold={}MB, threshold%={}, exceeds={}",
+            hot_segments_count,
+            hot_memory_bytes / (1024 * 1024),
+            memory_limit / (1024 * 1024),
+            threshold_bytes / (1024 * 1024),
+            self.eviction_threshold_percent,
+            hot_memory_bytes > threshold_bytes
+        );
+        
         if hot_memory_bytes > threshold_bytes {
             // Need to evict - target 70% of threshold to avoid thrashing
             let target_bytes = (threshold_bytes as f32 * 0.7) as usize;

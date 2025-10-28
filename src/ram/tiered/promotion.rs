@@ -182,10 +182,15 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     }
     segment.cold_file_fd.store(-1, Ordering::Release);
     
-    // Step 7: Clear promoting flag
+    // Step 7: Set reference bit to 1
+    // The segment was just accessed (which triggered promotion), so it should be marked
+    // as referenced to prevent immediate eviction by CLOCK algorithm
+    segment.mark_referenced();
+    
+    // Step 8: Clear promoting flag
     segment.promoting.store(false, Ordering::Release);
     
-    // Step 8: Drop all locks - cells are now accessible again
+    // Step 9: Drop all locks - cells are now accessible again
     drop(locks);
     
     info!("Successfully promoted segment {} to hot storage (locked {} cells during promotion)", 

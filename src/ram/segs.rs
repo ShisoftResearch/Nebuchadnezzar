@@ -195,6 +195,7 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
+        debug!("archive() called for segment {}, backup_file_name={:?}", self.id, self.backup_file_name);
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);

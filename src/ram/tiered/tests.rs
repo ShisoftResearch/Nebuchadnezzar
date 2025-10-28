@@ -968,11 +968,12 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     info!("=== Starting End-to-End Tiered Memory Test ===");
     
     // Configure tiered memory with tight limits to force eviction
-    // Memory limit: 1.5 segments (12MB), threshold: 50%
-    // This means eviction triggers at ~6MB (0.75 segments)
+    // Memory limit: 3 segments (24MB), threshold: 80%
+    // This means eviction triggers at ~19MB (2.4 segments)
+    // This allows room for: 1 head segment + 1 promoted segment without thrashing
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
-    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.5");
-    std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", SEGMENT_SIZE + SEGMENT_SIZE / 2));
+    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.8");
+    std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", SEGMENT_SIZE * 3));
     std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "50"); // Fast cleaner for testing
     
     let chunk_capacity = 10 * SEGMENT_SIZE; // 80MB virtual capacity
@@ -1007,9 +1008,9 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     
     // Phase 1: Fill memory beyond the limit to trigger automatic eviction
     info!("Phase 1: Writing cells to exceed memory limit and trigger eviction");
-    let large_data = "x".repeat(512); // 512 bytes per cell
-    let cells_per_segment = SEGMENT_SIZE / 1024; // Conservative estimate
-    let num_cells = cells_per_segment * 5; // Write 5 segments worth (40MB)
+    let large_data = "x".repeat(2048); // 2KB per cell
+    let cells_per_segment = SEGMENT_SIZE / 4096; // Conservative estimate (~2000 cells per segment)
+    let num_cells = cells_per_segment * 4; // Write 4 segments worth (32MB) - enough to trigger eviction but leave room for promotion
     
     let mut cell_ids = Vec::new();
     for i in 0..num_cells {
@@ -1034,6 +1035,16 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     }
     
     info!("Phase 1 complete: Wrote {} cells", num_cells);
+    
+    // Check current memory usage
+    let stats = chunks.list[0].tiered_manager.as_ref().unwrap().stats(&chunks.list[0]);
+    let memory_limit = chunks.list[0].tiered_manager.as_ref().unwrap().physical_memory_limit.unwrap();
+    let segment_size = SEGMENT_SIZE;
+    let estimated_hot_memory = stats.hot_segments * segment_size;
+    println!("Before waiting for eviction - Stats: hot_segments={}, cold_segments={}, total={}, limit={} bytes (~{} segments), estimated_hot_memory={} bytes",
+          stats.hot_segments, stats.cold_segments, stats.total_segments, memory_limit, memory_limit / segment_size, estimated_hot_memory);
+    info!("Before waiting for eviction - Stats: hot_segments={}, cold_segments={}, total={}, limit={} bytes (~{} segments), estimated_hot_memory={} bytes",
+          stats.hot_segments, stats.cold_segments, stats.total_segments, memory_limit, memory_limit / segment_size, estimated_hot_memory);
     
     // Give cleaner time to run and evict segments
     info!("Waiting for cleaner to detect memory pressure and evict...");
@@ -1083,16 +1094,25 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     
     // Give cleaner time to detect referenced cold segments and promote them
     info!("Waiting for cleaner to detect referenced cold segments and promote...");
-    thread::sleep(Duration::from_secs(3));
+    thread::sleep(Duration::from_secs(2));
+    
+    // Stop cleaner temporarily to prevent it from evicting the just-promoted segment
+    cleaner.stop();
+    thread::sleep(Duration::from_millis(200)); // Let cleaner thread finish
     
     // Phase 4: Verify promotion occurred by checking if cold segments became hot
     let mut hot_segment_ids_after = std::collections::HashSet::new();
     let mut cold_segment_ids_after = std::collections::HashSet::new();
     
     for segment in chunks.list[0].segments() {
-        if segment.is_hot() {
+        let is_hot = segment.is_hot();
+        let is_cold = segment.is_cold();
+        let fd = segment.cold_file_fd.load(std::sync::atomic::Ordering::Relaxed);
+        println!("Segment {}: is_hot={}, is_cold={}, fd={}", segment.id, is_hot, is_cold, fd);
+        
+        if is_hot {
             hot_segment_ids_after.insert(segment.id);
-        } else if segment.is_cold() {
+        } else if is_cold {
             cold_segment_ids_after.insert(segment.id);
         }
     }

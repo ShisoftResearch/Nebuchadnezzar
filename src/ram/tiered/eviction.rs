@@ -20,6 +20,9 @@ use std::thread;
 /// 4. mmap with MAP_FIXED (replaces anonymous mapping with file-backed)
 /// 5. Store file descriptor (marks segment as cold)
 pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error> {
+    debug!("evict_segment called for segment {}, is_cold={}, is_hot={}", 
+           segment.id, segment.is_cold(), segment.is_hot());
+    
     // Sanity check: don't evict if already cold
     if segment.is_cold() {
         warn!("Attempted to evict already-cold segment {}", segment.id);
@@ -34,23 +37,29 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
         thread::yield_now();
     }
     
-    // Step 2: Archive segment to backup file
-    // This writes the current memory contents to disk
+    // Step 2: Ensure backup file exists
+    // Try to archive - if it returns false, the backup might already exist
     let archived = segment.archive()?;
-    if !archived {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to archive segment {} for eviction", segment.id),
-        ));
-    }
+    debug!("Archive result for segment {}: archived={}", segment.id, archived);
     
-    // Step 3: Open backup file read-only
+    // Get backup path and verify it exists
     let backup_path = segment.backup_file_name.as_ref().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("Segment {} has no backup file path", segment.id),
         )
     })?;
+    
+    // If archive() returned false but backup exists (e.g., from previous write),
+    // that's fine - we can still proceed with eviction
+    if !archived && !std::path::Path::new(backup_path).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Segment {} backup file does not exist and archive failed", segment.id),
+        ));
+    }
+    
+    // Step 3: Open backup file read-only
     
     let path_cstr = CString::new(backup_path.as_str()).map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid path: {}", e))

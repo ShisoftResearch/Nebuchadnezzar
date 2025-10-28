@@ -43,6 +43,8 @@ impl ClockEvictionPolicy {
         let num_segments = segments.len();
         let start_pos = self.cursor.load(Ordering::Relaxed);
         
+        debug!("CLOCK selecting victim: {} total segments, head_seg_id={}", num_segments, head_seg_id);
+        
         // Make two passes: first try to find unreferenced segment, 
         // second pass will clear all reference bits if needed
         for pass in 0..2 {
@@ -52,21 +54,25 @@ impl ClockEvictionPolicy {
                 
                 // Skip head segment - it's actively being written to
                 if segment.id == head_seg_id {
+                    debug!("CLOCK: seg {} is head, skipping", segment.id);
                     continue;
                 }
                 
                 // Skip if segment has active references (being read)
                 if !segment.no_references() {
+                    debug!("CLOCK: seg {} has active references, skipping", segment.id);
                     continue;
                 }
                 
                 // Skip if segment is protected by transactions
                 if chunk.is_segment_protected(segment.id) {
+                    debug!("CLOCK: seg {} is protected, skipping", segment.id);
                     continue;
                 }
                 
                 // Skip if already cold
                 if segment.is_cold() {
+                    debug!("CLOCK: seg {} is already cold, skipping", segment.id);
                     continue;
                 }
                 
