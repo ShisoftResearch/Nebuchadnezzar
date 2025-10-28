@@ -1040,18 +1040,23 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     thread::sleep(Duration::from_secs(5));
     
     // Phase 2: Verify some segments were evicted to cold storage
-    let mut hot_count = 0;
-    let mut cold_count = 0;
+    // Track segment IDs by tier for later promotion verification
+    let mut hot_segment_ids = std::collections::HashSet::new();
+    let mut cold_segment_ids = std::collections::HashSet::new();
     
     for segment in chunks.list[0].segments() {
         if segment.is_hot() {
-            hot_count += 1;
+            hot_segment_ids.insert(segment.id);
         } else if segment.is_cold() {
-            cold_count += 1;
+            cold_segment_ids.insert(segment.id);
         }
     }
     
-    info!("After eviction: {} hot segments, {} cold segments", hot_count, cold_count);
+    let hot_count = hot_segment_ids.len();
+    let cold_count = cold_segment_ids.len();
+    
+    info!("After eviction: {} hot segments {:?}, {} cold segments {:?}", 
+          hot_count, hot_segment_ids, cold_count, cold_segment_ids);
     assert!(cold_count > 0, "Some segments should have been evicted to cold storage. If this fails, the cleaner may not be triggering eviction - check memory limits and thresholds");
     assert!(hot_count <= 3, "Hot segments should be within memory limit (~1.5 segments + head)");
     
@@ -1080,25 +1085,36 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     info!("Waiting for cleaner to detect referenced cold segments and promote...");
     thread::sleep(Duration::from_secs(3));
     
-    // Phase 4: Verify promotion occurred
-    let mut hot_count_after = 0;
-    let mut cold_count_after = 0;
+    // Phase 4: Verify promotion occurred by checking if cold segments became hot
+    let mut hot_segment_ids_after = std::collections::HashSet::new();
+    let mut cold_segment_ids_after = std::collections::HashSet::new();
     
     for segment in chunks.list[0].segments() {
         if segment.is_hot() {
-            hot_count_after += 1;
+            hot_segment_ids_after.insert(segment.id);
         } else if segment.is_cold() {
-            cold_count_after += 1;
+            cold_segment_ids_after.insert(segment.id);
         }
     }
     
-    info!("After promotion: {} hot segments, {} cold segments", hot_count_after, cold_count_after);
+    info!("After promotion: {} hot segments {:?}, {} cold segments {:?}", 
+          hot_segment_ids_after.len(), hot_segment_ids_after, 
+          cold_segment_ids_after.len(), cold_segment_ids_after);
     
-    // We expect hot count to increase (promotion) and cold count to decrease
-    // But cleaner may also evict, so we just verify the system is dynamic
+    // Check if any previously cold segments are now hot (promotion)
+    let promoted_segments: Vec<_> = cold_segment_ids
+        .intersection(&hot_segment_ids_after)
+        .copied()
+        .collect();
+    
+    info!("Promoted segments (cold->hot): {:?}", promoted_segments);
+    
+    // Verify promotion actually happened
     assert!(
-        hot_count_after != hot_count || cold_count_after != cold_count,
-        "Segment tiers should have changed due to promotion/eviction activity"
+        !promoted_segments.is_empty(),
+        "At least one cold segment should have been promoted to hot after being accessed. \
+         Previously cold segments: {:?}, Now hot segments: {:?}",
+        cold_segment_ids, hot_segment_ids_after
     );
     
     // Phase 5: Verify data integrity - all cells should still be readable
