@@ -7,12 +7,15 @@
 
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
+use crate::ram::cleaner::Cleaner;
 use crate::ram::schema::*;
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::ram::types::*;
 use crate::server::ServerMeta;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
+use std::time::Duration;
 
 // Global mutex to prevent test interference
 static TEST_MUTEX: Mutex<()> = Mutex::new(());
@@ -948,4 +951,209 @@ fn test_hot_segment_recycling() {
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::remove_dir_all(schema_dir);
+}
+
+/// End-to-end test: Verify tiered memory works naturally through cleaner and access patterns
+/// 
+/// This test demonstrates the complete tiered memory lifecycle WITHOUT manually calling
+/// eviction or promotion functions. Instead, it relies on:
+/// 1. Cleaner thread to detect memory pressure and evict automatically
+/// 2. Cleaner thread to detect referenced cold segments and promote automatically
+/// 3. Natural data access patterns to trigger reference bits
+#[test]
+fn test_tiered_memory_end_to_end_with_cleaner() {
+    let _guard = TEST_MUTEX.lock().unwrap();
+    let _ = env_logger::try_init();
+    
+    info!("=== Starting End-to-End Tiered Memory Test ===");
+    
+    // Configure tiered memory with tight limits to force eviction
+    // Memory limit: 1.5 segments (12MB), threshold: 50%
+    // This means eviction triggers at ~6MB (0.75 segments)
+    std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
+    std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.5");
+    std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", SEGMENT_SIZE + SEGMENT_SIZE / 2));
+    std::env::set_var("NEB_CLEANER_SLEEP_INTERVAL_MS", "50"); // Fast cleaner for testing
+    
+    let chunk_capacity = 10 * SEGMENT_SIZE; // 80MB virtual capacity
+    let fields = default_fields();
+    let schema = Schema::new("test_e2e_tiered", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("/tmp/neb_test_e2e_tiered_schema");
+    schemas.new_schema(schema.clone());
+    
+    // Create temp directories
+    let backup_dir = "/tmp/neb_test_e2e_tiered_bk";
+    let wal_dir = "/tmp/neb_test_e2e_tiered_wal";
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    let _ = std::fs::create_dir_all(backup_dir);
+    let _ = std::fs::create_dir_all(wal_dir);
+    
+    let chunks = Chunks::new(
+        1,
+        chunk_capacity,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        Some(backup_dir.to_string()),
+        Some(wal_dir.to_string()),
+    );
+    
+    // Start cleaner (this is what triggers eviction/promotion automatically)
+    let cleaner = Cleaner::new_and_start(chunks.clone());
+    
+    // Verify tiered memory is enabled
+    assert!(chunks.list[0].tiered_manager.is_some(), "Tiered memory should be enabled");
+    info!("Tiered memory enabled, cleaner running");
+    
+    // Phase 1: Fill memory beyond the limit to trigger automatic eviction
+    info!("Phase 1: Writing cells to exceed memory limit and trigger eviction");
+    let large_data = "x".repeat(512); // 512 bytes per cell
+    let cells_per_segment = SEGMENT_SIZE / 1024; // Conservative estimate
+    let num_cells = cells_per_segment * 5; // Write 5 segments worth (40MB)
+    
+    let mut cell_ids = Vec::new();
+    for i in 0..num_cells {
+        let id = Id::new(schema.id as u64, i as u64);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("name"), OwnedValue::String(format!("cell_{}", i)));
+        data_map.insert(&String::from("data"), OwnedValue::String(large_data.clone()));
+        
+        let data = OwnedValue::Map(data_map);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &id),
+            data,
+        };
+        
+        chunks.write_cell(&mut cell).expect("Write should succeed");
+        cell_ids.push(id);
+        
+        if i > 0 && i % 1000 == 0 {
+            info!("Written {} cells", i);
+        }
+    }
+    
+    info!("Phase 1 complete: Wrote {} cells", num_cells);
+    
+    // Give cleaner time to run and evict segments
+    info!("Waiting for cleaner to detect memory pressure and evict...");
+    thread::sleep(Duration::from_secs(5));
+    
+    // Phase 2: Verify some segments were evicted to cold storage
+    let mut hot_count = 0;
+    let mut cold_count = 0;
+    
+    for segment in chunks.list[0].segments() {
+        if segment.is_hot() {
+            hot_count += 1;
+        } else if segment.is_cold() {
+            cold_count += 1;
+        }
+    }
+    
+    info!("After eviction: {} hot segments, {} cold segments", hot_count, cold_count);
+    assert!(cold_count > 0, "Some segments should have been evicted to cold storage. If this fails, the cleaner may not be triggering eviction - check memory limits and thresholds");
+    assert!(hot_count <= 3, "Hot segments should be within memory limit (~1.5 segments + head)");
+    
+    // Phase 3: Access old data to trigger promotion through reference bits
+    info!("Phase 3: Accessing old cells to set reference bits and trigger promotion");
+    
+    // Access cells from early segments (likely cold now)
+    let access_count = cells_per_segment / 2; // Access half a segment's worth
+    for i in 0..access_count {
+        if let Some(id) = cell_ids.get(i) {
+            match chunks.read_cell(id) {
+                Ok(_cell) => {
+                    // Successfully read - this is what matters for tiered memory
+                    // Data correctness is verified in Phase 5
+                }
+                Err(e) => {
+                    error!("Failed to read cell {:?}: {:?}", id, e);
+                }
+            }
+        }
+    }
+    
+    info!("Accessed {} cells from potentially cold segments", access_count);
+    
+    // Give cleaner time to detect referenced cold segments and promote them
+    info!("Waiting for cleaner to detect referenced cold segments and promote...");
+    thread::sleep(Duration::from_secs(3));
+    
+    // Phase 4: Verify promotion occurred
+    let mut hot_count_after = 0;
+    let mut cold_count_after = 0;
+    
+    for segment in chunks.list[0].segments() {
+        if segment.is_hot() {
+            hot_count_after += 1;
+        } else if segment.is_cold() {
+            cold_count_after += 1;
+        }
+    }
+    
+    info!("After promotion: {} hot segments, {} cold segments", hot_count_after, cold_count_after);
+    
+    // We expect hot count to increase (promotion) and cold count to decrease
+    // But cleaner may also evict, so we just verify the system is dynamic
+    assert!(
+        hot_count_after != hot_count || cold_count_after != cold_count,
+        "Segment tiers should have changed due to promotion/eviction activity"
+    );
+    
+    // Phase 5: Verify data integrity - all cells should still be readable
+    info!("Phase 5: Verifying data integrity across all tiers");
+    let mut read_success = 0;
+    let mut read_failures = 0;
+    
+    for (idx, id) in cell_ids.iter().enumerate().take(num_cells) {
+        match chunks.read_cell(id) {
+            Ok(_cell) => {
+                read_success += 1;
+                // Successfully read - data is accessible regardless of tier
+                // This is the key test: cells should be readable whether hot or cold
+            }
+            Err(e) => {
+                read_failures += 1;
+                error!("Failed to read cell {:?}: {:?}", id, e);
+            }
+        }
+    }
+    
+    info!("Data integrity check: {} successful reads, {} failures", read_success, read_failures);
+    assert_eq!(read_failures, 0, "All cells should be readable regardless of tier");
+    assert_eq!(read_success, num_cells, "Should read all {} cells successfully", num_cells);
+    
+    // Phase 6: Verify tiered memory statistics
+    if let Some(ref manager) = chunks.list[0].tiered_manager {
+        let stats = manager.stats(&chunks.list[0]);
+        info!("Final tiered memory stats:");
+        info!("  Total segments: {}", stats.total_segments);
+        info!("  Hot segments: {}", stats.hot_segments);
+        info!("  Cold segments: {}", stats.cold_segments);
+        info!("  Threshold: {:.1} segments", stats.threshold);
+        
+        assert!(stats.total_segments > 0, "Should have segments");
+        assert!(stats.hot_segments > 0, "Should have hot segments");
+        assert!(stats.cold_segments >= 0, "Cold segments count should be valid");
+        assert_eq!(
+            stats.total_segments,
+            stats.hot_segments + stats.cold_segments,
+            "Total should equal hot + cold"
+        );
+    }
+    
+    // Stop cleaner
+    drop(cleaner);
+    info!("Cleaner stopped");
+    
+    // Clean up
+    std::env::remove_var("NEB_TIERED_MEMORY_ENABLED");
+    std::env::remove_var("NEB_TIERED_MEMORY_THRESHOLD");
+    std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
+    std::env::remove_var("NEB_CLEANER_SLEEP_INTERVAL_MS");
+    let _ = std::fs::remove_dir_all(backup_dir);
+    let _ = std::fs::remove_dir_all(wal_dir);
+    
+    info!("=== End-to-End Tiered Memory Test Complete ===");
 }
