@@ -44,7 +44,7 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, selected_segments: &Vec<Arc<Segment>>) -> usize {
+    pub fn combine_segments(chunk: &Chunk, selected_segments: &Vec<lightning::aarc::Arc<Segment>>) -> usize {
         let head_seg_id = chunk.get_head_seg_id();
         // Remove the head segment from the candidate segments
         // This should be done but head segment still in the list, need to investigate

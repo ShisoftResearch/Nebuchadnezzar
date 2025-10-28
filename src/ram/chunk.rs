@@ -2,6 +2,7 @@ use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatisti
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
+use crate::ram::segment_list::SegmentList;
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -14,15 +15,15 @@ use crate::{
 use super::schema::Schema;
 use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
-use lightning::linked_map::LinkedHashMap;
-use lightning::map::*;
+use lightning::map::{Map, WordMap, WordMutexGuard, PtrHashMap};
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use lightning::aarc::Arc as AArc;
 
-pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
-pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
+pub type CellReadGuard<'a> = WordMutexGuard<'a>;
+pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
 
 // Thread-local flag to indicate if we're currently in a transaction
 // When true, WAL writes will skip fsync (will be synced at commit instead)
@@ -43,7 +44,7 @@ pub fn is_in_transaction() -> bool {
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
-    pub segs: LinkedHashMap<usize, Arc<Segment>>,
+    pub segs: SegmentList,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -87,7 +88,7 @@ impl Chunk {
             }
         };
         debug!("Creating chunk {}, num segments {}", id, num_segs);
-        let segs = LinkedHashMap::with_capacity(upper_power_of_2(num_segs));
+        let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
         // Create tiered memory manager if enabled
         let tiered_manager = if enable_tiered_memory {
@@ -478,7 +479,7 @@ impl Chunk {
         );
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
-        self.segs.insert_back(segment_key, Arc::new(segment));
+        self.segs.insert_back(segment_key, AArc::new(segment));
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
@@ -491,7 +492,7 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<Arc<Segment>> {
+    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<AArc<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
@@ -507,7 +508,7 @@ impl Chunk {
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &Arc<Segment>) {
+    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &AArc<Segment>) {
         let pending_entry = (|| loop {
             if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32) {
                 return pending_entry;
@@ -541,7 +542,7 @@ impl Chunk {
         Ok(())
     }
 
-    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> Arc<Segment> {
+    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
         self.locate_segment(cell_location, cell_id).expect(
             format!(
                 "Cannot locate cell segment for cell id: {:?} at {}",
@@ -574,7 +575,7 @@ impl Chunk {
         self.segs.iter_front_keys().collect()
     }
 
-    pub fn segments(&self) -> Vec<Arc<Segment>> {
+    pub fn segments(&self) -> Vec<AArc<Segment>> {
         self.segs.iter_front_values().collect()
     }
 
@@ -634,7 +635,7 @@ impl Chunk {
         }
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -656,7 +657,7 @@ impl Chunk {
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<(Arc<Segment>, f32)> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -828,7 +829,7 @@ impl Chunk {
 }
 
 pub struct PendingEntry {
-    pub seg: Arc<Segment>,
+    pub seg: AArc<Segment>,
     pub addr: usize,
     pub size: u32,
     pub skip_sync: bool, // Skip fsync if part of a transaction (will be synced at commit)

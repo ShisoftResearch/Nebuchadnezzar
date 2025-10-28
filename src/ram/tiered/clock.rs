@@ -33,7 +33,7 @@ impl ClockEvictionPolicy {
     /// 3. Advance clock hand
     /// 
     /// Returns None if no victim can be found (all segments referenced or protected)
-    pub fn select_victim(&self, chunk: &Chunk) -> Option<Arc<Segment>> {
+    pub fn select_victim(&self, chunk: &Chunk) -> Option<lightning::aarc::Arc<Segment>> {
         let segments = chunk.segments();
         if segments.is_empty() {
             return None;

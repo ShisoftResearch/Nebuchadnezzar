@@ -475,7 +475,7 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
 fn phase2_allocate_and_load(
     files: &[SegmentFileInfo],
     chunks: &[Chunk],
-    allocated_segments: &mut Vec<(usize, Arc<Segment>)>,
+    allocated_segments: &mut Vec<(usize, lightning::aarc::Arc<Segment>)>,
     hot_memory_used: &mut HashMap<usize, usize>,
 ) -> io::Result<()> {
     info!("Phase 2: Allocating segments and loading data...");
@@ -580,7 +580,7 @@ fn phase2_allocate_and_load(
             );
         }
         
-        allocated_segments.push((file_info.chunk_id, Arc::new(segment)));
+        allocated_segments.push((file_info.chunk_id, lightning::aarc::Arc::new(segment)));
     }
     
     Ok(())
@@ -588,7 +588,7 @@ fn phase2_allocate_and_load(
 
 /// Phase 3: Rebuild cell indices from recovered segments
 fn phase3_rebuild_indices(
-    allocated_segments: &[(usize, Arc<Segment>)],
+    allocated_segments: &[(usize, lightning::aarc::Arc<Segment>)],
     chunks: &[Chunk],
     global_cell_index: &mut HashMap<u64, CellIndexEntry>,
 ) -> u32 {
@@ -708,7 +708,7 @@ pub fn recover_chunks(
     phase1_5_set_initial_seq_ids(chunks, &files);
     
     // Phase 2: Allocate segments and load data
-    let mut allocated_segments: Vec<(usize, Arc<Segment>)> = Vec::new();
+    let mut allocated_segments: Vec<(usize, lightning::aarc::Arc<Segment>)> = Vec::new();
     let mut hot_memory_used: HashMap<usize, usize> = HashMap::new();
     
     phase2_allocate_and_load(&files, chunks, &mut allocated_segments, &mut hot_memory_used)?;
