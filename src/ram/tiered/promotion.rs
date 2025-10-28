@@ -85,14 +85,10 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         
         for &idx in &unlocked_indices {
             let hash = cell_hashes[idx];
-            match chunk.cell_index.try_lock(hash) {
-                Some(Some(lock)) => {
+            match chunk.cell_index.lock(hash as usize) {
+                Some(lock) => {
                     // Successfully locked this cell
                     locks.push(lock);
-                }
-                Some(None) => {
-                    // Couldn't lock (busy or doesn't exist), try again in next iteration
-                    still_unlocked.push(idx);
                 }
                 None => {
                     error!("Cell {} not found in chunk {} index during promotion", hash, chunk.id);
