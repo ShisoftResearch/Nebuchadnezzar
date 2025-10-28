@@ -226,7 +226,7 @@ dependencies = [
  "futures",
  "futures-timer",
  "lazy_static",
- "lightning-containers 0.2.2 (git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop)",
+ "lightning-containers",
  "log",
  "num_cpus",
  "parking_lot",
@@ -753,31 +753,7 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#69a39594b3d2a287a24c09ad4219276c536cd7ee"
-dependencies = [
- "affinity",
- "ahash",
- "byteorder",
- "bytes",
- "crossbeam-epoch",
- "crossbeam-utils",
- "itertools",
- "lazy_static",
- "libc",
- "log",
- "num_cpus",
- "page_size",
- "parking_lot",
- "rand 0.8.5",
- "rayon",
- "smallvec",
- "static_assertions",
-]
-
-[[package]]
-name = "lightning-containers"
-version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?rev=74b6b064897c0bd3af5a4571ac000f6f63d5c574#74b6b064897c0bd3af5a4571ac000f6f63d5c574"
+source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#291fe82f0e125a69e87bc0e8346870066809b427"
 dependencies = [
  "affinity",
  "ahash",
@@ -887,7 +863,7 @@ dependencies = [
  "itertools",
  "lazy_static",
  "libc",
- "lightning-containers 0.2.2 (git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?rev=74b6b064897c0bd3af5a4571ac000f6f63d5c574)",
+ "lightning-containers",
  "log",
  "ndarray",
  "num",
