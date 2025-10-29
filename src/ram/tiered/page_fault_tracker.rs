@@ -73,8 +73,8 @@ extern "C" fn handle_segfault(
                     // Log the reference (signal-safe: write to stderr fd directly)
                     // Note: This is expensive but useful for debugging. Remove in production.
                     let msg = format!(
-                        "[PAGE_FAULT] Segment referenced: chunk={}, seg_id={}, addr={:#x}\n",
-                        chunk_id, segment_id, segment.addr
+                        "[PAGE_FAULT] Segment referenced: chunk={}, seg_id={}, hot={}, addr={:#x}\n",
+                        chunk_id, segment_id, segment.is_hot(), segment.addr
                     );
                     libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
                 }

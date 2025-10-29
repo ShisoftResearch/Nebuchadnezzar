@@ -447,7 +447,8 @@ impl TransactionManager {
                 .data_sites
                 .get_or_insert(server_id, || data_site::AsyncServiceClient::new(&client)));
         }
-        Ok(self.data_sites.get(&server_id).unwrap())
+        self.data_sites.get(&server_id)
+            .ok_or(io::Error::new(io::ErrorKind::NotFound, "data site not found"))
     }
     async fn get_data_site_by_id(
         &self,
