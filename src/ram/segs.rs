@@ -47,7 +47,6 @@ pub struct Segment {
     pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
     pub promoting: AtomicBool,      // True when promotion is in progress
-    pub protected: AtomicBool,      // True when segment is mprotect(PROT_NONE)'d
     // Padding to maintain struct size (prevents cache line sharing issues)
     _padding: [u8; 8], // 8 bytes padding to keep struct at 128 bytes
 }
@@ -102,7 +101,6 @@ impl Segment {
             cold_file_fd: AtomicI32::new(-1),  // Start as hot
             reference_bit: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
-            protected: AtomicBool::new(false), // Not protected initially
             _padding: [0u8; 8], // Initialize padding
         }
     }

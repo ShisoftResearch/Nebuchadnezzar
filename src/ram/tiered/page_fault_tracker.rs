@@ -1,13 +1,16 @@
 /// Segment-level reference bit tracking using mprotect + SIGSEGV
 /// 
 /// This module implements zero-overhead memory access tracking by:
-/// 1. Setting entire segments to PROT_NONE when CLOCK clears reference bits
-/// 2. Catching SIGSEGV/SIGBUS on first access to protected segments
-/// 3. Setting reference bit and re-enabling access (PROT_READ|PROT_WRITE)
-/// 4. CLOCK re-arms segments when sweeping by setting them back to PROT_NONE
+/// 1. CLOCK clears reference bit → calls protect_segment() to set PROT_NONE
+/// 2. First access triggers SIGSEGV → handler sets reference bit + unprotects
+/// 3. Subsequent accesses have zero overhead until CLOCK re-arms
 /// 
-/// Granularity: One bit per segment (8MB), matching natural data structure
-/// Overhead: One signal + syscall on first access after arming, then zero-cost
+/// Design:
+/// - Segment granularity (8MB): simpler than page-level, lower syscall overhead
+/// - No extra state tracking: mprotect itself tracks protection state
+/// - Signal-safe handler: lock-free, no allocation, minimal atomic operations
+/// 
+/// Overhead: One signal + one syscall (~1-2μs) on first access after protection
 
 use crate::ram::chunk::{chunk_and_segment_from_addr, get_segment_for_fault};
 use crate::ram::segs::SEGMENT_SIZE;
@@ -63,30 +66,23 @@ extern "C" fn handle_segfault(
         if let Some((chunk_id, segment_id)) = chunk_and_segment_from_addr(fault_addr) {
             // Get the segment
             if let Some(segment) = get_segment_for_fault(chunk_id, segment_id) {
-                // Check if this segment is protected
-                if segment.protected.load(Ordering::Relaxed) {
-                    // Set reference bit
-                    segment.mark_referenced();
-                    
-                    // Clear protected flag
-                    segment.protected.store(false, Ordering::Release);
-                    
-                    // Re-enable access to the entire segment
-                    let segment_addr = segment.addr;
-                    let result = libc::mprotect(
-                        segment_addr as *mut libc::c_void,
-                        SEGMENT_SIZE,
-                        PROT_READ | PROT_WRITE,
-                    );
-                    
-                    if result == 0 {
-                        // Success - return to retry the faulting instruction
-                        return;
-                    }
+                // Set reference bit
+                segment.mark_referenced();
+                
+                // Re-enable access to the entire segment
+                let segment_addr = segment.addr;
+                let result = libc::mprotect(
+                    segment_addr as *mut libc::c_void,
+                    SEGMENT_SIZE,
+                    PROT_READ | PROT_WRITE,
+                );
+                
+                if result == 0 {
+                    // Success - return to retry the faulting instruction
+                    return;
                 }
                 
-                // If we get here, either not protected or mprotect failed
-                // Fall through to crash
+                // If mprotect failed, fall through to crash
             }
         }
         
