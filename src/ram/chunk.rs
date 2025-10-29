@@ -13,7 +13,6 @@ use crate::{
 };
 
 use super::schema::Schema;
-use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
 use lightning::map::{Map, WordMap, WordMutexGuard, PtrHashMap};
 use lightning::ttl_cache::TTLCache;
@@ -24,6 +23,62 @@ use lightning::aarc::Arc as AArc;
 
 pub type CellReadGuard<'a> = WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
+
+// Global chunk allocation state for unified address space
+static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNK_SIZE_BITS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the current global chunk base address
+pub fn get_global_chunk_base() -> usize {
+    GLOBAL_CHUNK_BASE.load(Ordering::Acquire)
+}
+
+/// Get chunk size as power-of-2 bits
+pub fn get_chunk_size_bits() -> usize {
+    GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire)
+}
+
+/// Calculate chunk ID and segment ID from a fault address
+/// Returns: Some((chunk_id, segment_id)) or None if address not in range
+pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> {
+    use crate::ram::segs::SEGMENT_BITS_SHIFT;
+    
+    let base = GLOBAL_CHUNK_BASE.load(Ordering::Acquire);
+    if base == 0 || fault_addr < base {
+        return None;
+    }
+    
+    let offset = fault_addr - base;
+    let total_size = GLOBAL_ALLOCATED_SIZE.load(Ordering::Acquire);
+    
+    if offset >= total_size {
+        return None;
+    }
+    
+    let chunk_size_bits = GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire);
+    let chunk_id = offset >> chunk_size_bits;
+    let offset_in_chunk = offset & ((1 << chunk_size_bits) - 1);
+    let segment_id = offset_in_chunk >> SEGMENT_BITS_SHIFT;
+    
+    Some((chunk_id, segment_id))
+}
+
+/// Reset global chunk allocation (for tests)
+pub fn reset_global_chunk_allocation() {
+    let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
+    let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
+    
+    if base != 0 && size != 0 {
+        unsafe {
+            libc::munmap(base as *mut libc::c_void, size);
+        }
+    }
+    
+    GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
+    GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
+}
 
 // Thread-local flag to indicate if we're currently in a transaction
 // When true, WAL writes will skip fsync (will be synced at commit instead)
@@ -75,7 +130,35 @@ impl Chunk {
         tiered_memory_threshold: Option<f32>,
         tiered_physical_memory_limit: Option<usize>,
     ) -> Chunk {
-        let allocator = SegmentAllocator::new(id, size);
+        // Call new_with_base with base_addr=0 to use old allocation behavior
+        Self::new_with_base(
+            id,
+            0,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            enable_tiered_memory,
+            tiered_memory_threshold,
+            tiered_physical_memory_limit,
+        )
+    }
+
+    fn new_with_base(
+        id: usize,
+        base_addr: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        enable_tiered_memory: bool,
+        tiered_memory_threshold: Option<f32>,
+        tiered_physical_memory_limit: Option<usize>,
+    ) -> Chunk {
+        let allocate_memory = base_addr == 0;
+        let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
         let bootstrap_segment = allocator
             .alloc_seg(&backup_storage, &wal_storage)
             .expect(&format!("No space left for first segment in chunk {}", id));
@@ -869,6 +952,47 @@ impl Chunks {
         wal_storage: Option<String>,
         enable_recovery: bool,
     ) -> Arc<Chunks> {
+        use std::ptr;
+        use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+        
+        // Reset previous allocation (for test isolation)
+        reset_global_chunk_allocation();
+        
+        // Calculate power-of-2 chunk size
+        let chunk_size_raw = size / count;
+        let chunk_size = chunk_size_raw.next_power_of_two();
+        let chunk_size_bits = chunk_size.trailing_zeros() as usize;
+        
+        // Allocate one giant mmap for all chunks
+        let total_size = chunk_size * count;
+        let global_base = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                total_size,
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        
+        if global_base == libc::MAP_FAILED {
+            panic!("Failed to allocate {} bytes for {} chunks", total_size, count);
+        }
+        
+        let global_base_addr = global_base as usize;
+        
+        // Store global state
+        GLOBAL_CHUNK_BASE.store(global_base_addr, Ordering::Release);
+        GLOBAL_CHUNK_SIZE_BITS.store(chunk_size_bits, Ordering::Release);
+        GLOBAL_CHUNK_COUNT.store(count, Ordering::Release);
+        GLOBAL_ALLOCATED_SIZE.store(total_size, Ordering::Release);
+        
+        info!(
+            "Allocated global chunk space: base={:#x}, chunk_size={} (2^{}), count={}, total={}",
+            global_base_addr, chunk_size, chunk_size_bits, count, total_size
+        );
+        
         // Read tiered memory configuration from environment variables
         let enable_tiered_memory = std::env::var("NEB_TIERED_MEMORY_ENABLED")
             .map(|v| v == "1" || v.to_lowercase() == "true")
@@ -898,19 +1022,20 @@ impl Chunks {
             );
         }
         
-        let chunk_size = size / count;
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
         debug!("Creating chunks, count {} , total {} bytes", count, size);
         for i in 0..count {
+            let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
                 .clone()
                 .map(|dir| format!("{}/chunk-bk-{}", dir, i));
             let wal_storage = wal_storage
                 .clone()
                 .map(|dir| format!("{}/chunk-wal-{}", dir, i));
-            chunks.push(Chunk::new(
+            chunks.push(Chunk::new_with_base(
                 i,
+                chunk_base,
                 chunk_size,
                 meta.clone(),
                 index_builder.clone(),

@@ -375,26 +375,45 @@ pub struct SegmentAllocator {
 
 impl SegmentAllocator {
     pub fn new(chunk_id: usize, chunk_size: usize) -> Self {
-        let overflow = SEGMENT_SIZE - PAGE_SIZE;
-        let aligned_size = chunk_size + overflow;
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                aligned_size,
-                PROT_READ | PROT_WRITE,
-                MAP_ANONYMOUS | MAP_PRIVATE,
-                -1,
-                0,
-            )
+        Self::new_with_base(chunk_id, 0, chunk_size, true)
+    }
+    
+    /// Create allocator with pre-allocated base address
+    /// If allocate_memory=false, assumes memory at base_addr already exists
+    pub fn new_with_base(
+        chunk_id: usize,
+        base_addr: usize,
+        chunk_size: usize,
+        allocate_memory: bool,
+    ) -> Self {
+        let (base, addr, limit) = if allocate_memory {
+            // Old behavior: allocate our own mmap
+            let overflow = SEGMENT_SIZE - PAGE_SIZE;
+            let aligned_size = chunk_size + overflow;
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    aligned_size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            let addr = ptr as usize;
+            let start = addr + overflow;
+            let aligned_addr = start & SEGMENT_MASK;
+            (aligned_addr, aligned_addr, aligned_addr + chunk_size)
+        } else {
+            // New behavior: use provided base from global allocation
+            (base_addr, base_addr, base_addr + chunk_size)
         };
-        let addr = ptr as usize;
-        let start = addr + overflow;
-        let aligned_addr = start & SEGMENT_MASK;
+        
         Self {
-            base: aligned_addr,
-            offset: AtomicUsize::new(aligned_addr),
-            limit: aligned_addr + chunk_size,
-            gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
+            base,
+            offset: AtomicUsize::new(addr),
+            limit,
+            gc_threshold: base + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: LinkedRingBufferList::new(),
             next_seq_id: AtomicUsize::new(0),
             chunk_id,

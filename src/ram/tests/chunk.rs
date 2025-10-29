@@ -435,3 +435,68 @@ fn dyn_map_value() -> OwnedValue {
         ),
     ])
 }
+
+#[test]
+pub fn test_unified_chunk_address_space() {
+    use crate::ram::chunk::{get_global_chunk_base, get_chunk_size_bits, chunk_and_segment_from_addr};
+    use crate::ram::segs::SEGMENT_SIZE;
+    
+    let _ = env_logger::try_init();
+    
+    // Create chunks with unified address space
+    let fields = default_fields();
+    let schema = Schema::new("test", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    
+    let chunk_count = 4;
+    let total_size = CHUNK_SIZE * chunk_count;
+    let chunks = Chunks::new(
+        chunk_count,
+        total_size,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+    );
+    
+    // Verify global state is set
+    let base = get_global_chunk_base();
+    let size_bits = get_chunk_size_bits();
+    assert!(base != 0, "Global chunk base should be set");
+    assert!(size_bits > 0, "Chunk size bits should be set");
+    
+    info!("Global chunk base: {:#x}, size_bits: {}", base, size_bits);
+    
+    // Test address calculation for each chunk
+    for i in 0..chunk_count {
+        let chunk = &chunks.list[i];
+        let segment_addr = chunk.segments()[0].addr;
+        
+        // Calculate chunk ID and segment ID from address
+        let result = chunk_and_segment_from_addr(segment_addr);
+        assert!(result.is_some(), "Address should be in range");
+        
+        let (chunk_id, segment_id) = result.unwrap();
+        assert_eq!(chunk_id, i, "Chunk ID should match for chunk {}", i);
+        assert_eq!(segment_id, 0, "First segment should have ID 0 in chunk {}", i);
+        
+        info!("Chunk {} segment 0 addr: {:#x} -> chunk_id={}, seg_id={}", 
+              i, segment_addr, chunk_id, segment_id);
+        
+        // Test an address in the middle of the segment
+        let mid_addr = segment_addr + SEGMENT_SIZE / 2;
+        let result2 = chunk_and_segment_from_addr(mid_addr);
+        assert!(result2.is_some(), "Mid-address should be in range");
+        let (chunk_id2, segment_id2) = result2.unwrap();
+        assert_eq!(chunk_id2, i, "Chunk ID should still match for mid-address");
+        assert_eq!(segment_id2, 0, "Segment ID should still be 0 for mid-address");
+    }
+    
+    // Test address outside range
+    let invalid_addr = base - 1;
+    let result = chunk_and_segment_from_addr(invalid_addr);
+    assert!(result.is_none(), "Address before base should return None");
+    
+    info!("Unified chunk address space test passed!");
+}
