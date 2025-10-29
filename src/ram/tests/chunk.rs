@@ -498,5 +498,25 @@ pub fn test_unified_chunk_address_space() {
     let result = chunk_and_segment_from_addr(invalid_addr);
     assert!(result.is_none(), "Address before base should return None");
     
+    // Test global segment access
+    use crate::ram::chunk::get_segment_for_fault;
+    for i in 0..chunk_count {
+        let segment = get_segment_for_fault(i, 0);
+        assert!(segment.is_some(), "Should be able to access segment via global pointer");
+        let seg = segment.unwrap();
+        info!("Global access: chunk {} segment 0 at addr {:#x}, id {}", i, seg.addr, seg.id);
+        
+        // Verify segment address is within expected chunk range
+        let expected_chunk_base = base + (i * (1 << size_bits));
+        assert!(seg.addr >= expected_chunk_base, 
+                "Segment addr should be >= chunk base");
+        assert!(seg.addr < expected_chunk_base + (1 << size_bits), 
+                "Segment addr should be < chunk end");
+    }
+    
+    // Test invalid access
+    let invalid_seg = get_segment_for_fault(chunk_count + 1, 0);
+    assert!(invalid_seg.is_none(), "Should return None for out-of-bounds chunk");
+    
     info!("Unified chunk address space test passed!");
 }

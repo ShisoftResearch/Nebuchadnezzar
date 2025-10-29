@@ -29,6 +29,7 @@ static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_CHUNK_SIZE_BITS: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
@@ -65,6 +66,35 @@ pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> 
     Some((chunk_id, segment_id))
 }
 
+/// Set the global Chunks pointer (called by Chunks::new_with_recovery)
+pub fn set_global_chunks(chunks: &Arc<Chunks>) {
+    let ptr = Arc::as_ptr(chunks) as usize;
+    GLOBAL_CHUNKS_PTR.store(ptr, Ordering::Release);
+}
+
+/// Get a reference to the global Chunks instance
+/// SAFETY: Only safe to call if Chunks instance is still alive
+pub unsafe fn get_global_chunks() -> Option<&'static Chunks> {
+    let ptr = GLOBAL_CHUNKS_PTR.load(Ordering::Acquire);
+    if ptr == 0 {
+        None
+    } else {
+        Some(&*(ptr as *const Chunks))
+    }
+}
+
+/// Access a segment by chunk_id and segment_id from the global Chunks
+/// Used by signal handler to flip reference bits
+pub fn get_segment_for_fault(chunk_id: usize, segment_id: usize) -> Option<AArc<crate::ram::segs::Segment>> {
+    unsafe {
+        get_global_chunks().and_then(|chunks| {
+            chunks.list.get(chunk_id).and_then(|chunk| {
+                chunk.segs.get(&segment_id)
+            })
+        })
+    }
+}
+
 /// Reset global chunk allocation (for tests)
 pub fn reset_global_chunk_allocation() {
     let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
@@ -78,6 +108,7 @@ pub fn reset_global_chunk_allocation() {
     
     GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
     GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
+    GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
 }
 
 // Thread-local flag to indicate if we're currently in a transaction
@@ -1052,6 +1083,9 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
         });
+        
+        // Store global pointer for signal handler access
+        set_global_chunks(&chunks_arc);
         
         // Attempt recovery if enabled
         if enable_recovery {
