@@ -317,7 +317,16 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 
-                // Note: Reference bit tracking now handled automatically by mprotect fault handler
+                // For cold segments, manually set reference bit since mprotect won't catch them
+                // (cold segments are backed by files, not protected memory)
+                // For hot segments, mprotect fault handler will set the bit automatically
+                let cell_addr = *index;
+                let seg_id = self.allocator.id_by_addr(cell_addr);
+                if let Some(segment) = self.segs.get(&seg_id) {
+                    if segment.is_cold() {
+                        segment.mark_referenced();
+                    }
+                }
                 
                 return Ok(index);
             }
@@ -1047,6 +1056,9 @@ impl Chunks {
                 tiered_memory_threshold.unwrap_or(0.8),
                 tiered_physical_memory_limit.map(|l| format!("{}", l)).unwrap_or("None (use chunk capacity)".to_string())
             );
+            
+            // Install page fault handlers for reference bit tracking
+            crate::ram::tiered::page_fault_tracker::install_fault_handlers();
         }
         
         let mut chunks = Vec::new();

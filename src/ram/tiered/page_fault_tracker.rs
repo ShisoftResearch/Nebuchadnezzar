@@ -69,6 +69,16 @@ extern "C" fn handle_segfault(
                 // Set reference bit
                 segment.mark_referenced();
                 
+                if cfg!(debug_assertions) {                
+                    // Log the reference (signal-safe: write to stderr fd directly)
+                    // Note: This is expensive but useful for debugging. Remove in production.
+                    let msg = format!(
+                        "[PAGE_FAULT] Segment referenced: chunk={}, seg_id={}, addr={:#x}\n",
+                        chunk_id, segment_id, segment.addr
+                    );
+                    libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+                }
+                
                 // Re-enable access to the entire segment
                 let segment_addr = segment.addr;
                 let result = libc::mprotect(
