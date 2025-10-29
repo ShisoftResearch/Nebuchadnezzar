@@ -21,6 +21,10 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
+// Page constants (used for alignment and mprotect)
+pub const PAGE_SHIFT: usize = 12; // 4KB pages
+pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+
 #[derive(Default)]
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
 pub struct Segment {
@@ -41,8 +45,9 @@ pub struct Segment {
     pub dropped: AtomicBool,
     // Tiered memory fields
     pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
-    pub reference_bit: AtomicBool, // For CLOCK eviction algorithm
+    pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
     pub promoting: AtomicBool,      // True when promotion is in progress
+    pub protected: AtomicBool,      // True when segment is mprotect(PROT_NONE)'d
     // Padding to maintain struct size (prevents cache line sharing issues)
     _padding: [u8; 8], // 8 bytes padding to keep struct at 128 bytes
 }
@@ -97,6 +102,7 @@ impl Segment {
             cold_file_fd: AtomicI32::new(-1),  // Start as hot
             reference_bit: AtomicBool::new(false),
             promoting: AtomicBool::new(false),
+            protected: AtomicBool::new(false), // Not protected initially
             _padding: [0u8; 8], // Initialize padding
         }
     }
@@ -359,9 +365,6 @@ impl Iterator for SegmentEntryIter {
         Some(entry_meta)
     }
 }
-
-pub const PAGE_SHIFT: usize = 12; // 4K
-pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
 pub struct SegmentAllocator {
     base: usize,
