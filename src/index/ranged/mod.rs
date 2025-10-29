@@ -32,7 +32,8 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 32 * 1024 * 1024 * 1024, // G
+                total_size: 32 * 1024 * 1024 * 1024, // G
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,

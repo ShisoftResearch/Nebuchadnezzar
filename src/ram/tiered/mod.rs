@@ -11,7 +11,7 @@ mod tests;
 mod bench;
 
 /// Configuration for tiered memory management
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TieredConfig {
     /// Memory usage threshold (0.0-1.0) to trigger eviction
     pub threshold: f32,

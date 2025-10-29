@@ -38,7 +38,8 @@ pub async fn init() {
     NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            total_size: 64 * 1024 * 1024, // 64 MB - must be >= SEGMENT_SIZE (8 MB)
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -67,7 +68,8 @@ pub async fn smoke_test() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 512 * 1024 * 1024,
+            total_size: 512 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -147,7 +149,8 @@ pub async fn smoke_test_parallel() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 4,
-            memory_size: 16 * 1024 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -246,7 +249,8 @@ pub async fn txn() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 512 * 1024 * 1024,
+            total_size: 512 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -317,7 +321,8 @@ pub async fn schema_wal_recovery_test() {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
@@ -414,7 +419,8 @@ pub async fn schema_wal_recovery_test() {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
@@ -491,7 +497,8 @@ pub async fn schema_snapshot_recovery_test() {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
@@ -601,7 +608,8 @@ pub async fn schema_snapshot_recovery_test() {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
@@ -697,7 +705,8 @@ pub async fn schema_persistence_multiple_restarts() {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
@@ -767,7 +776,8 @@ pub async fn schema_persistence_multiple_restarts() {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: 64 * 1024 * 1024,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,

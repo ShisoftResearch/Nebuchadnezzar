@@ -14,7 +14,8 @@ pub async fn workspace_wr() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: SEGMENT_SIZE,
+            total_size: SEGMENT_SIZE,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             index_enabled: false,
@@ -156,7 +157,8 @@ pub async fn data_site_wr() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             index_enabled: false,
@@ -255,7 +257,8 @@ pub async fn multi_transaction() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             index_enabled: false,
@@ -365,7 +368,8 @@ pub async fn smoke_rw() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             index_enabled: false,

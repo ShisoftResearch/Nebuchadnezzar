@@ -66,7 +66,8 @@ pub enum ServerError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
     pub chunk_count: usize,
-    pub memory_size: usize,
+    pub total_size: usize,
+    pub tiered_config: Option<crate::ram::tiered::TieredConfig>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
     pub undo_log_storage: Option<String>,
@@ -156,7 +157,7 @@ impl NebServer {
         let conshasing = init_conshash(
             group_name,
             server_addr,
-            opts.memory_size as u64,
+            opts.total_size as u64,
             raft_client,
             membership_client,
         )
@@ -175,12 +176,12 @@ impl NebServer {
         };
         let chunks = Chunks::new_with_recovery(
             opts.chunk_count,
-            opts.memory_size,
+            opts.total_size,
             meta_rc.clone(),
             index_builder.clone(),
             opts.backup_storage.clone(),
             opts.wal_storage.clone(),
-            crate::ram::tiered::TieredConfig::from_env(),
+            opts.tiered_config.clone().or_else(|| crate::ram::tiered::TieredConfig::from_env()),
             opts.enable_recovery,
         );
         

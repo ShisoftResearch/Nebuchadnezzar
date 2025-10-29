@@ -21,7 +21,8 @@ pub async fn general() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -171,7 +172,8 @@ pub async fn multi_cell_update() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -269,7 +271,8 @@ pub async fn write_skew() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -368,7 +371,8 @@ pub async fn server_isolation() {
     let server_1 = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,
@@ -396,7 +400,8 @@ pub async fn server_isolation() {
     let server_2 = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            memory_size: 16 * 1024 * 1024,
+            total_size: 16 * 1024 * 1024,
+            tiered_config: None,
             backup_storage: None,
             wal_storage: None,
             undo_log_storage: None,

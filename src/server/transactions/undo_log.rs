@@ -1655,7 +1655,8 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -1726,7 +1727,8 @@ mod tests {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -1778,7 +1780,8 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -1865,7 +1868,8 @@ mod tests {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -1913,7 +1917,8 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -1992,7 +1997,8 @@ mod tests {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -2038,7 +2044,8 @@ mod tests {
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
@@ -2101,7 +2108,8 @@ mod tests {
         let server2 = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
-                memory_size: SEGMENT_SIZE * 4,
+                total_size: SEGMENT_SIZE * 4,
+                tiered_config: None,
                 backup_storage: Some(backup_path.to_str().unwrap().to_string()),
                 wal_storage: Some(wal_path.to_str().unwrap().to_string()),
                 index_enabled: false,
