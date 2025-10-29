@@ -50,6 +50,7 @@ pub fn cell_rw() {
         None,
         None,
         None,
+        None,
     );
     let header = chunks.write_cell(&mut cell).unwrap();
     let _cell_1_ptr = chunks.address_of(&Id::from_header(&header));
@@ -171,6 +172,7 @@ pub fn simple_cell_rw() {
         None,
         None,
         None,
+        None,
     );
     chunks.write_cell(&mut cell).unwrap();
     {
@@ -194,6 +196,7 @@ pub fn array_dyn_map() {
         1,
         CHUNK_SIZE,
         Arc::new(ServerMeta { schemas }),
+        None,
         None,
         None,
         None,
@@ -225,6 +228,7 @@ pub fn complex_cell_sel_read() {
         1,
         CHUNK_SIZE,
         Arc::new(ServerMeta { schemas }),
+        None,
         None,
         None,
         None,
@@ -455,6 +459,7 @@ pub fn test_unified_chunk_address_space() {
         chunk_count,
         total_size,
         Arc::new(ServerMeta { schemas }),
+        None,
         None,
         None,
         None,

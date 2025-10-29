@@ -1481,6 +1481,7 @@ mod tests {
                 None,
                 Some(backup_dir.to_str().unwrap().to_string()),
                 Some(wal_dir.to_str().unwrap().to_string()),
+                None,
             );
             
             let mut cell = OwnedCell::new_with_id(
@@ -1517,6 +1518,7 @@ mod tests {
                 None,
                 Some(backup_dir.to_str().unwrap().to_string()),
                 Some(wal_dir.to_str().unwrap().to_string()),
+                None,
                 true,
             );
             
@@ -1567,7 +1569,7 @@ mod tests {
         schemas.new_schema(schema);
         let meta = Arc::new(crate::server::ServerMeta { schemas });
         
-        let chunks = Chunks::new(1, 32 * 1024 * 1024, meta.clone(), None, None, None);
+        let chunks = Chunks::new(1, 32 * 1024 * 1024, meta.clone(), None, None, None, None);
         let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
         
         println!("=== Step 1: Create initial cell ===");

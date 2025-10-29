@@ -44,6 +44,7 @@ pub fn full_clean_cycle() {
         None,
         None,
         None,
+        None,
     );
     let chunk = &chunks.list[0];
 

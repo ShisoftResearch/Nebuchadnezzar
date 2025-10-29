@@ -60,6 +60,7 @@ fn test_eviction_on_memory_overflow() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
     );
     
     // Verify tiered manager is enabled in at least one chunk
@@ -207,6 +208,7 @@ fn test_cold_segment_promotion() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
     );
     
     // Write cells
@@ -313,6 +315,7 @@ fn test_cleaner_ignores_cold_segments() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
     );
     
     // Write data and force eviction
@@ -409,6 +412,7 @@ fn test_tiered_memory_with_recovery_enabled() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
         true, // recovery enabled
     );
     
@@ -548,6 +552,7 @@ fn test_recovery_loads_segments_as_cold() {
             None,
             Some(backup_dir.to_string()),
             Some(wal_dir.to_string()),
+            crate::ram::tiered::TieredConfig::from_env(),
         );
         
         // Write enough data to create at least 20 segments
@@ -601,6 +606,7 @@ fn test_recovery_loads_segments_as_cold() {
             None,
             Some(backup_dir.to_string()),
             Some(wal_dir.to_string()),
+            crate::ram::tiered::TieredConfig::from_env(),
             true, // enable recovery
         );
         
@@ -689,6 +695,7 @@ fn test_cold_segment_recycling() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
     );
     
     // Track allocated segment addresses
@@ -839,6 +846,7 @@ fn test_hot_segment_recycling() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        None, // No tiered memory for this test
     );
     
     // Phase 1: Fill multiple segments with recognizable data
@@ -997,6 +1005,7 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        crate::ram::tiered::TieredConfig::from_env(),
     );
     
     // Start cleaner (this is what triggers eviction/promotion automatically)
@@ -1038,7 +1047,7 @@ fn test_tiered_memory_end_to_end_with_cleaner() {
     
     // Check current memory usage
     let stats = chunks.list[0].tiered_manager.as_ref().unwrap().stats(&chunks.list[0]);
-    let memory_limit = chunks.list[0].tiered_manager.as_ref().unwrap().physical_memory_limit.unwrap();
+    let memory_limit = chunks.list[0].tiered_manager.as_ref().unwrap().physical_memory_limit;
     let segment_size = SEGMENT_SIZE;
     let estimated_hot_memory = stats.hot_segments * segment_size;
     println!("Before waiting for eviction - Stats: hot_segments={}, cold_segments={}, total={}, limit={} bytes (~{} segments), estimated_hot_memory={} bytes",

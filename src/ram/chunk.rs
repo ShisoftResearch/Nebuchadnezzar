@@ -157,9 +157,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        enable_tiered_memory: bool,
-        tiered_memory_threshold: Option<f32>,
-        tiered_physical_memory_limit: Option<usize>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Chunk {
         // Call new_with_base with base_addr=0 to use old allocation behavior
         Self::new_with_base(
@@ -170,9 +168,7 @@ impl Chunk {
             index_builder,
             backup_storage,
             wal_storage,
-            enable_tiered_memory,
-            tiered_memory_threshold,
-            tiered_physical_memory_limit,
+            tiered_config,
         )
     }
 
@@ -184,9 +180,7 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
-        enable_tiered_memory: bool,
-        tiered_memory_threshold: Option<f32>,
-        tiered_physical_memory_limit: Option<usize>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
@@ -201,20 +195,17 @@ impl Chunk {
                 n + 1
             }
         };
-        assert!(!(base_addr == 0 && enable_tiered_memory), "Should not enable tiered memory if the memory is not allocated by Chunks");
+        assert!(!(base_addr == 0 && tiered_config.is_some()), "Should not enable tiered memory if the memory is not allocated by Chunks");
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
         // Create tiered memory manager if enabled
-        let tiered_manager = if enable_tiered_memory {
-            let threshold = tiered_memory_threshold.unwrap_or(0.8);
-            Some(crate::ram::tiered::manager::TieredMemoryManager::new(
-                tiered_physical_memory_limit,
-                threshold,
-            ))
-        } else {
-            None
-        };
+        let tiered_manager = tiered_config.map(|config| {
+            crate::ram::tiered::manager::TieredMemoryManager::new(
+                config.physical_memory_limit,
+                config.threshold,
+            )
+        });
         
         let chunk = Chunk {
             id,
@@ -969,8 +960,9 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Arc<Chunks> {
-        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, false)
+        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, tiered_config, false)
     }
     
     pub fn new_with_recovery(
@@ -980,6 +972,7 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
         enable_recovery: bool,
     ) -> Arc<Chunks> {
         use std::ptr;
@@ -1023,32 +1016,12 @@ impl Chunks {
             global_base_addr, chunk_size, chunk_size_bits, count, total_size
         );
         
-        // Read tiered memory configuration from environment variables
-        let enable_tiered_memory = std::env::var("NEB_TIERED_MEMORY_ENABLED")
-            .map(|v| v == "1" || v.to_lowercase() == "true")
-            .unwrap_or(false);
-        
-        let tiered_memory_threshold = if enable_tiered_memory {
-            std::env::var("NEB_TIERED_MEMORY_THRESHOLD")
-                .ok()
-                .and_then(|v| v.parse::<f32>().ok())
-        } else {
-            None
-        };
-        
-        let tiered_physical_memory_limit = if enable_tiered_memory {
-            std::env::var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-        } else {
-            None
-        };
-        
-        if enable_tiered_memory {
+        // Log tiered memory configuration if enabled
+        if let Some(ref config) = tiered_config {
             info!(
-                "Tiered memory enabled with threshold: {}, physical memory limit: {} bytes",
-                tiered_memory_threshold.unwrap_or(0.8),
-                tiered_physical_memory_limit.map(|l| format!("{}", l)).unwrap_or("None (use chunk capacity)".to_string())
+                "Tiered memory enabled with threshold: {}, physical memory limit: {} MB",
+                config.threshold,
+                config.physical_memory_limit / (1024 * 1024)
             );
             
             // Install page fault handlers for reference bit tracking
@@ -1074,9 +1047,7 @@ impl Chunks {
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
-                enable_tiered_memory,
-                tiered_memory_threshold,
-                tiered_physical_memory_limit,
+                tiered_config.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -1123,6 +1094,7 @@ impl Chunks {
             Arc::<ServerMeta>::new(ServerMeta {
                 schemas: LocalSchemasCache::new_local(""),
             }),
+            None,
             None,
             None,
             None,

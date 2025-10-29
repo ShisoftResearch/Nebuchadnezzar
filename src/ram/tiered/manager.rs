@@ -13,7 +13,7 @@ use std::sync::atomic::AtomicBool;
 pub struct TieredMemoryManager {
     /// Physical memory limit in bytes (hot segments cannot exceed this)
     /// When hot segment memory usage exceeds this limit, eviction is triggered
-    pub physical_memory_limit: Option<usize>,
+    pub physical_memory_limit: usize,
     
     /// Eviction threshold as percentage of physical memory limit (0.0 to 1.0)
     /// Default: 0.8 (80%)
@@ -34,9 +34,9 @@ impl TieredMemoryManager {
     /// Create a new tiered memory manager
     /// 
     /// # Arguments
-    /// * `physical_memory_limit` - Physical memory limit in bytes (None = use threshold % of capacity)
+    /// * `physical_memory_limit` - Physical memory limit in bytes for hot segments
     /// * `eviction_threshold_percent` - Percentage (0.0-1.0) of limit before eviction
-    pub fn new(physical_memory_limit: Option<usize>, eviction_threshold_percent: f32) -> Self {
+    pub fn new(physical_memory_limit: usize, eviction_threshold_percent: f32) -> Self {
         TieredMemoryManager {
             physical_memory_limit,
             eviction_threshold_percent: eviction_threshold_percent.clamp(0.0, 1.0),
@@ -46,19 +46,9 @@ impl TieredMemoryManager {
         }
     }
     
-    /// Create with default threshold (80%) and no explicit memory limit
-    pub fn with_defaults() -> Self {
-        Self::new(None, 0.8)
-    }
-    
-    /// Create with explicit physical memory limit
-    pub fn with_memory_limit(physical_memory_limit_bytes: usize, threshold: f32) -> Self {
-        Self::new(Some(physical_memory_limit_bytes), threshold)
-    }
-    
     /// Check if eviction is needed and evict segments if necessary
     /// 
-    /// Uses physical_memory_limit if set, otherwise uses chunk capacity
+    /// Uses the configured physical_memory_limit for hot segments
     /// 
     /// Returns the number of segments evicted
     pub fn check_and_evict(&self, chunk: &Chunk) -> Result<usize, io::Error> {
@@ -69,8 +59,8 @@ impl TieredMemoryManager {
         let hot_segments_count = self.count_hot_segments(chunk);
         let hot_memory_bytes = hot_segments_count * SEGMENT_SIZE;
         
-        // Calculate memory limit: use physical_memory_limit if set, else use chunk capacity
-        let memory_limit = self.physical_memory_limit.unwrap_or(chunk.capacity);
+        // Calculate threshold based on physical memory limit
+        let memory_limit = self.physical_memory_limit;
         let threshold_bytes = (memory_limit as f32 * self.eviction_threshold_percent) as usize;
         
         debug!(
@@ -212,38 +202,35 @@ pub struct TieredMemoryStats {
     pub threshold: f32,
 }
 
-impl Default for TieredMemoryManager {
-    fn default() -> Self {
-        Self::with_defaults()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     
     #[test]
     fn test_manager_creation() {
-        let manager = TieredMemoryManager::new(None, 0.8);
+        let limit = 1024 * 1024 * 1024; // 1GB
+        let manager = TieredMemoryManager::new(limit, 0.8);
         assert!(manager.is_enabled());
         assert_eq!(manager.eviction_threshold_percent, 0.8);
+        assert_eq!(manager.physical_memory_limit, limit);
     }
     
     #[test]
     fn test_threshold_clamping() {
-        let manager = TieredMemoryManager::new(None, 1.5);
+        let limit = 1024 * 1024 * 1024; // 1GB
+        let manager = TieredMemoryManager::new(limit, 1.5);
         assert_eq!(manager.eviction_threshold_percent, 1.0);
         
-        let manager = TieredMemoryManager::new(None, -0.5);
+        let manager = TieredMemoryManager::new(limit, -0.5);
         assert_eq!(manager.eviction_threshold_percent, 0.0);
     }
     
     #[test]
     fn test_manager_with_memory_limit() {
         let limit = 64 * 1024 * 1024; // 64MB
-        let manager = TieredMemoryManager::with_memory_limit(limit, 0.9);
+        let manager = TieredMemoryManager::new(limit, 0.9);
         assert!(manager.is_enabled());
-        assert_eq!(manager.physical_memory_limit, Some(limit));
+        assert_eq!(manager.physical_memory_limit, limit);
         assert_eq!(manager.eviction_threshold_percent, 0.9);
     }
 }

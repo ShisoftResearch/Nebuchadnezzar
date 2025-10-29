@@ -388,24 +388,21 @@ fn should_recover_as_cold(
     hot_memory_used: &HashMap<usize, usize>,
 ) -> bool {
     if let Some(ref tiered_manager) = chunk.tiered_manager {
-        if let Some(physical_limit) = tiered_manager.physical_memory_limit {
-            let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
-            let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
-            
-            let recover_as_cold = file_info.is_backup && would_exceed_limit;
-            
-            debug!(
-                "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
-                chunk_hot_used / (1024 * 1024),
-                physical_limit / (1024 * 1024),
-                would_exceed_limit,
-                recover_as_cold
-            );
-            
+        let physical_limit = tiered_manager.physical_memory_limit;
+        let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
+        let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
+        
+        let recover_as_cold = file_info.is_backup && would_exceed_limit;
+        
+        debug!(
+            "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
+            chunk_hot_used / (1024 * 1024),
+            physical_limit / (1024 * 1024),
+            would_exceed_limit,
             recover_as_cold
-        } else {
-            false // No physical limit, recover all as hot
-        }
+        );
+        
+        recover_as_cold
     } else {
         false // Tiered memory not enabled
     }
@@ -845,6 +842,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false, // no recovery on first run
             );
 
@@ -875,6 +873,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true, // enable recovery
             );
 
@@ -910,6 +909,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -962,6 +962,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true, // recover first
             );
             println!("Chunks recovered successfully");
@@ -1025,6 +1026,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
             println!("Chunks recovered, cell count: {}", chunks.list[0].cell_count());
@@ -1063,6 +1065,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -1091,6 +1094,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true, // recover
             );
 
@@ -1119,6 +1123,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
 
@@ -1154,6 +1159,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -1184,6 +1190,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
 
@@ -1213,6 +1220,7 @@ mod tests {
             None, // index_builder
             Some(backup_dir.path().to_str().unwrap().to_string()),
             Some(wal_dir.path().to_str().unwrap().to_string()),
+            None, // no tiered memory
             true, // enable recovery even though nothing to recover
         );
 
@@ -1239,6 +1247,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -1267,6 +1276,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
 
@@ -1313,6 +1323,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -1333,6 +1344,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
 
@@ -1377,6 +1389,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 false,
             );
 
@@ -1408,6 +1421,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
                 true,
             );
 

@@ -154,6 +154,7 @@ fn bench_hot_segment_reads() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        Some(crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2)),
     );
     
     // Create 3 segments worth of data
@@ -247,6 +248,7 @@ fn bench_cold_segment_reads() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        Some(crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2)),
     );
     
     // Create 5 segments worth of data (most will be cold)
@@ -360,6 +362,7 @@ fn bench_mixed_uniform() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        Some(crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2)),
     );
     
     // Create 5 segments worth of data
@@ -466,6 +469,7 @@ fn bench_mixed_zipf() {
         None,
         Some(backup_dir.to_string()),
         Some(wal_dir.to_string()),
+        Some(crate::ram::tiered::TieredConfig::with_memory_limit(chunk_capacity / 2)),
     );
     
     // Create 5 segments worth of data
