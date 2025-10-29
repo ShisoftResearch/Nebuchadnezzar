@@ -3,8 +3,7 @@ use itertools::Itertools;
 use lightning::{aarc::Arc, map::PtrHashMap};
 use std::sync::atomic::Ordering::Relaxed;
 use std::{
-    pin::Pin,
-    sync::atomic::{AtomicU64, AtomicUsize},
+    sync::atomic::AtomicU64,
     thread,
 };
 use tokio::{sync::mpsc::*, task::LocalSet};

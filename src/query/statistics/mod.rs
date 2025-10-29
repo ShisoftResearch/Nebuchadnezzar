@@ -539,6 +539,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let mut rng = rand::thread_rng();
         for i in 0..CHUNK_TEST_SIZE {

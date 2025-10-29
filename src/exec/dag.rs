@@ -2,10 +2,7 @@
 // It can be used on local execution and distributed execution
 // depends on the model
 
-use std::{
-    any::Any,
-    collections::{BTreeMap, HashMap, VecDeque},
-};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use dovahkiin::expr::serde::Expr;
 use dovahkiin::types::OwnedValue;

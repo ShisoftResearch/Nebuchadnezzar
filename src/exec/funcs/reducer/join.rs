@@ -8,7 +8,7 @@ use crate::exec::{
     partitioner::Partitioner,
     query::{
         self,
-        partitioning::{get_hash_partitioner, Partitioning},
+        partitioning::Partitioning,
     },
     symbols::objs,
 };

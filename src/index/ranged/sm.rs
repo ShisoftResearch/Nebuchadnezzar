@@ -47,7 +47,7 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for MasterTreeSM {
-    fn locate_key(&self, entry: EntryKey) -> BoxFuture<(EntryKey, TreePlacement, EntryKey)> {
+    fn locate_key(&self, entry: EntryKey) -> BoxFuture<'_, (EntryKey, TreePlacement, EntryKey)> {
         let (lower, tree) = self
             .tree
             .range(..=&entry)
@@ -64,7 +64,7 @@ impl StateMachineCmds for MasterTreeSM {
         future::ready((lower, tree, upper)).boxed()
     }
 
-    fn next_tree(&self, tree_lower: EntryKey, ordering: Ordering) -> BoxFuture<Option<TreeInfo>> {
+    fn next_tree(&self, tree_lower: EntryKey, ordering: Ordering) -> BoxFuture<'_, Option<TreeInfo>> {
         debug!(
             "Query next tree for {:?}, ordering {:?}, trees {:?}",
             tree_lower, ordering, self.tree
@@ -102,7 +102,7 @@ impl StateMachineCmds for MasterTreeSM {
         .boxed()
     }
 
-    fn split(&mut self, src_tree: Id, new_tree: Id, pivot: EntryKey) -> BoxFuture<()> {
+    fn split(&mut self, src_tree: Id, new_tree: Id, pivot: EntryKey) -> BoxFuture<'_, ()> {
         // Call this after the tree have been split and persisted
         async move {
             let upper_bound = match self.tree.range(&pivot..).next() {
@@ -140,7 +140,7 @@ impl StateMachineCtl for MasterTreeSM {
     fn snapshot(&self) -> Vec<u8> {
         utils::serde::serialize(&self.tree)
     }
-    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
+    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
         let tree = utils::serde::deserialize(&data).unwrap();
         self.tree = tree;
         future::ready(()).boxed()

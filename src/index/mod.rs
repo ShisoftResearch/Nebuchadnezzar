@@ -12,19 +12,17 @@ pub const KEY_SIZE: usize = ID_SIZE + FEATURE_SIZE + 8; // 8 is the estimate len
 pub const SCHEMA_SCAN_PATT_SIZE: u8 = (FEATURE_SIZE + 8) as u8;
 pub const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
 use dovahkiin::types::{Id, OwnedValue};
 pub use entry::EntryKey;
 pub use entry::ID_SIZE;
-use futures::future::BoxFuture;
 use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::builder::IndexError;
 use crate::index::vector::{VectorIndexClient, VectorIndexerCore};
 use crate::ram::cell::ReadError;
 

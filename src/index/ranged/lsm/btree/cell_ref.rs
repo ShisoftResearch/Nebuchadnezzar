@@ -112,7 +112,7 @@ impl NodeCellRef {
         &self,
         deletion: &Arc<DeletionSet>,
         neb: &Arc<crate::client::AsyncClient>,
-    ) -> BoxFuture<()> {
+    ) -> BoxFuture<'_, ()> {
         if !self.is_default() {
             unsafe {
                 return self

@@ -9,7 +9,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use itertools::Itertools;
 
 use crate::{
-    client::{client_by_server_name, transaction::TxnError, AsyncClient},
+    client::{client_by_server_name, AsyncClient},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
         hash::get_hash_id_from_value,
@@ -23,7 +23,6 @@ use crate::{
         EntryKey, Feature, IndexerClients, SCHEMA_SCAN_PATT_SIZE,
     },
     ram::cell::{OwnedCell, ReadError},
-    server::cell_rpc::AsyncServiceClient,
 };
 
 const SCAN_BUFFER_SIZE: u16 = 64;

@@ -7,9 +7,7 @@ use crate::ram::types::{bool_io, u32_io, SharedMap, SharedValue, Type};
 
 use super::align_address_with_ty;
 use super::writer::{ARRAY_TYPE_MASK, NULL_PLACEHOLDER};
-use dovahkiin::ahash::HashMap;
 use dovahkiin::types::{key_hash, Map, ARRAY_LEN_TYPE};
-use std::collections::BTreeMap;
 use std::mem;
 
 /// Reads a field from memory at the given base pointer according to the field's schema.

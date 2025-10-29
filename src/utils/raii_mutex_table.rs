@@ -25,7 +25,7 @@ where
         }
     }
 
-    pub fn lock(&self, k: K) -> RAIIMutexGuard<K> {
+    pub fn lock(&self, k: K) -> RAIIMutexGuard<'_, K> {
         loop {
             let mut map_guard = self.map.lock();
             if !map_guard.contains(&k) {

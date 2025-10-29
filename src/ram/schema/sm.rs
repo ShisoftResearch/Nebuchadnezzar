@@ -38,20 +38,20 @@ raft_state_machine! {
 }
 
 impl StateMachineCmds for SchemasSM {
-    fn get_all(&self) -> BoxFuture<Vec<Schema>> {
+    fn get_all(&self) -> BoxFuture<'_, Vec<Schema>> {
         future::ready(self.map.get_all()).boxed()
     }
-    fn get(&self, id: u32) -> BoxFuture<Option<Schema>> {
+    fn get(&self, id: u32) -> BoxFuture<'_, Option<Schema>> {
         future::ready(self.map.schema_map.get(&id).map(|r| -> Schema {
             let borrow: &Schema = r;
             borrow.clone()
         }))
         .boxed()
     }
-    fn id_of_name(&self, name: String) -> BoxFuture<Option<u32>> {
+    fn id_of_name(&self, name: String) -> BoxFuture<'_, Option<u32>> {
         future::ready(self.map.id_of_name(&name)).boxed()
     }
-    fn get_by_name(&self, name: String) -> BoxFuture<Option<Schema>> {
+    fn get_by_name(&self, name: String) -> BoxFuture<'_, Option<Schema>> {
         let id = self.map.id_of_name(&name);
         if let Some(id) = id {
             self.get(id)
@@ -59,7 +59,7 @@ impl StateMachineCmds for SchemasSM {
             future::ready(None).boxed()
         }
     }
-    fn new_schema(&mut self, schema: Schema) -> BoxFuture<Result<(), NewSchemaError>> {
+    fn new_schema(&mut self, schema: Schema) -> BoxFuture<'_, Result<(), NewSchemaError>> {
         async move {
             self.map.new_schema(schema.clone())?;
             self.callback
@@ -70,7 +70,7 @@ impl StateMachineCmds for SchemasSM {
         }
         .boxed()
     }
-    fn del_schema(&mut self, name: String) -> BoxFuture<Result<(), DelSchemaError>> {
+    fn del_schema(&mut self, name: String) -> BoxFuture<'_, Result<(), DelSchemaError>> {
         async move {
             self.map.del_schema(&name)?;
             self.callback
@@ -81,7 +81,7 @@ impl StateMachineCmds for SchemasSM {
         }
         .boxed()
     }
-    fn next_id(&mut self) -> BoxFuture<u32> {
+    fn next_id(&mut self) -> BoxFuture<'_, u32> {
         // Always start from max existing ID to handle WAL replay scenarios
         // where schemas were added with explicit IDs
         let max_existing = self.map.schema_map.keys().max().copied().unwrap_or(0);
@@ -105,7 +105,7 @@ impl StateMachineCtl for SchemasSM {
     fn snapshot(&self) -> Vec<u8> {
         utils::serde::serialize(&self.map.get_all())
     }
-    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<()> {
+    fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
         trace!("========== SchemasSM::recover() CALLED ==========");
         trace!("Received {} bytes of snapshot data", data.len());
         

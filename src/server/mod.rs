@@ -180,6 +180,7 @@ impl NebServer {
             index_builder.clone(),
             opts.backup_storage.clone(),
             opts.wal_storage.clone(),
+            crate::ram::tiered::TieredConfig::from_env(),
             opts.enable_recovery,
         );
         

@@ -289,7 +289,7 @@ impl<'v> SharedCellData<'v> {
             data: self.data.owned(),
         }
     }
-    pub fn into_shared(self, guard: WordMutexGuard<'v>) -> SharedCell {
+    pub fn into_shared(self, guard: WordMutexGuard<'v>) -> SharedCell<'v> {
         SharedCell { guard, inner: self }
     }
 }
@@ -317,10 +317,10 @@ impl<'a, T> SharedData<'a, T> {
     pub fn compose(data: T, guard: WordMutexGuard<'a>) -> Self {
         Self { inner: data, guard }
     }
-    pub fn guard(&self) -> &WordMutexGuard {
+    pub fn guard(&self) -> &WordMutexGuard<'_> {
         &self.guard
     }
-    pub fn guard_mut(&'a mut self) -> &'a mut WordMutexGuard {
+    pub fn guard_mut(&'a mut self) -> &'a mut WordMutexGuard<'a> {
         &mut self.guard
     }
     pub fn into_guard(self) -> WordMutexGuard<'a> {

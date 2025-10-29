@@ -1,6 +1,6 @@
-use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell, ReadError, SharedCell, WriteError};
+use crate::ram::cell::{cell_header_from_entry_content_addr, CellHeader, OwnedCell};
 use crate::ram::chunk::Chunks;
-use crate::ram::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
+use crate::ram::entry::Entry;
 use crate::ram::io::reader;
 use crate::ram::types::Id;
 use bifrost::vector_clock::StandardVectorClock;
@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, remove_file, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -1481,6 +1481,7 @@ mod tests {
                 None,
                 Some(backup_dir.to_str().unwrap().to_string()),
                 Some(wal_dir.to_str().unwrap().to_string()),
+                None,
             );
             
             let mut cell = OwnedCell::new_with_id(
@@ -1517,6 +1518,7 @@ mod tests {
                 None,
                 Some(backup_dir.to_str().unwrap().to_string()),
                 Some(wal_dir.to_str().unwrap().to_string()),
+                None,
                 true,
             );
             
@@ -1567,7 +1569,7 @@ mod tests {
         schemas.new_schema(schema);
         let meta = Arc::new(crate::server::ServerMeta { schemas });
         
-        let chunks = Chunks::new(1, 32 * 1024 * 1024, meta.clone(), None, None, None);
+        let chunks = Chunks::new(1, 32 * 1024 * 1024, meta.clone(), None, None, None, None);
         let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
         
         println!("=== Step 1: Create initial cell ===");

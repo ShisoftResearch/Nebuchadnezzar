@@ -2,6 +2,7 @@ use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatisti
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
+use crate::ram::segment_list::SegmentList;
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -12,17 +13,103 @@ use crate::{
 };
 
 use super::schema::Schema;
-use crate::utils::upper_power_of_2;
 use bifrost::utils::time::get_time;
-use lightning::linked_map::LinkedHashMap;
-use lightning::map::*;
+use lightning::map::{Map, WordMap, WordMutexGuard, PtrHashMap};
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use lightning::aarc::Arc as AArc;
 
-pub type CellReadGuard<'a> = lightning::map::WordMutexGuard<'a>;
-pub type CellWriteGuard<'a> = lightning::map::WordMutexGuard<'a>;
+pub type CellReadGuard<'a> = WordMutexGuard<'a>;
+pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
+
+// Global chunk allocation state for unified address space
+static GLOBAL_CHUNK_BASE: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNK_SIZE_BITS: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
+static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
+
+/// Get the current global chunk base address
+pub fn get_global_chunk_base() -> usize {
+    GLOBAL_CHUNK_BASE.load(Ordering::Acquire)
+}
+
+/// Get chunk size as power-of-2 bits
+pub fn get_chunk_size_bits() -> usize {
+    GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire)
+}
+
+/// Calculate chunk ID and segment ID from a fault address
+/// Returns: Some((chunk_id, segment_id)) or None if address not in range
+pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> {
+    use crate::ram::segs::SEGMENT_BITS_SHIFT;
+    
+    let base = GLOBAL_CHUNK_BASE.load(Ordering::Acquire);
+    if base == 0 || fault_addr < base {
+        return None;
+    }
+    
+    let offset = fault_addr - base;
+    let total_size = GLOBAL_ALLOCATED_SIZE.load(Ordering::Acquire);
+    
+    if offset >= total_size {
+        return None;
+    }
+    
+    let chunk_size_bits = GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire);
+    let chunk_id = offset >> chunk_size_bits;
+    let offset_in_chunk = offset & ((1 << chunk_size_bits) - 1);
+    let segment_id = offset_in_chunk >> SEGMENT_BITS_SHIFT;
+    
+    Some((chunk_id, segment_id))
+}
+
+/// Set the global Chunks pointer (called by Chunks::new_with_recovery)
+pub fn set_global_chunks(chunks: &Arc<Chunks>) {
+    let ptr = Arc::as_ptr(chunks) as usize;
+    GLOBAL_CHUNKS_PTR.store(ptr, Ordering::Release);
+}
+
+/// Get a reference to the global Chunks instance
+/// SAFETY: Only safe to call if Chunks instance is still alive
+pub unsafe fn get_global_chunks() -> Option<&'static Chunks> {
+    let ptr = GLOBAL_CHUNKS_PTR.load(Ordering::Acquire);
+    if ptr == 0 {
+        None
+    } else {
+        Some(&*(ptr as *const Chunks))
+    }
+}
+
+/// Access a segment by chunk_id and segment_id from the global Chunks
+/// Used by signal handler to flip reference bits
+pub fn get_segment_for_fault(chunk_id: usize, segment_id: usize) -> Option<AArc<crate::ram::segs::Segment>> {
+    unsafe {
+        get_global_chunks().and_then(|chunks| {
+            chunks.list.get(chunk_id).and_then(|chunk| {
+                chunk.segs.get(&segment_id)
+            })
+        })
+    }
+}
+
+/// Reset global chunk allocation (for tests)
+pub fn reset_global_chunk_allocation() {
+    let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
+    let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
+    
+    if base != 0 && size != 0 {
+        unsafe {
+            libc::munmap(base as *mut libc::c_void, size);
+        }
+    }
+    
+    GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
+    GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
+    GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
+}
 
 // Thread-local flag to indicate if we're currently in a transaction
 // When true, WAL writes will skip fsync (will be synced at commit instead)
@@ -43,7 +130,7 @@ pub fn is_in_transaction() -> bool {
 pub struct Chunk {
     pub id: usize,
     pub cell_index: WordMap,
-    pub segs: LinkedHashMap<usize, Arc<Segment>>,
+    pub segs: SegmentList,
     pub head_seg_id: AtomicU64,
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
@@ -58,6 +145,8 @@ pub struct Chunk {
     /// Maps segment_id to count of incomplete transactions that have cells in this segment
     /// Used to prevent cleaner from cleaning segments that contain undo data
     pub protected_segments: PtrHashMap<u64, usize>,
+    /// Tiered memory manager for eviction/promotion
+    pub tiered_manager: Option<crate::ram::tiered::manager::TieredMemoryManager>,
 }
 
 impl Chunk {
@@ -68,8 +157,33 @@ impl Chunk {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Chunk {
-        let allocator = SegmentAllocator::new(id, size);
+        // Call new_with_base with base_addr=0 to use old allocation behavior
+        Self::new_with_base(
+            id,
+            0,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_config,
+        )
+    }
+
+    fn new_with_base(
+        id: usize,
+        base_addr: usize,
+        size: usize,
+        meta: Arc<ServerMeta>,
+        index_builder: Option<Arc<IndexBuilder>>,
+        backup_storage: Option<String>,
+        wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
+    ) -> Chunk {
+        let allocate_memory = base_addr == 0;
+        let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
         let bootstrap_segment = allocator
             .alloc_seg(&backup_storage, &wal_storage)
             .expect(&format!("No space left for first segment in chunk {}", id));
@@ -81,9 +195,18 @@ impl Chunk {
                 n + 1
             }
         };
+        assert!(!(base_addr == 0 && tiered_config.is_some()), "Should not enable tiered memory if the memory is not allocated by Chunks");
         debug!("Creating chunk {}, num segments {}", id, num_segs);
-        let segs = LinkedHashMap::with_capacity(upper_power_of_2(num_segs));
+        let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
+        // Create tiered memory manager if enabled
+        let tiered_manager = tiered_config.map(|config| {
+            crate::ram::tiered::manager::TieredMemoryManager::new(
+                config.physical_memory_limit,
+                config.threshold,
+            )
+        });
+        
         let chunk = Chunk {
             id,
             segs,
@@ -100,6 +223,7 @@ impl Chunk {
             alloc_lock: Mutex::new(()), // TODO: optimize this
             statistics: ChunkStatistics::new(),
             protected_segments: PtrHashMap::with_capacity(64),
+            tiered_manager,
         };
         chunk.put_segment(bootstrap_segment);
         return chunk;
@@ -175,7 +299,7 @@ impl Chunk {
         }
     }
 
-    pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard, ReadError> {
+    pub fn location_for_read<'a>(&self, hash: u64) -> Result<CellReadGuard<'_>, ReadError> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -183,6 +307,12 @@ impl Chunk {
                     warn!("Cannot find cell with hash {} for index is zero", hash);
                     return Err(ReadError::CellDoesNotExisted);
                 }
+                
+                // Reference bit tracking is handled by mprotect + SIGSEGV for ALL segments:
+                // - Hot segments (anonymous memory): mprotect works
+                // - Cold segments (file-backed memory): mprotect works! Kernel pages in from disk transparently
+                // CLOCK re-arms segments with mprotect(PROT_NONE) after clearing reference bits
+                
                 return Ok(index);
             }
             None => {
@@ -199,7 +329,7 @@ impl Chunk {
         }
     }
 
-    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard> {
+    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard<'_>> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -216,7 +346,7 @@ impl Chunk {
         header_from_chunk_raw(*self.location_for_read(hash)?).map(|pair| pair.0)
     }
 
-    fn read_cell(&self, hash: u64) -> Result<SharedCell, ReadError> {
+    fn read_cell(&self, hash: u64) -> Result<SharedCell<'_>, ReadError> {
         SharedCell::from_chunk_raw(self.location_for_read(hash)?, self).map(|(c, _)| c)
     }
 
@@ -225,7 +355,7 @@ impl Chunk {
         hash: u64,
         fields: &[u64],
         need_header: bool,
-    ) -> Result<SharedCell, ReadError> {
+    ) -> Result<SharedCell<'_>, ReadError> {
         let loc = self.location_for_read(hash)?;
         let (val, hdr) = select_from_chunk_raw(*loc, self, fields, need_header)?;
         Ok(SharedCell::compose(
@@ -453,7 +583,7 @@ impl Chunk {
         );
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
-        self.segs.insert_back(segment_key, Arc::new(segment));
+        self.segs.insert_back(segment_key, AArc::new(segment));
     }
 
     pub fn remove_segment(&self, segment_id: u64) {
@@ -466,7 +596,7 @@ impl Chunk {
         }
     }
 
-    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<Arc<Segment>> {
+    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<AArc<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
@@ -482,7 +612,7 @@ impl Chunk {
     }
 
     #[inline]
-    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &Arc<Segment>) {
+    fn put_tombstone(&self, cell_header: &CellHeader, cell_seg: &AArc<Segment>) {
         let pending_entry = (|| loop {
             if let Some(pending_entry) = self.try_acquire(TOMBSTONE_ENTRY_SIZE as u32) {
                 return pending_entry;
@@ -516,7 +646,7 @@ impl Chunk {
         Ok(())
     }
 
-    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> Arc<Segment> {
+    fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
         self.locate_segment(cell_location, cell_id).expect(
             format!(
                 "Cannot locate cell segment for cell id: {:?} at {}",
@@ -549,7 +679,7 @@ impl Chunk {
         self.segs.iter_front_keys().collect()
     }
 
-    pub fn segments(&self) -> Vec<Arc<Segment>> {
+    pub fn segments(&self) -> Vec<AArc<Segment>> {
         self.segs.iter_front_values().collect()
     }
 
@@ -609,7 +739,7 @@ impl Chunk {
         }
     }
 
-    pub fn segs_for_compact_cleaner(&self) -> Vec<Arc<Segment>> {
+    pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
         let utilization_selection = self
             .segments()
             .into_iter()
@@ -624,13 +754,14 @@ impl Chunk {
                 seg.id != head_seg_id 
                 && seg.no_references()
                 && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
         return list.into_iter().map(|pair| pair.0).collect();
     }
 
-    pub fn segs_for_combine_cleaner(&self) -> Vec<(Arc<Segment>, f32)> {
+    pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
         let head_seg_id = self.get_head_seg_id();
         let mut mapping: Vec<_> = self
             .segments()
@@ -645,6 +776,7 @@ impl Chunk {
                 && head_seg_id != seg.id 
                 && seg.no_references()
                 && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
@@ -801,7 +933,7 @@ impl Chunk {
 }
 
 pub struct PendingEntry {
-    pub seg: Arc<Segment>,
+    pub seg: AArc<Segment>,
     pub addr: usize,
     pub size: u32,
     pub skip_sync: bool, // Skip fsync if part of a transaction (will be synced at commit)
@@ -828,8 +960,9 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Arc<Chunks> {
-        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, false)
+        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, tiered_config, false)
     }
     
     pub fn new_with_recovery(
@@ -839,26 +972,82 @@ impl Chunks {
         index_builder: Option<Arc<IndexBuilder>>,
         backup_storage: Option<String>,
         wal_storage: Option<String>,
+        tiered_config: Option<crate::ram::tiered::TieredConfig>,
         enable_recovery: bool,
     ) -> Arc<Chunks> {
-        let chunk_size = size / count;
+        use std::ptr;
+        use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+        
+        // Reset previous allocation (for test isolation)
+        reset_global_chunk_allocation();
+        
+        // Calculate power-of-2 chunk size
+        let chunk_size_raw = size / count;
+        let chunk_size = chunk_size_raw.next_power_of_two();
+        let chunk_size_bits = chunk_size.trailing_zeros() as usize;
+        
+        // Allocate one giant mmap for all chunks
+        let total_size = chunk_size * count;
+        let global_base = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                total_size,
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE,
+                -1,
+                0,
+            )
+        };
+        
+        if global_base == libc::MAP_FAILED {
+            panic!("Failed to allocate {} bytes for {} chunks", total_size, count);
+        }
+        
+        let global_base_addr = global_base as usize;
+        
+        // Store global state
+        GLOBAL_CHUNK_BASE.store(global_base_addr, Ordering::Release);
+        GLOBAL_CHUNK_SIZE_BITS.store(chunk_size_bits, Ordering::Release);
+        GLOBAL_CHUNK_COUNT.store(count, Ordering::Release);
+        GLOBAL_ALLOCATED_SIZE.store(total_size, Ordering::Release);
+        
+        info!(
+            "Allocated global chunk space: base={:#x}, chunk_size={} (2^{}), count={}, total={}",
+            global_base_addr, chunk_size, chunk_size_bits, count, total_size
+        );
+        
+        // Log tiered memory configuration if enabled
+        if let Some(ref config) = tiered_config {
+            info!(
+                "Tiered memory enabled with threshold: {}, physical memory limit: {} MB",
+                config.threshold,
+                config.physical_memory_limit / (1024 * 1024)
+            );
+            
+            // Install page fault handlers for reference bit tracking
+            crate::ram::tiered::page_fault_tracker::install_fault_handlers();
+        }
+        
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
         debug!("Creating chunks, count {} , total {} bytes", count, size);
         for i in 0..count {
+            let chunk_base = global_base_addr + (i * chunk_size);
             let backup_storage = backup_storage
                 .clone()
                 .map(|dir| format!("{}/chunk-bk-{}", dir, i));
             let wal_storage = wal_storage
                 .clone()
                 .map(|dir| format!("{}/chunk-wal-{}", dir, i));
-            chunks.push(Chunk::new(
+            chunks.push(Chunk::new_with_base(
                 i,
+                chunk_base,
                 chunk_size,
                 meta.clone(),
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
+                tiered_config.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
@@ -866,6 +1055,9 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
         });
+        
+        // Store global pointer for signal handler access
+        set_global_chunks(&chunks_arc);
         
         // Attempt recovery if enabled
         if enable_recovery {
@@ -895,12 +1087,14 @@ impl Chunks {
         chunks_arc
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {
+        // Dummy doesn't use tiered memory or recovery
         Chunks::new(
             count,
             size,
             Arc::<ServerMeta>::new(ServerMeta {
                 schemas: LocalSchemasCache::new_local(""),
             }),
+            None,
             None,
             None,
             None,
@@ -913,7 +1107,7 @@ impl Chunks {
     fn locate_chunk_by_key(&self, key: &Id) -> (&Chunk, u64) {
         return (self.locate_chunk_by_partition(key.higher), key.lower);
     }
-    pub fn read_cell(&self, key: &Id) -> Result<SharedCell, ReadError> {
+    pub fn read_cell(&self, key: &Id) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_cell(hash);
     }
@@ -922,7 +1116,7 @@ impl Chunks {
         key: &Id,
         fields: &[u64],
         need_header: bool,
-    ) -> Result<SharedCell, ReadError> {
+    ) -> Result<SharedCell<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.read_selected(hash, fields, need_header);
     }
@@ -939,7 +1133,7 @@ impl Chunks {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         return chunk.head_cell(hash);
     }
-    pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard, ReadError> {
+    pub fn location_for_read(&self, key: &Id) -> Result<CellReadGuard<'_>, ReadError> {
         let (chunk, hash) = self.locate_chunk_by_key(key);
         chunk.location_for_read(hash)
     }

@@ -12,7 +12,7 @@ use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
@@ -21,7 +21,12 @@ pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
 
+// Page constants (used for alignment and mprotect)
+pub const PAGE_SHIFT: usize = 12; // 4KB pages
+pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+
 #[derive(Default)]
+#[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
 pub struct Segment {
     pub id: u64,
     pub seq_id: u64,
@@ -38,6 +43,12 @@ pub struct Segment {
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
+    // Tiered memory fields
+    pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
+    pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
+    pub promoting: AtomicBool,      // True when promotion is in progress
+    // Padding to maintain struct size (prevents cache line sharing issues)
+    _padding: [u8; 8], // 8 bytes padding to keep struct at 128 bytes
 }
 
 impl Segment {
@@ -83,10 +94,14 @@ impl Segment {
             backup_file_name: backup_storage
                 .clone()
                 .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
-            archived: AtomicBool::new(false),
-            dropped: AtomicBool::new(false),
             wal_file,
             wal_file_name,
+            archived: AtomicBool::new(false),
+            dropped: AtomicBool::new(false),
+            cold_file_fd: AtomicI32::new(-1),  // Start as hot
+            reference_bit: AtomicBool::new(false),
+            promoting: AtomicBool::new(false),
+            _padding: [0u8; 8], // Initialize padding
         }
     }
 
@@ -184,6 +199,7 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
+        debug!("archive() called for segment {}, backup_file_name={:?}", self.id, self.backup_file_name);
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
@@ -266,7 +282,6 @@ impl Segment {
             chunk.allocator.free(self.addr);
         }
     }
-
     // remove the backup if it have one
     pub fn dispense(&self) {
         debug!("dispense segment {}", self.id);
@@ -280,6 +295,43 @@ impl Segment {
                 warn!("cannot find segment backup to dispense {}", backup_storage)
             }
         }
+    }
+    
+    // Tiered memory helper methods (stubs when tiered memory is disabled)
+    
+    /// Check if segment is hot (in anonymous memory)
+    /// Always returns true when tiered memory is disabled
+    #[inline]
+    pub fn is_hot(&self) -> bool {
+        self.cold_file_fd.load(Ordering::Relaxed) == -1
+    }
+    
+    /// Check if segment is cold (backed by file mmap)
+    /// Always returns false when tiered memory is disabled
+    #[inline]
+    pub fn is_cold(&self) -> bool {
+        self.cold_file_fd.load(Ordering::Relaxed) >= 0
+    }
+    
+    /// Mark segment as recently accessed (for CLOCK algorithm)
+    /// No-op when tiered memory is disabled
+    #[inline]
+    pub fn mark_referenced(&self) {
+        self.reference_bit.store(true, Ordering::Relaxed);
+    }
+    
+    /// Clear reference bit and return old value (for CLOCK algorithm)
+    /// Always returns false when tiered memory is disabled
+    #[inline]
+    pub fn clear_reference_bit(&self) -> bool {
+        self.reference_bit.swap(false, Ordering::Relaxed)
+    }
+    
+    /// Get current reference bit value without clearing
+    /// Always returns false when tiered memory is disabled
+    #[inline]
+    pub fn get_reference_bit(&self) -> bool {
+        self.reference_bit.load(Ordering::Relaxed)
     }
 }
 
@@ -312,9 +364,6 @@ impl Iterator for SegmentEntryIter {
     }
 }
 
-pub const PAGE_SHIFT: usize = 12; // 4K
-pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
-
 pub struct SegmentAllocator {
     base: usize,
     offset: AtomicUsize,
@@ -327,26 +376,45 @@ pub struct SegmentAllocator {
 
 impl SegmentAllocator {
     pub fn new(chunk_id: usize, chunk_size: usize) -> Self {
-        let overflow = SEGMENT_SIZE - PAGE_SIZE;
-        let aligned_size = chunk_size + overflow;
-        let ptr = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                aligned_size,
-                PROT_READ | PROT_WRITE,
-                MAP_ANONYMOUS | MAP_PRIVATE,
-                -1,
-                0,
-            )
+        Self::new_with_base(chunk_id, 0, chunk_size, true)
+    }
+    
+    /// Create allocator with pre-allocated base address
+    /// If allocate_memory=false, assumes memory at base_addr already exists
+    pub fn new_with_base(
+        chunk_id: usize,
+        base_addr: usize,
+        chunk_size: usize,
+        allocate_memory: bool,
+    ) -> Self {
+        let (base, addr, limit) = if allocate_memory {
+            // Old behavior: allocate our own mmap
+            let overflow = SEGMENT_SIZE - PAGE_SIZE;
+            let aligned_size = chunk_size + overflow;
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    aligned_size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_ANONYMOUS | MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            let addr = ptr as usize;
+            let start = addr + overflow;
+            let aligned_addr = start & SEGMENT_MASK;
+            (aligned_addr, aligned_addr, aligned_addr + chunk_size)
+        } else {
+            // New behavior: use provided base from global allocation
+            (base_addr, base_addr, base_addr + chunk_size)
         };
-        let addr = ptr as usize;
-        let start = addr + overflow;
-        let aligned_addr = start & SEGMENT_MASK;
+        
         Self {
-            base: aligned_addr,
-            offset: AtomicUsize::new(aligned_addr),
-            limit: aligned_addr + chunk_size,
-            gc_threshold: aligned_addr + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
+            base,
+            offset: AtomicUsize::new(addr),
+            limit,
+            gc_threshold: base + (chunk_size as f64 * 0.9) as usize - SEGMENT_SIZE,
             free: LinkedRingBufferList::new(),
             next_seq_id: AtomicUsize::new(0),
             chunk_id,

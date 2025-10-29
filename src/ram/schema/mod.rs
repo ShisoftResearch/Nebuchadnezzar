@@ -5,12 +5,10 @@ use bifrost_hasher::hash_str;
 
 use dovahkiin::types::Type;
 use lightning::map::{Map, PtrHashMap as LFHashMap};
-use serde_json::value::Index;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::mem;
 
-use crate::index::vector;
 use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
 use crate::ram::io::align_ptr_addr;

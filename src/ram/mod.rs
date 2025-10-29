@@ -9,10 +9,12 @@ pub mod io;
 pub mod recovery;
 pub mod schema;
 pub mod segs;
+pub mod segment_list;
 pub mod tombstone;
 pub mod types;
 
 pub mod clock;
+pub mod tiered;
 
 #[cfg(test)]
 pub mod tests;
