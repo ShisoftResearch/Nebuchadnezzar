@@ -107,6 +107,15 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
     // Step 5: Store file descriptor (marks segment as cold)
     segment.cold_file_fd.store(fd, Ordering::Release);
     
+    // Step 6: Protect the segment with mprotect(PROT_NONE) to track future accesses
+    // Even though it's file-backed now, mprotect still works!
+    // This allows us to detect when cold segments are accessed and promote them
+    if let Err(e) = crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr) {
+        warn!("Failed to protect evicted segment {}: {}", segment.id, e);
+    } else {
+        debug!("Protected evicted segment {} with mprotect(PROT_NONE)", segment.id);
+    }
+    
     info!(
         "Successfully evicted segment {} to cold storage (fd: {})",
         segment.id, fd

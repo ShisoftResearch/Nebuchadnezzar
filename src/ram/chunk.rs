@@ -317,16 +317,10 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 
-                // For cold segments, manually set reference bit since mprotect won't catch them
-                // (cold segments are backed by files, not protected memory)
-                // For hot segments, mprotect fault handler will set the bit automatically
-                let cell_addr = *index;
-                let seg_id = self.allocator.id_by_addr(cell_addr);
-                if let Some(segment) = self.segs.get(&seg_id) {
-                    if segment.is_cold() {
-                        segment.mark_referenced();
-                    }
-                }
+                // Reference bit tracking is handled by mprotect + SIGSEGV for ALL segments:
+                // - Hot segments (anonymous memory): mprotect works
+                // - Cold segments (file-backed memory): mprotect works! Kernel pages in from disk transparently
+                // CLOCK re-arms segments with mprotect(PROT_NONE) after clearing reference bits
                 
                 return Ok(index);
             }
