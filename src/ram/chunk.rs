@@ -170,6 +170,7 @@ impl Chunk {
                 n + 1
             }
         };
+        assert!(!(base_addr == 0 && enable_tiered_memory), "Should not enable tiered memory if the memory is not allocated by Chunks");
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
