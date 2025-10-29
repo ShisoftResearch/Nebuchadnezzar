@@ -317,12 +317,7 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 
-                // Tiered memory: Mark segment as referenced for CLOCK algorithm
-                let cell_addr = *index;
-                let seg_id = self.allocator.id_by_addr(cell_addr);
-                if let Some(segment) = self.segs.get(&seg_id) {
-                    segment.mark_referenced();
-                }
+                // Note: Reference bit tracking now handled automatically by mprotect fault handler
                 
                 return Ok(index);
             }
