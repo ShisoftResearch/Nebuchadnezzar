@@ -5,6 +5,7 @@ pub mod chunk;
 pub mod segment_alignment_test;
 pub mod throughput_test;
 pub mod types;
+pub mod wordmap_test;
 
 use dovahkiin::types::Type;
 
