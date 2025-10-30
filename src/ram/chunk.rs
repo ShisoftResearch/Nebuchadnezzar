@@ -981,13 +981,12 @@ impl Chunks {
         // Reset previous allocation (for test isolation)
         reset_global_chunk_allocation();
         
-        // Calculate power-of-2 chunk size
-        let chunk_size_raw = size / count;
-        let chunk_size = chunk_size_raw.next_power_of_two();
+        // Calculate exact chunk size
+        let chunk_size = size / count;
         let chunk_size_bits = chunk_size.trailing_zeros() as usize;
         
         // Allocate one giant mmap for all chunks
-        let total_size = chunk_size * count;
+        let total_size = size;
         let global_base = unsafe {
             libc::mmap(
                 ptr::null_mut(),
