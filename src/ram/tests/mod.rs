@@ -1,5 +1,6 @@
 pub mod cell;
 pub mod chunk;
+pub mod throughput_test;
 pub mod types;
 
 use dovahkiin::types::Type;
