@@ -213,3 +213,56 @@ pub fn full_clean_cycle() {
         assert_eq!(cell.to_owned().data, default_cell(&id).data);
     });
 }
+
+#[test]
+fn test_shrink_fully_utilized_segment() {
+    use crate::ram::segs::{SegmentAllocator, SEGMENT_SIZE};
+    use std::sync::atomic::Ordering;
+
+    let _ = env_logger::try_init();
+    
+    // Create a segment allocator
+    let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 3);
+    
+    // Allocate a segment
+    let segment = allocator.alloc_seg(&None, &None).expect("Failed to allocate segment");
+    
+    // Set append_header to the bound, making the segment fully utilized
+    // This simulates the scenario where used_size == SEGMENT_SIZE
+    segment.append_header.store(segment.bound, Ordering::Relaxed);
+    
+    // Verify the segment is fully utilized
+    let used_size = segment.append_header.load(Ordering::Relaxed) - segment.addr;
+    assert_eq!(used_size, SEGMENT_SIZE, "Segment should be fully utilized");
+    
+    // Call shrink with SEGMENT_SIZE - this should not panic
+    // Before the fix, this would panic with "Shrink to 8388608 max 8388608"
+    // After the fix, it should return early without doing anything
+    segment.shrink(SEGMENT_SIZE);
+    
+    // Verify shrink didn't modify anything (since segment is full, there's nothing to shrink)
+    let used_size_after = segment.append_header.load(Ordering::Relaxed) - segment.addr;
+    assert_eq!(used_size_after, SEGMENT_SIZE, "Segment should still be fully utilized");
+}
+
+#[test]
+fn test_shrink_larger_than_segment_size() {
+    use crate::ram::segs::{SegmentAllocator, SEGMENT_SIZE};
+    use std::sync::atomic::Ordering;
+
+    let _ = env_logger::try_init();
+    
+    // Create a segment allocator
+    let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 3);
+    
+    // Allocate a segment
+    let segment = allocator.alloc_seg(&None, &None).expect("Failed to allocate segment");
+    
+    // Call shrink with size larger than SEGMENT_SIZE - this should not panic
+    // This is an edge case that should be handled gracefully
+    segment.shrink(SEGMENT_SIZE + 1);
+    
+    // Verify segment state is unchanged
+    let used_size = segment.append_header.load(Ordering::Relaxed) - segment.addr;
+    assert_eq!(used_size, 0, "Segment should still be empty");
+}
