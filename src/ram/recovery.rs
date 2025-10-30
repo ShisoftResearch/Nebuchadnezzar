@@ -9,7 +9,6 @@ use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct SegmentFileInfo {
@@ -138,8 +137,6 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
         
         if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {
             // Found uninitialized space
-            eprintln!("[find_append_header] Found uninitialized space at offset {} after {} entries", 
-                cursor - seg_addr, entries_found);
             break;
         }
         
@@ -149,13 +146,10 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
         
         if cursor > bound {
             // Overflow, use file_size
-            eprintln!("[find_append_header] Overflow detected, returning bound");
             return bound;
         }
     }
     
-    eprintln!("[find_append_header] Returning cursor at offset {} ({} entries)", 
-        cursor - seg_addr, entries_found);
     cursor
 }
 
@@ -339,7 +333,6 @@ fn phase1_discover_files(
     
     if files.is_empty() {
         info!("No segment files found, starting fresh");
-        eprintln!("[RECOVERY] No segment files found, starting fresh");
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "No segment files found",
@@ -347,7 +340,6 @@ fn phase1_discover_files(
     }
     
     info!("Discovered {} segment files", files.len());
-    eprintln!("[RECOVERY] Discovered {} segment files", files.len());
     
     Ok(files)
 }
@@ -355,7 +347,6 @@ fn phase1_discover_files(
 /// Phase 1.5: Set initial next_seq_id values for each chunk
 fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
     info!("Phase 1.5: Setting initial next_seq_id values...");
-    eprintln!("[RECOVERY] Phase 1.5: Setting initial next_seq_id values...");
     
     for chunk in chunks {
         // Find max seq_id for this chunk from discovered files
@@ -377,7 +368,6 @@ fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
             chunk.id,
             max_seq_id + 1
         );
-        eprintln!("[RECOVERY] Chunk {} initial next_seq_id set to {}", chunk.id, max_seq_id + 1);
     }
 }
 
@@ -476,11 +466,11 @@ fn phase2_allocate_and_load(
     hot_memory_used: &mut HashMap<usize, usize>,
 ) -> io::Result<()> {
     info!("Phase 2: Allocating segments and loading data...");
-    eprintln!("[RECOVERY] Phase 2: Allocating segments and loading data...");
-    eprintln!("[RECOVERY] Files to process: {}", files.len());
+    debug!("[RECOVERY] Phase 2: Allocating segments and loading data...");
+    debug!("[RECOVERY] Files to process: {}", files.len());
     
     for file_info in files {
-        eprintln!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
+        debug!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
             file_info.chunk_id, file_info.seg_id, file_info.seq_id, file_info.path.display());
         
         let chunk = &chunks[file_info.chunk_id];
@@ -495,9 +485,9 @@ fn phase2_allocate_and_load(
         );
         
         // Load file data
-        eprintln!("[RECOVERY] Loading file data...");
+        debug!("[RECOVERY] Loading file data...");
         let file_data = load_file_to_memory(&file_info.path)?;
-        eprintln!("[RECOVERY] Loaded {} bytes", file_data.len());
+        debug!("[RECOVERY] Loaded {} bytes", file_data.len());
         
         if file_data.len() > SEGMENT_SIZE {
             error!(
@@ -519,7 +509,7 @@ fn phase2_allocate_and_load(
             file_info.seq_id,
             chunk.allocator.next_seq_id.load(Ordering::Acquire)
         );
-        eprintln!("[RECOVERY] Allocating segment with original seq_id {}...", file_info.seq_id);
+        debug!("[RECOVERY] Allocating segment with original seq_id {}...", file_info.seq_id);
         let seg_opt = chunk.allocator.alloc_seg_with_seq_id(
             file_info.seq_id,
             &chunk.backup_storage,
@@ -528,11 +518,11 @@ fn phase2_allocate_and_load(
         
         let segment = match seg_opt {
             Some(seg) => {
-                eprintln!("[RECOVERY] Segment allocated: id={}, seq_id={}, addr={:#x}", seg.id, seg.seq_id, seg.addr);
+                debug!("[RECOVERY] Segment allocated: id={}, seq_id={}, addr={:#x}", seg.id, seg.seq_id, seg.addr);
                 seg
             },
             None => {
-                eprintln!("[RECOVERY] FAILED to allocate segment!");
+                debug!("[RECOVERY] FAILED to allocate segment!");
                 error!(
                     "Failed to allocate segment for chunk {} during recovery",
                     file_info.chunk_id
@@ -558,7 +548,7 @@ fn phase2_allocate_and_load(
         // Set append_header based on actual data
         let append_header = find_append_header(segment.addr, file_data.len());
         segment.append_header.store(append_header, Ordering::Release);
-        eprintln!("[RECOVERY] Set segment {} append_header to {} (offset {})",
+        debug!("[RECOVERY] Set segment {} append_header to {} (offset {})",
             segment.id, append_header, append_header - segment.addr);
         
         info!(
@@ -629,7 +619,7 @@ fn phase4_populate_chunk_indices(
     chunks: &[Chunk],
 ) -> usize {
     info!("Phase 4: Populating chunk cell indices...");
-    eprintln!("[RECOVERY] Phase 4: global_cell_index has {} entries", global_cell_index.len());
+    debug!("[RECOVERY] Phase 4: global_cell_index has {} entries", global_cell_index.len());
     
     let mut total_cells = 0;
     
@@ -642,10 +632,10 @@ fn phase4_populate_chunk_indices(
         if let Some(mut guard) = chunk.cell_index.try_insert_locked(*hash as usize) {
             *guard = entry.addr;
             total_cells += 1;
-            eprintln!("[RECOVERY] Inserted cell hash {} to chunk {} at addr {:#x}", hash, chunk_id, entry.addr);
+            debug!("[RECOVERY] Inserted cell hash {} to chunk {} at addr {:#x}", hash, chunk_id, entry.addr);
         } else {
             warn!("Cell hash {} already exists in chunk index", hash);
-            eprintln!("[RECOVERY] WARNING: Cell hash {} already exists in chunk {}", hash, chunk_id);
+            debug!("[RECOVERY] WARNING: Cell hash {} already exists in chunk {}", hash, chunk_id);
         }
     }
     
