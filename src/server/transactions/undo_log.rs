@@ -2040,7 +2040,7 @@ mod tests {
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
 
-        let server_addr = String::from("127.0.0.1:5313"); // Unique port for this test
+        let server_addr = String::from("127.0.0.1:5320"); // Unique port for this test
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
