@@ -41,13 +41,19 @@ pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 // - In case of crash: Max potential loss = WAL_SYNC_BATCH_SIZE bytes OR
 //                                          WAL_SYNC_INTERVAL_MS time window
 //
+// Performance Analysis:
+// - With 10ms interval: max 100 fsyncs/sec = ~13 MB/s if writing <130KB per interval
+// - With 100ms interval: max 10 fsyncs/sec = ~40+ MB/s (10x improvement)
+// - With i64::MAX interval: limited only by batch size = 100s-1000s MB/s
+//
 // Tuning Recommendations:
-// - High throughput: Increase batch size (1MB+) and interval (50ms+)
-// - Low latency: Decrease batch size (128KB) and interval (5ms)
-// - Strict durability: Set batch size to 0 (sync every write)
-pub const WAL_BUFFER_SIZE: usize = 256 * 1024;      // 256KB in-memory buffer (reduces syscalls)
-pub const WAL_SYNC_BATCH_SIZE: usize = 512 * 1024;  // Sync after 512KB of writes (reduces fsyncs)
-pub const WAL_SYNC_INTERVAL_MS: i64 = 10;           // Sync every 10ms (bounded loss window)
+// - High throughput: batch_size=4MB, interval=100ms (recommended for most workloads)
+// - Maximum throughput: batch_size=4MB, interval=i64::MAX (sync only on size)
+// - Low latency: batch_size=512KB, interval=50ms
+// - Strict durability: batch_size=0, interval=0 (sync every write)
+pub const WAL_BUFFER_SIZE: usize = 1024 * 1024;      // 1MB in-memory buffer (reduces syscalls)
+pub const WAL_SYNC_BATCH_SIZE: usize = 4 * 1024 * 1024;  // Sync after 4MB of writes (reduces fsyncs)
+pub const WAL_SYNC_INTERVAL_MS: i64 = 100;           // Sync every 100ms (10x less frequent than before)
 
 #[derive(Default)]
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
