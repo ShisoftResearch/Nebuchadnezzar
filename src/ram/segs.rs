@@ -39,7 +39,7 @@ pub struct Segment {
     pub last_tombstones_scanned: AtomicI64,
     pub references: AtomicUsize,
     pub backup_file_name: Option<String>,
-    pub wal_file: Option<parking_lot::Mutex<BufWriter<File>>>,
+    pub wal_file: parking_lot::Mutex<Option<BufWriter<File>>>,
     pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
@@ -61,7 +61,7 @@ impl Segment {
         wal_storage: &Option<String>,
     ) -> Segment {
         let mut wal_file_name = None;
-        let mut wal_file = None;
+        let mut wal_file_opt = None;
         let size = SEGMENT_SIZE;
         if let Some(backup_storage) = backup_storage {
             create_dir_all(backup_storage).unwrap();
@@ -74,7 +74,7 @@ impl Segment {
                 File::create(&file_name).unwrap(),
             ); // fast fail
             wal_file_name = Some(file_name);
-            wal_file = Some(parking_lot::Mutex::new(file));
+            wal_file_opt = Some(file);
         }
         debug!(
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
@@ -94,7 +94,7 @@ impl Segment {
             backup_file_name: backup_storage
                 .clone()
                 .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
-            wal_file,
+            wal_file: parking_lot::Mutex::new(wal_file_opt),
             wal_file_name,
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
@@ -218,22 +218,34 @@ impl Segment {
             
             if let Some(ref wal_file) = self.wal_file_name {
                 // if there is a WAL file ready, copy this file to backup
-                if let Some(ref file_mutex) = self.wal_file {
-                    // this should be redundant but I don't want to take the chance
-                    // obtain the writer lock before continue
-                    let mut writer = file_mutex.lock();
-                    writer.flush()?;
-                    writer.get_ref().sync_all()?;
-                    drop(writer);
-                    copy(wal_file, backup_file)?;
-                    // Sync the backup file after copy
-                    let backup_file_handle = File::open(backup_file_path)?;
-                    backup_file_handle.sync_all()?;
-                    remove_file(wal_file)?;
-                    return Ok(true);
-                } else {
-                    panic!()
+                // First, flush and close the WAL file
+                {
+                    let mut file_opt = self.wal_file.lock();
+                    if let Some(mut writer) = file_opt.take() {
+                        // Flush and sync the file before closing
+                        writer.flush()?;
+                        writer.get_ref().sync_all()?;
+                        // Writer is dropped here, closing the file handle
+                        // file_opt is now None
+                    } else {
+                        // WAL file was already closed or never opened
+                        error!("WAL file mutex is empty for segment {} - cannot archive", self.id);
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("WAL file mutex is empty for segment {}", self.id)
+                        ));
+                    }
                 }
+                
+                // Now the file is closed, we can safely copy and remove it
+                copy(wal_file, backup_file)?;
+                // Sync the backup file after copy
+                let backup_file_handle = File::open(backup_file_path)?;
+                backup_file_handle.sync_all()?;
+                
+                // Remove the WAL file (file is now closed, so this should succeed)
+                remove_file(wal_file)?;
+                return Ok(true);
             } else {
                 let backup_file = File::create(backup_file_path)?;
                 let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
@@ -251,8 +263,8 @@ impl Segment {
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
-        if let Some(ref wal_file) = self.wal_file {
-            let mut file = wal_file.lock();
+        let mut file_opt = self.wal_file.lock();
+        if let Some(ref mut file) = *file_opt {
             unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write(data_block)?;
@@ -266,7 +278,7 @@ impl Segment {
                 trace!("WAL sync skipped for segment {} (transactional write, will sync at commit)", self.id);
             }
         }
-        return Ok(());
+        Ok(())
     }
 
     pub fn no_references(&self) -> bool {

@@ -732,17 +732,18 @@ impl Service for DataManager {
             for (chunk_idx, seg_id) in &txn.protected_segments {
                 let chunk = &self.server.chunks.list[*chunk_idx];
                 if let Some(segment) = chunk.segs.get(&(*seg_id as usize)) {
-                    if let Some(ref wal_file_mutex) = segment.wal_file {
-                        if let Err(e) = (|| -> io::Result<()> {
-                            let mut writer = wal_file_mutex.lock();
-                            (*writer).flush()?;
-                            (*writer).get_ref().sync_all()?;
-                            Ok(())
-                        })() {
-                            error!("Failed to sync WAL for segment {} during commit: {:?}", seg_id, e);
-                        } else {
-                            debug!("Synced segment {} (chunk {}) WAL to disk for transaction commit", seg_id, chunk_idx);
+                    // Sync the WAL file if it exists
+                    if let Err(e) = (|| -> io::Result<()> {
+                        let mut file_opt = segment.wal_file.lock();
+                        if let Some(ref mut writer) = *file_opt {
+                            writer.flush()?;
+                            writer.get_ref().sync_all()?;
                         }
+                        Ok(())
+                    })() {
+                        error!("Failed to sync WAL for segment {} during commit: {:?}", seg_id, e);
+                    } else {
+                        debug!("Synced segment {} (chunk {}) WAL to disk for transaction commit", seg_id, chunk_idx);
                     }
                 }
             }
