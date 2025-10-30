@@ -1,3 +1,4 @@
+pub mod alignment_tests;
 pub mod cell;
 pub mod chunk;
 pub mod throughput_test;
