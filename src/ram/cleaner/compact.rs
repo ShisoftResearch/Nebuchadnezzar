@@ -131,7 +131,10 @@ impl CompactCleaner {
                 cursor += entry_size;
             });
         seg.append_header.store(cursor, Ordering::Release);
-        seg.shrink(cursor - seg_addr);
+        let used_size = cursor - seg_addr;
+        if used_size < SEGMENT_SIZE {
+            seg.shrink(used_size);
+        }
         let space_cleaned = seg.used_spaces() as usize - live_size;
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {}",

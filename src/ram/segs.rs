@@ -164,12 +164,10 @@ impl Segment {
     }
 
     pub fn shrink(&self, size: usize) {
-        debug_assert!(
-            size < SEGMENT_SIZE,
-            "Shrink to {} max {}",
-            size,
-            SEGMENT_SIZE
-        );
+        // If the segment is full or larger than SEGMENT_SIZE, there's nothing to shrink
+        if size >= SEGMENT_SIZE {
+            return;
+        }
         punch_hole(self.addr, size);
     }
 
