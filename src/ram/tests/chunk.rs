@@ -525,3 +525,351 @@ pub fn test_unified_chunk_address_space() {
     
     info!("Unified chunk address space test passed!");
 }
+
+#[test]
+fn test_wal_cleanup_after_archive() {
+    use tempfile::TempDir;
+    use std::path::Path;
+    
+    let _ = env_logger::try_init();
+    
+    // Create temporary directories for WAL and backup storage
+    let wal_dir = TempDir::new().unwrap();
+    let backup_dir = TempDir::new().unwrap();
+    
+    let wal_path = wal_dir.path().to_str().unwrap().to_string();
+    let backup_path = backup_dir.path().to_str().unwrap().to_string();
+    
+    info!("WAL directory: {}", wal_path);
+    info!("Backup directory: {}", backup_path);
+    
+    // Create chunks with WAL and backup storage
+    let fields = default_fields();
+    let schema = Schema::new("test_wal", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None, // index_builder
+        Some(backup_path.clone()),
+        Some(wal_path.clone()),
+        None, // tiered_config
+    );
+    
+    // Create a cell to write to the segment
+    let cell_id = Id::new(1, 1);
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(100));
+    data_map.insert(&String::from("score"), OwnedValue::U64(50));
+    data_map.insert(&String::from("name"), OwnedValue::String("Test".to_string()));
+    let data = OwnedValue::Map(data_map);
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &cell_id),
+        data,
+    };
+    
+    // Write cell to create a segment with WAL file
+    chunks.write_cell(&mut cell).unwrap();
+    info!("Cell written, WAL file should be created");
+    
+    // Get the segment
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    assert!(!seg_ids.is_empty(), "Should have at least one segment");
+    
+    let first_seg_id = seg_ids[0];
+    let segment = chunk.segs.get(&first_seg_id).unwrap();
+    
+    // Verify WAL file exists
+    let wal_file_name = segment.wal_file_name.as_ref().unwrap();
+    assert!(Path::new(wal_file_name).exists(), "WAL file should exist: {}", wal_file_name);
+    info!("WAL file exists: {}", wal_file_name);
+    
+    // Get the expected backup file name
+    let backup_file_name = segment.backup_file_name.as_ref().unwrap();
+    info!("Expected backup file: {}", backup_file_name);
+    
+    // Archive the segment
+    info!("Archiving segment...");
+    let result = segment.archive().unwrap();
+    assert!(result, "Archive should succeed");
+    
+    // Verify backup file exists
+    assert!(Path::new(backup_file_name).exists(), "Backup file should exist: {}", backup_file_name);
+    info!("Backup file created: {}", backup_file_name);
+    
+    // CRITICAL TEST: Verify WAL file is deleted
+    assert!(!Path::new(wal_file_name).exists(), 
+        "WAL file should be deleted after archive: {}", wal_file_name);
+    info!("✓ WAL file successfully deleted after archive");
+    
+    // Verify both files are not present at the same time
+    let wal_exists = Path::new(wal_file_name).exists();
+    let backup_exists = Path::new(backup_file_name).exists();
+    assert!(!wal_exists && backup_exists, 
+        "Only backup should exist, not WAL. WAL={}, Backup={}", wal_exists, backup_exists);
+    
+    info!("WAL cleanup after archive test passed!");
+}
+
+#[test]
+fn test_wal_file_handle_properly_closed() {
+    use tempfile::TempDir;
+    use std::path::Path;
+    use std::fs::OpenOptions;
+    
+    let _ = env_logger::try_init();
+    
+    // Create temporary directories
+    let wal_dir = TempDir::new().unwrap();
+    let backup_dir = TempDir::new().unwrap();
+    
+    let wal_path = wal_dir.path().to_str().unwrap().to_string();
+    let backup_path = backup_dir.path().to_str().unwrap().to_string();
+    
+    // Create chunks with storage
+    let fields = default_fields();
+    let schema = Schema::new("test_handle", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None, // index_builder
+        Some(backup_path),
+        Some(wal_path),
+        None, // tiered_config
+    );
+    
+    // Write some data
+    let cell_id = Id::new(1, 1);
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(200));
+    data_map.insert(&String::from("score"), OwnedValue::U64(60));
+    data_map.insert(&String::from("name"), OwnedValue::String("Test2".to_string()));
+    let data = OwnedValue::Map(data_map);
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &cell_id),
+        data,
+    };
+    
+    chunks.write_cell(&mut cell).unwrap();
+    
+    // Get segment and file path
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    let segment = chunk.segs.get(&seg_ids[0]).unwrap();
+    let wal_file_path = segment.wal_file_name.as_ref().unwrap().clone();
+    
+    info!("Testing file handle closure for: {}", wal_file_path);
+    
+    // Archive the segment
+    segment.archive().unwrap();
+    
+    // Try to open the WAL file path (should fail because it's deleted)
+    let open_result = OpenOptions::new().read(true).open(&wal_file_path);
+    assert!(open_result.is_err(), "WAL file should not exist and cannot be opened");
+    
+    // Try to create a new file with the same name (should succeed, proving file is closed and deleted)
+    let create_result = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&wal_file_path);
+    assert!(create_result.is_ok(), 
+        "Should be able to create new file at WAL path, proving old file is closed and deleted");
+    
+    // Clean up the test file
+    std::fs::remove_file(&wal_file_path).ok();
+    
+    info!("✓ WAL file handle properly closed and file deleted");
+}
+
+#[test]
+fn test_multiple_segments_wal_cleanup() {
+    use tempfile::TempDir;
+    use std::path::Path;
+    
+    let _ = env_logger::try_init();
+    
+    // Create temporary directories
+    let wal_dir = TempDir::new().unwrap();
+    let backup_dir = TempDir::new().unwrap();
+    
+    let wal_path = wal_dir.path().to_str().unwrap().to_string();
+    let backup_path = backup_dir.path().to_str().unwrap().to_string();
+    
+    // Create chunks
+    let fields = default_fields();
+    let schema = Schema::new("test_multi", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE * 2, // Larger to fit multiple segments
+        Arc::new(ServerMeta { schemas }),
+        None, // index_builder
+        Some(backup_path),
+        Some(wal_path.clone()),
+        None, // tiered_config
+    );
+    
+    // Create enough data to fill multiple segments
+    let mut cell_ids = Vec::new();
+    for i in 0..100 {
+        let cell_id = Id::new(1, i);
+        let mut data_map = OwnedMap::new();
+        data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
+        data_map.insert(&String::from("score"), OwnedValue::U64(i));
+        // Add large data to fill segments faster
+        data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
+        let data = OwnedValue::Map(data_map);
+        let mut cell = OwnedCell {
+            header: CellHeader::new(schema.id, &cell_id),
+            data,
+        };
+        chunks.write_cell(&mut cell).unwrap();
+        cell_ids.push(cell_id);
+    }
+    
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    info!("Created {} segments", seg_ids.len());
+    
+    let mut wal_files = Vec::new();
+    let mut backup_files = Vec::new();
+    
+    // Collect WAL and backup file names
+    for seg_id in &seg_ids {
+        if let Some(segment) = chunk.segs.get(seg_id) {
+            if let Some(ref wal_name) = segment.wal_file_name {
+                wal_files.push(wal_name.clone());
+            }
+            if let Some(ref backup_name) = segment.backup_file_name {
+                backup_files.push(backup_name.clone());
+            }
+        }
+    }
+    
+    info!("Found {} WAL files and {} backup file paths", wal_files.len(), backup_files.len());
+    
+    // Archive all segments
+    for seg_id in &seg_ids {
+        if let Some(segment) = chunk.segs.get(seg_id) {
+            // Skip if already archived
+            if segment.archived.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            
+            match segment.archive() {
+                Ok(true) => {
+                    info!("Archived segment {}", seg_id);
+                }
+                Ok(false) => {
+                    info!("Segment {} already archived or skipped", seg_id);
+                }
+                Err(e) => {
+                    error!("Failed to archive segment {}: {:?}", seg_id, e);
+                }
+            }
+        }
+    }
+    
+    // Verify WAL files are deleted
+    let mut wal_deleted_count = 0;
+    let mut backup_created_count = 0;
+    
+    for wal_file in &wal_files {
+        if !Path::new(wal_file).exists() {
+            wal_deleted_count += 1;
+        }
+    }
+    
+    for backup_file in &backup_files {
+        if Path::new(backup_file).exists() {
+            backup_created_count += 1;
+        }
+    }
+    
+    info!("✓ {} WAL files deleted, {} backup files created", 
+          wal_deleted_count, backup_created_count);
+    
+    // At least some WAL files should be deleted (head segment might still have WAL)
+    assert!(wal_deleted_count > 0, "At least some WAL files should be deleted");
+    assert!(backup_created_count > 0, "At least some backup files should be created");
+    
+    info!("Multiple segments WAL cleanup test passed!");
+}
+
+#[test]
+fn test_archive_idempotency() {
+    use tempfile::TempDir;
+    use std::path::Path;
+    
+    let _ = env_logger::try_init();
+    
+    // Create temporary directories
+    let wal_dir = TempDir::new().unwrap();
+    let backup_dir = TempDir::new().unwrap();
+    
+    let wal_path = wal_dir.path().to_str().unwrap().to_string();
+    let backup_path = backup_dir.path().to_str().unwrap().to_string();
+    
+    // Create chunks
+    let fields = default_fields();
+    let schema = Schema::new("test_idempotent", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+    
+    let chunks = Chunks::new(
+        1,
+        CHUNK_SIZE,
+        Arc::new(ServerMeta { schemas }),
+        None, // index_builder
+        Some(backup_path),
+        Some(wal_path),
+        None, // tiered_config
+    );
+    
+    // Write data
+    let cell_id = Id::new(1, 1);
+    let mut data_map = OwnedMap::new();
+    data_map.insert(&String::from("id"), OwnedValue::I64(300));
+    data_map.insert(&String::from("score"), OwnedValue::U64(70));
+    data_map.insert(&String::from("name"), OwnedValue::String("Test3".to_string()));
+    let data = OwnedValue::Map(data_map);
+    let mut cell = OwnedCell {
+        header: CellHeader::new(schema.id, &cell_id),
+        data,
+    };
+    
+    chunks.write_cell(&mut cell).unwrap();
+    
+    // Get segment
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    let segment = chunk.segs.get(&seg_ids[0]).unwrap();
+    
+    let wal_file = segment.wal_file_name.as_ref().unwrap();
+    let backup_file = segment.backup_file_name.as_ref().unwrap();
+    
+    // First archive
+    let result1 = segment.archive().unwrap();
+    assert!(result1, "First archive should succeed");
+    assert!(!Path::new(wal_file).exists(), "WAL should be deleted after first archive");
+    assert!(Path::new(backup_file).exists(), "Backup should exist after first archive");
+    
+    // Second archive attempt (should be idempotent)
+    let result2 = segment.archive().unwrap();
+    assert!(!result2, "Second archive should return false (already archived)");
+    assert!(!Path::new(wal_file).exists(), "WAL should still not exist");
+    assert!(Path::new(backup_file).exists(), "Backup should still exist");
+    
+    info!("✓ Archive is idempotent - multiple calls are safe");
+}
