@@ -732,15 +732,8 @@ impl Service for DataManager {
             for (chunk_idx, seg_id) in &txn.protected_segments {
                 let chunk = &self.server.chunks.list[*chunk_idx];
                 if let Some(segment) = chunk.segs.get(&(*seg_id as usize)) {
-                    // Sync the WAL file if it exists
-                    if let Err(e) = (|| -> io::Result<()> {
-                        let mut file_opt = segment.wal_file.lock();
-                        if let Some(ref mut writer) = *file_opt {
-                            writer.flush()?;
-                            writer.get_ref().sync_all()?;
-                        }
-                        Ok(())
-                    })() {
+                    // Use force_wal_sync to ensure WAL is persisted and counters are reset
+                    if let Err(e) = segment.force_wal_sync() {
                         error!("Failed to sync WAL for segment {} during commit: {:?}", seg_id, e);
                     } else {
                         debug!("Synced segment {} (chunk {}) WAL to disk for transaction commit", seg_id, chunk_idx);
