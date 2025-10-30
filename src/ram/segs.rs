@@ -51,9 +51,9 @@ pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 // - Maximum throughput: batch_size=4MB, interval=i64::MAX (sync only on size)
 // - Low latency: batch_size=512KB, interval=50ms
 // - Strict durability: batch_size=0, interval=0 (sync every write)
-pub const WAL_BUFFER_SIZE: usize = 1024 * 1024;      // 1MB in-memory buffer (reduces syscalls)
-pub const WAL_SYNC_BATCH_SIZE: usize = 4 * 1024 * 1024;  // Sync after 4MB of writes (reduces fsyncs)
-pub const WAL_SYNC_INTERVAL_MS: i64 = 100;           // Sync every 100ms (10x less frequent than before)
+pub const WAL_BUFFER_SIZE: usize = 512 * 1024;      // 512KB in-memory buffer (reduces syscalls)
+pub const WAL_SYNC_BATCH_SIZE: usize = 1 * 1024 * 1024;  // Sync after 1MB of writes (reduces fsyncs)
+pub const WAL_SYNC_INTERVAL_MS: i64 = 10;           // Sync every 10ms (10x less frequent than before)
 
 #[derive(Default)]
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment

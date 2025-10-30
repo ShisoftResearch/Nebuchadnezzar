@@ -61,7 +61,7 @@ fn test_write_throughput_with_wal_and_backup() {
     ));
     
     // Test parameters
-    let total_writes = 1740000usize; // ~8GB with 1KB cells
+    let total_writes = 10000000usize; // ~10GB with 1KB cells
     let writes_per_thread = total_writes / NUM_THREADS;
     let cell_data_size = 1024; // 1KB of data per cell
     
