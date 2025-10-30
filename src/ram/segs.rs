@@ -261,7 +261,6 @@ impl Segment {
                         // file_opt is now None
                     } else {
                         // WAL file was already closed or never opened
-                        error!("WAL file mutex is empty for segment {} - cannot archive", self.id);
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
                             format!("WAL file mutex is empty for segment {}", self.id)

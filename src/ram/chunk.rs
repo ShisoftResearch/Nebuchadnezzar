@@ -150,6 +150,62 @@ pub struct Chunk {
 }
 
 impl Chunk {
+    /// Debug-only validation for cell locations
+    /// Checks alignment and basic sanity of addresses stored in cell index
+    #[cfg(debug_assertions)]
+    fn validate_cell_location(&self, addr: usize, context: &str) -> bool {
+        // Check for obviously invalid addresses
+        if addr == 0 {
+            error!(
+                "[Chunk {}] Invalid cell location at {}: address is NULL (0x0)",
+                self.id, context
+            );
+            return false;
+        }
+
+        // Cell data should be at least 8-byte aligned for proper struct access
+        if addr % 8 != 0 {
+            error!(
+                "[Chunk {}] Invalid cell location at {}: address 0x{:x} is not 8-byte aligned",
+                self.id, context, addr
+            );
+            return false;
+        }
+
+        // Check if address looks suspicious (too high bits set)
+        // Valid pointers on x86-64 typically use only lower 48 bits
+        if addr > 0x0000_FFFF_FFFF_FFFF {
+            error!(
+                "[Chunk {}] Invalid cell location at {}: address 0x{:x} has invalid high bits",
+                self.id, context, addr
+            );
+            return false;
+        }
+
+        // Check if the address is within reasonable segment bounds
+        // We can't do precise bounds checking without segment info, but we can check basic sanity
+        if let Some(segment) = self.locate_segment(addr, &Id::new(0, 0)) {
+            let seg_start = segment.addr;
+            let seg_end = seg_start + SEGMENT_SIZE;
+            
+            if addr < seg_start || addr >= seg_end {
+                error!(
+                    "[Chunk {}] Invalid cell location at {}: address 0x{:x} outside segment bounds [0x{:x}, 0x{:x})",
+                    self.id, context, addr, seg_start, seg_end
+                );
+                return false;
+            }
+        } else {
+            warn!(
+                "[Chunk {}] Cannot validate cell location at {}: address 0x{:x} - segment not found (may be valid for new writes)",
+                self.id, context, addr
+            );
+            // Don't fail validation if segment not found - might be a newly allocated address
+        }
+
+        true
+    }
+
     fn new(
         id: usize,
         size: usize,
@@ -413,6 +469,17 @@ impl Chunk {
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+        
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.validate_cell_location(cell_loc, &format!("write_cell(hash={})", cell.header.hash)),
+                "Attempting to store invalid cell location 0x{:x} in cell index for hash {}",
+                cell_loc,
+                cell.header.hash
+            );
+        }
+        
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 *guard = cell_loc;
@@ -443,8 +510,37 @@ impl Chunk {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+        
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.validate_cell_location(new_cell_loc, &format!("update_cell(hash={})", hash)),
+                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (update)",
+                new_cell_loc,
+                hash
+            );
+        }
+        
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
+            
+            #[cfg(debug_assertions)]
+            {
+                // Also validate the old location we're about to mark dead
+                if cell_location != 0 {
+                    let is_valid = self.validate_cell_location(
+                        cell_location,
+                        &format!("update_cell old location(hash={})", hash)
+                    );
+                    if !is_valid {
+                        error!(
+                            "Found corrupted old cell location 0x{:x} for hash {} - this indicates prior corruption",
+                            cell_location, hash
+                        );
+                    }
+                }
+            }
+            
             let old_indices = self.old_index_res(&guard, &*schema)?;
             self.ensure_indices_with_res(cell, old_indices, &*schema);
             *guard = new_cell_loc;
@@ -463,10 +559,38 @@ impl Chunk {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
+        
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                self.validate_cell_location(new_cell_loc, &format!("upsert_cell(hash={})", hash)),
+                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (upsert)",
+                new_cell_loc,
+                hash
+            );
+        }
+        
         loop {
             if let Some(mut guard) = self.location_for_write(hash) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
+                
+                #[cfg(debug_assertions)]
+                {
+                    if cell_location != 0 {
+                        let is_valid = self.validate_cell_location(
+                            cell_location,
+                            &format!("upsert_cell old location(hash={})", hash)
+                        );
+                        if !is_valid {
+                            error!(
+                                "Found corrupted old cell location 0x{:x} for hash {} during upsert",
+                                cell_location, hash
+                            );
+                        }
+                    }
+                }
+                
                 let old_indices = self.old_index_res(&guard, &*schema)?;
                 *guard = new_cell_loc;
                 drop(guard);
@@ -497,6 +621,27 @@ impl Chunk {
     {
         if let Some(cell_guard) = self.location_for_write(hash) {
             let old_loc = *cell_guard;
+            
+            #[cfg(debug_assertions)]
+            {
+                // Validate old location before we try to read it
+                if old_loc != 0 {
+                    let is_valid = self.validate_cell_location(
+                        old_loc,
+                        &format!("update_cell_by old location(hash={})", hash)
+                    );
+                    if !is_valid {
+                        error!(
+                            "Corrupted cell location 0x{:x} detected for hash {} in update_cell_by - aborting to prevent further corruption",
+                            old_loc, hash
+                        );
+                        return Err(WriteError::ReadError(ReadError::ExecError(
+                            format!("Corrupted cell location: 0x{:x}", old_loc)
+                        )));
+                    }
+                }
+            }
+            
             match SharedCell::from_chunk_raw(cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
@@ -506,6 +651,17 @@ impl Chunk {
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
                         let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
+                        
+                        #[cfg(debug_assertions)]
+                        {
+                            debug_assert!(
+                                self.validate_cell_location(new_cell_loc, &format!("update_cell_by new location(hash={})", hash)),
+                                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (update_cell_by)",
+                                new_cell_loc,
+                                hash
+                            );
+                        }
+                        
                         *cell.into_guard() = new_cell_loc;
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);

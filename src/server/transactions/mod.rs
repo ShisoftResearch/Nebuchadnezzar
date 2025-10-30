@@ -11,6 +11,8 @@ pub mod manager;
 pub mod undo_log;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod corruption_tests;
 
 pub type TxnId = StandardVectorClock;
 
