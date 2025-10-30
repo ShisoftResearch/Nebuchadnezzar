@@ -497,16 +497,38 @@ impl TransactionManager {
                     let payload = dsr.payload;
                     match &payload {
                         TxnExecResult::Accepted(cell) => {
-                            txn.data.insert(
-                                id.clone(),
-                                DataObject {
-                                    server: server_id,
-                                    version: Some(cell.header.version),
-                                    cell: Some(cell.clone()),
-                                    new: false,
-                                    changed: false,
-                                },
-                            );
+                            // Check if there's a pending update in the transaction cache
+                            // If the cell was updated locally, we must return the cached updated version
+                            // instead of overwriting it with the remote (stale) value
+                            if let Some(data_obj) = txn.data.get_mut(id) {
+                                // Entry exists in transaction cache
+                                if data_obj.changed {
+                                    // There's a pending update - return the cached updated cell instead
+                                    // This ensures update-then-read visibility within the same transaction
+                                    if let Some(ref cached_cell) = data_obj.cell {
+                                        return Ok(TxnExecResult::Accepted(cached_cell.clone()));
+                                    }
+                                    // Changed but cell is None (removed) - return error
+                                    return Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted));
+                                }
+                                // Entry exists but not changed - only update if cell is missing
+                                if data_obj.cell.is_none() {
+                                    data_obj.cell = Some(cell.clone());
+                                    data_obj.version = Some(cell.header.version);
+                                }
+                            } else {
+                                // No entry exists - cache the remote value
+                                txn.data.insert(
+                                    id.clone(),
+                                    DataObject {
+                                        server: server_id,
+                                        version: Some(cell.header.version),
+                                        cell: Some(cell.clone()),
+                                        new: false,
+                                        changed: false,
+                                    },
+                                );
+                            }
                         }
                         TxnExecResult::Wait => {
                             awaits.wait(server_id).await;
