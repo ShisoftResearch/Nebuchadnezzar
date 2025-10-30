@@ -2034,6 +2034,7 @@ mod tests {
         use crate::server::{NebServer, ServerOptions, Service};
         use crate::ram::segs::SEGMENT_SIZE;
         use tempfile::TempDir;
+        use tokio::time::{sleep, Duration};
 
         let temp_dir = TempDir::new().unwrap();
         let undo_log_path = temp_dir.path().join("undo");
@@ -2041,6 +2042,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal");
 
         let server_addr = String::from("127.0.0.1:5320"); // Unique port for this test
+        // Use unique group name to avoid conflicts with other tests
+        let group_name = "test_e2e_txn_committed_no_rollback";
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
@@ -2055,10 +2058,14 @@ mod tests {
                 raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
-            "test",
+            group_name,
             async |_| {},
         )
         .await;
+
+        // Wait for Raft to stabilize before starting the test
+        // This prevents overwhelming the Raft heartbeat mechanism
+        sleep(Duration::from_millis(500)).await;
 
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
@@ -2119,10 +2126,13 @@ mod tests {
                 raft_storage: None, // No persistence for regular tests
             },
             &server_addr,
-            "test",
+            group_name,
             async |_| {},
         )
         .await;
+
+        // Wait for Raft to stabilize after recovery restart
+        sleep(Duration::from_millis(500)).await;
 
         server2.meta.schemas.new_schema(schema.clone());
 

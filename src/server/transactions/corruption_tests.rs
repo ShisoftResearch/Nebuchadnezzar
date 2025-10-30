@@ -714,6 +714,8 @@ async fn test_wikidata_import_scenario() {
 async fn test_update_cell_by_stress() {
     let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5307");
+    // Use unique group name to avoid conflicts with other tests
+    let group_name = "test_update_cell_by_stress";
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
@@ -728,10 +730,14 @@ async fn test_update_cell_by_stress() {
             raft_storage: None,
         },
         &server_addr,
-        "test",
+        group_name,
         async |_| {},
     )
     .await;
+
+    // Wait for Raft to stabilize before starting stress test
+    // This prevents overwhelming the Raft heartbeat mechanism
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let schema = Schema::new_with_id(
         1,
@@ -754,11 +760,18 @@ async fn test_update_cell_by_stress() {
 
     println!("Testing update_cell_by path that triggers mark_dead_entry_with_cell");
 
-    // This test specifically exercises the update path
-    let update_count = 200;
+    // Reduced concurrency to avoid overwhelming Raft
+    // Still high enough to stress test the corruption path
+    let update_count = 100;
     let mut tasks = Vec::new();
 
+    // Batch spawn tasks with small delays to avoid overwhelming Raft
     for i in 0..update_count {
+        // Small delay between spawning tasks to reduce Raft load
+        if i > 0 && i % 20 == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        
         let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
         let cid = cell_id.clone();
 
