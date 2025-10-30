@@ -434,7 +434,7 @@ impl Iterator for SegmentEntryIter {
         if cursor >= self.bound {
             return None;
         }
-        let (_, entry_meta) = entry::Entry::decode_from(cursor, |body_pos, header| {
+        let (entry_header, entry_meta) = entry::Entry::decode_from(cursor, |body_pos, header| {
             let entry_size = ENTRY_HEAD_SIZE + header.content_length as usize;
             debug!("Found body pos {}. Header: {:?}, entry size: {}, entry pos: {}, content length {}, bound {}",
                        body_pos, header, entry_size, cursor, header.content_length, self.bound);
@@ -445,7 +445,24 @@ impl Iterator for SegmentEntryIter {
                 entry_pos: cursor,
             };
         });
-        self.cursor += entry_meta.entry_size;
+        
+        // Stop iteration if we encounter UNDECIDED entries (uninitialized space)
+        // This can happen if the segment is partially written or if we're iterating
+        // while the segment is being modified
+        if entry_header.entry_type == entry::EntryType::UNDECIDED || entry_header.content_length == 0 {
+            debug!("Stopping segment iteration at UNDECIDED entry at position {}", cursor);
+            return None;
+        }
+        
+        // Validate that the entry doesn't exceed the bound
+        let next_cursor = cursor + entry_meta.entry_size;
+        if next_cursor > self.bound {
+            warn!("Entry at position {} exceeds segment bound (size: {}, bound: {}), stopping iteration",
+                  cursor, entry_meta.entry_size, self.bound);
+            return None;
+        }
+        
+        self.cursor = next_cursor;
         Some(entry_meta)
     }
 }
