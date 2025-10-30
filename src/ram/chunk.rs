@@ -364,6 +364,22 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
                 
+                #[cfg(debug_assertions)]
+                {
+                    let addr = *index;
+                    debug_assert!(
+                        addr % 8 == 0,
+                        "READ POINT: location_for_read retrieved MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                        addr, addr % 8, hash
+                    );
+                    if addr % 8 != 0 {
+                        error!(
+                            "READ POINT: Retrieved misaligned address 0x{:016x} (offset: {}) from cell_index for hash {}",
+                            addr, addr % 8, hash
+                        );
+                    }
+                }
+                
                 // Reference bit tracking is handled by mprotect + SIGSEGV for ALL segments:
                 // - Hot segments (anonymous memory): mprotect works
                 // - Cold segments (file-backed memory): mprotect works! Kernel pages in from disk transparently
@@ -392,6 +408,23 @@ impl Chunk {
                 if *index == 0 {
                     return None;
                 }
+                
+                #[cfg(debug_assertions)]
+                {
+                    let addr = *index;
+                    debug_assert!(
+                        addr % 8 == 0,
+                        "READ POINT: location_for_write retrieved MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                        addr, addr % 8, hash
+                    );
+                    if addr % 8 != 0 {
+                        error!(
+                            "READ POINT: Retrieved misaligned address 0x{:016x} (offset: {}) from cell_index for hash {}",
+                            addr, addr % 8, hash
+                        );
+                    }
+                }
+                
                 return Some(index);
             }
             None => None,
@@ -482,6 +515,21 @@ impl Chunk {
         
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
+                #[cfg(debug_assertions)]
+                {
+                    debug_assert!(
+                        cell_loc % 8 == 0,
+                        "WRITE POINT: write_cell attempting to store MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                        cell_loc, cell_loc % 8, cell.header.hash
+                    );
+                    if cell_loc % 8 != 0 {
+                        error!(
+                            "WRITE POINT: Attempting to store misaligned address 0x{:016x} (offset: {}) in cell_index for hash {} (write_cell)",
+                            cell_loc, cell_loc % 8, cell.header.hash
+                        );
+                    }
+                }
+                
                 *guard = cell_loc;
                 drop(guard);
                 self.ensure_indices(cell, None, &*schema);
@@ -526,18 +574,32 @@ impl Chunk {
             
             #[cfg(debug_assertions)]
             {
-                // Also validate the old location we're about to mark dead
+                // Validate the old location we just read
                 if cell_location != 0 {
-                    let is_valid = self.validate_cell_location(
-                        cell_location,
-                        &format!("update_cell old location(hash={})", hash)
+                    debug_assert!(
+                        cell_location % 8 == 0,
+                        "READ POINT: update_cell read MISALIGNED old address 0x{:016x} (offset: {}) for hash {}",
+                        cell_location, cell_location % 8, hash
                     );
-                    if !is_valid {
+                    if cell_location % 8 != 0 {
                         error!(
-                            "Found corrupted old cell location 0x{:x} for hash {} - this indicates prior corruption",
-                            cell_location, hash
+                            "READ POINT: Read misaligned old address 0x{:016x} (offset: {}) from cell_index for hash {} (update_cell)",
+                            cell_location, cell_location % 8, hash
                         );
                     }
+                }
+                
+                // Validate the new location we're about to write
+                debug_assert!(
+                    new_cell_loc % 8 == 0,
+                    "WRITE POINT: update_cell attempting to store MISALIGNED new address 0x{:016x} (offset: {}) for hash {}",
+                    new_cell_loc, new_cell_loc % 8, hash
+                );
+                if new_cell_loc % 8 != 0 {
+                    error!(
+                        "WRITE POINT: Attempting to store misaligned new address 0x{:016x} (offset: {}) in cell_index for hash {} (update_cell)",
+                        new_cell_loc, new_cell_loc % 8, hash
+                    );
                 }
             }
             
@@ -577,17 +639,32 @@ impl Chunk {
                 
                 #[cfg(debug_assertions)]
                 {
+                    // Validate old location we just read
                     if cell_location != 0 {
-                        let is_valid = self.validate_cell_location(
-                            cell_location,
-                            &format!("upsert_cell old location(hash={})", hash)
+                        debug_assert!(
+                            cell_location % 8 == 0,
+                            "READ POINT: upsert_cell(update) read MISALIGNED old address 0x{:016x} (offset: {}) for hash {}",
+                            cell_location, cell_location % 8, hash
                         );
-                        if !is_valid {
+                        if cell_location % 8 != 0 {
                             error!(
-                                "Found corrupted old cell location 0x{:x} for hash {} during upsert",
-                                cell_location, hash
+                                "READ POINT: Read misaligned old address 0x{:016x} (offset: {}) from cell_index for hash {} (upsert update path)",
+                                cell_location, cell_location % 8, hash
                             );
                         }
+                    }
+                    
+                    // Validate new location we're about to write
+                    debug_assert!(
+                        new_cell_loc % 8 == 0,
+                        "WRITE POINT: upsert_cell(update) attempting to store MISALIGNED new address 0x{:016x} (offset: {}) for hash {}",
+                        new_cell_loc, new_cell_loc % 8, hash
+                    );
+                    if new_cell_loc % 8 != 0 {
+                        error!(
+                            "WRITE POINT: Attempting to store misaligned new address 0x{:016x} (offset: {}) in cell_index for hash {} (upsert update path)",
+                            new_cell_loc, new_cell_loc % 8, hash
+                        );
                     }
                 }
                 
@@ -602,6 +679,22 @@ impl Chunk {
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
+                    
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            new_cell_loc % 8 == 0,
+                            "WRITE POINT: upsert_cell(insert) attempting to store MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                            new_cell_loc, new_cell_loc % 8, hash
+                        );
+                        if new_cell_loc % 8 != 0 {
+                            error!(
+                                "WRITE POINT: Attempting to store misaligned address 0x{:016x} (offset: {}) in cell_index for hash {} (upsert insert path)",
+                                new_cell_loc, new_cell_loc % 8, hash
+                            );
+                        }
+                    }
+                    
                     *guard = new_cell_loc;
                     drop(guard);
                     self.ensure_indices(cell, None, &*schema);
@@ -624,16 +717,17 @@ impl Chunk {
             
             #[cfg(debug_assertions)]
             {
-                // Validate old location before we try to read it
+                // Validate old location we just read
                 if old_loc != 0 {
-                    let is_valid = self.validate_cell_location(
-                        old_loc,
-                        &format!("update_cell_by old location(hash={})", hash)
+                    debug_assert!(
+                        old_loc % 8 == 0,
+                        "READ POINT: update_cell_by read MISALIGNED old address 0x{:016x} (offset: {}) for hash {}",
+                        old_loc, old_loc % 8, hash
                     );
-                    if !is_valid {
+                    if old_loc % 8 != 0 {
                         error!(
-                            "Corrupted cell location 0x{:x} detected for hash {} in update_cell_by - aborting to prevent further corruption",
-                            old_loc, hash
+                            "READ POINT: Read misaligned old address 0x{:016x} (offset: {}) from cell_index for hash {} (update_cell_by) - aborting",
+                            old_loc, old_loc % 8, hash
                         );
                         return Err(WriteError::ReadError(ReadError::ExecError(
                             format!("Corrupted cell location: 0x{:x}", old_loc)
@@ -650,19 +744,24 @@ impl Chunk {
                         .map(|_| probe_cell_indices(&cell, &*schema));
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
-                        let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
-                        
-                        #[cfg(debug_assertions)]
-                        {
-                            debug_assert!(
-                                self.validate_cell_location(new_cell_loc, &format!("update_cell_by new location(hash={})", hash)),
-                                "Attempting to store invalid cell location 0x{:x} in cell index for hash {} (update_cell_by)",
-                                new_cell_loc,
-                                hash
+                    let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
+                    
+                    #[cfg(debug_assertions)]
+                    {
+                        debug_assert!(
+                            new_cell_loc % 8 == 0,
+                            "WRITE POINT: update_cell_by attempting to store MISALIGNED new address 0x{:016x} (offset: {}) for hash {}",
+                            new_cell_loc, new_cell_loc % 8, hash
+                        );
+                        if new_cell_loc % 8 != 0 {
+                            error!(
+                                "WRITE POINT: Attempting to store misaligned new address 0x{:016x} (offset: {}) in cell_index for hash {} (update_cell_by)",
+                                new_cell_loc, new_cell_loc % 8, hash
                             );
                         }
-                        
-                        *cell.into_guard() = new_cell_loc;
+                    }
+                    
+                    *cell.into_guard() = new_cell_loc;
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
@@ -685,6 +784,24 @@ impl Chunk {
         let guard_opt = self.cell_index.lock(hash_key);
         if let Some(mut guard) = guard_opt {
             let cell_location = *guard;
+            
+            #[cfg(debug_assertions)]
+            {
+                if cell_location != 0 {
+                    debug_assert!(
+                        cell_location % 8 == 0,
+                        "READ POINT: remove_cell read MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                        cell_location, cell_location % 8, hash
+                    );
+                    if cell_location % 8 != 0 {
+                        error!(
+                            "READ POINT: Read misaligned address 0x{:016x} (offset: {}) from cell_index for hash {} (remove_cell)",
+                            cell_location, cell_location % 8, hash
+                        );
+                    }
+                }
+            }
+            
             if let Some(indexer) = &self.index_builder {
                 match SharedCell::from_chunk_raw(guard, self) {
                     Ok((cell, schema)) => {
@@ -709,6 +826,24 @@ impl Chunk {
         let guard = self.cell_index.lock(hash as usize);
         if let Some(guard) = guard {
             let cell_location = *guard;
+            
+            #[cfg(debug_assertions)]
+            {
+                if cell_location != 0 {
+                    debug_assert!(
+                        cell_location % 8 == 0,
+                        "READ POINT: remove_cell_by read MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
+                        cell_location, cell_location % 8, hash
+                    );
+                    if cell_location % 8 != 0 {
+                        error!(
+                            "READ POINT: Read misaligned address 0x{:016x} (offset: {}) from cell_index for hash {} (remove_cell_by)",
+                            cell_location, cell_location % 8, hash
+                        );
+                    }
+                }
+            }
+            
             match SharedCell::from_chunk_raw(guard, self) {
                 Ok((cell, schema)) => {
                     if predict(&cell) {
