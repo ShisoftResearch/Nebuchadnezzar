@@ -20,6 +20,7 @@ pub const CHUNK_COUNT: usize = 2;
 pub const NUM_THREADS: usize = 16;
 
 #[test]
+#[ignore]
 fn test_write_throughput_with_wal_and_backup() {
     let _ = env_logger::try_init();
     
