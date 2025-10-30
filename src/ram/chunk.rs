@@ -999,7 +999,14 @@ impl Chunks {
         };
         
         if global_base == libc::MAP_FAILED {
-            panic!("Failed to allocate {} bytes for {} chunks", total_size, count);
+            let errno = std::io::Error::last_os_error();
+            panic!(
+                "Failed to allocate {} bytes for {} chunks (chunk_size: {} bytes). \
+                Error: {} (errno: {}). \
+                This could be due to: insufficient memory, system limits (ulimit -v), \
+                or memory fragmentation. Try reducing total_size or chunk_count.",
+                total_size, count, chunk_size, errno, errno.raw_os_error().unwrap_or(-1)
+            );
         }
         
         let global_base_addr = global_base as usize;
