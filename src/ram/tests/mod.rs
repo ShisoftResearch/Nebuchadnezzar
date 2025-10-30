@@ -1,6 +1,8 @@
+pub mod alignment_root_cause_test;
 pub mod alignment_tests;
 pub mod cell;
 pub mod chunk;
+pub mod segment_alignment_test;
 pub mod throughput_test;
 pub mod types;
 
