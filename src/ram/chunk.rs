@@ -982,11 +982,11 @@ impl Chunks {
         reset_global_chunk_allocation();
         
         // Calculate exact chunk size
-        let chunk_size = size / count;
+        let chunk_size = (size / count).next_power_of_two();
         let chunk_size_bits = chunk_size.trailing_zeros() as usize;
         
         // Allocate one giant mmap for all chunks
-        let total_size = size;
+        let total_size = chunk_size * count;
         let global_base = unsafe {
             libc::mmap(
                 ptr::null_mut(),
