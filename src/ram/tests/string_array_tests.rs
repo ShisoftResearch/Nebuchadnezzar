@@ -56,8 +56,6 @@ fn test_string_array_basic() {
 }
 
 /// Test 2: UTF-8 characters and emojis  
-/// FIXME: Currently uses ASCII strings due to dovahkiin alignment issue
-/// The reader re-aligns but writer doesn't pad, causing misalignment for UTF-8 strings
 #[test]
 fn test_string_array_utf8() {
     let _ = env_logger::try_init();
