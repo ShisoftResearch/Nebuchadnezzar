@@ -16,7 +16,7 @@ use std::io;
 use std::mem;
 use std::sync::Arc;
 
-use crate::ram::cell::{Cell, CellHeader, OwnedCell, ReadError, WriteError};
+use crate::ram::cell::{CellHeader, OwnedCell, ReadError, WriteError};
 use crate::ram::schema::sm::client::SMClient as SchemaClient;
 use crate::ram::schema::sm::generate_sm_id;
 use crate::ram::schema::{DelSchemaError, NewSchemaError, Schema};
@@ -278,9 +278,9 @@ impl AsyncClient {
                 Ok(()) => {
                     return Ok(exec_value.unwrap());
                 }
-                Err(TxnError::NotRealizable) => {
+                Err(TxnError::NotRealizable(reason)) => {
                     let abort_result = txn.abort().await; // continue the loop to retry
-                    debug!("TXN NOT REALIZABLE, ABORT: {:?}", abort_result);
+                    debug!("TXN NOT REALIZABLE ({:?}), ABORT: {:?}", reason, abort_result);
                 }
                 Err(e) => {
                     // abort will always be an error to achieve early break

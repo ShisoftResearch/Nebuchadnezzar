@@ -9,11 +9,19 @@ use std::sync::Arc;
 use bifrost::rpc::RPCError;
 
 #[derive(Debug)]
+pub enum NotRealizableReason {
+    ReadTooLate(Id),
+    EarlyConflict(Id),
+    PrepareError,
+    CellChanged(Id),
+}
+
+#[derive(Debug)]
 pub enum TxnError {
     CannotFindAServer,
     IoError(io::Error),
     CannotBegin,
-    NotRealizable,
+    NotRealizable(NotRealizableReason),
     TooManyRetry,
     InternalError,
     Aborted(Option<Vec<RollbackFailure>>),
@@ -40,7 +48,9 @@ impl Transaction {
     pub async fn read(&self, id: Id) -> Result<Option<OwnedCell>, TxnError> {
         match self.client.read(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::ReadTooLate(id)
+            )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -55,11 +65,13 @@ impl Transaction {
     ) -> Result<Option<OwnedCell>, TxnError> {
         match self
             .client
-            .read_selected(self.tid.to_owned(), id, fields)
+            .read_selected(self.tid.to_owned(), id, fields.clone())
             .await
         {
             Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::ReadTooLate(id)
+            )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -68,9 +80,12 @@ impl Transaction {
         }
     }
     pub async fn write(&self, cell: OwnedCell) -> Result<(), TxnError> {
+        let cell_id = cell.id();
         match self.client.write(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::EarlyConflict(cell_id)
+            )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
@@ -78,9 +93,12 @@ impl Transaction {
         }
     }
     pub async fn update(&self, cell: OwnedCell) -> Result<(), TxnError> {
+        let cell_id = cell.id();
         match self.client.update(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::EarlyConflict(cell_id)
+            )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
@@ -90,7 +108,9 @@ impl Transaction {
     pub async fn remove(&self, id: Id) -> Result<(), TxnError> {
         match self.client.remove(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::EarlyConflict(id)
+            )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
@@ -100,7 +120,9 @@ impl Transaction {
     pub async fn head(&self, id: Id) -> Result<Option<CellHeader>, TxnError> {
         match self.client.head(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(head))) => Ok(Some(head)),
-            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable),
+            Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
+                NotRealizableReason::ReadTooLate(id)
+            )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -120,10 +142,10 @@ impl Transaction {
         match self.client.prepare(self.tid.to_owned()).await {
             Ok(Ok(TMPrepareResult::Success)) => return Ok(()),
             Ok(Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))) => {
-                Err(TxnError::NotRealizable)
+                Err(TxnError::NotRealizable(NotRealizableReason::PrepareError))
             }
-            Ok(Ok(TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(_)))) => {
-                Err(TxnError::NotRealizable)
+            Ok(Ok(TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(cell_id)))) => {
+                Err(TxnError::NotRealizable(NotRealizableReason::CellChanged(cell_id)))
             }
             Ok(Ok(rpr)) => Err(TxnError::PrepareError(rpr)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
