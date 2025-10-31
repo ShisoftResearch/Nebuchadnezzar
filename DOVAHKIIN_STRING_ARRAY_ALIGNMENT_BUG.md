@@ -116,11 +116,23 @@ Then `val_size` would need to return the padded size instead of just `len + 4`.
 
 ## Recommendation
 
-**Prefer the reader fix** (re-alignment in `read_slice`) because:
-1. It handles existing data correctly
-2. More efficient than padding all strings
-3. Maintains backward compatibility
-4. Only affects variable-length primitive array reading
+**CRITICAL**: The reader re-alignment alone is INSUFFICIENT!
+
+The fix in dovahkiin commit 778ce97 adds re-alignment to `read_slice`, but this causes
+**writer-reader mismatch** because the writer doesn't pad strings.
+
+**Example**:
+```
+Writer: "" at offset 0, "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ" (45 bytes) at offset 4 → ends at 49
+Reader: Reads "" at 0, "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ" at 4, then RE-ALIGNS to 52
+Result: Reader reads from wrong offset for next string → SEGFAULT
+```
+
+**Proper fix requires BOTH**:
+1. Writer: Add 4-byte padding after each string AND update `val_size` to return padded size
+2. Reader: Re-align between elements (already done in 778ce97)
+
+Without writer padding, the re-alignment fix breaks backward compatibility!
 
 ## Test Case
 
