@@ -5,6 +5,7 @@ pub mod chunk;
 pub mod schema_alignment_fix_test;
 pub mod segment_alignment_test;
 pub mod string_alignment_check;
+pub mod string_array_tests;
 pub mod throughput_test;
 pub mod types;
 pub mod wikidata_link_diagnostic;

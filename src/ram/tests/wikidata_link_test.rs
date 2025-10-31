@@ -112,6 +112,7 @@ fn test_wikidata_link_various_string_lengths() {
     
     let schema = Schema::new_with_id(3313777299, "wikidata_link", None, fields, false, false);
     let chunks = Chunks::new_dummy(1, CHUNK_SIZE);
+    chunks.list[0].meta.schemas.new_schema(schema.clone());
     
     // Test with various string lengths that cross alignment boundaries
     let string_lengths = vec![
@@ -179,6 +180,7 @@ fn test_wikidata_link_stress() {
     
     let schema = Schema::new_with_id(3313777299, "wikidata_link", None, fields, false, false);
     let chunks = Chunks::new_dummy(1, CHUNK_SIZE);
+    chunks.list[0].meta.schemas.new_schema(schema.clone());
     
     let num_cells = 100;
     let mut cell_locations = Vec::new();
