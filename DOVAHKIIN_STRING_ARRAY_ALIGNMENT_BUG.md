@@ -1,8 +1,10 @@
-# Dovahkiin String Array Alignment Bug
+# Dovahkiin String Array Alignment Bug (FIXED)
 
 ## Problem Summary
 
-The `string_io::read_slice` function in dovahkiin has a critical alignment bug when reading arrays of variable-length strings. This causes segfaults when reading UTF-8 strings or any strings with byte lengths that don't result in 4-byte-aligned sizes.
+The `string_io::read_slice` function in dovahkiin had a critical alignment bug when reading arrays of variable-length strings. This caused segfaults when reading UTF-8 strings or any strings with byte lengths that don't result in 4-byte-aligned sizes.
+
+**STATUS: FIXED in dovahkiin commit 8520e82**
 
 ## Root Cause
 
@@ -114,25 +116,47 @@ pub fn write(val: &str, mem_ptr: usize) {
 
 Then `val_size` would need to return the padded size instead of just `len + 4`.
 
-## Recommendation
+## Final Fix (dovahkiin commit 8520e82)
 
-**CRITICAL**: The reader re-alignment alone is INSUFFICIENT!
+The complete fix implemented in dovahkiin commit 8520e82 adds **BOTH**:
 
-The fix in dovahkiin commit 778ce97 adds re-alignment to `read_slice`, but this causes
-**writer-reader mismatch** because the writer doesn't pad strings.
-
-**Example**:
+### 1. Writer Padding (lines 143-151 in mod.rs)
+```rust
+// Add padding to align to 4-byte boundary
+let align = std::mem::align_of::<u32>();
+let unpadded_size = len + u32_io::type_size();
+let padded_size = (unpadded_size + align - 1) & !(align - 1);
+let padding = padded_size - unpadded_size;
+for _ in 0..padding {
+    ptr::write(smem_ptr as *mut u8, 0);
+    smem_ptr += 1;
+}
 ```
-Writer: "" at offset 0, "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ" (45 bytes) at offset 4 → ends at 49
-Reader: Reads "" at 0, "ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ" at 4, then RE-ALIGNS to 52
-Result: Reader reads from wrong offset for next string → SEGFAULT
+
+### 2. Updated size_at and val_size to return padded size
+```rust
+|mem_ptr| {  // size_at
+    let str_len = *u32_io::read(mem_ptr) as usize;
+    let unpadded_size = str_len + u32_io::type_size();
+    let align = std::mem::align_of::<u32>();
+    (unpadded_size + align - 1) & !(align - 1)  // Returns padded size
+}
+
+|val: &str| {  // val_size
+    let unpadded_size = val.as_bytes().len() + u32_io::type_size();
+    let align = std::mem::align_of::<u32>();
+    (unpadded_size + align - 1) & !(align - 1)  // Returns padded size
+}
 ```
 
-**Proper fix requires BOTH**:
-1. Writer: Add 4-byte padding after each string AND update `val_size` to return padded size
-2. Reader: Re-align between elements (already done in 778ce97)
+### 3. Reader Re-alignment (line 180 in macros.rs, from 778ce97)
+```rust
+mem_ptr += size_at(current_ptr);
+// Re-align for next element to handle variable-length types
+mem_ptr = (mem_ptr + align - 1) & !(align - 1);
+```
 
-Without writer padding, the re-alignment fix breaks backward compatibility!
+**With all three changes**, writer and reader stay synchronized and strings are properly aligned!
 
 ## Test Case
 
