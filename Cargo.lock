@@ -426,7 +426,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "dovahkiin"
 version = "0.1.0"
-source = "git+https://github.com/ShisoftResearch/Dovahkiin.git?branch=develop#d57aaa8f89b4c0be44414aa1a93f5e9e45bbf167"
+source = "git+https://github.com/ShisoftResearch/Dovahkiin.git?branch=develop#6393f3089779d7e9441ff608dc019261e3a4a3d3"
 dependencies = [
  "ahash",
  "bifrost",

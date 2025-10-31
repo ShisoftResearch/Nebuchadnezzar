@@ -2,9 +2,13 @@ pub mod alignment_root_cause_test;
 pub mod alignment_tests;
 pub mod cell;
 pub mod chunk;
+pub mod schema_alignment_fix_test;
 pub mod segment_alignment_test;
+pub mod string_alignment_check;
 pub mod throughput_test;
 pub mod types;
+pub mod wikidata_link_diagnostic;
+pub mod wikidata_link_test;
 pub mod wordmap_test;
 
 use dovahkiin::types::Type;
