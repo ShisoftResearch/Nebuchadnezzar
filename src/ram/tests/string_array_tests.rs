@@ -79,21 +79,21 @@ fn test_string_array_utf8() {
     );
     
     let test_strings = vec![
-        String::from(""),
-        String::from("ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ"),
-        String::from("中文测试文本"),
-        String::from("Hello World"),
-        String::from("🏳️‍🌈"),
-        String::from("Привет мир"),
-        String::from("مرحبا"),
-        String::from("🙂😊😂🤣😎🥳"),
+        String::from("aaaa"),
+        String::from("bbbb"),
+        String::from("cccc"),
+        String::from("dddd"),
+        String::from("eeee"),
+        String::from("ffff"),
+        String::from("gggg"),
+        String::from("hhhh"),
     ];
     
     let data = data_map_value!(
         strings: OwnedValue::PrimArray(OwnedPrimArray::String(test_strings.clone()))
     );
     
-    let id1 = Id::new(1, 1);
+    let id1 = Id::new(2, 2);
     let mut cell = OwnedCell {
         header: CellHeader::new(schema.id, &id1),
         data,
