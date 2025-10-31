@@ -136,6 +136,8 @@ fn read_field<'v>(
         // Case 2: Array of primitives - read length then contiguous data block
         (_, true, _, None) => {
             let array_ptr = base_ptr + target_offset;
+            trace!("Reading prim array {} at base_ptr={}, target_offset={}, array_ptr={}", 
+                   field.name, base_ptr, target_offset, array_ptr);
             // If vector_size is set, use it as the array length, otherwise read from memory
             let (array_len, raw_slice_offset) = field
                 .vector_size
@@ -145,10 +147,15 @@ fn read_field<'v>(
                         .u32()
                         .unwrap();
                     let raw_slice_offset = target_offset + types::u32_io::type_size();
+                    trace!("Read array len {} from offset {}", array_len, base_ptr + target_offset);
                     (array_len, raw_slice_offset)
                 });
             let slice_offset = align_address_with_ty(field.data_type, raw_slice_offset);
             let mut slice_ptr = base_ptr + slice_offset;
+            trace!(
+                "About to read prim array {}: len={}, raw_slice_offset={}, slice_offset={}, slice_ptr={}",
+                field.name, array_len, raw_slice_offset, slice_offset, slice_ptr
+            );
             // Read the entire primitive array at once
             let prim_arr = types::get_shared_prim_array_val(
                 field.data_type,

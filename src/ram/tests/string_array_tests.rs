@@ -38,6 +38,8 @@ fn test_string_array_basic() {
         String::from("aaaa"),
         String::from("bbbb"),
         String::from("cccc"),
+        String::from("dddd"),
+        String::from("eeee"),
     ];
     
     let data = data_map_value!(
