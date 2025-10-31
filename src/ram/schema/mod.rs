@@ -73,8 +73,13 @@ impl Schema {
             vec![],
             vec![],
         );
-        bound = align_ptr_addr(bound);
-        trace!("Schema {:?} has bound {}", fields, bound);
+        // CRITICAL: Align to 8 bytes for variable region, not just 4 bytes!
+        // The variable region may contain u64 fields that require 8-byte alignment.
+        // Using PTR_ALIGN (4 bytes) caused the +6 byte misalignment bug that crashed
+        // at addresses ending in 0xE6. Example: wikidata_link schema had static_bound=44,
+        // which is only 4-byte aligned, causing misaligned u64 reads in variable region.
+        bound = align_address(8, bound);
+        trace!("Schema {:?} has bound {} (8-byte aligned)", fields, bound);
         Schema {
             id: 0,
             name: name.to_string(),
