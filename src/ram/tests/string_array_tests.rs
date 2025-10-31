@@ -79,14 +79,14 @@ fn test_string_array_utf8() {
     );
     
     let test_strings = vec![
-        String::from("aaaa"),
-        String::from("bbbb"),
-        String::from("cccc"),
-        String::from("dddd"),
-        String::from("eeee"),
-        String::from("ffff"),
-        String::from("gggg"),
-        String::from("hhhh"),
+        String::from(""),
+        String::from("ಬಾ ಇಲ್ಲಿ ಸಂಭವಿಸ"),
+        String::from("中文测试文本"),
+        String::from("Hello World"),
+        String::from("🏳️‍🌈"),
+        String::from("Привет мир"),
+        String::from("مرحبا"),
+        String::from("🙂😊😂🤣😎🥳"),
     ];
     
     let data = data_map_value!(

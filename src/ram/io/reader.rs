@@ -168,6 +168,7 @@ fn read_field<'v>(
                     field.data_type
                 )
             });
+            trace!("Successfully read prim array, slice_ptr advanced to {}", slice_ptr);
             let val = SharedValue::PrimArray(prim_arr);
             let size = slice_ptr - array_ptr; // Calculate total size including length and data
             trace!(
