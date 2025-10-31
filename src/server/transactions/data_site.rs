@@ -455,8 +455,8 @@ impl Service for DataManager {
                 break;
             }
             if tid < meta.write {
-                // Thomas write rule
-                // TODO: Allow transaction to continue but don't write
+                // write timestamp conflict - reject during prepare
+                // Thomas Write Rule will be applied during commit phase
                 break;
             }
             cell_guards.push(meta);
@@ -524,6 +524,23 @@ impl Service for DataManager {
                     CommitOp::Read(_id, _version) => {}
                     CommitOp::Write(mut cell) => {
                         let cell_id = cell.id();
+                        
+                        // Apply Thomas Write Rule: Skip if this write is obsolete
+                        // Check if a later transaction has already written to this cell
+                        let should_skip = {
+                            let meta_ref = self.cell_meta_mutex(&cell_id);
+                            let meta = meta_ref.lock();
+                            &tid < &meta.write
+                        };
+                        
+                        if should_skip {
+                            debug!(
+                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (tid {:?} < write timestamp)",
+                                cell_id, tid
+                            );
+                            continue;
+                        }
+                        
                         let write_result = self.server.chunks.write_cell(&mut cell);
                         match write_result {
                             Ok(header) => {
