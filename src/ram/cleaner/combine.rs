@@ -169,7 +169,7 @@ impl CombinedCleaner {
             let segments_to_combine_len = segments.len();
             let cleaned_total_live_space = AtomicUsize::new(0);
             if pending_segments_len >= segments_to_combine_len {
-                warn!(
+                debug!(
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
                 );
