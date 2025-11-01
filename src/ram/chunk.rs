@@ -1009,6 +1009,7 @@ impl Chunk {
 
     /// Release protection for a segment when a transaction completes.
     /// This decrements the reference count and removes the entry if count reaches zero.
+    /// This operation is idempotent - if the segment is not protected, it silently succeeds.
     pub fn release_segment_protection(&self, segment_id: u64) {
         if let Some(mut guard) = self.protected_segments.lock(&segment_id) {
             if *guard > 1 {
@@ -1019,7 +1020,9 @@ impl Chunk {
                 guard.remove();
             }
         } else {
-            warn!("Attempted to release protection for unprotected segment {}", segment_id);
+            // Segment is not protected - this can happen if protection failed earlier
+            // or the segment was already released. Silently succeed (idempotent operation).
+            debug!("Attempted to release protection for unprotected segment {} (already released or never protected)", segment_id);
         }
     }
 

@@ -16,7 +16,7 @@ use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io::{self, Write};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -199,6 +199,7 @@ impl DataManager {
     }
 
     /// Release protection for a segment after transaction completion
+    /// This is idempotent - if the segment doesn't exist or wasn't protected, it silently succeeds.
     #[inline]
     fn release_segment_protection(&self, chunk_idx: usize, segment_id: u64) {
         if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
@@ -208,7 +209,9 @@ impl DataManager {
                 return;
             }
         }
-        warn!("Could not find segment {} in chunk {} to release protection", segment_id, chunk_idx);
+        // Segment not found in chunk - this can happen if segment was freed or chunk doesn't exist
+        // Silently succeed (idempotent operation)
+        debug!("Could not find segment {} in chunk {} to release protection (segment may have been freed)", segment_id, chunk_idx);
     }
 
     /// Release all segment protections for a transaction
@@ -336,8 +339,29 @@ impl DataManager {
         if txn.state != TxnState::Started {
             return Err(self.response_with(TxnExecResult::StateError(txn.state)));
         }
+        
+        // Optimization: If write is still committing, wait instead of rejecting immediately
+        // Note: This helps in edge cases where there might be timing issues, but typically
+        // if meta.write > tid, even after waiting, the constraint will still hold.
+        // The main value is avoiding unnecessary retries during race conditions in prepare/commit phases.
+        // For best results, applications should read cells early in transactions (right after begin())
+        // to minimize the window where writes from other transactions can cause ReadTooLate errors.
+        if read_too_late && committing {
+            // Write timestamp is newer but write is still in progress - wait for it to complete
+            // This can help in race conditions but the timestamp constraint will likely still apply after waiting
+            meta.waiting.insert((tid.clone(), *server_id));
+            debug!("-> READ {:?} WAITING for committing write {:?} on cell {:?}", tid, &meta.owner, id);
+            return Err(self.response_with(TxnExecResult::Wait));
+        }
+        
         if read_too_late {
-            // not realizable
+            // Write timestamp is newer and write has already committed - not realizable
+            warn!(
+                "ReadTooLate: Transaction {:?} trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
+                tid,
+                id,
+                meta.write
+            );
             return Err(self.response_with(TxnExecResult::Rejected));
         }
         if committing {
