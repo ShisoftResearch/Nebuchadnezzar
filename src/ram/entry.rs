@@ -67,6 +67,17 @@ impl Entry {
     where
         R: Fn(usize, EntryHeader) -> RR,
     {
+        // Validate address alignment before unsafe operations
+        #[cfg(debug_assertions)]
+        if pos % 8 != 0 {
+            panic!(
+                "Cannot decode entry header: address 0x{:016x} is misaligned (offset: {}). \
+                This indicates memory corruption in the cell address storage. \
+                Valid entry addresses must be 8-byte aligned.",
+                pos, pos % 8
+            );
+        }
+        
         let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
         let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
         let content_length = cursor.read_u32::<Endian>().unwrap();
@@ -79,7 +90,12 @@ impl Entry {
             release_cursor(cursor);
             (entry, content_read(pos, entry))
         } else {
-            panic!("Cannot decode entry header: {}", entry_type_bits);
+            panic!(
+                "Cannot decode entry header: invalid entry_type_bits={} (0x{:08x}) at address 0x{:016x}. \
+                Valid types are: UNDECIDED(0), CELL(1), TOMBSTONE(2). \
+                This likely indicates memory corruption or reading from an invalid address.",
+                entry_type_bits, entry_type_bits, pos
+            );
         }
     }
 }
