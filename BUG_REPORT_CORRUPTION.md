@@ -289,3 +289,4 @@ The investigation has:
 **Next Critical Step**: Run application with assertions enabled and review logs to identify exact point where +6 offset is introduced.
 
 
+

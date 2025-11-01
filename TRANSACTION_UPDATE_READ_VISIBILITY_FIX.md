@@ -115,3 +115,4 @@ The fix is covered by existing tests in `src/server/transactions/tests.rs`:
 - **User Impact**: Transaction operations would see stale values, breaking correctness
 - **Fix Impact**: Minimal - only changes behavior when reading from remote, preserves all other behavior
 
+
