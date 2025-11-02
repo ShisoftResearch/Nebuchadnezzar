@@ -211,7 +211,8 @@ impl CombinedCleaner {
                                 entry_addr,
                                 new_seg_id
                             );
-                            cell_mapping.push((seg_cursor, entry_addr, cell_hash, entry.cell_ver));
+                            // Include entry.size so we can mark dead space without decoding if cell was updated
+                            cell_mapping.push((seg_cursor, entry_addr, cell_hash, entry.cell_ver, entry.size));
                         }
                         seg_cursor += entry.size;
                     }
@@ -232,8 +233,8 @@ impl CombinedCleaner {
                     // Sort cells by hash to ensure consistent lock ordering across parallel threads
                     // This prevents deadlocks when multiple threads acquire locks in different orders
                     let mut sorted_cells = cells;
-                    sorted_cells.sort_by_key(|(_, _, hash, _)| *hash);
-                    sorted_cells.into_par_iter().for_each(|(new, old, hash, ver)| {
+                    sorted_cells.sort_by_key(|(_, _, hash, _, _)| *hash);
+                    sorted_cells.into_par_iter().for_each(|(new, old, hash, ver, entry_size)| {
                         trace!("Reset cell {} ptr from {} to {}", hash, old, new);
                         let index = chunk.cell_index.lock(hash as usize);
                         if let Some(mut actual_addr) = index {
@@ -267,11 +268,26 @@ impl CombinedCleaner {
                                     *actual_addr,
                                     ver
                                 );
-                                chunk.mark_dead_entry_with_seg(new, &new_seg);
+                                // SAFETY FIX: Don't call mark_dead_entry_with_seg - it tries to decode
+                                // the entry which may contain garbage if the cell was updated during combine.
+                                // Instead, directly increment dead_space using the size we already know.
+                                trace!(
+                                    "Marking {} bytes as dead in new segment {} without decoding (stale entry)",
+                                    entry_size,
+                                    new_seg.id
+                                );
+                                new_seg.dead_space.fetch_add(entry_size as u32, Ordering::Relaxed);
                             }
                         } else {
                             trace!("cell {} address {} have been removed on combine", hash, old);
-                            let _ = chunk.put_tombstone_by_cell_loc(new);
+                            // Cell was deleted - the copy in new segment is wasted space
+                            // Don't try to read/decode it, just mark space as dead
+                            trace!(
+                                "Marking {} bytes as dead in new segment {} (deleted cell)",
+                                entry_size,
+                                new_seg.id
+                            );
+                            new_seg.dead_space.fetch_add(entry_size as u32, Ordering::Relaxed);
                         }
                     });
                     new_seg_id
