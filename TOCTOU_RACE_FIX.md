@@ -7,6 +7,8 @@ Fixed a critical **Time-Of-Check-Time-Of-Use (TOCTOU)** race condition between t
 **Commits:**
 - `2938e606` - Improved entry decode error diagnostics
 - `fcab42d5` - Fixed TOCTOU race condition in compact cleaner
+- `0f87791d` - Fixed TOCTOU race condition in combine cleaner
+- `768e8c0b` - Added documentation
 
 ## The Bug
 
@@ -206,24 +208,71 @@ t8      Check: *cell_index == X?     -                        -
    - Look for "Skipping stale entry" messages
    - Confirms cleaner is properly detecting concurrent updates
 
+## The Same Bug in combine.rs
+
+### Discovery
+
+After fixing compact.rs, the same TOCTOU pattern was found in combine.rs, but it manifests differently.
+
+### The Race in combine.rs
+
+```rust
+// Line 81: Check (no lock)
+flat_map(|seg| chunk.live_entries(seg))  // ← Check without lock
+
+// Lines 200-206: Use (no lock) - Copy to new segment
+unsafe {
+    libc::memcpy(seg_cursor, entry_addr, entry.size);  // ← Copy potentially stale data
+}
+
+// Line 238: Lock acquired AFTER copying
+let index = chunk.cell_index.lock(hash);
+if *actual_addr != old {
+    chunk.mark_dead_entry_with_seg(new, &new_seg);  // ← BUG: Decode garbage!
+}
+```
+
+### Key Difference from compact.rs
+
+**Compact cleaner:** Can skip moving stale entries (works in-place)
+
+**Combine cleaner:** Has already copied the data by the time it discovers it's stale!
+
+The combine cleaner:
+1. Checks if entry is live via `live_entries()` (no lock)
+2. Copies entry to NEW segment (no lock)
+3. Locks cell_index AFTER copying
+4. If cell was updated, tries to decode the stale copy → PANIC!
+
+### The Fix for combine.rs
+
+Instead of calling `mark_dead_entry_with_seg()` which tries to decode the entry, directly increment the dead space counter:
+
+```rust
+// OLD (line 270):
+chunk.mark_dead_entry_with_seg(new, &new_seg);  // ← Tries to decode!
+
+// NEW (line 278):
+new_seg.dead_space.fetch_add(entry_size as u32, Ordering::Relaxed);  // ← Direct increment
+```
+
+We already have `entry_size` from when we collected the entry, so we don't need to decode it to know how much space to mark as dead.
+
+### Why This Works
+
+- The stale data is already copied to the new segment (can't undo)
+- We just need to track it as wasted space
+- We have the size from the original entry metadata
+- No need to decode potentially corrupted data
+- Next cleaner run will reclaim this space
+
 ## Related Files
 
-- **src/ram/cleaner/compact.rs** - Fixed TOCTOU race condition
-- **src/ram/cleaner/combine.rs** - Already correct (different design)
+- **src/ram/cleaner/compact.rs** - Fixed TOCTOU by locking before move
+- **src/ram/cleaner/combine.rs** - Fixed TOCTOU by avoiding decode on stale entries
 - **src/ram/entry.rs** - Improved error diagnostics
 - **src/ram/chunk.rs** - Added validation
 - **BUG_REPORT_CORRUPTION.md** - Original investigation
-
-## Notes
-
-### Why combine.rs doesn't have this bug
-
-The combine cleaner creates NEW segments and copies entries there. If a cell is updated during combine:
-- The copy in the new segment is marked as dead (line 270)
-- This is safe because it's in a different segment
-- The user's updated cell is in yet another location
-
-The compact cleaner works IN-PLACE within the same segment, so the race condition is more severe.
 
 ### Memory ordering
 
