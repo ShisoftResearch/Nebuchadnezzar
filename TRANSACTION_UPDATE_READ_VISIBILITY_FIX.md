@@ -116,3 +116,4 @@ The fix is covered by existing tests in `src/server/transactions/tests.rs`:
 - **Fix Impact**: Minimal - only changes behavior when reading from remote, preserves all other behavior
 
 
+

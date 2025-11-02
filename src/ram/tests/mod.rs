@@ -8,9 +8,6 @@ pub mod string_alignment_check;
 pub mod string_array_tests;
 pub mod throughput_test;
 pub mod types;
-pub mod wikidata_link_diagnostic;
-pub mod wikidata_link_test;
-pub mod wordmap_test;
 
 use dovahkiin::types::Type;
 
