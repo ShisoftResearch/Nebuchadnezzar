@@ -854,8 +854,8 @@ impl Chunk {
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
     }
     
-    // Legacy method that decodes entry to get size
-    // WARNING: This can panic if memory at addr is corrupted!
+    // Decodes entry to get size and marks it dead
+    // WARNING: Will panic if memory at addr is corrupted!
     // Prefer mark_dead_entry_with_size when size is known
     #[inline]
     pub fn mark_dead_entry_with_seg(&self, addr: usize, seg: &Segment) {
@@ -870,25 +870,11 @@ impl Chunk {
             }
         }
         
-        // Try to decode the entry to get its content_length
-        // This can fail if memory was already overwritten/corrupted
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Entry::decode_from(addr, |_, _| {})
-        })) {
-            Ok((entry, _)) => {
-                self.mark_dead_entry_with_size(addr, entry.content_length, seg);
-            }
-            Err(_) => {
-                // Entry decode failed - memory might be corrupted or already reused
-                warn!(
-                    "Failed to decode entry at addr 0x{:016x} in segment {} - \
-                    memory may have been corrupted or reused. Skipping dead space tracking.",
-                    addr, seg.id
-                );
-                // We can't track the exact size
-                // The next cleaner run will reclaim any uncounted space
-            }
-        }
+        // Decode entry to get its content_length
+        // This will PANIC if memory is corrupted - which is intentional!
+        // We want to know about memory corruption issues immediately
+        let (entry, _) = Entry::decode_from(addr, |_, _| {});
+        self.mark_dead_entry_with_size(addr, entry.content_length, seg);
     }
 
     pub fn mark_dead_entry_with_cell<C: Cell>(&self, addr: usize, cell: &C) {
