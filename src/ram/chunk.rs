@@ -671,6 +671,17 @@ impl Chunk {
                         .index_builder
                         .as_ref()
                         .map(|_| probe_cell_indices(&cell, &*schema));
+                    
+                    // Get old entry size BEFORE releasing lock to avoid race condition
+                    // where old_loc could be corrupted after we update cell_index
+                    let old_entry_size = if old_loc != 0 {
+                        match Entry::decode_from(old_loc, |_, _| {}) {
+                            (entry, _) => Some(entry.content_length),
+                        }
+                    } else {
+                        None
+                    };
+                    
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
                     let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
@@ -682,7 +693,14 @@ impl Chunk {
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
-                        self.mark_dead_entry_with_cell(old_loc, &new_cell);
+                        
+                        // Mark old entry as dead using size we captured earlier
+                        // This avoids decoding old_loc after lock is released (race condition)
+                        if let Some(size) = old_entry_size {
+                            let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
+                            self.mark_dead_entry_with_size(old_loc, size, &seg);
+                        }
+                        
                         self.refresh_statistics();
                         return Ok(new_cell);
                     } else {
@@ -828,9 +846,16 @@ impl Chunk {
         let header = header_from_chunk_raw(cell_location)
             .map_err(|e| WriteError::ReadError(e))?
             .0;
+        
+        // Get entry size while we know the memory is still valid
+        let entry_size = {
+            let (entry, _) = Entry::decode_from(cell_location, |_, _| {});
+            entry.content_length
+        };
+        
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
         self.put_tombstone(&header, &cell_seg);
-        self.mark_dead_entry_with_seg(cell_location, &cell_seg);
+        self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
         Ok(())
     }
 
