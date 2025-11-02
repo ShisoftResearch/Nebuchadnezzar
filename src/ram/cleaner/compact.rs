@@ -42,15 +42,8 @@ impl CompactCleaner {
         );
 
         // scan and mark live entries
-        // estimate segment live size for new allocation
-        let mut live_size: usize = 0;
-        let entries = chunk
-            .live_entries(seg)
-            .map(|entry| {
-                live_size += entry.meta.entry_size;
-                entry
-            })
-            .collect_vec();
+        let entries = chunk.live_entries(seg).collect_vec();
+        
         if entries.len() == 0 {
             chunk.remove_segment(seg.id);
             seg.mem_drop(chunk);
@@ -60,10 +53,14 @@ impl CompactCleaner {
             );
             return SEGMENT_SIZE;
         }
+        
+        // Record original used space before compaction
+        let original_used_space = seg.used_spaces() as usize;
         debug!(
-            "Segment {} from chunk {}. Total size {} bytes for new segment.",
-            seg.id, chunk.id, live_size
+            "Segment {} from chunk {}. Compacting {} entries, original used space {} bytes.",
+            seg.id, chunk.id, entries.len(), original_used_space
         );
+        
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
         // Compact in place
@@ -92,13 +89,11 @@ impl CompactCleaner {
                                 let new_addr = cursor;
                                 
                                 trace!(
-                                    "Memcpy cell entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
+                                    "Memcpy cell entry, size: {}, from {} to {}, seg_addr {}, for {:?}",
                                     entry_size,
                                     old_addr,
                                     new_addr,
-                                    seg_addr + live_size,
                                     seg_addr,
-                                    live_size,
                                     entry.content
                                 );
                                 
@@ -164,10 +159,25 @@ impl CompactCleaner {
         if used_size < SEGMENT_SIZE {
             seg.shrink(used_size);
         }
-        let space_cleaned = seg.used_spaces() as usize - live_size;
+        
+        // Calculate space cleaned from original to final used space
+        // Note: final space may include entries we kept that weren't in live_entries scan
+        // due to concurrent updates, so use actual used_spaces() values
+        let final_used_space = seg.used_spaces() as usize;
+        let space_cleaned = if original_used_space > final_used_space {
+            original_used_space - final_used_space
+        } else {
+            // Can happen if entries were added during compaction (shouldn't normally happen)
+            warn!(
+                "Segment {} used space increased during compaction: {} -> {}",
+                seg.id, original_used_space, final_used_space
+            );
+            0
+        };
+        
         debug!(
-            "Clean finished for segment {} from chunk {}, cleaned {}",
-            seg.id, chunk.id, space_cleaned
+            "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {})",
+            seg.id, chunk.id, space_cleaned, original_used_space, final_used_space
         );
         space_cleaned
     }
