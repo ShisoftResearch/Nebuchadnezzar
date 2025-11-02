@@ -844,9 +844,19 @@ impl Chunk {
         )
     }
 
-    // put dead entry address in a ideally non-blocking queue and wait for a worker to
-    // make the changes in corresponding segments.
-    // Because calculate segment from location is computation intensive, it have to be done lazily
+    // Mark entry as dead with explicit size (safer - doesn't need to decode)
+    #[inline]
+    pub fn mark_dead_entry_with_size(&self, addr: usize, size: u32, seg: &Segment) {
+        trace!(
+            "Marking {} bytes as dead at addr 0x{:016x} in segment {}",
+            size, addr, seg.id
+        );
+        seg.dead_space.fetch_add(size, Ordering::Relaxed);
+    }
+    
+    // Legacy method that decodes entry to get size
+    // WARNING: This can panic if memory at addr is corrupted!
+    // Prefer mark_dead_entry_with_size when size is known
     #[inline]
     pub fn mark_dead_entry_with_seg(&self, addr: usize, seg: &Segment) {
         #[cfg(debug_assertions)]
@@ -854,15 +864,31 @@ impl Chunk {
             if addr % 8 != 0 {
                 panic!(
                     "CORRUPTION: mark_dead_entry_with_seg received misaligned addr=0x{:016x} (offset: {}) for segment {}. \
-                    This address should have been validated earlier in update_cell_by.",
+                    This address should have been validated earlier.",
                     addr, addr % 8, seg.id
                 );
             }
         }
         
-        let (entry, _) = Entry::decode_from(addr, |_, _| {});
-        seg.dead_space
-            .fetch_add(entry.content_length, Ordering::Relaxed);
+        // Try to decode the entry to get its content_length
+        // This can fail if memory was already overwritten/corrupted
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Entry::decode_from(addr, |_, _| {})
+        })) {
+            Ok((entry, _)) => {
+                self.mark_dead_entry_with_size(addr, entry.content_length, seg);
+            }
+            Err(_) => {
+                // Entry decode failed - memory might be corrupted or already reused
+                warn!(
+                    "Failed to decode entry at addr 0x{:016x} in segment {} - \
+                    memory may have been corrupted or reused. Skipping dead space tracking.",
+                    addr, seg.id
+                );
+                // We can't track the exact size
+                // The next cleaner run will reclaim any uncounted space
+            }
+        }
     }
 
     pub fn mark_dead_entry_with_cell<C: Cell>(&self, addr: usize, cell: &C) {

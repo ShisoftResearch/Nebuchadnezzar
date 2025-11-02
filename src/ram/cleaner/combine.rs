@@ -268,26 +268,15 @@ impl CombinedCleaner {
                                     *actual_addr,
                                     ver
                                 );
-                                // SAFETY FIX: Don't call mark_dead_entry_with_seg - it tries to decode
-                                // the entry which may contain garbage if the cell was updated during combine.
-                                // Instead, directly increment dead_space using the size we already know.
-                                trace!(
-                                    "Marking {} bytes as dead in new segment {} without decoding (stale entry)",
-                                    entry_size,
-                                    new_seg.id
-                                );
-                                new_seg.dead_space.fetch_add(entry_size as u32, Ordering::Relaxed);
+                                // SAFETY FIX: Use mark_dead_entry_with_size instead of mark_dead_entry_with_seg
+                                // because the entry may contain garbage if the cell was updated during combine.
+                                chunk.mark_dead_entry_with_size(new, entry_size as u32, &new_seg);
                             }
                         } else {
                             trace!("cell {} address {} have been removed on combine", hash, old);
                             // Cell was deleted - the copy in new segment is wasted space
-                            // Don't try to read/decode it, just mark space as dead
-                            trace!(
-                                "Marking {} bytes as dead in new segment {} (deleted cell)",
-                                entry_size,
-                                new_seg.id
-                            );
-                            new_seg.dead_space.fetch_add(entry_size as u32, Ordering::Relaxed);
+                            // Use mark_dead_entry_with_size to avoid decoding potentially corrupt data
+                            chunk.mark_dead_entry_with_size(new, entry_size as u32, &new_seg);
                         }
                     });
                     new_seg_id
