@@ -74,61 +74,90 @@ impl CompactCleaner {
                 let entry_pos = entry.meta.entry_pos;
                 if cursor != entry_pos {
                     // Need to move
-                    let cell_migration = if entry.meta.entry_header.entry_type == EntryType::CELL {
-                        // Is cell
+                    if entry.meta.entry_header.entry_type == EntryType::CELL {
+                        // Is cell - acquire lock FIRST before deciding whether to move
                         let header = entry.content.as_cell_header();
                         trace!(
                             "Acquiring cell guard for update on compact {:?}",
                             header.id()
                         );
-                        Some(chunk.cell_index.lock(header.hash as usize))
-                    } else {
-                        None
-                    };
-                    trace!(
-                        "Memcpy entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
-                        entry_size,
-                        entry_pos,
-                        cursor,
-                        seg_addr + live_size,
-                        seg_addr,
-                        live_size,
-                        entry.content
-                    );
-                    unsafe {
-                        libc::memmove(
-                            cursor as *mut libc::c_void,
-                            entry_pos as *mut libc::c_void,
-                            entry_size,
-                        );
-                    }
-                    if let Some(cell_migrating) = cell_migration {
-                        let old_addr = entry_pos;
-                        let new_addr = cursor;
-                        if let Some(mut cell_guard)  = cell_migrating {
-                            if *cell_guard == old_addr {
-                                *cell_guard = new_addr;
-                            } else {
+                        let cell_guard = chunk.cell_index.lock(header.hash as usize);
+                        
+                        // Check if cell is still at expected location BEFORE moving
+                        if let Some(mut guard) = cell_guard {
+                            let actual_addr = *guard;
+                            if actual_addr == entry_pos {
+                                // Cell still at expected location, safe to move
+                                let old_addr = entry_pos;
+                                let new_addr = cursor;
+                                
                                 trace!(
-                                    "Cell {:?} address {} have been changed to {} on relocating on compact",
-                                    entry.content,
+                                    "Memcpy cell entry, size: {}, from {} to {}, bond {}, base {}, range {} for {:?}",
+                                    entry_size,
                                     old_addr,
-                                    *cell_guard
+                                    new_addr,
+                                    seg_addr + live_size,
+                                    seg_addr,
+                                    live_size,
+                                    entry.content
                                 );
-                                drop(cell_guard);
-                                chunk.mark_dead_entry_with_seg(new_addr, seg);
+                                
+                                // Now safe to move - we hold the lock
+                                unsafe {
+                                    libc::memmove(
+                                        new_addr as *mut libc::c_void,
+                                        old_addr as *mut libc::c_void,
+                                        entry_size,
+                                    );
+                                }
+                                
+                                // Update cell_index to point to new location
+                                *guard = new_addr;
+                                cursor += entry_size;
+                            } else {
+                                // Cell address changed - another thread updated it
+                                // Don't move this stale entry, don't advance cursor
+                                trace!(
+                                    "Cell {:?} address changed from {} to {} during compact - skipping stale entry",
+                                    header.id(),
+                                    entry_pos,
+                                    actual_addr
+                                );
                             }
                         } else {
+                            // Cell was deleted - don't move, don't advance cursor
                             trace!(
-                                "Cell {:?} address {} have been remove during compact",
-                                entry.content,
-                                old_addr
+                                "Cell {:?} was deleted during compact - skipping entry at {}",
+                                header.id(),
+                                entry_pos
                             );
-                            let _ = chunk.put_tombstone_by_cell_loc(new_addr);
                         }
+                    } else {
+                        // Tombstone - always safe to move (no cell_index entry)
+                        let old_addr = entry_pos;
+                        let new_addr = cursor;
+                        
+                        trace!(
+                            "Memcpy tombstone entry, size: {}, from {} to {}",
+                            entry_size,
+                            old_addr,
+                            new_addr
+                        );
+                        
+                        unsafe {
+                            libc::memmove(
+                                new_addr as *mut libc::c_void,
+                                old_addr as *mut libc::c_void,
+                                entry_size,
+                            );
+                        }
+                        
+                        cursor += entry_size;
                     }
+                } else {
+                    // Entry already at correct position, just advance cursor
+                    cursor += entry_size;
                 }
-                cursor += entry_size;
             });
         seg.append_header.store(cursor, Ordering::Release);
         let used_size = cursor - seg_addr;
