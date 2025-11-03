@@ -471,17 +471,6 @@ impl TransactionManager {
                     let payload = dsr.payload;
                     match &payload {
                         TxnExecResult::Accepted(cell) => {
-                            // Early Conflict Detection: Check if we're likely to fail at prepare
-                            // If this transaction will eventually update this cell and there are
-                            // already pending writes from other transactions, detect the conflict now
-                            if self.detect_early_conflict(tid, id, &cell) {
-                                debug!(
-                                    "Early conflict detected for txn {:?} on cell {:?} - aborting immediately",
-                                    tid, id
-                                );
-                                return Ok(TxnExecResult::Rejected);
-                            }
-                            
                             // Check if there's a pending update in the transaction cache
                             // If the cell was updated locally, we must return the cached updated version
                             // instead of overwriting it with the remote (stale) value
@@ -835,58 +824,7 @@ impl TransactionManager {
     fn cleanup_transaction(&self, tid: &TxnId) {
         self.transactions.lock(tid).map(|g| g.remove());
     }
-    
-    /// Early conflict detection: Check if transaction is likely to fail at prepare
-    /// Returns true if we should abort now rather than continue
-    fn detect_early_conflict(&self, tid: &TxnId, _cell_id: &Id, cell: &OwnedCell) -> bool {
-        // Strategy: Look for active transactions with higher timestamps that might conflict
-        // If we find many such transactions, this transaction is likely to fail
-        
-        // Count how many active transactions have higher timestamps
-        let mut higher_timestamp_count = 0;
-        let mut checked = 0;
-        const MAX_CHECK: usize = 20; // Don't scan too many transactions
-        
-        for txn_id in self.transactions.keys() {
-            if checked >= MAX_CHECK {
-                break;
-            }
-            checked += 1;
-            
-            // Skip self
-            if &txn_id == tid {
-                continue;
-            }
-            
-            // If this transaction has a higher timestamp and might touch the same cell
-            if &txn_id > tid {
-                // Check if this transaction is likely to write to cells
-                // (heuristic: any transaction with higher timestamp is a potential conflict)
-                higher_timestamp_count += 1;
-            }
-        }
-        
-        // Heuristic: If there are many transactions with higher timestamps,
-        // and we're reading a cell that's likely to be updated, abort early
-        // This is conservative but helps avoid wasted work
-        const CONFLICT_THRESHOLD: u32 = 10;
-        
-        if higher_timestamp_count >= CONFLICT_THRESHOLD {
-            // Additional check: is this a "hot" cell that's being frequently accessed?
-            // For now, use a simple heuristic based on version number
-            // High version numbers indicate frequent updates
-            if cell.header.version > 100 {
-                debug!(
-                    "Potential early conflict: {} higher-timestamp transactions active, cell version {}",
-                    higher_timestamp_count, cell.header.version
-                );
-                return true;
-            }
-        }
-        
-        false
-    }
-    
+ 
     /// Performs the actual prepare operation (extracted for retry logic)
     async fn do_prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
         let conclusion = {
