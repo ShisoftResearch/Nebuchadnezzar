@@ -822,7 +822,7 @@ impl TransactionManager {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
-        self.transactions.lock(tid).map(|g| g.remove());
+        self.transactions.remove(tid);
     }
  
     /// Performs the actual prepare operation (extracted for retry logic)
