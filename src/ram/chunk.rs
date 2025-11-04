@@ -1043,7 +1043,7 @@ impl Chunk {
                     .is_ok()
                 {
                     if let Err(e) = segment.archive() {
-                        error!("Cannot archive segment {}, reason:{:?}", self.id, e)
+                        error!("Cannot archive segment {} (chunk {}), reason:{:?}", seg_id, self.id, e)
                     }
                 }
             }

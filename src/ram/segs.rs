@@ -259,23 +259,41 @@ impl Segment {
                         // file_opt is now None
                     } else {
                         // WAL file was already closed or never opened
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("WAL file mutex is empty for segment {}", self.id)
-                        ));
+                        // Check if the WAL file exists on disk before returning error
+                        let wal_path = Path::new(wal_file);
+                        if !wal_path.exists() {
+                            // WAL file doesn't exist, fall through to memory-based archiving
+                            debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
+                        } else {
+                            // WAL file exists but mutex is empty - this shouldn't happen
+                            return Err(io::Error::new(
+                                io::ErrorKind::Other,
+                                format!("WAL file mutex is empty for segment {}, but file exists at {}", self.id, wal_file)
+                            ));
+                        }
                     }
                 }
                 
-                // Now the file is closed, we can safely copy and remove it
-                copy(wal_file, backup_file)?;
-                // Sync the backup file after copy
-                let backup_file_handle = File::open(backup_file_path)?;
-                backup_file_handle.sync_all()?;
-                
-                // Remove the WAL file (file is now closed, so this should succeed)
-                remove_file(wal_file)?;
-                return Ok(true);
-            } else {
+                // Check if WAL file exists before trying to copy it
+                let wal_path = Path::new(wal_file);
+                if wal_path.exists() {
+                    // Now the file is closed, we can safely copy and remove it
+                    copy(wal_file, backup_file)?;
+                    // Sync the backup file after copy
+                    let backup_file_handle = File::open(backup_file_path)?;
+                    backup_file_handle.sync_all()?;
+                    
+                    // Remove the WAL file (file is now closed, so this should succeed)
+                    remove_file(wal_file)?;
+                    return Ok(true);
+                } else {
+                    // WAL file doesn't exist, fall through to memory-based archiving
+                    debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
+                }
+            }
+            
+            // Fallback: write from memory if WAL file doesn't exist or wasn't configured
+            {
                 let backup_file = File::create(backup_file_path)?;
                 let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
                 let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
