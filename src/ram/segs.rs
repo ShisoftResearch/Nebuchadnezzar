@@ -612,13 +612,17 @@ impl SegmentAllocator {
     }
 }
 
-#[cfg(target_os = "linux")]
-unsafe fn madvise_free(addr: usize, size: usize) {
-    madvise(addr as *mut c_void, size, MADV_REMOVE);
-}
-
-#[cfg(not(target_os = "linux"))]
-unsafe fn madvise_free(addr: usize, size: usize) {
+/// Free physical memory pages for a memory region
+/// 
+/// Uses MADV_DONTNEED on all platforms, which tells the kernel to free
+/// physical pages while keeping the virtual mapping intact. For file-backed
+/// mappings, pages will be re-faulted from disk on next access. For anonymous
+/// mappings, pages will be zero-filled on next access.
+/// 
+/// Note: On Linux, MADV_REMOVE would punch holes in files (destructive),
+/// so we use MADV_DONTNEED instead which is safe for both anonymous and
+/// file-backed mappings.
+pub unsafe fn madvise_free(addr: usize, size: usize) {
     madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
 

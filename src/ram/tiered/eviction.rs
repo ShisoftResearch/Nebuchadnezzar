@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::{Segment, SEGMENT_SIZE};
+use crate::ram::segs::{madvise_free, Segment, SEGMENT_SIZE};
 use libc::{c_void, mmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
 use std::ffi::CString;
 use std::io;
@@ -73,7 +73,6 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
     // Step 4: mmap with MAP_FIXED at the original address
     // This atomically replaces the anonymous mapping with file-backed mapping
     // The data at segment.addr remains unchanged (same bytes)
-    // Physical memory pages are freed automatically by the kernel
     let result = unsafe {
         mmap(
             segment.addr as *mut c_void,
@@ -104,10 +103,20 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
         ));
     }
     
-    // Step 5: Store file descriptor (marks segment as cold)
+    // Step 5: Force the kernel to free physical memory pages immediately
+    // Without this, file-backed mappings can keep pages resident in page cache
+    // madvise_free uses MADV_DONTNEED to tell the kernel: "I don't need these pages in physical memory"
+    // This ensures cold segments don't consume physical memory even when the host
+    // hasn't fully exhausted its memory (kernel won't evict pages proactively otherwise)
+    unsafe {
+        madvise_free(segment.addr, SEGMENT_SIZE);
+    }
+    debug!("Freed physical pages for segment {} with madvise_free", segment.id);
+    
+    // Step 6: Store file descriptor (marks segment as cold)
     segment.cold_file_fd.store(fd, Ordering::Release);
     
-    // Step 6: Protect the segment with mprotect(PROT_NONE) to track future accesses
+    // Step 7: Protect the segment with mprotect(PROT_NONE) to track future accesses
     // Even though it's file-backed now, mprotect still works!
     // This allows us to detect when cold segments are accessed and promote them
     if let Err(e) = crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr) {
