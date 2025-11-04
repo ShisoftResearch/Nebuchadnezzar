@@ -76,7 +76,12 @@ impl CombinedCleaner {
         );
 
         // Get all entries in segments to combine and order them by data temperature and size
-        let nested_entries = segments
+        // Step 1: Collect and deduplicate using HashMap (faster than sort+chunk_by)
+        use std::collections::HashMap;
+        let mut deduped_cells: HashMap<u64, DummyEntry> = HashMap::new();
+        let mut tombstones: Vec<DummyEntry> = Vec::new();
+        
+        for entry in segments
             .iter()
             .flat_map(|seg| chunk.live_entries(seg))
             .filter(|entry| {
@@ -87,49 +92,55 @@ impl CombinedCleaner {
                 }
                 return true;
             })
-            .map(|entry| {
-                let entry_size = entry.meta.entry_size;
-                let entry_addr = entry.meta.entry_pos;
-                let cell_header = match entry.content {
-                    EntryContent::Cell(header) => Some(header),
-                    _ => None,
-                };
-                DummyEntry {
-                    size: entry_size,
-                    addr: entry_addr,
-                    timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
-                    cell_hash: cell_header.map(|h| h.hash),
-                    cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
-                }
-            })
-            .sorted_by_key(|entry| entry.cell_hash)
-            .chunk_by(|entry| entry.cell_hash)
-            .into_iter()
-            .map(|(hash, entry)| {
-                // combine entries have the same hash and then only keep the latest version
-                // for entries that does not have a hash, keep all of them
-                if hash.is_none() {
-                    entry.into_iter().collect_vec()
-                } else {
-                    vec![entry.into_iter().max_by_key(|e| e.cell_ver).unwrap()]
-                }
-            })
-            .flatten()
-            .sorted_by_key(|entry| entry.timestamp)
-            .chunk_by(|entry| entry.timestamp / 10)
-            .into_iter()
-            .map(|(t, group)| {
-                let mut group: Vec<_> = group.collect();
-                group.sort_by_key(|entry| entry.size);
-                return (t, group.into_iter());
-            })
-            .sorted_by_key(|&(t, _)| t)
-            .into_iter()
-            .map(|(_, group)| group);
-
-        let mut entries: Vec<_> = Iterator::flatten(nested_entries)
-            // order by temperature and size from greater to lesser
-            .rev()
+        {
+            let entry_size = entry.meta.entry_size;
+            let entry_addr = entry.meta.entry_pos;
+            let cell_header = match entry.content {
+                EntryContent::Cell(header) => Some(header),
+                _ => None,
+            };
+            let dummy_entry = DummyEntry {
+                size: entry_size,
+                addr: entry_addr,
+                timestamp: cell_header.map(|h| h.timestamp).unwrap_or(0),
+                cell_hash: cell_header.map(|h| h.hash),
+                cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
+            };
+            
+            if let Some(hash) = dummy_entry.cell_hash {
+                // Cell with hash: keep only the latest version
+                deduped_cells.entry(hash)
+                    .and_modify(|existing| {
+                        if dummy_entry.cell_ver > existing.cell_ver {
+                            *existing = dummy_entry.clone();
+                        }
+                    })
+                    .or_insert(dummy_entry);
+            } else {
+                // Tombstone or entry without hash: keep all
+                tombstones.push(dummy_entry);
+            }
+        }
+        
+        // Step 2: Combine deduplicated cells and tombstones, then sort by timestamp
+        let mut all_entries: Vec<_> = deduped_cells.into_values()
+            .chain(tombstones.into_iter())
+            .collect();
+            
+        // Sort by timestamp and then by size within timestamp buckets
+        all_entries.sort_by_key(|entry| entry.timestamp);
+        
+        let mut sorted_entries = Vec::new();
+        for (_, group) in &all_entries.into_iter().chunk_by(|entry| entry.timestamp / 10) {
+            let mut group: Vec<_> = group.collect();
+            group.sort_by_key(|entry| entry.size);
+            sorted_entries.extend(group);
+        }
+        
+        // Reverse to get hottest/largest first
+        sorted_entries.reverse();
+        
+        let mut entries: Vec<_> = sorted_entries.into_iter()
             // provide additional state for whether entry have been claimed on simulation
             .map(|e| (e, false))
             .collect();
