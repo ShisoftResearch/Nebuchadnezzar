@@ -983,7 +983,7 @@ impl Chunk {
                 let rate = seg.living_rate();
                 (seg, rate)
             })
-            .filter(|(_, utilization)| *utilization < 90f32);
+            .filter(|(_, utilization)| *utilization < 0.90f32);
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
@@ -1007,13 +1007,13 @@ impl Chunk {
                 let segment_utilization = living / SEGMENT_SIZE_U32 as f32;
                 (seg, segment_utilization)
             })
-            .filter(|(seg, utilization)| {
-                *utilization < 50f32 
-                && head_seg_id != seg.id 
-                && seg.no_references()
-                && !self.is_segment_protected(seg.id) // Don't clean protected segments
-                && seg.is_hot() // Don't clean cold segments (tiered memory)
-            })
+        .filter(|(seg, utilization)| {
+            *utilization < 0.50f32 
+            && head_seg_id != seg.id 
+            && seg.no_references()
+            && !self.is_segment_protected(seg.id) // Don't clean protected segments
+            && seg.is_hot() // Don't clean cold segments (tiered memory)
+        })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
         return mapping;
