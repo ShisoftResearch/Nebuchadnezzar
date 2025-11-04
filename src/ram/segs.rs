@@ -622,8 +622,47 @@ impl SegmentAllocator {
 /// Note: On Linux, MADV_REMOVE would punch holes in files (destructive),
 /// so we use MADV_DONTNEED instead which is safe for both anonymous and
 /// file-backed mappings.
+/// 
+/// This is aggressive - pages are freed immediately.
 pub unsafe fn madvise_free(addr: usize, size: usize) {
     madvise(addr as *mut c_void, size, MADV_DONTNEED);
+}
+
+/// Mark pages as cold (low priority for eviction)
+/// 
+/// Uses MADV_COLD (Linux 5.4+) to hint to the kernel that these pages
+/// should be evicted first under memory pressure. Unlike MADV_DONTNEED,
+/// this doesn't immediately free pages - it just marks them as candidates
+/// for eviction.
+/// 
+/// This is cooperative - the kernel decides when to actually evict pages.
+/// Pages remain resident until the kernel needs memory.
+/// 
+/// Falls back to MADV_DONTNEED on older kernels or non-Linux systems.
+pub unsafe fn madvise_cold(addr: usize, size: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        // MADV_COLD = 20 (Linux 5.4+)
+        const MADV_COLD: i32 = 20;
+        let result = madvise(addr as *mut c_void, size, MADV_COLD);
+        
+        if result != 0 {
+            let errno = std::io::Error::last_os_error();
+            // EINVAL likely means old kernel without MADV_COLD support
+            if errno.raw_os_error() == Some(libc::EINVAL) {
+                warn!("MADV_COLD not supported (kernel < 5.4), falling back to MADV_DONTNEED");
+                madvise(addr as *mut c_void, size, MADV_DONTNEED);
+            } else {
+                warn!("madvise(MADV_COLD) failed: {}", errno);
+            }
+        }
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Fall back to MADV_DONTNEED on non-Linux systems
+        madvise(addr as *mut c_void, size, MADV_DONTNEED);
+    }
 }
 
 fn punch_hole(seg_addr: usize, seg_size: usize) {
