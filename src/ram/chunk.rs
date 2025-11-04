@@ -368,6 +368,15 @@ impl Chunk {
                         debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
                     }
+                    
+                    // PROACTIVE EVICTION: Check memory limit BEFORE allocating new segment
+                    // This prevents OOM by ensuring we evict cold segments before allocating hot ones
+                    if let Some(ref tiered_manager) = self.tiered_manager {
+                        if let Err(e) = tiered_manager.check_and_evict(self) {
+                            error!("Proactive eviction failed before segment allocation: {:?}", e);
+                        }
+                    }
+                    
                     let _alloc_guard = self.alloc_lock.lock();
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
@@ -1261,12 +1270,31 @@ impl Chunks {
             global_base_addr, chunk_size, chunk_size_bits, count, total_size
         );
         
+        // Divide memory limit among chunks
+        // Each chunk gets an equal share of the total physical memory limit
+        let per_chunk_tiered_config = tiered_config.map(|config| {
+            let per_chunk_limit = config.physical_memory_limit / count;
+            warn!(
+                "Dividing physical memory limit among {} chunks: total {} MB → {} MB per chunk",
+                count,
+                config.physical_memory_limit / (1024 * 1024),
+                per_chunk_limit / (1024 * 1024)
+            );
+            crate::ram::tiered::TieredConfig {
+                threshold: config.threshold,
+                physical_memory_limit: per_chunk_limit,
+            }
+        });
+        
         // Log tiered memory configuration if enabled
-        if let Some(ref config) = tiered_config {
+        if let Some(ref config) = per_chunk_tiered_config {
             info!(
-                "Tiered memory enabled with threshold: {}, physical memory limit: {} MB",
+                "Tiered memory enabled with threshold: {}, physical memory limit per chunk: {} MB ({} chunks × {} MB = {} MB total)",
                 config.threshold,
-                config.physical_memory_limit / (1024 * 1024)
+                config.physical_memory_limit / (1024 * 1024),
+                count,
+                config.physical_memory_limit / (1024 * 1024),
+                (config.physical_memory_limit * count) / (1024 * 1024)
             );
             
             // Install page fault handlers for reference bit tracking
@@ -1292,7 +1320,7 @@ impl Chunks {
                 index_builder.clone(),
                 backup_storage,
                 wal_storage,
-                tiered_config.clone(),
+                per_chunk_tiered_config.clone(),
             ));
         }
         let num_schemas = meta.schemas.count() + 1;
