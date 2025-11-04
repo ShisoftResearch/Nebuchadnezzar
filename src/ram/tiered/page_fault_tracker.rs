@@ -69,9 +69,10 @@ extern "C" fn handle_segfault(
                 // Set reference bit
                 segment.mark_referenced();
                 
-                if cfg!(debug_assertions) {                
+                #[cfg(all(debug_assertions, feature = "debug_page_faults"))]
+                {               
                     // Log the reference (signal-safe: write to stderr fd directly)
-                    // Note: This is expensive but useful for debugging. Remove in production.
+                    // Note: This is expensive but useful for debugging. Only enabled with debug build AND feature flag.
                     let msg = format!(
                         "[PAGE_FAULT] Segment referenced: chunk={}, seg_id={}, hot={}, addr={:#x}\n",
                         chunk_id, segment_id, segment.is_hot(), segment.addr

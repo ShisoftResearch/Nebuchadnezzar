@@ -42,6 +42,11 @@ num = "*"
 core_affinity = "0.8.1"
 ndarray = "0.16.1"
 
+[features]
+# Enable verbose page fault logging (only works in debug builds)
+# Usage: cargo build --features debug_page_faults
+debug_page_faults = []
+
 [dev-dependencies]
 env_logger = "*"
 rayon = "*"
