@@ -141,34 +141,6 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
     Ok(())
 }
 
-/// Evict multiple segments in batch
-/// 
-/// This is useful for evicting several segments at once to reach a memory target.
-/// Each segment is evicted independently - if one fails, others may still succeed.
-pub fn evict_segments(
-    segments: &[&Segment],
-    chunk: &Chunk,
-) -> Result<usize, Vec<io::Error>> {
-    let mut evicted_count = 0;
-    let mut errors = Vec::new();
-    
-    for segment in segments {
-        match evict_segment(segment, chunk) {
-            Ok(()) => evicted_count += 1,
-            Err(e) => {
-                warn!("Failed to evict segment {}: {}", segment.id, e);
-                errors.push(e);
-            }
-        }
-    }
-    
-    if errors.is_empty() {
-        Ok(evicted_count)
-    } else {
-        Err(errors)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
