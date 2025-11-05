@@ -398,6 +398,9 @@ impl LocalSchemasCache {
         debug!("Counted schema length {}", len);
         len
     }
+    pub fn get_all(&self) -> Vec<Schema> {
+        self.map.get_all()
+    }
     pub fn fields_size(&self, schema_id: &u32, fields: &[u64]) -> Option<usize> {
         const DEFAULT_FIELD_SIZE: usize = 32; // Large default number for unknown field
         const DEFAULT_ARRAY_SIZE: usize = 32;
