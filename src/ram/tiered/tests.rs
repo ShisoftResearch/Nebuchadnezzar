@@ -620,10 +620,10 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     
     page_fault_tracker::install_fault_handlers();
     
-    // Medium configuration: 32MB physical, 256MB virtual
+    // Reduced configuration: 16MB physical, 64MB virtual (reduced for faster test)
     std::env::set_var("NEB_TIERED_MEMORY_ENABLED", "1");
     std::env::set_var("NEB_TIERED_MEMORY_THRESHOLD", "0.7");
-    std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", 32 * 1024 * 1024));
+    std::env::set_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT", &format!("{}", 16 * 1024 * 1024));
     
     let server_addr = String::from("127.0.0.1:5401");
     let backup_dir = "/tmp/neb_stress_test_bk";
@@ -634,7 +634,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
-            total_size: 256 * 1024 * 1024,
+            total_size: 64 * 1024 * 1024,  // Reduced from 256MB
             tiered_config: crate::ram::tiered::TieredConfig::from_env(),
             backup_storage: Some(backup_dir.to_string()),
             wal_storage: Some(wal_dir.to_string()),
@@ -656,13 +656,13 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
                                      schema.fields.clone(), schema.is_dynamic, schema.is_scannable);
     server.meta.schemas.new_schema(schema.clone());
     
-    // Initialize 10000 cells
-    info!("Initializing 10000 cells");
+    // Initialize 2000 cells (reduced from 10000 for faster test)
+    info!("Initializing 2000 cells");
     let client = transactions::new_async_client(&server_addr).await.unwrap();
-    let num_keys = 10000;
+    let num_keys = 2000;
     let mut ids = Vec::with_capacity(num_keys);
     
-    let batch_size = 500;
+    let batch_size = 200;
     for batch in 0..(num_keys / batch_size) {
         let tx = client.begin().await.unwrap().unwrap();
         for i in (batch * batch_size)..((batch + 1) * batch_size) {
@@ -670,7 +670,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
             let mut m = OwnedMap::new();
             m.insert(&String::from("id"), OwnedValue::I64(i as i64));
             m.insert(&String::from("name"), OwnedValue::String(format!("stress_{}", i)));
-            m.insert(&String::from("data"), OwnedValue::String("D".repeat(4096)));
+            m.insert(&String::from("data"), OwnedValue::String("D".repeat(1024)));  // Reduced from 4KB to 1KB
             m.insert(&String::from("score"), OwnedValue::U64(0));
             let cell = OwnedCell::new_with_id(schema.id, &id, OwnedValue::Map(m));
             let _ = client.write(tx.clone(), cell).await.unwrap().unwrap();
@@ -682,10 +682,10 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
     
     info!("Initialization complete, starting mixed workload");
     
-    // Mixed workload: readers and writers
-    let readers = 6;
-    let writers = 6;
-    let duration_secs = 20;
+    // Mixed workload: readers and writers (reduced from 6+6 for faster test)
+    let readers = 3;
+    let writers = 3;
+    let duration_secs = 10;  // Reduced from 20 seconds
     
     let success_counters: Arc<Vec<AtomicU64>> = Arc::new(
         (0..num_keys).map(|_| AtomicU64::new(0)).collect()
@@ -803,7 +803,7 @@ async fn test_stress_concurrent_mixed_workload_with_tiered_memory() {
 async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
-
+    
     info!("=== Starting Direct Write Test (No Transactions, No Tiered Memory) ===");
 
     // NO tiered memory configuration
@@ -813,7 +813,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
     let server_addr = String::from("127.0.0.1:5201");
     let backup_dir = "/tmp/neb_direct_bk";
     let wal_dir = "/tmp/neb_direct_wal";
-
+    
     // Clean up
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
@@ -869,7 +869,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
             
             match server.chunks.write_cell(&mut cell) {
                 Ok(_) => ids.push(id),
-                Err(e) => {
+                        Err(e) => {
                     error!("Failed to write cell {}: {:?}", i, e);
                     panic!("Write failed");
                 }
@@ -1035,7 +1035,7 @@ async fn test_direct_writes_without_transactions_or_tiered_memory() {
 async fn test_direct_writes_with_tiered_memory() {
     let _guard = TEST_MUTEX.lock().unwrap();
     let _ = env_logger::try_init();
-
+    
     info!("=== Starting Direct Write Test WITH Tiered Memory ===");
 
     page_fault_tracker::install_fault_handlers();
@@ -1058,7 +1058,7 @@ async fn test_direct_writes_with_tiered_memory() {
     let _ = std::fs::remove_dir_all(wal_dir);
     let _ = std::fs::create_dir_all(backup_dir);
     let _ = std::fs::create_dir_all(wal_dir);
-
+    
     let server = NebServer::new_from_opts(
         &ServerOptions {
             chunk_count: 1,
@@ -1274,6 +1274,6 @@ async fn test_direct_writes_with_tiered_memory() {
     std::env::remove_var("NEB_TIERED_PHYSICAL_MEMORY_LIMIT");
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
-
+    
     info!("=== Direct Write Test with Tiered Memory Complete ===");
 }

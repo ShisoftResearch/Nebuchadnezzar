@@ -46,11 +46,14 @@ impl DummySegment {
 impl CombinedCleaner {
     pub fn combine_segments(chunk: &Chunk, selected_segments: &Vec<lightning::aarc::Arc<Segment>>) -> usize {
         let head_seg_id = chunk.get_head_seg_id();
-        // Remove the head segment from the candidate segments
-        // This should be done but head segment still in the list, need to investigate
+        // Remove the head segment and segments being promoted from candidates
+        // Skip promoting segments to avoid deadlocks with promotion waiting for no_references
         let segments = selected_segments
             .iter()
-            .filter(|seg| seg.id != head_seg_id)
+            .filter(|seg| {
+                seg.id != head_seg_id && 
+                !seg.promoting.load(std::sync::atomic::Ordering::Acquire)
+            })
             .collect_vec();
 
         if segments.len() < 2 {
@@ -74,6 +77,13 @@ impl CombinedCleaner {
             segment_ids_to_combine,
             chunk.get_head_seg_id()
         );
+        
+        // Hold references to all source segments to prevent eviction/promotion during memcpy
+        // This prevents data corruption if a segment is remapped while we're copying from it
+        for seg in segments.iter() {
+            seg.references.fetch_add(1, Ordering::Relaxed);
+        }
+        debug!("Acquired references for {} source segments", segments.len());
 
         // Get all entries in segments to combine and order them by data temperature and size
         // Step 1: Collect and deduplicate using HashMap (faster than sort+chunk_by)
@@ -314,6 +324,14 @@ impl CombinedCleaner {
             segment_ids_to_combine,
             chunk.get_head_seg_id()
         );
+        
+        // Release references now that all memcpy operations are complete
+        // This allows eviction/promotion to proceed if needed
+        for old_seg in segments.iter() {
+            old_seg.references.fetch_sub(1, Ordering::Relaxed);
+        }
+        debug!("Released references for {} source segments", segments.len());
+        
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop(chunk);

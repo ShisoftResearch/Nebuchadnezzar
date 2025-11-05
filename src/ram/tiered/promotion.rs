@@ -19,13 +19,14 @@ use std::thread;
 /// - All cells in the segment must be locked to prevent reads during this window
 /// 
 /// Process:
-/// 1. Scan segment to find all cells (like the cleaner does)
-/// 2. Lock all cells iteratively using try_lock (retry those that fail)
-/// 3. Copy data to temp buffer (while file is still mapped)
-/// 4. Remap as anonymous with MAP_FIXED (creates empty window - cells are locked!)
-/// 5. Copy data back to anonymous mapping (fills empty window)
-/// 6. Close file descriptor and mark as hot
-/// 7. Unlock all cells
+/// 1. Wait for no active references (prevents races with cleaner)
+/// 2. Scan segment to find all cells (like the cleaner does)
+/// 3. Lock all cells iteratively using try_lock (retry those that fail)
+/// 4. Copy data to temp buffer (while file is still mapped)
+/// 5. Remap as anonymous with MAP_FIXED (creates empty window - cells are locked!)
+/// 6. Copy data back to anonymous mapping (fills empty window)
+/// 7. Close file descriptor and mark as hot
+/// 8. Unlock all cells
 ///
 /// The iterative locking ensures we eventually lock all cells without deadlock.
 pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
@@ -61,7 +62,14 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     
     debug!("Promoting segment {} to hot storage", segment.id);
     
-    // Step 1: Scan segment to collect all cell hashes (like the cleaner does)
+    // Step 1: Wait for no active references
+    // This ensures no one (like the cleaner) is actively reading from this segment
+    while !segment.no_references() {
+        thread::yield_now();
+    }
+    debug!("Promotion: all references released for segment {}", segment.id);
+    
+    // Step 2: Scan segment to collect all cell hashes (like the cleaner does)
     debug!("Scanning segment {} to find all cells", segment.id);
     let mut cell_hashes: Vec<u64> = Vec::with_capacity(1024);
     
@@ -74,7 +82,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     
     debug!("Found {} cells in segment {} to lock", cell_hashes.len(), segment.id);
     
-    // Step 2: Lock all cells iteratively using try_lock
+    // Step 3: Lock all cells iteratively using try_lock
     // Keep trying to lock cells that couldn't be locked until all are locked
     let mut locks: Vec<lightning::map::WordMutexGuard> = Vec::with_capacity(cell_hashes.len());
     let mut unlocked_indices: Vec<usize> = (0..cell_hashes.len()).collect();
@@ -131,7 +139,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     
     let segment_start = segment.addr;
     
-    // Step 3: Copy data to temp buffer BEFORE unmapping
+    // Step 4: Copy data to temp buffer BEFORE unmapping
     // All cells are now locked, safe to copy
     debug!("Copying segment {} data to temp buffer", segment.id);
     let mut data = vec![0u8; SEGMENT_SIZE];
@@ -143,9 +151,9 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         );
     }
     
-    // Step 4: Remap as anonymous with MAP_FIXED
+    // Step 5: Remap as anonymous with MAP_FIXED
     // ⚠️ CRITICAL SECTION: This creates an "empty window"
-    // The segment now points to zeros until step 5 completes
+    // The segment now points to zeros until step 6 completes
     // All cells are locked so no concurrent reads can happen
     debug!(
         "Remapping segment {} as anonymous (empty window protected by cell locks)",
@@ -183,7 +191,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         ));
     }
     
-    // Step 5: Copy data back to new anonymous mapping
+    // Step 6: Copy data back to new anonymous mapping
     // This fills the empty window - segment now contains correct data again
     debug!("Copying data back to segment {} anonymous mapping", segment.id);
     unsafe {
@@ -194,22 +202,22 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         );
     }
     
-    // Step 6: Close file descriptor and mark segment as hot
+    // Step 7: Close file descriptor and mark segment as hot
     let fd = segment.cold_file_fd.load(Ordering::Acquire);
     if fd >= 0 {
         unsafe { close(fd) };
     }
     segment.cold_file_fd.store(-1, Ordering::Release);
     
-    // Step 7: Set reference bit to 1
+    // Step 8: Set reference bit to 1
     // The segment was just accessed (which triggered promotion), so it should be marked
     // as referenced to prevent immediate eviction by CLOCK algorithm
     segment.mark_referenced();
     
-    // Step 8: Clear promoting flag
+    // Step 9: Clear promoting flag
     segment.promoting.store(false, Ordering::Release);
     
-    // Step 9: Drop all locks - cells are now accessible again
+    // Step 10: Drop all locks - cells are now accessible again
     drop(locks);
     
     info!("Successfully promoted segment {} to hot storage (locked {} cells during promotion)", 
