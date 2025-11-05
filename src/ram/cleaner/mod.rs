@@ -33,9 +33,9 @@ impl RateLimiter {
         let now = Instant::now();
         // Get intervals from environment or use defaults
         let promotion_interval_ms = env::var("NEB_PROMOTION_CHECK_INTERVAL_MS")
-            .unwrap_or("500".to_string())  // Check every 500ms (was every 100ms)
+            .unwrap_or("2000".to_string())  // Check every 2s (was every 100ms, more conservative)
             .parse::<u64>()
-            .unwrap_or(500);
+            .unwrap_or(2000);
         
         let eviction_interval_ms = env::var("NEB_EVICTION_CHECK_INTERVAL_MS")
             .unwrap_or("1000".to_string())  // Check every 1s (was every 100ms)
@@ -264,11 +264,12 @@ impl Cleaner {
             return;
         }
         
-        // Get sample size from env or use default (10% of segments, min 10, max 100)
+        // Get sample size from env or use default (5% of segments, min 5, max 50)
+        // Reduced from 10% to be more conservative since promotion is expensive
         let sample_pct = env::var("NEB_PROMOTION_SAMPLE_PERCENT")
-            .unwrap_or("10".to_string())
+            .unwrap_or("5".to_string())
             .parse::<f32>()
-            .unwrap_or(10.0)
+            .unwrap_or(5.0)
             .clamp(1.0, 100.0) / 100.0;
         
         let all_segments = chunk.segments();
@@ -278,10 +279,10 @@ impl Cleaner {
             return;
         }
         
-        // Calculate sample size
+        // Calculate sample size (more conservative limits)
         let sample_size = ((total_segs as f32 * sample_pct) as usize)
-            .max(10)
-            .min(100)
+            .max(5)
+            .min(50)
             .min(total_segs);
         
         // Use step size for sampling - this provides good coverage over time
@@ -301,14 +302,25 @@ impl Cleaner {
             .collect();
 
         if !segments_to_promote.is_empty() {
+            // Cap promotions per check to avoid overwhelming the system
+            let max_promotions = env::var("NEB_MAX_PROMOTIONS_PER_CHECK")
+                .unwrap_or("10".to_string())
+                .parse::<usize>()
+                .unwrap_or(10)
+                .max(1);
+            
+            let actual_promotions = segments_to_promote.len().min(max_promotions);
+            
             debug!(
-                "Cleaner promoting {} cold segments in chunk {} (sampled {}/{})",
-                segments_to_promote.len(),
+                "Cleaner promoting {} cold segments in chunk {} (sampled {}/{}, capped at {})",
+                actual_promotions,
                 chunk.id,
                 sample_size,
-                total_segs
+                total_segs,
+                max_promotions
             );
-            for segment in segments_to_promote {
+            
+            for segment in segments_to_promote.into_iter().take(max_promotions) {
                 if let Err(e) = tiered_manager.promote(&segment, chunk) {
                     error!("Tiered memory promotion failed in cleaner: {:?}", e);
                 }
