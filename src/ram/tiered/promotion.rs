@@ -79,6 +79,10 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     // Keep trying to lock cells that couldn't be locked until all are locked
     let mut locks: Vec<lightning::map::WordMutexGuard> = Vec::with_capacity(cell_hashes.len());
     let mut unlocked_indices: Vec<usize> = (0..cell_hashes.len()).collect();
+
+    const MAX_RETRY_ATTEMPTS: usize = 100;
+    let backoff = crossbeam::utils::Backoff::new();
+    let mut retry_count = 0;
     
     while !unlocked_indices.is_empty() {
         let mut still_unlocked = Vec::new();
@@ -89,10 +93,20 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
                 Some(Some(lock)) => {
                     // Successfully locked this cell
                     locks.push(lock);
+                    retry_count = 0;
+                    backoff.reset();
                 }
                 Some(None) => {
                     // Couldn't lock (busy or doesn't exist), try again in next iteration
                     still_unlocked.push(idx);
+                    retry_count += 1;
+                    if retry_count >= MAX_RETRY_ATTEMPTS {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Failed to lock cell after {} retries, giving up", retry_count),
+                        ));
+                    }
+                    backoff.spin();
                 }
                 None => {
                     error!("Cell {} not found in chunk {} index during promotion", hash, chunk.id);
