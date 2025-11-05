@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::cell::cell_header_from_entry_content_addr;
+use crate::ram::cell::{cell_hash_from_entry_content_addr, cell_header_from_entry_content_addr};
 use crate::ram::entry::EntryType;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use libc::{c_void, close, mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
@@ -63,12 +63,11 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
     
     // Step 1: Scan segment to collect all cell hashes (like the cleaner does)
     debug!("Scanning segment {} to find all cells", segment.id);
-    let mut cell_hashes: Vec<usize> = Vec::new();
+    let mut cell_hashes: Vec<u64> = Vec::with_capacity(1024);
     
     for entry_meta in segment.entry_iter() {
         if entry_meta.entry_header.entry_type == EntryType::CELL {
-            let cell_header = cell_header_from_entry_content_addr(entry_meta.body_pos);
-            let hash = cell_header.hash as usize;
+            let hash = cell_hash_from_entry_content_addr(entry_meta.body_pos);
             cell_hashes.push(hash);
         }
     }
@@ -92,7 +91,13 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
             match chunk.cell_index.try_lock(hash as usize) {
                 Some(Some(lock)) => {
                     // Successfully locked this cell
-                    locks.push(lock);
+                    let addr = *lock;
+                    if segment.contains_address(addr) {
+                        locks.push(lock);
+                    } else {
+                        drop(lock);
+                        warn!("Cell {} is not in segment {} during promotion, skipping", hash, segment.id);
+                    }
                     retry_count = 0;
                     backoff.reset();
                 }

@@ -11,6 +11,7 @@ use dovahkiin::types::referred::ARef;
 use lightning::map::WordMutexGuard;
 use serde::Serialize;
 use std::io::Cursor;
+use std::io::Seek;
 use std::ops::Deref;
 use std::ops::{Index, IndexMut};
 use std::ptr;
@@ -401,6 +402,14 @@ impl<'v> Cell for SharedCellData<'v> {
     fn data(&self) -> &Self::Value {
         &self.data
     }
+}
+
+pub fn cell_hash_from_entry_content_addr(addr: usize) -> u64 {
+    let mut cursor = addr_to_header_cursor(addr);
+    cursor.seek(std::io::SeekFrom::Start(24)).unwrap();
+    let hash = cursor.read_u64::<Endian>().unwrap();
+    release_cursor(cursor);
+    hash
 }
 
 pub fn cell_header_from_entry_content_addr(addr: usize) -> CellHeader {

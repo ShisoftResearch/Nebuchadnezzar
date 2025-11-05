@@ -437,6 +437,11 @@ impl Segment {
     pub fn get_reference_bit(&self) -> bool {
         self.reference_bit.load(Ordering::Relaxed)
     }
+
+    #[inline]
+    pub fn contains_address(&self, addr: usize) -> bool {
+        self.addr <= addr && addr < self.bound
+    }
 }
 
 pub struct SegmentEntryIter {
