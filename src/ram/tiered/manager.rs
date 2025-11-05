@@ -4,7 +4,8 @@ use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
 use std::io;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 /// Manages tiered memory for a chunk
 /// 
@@ -28,6 +29,13 @@ pub struct TieredMemoryManager {
     /// Whether to disable promotion (for benchmarking cold reads)
     /// When true, cold segments remain cold even when accessed
     pub disable_promotion: AtomicBool,
+    
+    /// Cached count of hot segments (updated incrementally)
+    /// This avoids scanning all segments on every check
+    cached_hot_count: AtomicUsize,
+    
+    /// Last time we did a full scan to verify the cached count
+    last_full_scan: std::sync::Mutex<Instant>,
 }
 
 impl TieredMemoryManager {
@@ -43,12 +51,15 @@ impl TieredMemoryManager {
             clock_policy: ClockEvictionPolicy::new(),
             enabled: true,
             disable_promotion: AtomicBool::new(false),
+            cached_hot_count: AtomicUsize::new(0),
+            last_full_scan: std::sync::Mutex::new(Instant::now() - Duration::from_secs(100)),
         }
     }
     
     /// Check if eviction is needed and evict segments if necessary
     /// 
-    /// Uses the configured physical_memory_limit for hot segments
+    /// Uses the configured physical_memory_limit for hot segments.
+    /// Uses cached hot segment count with periodic full scans for verification.
     /// 
     /// Returns the number of segments evicted
     pub fn check_and_evict(&self, chunk: &Chunk) -> Result<usize, io::Error> {
@@ -56,7 +67,8 @@ impl TieredMemoryManager {
             return Ok(0);
         }
         
-        let hot_segments_count = self.count_hot_segments(chunk);
+        // Use cached count with periodic verification (every 10 seconds)
+        let hot_segments_count = self.get_hot_count_cached(chunk);
         let hot_memory_bytes = hot_segments_count * SEGMENT_SIZE;
         
         // Calculate threshold based on physical memory limit
@@ -64,7 +76,7 @@ impl TieredMemoryManager {
         let threshold_bytes = (memory_limit as f32 * self.eviction_threshold_percent) as usize;
         
         debug!(
-            "check_and_evict: hot_segments={}, hot_memory={}MB, limit={}MB, threshold={}MB, threshold%={}, exceeds={}",
+            "check_and_evict: hot_segments={} (cached), hot_memory={}MB, limit={}MB, threshold={}MB, threshold%={}, exceeds={}",
             hot_segments_count,
             hot_memory_bytes / (1024 * 1024),
             memory_limit / (1024 * 1024),
@@ -88,7 +100,12 @@ impl TieredMemoryManager {
                 num_to_evict
             );
             
-            self.evict_until_target(chunk, num_to_evict)
+            let evicted = self.evict_until_target(chunk, num_to_evict)?;
+            
+            // Update cached count after eviction
+            self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
+            
+            Ok(evicted)
         } else {
             Ok(0)
         }
@@ -142,7 +159,53 @@ impl TieredMemoryManager {
         }
         
         debug!("Explicit eviction requested for {} segments", num_segments);
-        self.evict_until_target(chunk, num_segments)
+        let evicted = self.evict_until_target(chunk, num_segments)?;
+        
+        // Update cached count after eviction
+        self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
+        
+        Ok(evicted)
+    }
+    
+    /// Check if allocating a new segment would exceed the limit and evict if needed
+    /// 
+    /// This is more aggressive than check_and_evict - it doesn't use the threshold,
+    /// instead it checks if adding one more segment would exceed the physical limit.
+    /// 
+    /// Returns the number of segments evicted
+    pub fn evict_for_allocation(&self, chunk: &Chunk) -> Result<usize, io::Error> {
+        if !self.enabled {
+            return Ok(0);
+        }
+        
+        // Get current hot segment count (use cached value for speed)
+        let hot_segments_count = self.get_hot_count_cached(chunk);
+        let current_hot_memory = hot_segments_count * SEGMENT_SIZE;
+        let after_alloc_memory = current_hot_memory + SEGMENT_SIZE;
+        
+        // Check if allocating one more segment would exceed the physical limit
+        if after_alloc_memory > self.physical_memory_limit {
+            let excess_bytes = after_alloc_memory - self.physical_memory_limit;
+            let segments_to_evict = (excess_bytes + SEGMENT_SIZE - 1) / SEGMENT_SIZE; // Round up
+            
+            info!(
+                "Proactive eviction before allocation: current {} hot segments ({} MB), would be {} MB after allocation, limit {} MB, evicting {} segments",
+                hot_segments_count,
+                current_hot_memory / (1024 * 1024),
+                after_alloc_memory / (1024 * 1024),
+                self.physical_memory_limit / (1024 * 1024),
+                segments_to_evict
+            );
+            
+            let evicted = self.evict_until_target(chunk, segments_to_evict)?;
+            
+            // Update cached count
+            self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
+            
+            Ok(evicted)
+        } else {
+            Ok(0)
+        }
     }
     
     /// Promote a cold segment to hot
@@ -154,7 +217,54 @@ impl TieredMemoryManager {
             return Ok(());
         }
         
-        promote_segment(segment, chunk)
+        promote_segment(segment, chunk)?;
+        
+        // Update cached count after promotion
+        self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
+        
+        Ok(())
+    }
+    
+    /// Get hot segment count using cached value with periodic full scans
+    /// 
+    /// This avoids scanning all segments on every check, only doing full scans
+    /// every 10 seconds to verify/update the cached count.
+    fn get_hot_count_cached(&self, chunk: &Chunk) -> usize {
+        // Check if we need to do a full scan (every 10 seconds)
+        let should_full_scan = if let Ok(mut last_scan) = self.last_full_scan.try_lock() {
+            if last_scan.elapsed() >= Duration::from_secs(10) {
+                *last_scan = Instant::now();
+                true
+            } else {
+                false
+            }
+        } else {
+            // Another thread is doing a full scan, use cached value
+            false
+        };
+        
+        if should_full_scan {
+            // Do a full scan and update cache
+            let actual_count = self.count_hot_segments(chunk);
+            self.cached_hot_count.store(actual_count, Ordering::Relaxed);
+            debug!("Full scan updated hot segment count: {}", actual_count);
+            actual_count
+        } else {
+            // Use cached value
+            self.cached_hot_count.load(Ordering::Relaxed)
+        }
+    }
+    
+    /// Increment the cached hot segment count
+    /// Called when a new hot segment is created
+    pub fn increment_hot_count(&self) {
+        self.cached_hot_count.fetch_add(1, Ordering::Relaxed);
+    }
+    
+    /// Decrement the cached hot segment count
+    /// Called when a hot segment is removed or evicted
+    pub fn decrement_hot_count(&self) {
+        self.cached_hot_count.fetch_sub(1, Ordering::Relaxed);
     }
     
     /// Count hot segments in the chunk

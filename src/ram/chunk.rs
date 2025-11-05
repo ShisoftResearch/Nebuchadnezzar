@@ -369,11 +369,21 @@ impl Chunk {
                         Cleaner::clean(self, false);
                     }
                     
-                    // PROACTIVE EVICTION: Check memory limit BEFORE allocating new segment
-                    // This prevents OOM by ensuring we evict cold segments before allocating hot ones
+                    // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
+                    // This ensures we never exceed physical memory limit
                     if let Some(ref tiered_manager) = self.tiered_manager {
-                        if let Err(e) = tiered_manager.check_and_evict(self) {
-                            error!("Proactive eviction failed before segment allocation: {:?}", e);
+                        match tiered_manager.evict_for_allocation(self) {
+                            Ok(evicted) => {
+                                if evicted > 0 {
+                                    debug!(
+                                        "Proactively evicted {} segments before allocation in chunk {}",
+                                        evicted, self.id
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!("Proactive eviction failed before segment allocation: {:?}", e);
+                            }
                         }
                     }
                     
@@ -798,6 +808,17 @@ impl Chunk {
         );
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
+        let is_hot = segment.is_hot();
+        
+        // Update cached hot count BEFORE adding to list to avoid race with full scan
+        // If we increment after adding, a full scan could count the new segment
+        // and update the cache, then we'd increment again, leading to over-counting
+        if is_hot {
+            if let Some(ref tiered_manager) = self.tiered_manager {
+                tiered_manager.increment_hot_count();
+            }
+        }
+        
         self.segs.insert_back(segment_key, AArc::new(segment));
     }
 
@@ -806,6 +827,24 @@ impl Chunk {
             "Removing segment for chunk {} with id {}",
             self.id, segment_id
         );
+        
+        // Check if segment is hot BEFORE removing to avoid race with full scan
+        // If we decrement after removing, a full scan could miss the removed segment
+        // and update the cache, then we'd decrement again, leading to under-counting
+        let should_decrement = if let Some(seg) = self.segs.get(&(segment_id as usize)) {
+            seg.is_hot()
+        } else {
+            false
+        };
+        
+        // Decrement cache BEFORE removing from list
+        if should_decrement {
+            if let Some(ref tiered_manager) = self.tiered_manager {
+                tiered_manager.decrement_hot_count();
+            }
+        }
+        
+        // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
             seg.dispense();
         }
