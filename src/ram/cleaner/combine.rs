@@ -227,7 +227,9 @@ impl CombinedCleaner {
                         }
                         seg_cursor += entry.size;
                     }
-                    new_seg.append_header.store(seg_cursor, Ordering::Relaxed);
+                    // Use Release ordering to ensure the append_header update is visible
+                    // to other threads that might archive or read this segment
+                    new_seg.append_header.store(seg_cursor, Ordering::Release);
                     let used_size = seg_cursor - new_seg.addr;
                     if used_size < SEGMENT_SIZE {
                         new_seg.shrink(used_size);
@@ -263,7 +265,7 @@ impl CombinedCleaner {
                                 {
                                     let (current_header, _) = cell::header_from_chunk_raw(*actual_addr).unwrap();
                                     assert!(
-                                        current_header.version > ver,
+                                        current_header.version >= ver,
                                         "Cell {} with address {} changed to {} but version running backwards {} -> {}",
                                         hash,
                                         old,

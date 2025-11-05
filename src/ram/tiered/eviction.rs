@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::{madvise_cold, madvise_free, Segment, SEGMENT_SIZE};
+use crate::ram::segs::{madvise_cold, Segment, SEGMENT_SIZE};
 use libc::{c_void, mmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
 use std::ffi::CString;
 use std::io;
@@ -59,15 +59,11 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
         ));
     }
     
-    // Step 3: Aggressively free physical pages from hot anonymous memory BEFORE remapping
-    // This immediately releases the physical pages while the memory is still anonymous
-    // After we remap to file-backed, we'll use a gentler MADV_COLD approach
-    unsafe {
-        madvise_free(segment.addr, SEGMENT_SIZE);
-    }
-    debug!("Freed physical pages for hot segment {} before file-backed remapping", segment.id);
-    
-    // Step 4: Open backup file read-only
+    // Step 3: Open backup file read-only
+    // IMPORTANT: Do NOT call madvise_free() before mmap!
+    // Calling MADV_DONTNEED on anonymous memory causes the kernel to zero pages,
+    // which would corrupt data if accessed during the mmap transition.
+    // Instead, we'll apply madvise AFTER the file-backed mapping is established.
     
     let path_cstr = CString::new(backup_path.as_str()).map_err(|e| {
         io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid path: {}", e))
@@ -78,9 +74,10 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
         return Err(io::Error::last_os_error());
     }
     
-    // Step 5: mmap with MAP_FIXED at the original address
+    // Step 4: mmap with MAP_FIXED at the original address
     // This atomically replaces the anonymous mapping with file-backed mapping
-    // The data at segment.addr remains unchanged (same bytes)
+    // MAP_FIXED ensures atomic replacement: readers see either old data (anonymous)
+    // or new data (file-backed), never zeros or corrupted data.
     let result = unsafe {
         mmap(
             segment.addr as *mut c_void,
@@ -111,27 +108,57 @@ pub fn evict_segment(segment: &Segment, _chunk: &Chunk) -> Result<(), io::Error>
         ));
     }
     
-    // Step 6: Mark file-backed pages as COLD (low priority for eviction)
+    debug!("Atomically replaced anonymous mapping with file-backed mapping for segment {}", segment.id);
+    
+    // Step 5: Store file descriptor (marks segment as cold)
+    // CRITICAL: This MUST happen BEFORE mprotect(PROT_NONE)!
+    // 
+    // Ordering rationale:
+    // 1. mmap(MAP_FIXED) established file-backed mapping (completed above)
+    // 2. Store fd → segment is now "cold" (this step)
+    // 3. mprotect(PROT_NONE) → segment is protected (next step)
+    // 4. madvise_cold() → hint to evict pages (later step)
+    //
+    // If we protect (step 3) before storing fd (step 2):
+    // - SIGSEGV occurs between steps
+    // - Handler sees cold_file_fd=-1 (thinks segment is hot)
+    // - But memory is actually file-backed → mismatch → handler confusion → deadlock!
+    //
+    // Correct order prevents this race:
+    // - Store fd first → handler always sees consistent state
+    // - Then protect → handler knows segment is cold and can handle properly
+    segment.cold_file_fd.store(fd, Ordering::Release);
+    debug!("Marked segment {} as cold (fd={})", segment.id, fd);
+    
+    // Step 6: Protect the segment with mprotect(PROT_NONE)
+    // Now that cold_file_fd is set, the handler will correctly detect this as a cold segment
+    if let Err(e) = crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr) {
+        warn!("Failed to protect evicted segment {}: {}", segment.id, e);
+        // If we can't protect, close fd and revert to hot
+        segment.cold_file_fd.store(-1, Ordering::Release);
+        unsafe { libc::close(fd) };
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to protect segment during eviction: {}", e),
+        ));
+    }
+    debug!("Protected evicted segment {} with mprotect(PROT_NONE)", segment.id);
+    
+    // Step 7: Mark file-backed pages as COLD (low priority for eviction)
+    // NOW it's safe to call madvise_cold because:
+    // - The segment is protected (PROT_NONE) - no unsynchronized access possible
+    // - The segment is marked as cold (fd stored) - handler can detect and promote
+    // - File-backed mapping is established - faulting back in reads from file
+    //
     // MADV_COLD cooperatively hints to the kernel that these pages should be evicted
-    // first under memory pressure, but doesn't force immediate eviction.
+    // first under memory pressure. For file-backed mappings, faulting back in means
+    // reading from the file, not zeroing pages (unlike anonymous memory).
     // This gives the kernel flexibility to keep some frequently-accessed cold pages
     // in the page cache while still prioritizing their eviction.
     unsafe {
         madvise_cold(segment.addr, SEGMENT_SIZE);
     }
     debug!("Marked file-backed segment {} as cold (low priority for page cache)", segment.id);
-    
-    // Step 7: Store file descriptor (marks segment as cold)
-    segment.cold_file_fd.store(fd, Ordering::Release);
-    
-    // Step 8: Protect the segment with mprotect(PROT_NONE) to track future accesses
-    // Even though it's file-backed now, mprotect still works!
-    // This allows us to detect when cold segments are accessed and promote them
-    if let Err(e) = crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr) {
-        warn!("Failed to protect evicted segment {}: {}", segment.id, e);
-    } else {
-        debug!("Protected evicted segment {} with mprotect(PROT_NONE)", segment.id);
-    }
     
     info!(
         "Successfully evicted segment {} to cold storage (fd: {})",

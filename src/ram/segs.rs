@@ -295,7 +295,11 @@ impl Segment {
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
                 let backup_file = File::create(backup_file_path)?;
-                let seg_size = self.append_header.load(Ordering::Relaxed) - self.addr;
+                // CRITICAL: Use Acquire ordering to ensure we see the latest append_header value!
+                // If we use Relaxed, we might read a stale value and write a truncated backup file.
+                // When the kernel mmaps this truncated file, it zero-fills beyond the file size,
+                // causing schema IDs and other data to be read as zeros.
+                let seg_size = self.append_header.load(Ordering::Acquire) - self.addr;
                 let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
                 unsafe {
                     let data_block = slice::from_raw_parts(self.addr as *const u8, seg_size);
