@@ -360,7 +360,7 @@ impl LocalSchemasCache {
         debug!("Subscribing schema events...");
         let _ = sm
             .on_schema_added(move |schema| {
-                debug!("Add schema {} from subscription", schema.id);
+                info!("Received schema_added event: schema {} ({})", schema.id, schema.name);
                 m1.new_schema(schema);
                 future::ready(()).boxed()
             })
@@ -475,8 +475,25 @@ impl LocalSchemasMap {
     }
 
     fn new_schema(&self, schema: Schema) {
-        self.name_map.insert(schema.name.clone(), schema.id);
-        self.schema_map.insert(schema.id, Arc::new(schema));
+        let name = schema.name.clone();
+        let id = schema.id;
+        
+        // Check if schema already exists (could happen during subscription race)
+        if let Some(existing_id) = self.name_map.get(&name) {
+            if existing_id != id {
+                error!("Schema name collision: name '{}' already mapped to ID {} but new schema has ID {}", 
+                       name, existing_id, id);
+                // Don't overwrite - keep the existing mapping
+                return;
+            } else {
+                // Same ID, just update the schema (may have been modified)
+                debug!("Updating existing schema {} ({})", id, name);
+            }
+        }
+        
+        self.name_map.insert(name.clone(), id);
+        self.schema_map.insert(id, Arc::new(schema));
+        info!("Added schema to local cache: {} ({})", id, name);
     }
 
     fn get_all(&self) -> Vec<Schema> {

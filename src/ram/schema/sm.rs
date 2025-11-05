@@ -172,7 +172,8 @@ impl SchemasMap {
         if self.schema_map.contains_key(&id) {
             return Err(NewSchemaError::IdExists(id));
         }
-        self.schema_map.insert(id, schema);
+        self.schema_map.insert(id, schema.clone());
+        info!("Schema created in SchemasSM: {} ({})", id, name);
         debug!("Schema map inserted with id {}, tid {}", id, thread_id());
         return Ok(());
     }
