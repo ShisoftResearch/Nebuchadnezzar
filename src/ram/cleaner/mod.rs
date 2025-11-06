@@ -193,6 +193,7 @@ impl Cleaner {
                     .sum::<usize>();
             }
         }
+        #[cfg(feature = "combine_cleaner")]
         {
             debug!("Starting combine {}", chunk.id);
             let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
