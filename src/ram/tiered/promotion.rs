@@ -35,11 +35,6 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error
         warn!("Attempted to promote already-hot segment {}", segment.id);
         return Ok(());
     }
-    // Check if the segment is protected from cleaning due to incomplete transactions.
-    if chunk.is_segment_protected(segment.id) {
-        warn!("Segment {} is protected, skipping promotion", segment.id);
-        return Ok(());
-    }
     
     // Try to set promoting flag - only one thread should promote at a time
     if segment.promoting.compare_exchange(

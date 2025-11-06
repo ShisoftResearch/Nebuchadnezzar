@@ -274,7 +274,7 @@ impl<'v> SharedCellData<'v> {
             let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
             Ok((cell, schema))
         } else {
-            error!("Schema {} does not existed to read, all schemas: {:?}", schema_id, chunk.meta.schemas.get_all());
+            error!("Schema {} does not existed to read", schema_id);
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
@@ -463,7 +463,7 @@ pub fn select_from_chunk_raw<'v>(
             header,
         ))
     } else {
-        error!("Schema {} does not existed to read, all schemas: {:?}", schema_id, chunk.meta.schemas.get_all());
+        error!("Schema {} does not existed to read", schema_id);
         return Err(ReadError::SchemaDoesNotExisted(*schema_id));
     }
 }
