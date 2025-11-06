@@ -172,6 +172,8 @@ impl Cleaner {
         // have to put it right here for cleaners will clear the tombstone death counter
         chunk.scan_tombstone_survival();
         let mut cleaned_space: usize = 0;
+        
+        #[cfg(feature = "compact_cleaner")]
         {
             debug!("Starting compact {}", chunk.id);
             let segments_for_compact = chunk.segs_for_compact_cleaner();

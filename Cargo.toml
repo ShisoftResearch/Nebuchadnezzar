@@ -47,8 +47,16 @@ ndarray = "0.16.1"
 # When disabled (default), segments are marked as referenced directly during reads
 # Can be enabled for production use to get zero-overhead reference tracking
 # Default: disabled to avoid signal handler conflicts in tests
-default = []
+default = ["combine_cleaner", "compact_cleaner"]
 page_fault_tracking = []
+
+# Enable combine cleaner: merges multiple sparse segments into dense ones
+# This improves memory utilization by consolidating fragmented segments
+# Default: enabled for better memory efficiency
+combine_cleaner = []
+
+# Enable compact cleaner: compacts segments to reclaim dead space
+compact_cleaner = []
 
 # Enable verbose page fault logging (only works in debug builds + page_fault_tracking feature)
 # Usage: cargo build --features debug_page_faults
