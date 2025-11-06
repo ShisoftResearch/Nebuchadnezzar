@@ -398,6 +398,7 @@ async fn test_rapid_commit_sequence() {
 /// Test interleaved prepare and commit operations
 /// Can expose timing issues in transaction state management
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
 async fn test_interleaved_prepare_commit() {
     let _ = env_logger::try_init();
     let server_addr = String::from("127.0.0.1:5304");

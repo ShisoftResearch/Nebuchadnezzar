@@ -10,13 +10,11 @@ use bifrost::utils::time::get_time;
 use bifrost::vector_clock::StandardVectorClock;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
 use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::io;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -32,7 +30,7 @@ pub struct CellMeta {
     read: TxnId,
     write: TxnId,
     owner: Option<TxnId>, // transaction that owns the cell in Committing state
-    waiting: BTreeSet<(TxnId, u64)>, // transactions that waiting for owner to finish
+    // Note: We don't track waiting transactions anymore - waiters just poll instead
 }
 
 struct Transaction {
@@ -64,7 +62,6 @@ pub struct DataManager {
     txns: LFMap<TxnId, Arc<Mutex<Transaction>>>,
     cell_list: LinkedList<Id>,
     txns_sorted: Mutex<BTreeSet<TxnId>>,
-    managers: LFMap<u64, Arc<manager::AsyncServiceClient>>,
     server: Arc<NebServer>,
     cleanup_signal: Arc<AtomicBool>,
 }
@@ -98,7 +95,6 @@ impl DataManager {
             txns: LFMap::with_capacity(128),
             cell_list: LinkedList::new(),
             txns_sorted: Mutex::new(BTreeSet::new()),
-            managers: LFMap::with_capacity(16),
             server: server.clone(),
             cleanup_signal: cleanup_signal.clone(),
         });
@@ -174,7 +170,6 @@ impl DataManager {
                 read: TxnId::new(),
                 write: TxnId::new(),
                 owner: None,
-                waiting: BTreeSet::new(),
             }))
         })
     }
@@ -265,23 +260,6 @@ impl DataManager {
         let mut meta = meta_ref.lock();
         meta.write = tid.clone();
     }
-    async fn get_tnx_manager(
-        &self,
-        server_id: u64,
-    ) -> io::Result<Arc<manager::AsyncServiceClient>> {
-        loop {
-            if !self.managers.contains_key(&server_id) {
-                let client = self.server.get_member_by_server_id(server_id).await?;
-                return Ok(self
-                    .managers
-                    .get_or_insert(server_id, || manager::AsyncServiceClient::new(&client)));
-            } else {
-                if let Some(manager) = self.managers.get(&server_id) {
-                    return Ok(manager.clone());
-                }
-            }
-        }
-    }
     #[inline]
     fn wipe_out_transaction(&self, tid: &TxnId) {
         if let Some(txn) = self.txns.lock(tid) {
@@ -320,7 +298,6 @@ impl DataManager {
     }
     fn prepare_read<T: Send>(
         &self,
-        server_id: &u64,
         clock: &StandardVectorClock,
         tid: &TxnId,
         id: &Id,
@@ -340,22 +317,10 @@ impl DataManager {
             return Err(self.response_with(TxnExecResult::StateError(txn.state)));
         }
         
-        // Optimization: If write is still committing, wait instead of rejecting immediately
-        // Note: This helps in edge cases where there might be timing issues, but typically
-        // if meta.write > tid, even after waiting, the constraint will still hold.
-        // The main value is avoiding unnecessary retries during race conditions in prepare/commit phases.
-        // For best results, applications should read cells early in transactions (right after begin())
-        // to minimize the window where writes from other transactions can cause ReadTooLate errors.
-        if read_too_late && committing {
-            // Write timestamp is newer but write is still in progress - wait for it to complete
-            // This can help in race conditions but the timestamp constraint will likely still apply after waiting
-            meta.waiting.insert((tid.clone(), *server_id));
-            debug!("-> READ {:?} WAITING for committing write {:?} on cell {:?}", tid, &meta.owner, id);
-            return Err(self.response_with(TxnExecResult::Wait));
-        }
-        
+        // Check timestamp constraints first
         if read_too_late {
-            // Write timestamp is newer and write has already committed - not realizable
+            // Write timestamp is newer - not realizable even if still committing
+            // The timestamp constraint won't change after waiting
             warn!(
                 "ReadTooLate: Transaction {:?} trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
                 tid,
@@ -364,12 +329,15 @@ impl DataManager {
             );
             return Err(self.response_with(TxnExecResult::Rejected));
         }
+        
         if committing {
-            // ts >= wt but committing, need to wait until it committed
-            meta.waiting.insert((tid.clone(), *server_id));
-            debug!("-> READ {:?} WAITING {:?}", tid, &meta.owner);
+            // Timestamp is OK but another transaction is still committing
+            // Return Wait so caller can retry with backoff
+            debug!("-> READ {:?} WAITING for {:?} to finish commit on cell {:?}", tid, &meta.owner, id);
             return Err(self.response_with(TxnExecResult::Wait));
         }
+        
+        // Cell is available, update read timestamp
         if &meta.read < tid {
             meta.read = tid.clone()
         }
@@ -384,12 +352,12 @@ impl Service for DataManager {
 
     fn read(
         &self,
-        server_id: u64,
+        _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
-        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             r
         } else {
             match self.server.chunks.read_cell(&id) {
@@ -400,13 +368,13 @@ impl Service for DataManager {
     }
     fn read_selected(
         &self,
-        server_id: u64,
+        _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
         fields: Vec<u64>,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<OwnedCell, ReadError>>> {
-        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
         match self.server.chunks.read_selected(&id, &fields[..], true) {
@@ -417,12 +385,12 @@ impl Service for DataManager {
     }
     fn head(
         &self,
-        server_id: u64,
+        _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<CellHeader, ReadError>>> {
-        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
         match self.server.chunks.head_cell(&id) {
@@ -433,14 +401,14 @@ impl Service for DataManager {
     // TODO: Link this function in transaction manager
     fn read_partial_raw(
         &self,
-        server_id: u64,
+        _server_id: u64,
         clock: StandardVectorClock,
         tid: TxnId,
         id: Id,
         offset: usize,
         len: usize,
     ) -> BoxFuture<'_, DataSiteResponse<TxnExecResult<Vec<u8>, ReadError>>> {
-        if let Err(r) = self.prepare_read(&server_id, &clock, &tid, &id) {
+        if let Err(r) = self.prepare_read(&clock, &tid, &id) {
             return r;
         }
         match self.server.chunks.read_partial_raw(&id, offset, len) {
@@ -832,7 +800,6 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         self.update_clock(&clock);
-        let wake_up_futures = FuturesUnordered::new();
         let mut released_locks = 0;
         let affected_cells;
         {
@@ -848,7 +815,6 @@ impl Service for DataManager {
                 tid
             );
             let affected_len = txn.affected_cells.len();
-            let mut waiting_list: BTreeMap<u64, BTreeSet<TxnId>> = BTreeMap::new();
             // Reserve to avoid reallocations when many cells are touched
             let mut cell_mutices = Vec::with_capacity(affected_len);
             let mut cell_guards = Vec::with_capacity(affected_len);
@@ -866,45 +832,20 @@ impl Service for DataManager {
             // Use the actual number of cells we found metadata for, not affected_len
             affected_cells = cell_mutices.len();
             for cell_mutex in &cell_mutices {
-                cell_guards.push(cell_mutex.lock()); // lock all affected cells on by on
+                cell_guards.push(cell_mutex.lock()); // lock all affected cells one by one
             }
             for mut meta in cell_guards {
                 if meta.owner.as_ref() == Some(&tid) {
-                    // collect waiting transactions
-                    for &(ref waiting_tid, ref waiting_server_id) in &meta.waiting {
-                        waiting_list
-                            .entry(*waiting_server_id)
-                            .or_insert_with(|| BTreeSet::new())
-                            .insert(waiting_tid.clone());
-                    }
-                    meta.waiting.clear();
+                    // Release ownership - waiting transactions will discover this on their next poll
                     meta.owner = None;
                     released_locks += 1;
+                    debug!("Released lock on cell owned by {:?}", tid);
                 } else {
                     warn!("affected txn does not own the cell");
                 }
             }
-            debug!("RELEASE: {:?} for {:?}", tid, waiting_list);
-            for (server_id, transactions) in waiting_list {
-                // inform waiting servers to go on
-                wake_up_futures.push(async move {
-                    if let Ok(client) = self.get_tnx_manager(server_id).await {
-                        debug!("WAKING UP {} for {:?}", server_id, transactions);
-                        client
-                            .go_ahead(transactions, self.server.server_id)
-                            .await
-                            .unwrap();
-                    } else {
-                        debug!(
-                            "cannot inform server {} to continue its transactions",
-                            server_id
-                        );
-                    }
-                });
-            }
         }
         async move {
-            let _wake_up_res: Vec<_> = wake_up_futures.collect().await;
             
             // Release all segment protections before wiping out transaction
             let (protected_segments, txn_state) = {

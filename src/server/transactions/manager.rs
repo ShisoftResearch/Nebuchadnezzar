@@ -8,12 +8,12 @@ use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Duration;
 
 type TxnMutex = Arc<Mutex<Transaction>>;
 type TxnGuard<'a> = MutexGuard<'a, Transaction>;
@@ -21,6 +21,24 @@ type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
+
+/// Configuration for wait/retry behavior when transactions encounter conflicts
+#[derive(Clone, Debug)]
+pub struct WaitConfig {
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub max_total_wait_ms: u64,
+}
+
+impl Default for WaitConfig {
+    fn default() -> Self {
+        Self {
+            initial_backoff_ms: 1,      // Start with 1ms
+            max_backoff_ms: 100,        // Cap at 100ms  
+            max_total_wait_ms: 5000,    // Give up after 5 seconds
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct DataObject {
@@ -49,8 +67,6 @@ service! {
     rpc prepare(tid: TxnId) -> Result<TMPrepareResult, TMError>;
     rpc commit(tid: TxnId) -> Result<EndResult, TMError>;
     rpc abort(tid: TxnId) -> Result<AbortResult, TMError>;
-
-    rpc go_ahead(tids: BTreeSet<TxnId>, server_id: u64); // invoked by data site to continue on it's transaction in case of waiting
 }
 
 dispatch_rpc_service_functions!(TransactionManager);
@@ -61,7 +77,7 @@ pub struct TransactionManager {
     server: Arc<NebServer>,
     transactions: LFMap<TxnId, TxnMutex>,
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
-    await_manager: AwaitManager,
+    wait_config: WaitConfig,
 }
 
 impl TransactionManager {
@@ -70,8 +86,27 @@ impl TransactionManager {
             server: server.clone(),
             transactions: LFMap::with_capacity(128),
             data_sites: LFMap::with_capacity(8),
-            await_manager: AwaitManager::new(),
+            wait_config: WaitConfig::default(),
         })
+    }
+    
+    pub fn with_wait_config(server: &Arc<NebServer>, wait_config: WaitConfig) -> Arc<TransactionManager> {
+        Arc::new(Self {
+            server: server.clone(),
+            transactions: LFMap::with_capacity(128),
+            data_sites: LFMap::with_capacity(8),
+            wait_config,
+        })
+    }
+    
+    /// Helper function for exponential backoff wait with timeout
+    async fn backoff_wait(attempt: u32, config: &WaitConfig) -> Result<(), TMError> {
+        let backoff_ms = config.initial_backoff_ms * 2u64.pow(attempt);
+        let backoff_ms = backoff_ms.min(config.max_backoff_ms);
+        
+        debug!("Backing off for {}ms (attempt {})", backoff_ms, attempt);
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        Ok(())
     }
 }
 
@@ -96,8 +131,7 @@ impl Service for TransactionManager {
             }
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
-                    let awaits = self.await_manager.get_txn(&tid);
-                    self.read_from_site(server_id, &server, &tid, &id, &mut txn, &awaits)
+                    self.read_from_site(server_id, &server, &tid, &id, &mut txn)
                         .await
                 }
                 Err(e) => {
@@ -126,8 +160,7 @@ impl Service for TransactionManager {
             }
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
-                    let awaits = self.await_manager.get_txn(&tid);
-                    self.head_from_site(server_id, &server, &tid, &id, &txn, &awaits)
+                    self.head_from_site(server_id, &server, &tid, &id, &txn)
                         .await
                 }
                 Err(e) => {
@@ -186,9 +219,8 @@ impl Service for TransactionManager {
             }
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
-                    let awaits = self.await_manager.get_txn(&tid);
                     self.read_selected_from_site(
-                        server_id, &server, &tid, &id, &fields, &txn, &awaits,
+                        server_id, &server, &tid, &id, &fields, &txn,
                     )
                     .await
                 }
@@ -389,25 +421,6 @@ impl Service for TransactionManager {
         }
         .boxed()
     }
-    fn go_ahead(&self, tids: BTreeSet<TxnId>, server_id: u64) -> BoxFuture<'_, ()> {
-        debug!(
-            "=> TM WAKE UP TXN from {} for {} txn",
-            server_id,
-            tids.len()
-        );
-        let futures = FuturesUnordered::new();
-        for tid in tids {
-            let await_txn = self.await_manager.get_txn(&tid);
-            futures.push(async move {
-                debug!("WAKE UP: {:?}", tid);
-                await_txn.send(server_id).await;
-            });
-        }
-        async move {
-            let _: Vec<_> = futures.collect().await;
-        }
-        .boxed()
-    }
 }
 
 impl TransactionManager {
@@ -458,10 +471,18 @@ impl TransactionManager {
         tid: &TxnId,
         id: &Id,
         txn: &mut TxnGuard<'a>,
-        awaits: &TxnAwaits,
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
+        
         loop {
+            // Check timeout
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!("Read timeout for transaction {:?} on cell {:?}", tid, id);
+                return Ok(TxnExecResult::Rejected);
+            }
+            
             let read_response = server
                 .read(self_server_id, self.get_clock(), tid.to_owned(), id.clone())
                 .await;
@@ -505,7 +526,9 @@ impl TransactionManager {
                             }
                         }
                         TxnExecResult::Wait => {
-                            awaits.wait(server_id).await;
+                            // Backoff and retry
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
                             continue;
                         }
                         _ => {}
@@ -522,15 +545,23 @@ impl TransactionManager {
 
     async fn head_from_site<'a>(
         &self,
-        server_id: u64,
+        _server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
         _txn: &TxnGuard<'a>,
-        awaits: &TxnAwaits,
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
+        
         loop {
+            // Check timeout
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!("Head timeout for transaction {:?} on cell {:?}", tid, id);
+                return Ok(TxnExecResult::Rejected);
+            }
+            
             let head_response = server
                 .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
                 .await;
@@ -540,7 +571,9 @@ impl TransactionManager {
                     let payload = &dsr.payload;
                     match &payload {
                         &TxnExecResult::Wait => {
-                            awaits.wait(server_id).await;
+                            // Backoff and retry
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
                             continue;
                         }
                         _ => {}
@@ -556,16 +589,24 @@ impl TransactionManager {
     }
     async fn read_selected_from_site<'a>(
         &self,
-        server_id: u64,
+        _server_id: u64,
         server: &Arc<data_site::AsyncServiceClient>,
         tid: &TxnId,
         id: &Id,
         fields: &Vec<u64>,
         _txn: &TxnGuard<'a>,
-        awaits: &TxnAwaits,
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
+        
         loop {
+            // Check timeout
+            if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
+                warn!("Read selected timeout for transaction {:?} on cell {:?}", tid, id);
+                return Ok(TxnExecResult::Rejected);
+            }
+            
             let read_response = server
                 .read_selected(
                     self_server_id,
@@ -581,7 +622,9 @@ impl TransactionManager {
                     let payload = dsr.payload;
                     match payload {
                         TxnExecResult::Wait => {
-                            awaits.wait(server_id).await;
+                            // Backoff and retry
+                            Self::backoff_wait(attempt, &self.wait_config).await?;
+                            attempt += 1;
                             continue;
                         }
                         _ => {}
@@ -625,12 +668,21 @@ impl TransactionManager {
     }
     async fn site_prepare(
         server: &Arc<NebServer>,
-        awaits: &TxnAwaits,
+        config: &WaitConfig,
         tid: &TxnId,
         objs: &BTreeMap<Id, DataObject>,
         data_site: &Arc<data_site::AsyncServiceClient>,
     ) -> Result<DMPrepareResult, TMError> {
+        let start_time = std::time::Instant::now();
+        let mut attempt = 0u32;
+        
         loop {
+            // Check timeout
+            if start_time.elapsed().as_millis() > config.max_total_wait_ms as u128 {
+                warn!("Prepare timeout for transaction {:?}", tid);
+                return Ok(DMPrepareResult::NotRealizable); // Give up
+            }
+            
             let self_server_id = server.server_id;
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
             let server_for_clock = server.clone();
@@ -654,8 +706,10 @@ impl TransactionManager {
                 Ok(payload) => {
                     match payload {
                         DMPrepareResult::Wait => {
-                            awaits.wait(data_site.server_id()).await;
-                            continue; // after waiting, retry
+                            // Backoff and retry
+                            Self::backoff_wait(attempt, config).await?;
+                            attempt += 1;
+                            continue;
                         }
                         _ => return Ok(payload),
                     }
@@ -675,8 +729,7 @@ impl TransactionManager {
             .into_iter()
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
-                let awaits = self.await_manager.get_txn(&tid);
-                TransactionManager::site_prepare(&self.server, &awaits, &tid, &objs, &data_site)
+                TransactionManager::site_prepare(&self.server, &self.wait_config, &tid, &objs, &data_site)
                     .await
             })
             .collect();
@@ -860,72 +913,3 @@ impl TransactionManager {
     }
 }
 
-struct AwaitingServer {
-    sender: Mutex<Sender<()>>,
-    receiver: Mutex<Receiver<()>>,
-}
-
-impl AwaitingServer {
-    pub fn new() -> AwaitingServer {
-        let (sender, receiver) = channel(1);
-        AwaitingServer {
-            sender: Mutex::new(sender),
-            receiver: Mutex::new(receiver),
-        }
-    }
-    pub async fn send(&self) {
-        self.sender.lock().await.send(()).await.unwrap();
-    }
-    pub async fn wait(&self) {
-        self.receiver.lock().await.recv().await.unwrap();
-    }
-}
-
-struct AwaitManager {
-    channels: LFMap<TxnId, Arc<TxnAwaits>>,
-}
-
-struct TxnAwaits {
-    // Do not use the lock-free map here, allocating LFMap for all transactions is too expensive
-    map: parking_lot::Mutex<HashMap<u64, Arc<AwaitingServer>>>,
-}
-
-impl AwaitManager {
-    pub fn new() -> AwaitManager {
-        AwaitManager {
-            channels: LFMap::with_capacity(256),
-        }
-    }
-    pub fn get_txn(&self, tid: &TxnId) -> Arc<TxnAwaits> {
-        self.channels
-            .get_or_insert(tid.clone(), || TxnAwaits::new_ref())
-    }
-}
-
-impl TxnAwaits {
-    pub fn new_ref() -> Arc<Self> {
-        Arc::new(Self {
-            map: parking_lot::Mutex::new(HashMap::new()),
-        })
-    }
-    pub fn manager_of_server(&self, server_id: u64) -> Arc<AwaitingServer> {
-        let mut map = self.map.lock();
-        map.entry(server_id)
-            .or_insert_with(|| Arc::new(AwaitingServer::new()))
-            .clone()
-    }
-    pub async fn send(&self, server_id: u64) {
-        debug!("Will sending to wakeup from {}", server_id);
-        let manager = self.manager_of_server(server_id);
-        debug!("Sending to wakeup from {}", server_id);
-        manager.send().await;
-        debug!("Wakeup sent from {}", server_id);
-    }
-    pub async fn wait(&self, server_id: u64) {
-        debug!("Will start waiting for server {}", server_id);
-        let manager = self.manager_of_server(server_id);
-        debug!("Start waiting for server {}", server_id);
-        manager.wait().await;
-        debug!("Waked up from server {}", server_id);
-    }
-}

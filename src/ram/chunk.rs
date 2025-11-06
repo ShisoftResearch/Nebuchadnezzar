@@ -96,19 +96,27 @@ pub fn get_segment_for_fault(chunk_id: usize, segment_id: usize) -> Option<AArc<
 }
 
 /// Reset global chunk allocation (for tests)
+/// 
+/// IMPORTANT: Reset GLOBAL_CHUNKS_PTR BEFORE unmapping memory to prevent
+/// the signal handler from accessing unmapped memory during cleanup.
 pub fn reset_global_chunk_allocation() {
+    // Reset GLOBAL_CHUNKS_PTR first to prevent signal handler from accessing chunks
+    // This must happen BEFORE unmapping memory to avoid SIGSEGV in signal handler
+    GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
+    
     let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
     let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
     
+    // Reset other globals before unmapping
+    GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
+    GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
+    
+    // Now safe to unmap memory - signal handler won't try to access it
     if base != 0 && size != 0 {
         unsafe {
             libc::munmap(base as *mut libc::c_void, size);
         }
     }
-    
-    GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
-    GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
-    GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
 }
 
 // Thread-local flag to indicate if we're currently in a transaction
@@ -854,8 +862,11 @@ impl Chunk {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
-            error!(
-                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?}",
+            // Segment doesn't exist - this can happen when the cleaner combines segments
+            // and removes old ones. The address in cell_index may be stale.
+            // Callers should handle this by re-reading from cell_index or retrying.
+            debug!(
+                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?} (segment may have been removed by cleaner)",
                 cell_id,
                 addr,
                 seg_id,
