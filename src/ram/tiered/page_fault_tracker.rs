@@ -11,16 +11,25 @@
 /// - Signal-safe handler: lock-free, no allocation, minimal atomic operations
 /// 
 /// Overhead: One signal + one syscall (~1-2μs) on first access after protection
+/// 
+/// This feature can be disabled via Cargo.toml to use direct reference marking instead.
 
-use crate::ram::chunk::{chunk_and_segment_from_addr, get_segment_for_fault};
 use crate::ram::segs::SEGMENT_SIZE;
 use libc::{PROT_READ, PROT_WRITE, PROT_NONE};
+
+#[cfg(feature = "page_fault_tracking")]
+use crate::ram::chunk::{chunk_and_segment_from_addr, get_segment_for_fault};
+#[cfg(feature = "page_fault_tracking")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "page_fault_tracking")]
 static SIGNAL_HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Install SIGSEGV and SIGBUS handlers for segment fault tracking
 /// Safe to call multiple times (only installs once)
+/// 
+/// If page_fault_tracking feature is disabled, this is a no-op.
+#[cfg(feature = "page_fault_tracking")]
 pub fn install_fault_handlers() {
     if SIGNAL_HANDLER_INSTALLED.swap(true, Ordering::AcqRel) {
         return; // Already installed
@@ -46,6 +55,12 @@ pub fn install_fault_handlers() {
     info!("Segment fault handlers installed for reference bit tracking");
 }
 
+/// No-op when page_fault_tracking feature is disabled
+#[cfg(not(feature = "page_fault_tracking"))]
+pub fn install_fault_handlers() {
+    debug!("Page fault tracking disabled - using direct reference marking");
+}
+
 /// Signal handler for SIGSEGV/SIGBUS
 /// 
 /// SAFETY: This function must be signal-safe:
@@ -53,6 +68,7 @@ pub fn install_fault_handlers() {
 /// - No locks (except lock-free atomics)
 /// - No I/O operations
 /// - Only async-signal-safe functions
+#[cfg(feature = "page_fault_tracking")]
 extern "C" fn handle_segfault(
     _sig: libc::c_int,
     info: *mut libc::siginfo_t,
@@ -108,7 +124,9 @@ extern "C" fn handle_segfault(
 
 /// Protect a segment (set to PROT_NONE)
 /// Called by CLOCK when clearing reference bits
-/// Returns true if successfully protected
+/// When page_fault_tracking is enabled, uses mprotect
+/// When disabled, this is a no-op (reference tracking happens directly on read)
+#[cfg(feature = "page_fault_tracking")]
 pub fn protect_segment(segment_addr: usize) -> Result<(), String> {
     unsafe {
         let result = libc::mprotect(
@@ -129,8 +147,17 @@ pub fn protect_segment(segment_addr: usize) -> Result<(), String> {
     }
 }
 
+/// No-op when page_fault_tracking is disabled
+#[cfg(not(feature = "page_fault_tracking"))]
+pub fn protect_segment(_segment_addr: usize) -> Result<(), String> {
+    Ok(())
+}
+
 /// Unprotect a segment (set to PROT_READ|PROT_WRITE)
 /// Called when manually accessing a protected segment
+/// When page_fault_tracking is enabled, uses mprotect
+/// When disabled, this is a no-op
+#[cfg(feature = "page_fault_tracking")]
 pub fn unprotect_segment(segment_addr: usize) -> Result<(), String> {
     unsafe {
         let result = libc::mprotect(
@@ -149,6 +176,12 @@ pub fn unprotect_segment(segment_addr: usize) -> Result<(), String> {
             ))
         }
     }
+}
+
+/// No-op when page_fault_tracking is disabled
+#[cfg(not(feature = "page_fault_tracking"))]
+pub fn unprotect_segment(_segment_addr: usize) -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(test)]

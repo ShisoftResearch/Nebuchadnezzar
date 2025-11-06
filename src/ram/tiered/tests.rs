@@ -609,16 +609,17 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Drop server first to ensure all operations complete
     drop(server);
     
-    // Wait a bit for any pending signal handlers to complete
-    // This prevents SIGSEGV when resetting global state
+    // Wait for operations to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     
-    // Reset global chunk allocation state to prevent conflicts with other tests
-    // This is critical because the signal handler uses GLOBAL_CHUNKS_PTR
-    // and if it's not reset, the handler might access invalid memory
-    crate::ram::chunk::reset_global_chunk_allocation();
+    // Only reset global chunk allocation when page_fault_tracking is disabled
+    // With page_fault_tracking enabled, signal handlers may still be active
+    #[cfg(not(feature = "page_fault_tracking"))]
+    {
+        crate::ram::chunk::reset_global_chunk_allocation();
+    }
     
-    // Clean up files after resetting global state
+    // Clean up files
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);
     

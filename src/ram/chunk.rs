@@ -428,10 +428,17 @@ impl Chunk {
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_read(*index, "location_for_read", hash);
                 
-                // Reference bit tracking is handled by mprotect + SIGSEGV for ALL segments:
-                // - Hot segments (anonymous memory): mprotect works
-                // - Cold segments (file-backed memory): mprotect works! Kernel pages in from disk transparently
-                // CLOCK re-arms segments with mprotect(PROT_NONE) after clearing reference bits
+                // Reference bit tracking:
+                // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
+                // Without page_fault_tracking feature: mark reference bit directly here
+                #[cfg(not(feature = "page_fault_tracking"))]
+                {
+                    // Mark segment as referenced directly (no page fault tracking)
+                    let seg_id = self.allocator.id_by_addr(*index);
+                    if let Some(segment) = self.segs.get(&seg_id) {
+                        segment.mark_referenced();
+                    }
+                }
                 
                 return Ok(index);
             }

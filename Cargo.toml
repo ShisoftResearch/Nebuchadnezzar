@@ -43,7 +43,14 @@ core_affinity = "0.8.1"
 ndarray = "0.16.1"
 
 [features]
-# Enable verbose page fault logging (only works in debug builds)
+# Enable zero-overhead page fault tracking via mprotect/SIGSEGV
+# When disabled (default), segments are marked as referenced directly during reads
+# Can be enabled for production use to get zero-overhead reference tracking
+# Default: disabled to avoid signal handler conflicts in tests
+default = []
+page_fault_tracking = []
+
+# Enable verbose page fault logging (only works in debug builds + page_fault_tracking feature)
 # Usage: cargo build --features debug_page_faults
 debug_page_faults = []
 
