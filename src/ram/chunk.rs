@@ -1,8 +1,8 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
-use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::segment_list::SegmentList;
+use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
 use crate::ram::tombstone::{Tombstone, TOMBSTONE_ENTRY_SIZE};
 use crate::ram::types::Id;
 use crate::server::ServerMeta;
@@ -14,12 +14,12 @@ use crate::{
 
 use super::schema::Schema;
 use bifrost::utils::time::get_time;
-use lightning::map::{Map, WordMap, WordMutexGuard, PtrHashMap};
+use lightning::aarc::Arc as AArc;
+use lightning::map::{Map, PtrHashMap, WordMap, WordMutexGuard};
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use lightning::aarc::Arc as AArc;
 
 pub type CellReadGuard<'a> = WordMutexGuard<'a>;
 pub type CellWriteGuard<'a> = WordMutexGuard<'a>;
@@ -45,24 +45,24 @@ pub fn get_chunk_size_bits() -> usize {
 /// Returns: Some((chunk_id, segment_id)) or None if address not in range
 pub fn chunk_and_segment_from_addr(fault_addr: usize) -> Option<(usize, usize)> {
     use crate::ram::segs::SEGMENT_BITS_SHIFT;
-    
+
     let base = GLOBAL_CHUNK_BASE.load(Ordering::Acquire);
     if base == 0 || fault_addr < base {
         return None;
     }
-    
+
     let offset = fault_addr - base;
     let total_size = GLOBAL_ALLOCATED_SIZE.load(Ordering::Acquire);
-    
+
     if offset >= total_size {
         return None;
     }
-    
+
     let chunk_size_bits = GLOBAL_CHUNK_SIZE_BITS.load(Ordering::Acquire);
     let chunk_id = offset >> chunk_size_bits;
     let offset_in_chunk = offset & ((1 << chunk_size_bits) - 1);
     let segment_id = offset_in_chunk >> SEGMENT_BITS_SHIFT;
-    
+
     Some((chunk_id, segment_id))
 }
 
@@ -85,32 +85,36 @@ pub unsafe fn get_global_chunks() -> Option<&'static Chunks> {
 
 /// Access a segment by chunk_id and segment_id from the global Chunks
 /// Used by signal handler to flip reference bits
-pub fn get_segment_for_fault(chunk_id: usize, segment_id: usize) -> Option<AArc<crate::ram::segs::Segment>> {
+pub fn get_segment_for_fault(
+    chunk_id: usize,
+    segment_id: usize,
+) -> Option<AArc<crate::ram::segs::Segment>> {
     unsafe {
         get_global_chunks().and_then(|chunks| {
-            chunks.list.get(chunk_id).and_then(|chunk| {
-                chunk.segs.get(&segment_id)
-            })
+            chunks
+                .list
+                .get(chunk_id)
+                .and_then(|chunk| chunk.segs.get(&segment_id))
         })
     }
 }
 
 /// Reset global chunk allocation (for tests)
-/// 
+///
 /// IMPORTANT: Reset GLOBAL_CHUNKS_PTR BEFORE unmapping memory to prevent
 /// the signal handler from accessing unmapped memory during cleanup.
 pub fn reset_global_chunk_allocation() {
     // Reset GLOBAL_CHUNKS_PTR first to prevent signal handler from accessing chunks
     // This must happen BEFORE unmapping memory to avoid SIGSEGV in signal handler
     GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
-    
+
     let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
     let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
-    
+
     // Reset other globals before unmapping
     GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
     GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
-    
+
     // Now safe to unmap memory - signal handler won't try to access it
     if base != 0 && size != 0 {
         unsafe {
@@ -192,10 +196,10 @@ impl Chunk {
 
         // Check if the address is within reasonable segment bounds
         // We can't do precise bounds checking without segment info, but we can check basic sanity
-        if let Some(segment) = self.locate_segment(addr, &Id::new(0, 0)) {
+        if let Some(segment) = self.locate_segment(addr) {
             let seg_start = segment.addr;
             let seg_end = seg_start + SEGMENT_SIZE;
-            
+
             if addr < seg_start || addr >= seg_end {
                 error!(
                     "[Chunk {}] Invalid cell location at {}: address 0x{:x} outside segment bounds [0x{:x}, 0x{:x})",
@@ -213,7 +217,7 @@ impl Chunk {
 
         true
     }
-    
+
     /// Validate address before storing it in cell_index (WRITE operation)
     #[cfg(debug_assertions)]
     #[inline]
@@ -230,7 +234,7 @@ impl Chunk {
             );
         }
     }
-    
+
     /// Validate address after retrieving it from cell_index (READ operation)
     #[cfg(debug_assertions)]
     #[inline]
@@ -238,7 +242,10 @@ impl Chunk {
         debug_assert!(
             addr % 8 == 0,
             "READ POINT: {} retrieved MISALIGNED address 0x{:016x} (offset: {}) for hash {}",
-            operation, addr, addr % 8, hash
+            operation,
+            addr,
+            addr % 8,
+            hash
         );
         if addr % 8 != 0 {
             error!(
@@ -293,7 +300,10 @@ impl Chunk {
                 n + 1
             }
         };
-        assert!(!(base_addr == 0 && tiered_config.is_some()), "Should not enable tiered memory if the memory is not allocated by Chunks");
+        assert!(
+            !(base_addr == 0 && tiered_config.is_some()),
+            "Should not enable tiered memory if the memory is not allocated by Chunks"
+        );
         debug!("Creating chunk {}, num segments {}", id, num_segs);
         let segs = SegmentList::new(num_segs);
         let index = WordMap::with_capacity(64);
@@ -304,7 +314,7 @@ impl Chunk {
                 config.threshold,
             )
         });
-        
+
         let chunk = Chunk {
             id,
             segs,
@@ -376,7 +386,7 @@ impl Chunk {
                         debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
                     }
-                    
+
                     // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
                     // This ensures we never exceed physical memory limit
                     if let Some(ref tiered_manager) = self.tiered_manager {
@@ -390,11 +400,14 @@ impl Chunk {
                                 }
                             }
                             Err(e) => {
-                                error!("Proactive eviction failed before segment allocation: {:?}", e);
+                                error!(
+                                    "Proactive eviction failed before segment allocation: {:?}",
+                                    e
+                                );
                             }
                         }
                     }
-                    
+
                     let _alloc_guard = self.alloc_lock.lock();
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
@@ -424,22 +437,32 @@ impl Chunk {
                     warn!("Cannot find cell with hash {} for index is zero", hash);
                     return Err(ReadError::CellDoesNotExisted);
                 }
-                
+
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_read(*index, "location_for_read", hash);
-                
-                // Reference bit tracking:
-                // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
-                // Without page_fault_tracking feature: mark reference bit directly here
-                #[cfg(not(feature = "page_fault_tracking"))]
-                {
-                    // Mark segment as referenced directly (no page fault tracking)
-                    let seg_id = self.allocator.id_by_addr(*index);
-                    if let Some(segment) = self.segs.get(&seg_id) {
+
+                // Check if segment is cold and promote if needed
+                let seg_id = self.allocator.id_by_addr(*index);
+                if let Some(segment) = self.segs.get(&seg_id) {
+                    // If segment is cold (evicted to file), promote it back to hot
+                    if segment.is_cold() {
+                        debug!(
+                            "Cell access triggered promotion of cold segment {}",
+                            segment.id
+                        );
+                        crate::ram::tiered::promotion::promote_segment(&segment, self)
+                    }
+
+                    // Reference bit tracking:
+                    // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
+                    // Without page_fault_tracking feature: mark reference bit directly here
+                    #[cfg(not(feature = "page_fault_tracking"))]
+                    {
+                        // Mark segment as referenced directly (no page fault tracking)
                         segment.mark_referenced();
                     }
                 }
-                
+
                 return Ok(index);
             }
             None => {
@@ -463,10 +486,10 @@ impl Chunk {
                 if *index == 0 {
                     return None;
                 }
-                
+
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
-                
+
                 return Some(index);
             }
             None => None,
@@ -544,22 +567,25 @@ impl Chunk {
     fn write_cell(&self, cell: &mut OwnedCell) -> Result<CellHeader, WriteError> {
         debug!("Writing cell {:?} to chunk {}", cell.id(), self.id);
         let (cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-        
+
         #[cfg(debug_assertions)]
         {
             debug_assert!(
-                self.validate_cell_location(cell_loc, &format!("write_cell(hash={})", cell.header.hash)),
+                self.validate_cell_location(
+                    cell_loc,
+                    &format!("write_cell(hash={})", cell.header.hash)
+                ),
                 "Attempting to store invalid cell location 0x{:x} in cell index for hash {}",
                 cell_loc,
                 cell.header.hash
             );
         }
-        
+
         match self.cell_index.try_insert_locked(cell.header.hash as usize) {
             Some(mut guard) => {
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_write(cell_loc, "write_cell", cell.header.hash);
-                
+
                 *guard = cell_loc;
                 drop(guard);
                 self.ensure_indices(cell, None, &*schema);
@@ -588,7 +614,7 @@ impl Chunk {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-        
+
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -598,10 +624,10 @@ impl Chunk {
                 hash
             );
         }
-        
+
         if let Some(mut guard) = self.location_for_write(hash) {
             let cell_location = *guard;
-            
+
             #[cfg(debug_assertions)]
             {
                 if cell_location != 0 {
@@ -609,7 +635,7 @@ impl Chunk {
                 }
                 self.assert_address_aligned_for_write(new_cell_loc, "update_cell", hash);
             }
-            
+
             let old_indices = self.old_index_res(&guard, &*schema)?;
             self.ensure_indices_with_res(cell, old_indices, &*schema);
             *guard = new_cell_loc;
@@ -628,7 +654,7 @@ impl Chunk {
         let hash = cell.header.hash;
         // Write first, lock second to avoid deadlock with cleaner
         let (new_cell_loc, schema) = self.write_cell_to_chunk(cell)?;
-        
+
         #[cfg(debug_assertions)]
         {
             debug_assert!(
@@ -638,20 +664,28 @@ impl Chunk {
                 hash
             );
         }
-        
+
         loop {
             if let Some(mut guard) = self.location_for_write(hash) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
-                
+
                 #[cfg(debug_assertions)]
                 {
                     if cell_location != 0 {
-                        self.assert_address_aligned_for_read(cell_location, "upsert_cell(update/old)", hash);
+                        self.assert_address_aligned_for_read(
+                            cell_location,
+                            "upsert_cell(update/old)",
+                            hash,
+                        );
                     }
-                    self.assert_address_aligned_for_write(new_cell_loc, "upsert_cell(update)", hash);
+                    self.assert_address_aligned_for_write(
+                        new_cell_loc,
+                        "upsert_cell(update)",
+                        hash,
+                    );
                 }
-                
+
                 let old_indices = self.old_index_res(&guard, &*schema)?;
                 *guard = new_cell_loc;
                 drop(guard);
@@ -663,10 +697,14 @@ impl Chunk {
                 if let Some(mut guard) = reservation {
                     // New cell
                     trace!("Cell {} does not exists, will insert for upsert", hash);
-                    
+
                     #[cfg(debug_assertions)]
-                    self.assert_address_aligned_for_write(new_cell_loc, "upsert_cell(insert)", hash);
-                    
+                    self.assert_address_aligned_for_write(
+                        new_cell_loc,
+                        "upsert_cell(insert)",
+                        hash,
+                    );
+
                     *guard = new_cell_loc;
                     drop(guard);
                     self.ensure_indices(cell, None, &*schema);
@@ -686,26 +724,27 @@ impl Chunk {
     {
         if let Some(cell_guard) = self.location_for_write(hash) {
             let old_loc = *cell_guard;
-            
+
             #[cfg(debug_assertions)]
             {
                 if old_loc != 0 {
                     self.assert_address_aligned_for_read(old_loc, "update_cell_by(old)", hash);
                     if old_loc % 8 != 0 {
-                        return Err(WriteError::ReadError(ReadError::ExecError(
-                            format!("Corrupted cell location: 0x{:x}", old_loc)
-                        )));
+                        return Err(WriteError::ReadError(ReadError::ExecError(format!(
+                            "Corrupted cell location: 0x{:x}",
+                            old_loc
+                        ))));
                     }
                 }
             }
-            
+
             match SharedCell::from_chunk_raw(cell_guard, self) {
                 Ok((cell, schema)) => {
                     let old_indices = self
                         .index_builder
                         .as_ref()
                         .map(|_| probe_cell_indices(&cell, &*schema));
-                    
+
                     // Get old entry size BEFORE releasing lock to avoid race condition
                     // where old_loc could be corrupted after we update cell_index
                     let old_entry_size = if old_loc != 0 {
@@ -715,26 +754,26 @@ impl Chunk {
                     } else {
                         None
                     };
-                    
+
                     let new_cell = update(&cell);
                     if let Some(mut new_cell) = new_cell {
-                    let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
-                    
-                    #[cfg(debug_assertions)]
-                    self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
-                    
-                    *cell.into_guard() = new_cell_loc;
+                        let (new_cell_loc, schema) = self.write_cell_to_chunk(&mut new_cell)?;
+
+                        #[cfg(debug_assertions)]
+                        self.assert_address_aligned_for_write(new_cell_loc, "update_cell_by", hash);
+
+                        *cell.into_guard() = new_cell_loc;
                         if let Some(indexer) = &self.index_builder {
                             indexer.ensure_indices(&new_cell, &*schema, old_indices);
                         }
-                        
+
                         // Mark old entry as dead using size we captured earlier
                         // This avoids decoding old_loc after lock is released (race condition)
                         if let Some(size) = old_entry_size {
                             let seg = self.locate_segment_ensured(old_loc, &new_cell.id());
                             self.mark_dead_entry_with_size(old_loc, size, &seg);
                         }
-                        
+
                         self.refresh_statistics();
                         return Ok(new_cell);
                     } else {
@@ -753,14 +792,14 @@ impl Chunk {
         let guard_opt = self.cell_index.lock(hash_key);
         if let Some(mut guard) = guard_opt {
             let cell_location = *guard;
-            
+
             #[cfg(debug_assertions)]
             {
                 if cell_location != 0 {
                     self.assert_address_aligned_for_read(cell_location, "remove_cell", hash);
                 }
             }
-            
+
             if let Some(indexer) = &self.index_builder {
                 match SharedCell::from_chunk_raw(guard, self) {
                     Ok((cell, schema)) => {
@@ -785,14 +824,14 @@ impl Chunk {
         let guard = self.cell_index.lock(hash as usize);
         if let Some(guard) = guard {
             let cell_location = *guard;
-            
+
             #[cfg(debug_assertions)]
             {
                 if cell_location != 0 {
                     self.assert_address_aligned_for_read(cell_location, "remove_cell_by", hash);
                 }
             }
-            
+
             match SharedCell::from_chunk_raw(guard, self) {
                 Ok((cell, schema)) => {
                     if predict(&cell) {
@@ -824,7 +863,7 @@ impl Chunk {
         let segment_id = segment.id;
         let segment_key = segment_id as usize;
         let is_hot = segment.is_hot();
-        
+
         // Update cached hot count BEFORE adding to list to avoid race with full scan
         // If we increment after adding, a full scan could count the new segment
         // and update the cache, then we'd increment again, leading to over-counting
@@ -833,7 +872,7 @@ impl Chunk {
                 tiered_manager.increment_hot_count();
             }
         }
-        
+
         self.segs.insert_back(segment_key, AArc::new(segment));
     }
 
@@ -842,7 +881,7 @@ impl Chunk {
             "Removing segment for chunk {} with id {}",
             self.id, segment_id
         );
-        
+
         // Check if segment is hot BEFORE removing to avoid race with full scan
         // If we decrement after removing, a full scan could miss the removed segment
         // and update the cache, then we'd decrement again, leading to under-counting
@@ -851,21 +890,21 @@ impl Chunk {
         } else {
             false
         };
-        
+
         // Decrement cache BEFORE removing from list
         if should_decrement {
             if let Some(ref tiered_manager) = self.tiered_manager {
                 tiered_manager.decrement_hot_count();
             }
         }
-        
+
         // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
             seg.dispense();
         }
     }
 
-    fn locate_segment(&self, addr: usize, cell_id: &Id) -> Option<AArc<Segment>> {
+    pub fn locate_segment(&self, addr: usize) -> Option<AArc<Segment>> {
         let seg_id = self.allocator.id_by_addr(addr);
         let res = self.segs.get(&seg_id);
         if res.is_none() {
@@ -873,8 +912,7 @@ impl Chunk {
             // and removes old ones. The address in cell_index may be stale.
             // Callers should handle this by re-reading from cell_index or retrying.
             debug!(
-                "Cannot locate segment for {:?}@{}, got id {}, chunk segs {:?} (segment may have been removed by cleaner)",
-                cell_id,
+                "Cannot locate segment for {:?}, got id {}, chunk segs {:?} (segment may have been removed by cleaner)",
                 addr,
                 seg_id,
                 self.segs.iter_front_keys().collect::<Vec<_>>()
@@ -912,13 +950,13 @@ impl Chunk {
         let header = header_from_chunk_raw(cell_location)
             .map_err(|e| WriteError::ReadError(e))?
             .0;
-        
+
         // Get entry size while we know the memory is still valid
         let entry_size = {
             let (entry, _) = Entry::decode_from(cell_location, |_, _| {});
             entry.content_length
         };
-        
+
         let cell_seg = self.locate_segment_ensured(cell_location, &header.id());
         self.put_tombstone(&header, &cell_seg);
         self.mark_dead_entry_with_size(cell_location, entry_size, &cell_seg);
@@ -926,7 +964,7 @@ impl Chunk {
     }
 
     fn locate_segment_ensured(&self, cell_location: usize, cell_id: &Id) -> AArc<Segment> {
-        self.locate_segment(cell_location, cell_id).expect(
+        self.locate_segment(cell_location).expect(
             format!(
                 "Cannot locate cell segment for cell id: {:?} at {}",
                 cell_id, cell_location
@@ -940,11 +978,13 @@ impl Chunk {
     pub fn mark_dead_entry_with_size(&self, addr: usize, size: u32, seg: &Segment) {
         trace!(
             "Marking {} bytes as dead at addr 0x{:016x} in segment {}",
-            size, addr, seg.id
+            size,
+            addr,
+            seg.id
         );
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
     }
-    
+
     // Decodes entry to get size and marks it dead
     // WARNING: Will panic if memory at addr is corrupted!
     // Prefer mark_dead_entry_with_size when size is known
@@ -960,7 +1000,7 @@ impl Chunk {
                 );
             }
         }
-        
+
         // Decode entry to get its content_length
         // This will PANIC if memory is corrupted - which is intentional!
         // We want to know about memory corruption issues immediately
@@ -1073,13 +1113,13 @@ impl Chunk {
                 let segment_utilization = living / SEGMENT_SIZE_U32 as f32;
                 (seg, segment_utilization)
             })
-        .filter(|(seg, utilization)| {
-            *utilization < 0.50f32 
+            .filter(|(seg, utilization)| {
+                *utilization < 0.50f32 
             && head_seg_id != seg.id 
             && seg.no_references()
             && !self.is_segment_protected(seg.id) // Don't clean protected segments
             && seg.is_hot() // Don't clean cold segments (tiered memory)
-        })
+            })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
         return mapping;
@@ -1100,7 +1140,10 @@ impl Chunk {
                     .is_ok()
                 {
                     if let Err(e) = segment.archive() {
-                        error!("Cannot archive segment {} (chunk {}), reason:{:?}", seg_id, self.id, e)
+                        error!(
+                            "Cannot archive segment {} (chunk {}), reason:{:?}",
+                            seg_id, self.id, e
+                        )
                     }
                 }
             }
@@ -1111,13 +1154,18 @@ impl Chunk {
     /// This is used when a transaction has cells in this segment that might need to be undone.
     /// The segment_id is the key, and the value tracks how many incomplete transactions reference it.
     pub fn protect_segment(&self, segment_id: u64) {
-        if let Ok((mut guard, old_count)) = self.protected_segments.locked_with_upsert(segment_id, 1) {
+        if let Ok((mut guard, old_count)) =
+            self.protected_segments.locked_with_upsert(segment_id, 1)
+        {
             if old_count > 0 {
                 // Entry already existed, increment count
                 *guard += 1;
             }
             // If old_count == 0, locked_with_upsert already inserted 1, no need to increment
-            debug!("Protected segment {} for undo, count: {}", segment_id, *guard);
+            debug!(
+                "Protected segment {} for undo, count: {}",
+                segment_id, *guard
+            );
         }
     }
 
@@ -1128,7 +1176,10 @@ impl Chunk {
         if let Some(mut guard) = self.protected_segments.lock(&segment_id) {
             if *guard > 1 {
                 *guard -= 1;
-                debug!("Released protection for segment {}, count: {}", segment_id, *guard);
+                debug!(
+                    "Released protection for segment {}, count: {}",
+                    segment_id, *guard
+                );
             } else {
                 // Count is 1, remove the entry
                 guard.remove();
@@ -1247,7 +1298,9 @@ pub struct PendingEntry {
 impl Drop for PendingEntry {
     // dealing with entry write ahead log
     fn drop(&mut self) {
-        self.seg.write_wal(self.addr, self.size, self.skip_sync).unwrap();
+        self.seg
+            .write_wal(self.addr, self.size, self.skip_sync)
+            .unwrap();
         self.seg.references.fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -1267,9 +1320,18 @@ impl Chunks {
         wal_storage: Option<String>,
         tiered_config: Option<crate::ram::tiered::TieredConfig>,
     ) -> Arc<Chunks> {
-        Self::new_with_recovery(count, size, meta, index_builder, backup_storage, wal_storage, tiered_config, false)
+        Self::new_with_recovery(
+            count,
+            size,
+            meta,
+            index_builder,
+            backup_storage,
+            wal_storage,
+            tiered_config,
+            false,
+        )
     }
-    
+
     pub fn new_with_recovery(
         count: usize,
         size: usize,
@@ -1280,16 +1342,16 @@ impl Chunks {
         tiered_config: Option<crate::ram::tiered::TieredConfig>,
         enable_recovery: bool,
     ) -> Arc<Chunks> {
-        use std::ptr;
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
-        
+        use std::ptr;
+
         // Reset previous allocation (for test isolation)
         reset_global_chunk_allocation();
-        
+
         // Calculate exact chunk size
         let chunk_size = (size / count).next_power_of_two();
         let chunk_size_bits = chunk_size.trailing_zeros() as usize;
-        
+
         // Allocate one giant mmap for all chunks
         let total_size = chunk_size * count;
         let global_base = unsafe {
@@ -1302,7 +1364,7 @@ impl Chunks {
                 0,
             )
         };
-        
+
         if global_base == libc::MAP_FAILED {
             let errno = std::io::Error::last_os_error();
             panic!(
@@ -1310,23 +1372,27 @@ impl Chunks {
                 Error: {} (errno: {}). \
                 This could be due to: insufficient memory, system limits (ulimit -v), \
                 or memory fragmentation. Try reducing total_size or chunk_count.",
-                total_size, count, chunk_size, errno, errno.raw_os_error().unwrap_or(-1)
+                total_size,
+                count,
+                chunk_size,
+                errno,
+                errno.raw_os_error().unwrap_or(-1)
             );
         }
-        
+
         let global_base_addr = global_base as usize;
-        
+
         // Store global state
         GLOBAL_CHUNK_BASE.store(global_base_addr, Ordering::Release);
         GLOBAL_CHUNK_SIZE_BITS.store(chunk_size_bits, Ordering::Release);
         GLOBAL_CHUNK_COUNT.store(count, Ordering::Release);
         GLOBAL_ALLOCATED_SIZE.store(total_size, Ordering::Release);
-        
+
         info!(
             "Allocated global chunk space: base={:#x}, chunk_size={} (2^{}), count={}, total={}",
             global_base_addr, chunk_size, chunk_size_bits, count, total_size
         );
-        
+
         // Divide memory limit among chunks
         // Each chunk gets an equal share of the total physical memory limit
         let per_chunk_tiered_config = tiered_config.map(|config| {
@@ -1342,7 +1408,7 @@ impl Chunks {
                 physical_memory_limit: per_chunk_limit,
             }
         });
-        
+
         // Log tiered memory configuration if enabled
         if let Some(ref config) = per_chunk_tiered_config {
             info!(
@@ -1353,11 +1419,11 @@ impl Chunks {
                 config.physical_memory_limit / (1024 * 1024),
                 (config.physical_memory_limit * count) / (1024 * 1024)
             );
-            
+
             // Install page fault handlers for reference bit tracking
             crate::ram::tiered::page_fault_tracker::install_fault_handlers();
         }
-        
+
         let mut chunks = Vec::new();
         assert!(size >= SEGMENT_SIZE);
         debug!("Creating chunks, count {} , total {} bytes", count, size);
@@ -1385,19 +1451,19 @@ impl Chunks {
             list: chunks,
             statistics: TTLCache::with_capacity(num_schemas.next_power_of_two()),
         });
-        
+
         // Store global pointer for signal handler access
         set_global_chunks(&chunks_arc);
-        
+
         // Attempt recovery if enabled
         if enable_recovery {
             info!("Recovery enabled, attempting to recover from storage");
-            
+
             let config = crate::ram::recovery::RecoveryConfig {
                 num_chunks: count,
                 chunk_size,
             };
-            
+
             match crate::ram::recovery::recover_chunks(
                 &config,
                 &backup_storage,
@@ -1413,7 +1479,7 @@ impl Chunks {
                 }
             }
         }
-        
+
         chunks_arc
     }
     pub fn new_dummy(count: usize, size: usize) -> Arc<Chunks> {

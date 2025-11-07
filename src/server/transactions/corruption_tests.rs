@@ -1,10 +1,10 @@
 /// Tests specifically designed to detect data corruption issues during transactions
 /// Focuses on the panic: "Cannot decode entry header" in mark_dead_entry_with_cell
 use super::*;
+use crate::ram::cell::*;
 use crate::ram::schema::*;
 use crate::ram::tests::default_fields;
 use crate::ram::types::*;
-use crate::ram::cell::*;
 use crate::server::transactions;
 use crate::server::*;
 use env_logger;
@@ -50,8 +50,12 @@ async fn test_rapid_concurrent_updates_same_cell() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(1));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Test")));
-    let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Test")),
+    );
+    let mut cell =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks.write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -68,7 +72,7 @@ async fn test_rapid_concurrent_updates_same_cell() {
 
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
-            
+
             // Read the cell
             match txn_client.read(txn_id.clone(), cid.clone()).await {
                 Ok(Ok(TxnExecResult::Accepted(mut cell))) => {
@@ -76,15 +80,15 @@ async fn test_rapid_concurrent_updates_same_cell() {
                     let mut data = cell.data.Map().unwrap().clone();
                     data.insert(&String::from("score"), OwnedValue::U64(i as u64));
                     cell.data = OwnedValue::Map(data);
-                    
+
                     // Update the cell
-                    if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                        txn_client.update(txn_id.clone(), cell).await {
-                        
+                    if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                        txn_client.update(txn_id.clone(), cell).await
+                    {
                         // Try to prepare and commit
-                        if let Ok(Ok(TMPrepareResult::Success)) = 
-                            txn_client.prepare(txn_id.clone()).await {
-                            
+                        if let Ok(Ok(TMPrepareResult::Success)) =
+                            txn_client.prepare(txn_id.clone()).await
+                        {
                             match txn_client.commit(txn_id.clone()).await {
                                 Ok(Ok(EndResult::Success)) => {
                                     println!("Transaction {} committed successfully", i);
@@ -158,7 +162,8 @@ async fn test_varying_size_concurrent_updates() {
     data_map.insert(&String::from("id"), OwnedValue::I64(1));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
     data_map.insert(&String::from("name"), OwnedValue::String(String::from("X")));
-    let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    let mut cell =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks.write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -174,11 +179,11 @@ async fn test_varying_size_concurrent_updates() {
 
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
-            
+
             match txn_client.read(txn_id.clone(), cid.clone()).await {
                 Ok(Ok(TxnExecResult::Accepted(mut cell))) => {
                     let mut data = cell.data.Map().unwrap().clone();
-                    
+
                     // Vary the size dramatically - from small to large strings
                     let string_size = if i % 3 == 0 {
                         100 // Small
@@ -187,18 +192,18 @@ async fn test_varying_size_concurrent_updates() {
                     } else {
                         100000 // Large
                     };
-                    
+
                     let large_string = "X".repeat(string_size);
                     data.insert(&String::from("name"), OwnedValue::String(large_string));
                     data.insert(&String::from("score"), OwnedValue::U64(i as u64));
                     cell.data = OwnedValue::Map(data);
-                    
-                    if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                        txn_client.update(txn_id.clone(), cell).await {
-                        
-                        if let Ok(Ok(TMPrepareResult::Success)) = 
-                            txn_client.prepare(txn_id.clone()).await {
-                            
+
+                    if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                        txn_client.update(txn_id.clone(), cell).await
+                    {
+                        if let Ok(Ok(TMPrepareResult::Success)) =
+                            txn_client.prepare(txn_id.clone()).await
+                        {
                             let _ = txn_client.commit(txn_id.clone()).await;
                             println!("Transaction {} (size: {}) committed", i, string_size);
                         }
@@ -254,12 +259,15 @@ async fn test_multi_cell_concurrent_transactions() {
     // Create multiple cells
     let cell_count = 20;
     let mut cell_ids = Vec::new();
-    
+
     for i in 0..cell_count {
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("score"), OwnedValue::U64(0));
-        data_map.insert(&String::from("name"), OwnedValue::String(format!("Cell{}", i)));
+        data_map.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("Cell{}", i)),
+        );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
         server.chunks.write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
@@ -277,27 +285,30 @@ async fn test_multi_cell_concurrent_transactions() {
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
             let mut updated = 0;
-            
+
             // Try to update multiple cells in this transaction
             for (idx, cid) in cells.iter().enumerate().take(5) {
                 match txn_client.read(txn_id.clone(), cid.clone()).await {
                     Ok(Ok(TxnExecResult::Accepted(mut cell))) => {
                         let mut data = cell.data.Map().unwrap().clone();
-                        data.insert(&String::from("score"), OwnedValue::U64((i as u64) + (idx as u64)));
+                        data.insert(
+                            &String::from("score"),
+                            OwnedValue::U64((i as u64) + (idx as u64)),
+                        );
                         cell.data = OwnedValue::Map(data);
-                        
-                        if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                            txn_client.update(txn_id.clone(), cell).await {
+
+                        if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                            txn_client.update(txn_id.clone(), cell).await
+                        {
                             updated += 1;
                         }
                     }
                     _ => {}
                 }
             }
-            
+
             if updated > 0 {
-                if let Ok(Ok(TMPrepareResult::Success)) = 
-                    txn_client.prepare(txn_id.clone()).await {
+                if let Ok(Ok(TMPrepareResult::Success)) = txn_client.prepare(txn_id.clone()).await {
                     let _ = txn_client.commit(txn_id.clone()).await;
                     println!("Transaction {} committed with {} updates", i, updated);
                 }
@@ -351,8 +362,12 @@ async fn test_rapid_commit_sequence() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(1));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Test")));
-    let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Test")),
+    );
+    let mut cell =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks.write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -362,20 +377,18 @@ async fn test_rapid_commit_sequence() {
     for i in 0..50 {
         let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
         let txn_id = txn_client.begin().await.unwrap().unwrap();
-        
-        if let Ok(Ok(TxnExecResult::Accepted(mut cell))) = 
-            txn_client.read(txn_id.clone(), cell_id.clone()).await {
-            
+
+        if let Ok(Ok(TxnExecResult::Accepted(mut cell))) =
+            txn_client.read(txn_id.clone(), cell_id.clone()).await
+        {
             let mut data = cell.data.Map().unwrap().clone();
             data.insert(&String::from("score"), OwnedValue::U64(i as u64));
             cell.data = OwnedValue::Map(data);
-            
-            if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                txn_client.update(txn_id.clone(), cell).await {
-                
-                if let Ok(Ok(TMPrepareResult::Success)) = 
-                    txn_client.prepare(txn_id.clone()).await {
-                    
+
+            if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                txn_client.update(txn_id.clone(), cell).await
+            {
+                if let Ok(Ok(TMPrepareResult::Success)) = txn_client.prepare(txn_id.clone()).await {
                     match txn_client.commit(txn_id.clone()).await {
                         Ok(Ok(EndResult::Success)) => {
                             println!("Rapid commit {} succeeded", i);
@@ -387,7 +400,7 @@ async fn test_rapid_commit_sequence() {
                 }
             }
         }
-        
+
         // Minimal delay between transactions
         sleep(Duration::from_micros(100)).await;
     }
@@ -434,12 +447,15 @@ async fn test_interleaved_prepare_commit() {
     // Create multiple cells
     let cell_count = 10;
     let mut cell_ids = Vec::new();
-    
+
     for i in 0..cell_count {
         let mut data_map = OwnedMap::new();
         data_map.insert(&String::from("id"), OwnedValue::I64(i as i64));
         data_map.insert(&String::from("score"), OwnedValue::U64(0));
-        data_map.insert(&String::from("name"), OwnedValue::String(format!("Cell{}", i)));
+        data_map.insert(
+            &String::from("name"),
+            OwnedValue::String(format!("Cell{}", i)),
+        );
         let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map));
         server.chunks.write_cell(&mut cell).unwrap();
         cell_ids.push(cell.id());
@@ -456,24 +472,24 @@ async fn test_interleaved_prepare_commit() {
 
         tasks.push(tokio::spawn(async move {
             let txn_id = txn_client.begin().await.unwrap().unwrap();
-            
-            if let Ok(Ok(TxnExecResult::Accepted(mut cell))) = 
-                txn_client.read(txn_id.clone(), cid.clone()).await {
-                
+
+            if let Ok(Ok(TxnExecResult::Accepted(mut cell))) =
+                txn_client.read(txn_id.clone(), cid.clone()).await
+            {
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), OwnedValue::U64(i as u64));
                 cell.data = OwnedValue::Map(data);
-                
-                if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                    txn_client.update(txn_id.clone(), cell).await {
-                    
+
+                if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                    txn_client.update(txn_id.clone(), cell).await
+                {
                     // Prepare
-                    if let Ok(Ok(TMPrepareResult::Success)) = 
-                        txn_client.prepare(txn_id.clone()).await {
-                        
+                    if let Ok(Ok(TMPrepareResult::Success)) =
+                        txn_client.prepare(txn_id.clone()).await
+                    {
                         // Small delay before commit
                         sleep(Duration::from_micros((i % 1000) as u64)).await;
-                        
+
                         // Commit
                         match txn_client.commit(txn_id.clone()).await {
                             Ok(Ok(EndResult::Success)) => {
@@ -534,12 +550,19 @@ async fn test_maximum_concurrency_stress() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(1));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("StressTest")));
-    let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("StressTest")),
+    );
+    let mut cell =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks.write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
-    println!("Starting maximum concurrency stress test on cell: {:?}", cell_id);
+    println!(
+        "Starting maximum concurrency stress test on cell: {:?}",
+        cell_id
+    );
 
     let txn_count = 500;
     let mut tasks = Vec::with_capacity(txn_count);
@@ -553,22 +576,22 @@ async fn test_maximum_concurrency_stress() {
                 Ok(Ok(tid)) => tid,
                 _ => return,
             };
-            
+
             match txn_client.read(txn_id.clone(), cid.clone()).await {
                 Ok(Ok(TxnExecResult::Accepted(mut cell))) => {
                     let mut data = cell.data.Map().unwrap().clone();
-                    
+
                     // Add varying data
                     data.insert(&String::from("score"), OwnedValue::U64(i as u64));
                     data.insert(&String::from("iteration"), OwnedValue::I64(i as i64));
                     cell.data = OwnedValue::Map(data);
-                    
-                    if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                        txn_client.update(txn_id.clone(), cell).await {
-                        
-                        if let Ok(Ok(TMPrepareResult::Success)) = 
-                            txn_client.prepare(txn_id.clone()).await {
-                            
+
+                    if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                        txn_client.update(txn_id.clone(), cell).await
+                    {
+                        if let Ok(Ok(TMPrepareResult::Success)) =
+                            txn_client.prepare(txn_id.clone()).await
+                        {
                             match txn_client.commit(txn_id.clone()).await {
                                 Ok(Ok(EndResult::Success)) => {
                                     if i % 50 == 0 {
@@ -592,7 +615,10 @@ async fn test_maximum_concurrency_stress() {
         }
     }
 
-    println!("Maximum concurrency stress test completed: {} tasks finished", completed);
+    println!(
+        "Maximum concurrency stress test completed: {} tasks finished",
+        completed
+    );
 }
 
 /// Test that mimics the exact wikidata import scenario
@@ -603,12 +629,12 @@ async fn test_wikidata_import_scenario() {
     let server_addr = String::from("127.0.0.1:5306");
     let server = NebServer::new_from_opts(
         &ServerOptions {
-            chunk_count: 4,  // Multiple chunks like production
-            total_size: 512 * 1024 * 1024,  // Larger memory pool
+            chunk_count: 4,                // Multiple chunks like production
+            total_size: 512 * 1024 * 1024, // Larger memory pool
             tiered_config: None,
             backup_storage: None,
             wal_storage: None,
-            index_enabled: true,  // Enable indexing like production
+            index_enabled: true, // Enable indexing like production
             services: vec![Service::Cell, Service::Transaction],
             enable_recovery: false,
             undo_log_storage: None,
@@ -636,63 +662,67 @@ async fn test_wikidata_import_scenario() {
     // Simulate batched imports with 64 workers (matching wikidata import)
     let batch_count = 20;
     let items_per_batch = 50;
-    
+
     for batch in 0..batch_count {
         println!("Processing batch {}/{}", batch + 1, batch_count);
-        
+
         let mut batch_tasks = Vec::new();
-        
+
         // Each batch processes multiple items concurrently
         for item in 0..items_per_batch {
             let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
             let sid = schema.id;
-            
+
             batch_tasks.push(tokio::spawn(async move {
                 let txn_id = match txn_client.begin().await {
                     Ok(Ok(tid)) => tid,
                     _ => return false,
                 };
-                
+
                 // Create multiple related cells (like statements in wikidata)
                 let mut success = true;
                 let base_id = Id::rand();
-                
-                for stmt in 0..5 {  // 5 statements per item
+
+                for stmt in 0..5 {
+                    // 5 statements per item
                     let mut data_map = OwnedMap::new();
-                    data_map.insert(&String::from("id"), OwnedValue::I64(((batch * items_per_batch) as i64) + (item as i64)));
+                    data_map.insert(
+                        &String::from("id"),
+                        OwnedValue::I64(((batch * items_per_batch) as i64) + (item as i64)),
+                    );
                     data_map.insert(&String::from("score"), OwnedValue::U64(stmt as u64));
                     data_map.insert(
-                        &String::from("name"), 
-                        OwnedValue::String(format!("Item_{}_{}", item, stmt))
+                        &String::from("name"),
+                        OwnedValue::String(format!("Item_{}_{}", item, stmt)),
                     );
-                    
+
                     let cell = OwnedCell::new_with_id(sid, &base_id, OwnedValue::Map(data_map));
-                    
+
                     // Use update (upsert pattern) like wikidata import
                     match txn_client.update(txn_id.clone(), cell).await {
-                        Ok(Ok(TxnExecResult::Accepted(_))) => {},
+                        Ok(Ok(TxnExecResult::Accepted(_))) => {}
                         _ => {
                             success = false;
                             break;
                         }
                     }
                 }
-                
+
                 if success {
-                    if let Ok(Ok(TMPrepareResult::Success)) = 
-                        txn_client.prepare(txn_id.clone()).await {
-                        
+                    if let Ok(Ok(TMPrepareResult::Success)) =
+                        txn_client.prepare(txn_id.clone()).await
+                    {
                         match txn_client.commit(txn_id.clone()).await {
                             Ok(Ok(EndResult::Success)) => return true,
                             _ => return false,
                         }
                     }
                 }
-                
+
                 false
             }));
         }
-        
+
         // Wait for batch to complete
         let mut batch_success = 0;
         for task in batch_tasks {
@@ -700,9 +730,14 @@ async fn test_wikidata_import_scenario() {
                 batch_success += 1;
             }
         }
-        
-        println!("Batch {} completed: {}/{} successful", batch + 1, batch_success, items_per_batch);
-        
+
+        println!(
+            "Batch {} completed: {}/{} successful",
+            batch + 1,
+            batch_success,
+            items_per_batch
+        );
+
         // Small delay between batches
         sleep(Duration::from_millis(10)).await;
     }
@@ -754,8 +789,12 @@ async fn test_update_cell_by_stress() {
     let mut data_map = OwnedMap::new();
     data_map.insert(&String::from("id"), OwnedValue::I64(1));
     data_map.insert(&String::from("score"), OwnedValue::U64(0));
-    data_map.insert(&String::from("name"), OwnedValue::String(String::from("Test")));
-    let mut cell = OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
+    data_map.insert(
+        &String::from("name"),
+        OwnedValue::String(String::from("Test")),
+    );
+    let mut cell =
+        OwnedCell::new_with_id(schema.id, &Id::rand(), OwnedValue::Map(data_map.clone()));
     server.chunks.write_cell(&mut cell).unwrap();
     let cell_id = cell.id();
 
@@ -772,7 +811,7 @@ async fn test_update_cell_by_stress() {
         if i > 0 && i % 20 == 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        
+
         let txn_client = transactions::new_async_client(&server_addr).await.unwrap();
         let cid = cell_id.clone();
 
@@ -781,24 +820,24 @@ async fn test_update_cell_by_stress() {
                 Ok(Ok(tid)) => tid,
                 _ => return,
             };
-            
+
             // Read current cell
-            if let Ok(Ok(TxnExecResult::Accepted(mut cell))) = 
-                txn_client.read(txn_id.clone(), cid.clone()).await {
-                
+            if let Ok(Ok(TxnExecResult::Accepted(mut cell))) =
+                txn_client.read(txn_id.clone(), cid.clone()).await
+            {
                 // Modify it
                 let mut data = cell.data.Map().unwrap().clone();
                 data.insert(&String::from("score"), OwnedValue::U64(i as u64));
                 data.insert(&String::from("iteration"), OwnedValue::I64(i as i64));
                 cell.data = OwnedValue::Map(data);
-                
+
                 // Update (this calls update_cell_by which calls mark_dead_entry_with_cell)
-                if let Ok(Ok(TxnExecResult::Accepted(_))) = 
-                    txn_client.update(txn_id.clone(), cell).await {
-                    
-                    if let Ok(Ok(TMPrepareResult::Success)) = 
-                        txn_client.prepare(txn_id.clone()).await {
-                        
+                if let Ok(Ok(TxnExecResult::Accepted(_))) =
+                    txn_client.update(txn_id.clone(), cell).await
+                {
+                    if let Ok(Ok(TMPrepareResult::Success)) =
+                        txn_client.prepare(txn_id.clone()).await
+                    {
                         // The panic occurs during commit
                         let _ = txn_client.commit(txn_id.clone()).await;
                     }
@@ -813,4 +852,3 @@ async fn test_update_cell_by_stress() {
 
     println!("update_cell_by stress test completed");
 }
-

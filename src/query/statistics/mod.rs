@@ -158,9 +158,7 @@ impl ChunkStatistics {
             .collect::<HashMap<_, _>>();
         let now = now();
         for schema_id in schema_ids {
-            let histogram = schema_histograms
-                .remove(&schema_id)
-                .unwrap_or_default();
+            let histogram = schema_histograms.remove(&schema_id).unwrap_or_default();
             let count = *total_counts.get(&schema_id).unwrap_or(&0);
             let segs = *total_segs.get(&schema_id).unwrap_or(&0);
             let bytes = *total_size.get(&schema_id).unwrap_or(&0);

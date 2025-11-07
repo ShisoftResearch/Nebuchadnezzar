@@ -6,13 +6,13 @@ use bifrost::vector_clock::StandardVectorClock;
 use std::io;
 use std::sync::Arc;
 
-pub mod data_site;
-pub mod manager;
-pub mod undo_log;
-#[cfg(test)]
-mod tests;
 #[cfg(test)]
 mod corruption_tests;
+pub mod data_site;
+pub mod manager;
+#[cfg(test)]
+mod tests;
+pub mod undo_log;
 
 pub type TxnId = StandardVectorClock;
 

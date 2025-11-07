@@ -1,8 +1,9 @@
+pub mod cell_locking;
 pub mod clock;
 pub mod eviction;
-pub mod promotion;
 pub mod manager;
 pub mod page_fault_tracker;
+pub mod promotion;
 
 #[cfg(test)]
 mod tests;
@@ -37,15 +38,11 @@ impl TieredConfig {
                 }
             }
         }
-        
+
         #[cfg(target_os = "macos")]
         {
             use std::process::Command;
-            if let Ok(output) = Command::new("sysctl")
-                .arg("-n")
-                .arg("hw.memsize")
-                .output()
-            {
+            if let Ok(output) = Command::new("sysctl").arg("-n").arg("hw.memsize").output() {
                 if let Ok(mem_str) = String::from_utf8(output.stdout) {
                     if let Ok(mem) = mem_str.trim().parse::<usize>() {
                         return mem;
@@ -53,7 +50,7 @@ impl TieredConfig {
                 }
             }
         }
-        
+
         // Default fallback: 16GB if we can't detect
         log::warn!("Could not detect system memory, defaulting to 16GB");
         16 * 1024 * 1024 * 1024
@@ -88,7 +85,7 @@ impl TieredConfig {
         let enabled = std::env::var("NEB_TIERED_MEMORY_ENABLED")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
-        
+
         if !enabled {
             return None;
         }
@@ -115,4 +112,3 @@ impl Default for TieredConfig {
         Self::new()
     }
 }
-

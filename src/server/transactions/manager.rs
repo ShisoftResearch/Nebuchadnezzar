@@ -33,9 +33,9 @@ pub struct WaitConfig {
 impl Default for WaitConfig {
     fn default() -> Self {
         Self {
-            initial_backoff_ms: 1,      // Start with 1ms
-            max_backoff_ms: 100,        // Cap at 100ms  
-            max_total_wait_ms: 5000,    // Give up after 5 seconds
+            initial_backoff_ms: 1,   // Start with 1ms
+            max_backoff_ms: 100,     // Cap at 100ms
+            max_total_wait_ms: 5000, // Give up after 5 seconds
         }
     }
 }
@@ -89,8 +89,11 @@ impl TransactionManager {
             wait_config: WaitConfig::default(),
         })
     }
-    
-    pub fn with_wait_config(server: &Arc<NebServer>, wait_config: WaitConfig) -> Arc<TransactionManager> {
+
+    pub fn with_wait_config(
+        server: &Arc<NebServer>,
+        wait_config: WaitConfig,
+    ) -> Arc<TransactionManager> {
         Arc::new(Self {
             server: server.clone(),
             transactions: LFMap::with_capacity(128),
@@ -98,12 +101,12 @@ impl TransactionManager {
             wait_config,
         })
     }
-    
+
     /// Helper function for exponential backoff wait with timeout
     async fn backoff_wait(attempt: u32, config: &WaitConfig) -> Result<(), TMError> {
         let backoff_ms = config.initial_backoff_ms * 2u64.pow(attempt);
         let backoff_ms = backoff_ms.min(config.max_backoff_ms);
-        
+
         debug!("Backing off for {}ms (attempt {})", backoff_ms, attempt);
         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
         Ok(())
@@ -219,10 +222,8 @@ impl Service for TransactionManager {
             }
             match self.get_data_site_by_id(&id).await {
                 Ok((server_id, server)) => {
-                    self.read_selected_from_site(
-                        server_id, &server, &tid, &id, &fields, &txn,
-                    )
-                    .await
+                    self.read_selected_from_site(server_id, &server, &tid, &id, &fields, &txn)
+                        .await
                 }
                 Err(e) => {
                     error!("{:?}", e);
@@ -236,7 +237,7 @@ impl Service for TransactionManager {
     fn prepare(&self, tid: TxnId) -> BoxFuture<'_, Result<TMPrepareResult, TMError>> {
         async move {
             // Note: Automatic retry with fresh timestamps removed because it changes
-            // the transaction ID mid-flight, breaking the client's reference. 
+            // the transaction ID mid-flight, breaking the client's reference.
             // For remaining NotRealizable errors, clients should retry with a new transaction.
             self.do_prepare(&tid).await
         }
@@ -434,8 +435,10 @@ impl TransactionManager {
                 .data_sites
                 .get_or_insert(server_id, || data_site::AsyncServiceClient::new(&client)));
         }
-        self.data_sites.get(&server_id)
-            .ok_or(io::Error::new(io::ErrorKind::NotFound, "data site not found"))
+        self.data_sites.get(&server_id).ok_or(io::Error::new(
+            io::ErrorKind::NotFound,
+            "data site not found",
+        ))
     }
     async fn get_data_site_by_id(
         &self,
@@ -475,14 +478,14 @@ impl TransactionManager {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
-        
+
         loop {
             // Check timeout
             if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
                 warn!("Read timeout for transaction {:?} on cell {:?}", tid, id);
                 return Ok(TxnExecResult::Rejected);
             }
-            
+
             let read_response = server
                 .read(self_server_id, self.get_clock(), tid.to_owned(), id.clone())
                 .await;
@@ -554,14 +557,14 @@ impl TransactionManager {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
-        
+
         loop {
             // Check timeout
             if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
                 warn!("Head timeout for transaction {:?} on cell {:?}", tid, id);
                 return Ok(TxnExecResult::Rejected);
             }
-            
+
             let head_response = server
                 .head(self_server_id, self.get_clock(), tid.to_owned(), *id)
                 .await;
@@ -599,14 +602,17 @@ impl TransactionManager {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
         let self_server_id = self.server.server_id;
-        
+
         loop {
             // Check timeout
             if start_time.elapsed().as_millis() > self.wait_config.max_total_wait_ms as u128 {
-                warn!("Read selected timeout for transaction {:?} on cell {:?}", tid, id);
+                warn!(
+                    "Read selected timeout for transaction {:?} on cell {:?}",
+                    tid, id
+                );
                 return Ok(TxnExecResult::Rejected);
             }
-            
+
             let read_response = server
                 .read_selected(
                     self_server_id,
@@ -675,14 +681,14 @@ impl TransactionManager {
     ) -> Result<DMPrepareResult, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
-        
+
         loop {
             // Check timeout
             if start_time.elapsed().as_millis() > config.max_total_wait_ms as u128 {
                 warn!("Prepare timeout for transaction {:?}", tid);
                 return Ok(DMPrepareResult::NotRealizable); // Give up
             }
-            
+
             let self_server_id = server.server_id;
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
             let server_for_clock = server.clone();
@@ -729,8 +735,14 @@ impl TransactionManager {
             .into_iter()
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
-                TransactionManager::site_prepare(&self.server, &self.wait_config, &tid, &objs, &data_site)
-                    .await
+                TransactionManager::site_prepare(
+                    &self.server,
+                    &self.wait_config,
+                    &tid,
+                    &objs,
+                    &data_site,
+                )
+                .await
             })
             .collect();
         while let Some(result) = prepare_futures.next().await {
@@ -877,7 +889,7 @@ impl TransactionManager {
     fn cleanup_transaction(&self, tid: &TxnId) {
         self.transactions.remove(tid);
     }
- 
+
     /// Performs the actual prepare operation (extracted for retry logic)
     async fn do_prepare(&self, tid: &TxnId) -> Result<TMPrepareResult, TMError> {
         let conclusion = {
@@ -912,4 +924,3 @@ impl TransactionManager {
         Ok(conclusion)
     }
 }
-

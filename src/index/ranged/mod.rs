@@ -37,7 +37,7 @@ mod tests {
                 backup_storage: None,
                 wal_storage: None,
                 undo_log_storage: None,
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: None,   // No persistence for regular tests
                 index_enabled: false, // We don't use the high level index builder here
                 services: vec![Service::Cell, Service::RangedIndexer],
                 enable_recovery: false,

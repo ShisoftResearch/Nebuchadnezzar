@@ -6,10 +6,7 @@ use itertools::Itertools;
 use crate::exec::{
     funcs::reducer::PartitioningKeyValuePair,
     partitioner::Partitioner,
-    query::{
-        self,
-        partitioning::Partitioning,
-    },
+    query::{self, partitioning::Partitioning},
     symbols::objs,
 };
 

@@ -49,7 +49,7 @@ impl Transaction {
         match self.client.read(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(cell))) => Ok(Some(cell)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::ReadTooLate(id)
+                NotRealizableReason::ReadTooLate(id),
             )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
@@ -70,7 +70,7 @@ impl Transaction {
         {
             Ok(Ok(TxnExecResult::Accepted(fields))) => Ok(Some(fields)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::ReadTooLate(id)
+                NotRealizableReason::ReadTooLate(id),
             )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
@@ -84,7 +84,7 @@ impl Transaction {
         match self.client.write(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::EarlyConflict(cell_id)
+                NotRealizableReason::EarlyConflict(cell_id),
             )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -97,7 +97,7 @@ impl Transaction {
         match self.client.update(self.tid.to_owned(), cell).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::EarlyConflict(cell_id)
+                NotRealizableReason::EarlyConflict(cell_id),
             )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -109,7 +109,7 @@ impl Transaction {
         match self.client.remove(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(()))) => Ok(()),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::EarlyConflict(id)
+                NotRealizableReason::EarlyConflict(id),
             )),
             Ok(Ok(TxnExecResult::Error(we))) => Err(TxnError::WriteError(we)),
             Ok(Ok(_)) => Err(TxnError::InternalError),
@@ -121,7 +121,7 @@ impl Transaction {
         match self.client.head(self.tid.to_owned(), id).await {
             Ok(Ok(TxnExecResult::Accepted(head))) => Ok(Some(head)),
             Ok(Ok(TxnExecResult::Rejected)) => Err(TxnError::NotRealizable(
-                NotRealizableReason::ReadTooLate(id)
+                NotRealizableReason::ReadTooLate(id),
             )),
             Ok(Ok(TxnExecResult::Error(ReadError::CellDoesNotExisted))) => Ok(None),
             Ok(Ok(TxnExecResult::Error(re))) => Err(TxnError::ReadError(re)),
@@ -144,9 +144,9 @@ impl Transaction {
             Ok(Ok(TMPrepareResult::DMPrepareError(DMPrepareResult::NotRealizable))) => {
                 Err(TxnError::NotRealizable(NotRealizableReason::PrepareError))
             }
-            Ok(Ok(TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(cell_id)))) => {
-                Err(TxnError::NotRealizable(NotRealizableReason::CellChanged(cell_id)))
-            }
+            Ok(Ok(TMPrepareResult::DMCommitError(DMCommitResult::CellChanged(cell_id)))) => Err(
+                TxnError::NotRealizable(NotRealizableReason::CellChanged(cell_id)),
+            ),
             Ok(Ok(rpr)) => Err(TxnError::PrepareError(rpr)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),

@@ -360,7 +360,10 @@ impl LocalSchemasCache {
         debug!("Subscribing schema events...");
         let _ = sm
             .on_schema_added(move |schema| {
-                info!("Received schema_added event: schema {} ({})", schema.id, schema.name);
+                info!(
+                    "Received schema_added event: schema {} ({})",
+                    schema.id, schema.name
+                );
                 m1.new_schema(schema);
                 future::ready(()).boxed()
             })
@@ -477,7 +480,7 @@ impl LocalSchemasMap {
     fn new_schema(&self, schema: Schema) {
         let name = schema.name.clone();
         let id = schema.id;
-        
+
         // Check if schema already exists (could happen during subscription race)
         if let Some(existing_id) = self.name_map.get(&name) {
             if existing_id != id {
@@ -490,7 +493,7 @@ impl LocalSchemasMap {
                 debug!("Updating existing schema {} ({})", id, name);
             }
         }
-        
+
         self.name_map.insert(name.clone(), id);
         self.schema_map.insert(id, Arc::new(schema));
         info!("Added schema to local cache: {} ({})", id, name);

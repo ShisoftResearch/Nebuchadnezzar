@@ -44,16 +44,29 @@ impl DummySegment {
 // this optimization is intended for enabling neb to contain data more than it's memory
 
 impl CombinedCleaner {
-    pub fn combine_segments(chunk: &Chunk, selected_segments: &Vec<lightning::aarc::Arc<Segment>>) -> usize {
+    pub fn combine_segments(
+        chunk: &Chunk,
+        selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
+    ) -> usize {
         let head_seg_id = chunk.get_head_seg_id();
-        // Remove the head segment and segments being promoted from candidates
-        // Skip promoting segments to avoid deadlocks with promotion waiting for no_references
+        // Remove the head segment, cold segments, and segments locked by tiered operations
+        // Skip locked segments (eviction/promotion in progress) to avoid conflicts
+        // Skip cold segments to avoid accessing evicted data (would trigger promotion)
         let segments = selected_segments
             .iter()
             .filter(|seg| {
-                seg.id != head_seg_id && 
-                !seg.promoting.load(std::sync::atomic::Ordering::Acquire)
+                if seg.id == head_seg_id {
+                    return false;
+                }
+                // Check if segment is locked (skip if so)
+                if seg.is_locked() {
+                    return false; // Lock is held, skip
+                }
+                // Lock was available (we released it immediately by dropping the guard)
+                // Check if cold (skip if so)
+                !seg.is_cold()
             })
+            .cloned()
             .collect_vec();
 
         if segments.len() < 2 {
@@ -77,7 +90,7 @@ impl CombinedCleaner {
             segment_ids_to_combine,
             chunk.get_head_seg_id()
         );
-        
+
         // Hold references to all source segments to prevent eviction/promotion during memcpy
         // This prevents data corruption if a segment is remapped while we're copying from it
         for seg in segments.iter() {
@@ -90,7 +103,7 @@ impl CombinedCleaner {
         use std::collections::HashMap;
         let mut deduped_cells: HashMap<u64, DummyEntry> = HashMap::new();
         let mut tombstones: Vec<DummyEntry> = Vec::new();
-        
+
         for entry in segments
             .iter()
             .flat_map(|seg| chunk.live_entries(seg))
@@ -116,10 +129,11 @@ impl CombinedCleaner {
                 cell_hash: cell_header.map(|h| h.hash),
                 cell_ver: cell_header.map(|h| h.version).unwrap_or(0),
             };
-            
+
             if let Some(hash) = dummy_entry.cell_hash {
                 // Cell with hash: keep only the latest version
-                deduped_cells.entry(hash)
+                deduped_cells
+                    .entry(hash)
                     .and_modify(|existing| {
                         if dummy_entry.cell_ver > existing.cell_ver {
                             *existing = dummy_entry.clone();
@@ -131,26 +145,31 @@ impl CombinedCleaner {
                 tombstones.push(dummy_entry);
             }
         }
-        
+
         // Step 2: Combine deduplicated cells and tombstones, then sort by timestamp
-        let mut all_entries: Vec<_> = deduped_cells.into_values()
+        let mut all_entries: Vec<_> = deduped_cells
+            .into_values()
             .chain(tombstones.into_iter())
             .collect();
-            
+
         // Sort by timestamp and then by size within timestamp buckets
         all_entries.sort_by_key(|entry| entry.timestamp);
-        
+
         let mut sorted_entries = Vec::new();
-        for (_, group) in &all_entries.into_iter().chunk_by(|entry| entry.timestamp / 10) {
+        for (_, group) in &all_entries
+            .into_iter()
+            .chunk_by(|entry| entry.timestamp / 10)
+        {
             let mut group: Vec<_> = group.collect();
             group.sort_by_key(|entry| entry.size);
             sorted_entries.extend(group);
         }
-        
+
         // Reverse to get hottest/largest first
         sorted_entries.reverse();
-        
-        let mut entries: Vec<_> = sorted_entries.into_iter()
+
+        let mut entries: Vec<_> = sorted_entries
+            .into_iter()
             // provide additional state for whether entry have been claimed on simulation
             .map(|e| (e, false))
             .collect();
@@ -324,14 +343,14 @@ impl CombinedCleaner {
             segment_ids_to_combine,
             chunk.get_head_seg_id()
         );
-        
+
         // Release references now that all memcpy operations are complete
         // This allows eviction/promotion to proceed if needed
         for old_seg in segments.iter() {
             old_seg.references.fetch_sub(1, Ordering::Relaxed);
         }
         debug!("Released references for {} source segments", segments.len());
-        
+
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
             old_seg.mem_drop(chunk);

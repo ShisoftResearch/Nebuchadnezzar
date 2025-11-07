@@ -1,229 +1,209 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::cell::{cell_hash_from_entry_content_addr, cell_header_from_entry_content_addr};
-use crate::ram::entry::EntryType;
-use crate::ram::segs::{Segment, SEGMENT_SIZE};
-use libc::{c_void, close, mmap, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
+use crate::ram::tiered::cell_locking;
+use libc::{c_void, close, mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use std::io;
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
 
-/// Promote a cold segment to hot (anonymous memory)
-/// 
-/// **CRITICAL**: This function locks ALL cells in the segment during promotion to prevent 
-/// concurrent access during the "empty window" created by MAP_FIXED remapping.
-/// 
-/// Why cell locking is required:
-/// - MAP_FIXED with MAP_ANONYMOUS creates a new zero-filled anonymous mapping
-/// - Between the mmap call and memcpy completion, the segment contains zeros
-/// - All cells in the segment must be locked to prevent reads during this window
-/// 
-/// Process:
-/// 1. Wait for no active references (prevents races with cleaner)
-/// 2. Scan segment to find all cells (like the cleaner does)
-/// 3. Lock all cells iteratively using try_lock (retry those that fail)
-/// 4. Copy data to temp buffer (while file is still mapped)
-/// 5. Remap as anonymous with MAP_FIXED (creates empty window - cells are locked!)
-/// 6. Copy data back to anonymous mapping (fills empty window)
-/// 7. Close file descriptor and mark as hot
-/// 8. Unlock all cells
+/// Promote a cold segment to hot storage with cell-level locking
 ///
-/// The iterative locking ensures we eventually lock all cells without deadlock.
-pub fn promote_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
-    // Sanity check: don't promote if already hot
-    if segment.is_hot() {
-        warn!("Attempted to promote already-hot segment {}", segment.id);
-        return Ok(());
-    }
-    
-    // Try to set promoting flag - only one thread should promote at a time
-    if segment.promoting.compare_exchange(
-        false,
-        true,
-        Ordering::AcqRel,
-        Ordering::Acquire
-    ).is_err() {
-        // Another thread is already promoting - wait for it to complete
-        debug!("Segment {} already being promoted by another thread, waiting...", segment.id);
-        while segment.promoting.load(Ordering::Acquire) {
-            thread::yield_now();
-        }
-        // Check if it's now hot
+/// This operation uses cell-level locking to ensure safety:
+///
+/// **CRITICAL SAFETY**: We must lock ALL cells in the segment during promotion
+/// to prevent concurrent reads from accessing memory while it's being overwritten.
+///
+/// Process:
+/// 1. Acquire segment lock (blocks until available) - ensures only one promotion at a time
+/// 2. Check if already hot (skip if so)
+/// 3. Wait for no active references (prevents races with cleaner)
+/// 4. Check if segment is transaction-protected (skip if so)
+/// 5. mmap file to a TEMPORARY location (NOT the segment address)
+/// 6. Scan temporary mapping to find all cell IDs
+/// 7. Lock all cell IDs in the cell index (prevents new readers)
+/// 8. Copy data from temporary mapping to segment address
+/// 9. Mark as hot and close file descriptor (update tiered_lock)
+/// 10. Unlock all cells
+/// 11. Unmap temporary file
+///
+/// This approach:
+/// - Prevents readers from acquiring cell locks during data copy
+/// - Uses temporary mapping to avoid corrupting segment address
+/// - No "empty window" - data is copied atomically from reader's perspective
+/// This function have to succeed or panic.
+pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
+    debug!(
+        "Promoting segment {} to hot storage with cell locking",
+        segment.id
+    );
+
+    // Step 1: Acquire segment lock (blocks until available)
+    // This ensures only one promotion/eviction/cleaner operation at a time
+    loop {
         if segment.is_hot() {
-            return Ok(());
+            // Already hot, skip promotion
+            debug!("Segment {} is already hot, skipping promotion", segment.id);
+            return;
         }
-        // Still cold? This shouldn't happen but be safe
-        warn!("Segment {} still cold after promotion by another thread", segment.id);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Promotion race condition detected",
-        ));
+        if segment.lock_cold() {
+            // Locked cold, proceed with promotion
+            break;
+        }
+        // Locked for any reason, wait
+        thread::yield_now();
     }
-    
-    debug!("Promoting segment {} to hot storage", segment.id);
-    
-    // Step 1: Wait for no active references
-    // This ensures no one (like the cleaner) is actively reading from this segment
+
+    debug!("Segment {} is cold, proceeding with promotion", segment.id);
+
+    // Step 3: Wait for no active references (prevents races with cleaner)
+    // We hold the tiered_lock while waiting - this is safe because:
+    // - Cell read/write operations don't need tiered_lock, only cell locks
+    // - Eviction will skip if lock is held
+    // - Other promotions will block on the lock (which is what we want)
     while !segment.no_references() {
         thread::yield_now();
     }
-    debug!("Promotion: all references released for segment {}", segment.id);
-    
-    // Step 2: Scan segment to collect all cell hashes (like the cleaner does)
-    debug!("Scanning segment {} to find all cells", segment.id);
-    let mut cell_hashes: Vec<u64> = Vec::with_capacity(1024);
-    
-    for entry_meta in segment.entry_iter() {
-        if entry_meta.entry_header.entry_type == EntryType::CELL {
-            let hash = cell_hash_from_entry_content_addr(entry_meta.body_pos);
-            cell_hashes.push(hash);
-        }
-    }
-    
-    debug!("Found {} cells in segment {} to lock", cell_hashes.len(), segment.id);
-    
-    // Step 3: Lock all cells iteratively using try_lock
-    // Keep trying to lock cells that couldn't be locked until all are locked
-    let mut locks: Vec<lightning::map::WordMutexGuard> = Vec::with_capacity(cell_hashes.len());
-    let mut unlocked_indices: Vec<usize> = (0..cell_hashes.len()).collect();
-
-    const MAX_RETRY_ATTEMPTS: usize = 100;
-    let backoff = crossbeam::utils::Backoff::new();
-    let mut retry_count = 0;
-    
-    while !unlocked_indices.is_empty() {
-        let mut still_unlocked = Vec::new();
-        
-        for &idx in &unlocked_indices {
-            let hash = cell_hashes[idx];
-            match chunk.cell_index.try_lock(hash as usize) {
-                Some(Some(lock)) => {
-                    // Successfully locked this cell
-                    let addr = *lock;
-                    if segment.contains_address(addr) {
-                        locks.push(lock);
-                    } else {
-                        drop(lock);
-                        warn!("Cell {} is not in segment {} during promotion, skipping", hash, segment.id);
-                    }
-                    retry_count = 0;
-                    backoff.reset();
-                }
-                Some(None) => {
-                    // Couldn't lock (busy or doesn't exist), try again in next iteration
-                    still_unlocked.push(idx);
-                    retry_count += 1;
-                    if retry_count >= MAX_RETRY_ATTEMPTS {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!("Failed to lock cell after {} retries, giving up", retry_count),
-                        ));
-                    }
-                    backoff.spin();
-                }
-                None => {
-                    error!("Cell {} not found in chunk {} index during promotion", hash, chunk.id);
-                }
-            }
-        }
-        
-        unlocked_indices = still_unlocked;
-        
-        if !unlocked_indices.is_empty() {
-            // Some cells still locked by others, yield and retry
-            thread::yield_now();
-        }
-    }
-    
-    debug!("Successfully locked all {} cells in segment {}", locks.len(), segment.id);
-    
-    let segment_start = segment.addr;
-    
-    // Step 4: Copy data to temp buffer BEFORE unmapping
-    // All cells are now locked, safe to copy
-    debug!("Copying segment {} data to temp buffer", segment.id);
-    let mut data = vec![0u8; SEGMENT_SIZE];
-    unsafe {
-        ptr::copy_nonoverlapping(
-            segment_start as *const u8,
-            data.as_mut_ptr(),
-            SEGMENT_SIZE,
-        );
-    }
-    
-    // Step 5: Remap as anonymous with MAP_FIXED
-    // ⚠️ CRITICAL SECTION: This creates an "empty window"
-    // The segment now points to zeros until step 6 completes
-    // All cells are locked so no concurrent reads can happen
     debug!(
-        "Remapping segment {} as anonymous (empty window protected by cell locks)",
+        "Promotion: all references released for segment {}",
         segment.id
     );
-    let result = unsafe {
+
+    // Step 4: Check if segment is protected by transactions
+    if chunk.is_segment_protected(segment.id) {
+        error!(
+            "Segment {} is transaction-protected, cannot promote",
+            segment.id
+        );
+        panic!();
+    }
+
+    // Step 5: Get backup file path and open it
+    let backup_path = match segment.backup_file_name.as_ref() {
+        Some(backup_path) => backup_path,
+        None => {
+            error!("Segment {} has no backup file path", segment.id);
+            panic!();
+        }
+    };
+
+    let path_cstr = match std::ffi::CString::new(backup_path.as_str()) {
+        Ok(path_cstr) => path_cstr,
+        Err(e) => {
+            error!("Invalid path: {}", e);
+            panic!();
+        }
+    };
+
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        let err = io::Error::last_os_error();
+        error!(
+            "Failed to open backup file for segment {}: {}",
+            segment.id, err
+        );
+        panic!();
+    }
+
+    // Step 6: mmap file to a TEMPORARY location (NOT the segment address)
+    // This allows us to scan the data without corrupting the existing segment
+    debug!(
+        "Mapping cold file (fd={}) for segment {} to temporary location",
+        fd, segment.id
+    );
+    let temp_addr = unsafe {
         mmap(
-            segment_start as *mut c_void,
+            std::ptr::null_mut(),
             SEGMENT_SIZE,
-            PROT_READ | PROT_WRITE,
-            MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED,
-            -1,
+            PROT_READ,
+            MAP_PRIVATE,
+            fd,
             0,
         )
     };
-    
-    if result == libc::MAP_FAILED {
-        // Failed to remap - clear promoting flag and drop locks
-        segment.promoting.store(false, Ordering::Release);
-        drop(locks);
-        return Err(io::Error::last_os_error());
-    }
-    
-    // Verify MAP_FIXED returned the same address
-    if result as usize != segment_start {
+
+    if temp_addr == libc::MAP_FAILED {
+        let err = io::Error::last_os_error();
         error!(
-            "MAP_FIXED returned different address during promotion: expected {}, got {}",
-            segment_start, result as usize
+            "Failed to mmap cold file for segment {}: {}",
+            segment.id, err
         );
-        segment.promoting.store(false, Ordering::Release);
-        drop(locks);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "MAP_FIXED returned unexpected address during promotion",
-        ));
+        unsafe { close(fd) };
+        // tiered_guard will be dropped automatically, releasing the lock
+        panic!(
+            "Failed to mmap cold file for segment {}: {}",
+            segment.id, err
+        );
     }
-    
-    // Step 6: Copy data back to new anonymous mapping
-    // This fills the empty window - segment now contains correct data again
-    debug!("Copying data back to segment {} anonymous mapping", segment.id);
+
+    debug!(
+        "Temporary mapping created at {:#x} for segment {}",
+        temp_addr as usize, segment.id
+    );
+
+    // Create an entry iterator for the temporary mapping
+    let temp_start = temp_addr as usize;
+
+    let temp_entry_iter = SegmentEntryIter {
+        bound: SEGMENT_SIZE, // Scan to the end of the temporary mapping
+        cursor: temp_start,
+    };
+
+    // Step 6-7: Lock all cells in the segment
+    let _locks = cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
+
+    // Handle result and cleanup
+    // Step 8: Copy data from temporary mapping to segment address
+    // All cells are now locked, safe to overwrite segment memory
+    debug!(
+        "Copying data from temporary mapping to segment {} address",
+        segment.id
+    );
+    let segment_addr = segment.addr;
+
+    // Ensure segment memory is writable
+    let mprotect_result = unsafe {
+        libc::mprotect(
+            segment_addr as *mut c_void,
+            SEGMENT_SIZE,
+            PROT_READ | PROT_WRITE,
+        )
+    };
+    if mprotect_result != 0 {
+        let err = io::Error::last_os_error();
+        error!("Failed to make segment {} writable: {}", segment.id, err);
+        unsafe { munmap(temp_addr, SEGMENT_SIZE) };
+        panic!("Failed to make segment {} writable: {}", segment.id, err);
+    }
+
+    // Copy full segment
     unsafe {
         ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            segment_start as *mut u8,
+            temp_addr as *const u8,
+            segment_addr as *mut u8,
             SEGMENT_SIZE,
         );
     }
-    
-    // Step 7: Close file descriptor and mark segment as hot
-    let fd = segment.cold_file_fd.load(Ordering::Acquire);
-    if fd >= 0 {
-        unsafe { close(fd) };
-    }
-    segment.cold_file_fd.store(-1, Ordering::Release);
-    
-    // Step 8: Set reference bit to 1
-    // The segment was just accessed (which triggered promotion), so it should be marked
-    // as referenced to prevent immediate eviction by CLOCK algorithm
+
+    debug!("Data copied successfully for segment {}", segment.id);
+
+    // Step 9: Mark as hot and close file descriptor (update tiered_lock)
+    unsafe { close(fd) };
+    segment.set_hot();
+    debug!("Marked segment {} as hot and closed fd", segment.id);
+
+    // Step 10: Set reference bit
     segment.mark_referenced();
-    
-    // Step 9: Clear promoting flag
-    segment.promoting.store(false, Ordering::Release);
-    
-    // Step 10: Drop all locks - cells are now accessible again
-    drop(locks);
-    
-    info!("Successfully promoted segment {} to hot storage (locked {} cells during promotion)", 
-          segment.id, cell_hashes.len());
-    
-    Ok(())
+
+    // Locks are automatically dropped when _cell_locks goes out of scope
+
+    // Step 11: Unmap temporary file
+    unsafe { munmap(temp_addr, SEGMENT_SIZE) };
+    debug!("Unmapped temporary mapping for segment {}", segment.id);
+    info!(
+        "Successfully promoted segment {} to hot storage with cell locking",
+        segment.id
+    );
 }
 
 #[cfg(test)]

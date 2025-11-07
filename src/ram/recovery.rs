@@ -24,7 +24,7 @@ impl SegmentFileInfo {
     /// Parse filename pattern: {chunk_id}-{seg_id}-{seq_id}.{nlog|nbackup}
     pub fn parse_filename(path: &Path) -> Option<Self> {
         let stem = path.file_stem()?.to_str()?;
-        
+
         // Check extension
         let extension = path.extension()?.to_str()?;
         let is_backup = match extension {
@@ -32,20 +32,20 @@ impl SegmentFileInfo {
             "nlog" => false,
             _ => return None,
         };
-        
+
         // Parse {chunk_id}-{seg_id}-{seq_id}
         let parts: Vec<&str> = stem.split('-').collect();
         if parts.len() != 3 {
             return None;
         }
-        
+
         let chunk_id = parts[0].parse::<usize>().ok()?;
         let seg_id = parts[1].parse::<u64>().ok()?;
         let seq_id = parts[2].parse::<u64>().ok()?;
-        
+
         let metadata = fs::metadata(path).ok()?;
         let size = metadata.len();
-        
+
         Some(SegmentFileInfo {
             chunk_id,
             seg_id,
@@ -58,11 +58,15 @@ impl SegmentFileInfo {
 }
 
 /// Helper function to recursively scan directories for segment files
-fn scan_dir_recursive(dir: &Path, files: &mut Vec<SegmentFileInfo>, is_backup_scan: bool) -> io::Result<()> {
+fn scan_dir_recursive(
+    dir: &Path,
+    files: &mut Vec<SegmentFileInfo>,
+    is_backup_scan: bool,
+) -> io::Result<()> {
     if !dir.exists() {
         return Ok(());
     }
-    
+
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -86,34 +90,34 @@ pub fn discover_segment_files(
     wal_storage: &Option<String>,
 ) -> io::Result<Vec<SegmentFileInfo>> {
     let mut files = Vec::new();
-    
+
     // Scan backup storage recursively
     if let Some(backup_dir) = backup_storage {
         scan_dir_recursive(Path::new(backup_dir), &mut files, true)?;
     }
-    
+
     // Scan WAL storage recursively
     if let Some(wal_dir) = wal_storage {
         scan_dir_recursive(Path::new(wal_dir), &mut files, false)?;
     }
-    
+
     // Deduplicate: prefer backup over WAL for same (chunk_id, seg_id, seq_id)
     let mut seen = HashSet::new();
     let mut deduped = Vec::new();
-    
+
     // Sort: backup files first (is_backup = true)
     files.sort_by(|a, b| b.is_backup.cmp(&a.is_backup));
-    
+
     for file in files {
         let key = (file.chunk_id, file.seg_id, file.seq_id);
         if seen.insert(key) {
             deduped.push(file);
         }
     }
-    
+
     // Sort by seq_id (chronological order)
     deduped.sort_by_key(|f| f.seq_id);
-    
+
     Ok(deduped)
 }
 
@@ -130,26 +134,26 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
     let mut cursor = seg_addr;
     let bound = seg_addr + file_size;
     let mut entries_found = 0;
-    
+
     while cursor < bound {
         // Try to decode entry header
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
-        
+
         if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {
             // Found uninitialized space
             break;
         }
-        
+
         entries_found += 1;
         let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
         cursor += entry_size;
-        
+
         if cursor > bound {
             // Overflow, use file_size
             return bound;
         }
     }
-    
+
     cursor
 }
 
@@ -169,30 +173,33 @@ pub fn rebuild_cell_index_from_segment(
 ) -> (u32, u32) {
     let mut dead_space = 0u32;
     let mut tombstone_count = 0u32;
-    
+
     let bound = seg.append_header.load(Ordering::Relaxed);
     let mut cursor = seg.addr;
-    
+
     while cursor < bound {
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
         let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
-        
+
         match entry_header.entry_type {
             EntryType::CELL => {
                 let content_addr = Entry::content_pos(cursor);
                 let cell_header = cell_header_from_entry_content_addr(content_addr);
                 let hash = cell_header.hash;
-                
+
                 // Check if we should update the index
                 match cell_index.get(&hash) {
                     None => {
                         // New cell, insert into index
-                        cell_index.insert(hash, CellIndexEntry {
-                            addr: cursor,
-                            version: cell_header.version,
-                            seg_id: seg.id,
-                            partition: cell_header.partition,
-                        });
+                        cell_index.insert(
+                            hash,
+                            CellIndexEntry {
+                                addr: cursor,
+                                version: cell_header.version,
+                                seg_id: seg.id,
+                                partition: cell_header.partition,
+                            },
+                        );
                         debug!(
                             "Recovered cell hash {} version {} at segment {}",
                             hash, cell_header.version, seg.id
@@ -203,22 +210,28 @@ pub fn rebuild_cell_index_from_segment(
                             // Newer version, update index and mark old as dead
                             info!(
                                 "Cell hash {} updated from version {} to {} (seg {} -> {})",
-                                hash, existing.version, cell_header.version,
-                                existing.seg_id, seg.id
+                                hash,
+                                existing.version,
+                                cell_header.version,
+                                existing.seg_id,
+                                seg.id
                             );
-                            
+
                             // Mark old cell as dead in its segment
                             if let Some(old_seg) = chunk.segs.get(&(existing.seg_id as usize)) {
                                 chunk.mark_dead_entry_with_seg(existing.addr, &old_seg);
                             }
-                            
+
                             // Update to new version
-                            cell_index.insert(hash, CellIndexEntry {
-                                addr: cursor,
-                                version: cell_header.version,
-                                seg_id: seg.id,
-                                partition: cell_header.partition,
-                            });
+                            cell_index.insert(
+                                hash,
+                                CellIndexEntry {
+                                    addr: cursor,
+                                    version: cell_header.version,
+                                    seg_id: seg.id,
+                                    partition: cell_header.partition,
+                                },
+                            );
                         } else {
                             // Older version, mark this one as dead
                             dead_space += entry_header.content_length;
@@ -234,9 +247,9 @@ pub fn rebuild_cell_index_from_segment(
                 let content_addr = Entry::content_pos(cursor);
                 let tombstone = Tombstone::read_from_entry_content_addr(content_addr);
                 let hash = tombstone.hash;
-                
+
                 tombstone_count += 1;
-                
+
                 // Check if we should remove from index
                 match cell_index.get(&hash) {
                     Some(existing) => {
@@ -246,12 +259,14 @@ pub fn rebuild_cell_index_from_segment(
                                 "Cell hash {} removed by tombstone version {} (cell version {})",
                                 hash, tombstone.version, existing.version
                             );
-                            
+
                             // Mark cell as dead in its segment
-                            if let Some(target_seg) = chunk.segs.get(&(tombstone.segment_id as usize)) {
+                            if let Some(target_seg) =
+                                chunk.segs.get(&(tombstone.segment_id as usize))
+                            {
                                 chunk.mark_dead_entry_with_seg(existing.addr, &target_seg);
                             }
-                            
+
                             cell_index.remove(&hash);
                         } else {
                             // Tombstone is older, ignore it
@@ -262,21 +277,21 @@ pub fn rebuild_cell_index_from_segment(
                         }
                     }
                     None => {
-                        debug!(
-                            "Tombstone for hash {} but no cell in index",
-                            hash
-                        );
+                        debug!("Tombstone for hash {} but no cell in index", hash);
                     }
                 }
             }
             _ => {
-                warn!("Unknown entry type at {}: {:?}", cursor, entry_header.entry_type);
+                warn!(
+                    "Unknown entry type at {}: {:?}",
+                    cursor, entry_header.entry_type
+                );
             }
         }
-        
+
         cursor += entry_size;
     }
-    
+
     (dead_space, tombstone_count)
 }
 
@@ -292,12 +307,12 @@ impl RecoveryConfig {
     pub fn can_fit(&self, files: &[SegmentFileInfo]) -> bool {
         // Group by chunk_id and find max seg_id per chunk
         let mut max_seg_per_chunk: HashMap<usize, u64> = HashMap::new();
-        
+
         for file in files {
             let entry = max_seg_per_chunk.entry(file.chunk_id).or_insert(0);
             *entry = (*entry).max(file.seg_id);
         }
-        
+
         // Check if all chunks fit
         for (chunk_id, max_seg_id) in max_seg_per_chunk {
             if chunk_id >= self.num_chunks {
@@ -307,7 +322,7 @@ impl RecoveryConfig {
                 );
                 return false;
             }
-            
+
             // Calculate max segments this chunk can hold
             let max_segs = self.chunk_size / SEGMENT_SIZE;
             if (max_seg_id as usize) >= max_segs {
@@ -318,7 +333,7 @@ impl RecoveryConfig {
                 return false;
             }
         }
-        
+
         true
     }
 }
@@ -330,7 +345,7 @@ fn phase1_discover_files(
 ) -> io::Result<Vec<SegmentFileInfo>> {
     info!("Phase 1: Discovering segment files...");
     let files = discover_segment_files(backup_storage, wal_storage)?;
-    
+
     if files.is_empty() {
         info!("No segment files found, starting fresh");
         return Err(io::Error::new(
@@ -338,16 +353,16 @@ fn phase1_discover_files(
             "No segment files found",
         ));
     }
-    
+
     info!("Discovered {} segment files", files.len());
-    
+
     Ok(files)
 }
 
 /// Phase 1.5: Set initial next_seq_id values for each chunk
 fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
     info!("Phase 1.5: Setting initial next_seq_id values...");
-    
+
     for chunk in chunks {
         // Find max seq_id for this chunk from discovered files
         let max_seq_id = files
@@ -356,13 +371,13 @@ fn phase1_5_set_initial_seq_ids(chunks: &[Chunk], files: &[SegmentFileInfo]) {
             .map(|f| f.seq_id)
             .max()
             .unwrap_or(0);
-        
+
         // Set next_seq_id so newly allocated segments get higher seq_ids
         chunk
             .allocator
             .next_seq_id
             .store((max_seq_id + 1) as usize, Ordering::Release);
-        
+
         info!(
             "Chunk {} initial next_seq_id set to {}",
             chunk.id,
@@ -379,11 +394,14 @@ fn should_recover_as_cold(
 ) -> bool {
     if let Some(ref tiered_manager) = chunk.tiered_manager {
         let physical_limit = tiered_manager.physical_memory_limit;
-        let chunk_hot_used = hot_memory_used.get(&file_info.chunk_id).copied().unwrap_or(0);
+        let chunk_hot_used = hot_memory_used
+            .get(&file_info.chunk_id)
+            .copied()
+            .unwrap_or(0);
         let would_exceed_limit = (chunk_hot_used + SEGMENT_SIZE) > physical_limit;
-        
+
         let recover_as_cold = file_info.is_backup && would_exceed_limit;
-        
+
         debug!(
             "Recovery decision: hot_used={} MB, limit={} MB, would_exceed={}, recover_as_cold={}",
             chunk_hot_used / (1024 * 1024),
@@ -391,7 +409,7 @@ fn should_recover_as_cold(
             would_exceed_limit,
             recover_as_cold
         );
-        
+
         recover_as_cold
     } else {
         false // Tiered memory not enabled
@@ -400,17 +418,23 @@ fn should_recover_as_cold(
 
 /// Recover a segment as cold by mmapping the backup file directly
 fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io::Result<()> {
-    info!("Recovering segment {} as COLD (tiered memory enabled)", segment.id);
-    
+    info!(
+        "Recovering segment {} as COLD (tiered memory enabled)",
+        segment.id
+    );
+
     // mmap the backup file directly instead of copying to memory
     let c_path = std::ffi::CString::new(file_info.path.to_str().unwrap()).unwrap();
     let fd = unsafe { open(c_path.as_ptr(), O_RDONLY) };
-    
+
     if fd < 0 {
-        error!("Failed to open backup file for cold recovery: {:?}", io::Error::last_os_error());
+        error!(
+            "Failed to open backup file for cold recovery: {:?}",
+            io::Error::last_os_error()
+        );
         return Err(io::Error::last_os_error());
     }
-    
+
     // Use MAP_FIXED to replace the anonymous mapping with file-backed
     let mmap_addr = unsafe {
         mmap(
@@ -422,23 +446,31 @@ fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io
             0,
         )
     };
-    
+
     if mmap_addr == libc::MAP_FAILED {
-        unsafe { libc::close(fd); }
-        error!("Failed to mmap backup file for cold recovery: {:?}", io::Error::last_os_error());
+        unsafe {
+            libc::close(fd);
+        }
+        error!(
+            "Failed to mmap backup file for cold recovery: {:?}",
+            io::Error::last_os_error()
+        );
         return Err(io::Error::last_os_error());
     }
-    
-    // Mark segment as cold
-    segment.cold_file_fd.store(fd, Ordering::Release);
+
+    // Mark segment as cold (acquire lock and set state)
+    // Note: We don't need to keep the fd open, just mark it as cold
+    segment.set_cold();
+    // Close the fd since we don't need it anymore (will reopen on promotion)
+    unsafe { libc::close(fd) };
     segment.archived.store(true, Ordering::Release); // Already archived (it's the backup file!)
-    
+
     info!(
         "Recovered segment {} as COLD from {}",
         segment.id,
         file_info.path.display()
     );
-    
+
     Ok(())
 }
 
@@ -450,7 +482,7 @@ fn recover_segment_as_hot(segment: &Segment, file_data: &[u8]) {
         let dst_ptr = segment.addr as *mut u8;
         std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, file_data.len());
     }
-    
+
     debug!(
         "Copied {} bytes to segment memory at address {:#x} (HOT recovery)",
         file_data.len(),
@@ -468,13 +500,18 @@ fn phase2_allocate_and_load(
     info!("Phase 2: Allocating segments and loading data...");
     debug!("[RECOVERY] Phase 2: Allocating segments and loading data...");
     debug!("[RECOVERY] Files to process: {}", files.len());
-    
+
     for file_info in files {
-        debug!("[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}", 
-            file_info.chunk_id, file_info.seg_id, file_info.seq_id, file_info.path.display());
-        
+        debug!(
+            "[RECOVERY] Processing file: chunk={}, seg={}, seq={}, path={}",
+            file_info.chunk_id,
+            file_info.seg_id,
+            file_info.seq_id,
+            file_info.path.display()
+        );
+
         let chunk = &chunks[file_info.chunk_id];
-        
+
         info!(
             "Loading chunk {} segment {} seq {} from {} ({} bytes)",
             file_info.chunk_id,
@@ -483,12 +520,12 @@ fn phase2_allocate_and_load(
             file_info.path.display(),
             file_info.size
         );
-        
+
         // Load file data
         debug!("[RECOVERY] Loading file data...");
         let file_data = load_file_to_memory(&file_info.path)?;
         debug!("[RECOVERY] Loaded {} bytes", file_data.len());
-        
+
         if file_data.len() > SEGMENT_SIZE {
             error!(
                 "File {} size {} exceeds segment size {}",
@@ -501,7 +538,7 @@ fn phase2_allocate_and_load(
                 "File size exceeds segment capacity",
             ));
         }
-        
+
         // Allocate segment memory with the ORIGINAL seq_id from the file
         // This ensures undo log references remain valid after recovery
         debug!(
@@ -509,18 +546,24 @@ fn phase2_allocate_and_load(
             file_info.seq_id,
             chunk.allocator.next_seq_id.load(Ordering::Acquire)
         );
-        debug!("[RECOVERY] Allocating segment with original seq_id {}...", file_info.seq_id);
+        debug!(
+            "[RECOVERY] Allocating segment with original seq_id {}...",
+            file_info.seq_id
+        );
         let seg_opt = chunk.allocator.alloc_seg_with_seq_id(
             file_info.seq_id,
             &chunk.backup_storage,
-            &chunk.wal_storage
+            &chunk.wal_storage,
         );
-        
+
         let segment = match seg_opt {
             Some(seg) => {
-                debug!("[RECOVERY] Segment allocated: id={}, seq_id={}, addr={:#x}", seg.id, seg.seq_id, seg.addr);
+                debug!(
+                    "[RECOVERY] Segment allocated: id={}, seq_id={}, addr={:#x}",
+                    seg.id, seg.seq_id, seg.addr
+                );
                 seg
-            },
+            }
             None => {
                 debug!("[RECOVERY] FAILED to allocate segment!");
                 error!(
@@ -533,10 +576,10 @@ fn phase2_allocate_and_load(
                 ));
             }
         };
-        
+
         // Determine if this segment should be recovered as cold
         let should_recover_as_cold = should_recover_as_cold(chunk, file_info, hot_memory_used);
-        
+
         if should_recover_as_cold {
             recover_segment_as_cold(&segment, file_info)?;
         } else {
@@ -544,13 +587,19 @@ fn phase2_allocate_and_load(
             // Update hot memory tracking
             *hot_memory_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
         }
-        
+
         // Set append_header based on actual data
         let append_header = find_append_header(segment.addr, file_data.len());
-        segment.append_header.store(append_header, Ordering::Release);
-        debug!("[RECOVERY] Set segment {} append_header to {} (offset {})",
-            segment.id, append_header, append_header - segment.addr);
-        
+        segment
+            .append_header
+            .store(append_header, Ordering::Release);
+        debug!(
+            "[RECOVERY] Set segment {} append_header to {} (offset {})",
+            segment.id,
+            append_header,
+            append_header - segment.addr
+        );
+
         info!(
             "Recovered segment: chunk {} original_seg {} -> runtime_seg {} (seq {}), append_header offset {}",
             file_info.chunk_id,
@@ -559,17 +608,17 @@ fn phase2_allocate_and_load(
             segment.seq_id,
             append_header - segment.addr
         );
-        
+
         if file_info.seg_id != segment.id {
             warn!(
                 "Segment ID changed: original {} -> runtime {} (address-derived)",
                 file_info.seg_id, segment.id
             );
         }
-        
+
         allocated_segments.push((file_info.chunk_id, lightning::aarc::Arc::new(segment)));
     }
-    
+
     Ok(())
 }
 
@@ -581,34 +630,34 @@ fn phase3_rebuild_indices(
 ) -> u32 {
     info!("Phase 3: Rebuilding cell indices...");
     let mut total_tombstones = 0;
-    
+
     for (chunk_id, segment) in allocated_segments {
         let chunk = &chunks[*chunk_id];
-        
+
         debug!(
             "Scanning chunk {} segment {} for entries",
             chunk_id, segment.id
         );
-        
+
         // Put segment in chunk first
         chunk.segs.insert_back(segment.id as usize, segment.clone());
-        
+
         // Rebuild index from this segment
         let (dead_space, tombstone_count) =
             rebuild_cell_index_from_segment(chunk, segment, global_cell_index);
-        
+
         // Update segment metadata
         segment.dead_space.store(dead_space, Ordering::Release);
         segment.tombstones.store(tombstone_count, Ordering::Release);
-        
+
         total_tombstones += tombstone_count;
-        
+
         debug!(
             "Segment {} has {} dead bytes, {} tombstones",
             segment.id, dead_space, tombstone_count
         );
     }
-    
+
     total_tombstones
 }
 
@@ -619,26 +668,35 @@ fn phase4_populate_chunk_indices(
     chunks: &[Chunk],
 ) -> usize {
     info!("Phase 4: Populating chunk cell indices...");
-    debug!("[RECOVERY] Phase 4: global_cell_index has {} entries", global_cell_index.len());
-    
+    debug!(
+        "[RECOVERY] Phase 4: global_cell_index has {} entries",
+        global_cell_index.len()
+    );
+
     let mut total_cells = 0;
-    
+
     for (hash, entry) in global_cell_index.iter() {
         // Find which chunk this cell belongs to using partition
         let chunk_id = (entry.partition as usize) % config.num_chunks;
         let chunk = &chunks[chunk_id];
-        
+
         // Insert into chunk's cell_index
         if let Some(mut guard) = chunk.cell_index.try_insert_locked(*hash as usize) {
             *guard = entry.addr;
             total_cells += 1;
-            debug!("[RECOVERY] Inserted cell hash {} to chunk {} at addr {:#x}", hash, chunk_id, entry.addr);
+            debug!(
+                "[RECOVERY] Inserted cell hash {} to chunk {} at addr {:#x}",
+                hash, chunk_id, entry.addr
+            );
         } else {
             warn!("Cell hash {} already exists in chunk index", hash);
-            debug!("[RECOVERY] WARNING: Cell hash {} already exists in chunk {}", hash, chunk_id);
+            debug!(
+                "[RECOVERY] WARNING: Cell hash {} already exists in chunk {}",
+                hash, chunk_id
+            );
         }
     }
-    
+
     total_cells
 }
 
@@ -666,17 +724,17 @@ pub fn recover_chunks(
     chunks: &[Chunk],
 ) -> io::Result<()> {
     info!("Starting recovery from storage directories");
-    
+
     // Phase 1: Discover files
     let files = match phase1_discover_files(backup_storage, wal_storage) {
         Ok(files) => files,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             info!("No segment files found, starting fresh");
             return Ok(());
-        },
+        }
         Err(e) => return Err(e),
     };
-    
+
     // Check if configuration can fit all segments
     let can_fit = config.can_fit(&files);
     if !can_fit {
@@ -690,33 +748,39 @@ pub fn recover_chunks(
             "Configuration cannot fit recovered segments",
         ));
     }
-    
+
     // Phase 1.5: Pre-set next_seq_id for each chunk BEFORE allocating segments
     phase1_5_set_initial_seq_ids(chunks, &files);
-    
+
     // Phase 2: Allocate segments and load data
     let mut allocated_segments: Vec<(usize, lightning::aarc::Arc<Segment>)> = Vec::new();
     let mut hot_memory_used: HashMap<usize, usize> = HashMap::new();
-    
-    phase2_allocate_and_load(&files, chunks, &mut allocated_segments, &mut hot_memory_used)?;
-    
+
+    phase2_allocate_and_load(
+        &files,
+        chunks,
+        &mut allocated_segments,
+        &mut hot_memory_used,
+    )?;
+
     // Phase 3: Rebuild cell indices
     let mut global_cell_index: HashMap<u64, CellIndexEntry> = HashMap::new();
-    let total_tombstones = phase3_rebuild_indices(&allocated_segments, chunks, &mut global_cell_index);
-    
+    let total_tombstones =
+        phase3_rebuild_indices(&allocated_segments, chunks, &mut global_cell_index);
+
     // Phase 4: Update chunk cell_index WordMaps
     let total_cells = phase4_populate_chunk_indices(&global_cell_index, config, chunks);
-    
+
     info!(
         "Recovery complete: {} cells, {} tombstones across {} segments",
         total_cells,
         total_tombstones,
         allocated_segments.len()
     );
-    
+
     // Phase 5: Clean up old files
     phase5_cleanup_old_files(&files);
-    
+
     info!("Recovery completed successfully");
     Ok(())
 }
@@ -789,7 +853,7 @@ mod tests {
     fn test_parse_filename() {
         use std::fs::File;
         let temp_dir = TempDir::new().unwrap();
-        
+
         // Create test files
         let path1 = temp_dir.path().join("0-12345-67.nlog");
         File::create(&path1).unwrap();
@@ -832,7 +896,7 @@ mod tests {
                 None, // index_builder
                 Some(backup_dir.path().to_str().unwrap().to_string()),
                 Some(wal_dir.path().to_str().unwrap().to_string()),
-                None, // no tiered memory
+                None,  // no tiered memory
                 false, // no recovery on first run
             );
 
@@ -887,7 +951,7 @@ mod tests {
         let backup_dir = TempDir::new().unwrap();
 
         let cell_id = Id::new(0, 42);
-        
+
         println!("=== Phase 1: Write initial data ===");
         // Phase 1: Write initial data
         {
@@ -907,7 +971,7 @@ mod tests {
             let mut cell = default_cell(&cell_id);
             chunks.write_cell(&mut cell).unwrap();
             println!("Cell written successfully");
-            
+
             // Archive
             println!("Archiving segments...");
             for chunk in &chunks.list {
@@ -941,10 +1005,12 @@ mod tests {
                 }
                 files
             }
-            
-            println!("Files before recovery: WAL={:?}, Backup={:?}", 
+
+            println!(
+                "Files before recovery: WAL={:?}, Backup={:?}",
                 list_files_recursively(wal_dir.path()),
-                list_files_recursively(backup_dir.path()));
+                list_files_recursively(backup_dir.path())
+            );
             let chunks = Chunks::new_with_recovery(
                 1,
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
@@ -956,9 +1022,11 @@ mod tests {
                 true, // recover first
             );
             println!("Chunks recovered successfully");
-            println!("Files after recovery: WAL={:?}, Backup={:?}", 
+            println!(
+                "Files after recovery: WAL={:?}, Backup={:?}",
                 list_files_recursively(wal_dir.path()),
-                list_files_recursively(backup_dir.path()));
+                list_files_recursively(backup_dir.path())
+            );
 
             // Update with new data (version will be higher)
             println!("Updating cell...");
@@ -976,7 +1044,10 @@ mod tests {
             println!("About to update cell...");
             chunks.update_cell(&mut updated_cell).unwrap();
             println!("Cell updated successfully");
-            println!("Cell count before archiving: {}", chunks.list[0].cell_count());
+            println!(
+                "Cell count before archiving: {}",
+                chunks.list[0].cell_count()
+            );
 
             // Archive updated segment
             println!("Archiving updated segments...");
@@ -987,24 +1058,42 @@ mod tests {
                     println!("Archive result: {}", result);
                 }
             }
-            
+
             // List files
-            println!("WAL files: {:?}", std::fs::read_dir(wal_dir.path()).unwrap().collect::<Vec<_>>());
-            println!("Backup files: {:?}", std::fs::read_dir(backup_dir.path()).unwrap().collect::<Vec<_>>());
-            
+            println!(
+                "WAL files: {:?}",
+                std::fs::read_dir(wal_dir.path())
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            );
+            println!(
+                "Backup files: {:?}",
+                std::fs::read_dir(backup_dir.path())
+                    .unwrap()
+                    .collect::<Vec<_>>()
+            );
+
             println!("Phase 2 complete, dropping chunks...");
         }
         println!("Phase 2 chunks dropped");
 
         println!("=== Phase 3: Final recovery and verification ===");
-        println!("WAL files: {:?}", std::fs::read_dir(wal_dir.path()).unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().display().to_string())
-            .collect::<Vec<_>>());
-        println!("Backup files: {:?}", std::fs::read_dir(backup_dir.path()).unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path().display().to_string())
-            .collect::<Vec<_>>());
+        println!(
+            "WAL files: {:?}",
+            std::fs::read_dir(wal_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().display().to_string())
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "Backup files: {:?}",
+            std::fs::read_dir(backup_dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().display().to_string())
+                .collect::<Vec<_>>()
+        );
         // Phase 3: Recover and verify we get the latest version
         {
             let schemas = setup_test_schema();
@@ -1019,8 +1108,14 @@ mod tests {
                 None, // no tiered memory
                 true,
             );
-            println!("Chunks recovered, cell count: {}", chunks.list[0].cell_count());
-            println!("Trying to read cell with id {:?}, hash {}", cell_id, cell_id.lower);
+            println!(
+                "Chunks recovered, cell count: {}",
+                chunks.list[0].cell_count()
+            );
+            println!(
+                "Trying to read cell with id {:?}, hash {}",
+                cell_id, cell_id.lower
+            );
 
             println!("Reading cell...");
             let cell = chunks.read_cell(&cell_id).unwrap();
@@ -1121,7 +1216,7 @@ mod tests {
             assert_eq!(chunks.list[0].cell_count(), 2);
             assert!(chunks.read_cell(&cell_ids[1]).is_ok());
             assert!(chunks.read_cell(&cell_ids[3]).is_ok());
-            
+
             // Deleted cells should not exist
             assert!(chunks.read_cell(&cell_ids[0]).is_err());
             assert!(chunks.read_cell(&cell_ids[2]).is_err());
@@ -1184,12 +1279,17 @@ mod tests {
                 true,
             );
 
-            let recovered_seq_id = chunks.list[0].allocator.next_seq_id.load(Ordering::Relaxed) as u64;
+            let recovered_seq_id =
+                chunks.list[0].allocator.next_seq_id.load(Ordering::Relaxed) as u64;
             println!("Recovered seq_id: {}", recovered_seq_id);
-            
+
             // seq_id should be at least the initial value (may be higher if more segments were allocated)
-            assert!(recovered_seq_id >= initial_seq_id, 
-                "Expected seq_id >= {}, got {}", initial_seq_id, recovered_seq_id);
+            assert!(
+                recovered_seq_id >= initial_seq_id,
+                "Expected seq_id >= {}, got {}",
+                initial_seq_id,
+                recovered_seq_id
+            );
         }
     }
 
@@ -1250,7 +1350,10 @@ mod tests {
             let seg = &chunks.list[0].segments()[0];
             let actual_append = seg.append_header.load(Ordering::Relaxed);
             actual_append_offset = actual_append - seg.addr;
-            println!("Actual append header: {} (offset: {})", actual_append, actual_append_offset);
+            println!(
+                "Actual append header: {} (offset: {})",
+                actual_append, actual_append_offset
+            );
 
             // Archive the segment
             seg.archive().unwrap();
@@ -1273,13 +1376,16 @@ mod tests {
             // Find the segment with data (non-zero offset)
             let segs = chunks.list[0].segments();
             println!("Total segments after recovery: {}", segs.len());
-            
+
             let mut found_matching_segment = false;
             for seg in &segs {
                 let recovered_append = seg.append_header.load(Ordering::Relaxed);
                 let recovered_offset = recovered_append - seg.addr;
-                println!("Segment {} append_header offset: {}", seg.id, recovered_offset);
-                
+                println!(
+                    "Segment {} append_header offset: {}",
+                    seg.id, recovered_offset
+                );
+
                 if recovered_offset == actual_append_offset {
                     found_matching_segment = true;
                     println!("Found matching segment with correct offset!");
@@ -1288,10 +1394,14 @@ mod tests {
             }
 
             // Should find at least one segment with the correct offset
-            assert!(found_matching_segment, 
-                "No segment found with offset {}. Segments: {:?}", 
-                actual_append_offset, 
-                segs.iter().map(|s| (s.id, s.append_header.load(Ordering::Relaxed) - s.addr)).collect::<Vec<_>>());
+            assert!(
+                found_matching_segment,
+                "No segment found with offset {}. Segments: {:?}",
+                actual_append_offset,
+                segs.iter()
+                    .map(|s| (s.id, s.append_header.load(Ordering::Relaxed) - s.addr))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 
@@ -1373,7 +1483,7 @@ mod tests {
         {
             let schemas = setup_test_schema();
             let chunks = Chunks::new_with_recovery(
-                3, // 3 chunks
+                3,                     // 3 chunks
                 TEST_SEGMENT_SIZE * 8, // Need more space for multiple recovery cycles
                 Arc::new(ServerMeta { schemas }),
                 None, // index_builder

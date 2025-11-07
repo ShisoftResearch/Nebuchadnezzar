@@ -55,6 +55,7 @@ pub enum ReadError {
     CellIdIsUnitId,
     NotMatch,
     ExecError(String),
+    SegmentPromotionFailed,
 }
 
 impl CellHeader {
@@ -274,7 +275,13 @@ impl<'v> SharedCellData<'v> {
             let cell = Self::from_data(header, reader::read_by_schema(data_ptr, &*schema));
             Ok((cell, schema))
         } else {
-            error!("Schema {} does not existed to read", schema_id);
+            error!(
+                "Schema {} does not existed to read ptr {} from chunk {}, segment {:?}",
+                schema_id,
+                ptr,
+                chunk.id,
+                chunk.locate_segment(ptr).map(|seg| seg.id)
+            );
             return Err(ReadError::SchemaDoesNotExisted(*schema_id));
         }
     }
@@ -463,7 +470,13 @@ pub fn select_from_chunk_raw<'v>(
             header,
         ))
     } else {
-        error!("Schema {} does not existed to read", schema_id);
+        error!(
+            "Schema {} does not existed to read ptr {} from chunk {}, segment {:?}",
+            schema_id,
+            ptr,
+            chunk.id,
+            chunk.locate_segment(ptr).map(|seg| seg.id)
+        );
         return Err(ReadError::SchemaDoesNotExisted(*schema_id));
     }
 }

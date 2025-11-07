@@ -88,7 +88,7 @@ impl StateMachineCmds for SchemasSM {
         if self.id_count < max_existing {
             self.id_count = max_existing;
         }
-        
+
         self.id_count += 1;
         while self.map.schema_map.contains_key(&self.id_count) {
             self.id_count += 1;
@@ -108,27 +108,27 @@ impl StateMachineCtl for SchemasSM {
     fn recover(&mut self, data: Vec<u8>) -> BoxFuture<'_, ()> {
         trace!("========== SchemasSM::recover() CALLED ==========");
         trace!("Received {} bytes of snapshot data", data.len());
-        
+
         let schemas: Vec<Schema> = match utils::serde::deserialize::<Vec<Schema>>(&data) {
             Some(s) => {
                 trace!("Successfully deserialized {} schemas", s.len());
                 s
-            },
+            }
             None => {
                 trace!("Failed to deserialize schemas from snapshot data");
                 return future::ready(()).boxed();
             }
         };
-        
+
         trace!("Loading {} schemas into map...", schemas.len());
         self.map.load_from_list(schemas.clone());
         trace!("Schemas loaded into map");
-        
+
         // Calculate id_count from max schema ID to prevent duplicate IDs after recovery
         self.id_count = schemas.iter().map(|s| s.id).max().unwrap_or(0);
         trace!("Set id_count to {}", self.id_count);
         trace!("========== SchemasSM::recover() COMPLETE ==========");
-        
+
         future::ready(()).boxed()
     }
 
@@ -140,7 +140,11 @@ impl StateMachineCtl for SchemasSM {
 impl SchemasSM {
     pub async fn new<'a>(group: &'a str, raft_service: &Arc<RaftService>) -> SchemasSM {
         let sm_id = generate_sm_id(group);
-        trace!("Creating SchemasSM for group '{}' with SM ID: {}", group, sm_id);
+        trace!(
+            "Creating SchemasSM for group '{}' with SM ID: {}",
+            group,
+            sm_id
+        );
         SchemasSM {
             callback: SMCallback::new(sm_id, raft_service.clone()).await,
             map: SchemasMap::new(),

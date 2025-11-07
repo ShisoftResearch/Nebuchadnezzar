@@ -64,7 +64,11 @@ impl StateMachineCmds for MasterTreeSM {
         future::ready((lower, tree, upper)).boxed()
     }
 
-    fn next_tree(&self, tree_lower: EntryKey, ordering: Ordering) -> BoxFuture<'_, Option<TreeInfo>> {
+    fn next_tree(
+        &self,
+        tree_lower: EntryKey,
+        ordering: Ordering,
+    ) -> BoxFuture<'_, Option<TreeInfo>> {
         debug!(
             "Query next tree for {:?}, ordering {:?}, trees {:?}",
             tree_lower, ordering, self.tree
@@ -122,7 +126,7 @@ impl StateMachineCmds for MasterTreeSM {
                 assert_eq!(prev_tree.id, src_tree);
                 prev_tree.epoch += 1;
             }
-            
+
             // Persist the tree state after split
             if let Err(e) = self.persist_tree() {
                 error!("Failed to persist tree after split: {:?}", e);
@@ -167,7 +171,7 @@ impl MasterTreeSM {
             conshash: conshash.clone(),
             persistence_path: persistence_path.clone(),
         };
-        
+
         // Try to recover from disk if persistence path is provided
         if let Some(path) = persistence_path {
             if let Err(e) = sm.recover_from_disk(&path) {
@@ -176,7 +180,7 @@ impl MasterTreeSM {
                 info!("Successfully recovered MasterTreeSM from disk");
             }
         }
-        
+
         sm
     }
 
@@ -190,7 +194,7 @@ impl MasterTreeSM {
         let genesis_id = Id::rand();
         self.tree
             .insert(min_entry_key(), TreePlacement::new(genesis_id));
-        
+
         if let Err(e) = locate_tree_server_from_conshash(&genesis_id, &self.conshash)
             .await
             .unwrap()
@@ -204,12 +208,12 @@ impl MasterTreeSM {
             error!("Failed to create genesis tree: {:?}", e);
             return false;
         }
-        
+
         // Persist the initial tree state
         if let Err(e) = self.persist_tree() {
             error!("Failed to persist initial tree: {:?}", e);
         }
-        
+
         true
     }
 
@@ -234,10 +238,12 @@ impl MasterTreeSM {
         let mut writer = BufWriter::new(file);
 
         // Convert BTreeMap to Vec for serialization
-        let entries: Vec<(EntryKey, TreePlacement)> = self.tree.iter()
+        let entries: Vec<(EntryKey, TreePlacement)> = self
+            .tree
+            .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        
+
         // Serialize the vec
         let serialized = utils::serde::serialize(&entries);
         writer.write_all(&serialized)?;
@@ -330,12 +336,12 @@ mod tests {
         let tree_path = temp_dir.path().join("master_tree.dat");
 
         info!("=== Testing direct tree persistence and recovery ===");
-        
+
         // Create test data
         let test_id_1 = Id::rand();
         let test_id_2 = Id::rand();
         let test_id_3 = Id::rand();
-        
+
         let key1 = min_entry_key();
         let mut key2_bytes = vec![0x20];
         key2_bytes.extend(vec![0; 31]);
@@ -343,23 +349,40 @@ mod tests {
         let mut key3_bytes = vec![0x30];
         key3_bytes.extend(vec![0; 31]);
         let key3 = EntryKey::from_slice(&key3_bytes);
-        
+
         // Create initial tree and persist
         {
             let mut tree = BTreeMap::new();
-            tree.insert(key1.clone(), TreePlacement { id: test_id_1, epoch: 1 });
-            tree.insert(key2.clone(), TreePlacement { id: test_id_2, epoch: 1 });
-            tree.insert(key3.clone(), TreePlacement { id: test_id_3, epoch: 2 });
-            
+            tree.insert(
+                key1.clone(),
+                TreePlacement {
+                    id: test_id_1,
+                    epoch: 1,
+                },
+            );
+            tree.insert(
+                key2.clone(),
+                TreePlacement {
+                    id: test_id_2,
+                    epoch: 1,
+                },
+            );
+            tree.insert(
+                key3.clone(),
+                TreePlacement {
+                    id: test_id_3,
+                    epoch: 2,
+                },
+            );
+
             info!("Created tree with {} entries", tree.len());
-            
+
             // Serialize and write manually
-            let entries: Vec<(EntryKey, TreePlacement)> = tree.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
+            let entries: Vec<(EntryKey, TreePlacement)> =
+                tree.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let serialized = utils::serde::serialize(&entries);
             fs::write(&tree_path, &serialized).unwrap();
-            
+
             info!("Persisted tree to disk");
         }
 
@@ -372,28 +395,33 @@ mod tests {
         // Recover the tree
         {
             let buffer = fs::read(&tree_path).unwrap();
-            let entries: Vec<(EntryKey, TreePlacement)> = utils::serde::deserialize(&buffer).unwrap();
+            let entries: Vec<(EntryKey, TreePlacement)> =
+                utils::serde::deserialize(&buffer).unwrap();
             let recovered_tree: BTreeMap<EntryKey, TreePlacement> = entries.into_iter().collect();
-            
+
             info!("Recovered tree with {} entries", recovered_tree.len());
-            
+
             // Verify recovery worked - should have the same 3 entries
-            assert_eq!(recovered_tree.len(), 3, "Recovered tree should have 3 entries");
-            
+            assert_eq!(
+                recovered_tree.len(),
+                3,
+                "Recovered tree should have 3 entries"
+            );
+
             // Verify specific entries exist
             assert!(recovered_tree.contains_key(&key1));
             assert!(recovered_tree.contains_key(&key2));
             assert!(recovered_tree.contains_key(&key3));
-            
+
             // Verify epochs
             let entry1 = recovered_tree.get(&key1).unwrap();
             assert_eq!(entry1.epoch, 1);
             assert_eq!(entry1.id, test_id_1);
-            
+
             let entry2 = recovered_tree.get(&key2).unwrap();
             assert_eq!(entry2.epoch, 1);
             assert_eq!(entry2.id, test_id_2);
-            
+
             let entry3 = recovered_tree.get(&key3).unwrap();
             assert_eq!(entry3.epoch, 2);
             assert_eq!(entry3.id, test_id_3);
@@ -412,7 +440,7 @@ mod tests {
         let group_name = "tree_no_persist_test";
 
         info!("=== Testing MasterTreeSM without persistence ===");
-        
+
         let rpc_server = Server::new(&server_addr.to_string());
         let storage = raft::Storage::DISK(DiskOptions {
             path: raft_path.to_str().unwrap().to_string(),
@@ -422,7 +450,7 @@ mod tests {
             snapshot_log_threshold: 1000,
             log_compaction_threshold: 2000,
         });
-        
+
         let raft_service = raft::RaftService::new(raft::Options {
             storage,
             address: server_addr.to_string(),
@@ -440,10 +468,14 @@ mod tests {
             .await
             .unwrap();
         RaftClient::prepare_subscription(&rpc_server).await;
-        
-        let member_service = MemberService::new(&server_addr.to_string(), &raft_client, &raft_service).await;
-        member_service.join_group(&group_name.to_string()).await.unwrap();
-        
+
+        let member_service =
+            MemberService::new(&server_addr.to_string(), &raft_client, &raft_service).await;
+        member_service
+            .join_group(&group_name.to_string())
+            .await
+            .unwrap();
+
         let membership_client = Arc::new(ObserverClient::new(&raft_client));
         let conshash = bifrost::conshash::ConsistentHashing::new_with_id(
             1000,
@@ -453,30 +485,38 @@ mod tests {
         )
         .await
         .unwrap();
-        conshash.set_weight(&server_addr.to_string(), 1024).await.unwrap();
+        conshash
+            .set_weight(&server_addr.to_string(), 1024)
+            .await
+            .unwrap();
         conshash.init_table().await.unwrap();
 
         // Create MasterTreeSM without persistence (None)
-        let mut tree_sm = MasterTreeSM::new_with_persistence(
-            &raft_service,
-            &conshash,
-            None,
-        );
-        
+        let mut tree_sm = MasterTreeSM::new_with_persistence(&raft_service, &conshash, None);
+
         // Add an entry
         let mut key_bytes = vec![0x40];
         key_bytes.extend(vec![0; 31]);
         let key = EntryKey::from_slice(&key_bytes);
-        tree_sm.tree.insert(key, TreePlacement { id: Id::rand(), epoch: 1 });
-        
+        tree_sm.tree.insert(
+            key,
+            TreePlacement {
+                id: Id::rand(),
+                epoch: 1,
+            },
+        );
+
         // Try to persist - should succeed but do nothing
         tree_sm.persist_tree().unwrap();
-        
+
         info!("Added entry without persistence path");
 
         // Verify no persistence file was created
         let potential_path = temp_dir.path().join("master_tree.dat");
-        assert!(!potential_path.exists(), "No persistence file should be created when path is None");
+        assert!(
+            !potential_path.exists(),
+            "No persistence file should be created when path is None"
+        );
 
         info!("No-persistence test passed!");
     }
@@ -485,7 +525,7 @@ mod tests {
     fn test_tree_placement_creation() {
         let test_id = Id::rand();
         let placement = TreePlacement::new(test_id);
-        
+
         assert_eq!(placement.id, test_id);
         assert_eq!(placement.epoch, INITIAL_TREE_EPOCH);
     }

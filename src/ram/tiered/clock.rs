@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// CLOCK eviction policy for selecting victim segments to evict
-/// 
+///
 /// The CLOCK algorithm approximates LRU using a circular buffer with reference bits.
 /// It provides good approximation of LRU with O(1) amortized time complexity.
 pub struct ClockEvictionPolicy {
@@ -18,9 +18,9 @@ impl ClockEvictionPolicy {
             cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
-    
+
     /// Select a victim segment for eviction using the CLOCK algorithm
-    /// 
+    ///
     /// Algorithm:
     /// 1. Start at current clock hand position
     /// 2. For each segment:
@@ -31,88 +31,107 @@ impl ClockEvictionPolicy {
     ///    - If reference bit is set, clear it and continue
     ///    - If reference bit is clear, select as victim
     /// 3. Advance clock hand
-    /// 
+    ///
     /// Returns None if no victim can be found (all segments referenced or protected)
     pub fn select_victim(&self, chunk: &Chunk) -> Option<lightning::aarc::Arc<Segment>> {
         let segments = chunk.segments();
         if segments.is_empty() {
             return None;
         }
-        
+
         let head_seg_id = chunk.get_head_seg_id();
         let num_segments = segments.len();
         let start_pos = self.cursor.load(Ordering::Relaxed);
-        
-        debug!("CLOCK selecting victim: {} total segments, head_seg_id={}", num_segments, head_seg_id);
-        
-        // Make two passes: first try to find unreferenced segment, 
+
+        debug!(
+            "CLOCK selecting victim: {} total segments, head_seg_id={}",
+            num_segments, head_seg_id
+        );
+
+        // Make two passes: first try to find unreferenced segment,
         // second pass will clear all reference bits if needed
         for pass in 0..2 {
             for i in 0..num_segments {
                 let pos = (start_pos + i) % num_segments;
                 let segment = &segments[pos];
-                
+
                 // Skip head segment - it's actively being written to
                 if segment.id == head_seg_id {
                     debug!("CLOCK: seg {} is head, skipping", segment.id);
                     continue;
                 }
-                
+
                 // Skip if segment has active references (being read)
                 if !segment.no_references() {
                     debug!("CLOCK: seg {} has active references, skipping", segment.id);
                     continue;
                 }
-                
+
                 // Skip if segment is protected by transactions
                 if chunk.is_segment_protected(segment.id) {
                     debug!("CLOCK: seg {} is protected, skipping", segment.id);
                     continue;
                 }
-                
+
                 // Skip if already cold
                 if segment.is_cold() {
                     debug!("CLOCK: seg {} is already cold, skipping", segment.id);
                     continue;
                 }
-                
+
                 // Check and clear reference bit
                 let was_referenced = segment.clear_reference_bit();
-                
+
                 // If reference bit was set (now cleared), re-arm the segment with mprotect
                 // This applies to both hot and cold (file-backed) segments
                 if was_referenced {
-                    debug!("CLOCK re-arming segment {} with mprotect(PROT_NONE)", segment.id);
-                    if let Err(e) = crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr) {
-                        warn!("Failed to protect segment {} after clearing ref bit: {}", segment.id, e);
+                    debug!(
+                        "CLOCK re-arming segment {} with mprotect(PROT_NONE)",
+                        segment.id
+                    );
+                    if let Err(e) =
+                        crate::ram::tiered::page_fault_tracker::protect_segment(segment.addr)
+                    {
+                        warn!(
+                            "Failed to protect segment {} after clearing ref bit: {}",
+                            segment.id, e
+                        );
                     } else {
                         debug!("CLOCK successfully protected segment {}", segment.id);
                     }
                 }
-                
+
                 if pass == 0 {
                     // First pass: only select if not referenced
                     if !was_referenced {
                         // Found victim!
-                        self.cursor.store((pos + 1) % num_segments, Ordering::Relaxed);
-                        debug!("CLOCK selected segment {} as victim (first pass, unreferenced)", segment.id);
+                        self.cursor
+                            .store((pos + 1) % num_segments, Ordering::Relaxed);
+                        debug!(
+                            "CLOCK selected segment {} as victim (first pass, unreferenced)",
+                            segment.id
+                        );
                         return Some(segment.clone());
                     }
                 } else {
                     // Second pass: select any eligible segment (bits already cleared)
                     // This only happens if ALL segments were referenced in first pass
-                    self.cursor.store((pos + 1) % num_segments, Ordering::Relaxed);
-                    debug!("CLOCK selected segment {} as victim (second pass, all were referenced)", segment.id);
+                    self.cursor
+                        .store((pos + 1) % num_segments, Ordering::Relaxed);
+                    debug!(
+                        "CLOCK selected segment {} as victim (second pass, all were referenced)",
+                        segment.id
+                    );
                     return Some(segment.clone());
                 }
             }
         }
-        
+
         // No eligible victim found
         debug!("CLOCK could not find any victim segment (all protected or head segment)");
         None
     }
-    
+
     /// Reset the clock hand to the beginning
     /// Useful for testing or explicit resets
     pub fn reset(&self) {
@@ -134,4 +153,3 @@ mod tests {
         // Full integration tests in tiered/tests.rs
     }
 }
-

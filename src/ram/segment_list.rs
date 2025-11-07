@@ -1,5 +1,5 @@
-use lightning::aarc::{Arc as AArc, AtomicArc};
 use crate::ram::segs::Segment;
+use lightning::aarc::{Arc as AArc, AtomicArc};
 
 /// A lock-free array-based segment list that provides O(1) access by segment ID.
 /// Uses AtomicArc from Lightning to allow concurrent reads and updates without locks.
@@ -24,7 +24,11 @@ impl SegmentList {
     /// Returns the old segment if one existed
     pub fn insert(&self, key: usize, segment: AArc<Segment>) -> Option<AArc<Segment>> {
         if key >= self.segments.len() {
-            panic!("Segment key {} exceeds capacity {}", key, self.segments.len());
+            panic!(
+                "Segment key {} exceeds capacity {}",
+                key,
+                self.segments.len()
+            );
         }
 
         let old = self.segments[key].swap_ref(segment);
@@ -81,35 +85,32 @@ impl SegmentList {
     /// Iterate over all segment IDs that have active segments
     /// Returns an iterator over keys (segment IDs)
     pub fn iter_keys(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.segments.len())
-            .filter(move |i| !self.segments[*i].is_null())
+        (0..self.segments.len()).filter(move |i| !self.segments[*i].is_null())
     }
 
     /// Iterate over all active segments
     /// Returns an iterator over Arc<Segment>
     pub fn iter_values(&self) -> impl Iterator<Item = AArc<Segment>> + '_ {
-        (0..self.segments.len())
-            .filter_map(move |i| {
-                let arc = self.segments[i].load();
-                if arc.is_null() {
-                    None
-                } else {
-                    Some(arc)
-                }
-            })
+        (0..self.segments.len()).filter_map(move |i| {
+            let arc = self.segments[i].load();
+            if arc.is_null() {
+                None
+            } else {
+                Some(arc)
+            }
+        })
     }
 
     /// Iterate over all (key, segment) pairs
     pub fn iter(&self) -> impl Iterator<Item = (usize, AArc<Segment>)> + '_ {
-        (0..self.segments.len())
-            .filter_map(move |i| {
-                let arc = self.segments[i].load();
-                if arc.is_null() {
-                    None
-                } else {
-                    Some((i, arc))
-                }
-            })
+        (0..self.segments.len()).filter_map(move |i| {
+            let arc = self.segments[i].load();
+            if arc.is_null() {
+                None
+            } else {
+                Some((i, arc))
+            }
+        })
     }
 
     /// Count the number of active segments
@@ -148,21 +149,21 @@ mod tests {
     #[test]
     fn test_segment_list_basic() {
         let list = SegmentList::new(10);
-        
+
         // Create a dummy segment
-        let segment = AArc::new(Segment::new(0, 0, 0, 0x1000, &None, &None));
-        
+        let segment = AArc::new(Segment::new(0, 0, 0, 0x1000, true, &None, &None));
+
         // Insert
         assert!(list.insert(0, segment.clone()).is_none());
-        
+
         // Get
         assert!(list.get(&0).is_some());
         assert_eq!(list.get(&0).unwrap().id, 0);
-        
+
         // Contains
         assert!(list.contains_key(&0));
         assert!(!list.contains_key(&1));
-        
+
         // Remove
         assert!(list.remove(&0).is_some());
         assert!(!list.contains_key(&0));
@@ -171,20 +172,20 @@ mod tests {
     #[test]
     fn test_segment_list_iteration() {
         let list = SegmentList::new(10);
-        
+
         // Insert a few segments
         for i in 0..5 {
-            let segment = AArc::new(Segment::new(i as u64, 0, 0, 0x1000 * i, &None, &None));
+            let segment = AArc::new(Segment::new(i as u64, 0, 0, 0x1000 * i, true, &None, &None));
             list.insert(i, segment);
         }
-        
+
         // Check length
         assert_eq!(list.len(), 5);
-        
+
         // Check iteration
         let keys: Vec<_> = list.iter_keys().collect();
         assert_eq!(keys, vec![0, 1, 2, 3, 4]);
-        
+
         // Check values iteration
         let values: Vec<_> = list.iter_values().collect();
         assert_eq!(values.len(), 5);
@@ -196,20 +197,19 @@ mod tests {
     #[test]
     fn test_segment_list_replace() {
         let list = SegmentList::new(10);
-        
-        let seg1 = AArc::new(Segment::new(0, 1, 0, 0x1000, &None, &None));
-        let seg2 = AArc::new(Segment::new(0, 2, 0, 0x1000, &None, &None));
-        
+
+        let seg1 = AArc::new(Segment::new(0, 1, 0, 0x1000, true, &None, &None));
+        let seg2 = AArc::new(Segment::new(0, 2, 0, 0x1000, true, &None, &None));
+
         // Insert first segment
         assert!(list.insert(0, seg1.clone()).is_none());
-        
+
         // Replace with second segment
         let old = list.insert(0, seg2.clone());
         assert!(old.is_some());
         assert_eq!(old.unwrap().seq_id, 1);
-        
+
         // Verify new segment is in place
         assert_eq!(list.get(&0).unwrap().seq_id, 2);
     }
 }
-

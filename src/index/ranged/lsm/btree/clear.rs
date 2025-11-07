@@ -9,7 +9,8 @@ where
     let child_refs: Vec<NodeCellRef> = match &*read_unchecked::<KS, PS>(node_ref) {
         &NodeData::Internal(ref node) => {
             // Collect all non-default child pointers
-            node.ptrs.as_slice_immute()
+            node.ptrs
+                .as_slice_immute()
                 .iter()
                 .filter(|r| !r.is_default())
                 .cloned()

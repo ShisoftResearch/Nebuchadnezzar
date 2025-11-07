@@ -2,10 +2,7 @@ use core_affinity::CoreId;
 use itertools::Itertools;
 use lightning::{aarc::Arc, map::PtrHashMap};
 use std::sync::atomic::Ordering::Relaxed;
-use std::{
-    sync::atomic::AtomicU64,
-    thread,
-};
+use std::{sync::atomic::AtomicU64, thread};
 use tokio::{sync::mpsc::*, task::LocalSet};
 
 use super::{Stage, StageId};

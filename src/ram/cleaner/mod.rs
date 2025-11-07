@@ -33,20 +33,20 @@ impl RateLimiter {
         let now = Instant::now();
         // Get intervals from environment or use defaults
         let promotion_interval_ms = env::var("NEB_PROMOTION_CHECK_INTERVAL_MS")
-            .unwrap_or("2000".to_string())  // Check every 2s (was every 100ms, more conservative)
+            .unwrap_or("2000".to_string()) // Check every 2s (was every 100ms, more conservative)
             .parse::<u64>()
             .unwrap_or(2000);
-        
+
         let eviction_interval_ms = env::var("NEB_EVICTION_CHECK_INTERVAL_MS")
-            .unwrap_or("1000".to_string())  // Check every 1s (was every 100ms)
+            .unwrap_or("1000".to_string()) // Check every 1s (was every 100ms)
             .parse::<u64>()
             .unwrap_or(1000);
-        
+
         let eviction_cooldown_ms = env::var("NEB_EVICTION_COOLDOWN_MS")
-            .unwrap_or("2000".to_string())  // Wait 2s after eviction before checking again
+            .unwrap_or("2000".to_string()) // Wait 2s after eviction before checking again
             .parse::<u64>()
             .unwrap_or(2000);
-        
+
         Self {
             last_promotion_check: now,
             last_eviction_check: now,
@@ -56,7 +56,7 @@ impl RateLimiter {
             eviction_cooldown: Duration::from_millis(eviction_cooldown_ms),
         }
     }
-    
+
     fn should_check_promotion(&mut self) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last_promotion_check) >= self.promotion_check_interval {
@@ -66,15 +66,17 @@ impl RateLimiter {
             false
         }
     }
-    
+
     fn should_check_eviction(&mut self) -> bool {
         let now = Instant::now();
         // Check two conditions:
         // 1. Enough time since last check
         // 2. Enough cooldown time since last eviction (avoid thrashing)
-        let enough_time_since_check = now.duration_since(self.last_eviction_check) >= self.eviction_check_interval;
-        let cooldown_passed = now.duration_since(self.last_eviction_triggered) >= self.eviction_cooldown;
-        
+        let enough_time_since_check =
+            now.duration_since(self.last_eviction_check) >= self.eviction_check_interval;
+        let cooldown_passed =
+            now.duration_since(self.last_eviction_triggered) >= self.eviction_cooldown;
+
         if enough_time_since_check && cooldown_passed {
             self.last_eviction_check = now;
             true
@@ -82,7 +84,7 @@ impl RateLimiter {
             false
         }
     }
-    
+
     fn mark_eviction_triggered(&mut self) {
         self.last_eviction_triggered = Instant::now();
     }
@@ -104,24 +106,24 @@ impl Cleaner {
             .name("Cleaner main".into())
             .spawn(move || {
                 let mut rate_limiter = RateLimiter::new();
-                
+
                 while !stop_tag_ref_clone.load(Ordering::Relaxed) {
                     // Check if we should do promotion/eviction this iteration
                     let should_promote = rate_limiter.should_check_promotion();
                     let should_evict = rate_limiter.should_check_eviction();
-                    
+
                     // Track if any evictions actually occurred across all chunks
                     let any_evictions = AtomicBool::new(false);
-                    
+
                     checks_ref_clone.list.par_iter().for_each(|chunk| {
                         // Pre-clean: handle promotions (rate-limited)
                         if should_promote {
                             Self::pre_clean(chunk);
                         }
-                        
+
                         // Main cleaning: always run
                         Self::clean(chunk, false);
-                        
+
                         // Post-clean: handle evictions (rate-limited)
                         if should_evict {
                             if let Some(evicted) = Self::post_clean(chunk) {
@@ -132,18 +134,18 @@ impl Cleaner {
                             }
                         }
                     });
-                    
+
                     // Only trigger eviction cooldown if actual evictions occurred
                     if should_evict && any_evictions.load(Ordering::Relaxed) {
                         rate_limiter.mark_eviction_triggered();
                     }
-                    
+
                     thread::sleep(Duration::from_millis(sleep_interval_ms));
                 }
                 warn!("Cleaner main thread stopped");
             })
             .unwrap();
-        
+
         let cleaner = Cleaner {
             chunks: chunks.clone(),
             stopped: stop_tag.clone(),
@@ -172,7 +174,7 @@ impl Cleaner {
         // have to put it right here for cleaners will clear the tombstone death counter
         chunk.scan_tombstone_survival();
         let mut cleaned_space: usize = 0;
-        
+
         #[cfg(feature = "compact_cleaner")]
         {
             debug!("Starting compact {}", chunk.id);
@@ -251,51 +253,56 @@ impl Cleaner {
             None
         }
     }
-    
+
     /// Handle promotion requests in the cleaner thread to avoid race conditions
-    /// 
+    ///
     /// Uses sampling to check only a subset of segments for promotion, reducing overhead.
     /// This method checks cold segments that have been referenced (accessed)
     /// and promotes them to hot storage. This eliminates the race condition
     /// where user threads would promote segments while cleaners are iterating.
     fn handle_promotion_requests(
-        chunk: &Chunk, 
-        tiered_manager: &crate::ram::tiered::manager::TieredMemoryManager
+        chunk: &Chunk,
+        tiered_manager: &crate::ram::tiered::manager::TieredMemoryManager,
     ) {
         // Skip if promotion is disabled (e.g., for benchmarking)
-        if tiered_manager.disable_promotion.load(std::sync::atomic::Ordering::Relaxed) {
+        if tiered_manager
+            .disable_promotion
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return;
         }
-        
+
         // Get sample size from env or use default (5% of segments, min 5, max 50)
         // Reduced from 10% to be more conservative since promotion is expensive
         let sample_pct = env::var("NEB_PROMOTION_SAMPLE_PERCENT")
             .unwrap_or("5".to_string())
             .parse::<f32>()
             .unwrap_or(5.0)
-            .clamp(1.0, 100.0) / 100.0;
-        
+            .clamp(1.0, 100.0)
+            / 100.0;
+
         let all_segments = chunk.segments();
         let total_segs = all_segments.len();
-        
+
         if total_segs == 0 {
             return;
         }
-        
+
         // Calculate sample size (more conservative limits)
         let sample_size = ((total_segs as f32 * sample_pct) as usize)
             .max(5)
             .min(50)
             .min(total_segs);
-        
+
         // Use step size for sampling - this provides good coverage over time
         // as segment indices change due to creation/deletion
         let step = if sample_size > 0 {
             total_segs / sample_size
         } else {
             total_segs
-        }.max(1);
-        
+        }
+        .max(1);
+
         // Sample segments using stride pattern for even distribution
         let segments_to_promote: Vec<_> = all_segments
             .into_iter()
@@ -311,18 +318,14 @@ impl Cleaner {
                 .parse::<usize>()
                 .unwrap_or(10)
                 .max(1);
-            
+
             let actual_promotions = segments_to_promote.len().min(max_promotions);
-            
+
             debug!(
                 "Cleaner promoting {} cold segments in chunk {} (sampled {}/{}, capped at {})",
-                actual_promotions,
-                chunk.id,
-                sample_size,
-                total_segs,
-                max_promotions
+                actual_promotions, chunk.id, sample_size, total_segs, max_promotions
             );
-            
+
             for segment in segments_to_promote.into_iter().take(max_promotions) {
                 if let Err(e) = tiered_manager.promote(&segment, chunk) {
                     error!("Tiered memory promotion failed in cleaner: {:?}", e);
@@ -330,7 +333,7 @@ impl Cleaner {
             }
         }
     }
-    
+
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
     }
@@ -340,7 +343,7 @@ impl Drop for Cleaner {
     fn drop(&mut self) {
         // Signal the cleaner thread to stop
         self.stopped.store(true, Ordering::Relaxed);
-        
+
         // Wait for the thread to finish
         if let Some(handle) = self._handle.take() {
             let _ = handle.join();

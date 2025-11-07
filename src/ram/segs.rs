@@ -7,13 +7,17 @@ use bifrost::utils::time::get_time;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
 use parking_lot;
-use std::fs::{copy, create_dir_all, remove_file, File};
-use std::{io, slice};
+use std::fs::{self, create_dir_all, remove_file, File};
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering, Ordering::*};
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicI8, AtomicU32, AtomicUsize,
+    Ordering::{self, *},
+};
+use std::{io, slice};
 
 use super::entry::ENTRY_HEAD_SIZE;
 
@@ -21,6 +25,11 @@ pub const SEGMENT_SIZE_U32: u32 = 8 * 1024 * 1024;
 pub const SEGMENT_SIZE: usize = SEGMENT_SIZE_U32 as usize;
 pub const SEGMENT_MASK: usize = !(SEGMENT_SIZE - 1);
 pub const SEGMENT_BITS_SHIFT: u32 = SEGMENT_SIZE.trailing_zeros();
+
+pub const HOT_SEGMENT: u8 = 1;
+pub const COLD_SEGMENT: u8 = 2;
+pub const HOT_COLD_MASK: u8 = !0 << 1 >> 1;
+pub const LOCKING_SEGMENT_BITS: u8 = !HOT_COLD_MASK;
 
 // Page constants (used for alignment and mprotect)
 pub const PAGE_SHIFT: usize = 12; // 4KB pages
@@ -51,9 +60,9 @@ pub const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 // - Maximum throughput: batch_size=4MB, interval=i64::MAX (sync only on size)
 // - Low latency: batch_size=512KB, interval=50ms
 // - Strict durability: batch_size=0, interval=0 (sync every write)
-pub const WAL_BUFFER_SIZE: usize = 512 * 1024;      // 512KB in-memory buffer (reduces syscalls)
-pub const WAL_SYNC_BATCH_SIZE: usize = 1 * 1024 * 1024;  // Sync after 1MB of writes (reduces fsyncs)
-pub const WAL_SYNC_INTERVAL_MS: i64 = 10;           // Sync every 10ms (10x less frequent than before)
+pub const WAL_BUFFER_SIZE: usize = 512 * 1024; // 512KB in-memory buffer (reduces syscalls)
+pub const WAL_SYNC_BATCH_SIZE: usize = 1 * 1024 * 1024; // Sync after 1MB of writes (reduces fsyncs)
+pub const WAL_SYNC_INTERVAL_MS: i64 = 10; // Sync every 10ms (10x less frequent than before)
 
 #[derive(Default)]
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
@@ -74,11 +83,13 @@ pub struct Segment {
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
     // Tiered memory fields
-    pub cold_file_fd: AtomicI32,  // -1 = hot, >= 0 = file descriptor for cold
+    /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
+    /// Holds the hot/cold state: false = hot (anonymous memory), true = cold (backed by file)
+    /// Cell read/write operations do NOT need this lock, only cell-level locks
+    pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
-    pub promoting: AtomicBool,      // True when promotion is in progress
     // WAL batch sync tracking (for group commit optimization)
-    pub last_sync_time: AtomicI64,   // Timestamp of last fsync in milliseconds
+    pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
 }
 
@@ -88,6 +99,7 @@ impl Segment {
         seq_id: u64,
         chunk_id: usize,
         buffer_ptr: usize,
+        hot: bool,
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
     ) -> Segment {
@@ -111,6 +123,7 @@ impl Segment {
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
             chunk_id, id, seq_id, size, buffer_ptr
         );
+        let tiered_lock = if hot { HOT_SEGMENT } else { COLD_SEGMENT };
         Segment {
             addr: buffer_ptr,
             id,
@@ -129,9 +142,8 @@ impl Segment {
             wal_file_name,
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
-            cold_file_fd: AtomicI32::new(-1),  // Start as hot
+            tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
-            promoting: AtomicBool::new(false),
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
         }
@@ -229,86 +241,112 @@ impl Segment {
 
     // archive this segment and write the data to backup storage
     pub fn archive(&self) -> Result<bool, io::Error> {
-        debug!("archive() called for segment {}, backup_file_name={:?}", self.id, self.backup_file_name);
+        debug!(
+            "archive() called for segment {}, backup_file_name={:?}",
+            self.id, self.backup_file_name
+        );
         if let &Some(ref backup_file) = &self.backup_file_name {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
             if backup_file_path.exists() {
-                warn!(
-                    "Segment backup {} exists and can't archive twice",
-                    backup_file
+                // warn!(
+                //     "Segment backup {} exists and can't archive twice",
+                //     backup_file
+                // );
+                // return Ok(false);
+                debug!(
+                    "[DEBUG ONLY] Removing existing backup file for segment {}",
+                    self.id
                 );
-                return Ok(false);
+                fs::remove_file(backup_file_path)?;
             }
-            
+
             // Ensure parent directory exists before creating backup file
             if let Some(parent) = backup_file_path.parent() {
                 create_dir_all(parent)?;
             }
-            
-            if let Some(ref wal_file) = self.wal_file_name {
-                // if there is a WAL file ready, copy this file to backup
-                // First, flush and close the WAL file
-                {
-                    let mut file_opt = self.wal_file.lock();
-                    if let Some(mut writer) = file_opt.take() {
-                        // Flush and sync the file before closing
-                        writer.flush()?;
-                        writer.get_ref().sync_all()?;
-                        // Writer is dropped here, closing the file handle
-                        // file_opt is now None
-                    } else {
-                        // WAL file was already closed or never opened
-                        // Check if the WAL file exists on disk before returning error
-                        let wal_path = Path::new(wal_file);
-                        if !wal_path.exists() {
-                            // WAL file doesn't exist, fall through to memory-based archiving
-                            debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
-                        } else {
-                            // WAL file exists but mutex is empty - this shouldn't happen
-                            return Err(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("WAL file mutex is empty for segment {}, but file exists at {}", self.id, wal_file)
-                            ));
-                        }
-                    }
-                }
-                
-                // Check if WAL file exists before trying to copy it
-                let wal_path = Path::new(wal_file);
-                if wal_path.exists() {
-                    // Now the file is closed, we can safely copy and remove it
-                    copy(wal_file, backup_file)?;
-                    // Sync the backup file after copy
-                    let backup_file_handle = File::open(backup_file_path)?;
-                    backup_file_handle.sync_all()?;
-                    
-                    // Remove the WAL file (file is now closed, so this should succeed)
-                    remove_file(wal_file)?;
-                    return Ok(true);
-                } else {
-                    // WAL file doesn't exist, fall through to memory-based archiving
-                    debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
-                }
-            }
-            
+
+            // TODO: restore this after testing
+            // if let Some(ref wal_file) = self.wal_file_name {
+            //     // if there is a WAL file ready, copy this file to backup
+            //     // First, flush and close the WAL file if it's open
+            //     {
+            //         let mut file_opt = self.wal_file.lock();
+            //         if let Some(mut writer) = file_opt.take() {
+            //             // Flush and sync the file before closing
+            //             writer.flush()?;
+            //             writer.get_ref().sync_all()?;
+            //             // Writer is dropped here, closing the file handle
+            //             // file_opt is now None
+            //         } else {
+            //             // WAL file was already closed or never opened
+            //             // This is fine - we'll read it from disk if it exists
+            //             debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
+            //         }
+            //     }
+
+            //     // Check if WAL file exists before trying to copy it
+            //     // Note: The file might exist even if the mutex is empty (e.g., after recovery)
+            //     let wal_path = Path::new(wal_file);
+            //     if wal_path.exists() {
+            //         // CRITICAL: WAL files contain only the written data, not full SEGMENT_SIZE.
+            //         // For explicit file I/O during promotion (pread), we need full-size files.
+            //         // Copy WAL and pad to SEGMENT_SIZE with zeros.
+
+            //         // Read the WAL file
+            //         let wal_data = std::fs::read(wal_file)?;
+            //         let wal_size = wal_data.len();
+
+            //         // Create backup file and write WAL data + padding
+            //         let mut backup_file = File::create(backup_file_path)?;
+            //         backup_file.write_all(&wal_data)?;
+
+            //         // Pad to SEGMENT_SIZE if needed
+            //         if wal_size < SEGMENT_SIZE {
+            //             let padding_size = SEGMENT_SIZE - wal_size;
+            //             let padding = vec![0u8; padding_size];
+            //             backup_file.write_all(&padding)?;
+            //             debug!(
+            //                 "Padded WAL backup for segment {} from {} to {} bytes",
+            //                 self.id, wal_size, SEGMENT_SIZE
+            //             );
+            //         }
+
+            //         backup_file.sync_all()?;
+
+            //         // Remove the WAL file (file is now closed, so this should succeed)
+            //         remove_file(wal_file)?;
+            //         return Ok(true);
+            //     } else {
+            //         // WAL file doesn't exist, fall through to memory-based archiving
+            //         debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
+            //     }
+            // }
+
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
                 let backup_file = File::create(backup_file_path)?;
-                // CRITICAL: Use Acquire ordering to ensure we see the latest append_header value!
-                // If we use Relaxed, we might read a stale value and write a truncated backup file.
-                // When the kernel mmaps this truncated file, it zero-fills beyond the file size,
-                // causing schema IDs and other data to be read as zeros.
-                let seg_size = self.append_header.load(Ordering::Acquire) - self.addr;
-                let mut buffer = BufWriter::with_capacity(seg_size, backup_file);
+                // CRITICAL: Write the FULL segment size, not just the used portion.
+                // This is required for explicit file I/O during promotion, which reads
+                // the entire SEGMENT_SIZE using pread(). If we only write the used portion,
+                // promotion will hit EOF and fail.
+                //
+                // The unused portion (beyond append_header) is effectively garbage, but
+                // writing it ensures we can always read back the full segment atomically.
+                let mut buffer = BufWriter::with_capacity(SEGMENT_SIZE, backup_file);
                 unsafe {
-                    let data_block = slice::from_raw_parts(self.addr as *const u8, seg_size);
+                    let data_block = slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
                     buffer.write(data_block)?;
                 }
                 buffer.flush()?;
                 buffer.get_ref().sync_all()?;
                 return Ok(true);
             }
+        } else {
+            warn!(
+                "Segment {} has no backup file name, cannot archive",
+                self.id
+            );
         }
         return Ok(false);
     }
@@ -320,37 +358,47 @@ impl Segment {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write(data_block)?;
             }
-            
+
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching
             if skip_sync {
                 // Transaction context: no sync, will be synced at commit
-                trace!("WAL sync skipped for segment {} (transactional write, will sync at commit)", self.id);
+                trace!(
+                    "WAL sync skipped for segment {} (transactional write, will sync at commit)",
+                    self.id
+                );
                 return Ok(());
             }
-            
+
             // Group commit logic for non-transactional writes
             let current_time = get_time();
-            let bytes_written = self.bytes_since_sync.fetch_add(size as usize, Ordering::Relaxed) + size as usize;
+            let bytes_written = self
+                .bytes_since_sync
+                .fetch_add(size as usize, Ordering::Relaxed)
+                + size as usize;
             let last_sync = self.last_sync_time.load(Ordering::Relaxed);
             let time_since_sync = current_time - last_sync;
-            
+
             // Sync if either threshold is reached:
             // 1. Enough bytes have accumulated (batch size threshold)
             // 2. Enough time has passed (time threshold)
-            let should_sync = bytes_written >= WAL_SYNC_BATCH_SIZE || 
-                              time_since_sync >= WAL_SYNC_INTERVAL_MS;
-            
+            let should_sync =
+                bytes_written >= WAL_SYNC_BATCH_SIZE || time_since_sync >= WAL_SYNC_INTERVAL_MS;
+
             if should_sync {
                 // Only flush if we're going to sync (sync_data implicitly flushes)
                 file.get_ref().sync_data()?;
-                
+
                 // Reset counters after successful sync
                 self.bytes_since_sync.store(0, Ordering::Relaxed);
                 self.last_sync_time.store(current_time, Ordering::Relaxed);
-                
-                trace!("WAL synced for segment {} ({} bytes, {} ms since last sync)", 
-                       self.id, bytes_written, time_since_sync);
+
+                trace!(
+                    "WAL synced for segment {} ({} bytes, {} ms since last sync)",
+                    self.id,
+                    bytes_written,
+                    time_since_sync
+                );
             } else {
                 trace!("WAL write buffered for segment {} ({} bytes accumulated, {} ms since last sync)",
                        self.id, bytes_written, time_since_sync);
@@ -366,12 +414,12 @@ impl Segment {
         if let Some(ref mut file) = *file_opt {
             file.flush()?;
             file.get_ref().sync_all()?;
-            
+
             // Reset counters after forced sync
             let current_time = get_time();
             self.bytes_since_sync.store(0, Ordering::Relaxed);
             self.last_sync_time.store(current_time, Ordering::Relaxed);
-            
+
             trace!("Forced WAL sync for segment {}", self.id);
         }
         Ok(())
@@ -404,37 +452,74 @@ impl Segment {
             }
         }
     }
-    
+
     // Tiered memory helper methods (stubs when tiered memory is disabled)
-    
+
     /// Check if segment is hot (in anonymous memory)
     /// Always returns true when tiered memory is disabled
+    /// This is a fast check that doesn't acquire the lock (may be stale)
     #[inline]
     pub fn is_hot(&self) -> bool {
-        self.cold_file_fd.load(Ordering::Relaxed) == -1
+        self.tiered_lock.load(Ordering::Relaxed) & HOT_COLD_MASK == HOT_SEGMENT
     }
-    
-    /// Check if segment is cold (backed by file mmap)
+
+    /// Check if segment is cold (backed by file)
     /// Always returns false when tiered memory is disabled
+    /// This is a fast check that doesn't acquire the lock (may be stale)
     #[inline]
     pub fn is_cold(&self) -> bool {
-        self.cold_file_fd.load(Ordering::Relaxed) >= 0
+        self.tiered_lock.load(Ordering::Relaxed) & HOT_COLD_MASK == COLD_SEGMENT
     }
-    
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        let lock_bits = self.tiered_lock.load(Ordering::Relaxed);
+        lock_bits & HOT_COLD_MASK != lock_bits
+    }
+
+    pub fn set_cold(&self) {
+        self.tiered_lock.store(COLD_SEGMENT, Ordering::Relaxed);
+    }
+
+    pub fn set_hot(&self) {
+        self.tiered_lock.store(HOT_SEGMENT, Ordering::Relaxed);
+    }
+    pub fn lock_cold(&self) -> bool {
+        self.tiered_lock
+            .compare_exchange(
+                COLD_SEGMENT,
+                COLD_SEGMENT | LOCKING_SEGMENT_BITS,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    pub fn lock_hot(&self) -> bool {
+        self.tiered_lock
+            .compare_exchange(
+                HOT_SEGMENT,
+                HOT_SEGMENT | LOCKING_SEGMENT_BITS,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Mark segment as recently accessed (for CLOCK algorithm)
     /// No-op when tiered memory is disabled
     #[inline]
     pub fn mark_referenced(&self) {
         self.reference_bit.store(true, Ordering::Relaxed);
     }
-    
+
     /// Clear reference bit and return old value (for CLOCK algorithm)
     /// Always returns false when tiered memory is disabled
     #[inline]
     pub fn clear_reference_bit(&self) -> bool {
         self.reference_bit.swap(false, Ordering::Relaxed)
     }
-    
+
     /// Get current reference bit value without clearing
     /// Always returns false when tiered memory is disabled
     #[inline]
@@ -449,8 +534,8 @@ impl Segment {
 }
 
 pub struct SegmentEntryIter {
-    bound: usize,
-    cursor: usize,
+    pub(crate) bound: usize,
+    pub(crate) cursor: usize,
 }
 
 impl Iterator for SegmentEntryIter {
@@ -472,15 +557,18 @@ impl Iterator for SegmentEntryIter {
                 entry_pos: cursor,
             };
         });
-        
+
         // Stop iteration if we encounter UNDECIDED entries (uninitialized space)
         // This can happen if the segment is partially written or if we're iterating
         // while the segment is being modified
-        if entry_header.entry_type == entry::EntryType::UNDECIDED || entry_header.content_length == 0 {
-            debug!("Stopping segment iteration at UNDECIDED entry at position {}", cursor);
+        if entry_header.entry_type == entry::EntryType::UNDECIDED {
+            debug!(
+                "Stopping segment iteration at UNDECIDED entry at position {}",
+                cursor
+            );
             return None;
         }
-        
+
         // Validate that the entry doesn't exceed the bound
         let next_cursor = cursor + entry_meta.entry_size;
         if next_cursor > self.bound {
@@ -488,7 +576,7 @@ impl Iterator for SegmentEntryIter {
                   cursor, entry_meta.entry_size, self.bound);
             return None;
         }
-        
+
         self.cursor = next_cursor;
         Some(entry_meta)
     }
@@ -508,7 +596,7 @@ impl SegmentAllocator {
     pub fn new(chunk_id: usize, chunk_size: usize) -> Self {
         Self::new_with_base(chunk_id, 0, chunk_size, true)
     }
-    
+
     /// Create allocator with pre-allocated base address
     /// If allocate_memory=false, assumes memory at base_addr already exists
     pub fn new_with_base(
@@ -539,7 +627,7 @@ impl SegmentAllocator {
             // New behavior: use provided base from global allocation
             (base_addr, base_addr, base_addr + chunk_size)
         };
-        
+
         Self {
             base,
             offset: AtomicUsize::new(addr),
@@ -582,7 +670,15 @@ impl SegmentAllocator {
             .map(|addr| {
                 let id = self.id_by_addr(addr);
                 let seq_id = self.next_seq_id.fetch_add(1, Ordering::AcqRel);
-                Segment::new(id as u64, seq_id as u64, self.chunk_id, addr, backup_storage, wal_storage)
+                Segment::new(
+                    id as u64,
+                    seq_id as u64,
+                    self.chunk_id,
+                    addr,
+                    true,
+                    backup_storage,
+                    wal_storage,
+                )
             })
     }
 
@@ -616,7 +712,15 @@ impl SegmentAllocator {
             .map(|addr| {
                 let id = self.id_by_addr(addr);
                 // Use the provided seq_id instead of fetching a new one
-                Segment::new(id as u64, seq_id, self.chunk_id, addr, backup_storage, wal_storage)
+                Segment::new(
+                    id as u64,
+                    seq_id,
+                    self.chunk_id,
+                    addr,
+                    true,
+                    backup_storage,
+                    wal_storage,
+                )
             })
     }
 
@@ -632,7 +736,7 @@ impl SegmentAllocator {
         let id = offset >> SEGMENT_BITS_SHIFT;
         id
     }
-    
+
     #[inline]
     pub fn addr_by_id(&self, id: usize) -> usize {
         self.base + (id << SEGMENT_BITS_SHIFT)
@@ -640,31 +744,31 @@ impl SegmentAllocator {
 }
 
 /// Free physical memory pages for a memory region
-/// 
+///
 /// Uses MADV_DONTNEED on all platforms, which tells the kernel to free
 /// physical pages while keeping the virtual mapping intact. For file-backed
 /// mappings, pages will be re-faulted from disk on next access. For anonymous
 /// mappings, pages will be zero-filled on next access.
-/// 
+///
 /// Note: On Linux, MADV_REMOVE would punch holes in files (destructive),
 /// so we use MADV_DONTNEED instead which is safe for both anonymous and
 /// file-backed mappings.
-/// 
+///
 /// This is aggressive - pages are freed immediately.
 pub unsafe fn madvise_free(addr: usize, size: usize) {
     madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
 
 /// Mark pages as cold (low priority for eviction)
-/// 
+///
 /// Uses MADV_COLD (Linux 5.4+) to hint to the kernel that these pages
 /// should be evicted first under memory pressure. Unlike MADV_DONTNEED,
 /// this doesn't immediately free pages - it just marks them as candidates
 /// for eviction.
-/// 
+///
 /// This is cooperative - the kernel decides when to actually evict pages.
 /// Pages remain resident until the kernel needs memory.
-/// 
+///
 /// Falls back to MADV_DONTNEED on older kernels or non-Linux systems.
 pub unsafe fn madvise_cold(addr: usize, size: usize) {
     #[cfg(target_os = "linux")]
@@ -672,7 +776,7 @@ pub unsafe fn madvise_cold(addr: usize, size: usize) {
         // MADV_COLD = 20 (Linux 5.4+)
         const MADV_COLD: i32 = 20;
         let result = madvise(addr as *mut c_void, size, MADV_COLD);
-        
+
         if result != 0 {
             let errno = std::io::Error::last_os_error();
             // EINVAL likely means old kernel without MADV_COLD support
@@ -684,7 +788,7 @@ pub unsafe fn madvise_cold(addr: usize, size: usize) {
             }
         }
     }
-    
+
     #[cfg(not(target_os = "linux"))]
     {
         // Fall back to MADV_DONTNEED on non-Linux systems

@@ -229,11 +229,13 @@ impl AsyncClient {
                 let backoff_ms = 2u64.pow(retried.min(10)) * 5; // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms, cap at 5120ms
                 debug!(
                     "Client retrying transaction after {}ms backoff (attempt {}/{})",
-                    backoff_ms, retried + 1, TRANSACTION_MAX_RETRY
+                    backoff_ms,
+                    retried + 1,
+                    TRANSACTION_MAX_RETRY
                 );
                 tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
             }
-            
+
             txn.state = StdCell::new(txn_server::TxnState::Started);
             txn.tid = match txn.client.begin().await {
                 Ok(Ok(id)) => id,
@@ -280,7 +282,10 @@ impl AsyncClient {
                 }
                 Err(TxnError::NotRealizable(reason)) => {
                     let abort_result = txn.abort().await; // continue the loop to retry
-                    debug!("TXN NOT REALIZABLE ({:?}), ABORT: {:?}", reason, abort_result);
+                    debug!(
+                        "TXN NOT REALIZABLE ({:?}), ABORT: {:?}",
+                        reason, abort_result
+                    );
                 }
                 Err(e) => {
                     // abort will always be an error to achieve early break
@@ -384,7 +389,7 @@ impl AsyncClient {
                 return Ok(Err(DelSchemaError::PostProcessError(
                     "Cannot find server for post process".to_string(),
                 )));
-            }   
+            }
         }
         // Need to do the post processing before deleting the schema from the schema client
         return self.schema_client.del_schema(&name).await;

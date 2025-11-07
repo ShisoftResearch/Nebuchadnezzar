@@ -88,11 +88,19 @@ impl VectorIndexClient {
             .remove(cell_id, schema_id, field_id)
     }
 
-    pub fn new_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+    pub fn new_index(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core().new_index(schema_id, field_id)
     }
 
-    pub fn delete_index(&self, schema_id: u32, field_id: u64) -> BoxFuture<'_, Result<(), IndexError>> {
+    pub fn delete_index(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+    ) -> BoxFuture<'_, Result<(), IndexError>> {
         self.get_vector_index_core()
             .delete_index(schema_id, field_id)
     }

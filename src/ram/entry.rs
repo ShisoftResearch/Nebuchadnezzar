@@ -74,10 +74,11 @@ impl Entry {
                 "Cannot decode entry header: address 0x{:016x} is misaligned (offset: {}). \
                 This indicates memory corruption in the cell address storage. \
                 Valid entry addresses must be 8-byte aligned.",
-                pos, pos % 8
+                pos,
+                pos % 8
             );
         }
-        
+
         let mut cursor = Cursor::new(unsafe { Box::from_raw(pos as *mut [u8; 8] as *mut [u8]) });
         let entry_type_bits = cursor.read_u32::<Endian>().unwrap();
         let content_length = cursor.read_u32::<Endian>().unwrap();

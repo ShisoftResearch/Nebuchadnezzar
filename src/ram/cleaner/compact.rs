@@ -11,6 +11,10 @@ pub struct CompactCleaner;
 
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
+        if seg.is_locked() {
+            debug!("Segment {} is locked, skipping cleaning", seg.id);
+            return 0;
+        }
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
@@ -43,7 +47,7 @@ impl CompactCleaner {
 
         // scan and mark live entries
         let entries = chunk.live_entries(seg).collect_vec();
-        
+
         if entries.len() == 0 {
             chunk.remove_segment(seg.id);
             seg.mem_drop(chunk);
@@ -53,14 +57,17 @@ impl CompactCleaner {
             );
             return SEGMENT_SIZE;
         }
-        
+
         // Record original used space before compaction
         let original_used_space = seg.used_spaces() as usize;
         debug!(
             "Segment {} from chunk {}. Compacting {} entries, original used space {} bytes.",
-            seg.id, chunk.id, entries.len(), original_used_space
+            seg.id,
+            chunk.id,
+            entries.len(),
+            original_used_space
         );
-        
+
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
         // Compact in place
@@ -159,7 +166,7 @@ impl CompactCleaner {
         if used_size < SEGMENT_SIZE {
             seg.shrink(used_size);
         }
-        
+
         // Calculate space cleaned from original to final used space
         // Note: final space may include entries we kept that weren't in live_entries scan
         // due to concurrent updates, so use actual used_spaces() values
@@ -174,7 +181,7 @@ impl CompactCleaner {
             );
             0
         };
-        
+
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {})",
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space
