@@ -250,16 +250,11 @@ impl Segment {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(backup_file);
             if backup_file_path.exists() {
-                // warn!(
-                //     "Segment backup {} exists and can't archive twice",
-                //     backup_file
-                // );
-                // return Ok(false);
                 debug!(
-                    "[DEBUG ONLY] Removing existing backup file for segment {}",
-                    self.id
+                    "Segment backup {} exists and can't archive twice",
+                    backup_file
                 );
-                fs::remove_file(backup_file_path)?;
+                return Ok(false);
             }
 
             // Ensure parent directory exists before creating backup file
