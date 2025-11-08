@@ -99,29 +99,30 @@ pub fn get_segment_for_fault(
     }
 }
 
-/// Reset global chunk allocation (for tests)
-///
-/// IMPORTANT: Reset GLOBAL_CHUNKS_PTR BEFORE unmapping memory to prevent
-/// the signal handler from accessing unmapped memory during cleanup.
-pub fn reset_global_chunk_allocation() {
-    // Reset GLOBAL_CHUNKS_PTR first to prevent signal handler from accessing chunks
-    // This must happen BEFORE unmapping memory to avoid SIGSEGV in signal handler
-    GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
+// /// Reset global chunk allocation (for tests)
+// ///
+// /// IMPORTANT: Reset GLOBAL_CHUNKS_PTR BEFORE unmapping memory to prevent
+// /// the signal handler from accessing unmapped memory during cleanup.
+// pub fn reset_global_chunk_allocation() {
+//     // Reset GLOBAL_CHUNKS_PTR first to prevent signal handler from accessing chunks
+//     // This must happen BEFORE unmapping memory to avoid SIGSEGV in signal handler
+//     GLOBAL_CHUNKS_PTR.store(0, Ordering::Release);
 
-    let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
-    let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
+//     let base = GLOBAL_CHUNK_BASE.swap(0, Ordering::AcqRel);
+//     let size = GLOBAL_ALLOCATED_SIZE.swap(0, Ordering::AcqRel);
 
-    // Reset other globals before unmapping
-    GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
-    GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
+//     // Reset other globals before unmapping
+//     GLOBAL_CHUNK_SIZE_BITS.store(0, Ordering::Release);
+//     GLOBAL_CHUNK_COUNT.store(0, Ordering::Release);
 
-    // Now safe to unmap memory - signal handler won't try to access it
-    if base != 0 && size != 0 {
-        unsafe {
-            libc::munmap(base as *mut libc::c_void, size);
-        }
-    }
-}
+//     // Now safe to unmap memory - signal handler won't try to access it
+//     if base != 0 && size != 0 {
+//         unsafe {
+//             println!("unmapping memory from {}", base);
+//             libc::munmap(base as *mut libc::c_void, size);
+//         }
+//     }
+// }
 
 // Thread-local flag to indicate if we're currently in a transaction
 // When true, WAL writes will skip fsync (will be synced at commit instead)
@@ -1294,9 +1295,6 @@ impl Chunks {
     ) -> Arc<Chunks> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
-
-        // Reset previous allocation (for test isolation)
-        reset_global_chunk_allocation();
 
         // Calculate exact chunk size
         let chunk_size = (size / count).next_power_of_two();

@@ -267,62 +267,61 @@ impl Segment {
                 create_dir_all(parent)?;
             }
 
-            // TODO: restore this after testing
-            // if let Some(ref wal_file) = self.wal_file_name {
-            //     // if there is a WAL file ready, copy this file to backup
-            //     // First, flush and close the WAL file if it's open
-            //     {
-            //         let mut file_opt = self.wal_file.lock();
-            //         if let Some(mut writer) = file_opt.take() {
-            //             // Flush and sync the file before closing
-            //             writer.flush()?;
-            //             writer.get_ref().sync_all()?;
-            //             // Writer is dropped here, closing the file handle
-            //             // file_opt is now None
-            //         } else {
-            //             // WAL file was already closed or never opened
-            //             // This is fine - we'll read it from disk if it exists
-            //             debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
-            //         }
-            //     }
+            if let Some(ref wal_file) = self.wal_file_name {
+                // if there is a WAL file ready, copy this file to backup
+                // First, flush and close the WAL file if it's open
+                {
+                    let mut file_opt = self.wal_file.lock();
+                    if let Some(mut writer) = file_opt.take() {
+                        // Flush and sync the file before closing
+                        writer.flush()?;
+                        writer.get_ref().sync_all()?;
+                        // Writer is dropped here, closing the file handle
+                        // file_opt is now None
+                    } else {
+                        // WAL file was already closed or never opened
+                        // This is fine - we'll read it from disk if it exists
+                        debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
+                    }
+                }
 
-            //     // Check if WAL file exists before trying to copy it
-            //     // Note: The file might exist even if the mutex is empty (e.g., after recovery)
-            //     let wal_path = Path::new(wal_file);
-            //     if wal_path.exists() {
-            //         // CRITICAL: WAL files contain only the written data, not full SEGMENT_SIZE.
-            //         // For explicit file I/O during promotion (pread), we need full-size files.
-            //         // Copy WAL and pad to SEGMENT_SIZE with zeros.
+                // Check if WAL file exists before trying to copy it
+                // Note: The file might exist even if the mutex is empty (e.g., after recovery)
+                let wal_path = Path::new(wal_file);
+                if wal_path.exists() {
+                    // CRITICAL: WAL files contain only the written data, not full SEGMENT_SIZE.
+                    // For explicit file I/O during promotion (pread), we need full-size files.
+                    // Copy WAL and pad to SEGMENT_SIZE with zeros.
 
-            //         // Read the WAL file
-            //         let wal_data = std::fs::read(wal_file)?;
-            //         let wal_size = wal_data.len();
+                    // Read the WAL file
+                    let wal_data = std::fs::read(wal_file)?;
+                    let wal_size = wal_data.len();
 
-            //         // Create backup file and write WAL data + padding
-            //         let mut backup_file = File::create(backup_file_path)?;
-            //         backup_file.write_all(&wal_data)?;
+                    // Create backup file and write WAL data + padding
+                    let mut backup_file = File::create(backup_file_path)?;
+                    backup_file.write_all(&wal_data)?;
 
-            //         // Pad to SEGMENT_SIZE if needed
-            //         if wal_size < SEGMENT_SIZE {
-            //             let padding_size = SEGMENT_SIZE - wal_size;
-            //             let padding = vec![0u8; padding_size];
-            //             backup_file.write_all(&padding)?;
-            //             debug!(
-            //                 "Padded WAL backup for segment {} from {} to {} bytes",
-            //                 self.id, wal_size, SEGMENT_SIZE
-            //             );
-            //         }
+                    // Pad to SEGMENT_SIZE if needed
+                    if wal_size < SEGMENT_SIZE {
+                        let padding_size = SEGMENT_SIZE - wal_size;
+                        let padding = vec![0u8; padding_size];
+                        backup_file.write_all(&padding)?;
+                        debug!(
+                            "Padded WAL backup for segment {} from {} to {} bytes",
+                            self.id, wal_size, SEGMENT_SIZE
+                        );
+                    }
 
-            //         backup_file.sync_all()?;
+                    backup_file.sync_all()?;
 
-            //         // Remove the WAL file (file is now closed, so this should succeed)
-            //         remove_file(wal_file)?;
-            //         return Ok(true);
-            //     } else {
-            //         // WAL file doesn't exist, fall through to memory-based archiving
-            //         debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
-            //     }
-            // }
+                    // Remove the WAL file (file is now closed, so this should succeed)
+                    remove_file(wal_file)?;
+                    return Ok(true);
+                } else {
+                    // WAL file doesn't exist, fall through to memory-based archiving
+                    debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
+                }
+            }
 
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
@@ -748,58 +747,11 @@ impl SegmentAllocator {
     }
 }
 
-/// Free physical memory pages for a memory region
-///
-/// Uses MADV_DONTNEED on all platforms, which tells the kernel to free
-/// physical pages while keeping the virtual mapping intact. For file-backed
-/// mappings, pages will be re-faulted from disk on next access. For anonymous
-/// mappings, pages will be zero-filled on next access.
-///
-/// Note: On Linux, MADV_REMOVE would punch holes in files (destructive),
-/// so we use MADV_DONTNEED instead which is safe for both anonymous and
-/// file-backed mappings.
-///
-/// This is aggressive - pages are freed immediately.
+
 pub unsafe fn madvise_free(addr: usize, size: usize) {
-    madvise(addr as *mut c_void, size, MADV_DONTNEED);
+    // madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
 
-/// Mark pages as cold (low priority for eviction)
-///
-/// Uses MADV_COLD (Linux 5.4+) to hint to the kernel that these pages
-/// should be evicted first under memory pressure. Unlike MADV_DONTNEED,
-/// this doesn't immediately free pages - it just marks them as candidates
-/// for eviction.
-///
-/// This is cooperative - the kernel decides when to actually evict pages.
-/// Pages remain resident until the kernel needs memory.
-///
-/// Falls back to MADV_DONTNEED on older kernels or non-Linux systems.
-pub unsafe fn madvise_cold(addr: usize, size: usize) {
-    #[cfg(target_os = "linux")]
-    {
-        // MADV_COLD = 20 (Linux 5.4+)
-        const MADV_COLD: i32 = 20;
-        let result = madvise(addr as *mut c_void, size, MADV_COLD);
-
-        if result != 0 {
-            let errno = std::io::Error::last_os_error();
-            // EINVAL likely means old kernel without MADV_COLD support
-            if errno.raw_os_error() == Some(libc::EINVAL) {
-                warn!("MADV_COLD not supported (kernel < 5.4), falling back to MADV_DONTNEED");
-                madvise(addr as *mut c_void, size, MADV_DONTNEED);
-            } else {
-                warn!("madvise(MADV_COLD) failed: {}", errno);
-            }
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        // Fall back to MADV_DONTNEED on non-Linux systems
-        madvise(addr as *mut c_void, size, MADV_DONTNEED);
-    }
-}
 
 fn punch_hole(seg_addr: usize, seg_size: usize) {
     let right_boundary = seg_addr + seg_size;

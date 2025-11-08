@@ -696,13 +696,6 @@ async fn test_large_scale_transactions_with_natural_tiered_memory() {
     // Wait for operations to complete
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Only reset global chunk allocation when page_fault_tracking is disabled
-    // With page_fault_tracking enabled, signal handlers may still be active
-    #[cfg(not(feature = "page_fault_tracking"))]
-    {
-        crate::ram::chunk::reset_global_chunk_allocation();
-    }
-
     // Clean up files
     let _ = std::fs::remove_dir_all(backup_dir);
     let _ = std::fs::remove_dir_all(wal_dir);

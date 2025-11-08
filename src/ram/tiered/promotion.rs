@@ -180,19 +180,6 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     let _locks = cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
-    let mprotect_result = unsafe {
-        libc::mprotect(
-            segment_addr as *mut c_void,
-            SEGMENT_SIZE,
-            PROT_READ | PROT_WRITE,
-        )
-    };
-    if mprotect_result != 0 {
-        let err = io::Error::last_os_error();
-        error!("Failed to make segment {} writable: {}", segment.id, err);
-        unsafe { munmap(temp_addr, map_size) };
-        panic!("Failed to make segment {} writable: {}", segment.id, err);
-    }
 
     // Copy data from file (up to map_size) and zero-fill the rest if needed
     let copy_size = scanned_size.min(map_size);

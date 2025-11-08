@@ -140,6 +140,15 @@ impl Cleaner {
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
+        println!("Cleaner stopped");
+    }
+
+    pub fn dummy(chunks: &Arc<Chunks>) -> Self {
+        Cleaner {
+            chunks: chunks.clone(),
+            stopped: Arc::new(AtomicBool::new(false)),
+            _handle: None,
+        }
     }
 }
 
