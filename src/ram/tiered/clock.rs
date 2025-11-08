@@ -84,6 +84,7 @@ impl ClockEvictionPolicy {
 
                 // If reference bit was set (now cleared), re-arm the segment with mprotect
                 // This applies to both hot and cold (file-backed) segments
+                #[cfg(feature = "page_fault_tracking")]
                 if was_referenced {
                     debug!(
                         "CLOCK re-arming segment {} with mprotect(PROT_NONE)",

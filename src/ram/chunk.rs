@@ -389,6 +389,7 @@ impl Chunk {
 
                     // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
                     // This ensures we never exceed physical memory limit
+                    #[cfg(feature = "tiered_memory")]
                     if let Some(ref tiered_manager) = self.tiered_manager {
                         match tiered_manager.evict_for_allocation(self) {
                             Ok(evicted) => {
@@ -445,6 +446,7 @@ impl Chunk {
                 let seg_id = self.allocator.id_by_addr(*index);
                 if let Some(segment) = self.segs.get(&seg_id) {
                     // If segment is cold (evicted to file), promote it back to hot
+                    #[cfg(feature = "tiered_memory")]
                     if segment.is_cold() {
                         debug!(
                             "Cell access triggered promotion of cold segment {}",
@@ -1025,62 +1027,6 @@ impl Chunk {
         self.segs.iter_front_values().collect()
     }
 
-    // Scan for dead tombstone. This will scan the whole segment, decoding all entry header
-    // and looking for those with entry type tombstone.
-    // It is resource intensive so there will be some rules to skip the scan.
-    // This function should be invoked repeatedly by cleaner
-    // Actual cleaning will be performed by cleaner regardless tombstone survival condition
-    pub fn scan_tombstone_survival(&self) {
-        trace!("Scanning tombstones");
-        let seg_ids = self.segment_ids();
-        for seg_id in seg_ids {
-            let seg_key = seg_id as usize;
-            if let Some(segment) = self.segs.get(&seg_key).map(|s| s.clone()) {
-                let now = get_time();
-                let tombstones = segment.tombstones.load(Ordering::Relaxed);
-                let dead_tombstones = segment.dead_tombstones.load(Ordering::Relaxed);
-                let mut death_count = 0;
-                if
-                // have not much tombstones
-                (tombstones as f64) * (TOMBSTONE_ENTRY_SIZE as f64) < (SEGMENT_SIZE as f64) * 0.2 ||
-                        // large partition have been scanned
-                        (dead_tombstones as f32 / tombstones as f32) > 0.8 ||
-                        // have been scanned recently
-                        now - segment.last_tombstones_scanned.load(Ordering::Relaxed) < 5000
-                {
-                    continue;
-                }
-                debug!(
-                    "Scanning tombstones in chunk {}, segment {}",
-                    self.id, seg_id
-                );
-                for entry_meta in segment.entry_iter() {
-                    if entry_meta.entry_header.entry_type == EntryType::TOMBSTONE {
-                        let tombstone =
-                            Tombstone::read_from_entry_content_addr(entry_meta.body_pos);
-                        if !self.contains_seg(tombstone.segment_id) {
-                            // segment that the tombstone pointed to have been cleaned by compact or combined cleaner
-                            death_count += 1;
-                        }
-                    }
-                }
-                // store the death count for following cleaners will just reset it
-                segment
-                    .dead_tombstones
-                    .store(death_count, Ordering::Relaxed);
-                segment
-                    .last_tombstones_scanned
-                    .store(now, Ordering::Relaxed);
-                debug!(
-                    "Scanned tombstones in chunk {}, segment {}, death count {}",
-                    self.id, seg_id, death_count
-                );
-            } else {
-                warn!("leaked segment in addrs_seg: {}", seg_id)
-            }
-        }
-    }
-
     pub fn segs_for_compact_cleaner(&self) -> Vec<AArc<Segment>> {
         let utilization_selection = self
             .segments()
@@ -1134,6 +1080,9 @@ impl Chunk {
             } // never archive head segments
             let seg_key = seg_id as usize;
             if let Some(segment) = self.segs.get(&seg_key) {
+                if !segment.lock_hot() {
+                    continue;
+                }
                 if segment
                     .archived
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -1146,6 +1095,7 @@ impl Chunk {
                         )
                     }
                 }
+                segment.set_hot();
             }
         }
     }

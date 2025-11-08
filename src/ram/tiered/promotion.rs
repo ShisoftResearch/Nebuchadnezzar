@@ -1,4 +1,5 @@
 use crate::ram::chunk::Chunk;
+use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
 use crate::ram::tiered::cell_locking;
 use libc::{c_void, close, mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
@@ -75,6 +76,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             "Segment {} is transaction-protected, cannot promote",
             segment.id
         );
+        segment.set_cold();
         panic!();
     }
 
@@ -83,6 +85,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         Some(backup_path) => backup_path,
         None => {
             error!("Segment {} has no backup file path", segment.id);
+            segment.set_cold();
             panic!();
         }
     };
@@ -91,6 +94,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         Ok(path_cstr) => path_cstr,
         Err(e) => {
             error!("Invalid path: {}", e);
+            segment.set_cold();
             panic!();
         }
     };
@@ -102,19 +106,33 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             "Failed to open backup file for segment {}: {}",
             segment.id, err
         );
+        segment.set_cold();
         panic!();
     }
 
     // Step 6: mmap file to a TEMPORARY location (NOT the segment address)
     // This allows us to scan the data without corrupting the existing segment
+    // Get the actual file size BEFORE mmap to avoid mapping beyond the file
+    let file_size = match std::fs::metadata(backup_path) {
+        Ok(metadata) => metadata.len() as usize,
+        Err(e) => {
+            error!("Failed to get file size for segment {}: {}", segment.id, e);
+            unsafe { close(fd) };
+            panic!("Failed to get file size for segment {}: {}", segment.id, e);
+        }
+    };
+    
+    // Limit mapping size to actual file size to avoid SIGBUS
+    let map_size = file_size.min(SEGMENT_SIZE);
+    
     debug!(
-        "Mapping cold file (fd={}) for segment {} to temporary location",
-        fd, segment.id
+        "Mapping cold file (fd={}) for segment {} to temporary location (file_size={}, map_size={})",
+        fd, segment.id, file_size, map_size
     );
     let temp_addr = unsafe {
         mmap(
             std::ptr::null_mut(),
-            SEGMENT_SIZE,
+            map_size,  // Use actual file size, not SEGMENT_SIZE
             PROT_READ,
             MAP_PRIVATE,
             fd,
@@ -130,38 +148,38 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         );
         unsafe { close(fd) };
         // tiered_guard will be dropped automatically, releasing the lock
+        segment.set_cold();
         panic!(
             "Failed to mmap cold file for segment {}: {}",
             segment.id, err
         );
     }
-
+    
     debug!(
-        "Temporary mapping created at {:#x} for segment {}",
-        temp_addr as usize, segment.id
+        "Temporary mapping created at {:#x} for segment {} (file_size={}, map_size={})",
+        temp_addr as usize, segment.id, file_size, map_size
     );
 
-    // Create an entry iterator for the temporary mapping
+    // Always scan the file to find the actual valid data boundary
     let temp_start = temp_addr as usize;
+    let scanned_boundary = find_append_header(temp_start, map_size);
+    let scanned_size = scanned_boundary - temp_start;
+    
+    debug!(
+        "Scanned file for segment {}: found valid data boundary at offset {} (size: {})",
+        segment.id, scanned_size, scanned_size
+    );
+    
+    let scan_boundary = scanned_boundary;
 
     let temp_entry_iter = SegmentEntryIter {
-        bound: SEGMENT_SIZE, // Scan to the end of the temporary mapping
+        bound: scan_boundary,
         cursor: temp_start,
     };
 
-    // Step 6-7: Lock all cells in the segment
     let _locks = cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
 
-    // Handle result and cleanup
-    // Step 8: Copy data from temporary mapping to segment address
-    // All cells are now locked, safe to overwrite segment memory
-    debug!(
-        "Copying data from temporary mapping to segment {} address",
-        segment.id
-    );
     let segment_addr = segment.addr;
-
-    // Ensure segment memory is writable
     let mprotect_result = unsafe {
         libc::mprotect(
             segment_addr as *mut c_void,
@@ -172,25 +190,44 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     if mprotect_result != 0 {
         let err = io::Error::last_os_error();
         error!("Failed to make segment {} writable: {}", segment.id, err);
-        unsafe { munmap(temp_addr, SEGMENT_SIZE) };
+        unsafe { munmap(temp_addr, map_size) };
         panic!("Failed to make segment {} writable: {}", segment.id, err);
     }
 
-    // Copy full segment
+    // Copy data from file (up to map_size) and zero-fill the rest if needed
+    let copy_size = scanned_size.min(map_size);
     unsafe {
         ptr::copy_nonoverlapping(
             temp_addr as *const u8,
             segment_addr as *mut u8,
-            SEGMENT_SIZE,
+            copy_size,
         );
+        // Zero-fill the rest of the segment if file was shorter than SEGMENT_SIZE
+        if copy_size < SEGMENT_SIZE {
+            ptr::write_bytes(
+                (segment_addr + copy_size) as *mut u8,
+                0,
+                SEGMENT_SIZE - copy_size,
+            );
+        }
     }
+
+    let restored_append_header = segment.addr + scanned_size;
+    segment.append_header.store(restored_append_header, Ordering::Release);
+    debug!(
+        "Restored append_header for segment {} to {} (offset {}) based on scanned file boundary",
+        segment.id, restored_append_header, scanned_size
+    );
 
     debug!("Data copied successfully for segment {}", segment.id);
 
     // Step 9: Mark as hot and close file descriptor (update tiered_lock)
     unsafe { close(fd) };
     segment.set_hot();
-    debug!("Marked segment {} as hot and closed fd", segment.id);
+    debug!(
+        "Marked segment {} as HOT (addr {:#x}) after promotion and closed fd",
+        segment.id, segment.addr
+    );
 
     // Step 10: Set reference bit
     segment.mark_referenced();
@@ -198,7 +235,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     // Locks are automatically dropped when _cell_locks goes out of scope
 
     // Step 11: Unmap temporary file
-    unsafe { munmap(temp_addr, SEGMENT_SIZE) };
+    unsafe { munmap(temp_addr, map_size) };
     debug!("Unmapped temporary mapping for segment {}", segment.id);
     info!(
         "Successfully promoted segment {} to hot storage with cell locking",

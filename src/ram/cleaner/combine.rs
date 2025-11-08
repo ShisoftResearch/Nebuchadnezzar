@@ -7,7 +7,6 @@ use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::Arc;
 
 use libc;
 
@@ -55,16 +54,7 @@ impl CombinedCleaner {
         let segments = selected_segments
             .iter()
             .filter(|seg| {
-                if seg.id == head_seg_id {
-                    return false;
-                }
-                // Check if segment is locked (skip if so)
-                if seg.is_locked() {
-                    return false; // Lock is held, skip
-                }
-                // Lock was available (we released it immediately by dropping the guard)
-                // Check if cold (skip if so)
-                !seg.is_cold()
+                seg.id != head_seg_id && seg.lock_hot()
             })
             .cloned()
             .collect_vec();
@@ -75,6 +65,9 @@ impl CombinedCleaner {
                 chunk.id,
                 segments.len()
             );
+            for seg in segments.iter() {
+                seg.set_hot();
+            }
             return 0;
         }
 
@@ -213,6 +206,9 @@ impl CombinedCleaner {
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
                 );
+                for seg in segments.iter() {    
+                    seg.set_hot();
+                }
                 return 0;
             }
 
@@ -353,6 +349,7 @@ impl CombinedCleaner {
 
         for old_seg in segments {
             chunk.remove_segment(old_seg.id);
+            old_seg.set_hot();
             old_seg.mem_drop(chunk);
         }
         debug!(

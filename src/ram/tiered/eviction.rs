@@ -29,7 +29,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     // Step 1: Try to acquire segment lock (skip if already locked)
     if !segment.lock_hot() {
         debug!("Segment {} is not hot, skipping eviction", segment.id);
-        return Ok(());
+        return Err(io::Error::new(io::ErrorKind::Other, "Segment is not hot"));
     }
 
     debug!(
@@ -38,8 +38,22 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     );
 
     // Step 3: Wait for no active references (prevents races with cleaner)
+    let mut wait_count = 0;
     while !segment.no_references() {
+        wait_count += 1;
+        if wait_count % 1000 == 0 {
+            debug!(
+                "Segment {} waiting for references to drop (waited {} times)",
+                segment.id, wait_count
+            );
+        }
         thread::yield_now();
+    }
+    if wait_count > 0 {
+        debug!(
+            "Segment {} references dropped after {} waits",
+            segment.id, wait_count
+        );
     }
 
     // Step 4: Lock all cells in the segment
@@ -51,7 +65,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     ) {
         Ok(cell_locks) => cell_locks,
         Err(e) => {
-            error!("Failed to lock cells for segment {}: {}", segment.id, e);
+            warn!("Failed to lock cells for segment {}: {}. Giving up eviction", segment.id, e);
             segment.set_hot();
             return Err(e);
         }
@@ -86,6 +100,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
 
     // Verify file exists (either newly created or already present)
     if !archived && !std::path::Path::new(backup_path).exists() {
+        segment.set_hot();
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
@@ -97,12 +112,16 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
 
     // Step 6: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();
+    debug!(
+        "Marked segment {} as COLD (addr {:#x}), about to free physical pages",
+        segment.id, segment.addr
+    );
     unsafe {
         madvise_free(segment.addr, SEGMENT_SIZE);
     }
     debug!(
-        "Marked segment {} as cold and freed physical pages",
-        segment.id
+        "Freed physical pages for segment {} (addr {:#x})",
+        segment.id, segment.addr
     );
 
     // Locks are automatically dropped when _cell_locks and tiered_guard go out of scope

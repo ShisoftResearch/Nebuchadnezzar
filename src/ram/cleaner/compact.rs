@@ -6,25 +6,33 @@ use std::sync::atomic::Ordering;
 
 use itertools::Itertools;
 use libc;
+use lightning::map::Map;
 
 pub struct CompactCleaner;
 
 impl CompactCleaner {
     pub fn clean_segment(chunk: &Chunk, seg: &Segment) -> usize {
-        if seg.is_locked() {
-            debug!("Segment {} is locked, skipping cleaning", seg.id);
+        // Try to acquire segment lock first
+        if !seg.lock_hot() {
+            debug!("Segment {} is not hot or locked, skipping cleaning", seg.id);
             return 0;
         }
+        
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
-            trace!(
+            debug!(
                 "Skip cleaning chunk {} segment {} for it have no dead spaces",
                 chunk.id,
                 dead_space
             );
+            seg.set_hot();
             return 0;
         }
+
+        // Hold a reference to prevent eviction from freeing memory during compaction
+        // Eviction waits for no_references() before calling madvise_free()
+        seg.references.fetch_add(1, Ordering::Relaxed);
 
         // Previous implementation is inplace compaction. Segments are mutable and subject to changes.
         // Log-structured cleaner suggests new segment allocation and copy living entries from the
@@ -41,8 +49,8 @@ impl CompactCleaner {
         // Actually, malloc already handled this situation to overcome fragmentation, we can simply use
         // malloc to allocate new memory spaces for segments than maintaining seglets mappings in userspace.
         debug!(
-            "Compact cleaning segment {} from chunk {}",
-            seg.id, chunk.id
+            "Compact cleaning segment {} from chunk {}, is hot {}, segment address {:#x}",
+            seg.id, chunk.id, seg.is_hot(), seg.addr
         );
 
         // scan and mark live entries
@@ -55,6 +63,8 @@ impl CompactCleaner {
                 "Compact segment {} leades to remove the segment for it is empty",
                 seg.id
             );
+            seg.references.fetch_sub(1, Ordering::Relaxed);
+            seg.set_hot();
             return SEGMENT_SIZE;
         }
 
@@ -70,6 +80,7 @@ impl CompactCleaner {
 
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
+        let mut released_tombstones = 0;
         // Compact in place
         entries
             .into_iter()
@@ -138,7 +149,15 @@ impl CompactCleaner {
                         // Tombstone - always safe to move (no cell_index entry)
                         let old_addr = entry_pos;
                         let new_addr = cursor;
-                        
+                        let tombstone = entry.content.as_tombstone();
+                        let cell_hash = tombstone.hash;
+                        let seg_id = tombstone.segment_id;
+                        if chunk.cell_index.contains_key(&(cell_hash as usize)) || !chunk.contains_seg(seg_id) {
+                            trace!("Tombstone entry {:?} is obsolete, skipping moving", cell_hash);
+                            released_tombstones += 1;
+                            return;
+                        }
+
                         trace!(
                             "Memcpy tombstone entry, size: {}, from {} to {}",
                             entry_size,
@@ -162,6 +181,7 @@ impl CompactCleaner {
                 }
             });
         seg.append_header.store(cursor, Ordering::Release);
+        seg.tombstones.fetch_sub(released_tombstones as u32, Ordering::Relaxed);
         let used_size = cursor - seg_addr;
         if used_size < SEGMENT_SIZE {
             seg.shrink(used_size);
@@ -183,9 +203,13 @@ impl CompactCleaner {
         };
 
         debug!(
-            "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {})",
-            seg.id, chunk.id, space_cleaned, original_used_space, final_used_space
+            "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {}) released {} tombstones",
+            seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
+        
+        // Release reference before unlocking
+        seg.references.fetch_sub(1, Ordering::Relaxed);
+        seg.set_hot();
         space_cleaned
     }
 }

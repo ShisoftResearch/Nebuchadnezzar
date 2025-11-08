@@ -56,59 +56,35 @@ impl TieredMemoryManager {
         }
     }
 
-    /// Check if eviction is needed and evict segments if necessary
+    /// Check if eviction is needed and evict segments if necessary (legacy/test-only)
     ///
-    /// Uses the configured physical_memory_limit for hot segments.
-    /// Uses cached hot segment count with periodic full scans for verification.
+    /// NOTE: This method is kept for tests/benchmarks compatibility.
+    /// Production code should rely on passive eviction via `evict_for_allocation()`.
     ///
     /// Returns the number of segments evicted
     pub fn check_and_evict(&self, chunk: &Chunk) -> Result<usize, io::Error> {
+        // For tests/benchmarks, just use evict_for_allocation logic
+        self.evict_for_allocation(chunk)
+    }
+
+    /// Explicitly evict a specific number of segments (test-only)
+    ///
+    /// NOTE: This method is kept for tests compatibility.
+    /// Production code should rely on passive eviction via `evict_for_allocation()`.
+    ///
+    /// Returns the number of segments successfully evicted
+    pub fn explicit_evict(&self, chunk: &Chunk, num_segments: usize) -> Result<usize, io::Error> {
         if !self.enabled {
             return Ok(0);
         }
 
-        // Use cached count with periodic verification (every 10 seconds)
-        let hot_segments_count = self.get_hot_count_cached(chunk);
-        let hot_memory_bytes = hot_segments_count * SEGMENT_SIZE;
+        debug!("Explicit eviction requested for {} segments", num_segments);
+        let evicted = self.evict_until_target(chunk, num_segments)?;
 
-        // Calculate threshold based on physical memory limit
-        let memory_limit = self.physical_memory_limit;
-        let threshold_bytes = (memory_limit as f32 * self.eviction_threshold_percent) as usize;
+        // Update cached count after eviction
+        self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
 
-        debug!(
-            "check_and_evict: hot_segments={} (cached), hot_memory={}MB, limit={}MB, threshold={}MB, threshold%={}, exceeds={}",
-            hot_segments_count,
-            hot_memory_bytes / (1024 * 1024),
-            memory_limit / (1024 * 1024),
-            threshold_bytes / (1024 * 1024),
-            self.eviction_threshold_percent,
-            hot_memory_bytes > threshold_bytes
-        );
-
-        if hot_memory_bytes > threshold_bytes {
-            // Need to evict - target 70% of threshold to avoid thrashing
-            let target_bytes = (threshold_bytes as f32 * 0.7) as usize;
-            let target_segments = target_bytes / SEGMENT_SIZE;
-            let num_to_evict = hot_segments_count.saturating_sub(target_segments);
-
-            info!(
-                "Memory pressure detected: {} hot segments ({} MB), limit: {} MB, threshold: {} MB, evicting {} segments",
-                hot_segments_count, 
-                hot_memory_bytes / (1024 * 1024),
-                memory_limit / (1024 * 1024),
-                threshold_bytes / (1024 * 1024),
-                num_to_evict
-            );
-
-            let evicted = self.evict_until_target(chunk, num_to_evict)?;
-
-            // Update cached count after eviction
-            self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
-
-            Ok(evicted)
-        } else {
-            Ok(0)
-        }
+        Ok(evicted)
     }
 
     /// Evict segments until we've evicted the target number
@@ -152,23 +128,6 @@ impl TieredMemoryManager {
         Ok(evicted_count)
     }
 
-    /// Explicitly evict a specific number of segments
-    ///
-    /// This is useful for manual memory management or testing
-    /// Returns the number of segments successfully evicted
-    pub fn explicit_evict(&self, chunk: &Chunk, num_segments: usize) -> Result<usize, io::Error> {
-        if !self.enabled {
-            return Ok(0);
-        }
-
-        debug!("Explicit eviction requested for {} segments", num_segments);
-        let evicted = self.evict_until_target(chunk, num_segments)?;
-
-        // Update cached count after eviction
-        self.cached_hot_count.fetch_sub(evicted, Ordering::Relaxed);
-
-        Ok(evicted)
-    }
 
     /// Check if allocating a new segment would exceed the limit and evict if needed
     ///

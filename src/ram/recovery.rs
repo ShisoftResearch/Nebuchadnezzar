@@ -136,6 +136,13 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
     let mut entries_found = 0;
 
     while cursor < bound {
+        // Ensure we have at least ENTRY_HEAD_SIZE bytes remaining to read the header
+        // This prevents SIGBUS when accessing memory beyond the mapped region
+        if cursor + ENTRY_HEAD_SIZE > bound {
+            // Not enough bytes to read a complete entry header
+            break;
+        }
+        
         // Try to decode entry header
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
 
@@ -146,12 +153,14 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
 
         entries_found += 1;
         let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
-        cursor += entry_size;
-
-        if cursor > bound {
-            // Overflow, use file_size
-            return bound;
+        
+        // Check if the full entry fits within bounds before advancing
+        if cursor + entry_size > bound {
+            // Entry would exceed bounds, stop here
+            break;
         }
+        
+        cursor += entry_size;
     }
 
     cursor

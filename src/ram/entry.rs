@@ -109,4 +109,12 @@ impl EntryContent {
             panic!("entry not header");
         }
     }
+
+    pub fn as_tombstone(&self) -> &Tombstone {
+        if let EntryContent::Tombstone(ref tombstone) = self {
+            return tombstone;
+        } else {
+            panic!("entry not tombstone");
+        }
+    }
 }

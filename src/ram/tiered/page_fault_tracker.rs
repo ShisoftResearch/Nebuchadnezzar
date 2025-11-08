@@ -142,12 +142,6 @@ pub fn protect_segment(segment_addr: usize) -> Result<(), String> {
     }
 }
 
-/// No-op when page_fault_tracking is disabled
-#[cfg(not(feature = "page_fault_tracking"))]
-pub fn protect_segment(_segment_addr: usize) -> Result<(), String> {
-    Ok(())
-}
-
 /// Unprotect a segment (set to PROT_READ|PROT_WRITE)
 /// Called when manually accessing a protected segment
 /// When page_fault_tracking is enabled, uses mprotect
@@ -171,12 +165,6 @@ pub fn unprotect_segment(segment_addr: usize) -> Result<(), String> {
             ))
         }
     }
-}
-
-/// No-op when page_fault_tracking is disabled
-#[cfg(not(feature = "page_fault_tracking"))]
-pub fn unprotect_segment(_segment_addr: usize) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(test)]

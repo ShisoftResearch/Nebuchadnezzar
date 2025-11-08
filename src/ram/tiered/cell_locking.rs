@@ -60,7 +60,10 @@ pub fn lock_all_cells_in_segment(
     unique_cell_hashes.sort();
 
     if cfg!(debug_assertions) && unique_cell_hashes.is_empty() {
-        warn!("No cells found in segment {} for promotion={}", segment.id, promoting);
+        warn!(
+            "No cells found in segment {} for promotion={}",
+            segment.id, promoting
+        );
     }
 
     debug!(
@@ -74,7 +77,7 @@ pub fn lock_all_cells_in_segment(
     let mut locks: Vec<WordMutexGuard> = Vec::with_capacity(unique_cell_hashes.len());
     let mut cell_hashes: Vec<u64> = unique_cell_hashes;
 
-    const MAX_RETRY_ATTEMPTS: usize = 1000;
+    const MAX_RETRY_ATTEMPTS: usize = 100;
     let backoff = crossbeam::utils::Backoff::new();
     let mut retry_count = 0;
 
@@ -120,7 +123,7 @@ pub fn lock_all_cells_in_segment(
                             format!("Failed to lock cell {} after {} retries for segment {} for promotion={}", hash, retry_count, segment.id, promoting),
                         ));
                     }
-                    debug!("Failed to lock cell {} after {} retries for segment {} for promotion={}, retrying", hash, retry_count, segment.id, promoting);
+                    trace!("Failed to lock cell {} after {} retries for segment {} for promotion={}, retrying", hash, retry_count, segment.id, promoting);
                     backoff.spin();
                 }
                 None => {

@@ -74,8 +74,6 @@ pub struct Segment {
     pub append_header: AtomicUsize,
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
-    pub dead_tombstones: AtomicU32,
-    pub last_tombstones_scanned: AtomicI64,
     pub references: AtomicUsize,
     pub backup_file_name: Option<String>,
     pub wal_file: parking_lot::Mutex<Option<BufWriter<File>>>,
@@ -132,8 +130,6 @@ impl Segment {
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
-            dead_tombstones: AtomicU32::new(0),
-            last_tombstones_scanned: AtomicI64::new(0),
             references: AtomicUsize::new(0),
             backup_file_name: backup_storage
                 .clone()
@@ -180,7 +176,11 @@ impl Segment {
         if size >= SEGMENT_SIZE {
             return;
         }
-        punch_hole(self.addr, size);
+        // DISABLED: punch_hole() is incompatible with tiered memory eviction
+        // Tiered memory handles memory reclamation through eviction, so punch_hole() is not needed
+        // Calling punch_hole() can cause SIGSEGV when eviction tries to archive() a segment
+        // whose tail pages were freed by punch_hole()
+        // punch_hole(self.addr, size);
     }
 
     fn append_header(&self) -> usize {
@@ -200,10 +200,11 @@ impl Segment {
 
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
-        let dead_tombstones_space =
-            self.dead_tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        // We count tombstone space becasue we want to actively clean them out when they are obsolete
+        let tombstones_space =
+            self.tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
         let dead_cells_space = self.dead_space();
-        return dead_tombstones_space + dead_cells_space;
+        return tombstones_space + dead_cells_space;
     }
 
     pub fn used_spaces(&self) -> u32 {
@@ -326,16 +327,20 @@ impl Segment {
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
                 let backup_file = File::create(backup_file_path)?;
-                // CRITICAL: Write the FULL segment size, not just the used portion.
-                // This is required for explicit file I/O during promotion, which reads
-                // the entire SEGMENT_SIZE using pread(). If we only write the used portion,
-                // promotion will hit EOF and fail.
-                //
-                // The unused portion (beyond append_header) is effectively garbage, but
-                // writing it ensures we can always read back the full segment atomically.
-                let mut buffer = BufWriter::with_capacity(SEGMENT_SIZE, backup_file);
+                // Write only the valid data up to append_header to avoid reading from
+                // memory that may have been freed by punch_hole() during compaction.
+                // Promotion uses mmap() which handles variable-sized files correctly.
+                let valid_size = self.append_header() - self.addr;
+                let write_size = valid_size.max(PAGE_SIZE); // At least one page to ensure file exists
+                
+                debug!(
+                    "Archiving segment {} from memory: valid_size={}, write_size={}",
+                    self.id, valid_size, write_size
+                );
+                
+                let mut buffer = BufWriter::with_capacity(write_size, backup_file);
                 unsafe {
-                    let data_block = slice::from_raw_parts(self.addr as *const u8, SEGMENT_SIZE);
+                    let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
                     buffer.write(data_block)?;
                 }
                 buffer.flush()?;
