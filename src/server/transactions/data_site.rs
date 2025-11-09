@@ -444,9 +444,6 @@ impl Service for DataManager {
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
 
-        // Use the more recent timestamp between the transaction ID and the incoming clock
-        let effective_ts = if &clock > &tid { clock } else { tid.clone() };
-
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
@@ -461,20 +458,22 @@ impl Service for DataManager {
         }
         for cell_mutex in &cell_mutices {
             let meta = cell_mutex.lock();
-            if effective_ts < meta.read {
-                // write too late
+            // Use original tid (not effective_ts) for all conflict checks
+            // This ensures strict serializability for both read-write and write-write conflicts
+            // The effective_ts optimization is disabled to prevent bypassing conflicts
+            if tid < meta.read {
+                // write too late - another transaction with newer timestamp already read
                 debug!(
-                    "PREPARE: Write too late for {:?} (effective ts: {:?}), cell read timestamp: {:?}",
-                    tid, effective_ts, meta.read
+                    "PREPARE: Write too late for {:?} (tid: {:?}), cell read timestamp: {:?}",
+                    tid, tid, meta.read
                 );
                 break;
             }
-            if effective_ts < meta.write {
-                // write timestamp conflict - reject during prepare
-                // Thomas Write Rule will be applied during commit phase
+            if tid < meta.write {
+                // write timestamp conflict - another transaction with newer timestamp already wrote
                 debug!(
-                    "PREPARE: Write conflict for {:?} (effective ts: {:?}), cell write timestamp: {:?}",
-                    tid, effective_ts, meta.write
+                    "PREPARE: Write conflict for {:?} (tid: {:?}), cell write timestamp: {:?}",
+                    tid, tid, meta.write
                 );
                 break;
             }
