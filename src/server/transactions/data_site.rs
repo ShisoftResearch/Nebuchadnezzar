@@ -726,6 +726,7 @@ impl Service for DataManager {
                                 });
                         match write_result {
                             Ok(cell) => {
+                                debug_assert!(old_cell_ref.is_some());
                                 txn.history.insert(
                                     cell_id,
                                     CellHistory::new(old_cell_ref, cell.header.version),

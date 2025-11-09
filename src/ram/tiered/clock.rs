@@ -55,6 +55,11 @@ impl ClockEvictionPolicy {
                 let pos = (start_pos + i) % num_segments;
                 let segment = &segments[pos];
 
+                if !segment.archived.load(Ordering::Relaxed) {
+                    debug!("CLOCK: seg {} is not archived, skipping", segment.id);
+                    continue;
+                }
+
                 // Skip head segment - it's actively being written to
                 if segment.id == head_seg_id {
                     debug!("CLOCK: seg {} is head, skipping", segment.id);

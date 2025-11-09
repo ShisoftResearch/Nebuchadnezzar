@@ -59,22 +59,6 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
-    // Step 4: Write segment data to backup file BEFORE locking cells
-    // This maintains lock ordering: tiered_lock → file_state → cell_locks
-    // archive() will acquire and release file_state internally
-    let archived = match segment.archive() {
-        Ok(archived) => archived,
-        Err(e) => {
-            error!("Failed to archive segment {}: {}", segment.id, e);
-            segment.set_hot();
-            return Err(e);
-        }
-    };
-    debug!(
-        "Archive result for segment {}: archived={}",
-        segment.id, archived
-    );
-
     // Get backup path and verify it exists
     let backup_path =
         match chunk
@@ -93,12 +77,12 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         };
 
     // Verify file exists (either newly created or already present)
-    if !archived && !std::path::Path::new(&backup_path).exists() {
+    if !std::path::Path::new(&backup_path).exists() {
         segment.set_hot();
         return Err(io::Error::new(
             io::ErrorKind::Other,
             format!(
-                "Segment {} backup file does not exist and archive failed",
+                "Segment {} backup file does not exist",
                 segment.id
             ),
         ));
