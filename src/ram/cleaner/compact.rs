@@ -210,6 +210,9 @@ impl CompactCleaner {
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
 
+        // Mark segment as needing backup update since content has changed
+        seg.needs_backup_update.store(true, Ordering::Release);
+
         // Release reference before unlocking
         seg.references.fetch_sub(1, Ordering::Relaxed);
         seg.set_hot();

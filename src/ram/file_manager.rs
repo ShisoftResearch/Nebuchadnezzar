@@ -105,6 +105,47 @@ impl SegmentFileManager {
         }
     }
 
+    /// Open or create a backup file for writing with buffering
+    /// If the file exists, it opens for read/write without truncating
+    /// If the file doesn't exist, it creates a new one
+    pub fn open_or_create_backup_writer(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+        buffer_size: usize,
+    ) -> io::Result<Option<BufWriter<File>>> {
+        if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
+            // Ensure parent directory exists
+            if let Some(parent) = Path::new(&backup_path).parent() {
+                create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .open(&backup_path)?;
+            Ok(Some(BufWriter::with_capacity(buffer_size, file)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Create a backup file writer with buffering (truncates if exists)
+    pub fn create_backup_writer(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+        buffer_size: usize,
+    ) -> io::Result<Option<BufWriter<File>>> {
+        if let Some(file) = self.create_backup_file(chunk_id, seg_id, seq_id)? {
+            Ok(Some(BufWriter::with_capacity(buffer_size, file)))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Open an existing WAL file for reading
     pub fn open_wal_file(
         &self,

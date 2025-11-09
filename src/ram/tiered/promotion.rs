@@ -2,7 +2,7 @@ use crate::ram::chunk::Chunk;
 use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
 use crate::ram::tiered::cell_locking;
-use libc::{c_void, close, mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ};
 use std::io;
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -80,48 +80,59 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         panic!();
     }
 
-    // Step 5: Get backup file path and open it
-    let backup_path =
-        match chunk
-            .file_manager
-            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
-        {
-            Some(backup_path) => backup_path,
-            None => {
-                error!("Segment {} has no backup file path", segment.id);
+    // Step 5: Get backup file handler from segment's file_state
+    // Lock file_state to access or create the backup file handler
+    let mut file_state = segment.file_state.lock();
+    
+    // Get or create backup file handler
+    if file_state.backup.is_none() {
+        // Open existing backup file with read+write access
+        file_state.backup = match file_state.manager.open_or_create_backup_writer(
+            segment.chunk_id,
+            segment.id,
+            segment.seq_id,
+            crate::ram::segs::SEGMENT_SIZE,
+        ) {
+            Ok(writer) => writer,
+            Err(e) => {
+                error!(
+                    "Failed to open backup file for segment {}: {}",
+                    segment.id, e
+                );
                 segment.set_cold();
                 panic!();
             }
         };
+    }
 
-    let path_cstr = match std::ffi::CString::new(backup_path.as_str()) {
-        Ok(path_cstr) => path_cstr,
-        Err(e) => {
-            error!("Invalid path: {}", e);
-            segment.set_cold();
-            panic!();
-        }
-    };
-
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDONLY) };
-    if fd < 0 {
-        let err = io::Error::last_os_error();
-        error!(
-            "Failed to open backup file for segment {}: {}",
-            segment.id, err
-        );
+    // Extract file descriptor from the backup file handler
+    let fd = if let Some(ref writer) = file_state.backup {
+        use std::os::unix::io::AsRawFd;
+        writer.get_ref().as_raw_fd()
+    } else {
+        error!("Failed to get backup file handler for segment {}", segment.id);
         segment.set_cold();
         panic!();
-    }
+    };
+
+    // Get backup path for logging
+    let backup_path = file_state
+        .manager
+        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+        .unwrap_or_else(|| String::from("<unknown>"));
+
+    // Release the file_state lock before performing long operations
+    // The file descriptor remains valid as long as the file is open
+    drop(file_state);
 
     // Step 6: mmap file to a TEMPORARY location (NOT the segment address)
     // This allows us to scan the data without corrupting the existing segment
     // Get the actual file size BEFORE mmap to avoid mapping beyond the file
-    let file_size = match std::fs::metadata(backup_path) {
+    let file_size = match std::fs::metadata(&backup_path) {
         Ok(metadata) => metadata.len() as usize,
         Err(e) => {
             error!("Failed to get file size for segment {}: {}", segment.id, e);
-            unsafe { close(fd) };
+            // Note: Don't close fd - it's owned by the BufWriter in file_state
             panic!("Failed to get file size for segment {}: {}", segment.id, e);
         }
     };
@@ -150,8 +161,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             "Failed to mmap cold file for segment {}: {}",
             segment.id, err
         );
-        unsafe { close(fd) };
-        // tiered_guard will be dropped automatically, releasing the lock
+        // Note: Don't close fd - it's owned by the BufWriter in file_state
         segment.set_cold();
         panic!(
             "Failed to mmap cold file for segment {}: {}",
@@ -211,11 +221,11 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     debug!("Data copied successfully for segment {}", segment.id);
 
-    // Step 9: Mark as hot and close file descriptor (update tiered_lock)
-    unsafe { close(fd) };
+    // Step 9: Mark as hot (update tiered_lock)
+    // Note: We keep the backup file open for future eviction/promotion cycles
     segment.set_hot();
     debug!(
-        "Marked segment {} as HOT (addr {:#x}) after promotion and closed fd",
+        "Marked segment {} as HOT (addr {:#x}) after promotion, keeping backup file open",
         segment.id, segment.addr
     );
 

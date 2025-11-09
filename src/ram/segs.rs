@@ -80,6 +80,7 @@ pub struct Segment {
     pub file_state: parking_lot::Mutex<SegmentFileState>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
+    pub needs_backup_update: AtomicBool, // Set after compaction to force backup update
     // Tiered memory fields
     /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
     /// Holds the hot/cold state: false = hot (anonymous memory), true = cold (backed by file)
@@ -94,6 +95,7 @@ pub struct Segment {
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
     pub wal: Option<BufWriter<File>>,
+    pub backup: Option<BufWriter<File>>,
 }
 
 impl Segment {
@@ -135,9 +137,11 @@ impl Segment {
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
+                backup: None,
             }),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
+            needs_backup_update: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
             last_sync_time: AtomicI64::new(0),
@@ -240,6 +244,7 @@ impl Segment {
     }
 
     // archive this segment and write the data to backup storage
+    // The backup file handler is kept open for reuse during promotion
     pub fn archive(&self) -> Result<bool, io::Error> {
         let mut state = self.file_state.lock();
         let backup_path_opt = state
@@ -254,9 +259,15 @@ impl Segment {
         if let Some(backup_file) = backup_path_opt {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(&backup_file);
-            if backup_file_path.exists() {
+            
+            // Check if we need to force backup update (e.g., after compaction)
+            let force_update = self.needs_backup_update.load(Ordering::Acquire);
+            
+            // If backup file already exists and we have a handler, skip archiving
+            // unless force_update is set (segment was compacted)
+            if backup_file_path.exists() && state.backup.is_some() && !force_update {
                 debug!(
-                    "Segment backup {} exists and can't archive twice",
+                    "Segment backup {} exists with open handler, skipping archive",
                     backup_file
                 );
                 return Ok(false);
@@ -292,6 +303,17 @@ impl Segment {
                     state
                         .manager
                         .delete_wal(self.chunk_id, self.id, self.seq_id)?;
+                    
+                    // Open the backup file for future use (without closing it)
+                    if state.backup.is_none() {
+                        state.backup = state.manager.open_or_create_backup_writer(
+                            self.chunk_id,
+                            self.id,
+                            self.seq_id,
+                            SEGMENT_SIZE,
+                        )?;
+                    }
+                    
                     return Ok(true);
                 } else {
                     // WAL file doesn't exist, fall through to memory-based archiving
@@ -300,33 +322,55 @@ impl Segment {
             }
 
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
+            // Reuse existing backup handler if available, otherwise create new one
             {
-                let backup_file = state
-                    .manager
-                    .create_backup_file(self.chunk_id, self.id, self.seq_id)?
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::Other, "Failed to create backup file")
-                    })?;
-
-                // Write only the valid data up to append_header to avoid reading from
-                // memory that may have been freed by punch_hole() during compaction.
-                // Promotion uses mmap() which handles variable-sized files correctly.
-                let valid_size = self.append_header() - self.addr;
-                let write_size = valid_size.max(PAGE_SIZE); // At least one page to ensure file exists
+                let write_size = {
+                    let valid_size = self.append_header() - self.addr;
+                    valid_size.max(PAGE_SIZE) // At least one page to ensure file exists
+                };
 
                 debug!(
-                    "Archiving segment {} from memory: valid_size={}, write_size={}",
-                    self.id, valid_size, write_size
+                    "Archiving segment {} from memory: write_size={}",
+                    self.id, write_size
                 );
 
-                let mut buffer = BufWriter::with_capacity(write_size, backup_file);
-                unsafe {
-                    let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
-                    buffer.write(data_block)?;
+                // Get or create backup writer
+                if state.backup.is_none() {
+                    state.backup = state.manager.create_backup_writer(
+                        self.chunk_id,
+                        self.id,
+                        self.seq_id,
+                        SEGMENT_SIZE,
+                    )?;
                 }
-                buffer.flush()?;
-                buffer.get_ref().sync_all()?;
-                return Ok(true);
+
+                if let Some(ref mut writer) = state.backup {
+                    // Truncate the file to zero and write from beginning
+                    writer.get_mut().set_len(0)?;
+                    writer.get_mut().sync_all()?;
+                    
+                    unsafe {
+                        let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
+                        writer.write(data_block)?;
+                    }
+                    writer.flush()?;
+                    writer.get_ref().sync_all()?;
+                    
+                    // Clear the needs_backup_update flag after successful update
+                    self.needs_backup_update.store(false, Ordering::Release);
+                    
+                    debug!(
+                        "Archived segment {} to backup file, keeping handler open",
+                        self.id
+                    );
+                    
+                    return Ok(true);
+                } else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        "Failed to create backup writer"
+                    ));
+                }
             }
         } else {
             warn!(
