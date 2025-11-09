@@ -1,5 +1,5 @@
 use super::*;
-use crate::ram::cell::OwnedCellRef;
+use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
@@ -316,13 +316,13 @@ impl DataManager {
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
-        
+
         // Use the more recent timestamp between the transaction ID and the incoming clock
         // This allows transactions to proceed even if their original timestamp is stale
         // due to clock updates from concurrent transactions
         let effective_ts = if clock > tid { clock } else { tid };
         let read_too_late = &meta.write > effective_ts;
-        
+
         txn.last_activity = get_time();
         if txn.state != TxnState::Started {
             return Err(self.response_with(TxnExecResult::StateError(txn.state)));
@@ -443,10 +443,10 @@ impl Service for DataManager {
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
-        
+
         // Use the more recent timestamp between the transaction ID and the incoming clock
         let effective_ts = if &clock > &tid { clock } else { tid.clone() };
-        
+
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
@@ -505,10 +505,10 @@ impl Service for DataManager {
         cells: Vec<CommitOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         self.update_clock(&clock);
-        
+
         // Use the more recent timestamp between the transaction ID and the incoming clock
         let effective_ts = if &clock > &tid { &clock } else { &tid };
-        
+
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
@@ -659,22 +659,28 @@ impl Service for DataManager {
                             }
                         }
                     }
-                    CommitOp::Update(cell) => {
+                    CommitOp::Update(mut cell) => {
                         let cell_id = cell.id();
                         // Read cell and extract information while holding lock
-                        let (cell_addr, orig_version, old_cell_ref) = {
-                            let shared_cell = match self.server.chunks.read_cell(&cell_id) {
-                                Ok(cell) => cell,
-                                Err(re) => {
-                                    write_error = Some((cell_id, WriteError::ReadError(re)));
-                                    break;
+                        let (cell_addr, orig_version) =
+                            {
+                                match self.server.chunks.location_for_read(&cell_id).and_then(
+                                    |loc| {
+                                        let addr = *loc;
+                                        let header = header_from_chunk_raw(addr);
+                                        header.map(|(header, _)| (header, addr))
+                                    },
+                                ) {
+                                    Ok((header, addr)) => {
+                                        let version = header.version;
+                                        (addr, version)
+                                    }
+                                    Err(re) => {
+                                        write_error = Some((cell_id, WriteError::ReadError(re)));
+                                        break;
+                                    }
                                 }
-                            };
-                            let addr = **shared_cell.guard();
-                            let version = shared_cell.header.version;
-                            let cell_ref = shared_cell.to_owned().into_ref();
-                            (addr, version, cell_ref)
-                        }; // SharedCell dropped here, lock released
+                            }; // SharedCell dropped here, lock released
 
                         // Now protect the segment without holding cell lock
                         let chunk = self.server.chunks.locate_chunk_by_partition(cell_id.higher);
@@ -706,12 +712,14 @@ impl Service for DataManager {
                                 // Continue anyway - segment protection will prevent data loss
                             }
                         }
-
+                        cell.header.version = orig_version; // Enforce version consistency
+                        let mut old_cell_ref = None;
                         let write_result =
                             self.server
                                 .chunks
                                 .update_cell_by(&cell_id, |cell_to_update| {
                                     if cell_to_update.header.version == orig_version {
+                                        old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
                                         Some(cell)
                                     } else {
                                         None
@@ -721,7 +729,7 @@ impl Service for DataManager {
                             Ok(cell) => {
                                 txn.history.insert(
                                     cell_id,
-                                    CellHistory::new(Some(old_cell_ref), cell.header.version),
+                                    CellHistory::new(old_cell_ref, cell.header.version),
                                 );
                                 self.update_cell_write(&cell_id, effective_ts);
                             }
