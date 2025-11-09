@@ -153,7 +153,6 @@ pub struct Chunk {
     pub capacity: usize,
     pub gc_lock: Mutex<()>,
     pub allocator: SegmentAllocator,
-    pub alloc_lock: Mutex<()>,
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
     /// Maps segment_id to count of incomplete transactions that have cells in this segment
@@ -343,7 +342,6 @@ impl Chunk {
             total_space: AtomicUsize::new(0),
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
-            alloc_lock: Mutex::new(()), // TODO: optimize this
             statistics: ChunkStatistics::new(),
             protected_segments: PtrHashMap::with_capacity(64),
             tiered_manager,
@@ -359,8 +357,12 @@ impl Chunk {
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
         let mut tried_gc = false;
         loop {
-            let head_seg_id = self.get_head_seg_id() as usize;
-            let head = self.segs.get(&head_seg_id).unwrap_or_else(|| {
+            let head_seg_id = self.get_head_seg_id();
+            if head_seg_id == u64::MAX {
+                // Allocating new segment in progress, wait for it to complete
+                continue;
+            }
+            let head = self.segs.get(&(head_seg_id as usize)).unwrap_or_else(|| {
                 panic!(
                     "Cannot get header segment with id: {}, have ids {:?}",
                     head_seg_id,
@@ -401,6 +403,10 @@ impl Chunk {
                         Cleaner::clean(self, false);
                     }
 
+                    if !self.head_seg_id.compare_exchange(head_seg_id, u64::MAX, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        // New segment allocated, retry
+                        continue;
+                    }
                     // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
                     // This ensures we never exceed physical memory limit
                     #[cfg(feature = "tiered_memory")]
@@ -423,29 +429,25 @@ impl Chunk {
                         }
                     }
 
-                    let _alloc_guard = self.alloc_lock.lock();
-                    let header_id = self.get_head_seg_id() as usize;
-                    if head_seg_id == header_id {
-                        // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
-                        let new_seg = new_seg_opt.expect("No space left after full GCs");
-                        // for performance, won't CAS total_space
-                        self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
-                        let new_seg_id = new_seg.id;
-                        self.put_segment(new_seg);
-                        match head.archive() {
-                            Ok(false) => {
-                                warn!("Old egment {} archive failed after allocation", head.id);
-                            },
-                            Err(e) => {
-                                warn!("Old segment {} archive failed after allocation: {}", head.id, e);
-                            },
-                            Ok(true) => {
-                                debug!("Old segment {} archived after allocation", head.id);
-                            },
-                        }
-                        self.head_seg_id.store(new_seg_id, Ordering::Release);
+                    // head segment did not changed and locked, suitable for creating a new segment and point it to
+                    let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
+                    let new_seg = new_seg_opt.expect("No space left after full GCs");
+                    // for performance, won't CAS total_space
+                    self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
+                    let new_seg_id = new_seg.id;
+                    self.put_segment(new_seg);
+                    match head.archive() {
+                        Ok(false) => {
+                            warn!("Old egment {} archive failed after allocation", head.id);
+                        },
+                        Err(e) => {
+                            warn!("Old segment {} archive failed after allocation: {}", head.id, e);
+                        },
+                        Ok(true) => {
+                            debug!("Old segment {} archived after allocation", head.id);
+                        },
                     }
+                    self.head_seg_id.store(new_seg_id, Ordering::Release);
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
                 }

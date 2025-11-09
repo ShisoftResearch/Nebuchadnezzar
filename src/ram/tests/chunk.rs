@@ -962,8 +962,8 @@ fn test_archive_idempotency() {
     // Second archive attempt (should be idempotent)
     let result2 = segment.archive().unwrap();
     assert!(
-        !result2,
-        "Second archive should return false (already archived)"
+        result2,
+        "Second archive should return true (repeated archive)"
     );
     assert!(!Path::new(&wal_file).exists(), "WAL should still not exist");
     assert!(

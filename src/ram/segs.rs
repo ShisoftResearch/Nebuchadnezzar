@@ -278,6 +278,13 @@ impl Segment {
             if has_old_backup {
                 debug!("Backup file {} already exists, deleting", backup_file);
                 fs::rename(&backup_file, format!("{}.old", backup_file))?;
+                // Prepare the new backup file
+                state.backup = state.manager.create_backup_writer(
+                    self.chunk_id,
+                    self.id,
+                    self.seq_id,
+                    SEGMENT_SIZE,
+                )?;
             }
 
             // Check if WAL file exists
