@@ -1,4 +1,4 @@
-use super::*;
+use super::{complex_fields, default_fields, dyn_map_field, simple_fields};
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::schema::*;
@@ -972,4 +972,248 @@ fn test_archive_idempotency() {
     );
 
     info!("✓ Archive is idempotent - multiple calls are safe");
+}
+
+#[test]
+fn test_multiple_segments_in_chunk() {
+    use std::sync::Arc as StdArc;
+    use std::thread;
+
+    let _ = env_logger::try_init();
+
+    info!("Testing multiple segments in a chunk with concurrent writes");
+
+    // Create chunks with a small chunk size to force multiple segments
+    let fields = default_fields();
+    let schema = Schema::new("test_multi_seg", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+
+    // Use a chunk size that can hold multiple segments
+    // SEGMENT_SIZE is 8MB, each cell is ~50KB, so 160 cells = 8MB
+    // We want to trigger 3-4 segments, so need ~480-640 cells
+    let chunk_size = CHUNK_SIZE * 8;  // 64MB chunk to hold multiple 8MB segments
+    let chunks = StdArc::new(Chunks::new(
+        1,
+        chunk_size,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    info!("Created chunks with size {}", chunk_size);
+
+    // Spawn multiple threads to write cells concurrently to trigger segment allocation
+    // We need to fill up a segment to trigger allocation of a new one
+    // SEGMENT_SIZE is typically 8MB, so we need enough cells to fill that
+    let num_threads = 8;
+    let cells_per_thread = 60;  // 8 * 60 * ~50KB = 24MB, enough for 3 segments
+    let mut handles = vec![];
+
+    for thread_id in 0..num_threads {
+        let chunks_clone = StdArc::clone(&chunks);
+        let schema_id = schema.id;
+
+        let handle = thread::spawn(move || {
+            for i in 0..cells_per_thread {
+                let cell_id = Id::new(1, thread_id * cells_per_thread + i);
+                let mut data_map = OwnedMap::new();
+                data_map.insert(&String::from("id"), OwnedValue::I64((thread_id * cells_per_thread + i) as i64));
+                data_map.insert(&String::from("score"), OwnedValue::U64(i));
+                // Add large data to fill segments faster and trigger multiple segment allocations
+                data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
+                let data = OwnedValue::Map(data_map);
+                let mut cell = OwnedCell {
+                    header: CellHeader::new(schema_id, &cell_id),
+                    data,
+                };
+
+                match chunks_clone.write_cell(&mut cell) {
+                    Ok(_) => {
+                        trace!("Thread {} wrote cell {}", thread_id, i);
+                    }
+                    Err(e) => {
+                        error!("Thread {} failed to write cell {}: {:?}", thread_id, i, e);
+                        panic!("Write failed: {:?}", e);
+                    }
+                }
+            }
+            info!("Thread {} completed writing {} cells", thread_id, cells_per_thread);
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all threads to complete
+    for handle in handles {
+        handle.join().expect("Thread panicked");
+    }
+
+    info!("All threads completed successfully");
+
+    // Verify we have multiple segments
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    info!("Created {} segments: {:?}", seg_ids.len(), seg_ids);
+
+    assert!(
+        seg_ids.len() > 1,
+        "Should have created multiple segments, but only have {}",
+        seg_ids.len()
+    );
+
+    // Verify all segments are accessible
+    for seg_id in &seg_ids {
+        let segment = chunk.segs.get(seg_id);
+        assert!(
+            segment.is_some(),
+            "Segment {} should be accessible",
+            seg_id
+        );
+        info!("Segment {} is accessible", seg_id);
+    }
+
+    // Verify head_seg_id points to a valid segment
+    let head_seg_id = chunk.get_head_seg_id();
+    info!("Head segment id: {}", head_seg_id);
+    let head_seg = chunk.segs.get(&(head_seg_id as usize));
+    assert!(
+        head_seg.is_some(),
+        "Head segment {} should be accessible. Available segments: {:?}",
+        head_seg_id,
+        seg_ids
+    );
+
+    info!("✓ Multiple segments test passed!");
+}
+
+#[test]
+fn test_concurrent_segment_allocation_and_cleanup() {
+    use crate::ram::cleaner::Cleaner;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::thread;
+    use std::time::Duration;
+
+    let _ = env_logger::try_init();
+
+    info!("Testing concurrent segment allocation and cleanup to stress test head_seg_id race conditions");
+
+    // Create chunks with moderate size
+    let fields = default_fields();
+    let schema = Schema::new("test_race", None, fields, false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema.clone());
+
+    let chunk_size = CHUNK_SIZE * 16;  // 128MB to accommodate many segments
+    let chunks = StdArc::new(Chunks::new(
+        1,
+        chunk_size,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    ));
+
+    info!("Created chunks with size {}", chunk_size);
+
+    let stop_flag = StdArc::new(AtomicBool::new(false));
+    let chunks_for_cleaner = StdArc::clone(&chunks);
+    let stop_flag_for_cleaner = StdArc::clone(&stop_flag);
+
+    // Start a cleaner thread that aggressively runs GC
+    let cleaner_handle = thread::spawn(move || {
+        let mut iteration = 0;
+        while !stop_flag_for_cleaner.load(AtomicOrdering::Relaxed) {
+            iteration += 1;
+            if iteration % 10 == 0 {
+                debug!("Cleaner iteration {}", iteration);
+            }
+            // Run partial GC to trigger segment cleanup
+            Cleaner::clean(&chunks_for_cleaner.list[0], false);
+            // Small sleep to let writers make progress
+            thread::sleep(Duration::from_micros(100));
+        }
+        info!("Cleaner thread completed {} iterations", iteration);
+    });
+
+    // Spawn multiple writer threads that continuously write and delete cells
+    let num_threads = 8;
+    let cells_per_thread = 150;
+    let mut handles = vec![];
+
+    for thread_id in 0..num_threads {
+        let chunks_clone = StdArc::clone(&chunks);
+        let schema_id = schema.id;
+
+        let handle = thread::spawn(move || {
+            for i in 0..cells_per_thread {
+                let cell_id = Id::new(1, thread_id * cells_per_thread + i);
+                let mut data_map = OwnedMap::new();
+                data_map.insert(&String::from("id"), OwnedValue::I64((thread_id * cells_per_thread + i) as i64));
+                data_map.insert(&String::from("score"), OwnedValue::U64(i));
+                // Add large data to fill segments faster
+                data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
+                let data = OwnedValue::Map(data_map);
+                let mut cell = OwnedCell {
+                    header: CellHeader::new(schema_id, &cell_id),
+                    data,
+                };
+
+                match chunks_clone.write_cell(&mut cell) {
+                    Ok(_) => {
+                        trace!("Thread {} wrote cell {}", thread_id, i);
+                        
+                        // Occasionally delete old cells to create dead space for cleaner
+                        if i > 10 && i % 5 == 0 {
+                            let old_cell_id = Id::new(1, thread_id * cells_per_thread + (i - 10));
+                            let _ = chunks_clone.remove_cell(&old_cell_id);
+                            trace!("Thread {} deleted cell {}", thread_id, i - 10);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Thread {} failed to write cell {}: {:?}", thread_id, i, e);
+                        panic!("Write failed: {:?}", e);
+                    }
+                }
+            }
+            info!("Thread {} completed writing {} cells", thread_id, cells_per_thread);
+        });
+
+        handles.push(handle);
+    }
+
+    // Wait for all writer threads to complete
+    for handle in handles {
+        handle.join().expect("Writer thread panicked");
+    }
+
+    info!("All writer threads completed successfully");
+
+    // Stop the cleaner thread
+    stop_flag.store(true, AtomicOrdering::Relaxed);
+    cleaner_handle.join().expect("Cleaner thread panicked");
+
+    info!("Cleaner thread stopped");
+
+    // Verify we have multiple segments
+    let chunk = &chunks.list[0];
+    let seg_ids = chunk.segment_ids();
+    info!("Final state: {} segments: {:?}", seg_ids.len(), seg_ids);
+
+    // Verify head_seg_id points to a valid segment
+    let head_seg_id = chunk.get_head_seg_id();
+    info!("Head segment id: {}", head_seg_id);
+    let head_seg = chunk.segs.get(&(head_seg_id as usize));
+    assert!(
+        head_seg.is_some(),
+        "Head segment {} should be accessible. Available segments: {:?}",
+        head_seg_id,
+        seg_ids
+    );
+
+    info!("✓ Concurrent segment allocation and cleanup test passed!");
 }

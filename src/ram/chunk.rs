@@ -362,13 +362,20 @@ impl Chunk {
                 // Allocating new segment in progress, wait for it to complete
                 continue;
             }
-            let head = self.segs.get(&(head_seg_id as usize)).unwrap_or_else(|| {
-                panic!(
-                    "Cannot get header segment with id: {}, have ids {:?}",
-                    head_seg_id,
-                    self.segs.iter_front_keys().collect::<Vec<_>>()
-                );
-            });
+            // Try to get the head segment. If it's been removed (e.g., by cleaner after
+            // a new head was allocated), retry with the updated head_seg_id.
+            let head = match self.segs.get(&(head_seg_id as usize)) {
+                Some(seg) => seg,
+                None => {
+                    // Segment was removed (likely by cleaner after a new head was allocated)
+                    // Retry the loop to get the current head segment
+                    debug!(
+                        "Head segment {} was removed, retrying with current head",
+                        head_seg_id
+                    );
+                    continue;
+                }
+            };
             match head.try_acquire(size) {
                 Some(addr) => {
                     trace!(
