@@ -5,6 +5,7 @@ pub mod cell;
 pub mod chunk;
 pub mod cleaner;
 pub mod entry;
+pub mod file_manager;
 pub mod io;
 pub mod recovery;
 pub mod schema;

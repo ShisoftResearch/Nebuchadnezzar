@@ -216,6 +216,7 @@ impl CombinedCleaner {
                 "Updating cell reference, pending segments {}",
                 pending_segments.len()
             );
+            let file_manager = &chunk.file_manager;
             let new_segs = pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
@@ -264,7 +265,7 @@ impl CombinedCleaner {
                 })
                 .map(|(segment, cells)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
-                    segment.archive().unwrap();
+                    segment.archive(file_manager).unwrap();
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();

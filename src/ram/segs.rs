@@ -7,14 +7,14 @@ use bifrost::utils::time::get_time;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
 use parking_lot;
-use std::fs::{self, create_dir_all, remove_file, File};
+use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicI8, AtomicU32, AtomicUsize,
+    AtomicBool, AtomicI64, AtomicU32, AtomicUsize,
     Ordering::{self, *},
 };
 use std::{io, slice};
@@ -69,15 +69,14 @@ pub const WAL_SYNC_INTERVAL_MS: i64 = 10; // Sync every 10ms (10x less frequent 
 pub struct Segment {
     pub id: u64,
     pub seq_id: u64,
+    pub chunk_id: usize,
     pub addr: usize,
     pub bound: usize,
     pub append_header: AtomicUsize,
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
     pub references: AtomicUsize,
-    pub backup_file_name: Option<String>,
     pub wal_file: parking_lot::Mutex<Option<BufWriter<File>>>,
-    pub wal_file_name: Option<String>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
     // Tiered memory fields
@@ -101,22 +100,28 @@ impl Segment {
         backup_storage: &Option<String>,
         wal_storage: &Option<String>,
     ) -> Segment {
-        let mut wal_file_name = None;
+        use crate::ram::file_manager::SegmentFileManager;
+        
         let mut wal_file_opt = None;
         let size = SEGMENT_SIZE;
-        if let Some(backup_storage) = backup_storage {
-            create_dir_all(backup_storage).unwrap();
+        
+        // Use file manager for directory and file creation
+        let file_manager = SegmentFileManager::new(
+            backup_storage.clone(),
+            wal_storage.clone(),
+        );
+        
+        if let Err(e) = file_manager.init_directories() {
+            panic!("Failed to initialize storage directories: {}", e);
         }
-        if let Some(wal_storage) = wal_storage {
-            create_dir_all(wal_storage).unwrap();
-            let file_name = format!("{}/{}-{}-{}.nlog", wal_storage, chunk_id, id, seq_id);
-            let file = BufWriter::with_capacity(
-                WAL_BUFFER_SIZE, // 256KB for better batching
-                File::create(&file_name).unwrap(),
-            ); // fast fail
-            wal_file_name = Some(file_name);
-            wal_file_opt = Some(file);
+        
+        if wal_storage.is_some() {
+            match file_manager.create_wal_file(chunk_id, id, seq_id, WAL_BUFFER_SIZE) {
+                Ok(file_opt) => wal_file_opt = file_opt,
+                Err(e) => panic!("Failed to create WAL file: {}", e),
+            }
         }
+        
         debug!(
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
             chunk_id, id, seq_id, size, buffer_ptr
@@ -126,16 +131,13 @@ impl Segment {
             addr: buffer_ptr,
             id,
             seq_id,
+            chunk_id,
             bound: buffer_ptr + size,
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
             references: AtomicUsize::new(0),
-            backup_file_name: backup_storage
-                .clone()
-                .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, id, seq_id)),
             wal_file: parking_lot::Mutex::new(wal_file_opt),
-            wal_file_name,
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
@@ -241,14 +243,17 @@ impl Segment {
     }
 
     // archive this segment and write the data to backup storage
-    pub fn archive(&self) -> Result<bool, io::Error> {
+    pub fn archive(&self, file_manager: &crate::ram::file_manager::SegmentFileManager) -> Result<bool, io::Error> {
+        let backup_path_opt = file_manager.backup_path(self.chunk_id, self.id, self.seq_id);
+        
         debug!(
-            "archive() called for segment {}, backup_file_name={:?}",
-            self.id, self.backup_file_name
+            "archive() called for segment {}, backup_path={:?}",
+            self.id, backup_path_opt
         );
-        if let &Some(ref backup_file) = &self.backup_file_name {
+        
+        if let Some(backup_file) = backup_path_opt {
             while !self.no_references() { /* wait until all references released */ }
-            let backup_file_path = Path::new(backup_file);
+            let backup_file_path = Path::new(&backup_file);
             if backup_file_path.exists() {
                 debug!(
                     "Segment backup {} exists and can't archive twice",
@@ -257,12 +262,8 @@ impl Segment {
                 return Ok(false);
             }
 
-            // Ensure parent directory exists before creating backup file
-            if let Some(parent) = backup_file_path.parent() {
-                create_dir_all(parent)?;
-            }
-
-            if let Some(ref wal_file) = self.wal_file_name {
+            // Check if WAL file exists
+            if file_manager.wal_exists(self.chunk_id, self.id, self.seq_id) {
                 // if there is a WAL file ready, copy this file to backup
                 // First, flush and close the WAL file if it's open
                 {
@@ -280,47 +281,27 @@ impl Segment {
                     }
                 }
 
-                // Check if WAL file exists before trying to copy it
-                // Note: The file might exist even if the mutex is empty (e.g., after recovery)
-                let wal_path = Path::new(wal_file);
-                if wal_path.exists() {
-                    // CRITICAL: WAL files contain only the written data, not full SEGMENT_SIZE.
-                    // For explicit file I/O during promotion (pread), we need full-size files.
-                    // Copy WAL and pad to SEGMENT_SIZE with zeros.
-
-                    // Read the WAL file
-                    let wal_data = std::fs::read(wal_file)?;
-                    let wal_size = wal_data.len();
-
-                    // Create backup file and write WAL data + padding
-                    let mut backup_file = File::create(backup_file_path)?;
-                    backup_file.write_all(&wal_data)?;
-
-                    // Pad to SEGMENT_SIZE if needed
-                    if wal_size < SEGMENT_SIZE {
-                        let padding_size = SEGMENT_SIZE - wal_size;
-                        let padding = vec![0u8; padding_size];
-                        backup_file.write_all(&padding)?;
-                        debug!(
-                            "Padded WAL backup for segment {} from {} to {} bytes",
-                            self.id, wal_size, SEGMENT_SIZE
-                        );
-                    }
-
-                    backup_file.sync_all()?;
-
-                    // Remove the WAL file (file is now closed, so this should succeed)
-                    remove_file(wal_file)?;
+                // Copy WAL to backup with padding
+                if file_manager.copy_wal_to_backup(
+                    self.chunk_id,
+                    self.id,
+                    self.seq_id,
+                    Some(SEGMENT_SIZE),
+                )? {
+                    // Delete WAL file after successful copy
+                    file_manager.delete_wal(self.chunk_id, self.id, self.seq_id)?;
                     return Ok(true);
                 } else {
                     // WAL file doesn't exist, fall through to memory-based archiving
-                    debug!("WAL file {} does not exist for segment {}, falling back to memory-based archiving", wal_file, self.id);
+                    debug!("WAL file does not exist for segment {}, falling back to memory-based archiving", self.id);
                 }
             }
 
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
-                let backup_file = File::create(backup_file_path)?;
+                let backup_file = file_manager.create_backup_file(self.chunk_id, self.id, self.seq_id)?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to create backup file"))?;
+                
                 // Write only the valid data up to append_header to avoid reading from
                 // memory that may have been freed by punch_hole() during compaction.
                 // Promotion uses mmap() which handles variable-sized files correctly.
@@ -343,7 +324,7 @@ impl Segment {
             }
         } else {
             warn!(
-                "Segment {} has no backup file name, cannot archive",
+                "Segment {} has no backup storage configured, cannot archive",
                 self.id
             );
         }
@@ -438,17 +419,10 @@ impl Segment {
         }
     }
     // remove the backup if it have one
-    pub fn dispense(&self) {
+    pub fn dispense(&self, file_manager: &crate::ram::file_manager::SegmentFileManager) {
         debug!("dispense segment {}", self.id);
-        if let &Some(ref backup_storage) = &self.backup_file_name {
-            let path = Path::new(backup_storage);
-            if path.exists() {
-                if let Err(_e) = remove_file(path) {
-                    error!("cannot reclaim segment file on dispense {}", backup_storage)
-                }
-            } else {
-                warn!("cannot find segment backup to dispense {}", backup_storage)
-            }
+        if let Err(e) = file_manager.delete_all(self.chunk_id, self.id, self.seq_id) {
+            error!("cannot reclaim segment files on dispense: {}", e);
         }
     }
 
@@ -743,7 +717,7 @@ impl SegmentAllocator {
 }
 
 
-pub unsafe fn madvise_free(addr: usize, size: usize) {
+pub unsafe fn madvise_free(_addr: usize, _size: usize) {
     // madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
 

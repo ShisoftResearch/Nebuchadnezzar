@@ -1,0 +1,954 @@
+   Compiling neb v0.2.0 (/home/shisoft/Code/OSS Projects/Nebuchadnezzar)
+   Compiling neb v0.2.0 (/home/shisoft/Code/OSS Projects/Nebuchadnezzar)
+warning: unused import: `HashSet`
+ --> src/ram/recovery.rs:8:33
+  |
+8 | use std::collections::{HashMap, HashSet};
+  |                                 ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PathBuf`
+  --> src/ram/recovery.rs:11:23
+   |
+11 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `HashSet`
+ --> src/ram/recovery.rs:8:33
+  |
+8 | use std::collections::{HashMap, HashSet};
+  |                                 ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `PathBuf`
+  --> src/ram/recovery.rs:11:23
+   |
+11 | use std::path::{Path, PathBuf};
+   |                       ^^^^^^^
+
+warning: unused import: `crate::ram::io::align_ptr_addr`
+  --> src/ram/schema/mod.rs:14:5
+   |
+14 | use crate::ram::io::align_ptr_addr;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ram::io::align_ptr_addr`
+  --> src/ram/schema/mod.rs:14:5
+   |
+14 | use crate::ram::io::align_ptr_addr;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/ram/tiered/clock.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::atomic::Ordering`
+ --> src/ram/tiered/eviction.rs:5:5
+  |
+5 | use std::sync::atomic::Ordering;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> src/ram/tiered/clock.rs:4:5
+  |
+4 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::atomic::Ordering`
+ --> src/ram/tiered/eviction.rs:5:5
+  |
+5 | use std::sync::atomic::Ordering;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ram::segs::SEGMENT_SIZE`
+  --> src/ram/tiered/page_fault_tracker.rs:16:5
+   |
+16 | use crate::ram::segs::SEGMENT_SIZE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PROT_NONE`, `PROT_READ`, and `PROT_WRITE`
+  --> src/ram/tiered/page_fault_tracker.rs:17:12
+   |
+17 | use libc::{PROT_NONE, PROT_READ, PROT_WRITE};
+   |            ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `PROT_WRITE` and `c_void`
+ --> src/ram/tiered/promotion.rs:5:12
+  |
+5 | use libc::{c_void, close, mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+  |            ^^^^^^                                               ^^^^^^^^^^
+
+warning: unused import: `crate::ram::segs::SEGMENT_SIZE`
+  --> src/ram/tiered/page_fault_tracker.rs:16:5
+   |
+16 | use crate::ram::segs::SEGMENT_SIZE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `PROT_NONE`, `PROT_READ`, and `PROT_WRITE`
+  --> src/ram/tiered/page_fault_tracker.rs:17:12
+   |
+17 | use libc::{PROT_NONE, PROT_READ, PROT_WRITE};
+   |            ^^^^^^^^^  ^^^^^^^^^  ^^^^^^^^^^
+
+warning: unused imports: `PROT_WRITE` and `c_void`
+ --> src/ram/tiered/promotion.rs:5:12
+  |
+5 | use libc::{c_void, close, mmap, munmap, MAP_PRIVATE, PROT_READ, PROT_WRITE};
+  |            ^^^^^^                                               ^^^^^^^^^^
+
+warning: unused import: `crate::ram::chunk::*`
+ --> src/ram/tests/alignment_tests.rs:2:5
+  |
+2 | use crate::ram::chunk::*;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ram::chunk::*`
+ --> src/ram/tests/alignment_tests.rs:2:5
+  |
+2 | use crate::ram::chunk::*;
+  |     ^^^^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `fast_map`
+  --> src/ram/tests/cell.rs:65:7
+   |
+65 | #[cfg(feature = "fast_map")]
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `cleaner`, `combine_cleaner`, `compact_cleaner`, `debug_page_faults`, `default`, `page_fault_tracking`, and `tiered_memory`
+   = help: consider adding `fast_map` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unused import: `crate::ram::types`
+ --> src/ram/tests/cell.rs:4:5
+  |
+4 | use crate::ram::types;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `fast_map`
+  --> src/ram/tests/cell.rs:65:7
+   |
+65 | #[cfg(feature = "fast_map")]
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `cleaner`, `combine_cleaner`, `compact_cleaner`, `debug_page_faults`, `default`, `page_fault_tracking`, and `tiered_memory`
+   = help: consider adding `fast_map` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unused import: `crate::ram::types`
+ --> src/ram/tests/cell.rs:4:5
+  |
+4 | use crate::ram::types;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::path::Path`
+   --> src/ram/tests/chunk.rs:667:9
+    |
+667 |     use std::path::Path;
+    |         ^^^^^^^^^^^^^^^
+
+warning: unused import: `std::path::Path`
+   --> src/ram/tests/chunk.rs:667:9
+    |
+667 |     use std::path::Path;
+    |         ^^^^^^^^^^^^^^^
+
+warning: unused import: `Segment`
+ --> src/ram/tests/segment_alignment_test.rs:3:24
+  |
+3 | use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE};
+  |                        ^^^^^^^
+
+warning: unused import: `Segment`
+ --> src/ram/tests/segment_alignment_test.rs:3:24
+  |
+3 | use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE};
+  |                        ^^^^^^^
+
+warning: unused import: `dovahkiin::types::Type`
+  --> src/ram/tests/throughput_test.rs:10:5
+   |
+10 | use dovahkiin::types::Type;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `dovahkiin::types::Type`
+  --> src/ram/tests/throughput_test.rs:10:5
+   |
+10 | use dovahkiin::types::Type;
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `IndexedDataClient` and `ReadError`
+   --> src/query/data_client.rs:321:30
+    |
+321 |         query::data_client::{IndexedDataClient, ValueRange, ValueRangeTerm},
+    |                              ^^^^^^^^^^^^^^^^^
+322 |         ram::{
+323 |             cell::{OwnedCell, ReadError},
+    |                               ^^^^^^^^^
+
+warning: unused imports: `IndexedDataClient` and `ReadError`
+   --> src/query/data_client.rs:321:30
+    |
+321 |         query::data_client::{IndexedDataClient, ValueRange, ValueRangeTerm},
+    |                              ^^^^^^^^^^^^^^^^^
+322 |         ram::{
+323 |             cell::{OwnedCell, ReadError},
+    |                               ^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+   --> src/server/transactions/undo_log.rs:917:9
+    |
+917 |     use std::collections::HashMap;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `std::collections::HashMap`
+   --> src/server/transactions/undo_log.rs:917:9
+    |
+917 |     use std::collections::HashMap;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ram::types::OwnedValue`
+    --> src/server/transactions/undo_log.rs:1734:13
+     |
+1734 |         use crate::ram::types::OwnedValue;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::ram::types::OwnedValue`
+    --> src/server/transactions/undo_log.rs:1734:13
+     |
+1734 |         use crate::ram::types::OwnedValue;
+     |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: the feature `async_closure` has been stable since 1.85.0 and no longer requires an attribute to enable
+ --> src/lib.rs:2:12
+  |
+2 | #![feature(async_closure)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: the feature `is_sorted` has been stable since 1.82.0 and no longer requires an attribute to enable
+ --> src/lib.rs:5:12
+  |
+5 | #![feature(is_sorted)]
+  |            ^^^^^^^^^
+
+warning: the feature `async_closure` has been stable since 1.85.0 and no longer requires an attribute to enable
+ --> src/lib.rs:2:12
+  |
+2 | #![feature(async_closure)]
+  |            ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(stable_features)]` on by default
+
+warning: the feature `is_sorted` has been stable since 1.82.0 and no longer requires an attribute to enable
+ --> src/lib.rs:5:12
+  |
+5 | #![feature(is_sorted)]
+  |            ^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:359:25
+    |
+359 |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:497:25
+    |
+497 |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:639:25
+    |
+639warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:359:25
+    |
+359 |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:497:25
+    |
+497 |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/ram/tiered/bench.rs:639:25
+    |
+639 |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+
+ |     let mut rng = rand::thread_rng();
+    |                         ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/index/ranged/lsm/btree/reconstruct.rs:281:41
+    |
+281 |                     let mut rng = rand::thread_rng();
+    |                                         ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/index/ranged/lsm/btree/reconstruct.rs:281:41
+    |
+281 |                     let mut rng = rand::thread_rng();
+    |                                         ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+  --> src/index/ranged/mod.rs:73:29
+   |
+73 |         let mut rng = rand::thread_rng();
+   |                             ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+  --> src/index/ranged/mod.rs:73:29
+   |
+73 |         let mut rng = rand::thread_rng();
+   |                             ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/query/statistics/mod.rs:549:29
+    |
+549 |         let mut rng = rand::thread_rng();
+    |                             ^^^^^^^^^^
+
+warning: use of deprecated function `rand::thread_rng`: Renamed to `rng`
+   --> src/query/statistics/mod.rs:549:29
+    |
+549 |         let mut rng = rand::thread_rng();
+    |                             ^^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen`: Renamed to `random` to avoid conflict with the new `gen` keyword in Rust 2024.
+  --> src/ram/tiered/bench.rs:61:26
+   |
+61 |         let u: f64 = rng.gen();
+   |                          ^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/ram/tiered/bench.rs:361:28
+    |
+361 |         let cell_idx = rng.gen_range(0..num_cells);
+    |                            ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/ram/tiered/bench.rs:499:28
+    |
+499 |         let cell_idx = rng.gen_range(0..num_cells);
+    |                            ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen`: Renamed to `random` to avoid conflict with the new `gen` keyword in Rust 2024.
+  --> src/ram/tiered/bench.rs:61:26
+   |
+61 |         let u: f64 = rng.gen();
+   |                          ^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/ram/tiered/bench.rs:361:28
+    |
+361 |         let cell_idx = rng.gen_range(0..num_cells);
+    |                            ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/ram/tiered/bench.rs:499:28
+    |
+499 |         let cell_idx = rng.gen_range(0..num_cells);
+    |                            ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/index/ranged/lsm/btree/reconstruct.rs:282:54
+    |
+282 |                     if i > all_keys.len() / 2 && rng.gen_range(0..50) == 1 {
+    |                                                      ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/index/ranged/lsm/btree/reconstruct.rs:282:54
+    |
+282 |                     if i > all_keys.len() / 2 && rng.gen_range(0..50) == 1 {
+    |                                                      ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/query/statistics/mod.rs:555:37
+    |
+555 |                 OwnedValue::U64(rng.gen_range(60..100)),
+    |                                     ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/query/statistics/mod.rs:555:37
+    |
+555 |                 OwnedValue::U64(rng.gen_range(60..100)),
+    |                                     ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/server/tests.rs:205:33
+    |
+205 |                 if j > 1 && rng.gen_range(0..8) == 4 {
+    |                                 ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/server/tests.rs:211:40
+    |
+211 |                 value[ARRAY] = (1..rng.gen_range(1..1024)).collect::<Vec<u64>>().value();
+    |                                        ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/server/tests.rs:205:33
+    |
+205 |                 if j > 1 && rng.gen_range(0..8) == 4 {
+    |                                 ^^^^^^^^^
+
+warning: use of deprecated method `rand::Rng::gen_range`: Renamed to `random_range`
+   --> src/server/tests.rs:211:40
+    |
+211 |                 value[ARRAY] = (1..rng.gen_range(1..1024)).collect::<Vec<u64>>().value();
+    |                                        ^^^^^^^^^
+
+warning: unused import: `Read`
+  --> src/ram/recovery.rs:10:21
+   |
+10 | use std::io::{self, Read, Write};
+   |                     ^^^^
+
+warning: unused import: `VectorIndexerCore`
+  --> src/index/mod.rs:26:47
+   |
+26 | use crate::index::vector::{VectorIndexClient, VectorIndexerCore};
+   |                                               ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Map`
+ --> src/ram/tiered/cell_locking.rs:5:22
+  |
+5 | use lightning::map::{Map, WordMutexGuard};
+  |                      ^^^
+
+warning: unused import: `crate::ram::cell::Cell`
+ --> src/server/cell_rpc.rs:1:5
+  |
+1 | use crate::ram::cell::Cell;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Read`
+  --> src/ram/recovery.rs:10:21
+   |
+10 | use std::io::{self, Read, Write};
+   |                     ^^^^
+
+warning: unused import: `VectorIndexerCore`
+  --> src/index/mod.rs:26:47
+   |
+26 | use crate::index::vector::{VectorIndexClient, VectorIndexerCore};
+   |                                               ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Map`
+ --> src/ram/tiered/cell_locking.rs:5:22
+  |
+5 | use lightning::map::{Map, WordMutexGuard};
+  |                      ^^^
+
+warning: unused import: `crate::ram::cell::Cell`
+ --> src/server/cell_rpc.rs:1:5
+  |
+1 | use crate::ram::cell::Cell;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable `entries_found` is assigned to, but never used
+  --> src/ram/recovery.rs:36:9
+   |
+36 |     let mut entries_found = 0;
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_entries_found` instead
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `entries_found` is never read
+  --> src/ram/recovery.rs:54:9
+   |
+54 |         entries_found += 1;
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `entries_found` is assigned to, but never used
+  --> src/ram/recovery.rs:36:9
+   |
+36 |     let mut entries_found = 0;
+   |         ^^^^^^^^^^^^^^^^^
+   |
+   = note: consider using `_entries_found` instead
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `entries_found` is never read
+  --> src/ram/recovery.rs:54:9
+   |
+54 |         entries_found += 1;
+   |         ^^^^^^^^^^^^^^^^^^
+   |
+   = help: maybe it is overwritten before being read?
+   = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `dependences`
+   --> src/exec/dag.rs:294:17
+    |
+294 |             let dependences = self.outlinks.get(&node_id);
+    |                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dependences`
+
+warning: unused variable: `out_ty`
+   --> src/exec/dag.rs:296:30
+    |
+296 |                 let (in_tys, out_ty) = node.symbol.symbol_obj().io_types();
+    |                              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_ty`
+
+warning: unused variable: `in_ty`
+   --> src/exec/dag.rs:306:21
+    |
+306 |                 for in_ty in in_tys {}
+    |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_in_ty`
+
+warning: unused variable: `dependences`
+   --> src/exec/dag.rs:294:17
+    |
+294 |             let dependences = self.outlinks.get(&node_id);
+    |                 ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_dependences`
+
+warning: unused variable: `out_ty`
+   --> src/exec/dag.rs:296:30
+    |
+296 |                 let (in_tys, out_ty) = node.symbol.symbol_obj().io_types();
+    |                              ^^^^^^ help: if this is intentional, prefix it with an underscore: `_out_ty`
+
+warning: unused variable: `in_ty`
+   --> src/exec/dag.rs:306:21
+    |
+306 |                 for in_ty in in_tys {}
+    |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_in_ty`
+
+warning: unused variable: `task`
+   --> src/exec/scheduler/worker.rs:111:17
+    |
+111 |             let task = this.tasks.get_ref(&task_id).unwrap();
+    |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_task`
+
+warning: unused variable: `task`
+   --> src/exec/scheduler/worker.rs:111:17
+    |
+111 |             let task = this.tasks.get_ref(&task_id).unwrap();
+    |                 ^^^^ help: if this is intentional, prefix it with an underscore: `_task`
+
+warning: unused variable: `txn_index`
+    --> src/server/transactions/undo_log.rs:1001:13
+     |
+1001 |         let txn_index = undo_log.recover().unwrap();
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_txn_index`
+
+warning: unused variable: `txn_index`
+    --> src/server/transactions/undo_log.rs:1001:13
+     |
+1001 |         let txn_index = undo_log.recover().unwrap();
+     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_txn_index`
+
+warning: unused variable: `seg_id`
+    --> src/server/transactions/undo_log.rs:1883:26
+     |
+1883 |         let (_cell_addr, seg_id, seq_id, cell_offset) = {
+     |                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_seg_id`
+
+warning: unused variable: `seg_id`
+    --> src/server/transactions/undo_log.rs:1883:26
+     |
+1883 |         let (_cell_addr, seg_id, seq_id, cell_offset) = {
+     |                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_seg_id`
+
+warning: associated function `new` is never used
+   --> src/ram/chunk.rs:260:8
+    |
+166 | impl Chunk {
+    | ---------- associated function in this implementation
+...
+260 |     fn new(
+    |        ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `punch_hole` is never used
+   --> src/ram/segs.rs:725:4
+    |
+725 | fn punch_hole(seg_addr: usize, seg_size: usize) {
+    |    ^^^^^^^^^^
+
+warning: field `s` is never read
+  --> src/ram/tiered/bench.rs:36:5
+   |
+34 | struct ZipfGenerator {
+   |        ------------- field in this struct
+35 |     n: usize,            // number of items
+36 |     s: f64,              // skewness parameter
+   |     ^
+
+warning: struct `Task` is never constructed
+  warning: associated function `new` is never used
+   --> src/ram/chunk.rs:260:8
+    |
+166 | impl Chunk {
+    | ---------- associated function in this implementation
+...
+260 |     fn new(
+    |        ^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `punch_hole` is never used
+   --> src/ram/segs.rs:725:4
+    |
+725 | fn punch_hole(seg_addr: usize, seg_size: usize) {
+    |    ^^^^^^^^^^
+
+warning: field `s` is never read
+  --> src/ram/tiered/bench.rs:36:5
+   |
+34 | struct ZipfGenerator {
+   |        ------------- field in this struct
+35 |     n: usize,            // number of items
+36 |     s: f64,              // skewness parameter
+   |     ^
+
+warning: struct `Task` is never constructed
+  --> src/exec/scheduler/coordinator.rs:12:8
+   |
+12 | struct Task {
+   |        ^^^^
+
+warning: struct `Stage` is never constructed
+  --> src/exec/scheduler/coordinator.rs:20:8
+   |
+20 | struct Stage {
+   |        ^^^^^
+
+warning: struct `Job` is never constructed
+  --> src/exec/scheduler/coordinator.rs:26:8
+   |
+26 | struct Job {
+   |        ^^^
+
+warning: struct `Coordinator` is never constructed
+  --> src/exec/scheduler/coordinator.rs:32:8
+   |
+32 | struct Coordinator {
+   |        ^^^^^^^^^^^
+
+warning: method `new_job` is never used
+  --> src/exec/scheduler/coordinator.rs:38:12
+   |
+--> src/exec/scheduler/coordinator.rs:12:8
+   |
+12 | struct Task {
+   |        ^^^^
+
+warning: struct `Stage` is never constructed
+  --> src/exec/scheduler/coordinator.rs:20:8
+   |
+20 | struct Stage {
+   |        ^^^^^
+
+warning: struct `Job` is never constructed
+  --> src/exec/scheduler/coordinator.rs:26:8
+   |
+26 | struct Job {
+   |        ^^^
+
+warning: struct `Coordinator` is never constructed
+  --> src/exec/scheduler/coordinator.rs:32:8
+   |
+32 | struct Coordinator {
+   |        ^^^^^^^^^^^
+
+warning: method `new_job` is never used
+  --> src/exec/scheduler/coordinator.rs:38:12
+   |
+37 | impl Coordinator {
+   | ---------------- 37 | impl Coordinator {
+   | ---------------- method in this implementation
+38 |     pub fn new_job(&self, dag: DAG) -> u64 {
+   |            ^^^^^^^
+
+method in this implementation
+38 |     pub fn new_job(&self, dag: DAG) -> u64 {
+   |            ^^^^^^^
+
+warning: fields `stages`, `pending_tasks`, and `core_id` are never read
+  --> src/exec/scheduler/worker.rs:24:5
+   |
+22 | struct Executer {
+   |        -------- fields in this struct
+23 |     tasks: Arc<TaskMap>,
+24 |     stages: Arc<StageMap>,
+   |     ^^^^^^
+25 |     pending_tasks: UnboundedSender<u64>,
+   |     ^^^^^^^^^^^^^
+26 |     current_task: AtomicU64,
+27 |     core_id: CoreId,
+   |     ^^^^^^^
+
+warning: fields `tasks`, `stages`, `execs`, and `worker_task_counter` are never read
+  --> src/exec/scheduler/worker.rs:31:5
+   |
+warning: fields `stages`, `pending_tasks`, and `core_id` are never read
+  --> src/exec/scheduler/worker.rs:24:5
+   |
+22 | struct Executer {
+   |        -------- fields in this struct
+23 |     tasks: Arc<TaskMap>,
+24 |     stages: Arc<StageMap>,
+   |     ^^^^^^
+25 |     pending_tasks: UnboundedSender<u64>,
+   |     ^^^^^^^^^^^^^
+26 |     current_task: AtomicU64,
+27 |     core_id: CoreId,
+   |     ^^^^^^^
+
+warning: fields `tasks`, `stages`, `execs`, and `worker_task_counter` are never read
+  --> src/exec/scheduler/worker.rs:31:5
+   |
+30 | pub struct Worker {
+   |            ------ fields in this struct
+31 |     tasks: Arc<TaskMap>,
+   |     ^^^^^
+32 |     stages: Arc<StageMap>,
+   |     ^^^^^^
+33 |     execs: Vec<Arc<Executer>>,
+   |     30 | pub struct Worker {
+   |            ------ fields in this struct
+31 |     tasks: Arc<TaskMap>,
+   |     ^^^^^
+32 |     stages: Arc<StageMap>,
+   |     ^^^^^^
+33 |     execs: Vec<Arc<Executer>>,
+   |     ^^^^^
+34 |     worker_task_counter: AtomicU64,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `new_task`, `new_stage`, and `obsolete_stage` are never used^^^^^
+34 |     worker_task_counter: AtomicU64,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `new_task`, `new_stage`, and `obsolete_stage` are never used
+  --> src/exec/scheduler/worker.rs:78:8
+   |
+37 | impl Worker {
+   
+  --> src/exec/scheduler/worker.rs:78:8
+   |
+37 | impl Worker {
+   | ----------- methods in this implementation
+...
+78 || ----------- methods in this implementation
+...
+78 |     fn new_task(&self, task: Task) {
+   |        ^^^^^^^^
+...
+85 |     fn new_task(&self, task: Task) {
+   |        ^^^^^^^^
+...
+85 |     fn new_stage(&self, stage: Stage, stage_id: StageId) {
+   |        ^^^^^^^^^
+...
+88 |     fn new_stage(&self, stage: Stage, stage_id: StageId) {
+   |        ^^^^^^^^^
+...
+88 |     fn obsolete_stage(&self, stage_id: StageId) {
+   |        ^^^^^^^^^^^^^^
+
+warning: method `push_task` is never used     fn obsolete_stage(&self, stage_id: StageId) {
+   |        ^^^^^^^^^^^^^^
+
+warning: method `push_task` is never used
+   --> src/exec/scheduler/worker.rs:116:8
+    |
+ 93 | impl Executer {
+    |
+   --> src/exec/scheduler/worker.rs:116:8
+    |
+ 93 | impl Executer {
+    | ------------- method in this implementation
+...
+116  ------------- method in this implementation
+...
+116 |     fn push_task(&self, task_id: u64) {
+    |        ^^^^^^^^^
+
+|     fn push_task(&self, task_id: u64) {
+    |        ^^^^^^^^^
+
+warning: associated function `new` is never used
+   --> src/exec/scheduler/worker.rs:122:8
+    |
+121 | impl StageId {
+    | ------------ associated function in this implementationwarning: associated function `new` is never used
+   --> src/exec/scheduler/worker.rs:122:8
+    |
+121 | impl StageId {
+    | ------------ associated function in this implementation
+122 |     fn new(host: u64, id: u64) -> Self {
+    |        ^^^
+
+warning: fields `threads`, `in_queue`, `memory`, and `mem_used` are never read
+   --> src/exec/scheduler/worker.rs:128:5
+    |
+127 | pub struct WorkerDesc {
+    |            
+122 |     fn new(host: u64, id: u64) -> Self {
+    |        ^^^
+
+warning: fields `threads`, `in_queue`, `memory`, and `mem_used` are never read
+   --> src/exec/scheduler/worker.rs:128:5
+    |
+127 | pub struct WorkerDesc {
+    |            ---------- fields in this struct
+128 |     threads: u64,
+    |     ---------- fields in this struct
+128 |     threads: u64,
+    |     ^^^^^^^
+129 |     in_queue: u64,
+    |     ^^^^^^^
+129 |     in_queue: u64,
+    |     ^^^^^^^^
+130 |     memory: u64,
+    |     ^^^^^^^^^^^^^^
+130 |     memory: u64,
+    |     ^^^^^^
+131 |     mem_used: u64,
+    |     ^^^^^^^^
+
+
+131 |     mem_used: u64,
+    |     ^^^^^^^^
+
+warning: struct `DebugNode` is never constructed
+  --> src/index/ranged/lsm/btree/test.rs:27:8
+   |
+27 |warning: struct `DebugNode` is never constructed
+  --> src/index/ranged/lsm/btree/test.rs:27:8
+   |
+27 | struct DebugNode {
+   |        ^^^^^^^^^
+
+warning struct DebugNode {
+   |        ^^^^^^^^^
+
+warning: fields `row_count` and `row_bytes` are never read
+  --> src/query/cost/mod.rs:11:5
+   |
+10 | pub struct CostResult {
+   |            : fields `row_count` and `row_bytes` are never read
+  --> src/query/cost/mod.rs:11:5
+   |
+10 | pub struct CostResult {
+   |            ---------- fields in this struct
+11 |     row_count: usize,
+   |     ^^^^^^^^^
+---------- fields in this struct
+11 |     row_count: usize,
+   |     ^^^^^^^^^
+12 |     row_bytes: usize,
+   |     ^^^^^^^^^
+
+12 |     row_bytes: usize,
+   |     ^^^^^^^^^
+
+warning: field `costs` is never read
+  --> src/query/cost/mod.rs:16:5
+   |
+15 | pub struct DistHostCostResult {
+   warning: field `costs` is never read
+  --> src/query/cost/mod.rs:16:5
+   |
+15 | pub struct DistHostCostResult {
+   |            ------------------ field in this struct
+16 |     costs: Vec<CostResult>,
+   |     ^^^^^|            ------------------ field in this struct
+16 |     costs: Vec<CostResult>,
+   |     ^^^^^
+
+warning: trait `CostFunction` is never used
+  --> src/query/cost/mod.rs:19:7
+   |
+
+
+warning: trait `CostFunction` is never used
+  --> src/query/cost/mod.rs:19:7
+   |
+19 | trait CostFunction {
+   |       ^^^^^^^^^^^^
+
+warning: method `total_cost` is never used
+  --> src/query/cost/mod.rs:30:8
+   |
+19 | trait CostFunction {
+   |       ^^^^^^^^^^^^
+
+warning: method `total_cost` is never used
+  --> src/query/cost/mod.rs:30:8
+   |
+29 | impl DistHostCostResult {
+   | ----------------------- method in this implementation
+29 | impl DistHostCostResult {
+   | ----------------------- method in this implementation
+30 |     fn total_cost(&self) -> CostResult {
+   |        ^^^^^^^^^^
+
+30 |     fn total_cost(&self) -> CostResult {
+   |        ^^^^^^^^^^
+
+warning: function `row_bytes` is never used
+  --> src/query/cost/mod.rs:53:4
+   |
+53 | fn row_bytes(
+   warning: function `row_bytes` is never used
+  --> src/query/cost/mod.rs:53:4
+   |
+53 | fn row_bytes(
+   |    ^^^^^^^^^
+
+|    ^^^^^^^^^
+
+warning: field `server` is never read
+ --> src/query/cost/range_index.rs:8:5
+  |
+7 warning: field `server` is never read
+ --> src/query/cost/range_index.rs:8:5
+  |
+7 | pub struct RangeIndexCost {
+  |            -------------- field in this struct
+8 |     server: Arc<NebServer>,
+  |     | pub struct RangeIndexCost {
+  |            -------------- field in this struct
+8 |     server: Arc<NebServer>,
+  |     ^^^^^^
+
+warning: field `server` is never read
+ --> src/query/cost/scan.rs:8:5
+  ^^^^^^
+
+warning: field `server` is never read
+ --> src/query/cost/scan.rs:8:5
+  |
+7 | pub struct ScanIndexCost {
+  |            ------------- field in this struct|
+7 | pub struct ScanIndexCost {
+  |            ------------- field in this struct
+8 |     server: Arc<NebServer>,
+  |     ^^^^^^
+
+
+8 |     server: Arc<NebServer>,
+  |     ^^^^^^
+

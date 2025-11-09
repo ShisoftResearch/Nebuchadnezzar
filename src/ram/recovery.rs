@@ -1,6 +1,7 @@
 use super::cell::cell_header_from_entry_content_addr;
 use super::chunk::Chunk;
 use super::entry::{Entry, EntryType, ENTRY_HEAD_SIZE};
+use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
 use libc::{c_void, mmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
@@ -10,123 +11,22 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
-#[derive(Debug, Clone)]
-pub struct SegmentFileInfo {
-    pub chunk_id: usize,
-    pub seg_id: u64,
-    pub seq_id: u64,
-    pub path: PathBuf,
-    pub size: u64,
-    pub is_backup: bool,
-}
-
-impl SegmentFileInfo {
-    /// Parse filename pattern: {chunk_id}-{seg_id}-{seq_id}.{nlog|nbackup}
-    pub fn parse_filename(path: &Path) -> Option<Self> {
-        let stem = path.file_stem()?.to_str()?;
-
-        // Check extension
-        let extension = path.extension()?.to_str()?;
-        let is_backup = match extension {
-            "nbackup" => true,
-            "nlog" => false,
-            _ => return None,
-        };
-
-        // Parse {chunk_id}-{seg_id}-{seq_id}
-        let parts: Vec<&str> = stem.split('-').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-
-        let chunk_id = parts[0].parse::<usize>().ok()?;
-        let seg_id = parts[1].parse::<u64>().ok()?;
-        let seq_id = parts[2].parse::<u64>().ok()?;
-
-        let metadata = fs::metadata(path).ok()?;
-        let size = metadata.len();
-
-        Some(SegmentFileInfo {
-            chunk_id,
-            seg_id,
-            seq_id,
-            path: path.to_path_buf(),
-            size,
-            is_backup,
-        })
-    }
-}
-
-/// Helper function to recursively scan directories for segment files
-fn scan_dir_recursive(
-    dir: &Path,
-    files: &mut Vec<SegmentFileInfo>,
-    is_backup_scan: bool,
-) -> io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            // Recursively scan subdirectories
-            scan_dir_recursive(&path, files, is_backup_scan)?;
-        } else if path.is_file() {
-            if let Some(info) = SegmentFileInfo::parse_filename(&path) {
-                if info.is_backup == is_backup_scan {
-                    files.push(info);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Discover all segment files in storage directories
 pub fn discover_segment_files(
     backup_storage: &Option<String>,
     wal_storage: &Option<String>,
 ) -> io::Result<Vec<SegmentFileInfo>> {
-    let mut files = Vec::new();
-
-    // Scan backup storage recursively
-    if let Some(backup_dir) = backup_storage {
-        scan_dir_recursive(Path::new(backup_dir), &mut files, true)?;
-    }
-
-    // Scan WAL storage recursively
-    if let Some(wal_dir) = wal_storage {
-        scan_dir_recursive(Path::new(wal_dir), &mut files, false)?;
-    }
-
-    // Deduplicate: prefer backup over WAL for same (chunk_id, seg_id, seq_id)
-    let mut seen = HashSet::new();
-    let mut deduped = Vec::new();
-
-    // Sort: backup files first (is_backup = true)
-    files.sort_by(|a, b| b.is_backup.cmp(&a.is_backup));
-
-    for file in files {
-        let key = (file.chunk_id, file.seg_id, file.seq_id);
-        if seen.insert(key) {
-            deduped.push(file);
-        }
-    }
-
-    // Sort by seq_id (chronological order)
-    deduped.sort_by_key(|f| f.seq_id);
-
-    Ok(deduped)
+    let file_manager = SegmentFileManager::new(
+        backup_storage.clone(),
+        wal_storage.clone(),
+    );
+    file_manager.discover_files()
 }
 
 /// Load file content into memory buffer
 pub fn load_file_to_memory(path: &Path) -> io::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)?;
-    Ok(buffer)
+    let file_manager = SegmentFileManager::new(None, None);
+    file_manager.read_file(path)
 }
 
 /// Find the actual append_header by scanning segment data
@@ -918,7 +818,7 @@ mod tests {
             // Archive segments to create backup files
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
 
@@ -985,7 +885,7 @@ mod tests {
             println!("Archiving segments...");
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
             println!("Phase 1 complete, dropping chunks...");
@@ -1063,7 +963,7 @@ mod tests {
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
                     println!("Archiving segment {} with seq_id {}", seg.id, seg.seq_id);
-                    let result = seg.archive().unwrap();
+                    let result = seg.archive(&chunk.file_manager).unwrap();
                     println!("Archive result: {}", result);
                 }
             }
@@ -1171,7 +1071,7 @@ mod tests {
             // Archive
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
 
@@ -1202,7 +1102,7 @@ mod tests {
             // Archive with tombstones
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
         }
@@ -1266,7 +1166,7 @@ mod tests {
             // Archive
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
 
@@ -1365,7 +1265,7 @@ mod tests {
             );
 
             // Archive the segment
-            seg.archive().unwrap();
+            seg.archive(&chunks.list[0].file_manager).unwrap();
         }
 
         // Phase 2: Recover and verify append_header is correctly restored
@@ -1440,7 +1340,7 @@ mod tests {
             chunks.write_cell(&mut cell).unwrap();
 
             let seg = &chunks.list[0].segments()[0];
-            seg.archive().unwrap();
+            seg.archive(&chunks.list[0].file_manager).unwrap();
         }
 
         // Phase 2: Recover - should handle file discovery and deduplication gracefully
@@ -1511,7 +1411,7 @@ mod tests {
             // Archive all segments
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
 

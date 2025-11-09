@@ -1782,7 +1782,7 @@ mod tests {
             // Archive segments
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive().unwrap();
+                    seg.archive(&chunk.file_manager).unwrap();
                 }
             }
 
@@ -2028,11 +2028,10 @@ mod tests {
         // Archive segments before shutdown
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 
-        // Simulate crash - don't commit the transaction (after prepare)
         drop(txn);
         drop(server);
 
@@ -2138,7 +2137,7 @@ mod tests {
         // Archive before transaction
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 
@@ -2182,11 +2181,10 @@ mod tests {
         // Archive segments before shutdown
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 
-        // Simulate crash - don't commit the transaction (after prepare)
         drop(txn);
         drop(server);
 
@@ -2289,7 +2287,7 @@ mod tests {
         // Archive before transaction
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 
@@ -2317,11 +2315,10 @@ mod tests {
         // Archive segments before shutdown
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 
-        // Simulate crash - don't commit the transaction (after prepare)
         drop(txn);
         drop(server);
 
@@ -2445,7 +2442,7 @@ mod tests {
         // Archive segments before shutdown
         for chunk in &server.chunks.list {
             for seg in chunk.segments() {
-                seg.archive().unwrap();
+                seg.archive(&chunk.file_manager).unwrap();
             }
         }
 

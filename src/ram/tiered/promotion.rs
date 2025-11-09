@@ -81,7 +81,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     }
 
     // Step 5: Get backup file path and open it
-    let backup_path = match segment.backup_file_name.as_ref() {
+    let backup_path = match chunk.file_manager.backup_path(segment.chunk_id, segment.id, segment.seq_id) {
         Some(backup_path) => backup_path,
         None => {
             error!("Segment {} has no backup file path", segment.id);

@@ -1,5 +1,6 @@
 use crate::query::statistics::{merge_statistics, ChunkStatistics, SchemaStatistics};
 use crate::ram::entry::{Entry, EntryContent, EntryType};
+use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::{LocalSchemasCache, SchemaRef};
 use crate::ram::segment_list::SegmentList;
 use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE, SEGMENT_SIZE_U32};
@@ -13,7 +14,6 @@ use crate::{
 };
 
 use super::schema::Schema;
-use bifrost::utils::time::get_time;
 use lightning::aarc::Arc as AArc;
 use lightning::map::{Map, PtrHashMap, WordMap, WordMutexGuard};
 use lightning::ttl_cache::TTLCache;
@@ -148,6 +148,7 @@ pub struct Chunk {
     pub meta: Arc<ServerMeta>,
     pub backup_storage: Option<String>,
     pub wal_storage: Option<String>,
+    pub file_manager: Arc<SegmentFileManager>,
     pub total_space: AtomicUsize,
     pub capacity: usize,
     pub gc_lock: Mutex<()>,
@@ -290,6 +291,18 @@ impl Chunk {
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
+        
+        // Create file manager
+        let file_manager = Arc::new(SegmentFileManager::new(
+            backup_storage.clone(),
+            wal_storage.clone(),
+        ));
+        
+        // Initialize storage directories
+        if let Err(e) = file_manager.init_directories() {
+            panic!("Failed to initialize storage directories: {}", e);
+        }
+        
         let bootstrap_segment = allocator
             .alloc_seg(&backup_storage, &wal_storage)
             .expect(&format!("No space left for first segment in chunk {}", id));
@@ -323,6 +336,7 @@ impl Chunk {
             meta,
             backup_storage,
             wal_storage,
+            file_manager,
             allocator,
             index_builder,
             capacity: size,
@@ -903,7 +917,7 @@ impl Chunk {
 
         // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
-            seg.dispense();
+            seg.dispense(&self.file_manager);
         }
     }
 
@@ -1089,7 +1103,7 @@ impl Chunk {
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    if let Err(e) = segment.archive() {
+                    if let Err(e) = segment.archive(&self.file_manager) {
                         error!(
                             "Cannot archive segment {} (chunk {}), reason:{:?}",
                             seg_id, self.id, e
