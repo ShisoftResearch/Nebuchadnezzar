@@ -8,6 +8,7 @@ use bifrost::utils::time::get_time;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
 use parking_lot;
+use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufWriter;
@@ -80,7 +81,6 @@ pub struct Segment {
     pub file_state: parking_lot::Mutex<SegmentFileState>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
-    pub needs_backup_update: AtomicBool, // Set after compaction to force backup update
     // Tiered memory fields
     /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
     /// Holds the hot/cold state: false = hot (anonymous memory), true = cold (backed by file)
@@ -151,7 +151,6 @@ impl Segment {
             }),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
-            needs_backup_update: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
             last_sync_time: AtomicI64::new(0),
@@ -274,18 +273,11 @@ impl Segment {
             // 4. Reading segment memory during archive is safe - data is copied atomically
             // The reference counter is only for preventing madvise_free during eviction
             let backup_file_path = Path::new(&backup_file);
-            
-            // Check if we need to force backup update (e.g., after compaction)
-            let force_update = self.needs_backup_update.load(Ordering::Acquire);
-            
-            // If backup file already exists and we have a handler, skip archiving
-            // unless force_update is set (segment was compacted)
-            if backup_file_path.exists() && state.backup.is_some() && !force_update {
-                debug!(
-                    "Segment backup {} exists with open handler, skipping archive",
-                    backup_file
-                );
-                return Ok(false);
+            let has_old_backup = backup_file_path.exists();
+            // If backup file already exists, we use make a backup of the existing file
+            if has_old_backup {
+                debug!("Backup file {} already exists, deleting", backup_file);
+                fs::rename(&backup_file, format!("{}.old", backup_file))?;
             }
 
             // Check if WAL file exists
@@ -328,7 +320,8 @@ impl Segment {
                             SEGMENT_SIZE,
                         )?;
                     }
-                    
+                    self.archived.store(true, Ordering::Release);
+                    debug!("WAL file copied to backup for segment {}", self.id);
                     return Ok(true);
                 } else {
                     // WAL file doesn't exist, fall through to memory-based archiving
@@ -371,14 +364,11 @@ impl Segment {
                     writer.flush()?;
                     writer.get_ref().sync_all()?;
                     
-                    // Clear the needs_backup_update flag after successful update
-                    self.needs_backup_update.store(false, Ordering::Release);
-                    
                     debug!(
                         "Archived segment {} to backup file, keeping handler open",
                         self.id
                     );
-                    
+                    self.archived.store(true, Ordering::Release);
                     return Ok(true);
                 } else {
                     return Err(io::Error::new(

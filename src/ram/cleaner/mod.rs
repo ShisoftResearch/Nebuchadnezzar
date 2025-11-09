@@ -136,8 +136,6 @@ impl Cleaner {
         chunk
             .total_space
             .fetch_sub(cleaned_space, Ordering::Relaxed);
-        debug!("Archiving segments for chunk {}", chunk.id);
-        chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
     }
 

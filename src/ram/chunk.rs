@@ -385,7 +385,6 @@ impl Chunk {
                     });
                 }
                 None => {
-                    drop(head);
                     if self.total_space.load(Ordering::Relaxed) >= self.capacity - SEGMENT_SIZE {
                         // No space left
                         if tried_gc {
@@ -434,6 +433,17 @@ impl Chunk {
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                         let new_seg_id = new_seg.id;
                         self.put_segment(new_seg);
+                        match head.archive() {
+                            Ok(false) => {
+                                warn!("Old egment {} archive failed after allocation", head.id);
+                            },
+                            Err(e) => {
+                                warn!("Old segment {} archive failed after allocation: {}", head.id, e);
+                            },
+                            Ok(true) => {
+                                debug!("Old segment {} archived after allocation", head.id);
+                            },
+                        }
                         self.head_seg_id.store(new_seg_id, Ordering::Release);
                     }
                     // whether the segment acquisition success or not,
@@ -1082,35 +1092,6 @@ impl Chunk {
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
         return mapping;
-    }
-
-    pub fn check_and_archive_segments(&self) {
-        let seg_ids = self.segment_ids();
-        let head_id = self.get_head_seg_id();
-        for seg_id in seg_ids {
-            if seg_id as u64 == head_id {
-                continue;
-            } // never archive head segments
-            let seg_key = seg_id as usize;
-            if let Some(segment) = self.segs.get(&seg_key) {
-                if !segment.lock_hot() {
-                    continue;
-                }
-                if segment
-                    .archived
-                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    if let Err(e) = segment.archive() {
-                        error!(
-                            "Cannot archive segment {} (chunk {}), reason:{:?}",
-                            seg_id, self.id, e
-                        )
-                    }
-                }
-                segment.set_hot();
-            }
-        }
     }
 
     /// Protect a segment from being cleaned by the garbage collector.

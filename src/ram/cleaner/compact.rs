@@ -194,7 +194,7 @@ impl CompactCleaner {
         // Note: final space may include entries we kept that weren't in live_entries scan
         // due to concurrent updates, so use actual used_spaces() values
         let final_used_space = seg.used_spaces() as usize;
-        let space_cleaned = if original_used_space > final_used_space {
+        let space_cleaned = if original_used_space >= final_used_space {
             original_used_space - final_used_space
         } else {
             // Can happen if entries were added during compaction (shouldn't normally happen)
@@ -204,14 +204,19 @@ impl CompactCleaner {
             );
             0
         };
-
+        match seg.archive() { // force archive to update backup file
+            Ok(true) => {},
+            Ok(false) => {
+                warn!("Segment {} archive failed after compaction", seg.id);
+            },
+            Err(e) => {
+                warn!("Segment {} archive failed after compaction: {}", seg.id, e);
+            },
+        }
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {}) released {} tombstones",
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
-
-        // Mark segment as needing backup update since content has changed
-        seg.needs_backup_update.store(true, Ordering::Release);
 
         // Release reference before unlocking
         seg.references.fetch_sub(1, Ordering::Relaxed);
