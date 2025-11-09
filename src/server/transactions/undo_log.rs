@@ -2089,8 +2089,19 @@ mod tests {
         let undo_log_path = temp_dir.path().join("undo");
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
+        let raft_path = temp_dir.path().join("raft");
 
         let server_addr = String::from("127.0.0.1:5311"); // Unique port for this test
+        
+        let schema = crate::ram::schema::Schema::new_with_id(
+            1,
+            &String::from("test"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
@@ -2102,23 +2113,23 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Enable Raft persistence for schema
             },
             &server_addr,
             "test",
-            async |_| {},
+            async move |_| {},
         )
         .await;
-
-        let schema = crate::ram::schema::Schema::new_with_id(
-            1,
-            &String::from("test"),
-            None,
-            default_fields(),
-            false,
-            false,
-        );
-        server.meta.schemas.new_schema(schema.clone());
+        
+        // Add schema via async client so it's persisted to Raft
+        use crate::client::AsyncClient;
+        let client = AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr.clone()],
+            "test"
+        ).await.unwrap();
+        client.new_schema_with_id(schema.clone()).await.unwrap().unwrap();
 
         // First, write a cell outside of transaction
         let mut data_map = OwnedMap::new();
@@ -2200,15 +2211,13 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Use same Raft storage to recover schema
             },
             &server_addr,
             "test",
-            async |_| {},
+            async move |_| {},
         )
         .await;
-
-        server2.meta.schemas.new_schema(schema.clone());
 
         // Cell should have original value after rollback
         let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();
@@ -2239,8 +2248,19 @@ mod tests {
         let undo_log_path = temp_dir.path().join("undo");
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
+        let raft_path = temp_dir.path().join("raft");
 
         let server_addr = String::from("127.0.0.1:5312"); // Unique port for this test
+        
+        let schema = crate::ram::schema::Schema::new_with_id(
+            1,
+            &String::from("test"),
+            None,
+            default_fields(),
+            false,
+            false,
+        );
+        
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
@@ -2252,23 +2272,23 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Enable Raft persistence for schema
             },
             &server_addr,
             "test",
-            async |_| {},
+            async move |_| {},
         )
         .await;
-
-        let schema = crate::ram::schema::Schema::new_with_id(
-            1,
-            &String::from("test"),
-            None,
-            default_fields(),
-            false,
-            false,
-        );
-        server.meta.schemas.new_schema(schema.clone());
+        
+        // Add schema via async client so it's persisted to Raft
+        use crate::client::AsyncClient;
+        let client = AsyncClient::new(
+            &server.rpc,
+            &server.membership,
+            &vec![server_addr.clone()],
+            "test"
+        ).await.unwrap();
+        client.new_schema_with_id(schema.clone()).await.unwrap().unwrap();
 
         // First, write a cell outside of transaction
         let mut data_map = OwnedMap::new();
@@ -2334,15 +2354,13 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path.to_str().unwrap().to_string()), // Use same Raft storage to recover schema
             },
             &server_addr,
             "test",
-            async |_| {},
+            async move |_| {},
         )
         .await;
-
-        server2.meta.schemas.new_schema(schema.clone());
 
         // Cell should exist after rollback
         let restored_cell = server2.chunks.read_cell(&cell_id).unwrap();

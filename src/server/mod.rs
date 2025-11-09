@@ -198,17 +198,20 @@ impl NebServer {
             match transactions::undo_log::UndoLogger::new(undo_log_path.clone()) {
                 Ok(log) => {
                     // Recover undo log from disk and get incomplete transactions
-                    match log.recover() {
-                        Ok(txn_index) => {
-                            // Perform rollback for incomplete transactions
-                            // Segments are already in memory, so we can read directly from them
-                            if let Err(e) = log.rollback_incomplete_transactions(txn_index, &chunks)
-                            {
-                                error!("Failed to rollback incomplete transactions: {:?}", e);
+                    // Only perform recovery if enable_recovery is true
+                    if opts.enable_recovery {
+                        match log.recover() {
+                            Ok(txn_index) => {
+                                // Perform rollback for incomplete transactions
+                                // Segments are already in memory, so we can read directly from them
+                                if let Err(e) = log.rollback_incomplete_transactions(txn_index, &chunks)
+                                {
+                                    error!("Failed to rollback incomplete transactions: {:?}", e);
+                                }
                             }
-                        }
-                        Err(e) => {
-                            error!("Failed to recover undo log: {:?}", e);
+                            Err(e) => {
+                                error!("Failed to recover undo log: {:?}", e);
+                            }
                         }
                     }
 
