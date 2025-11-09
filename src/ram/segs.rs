@@ -267,7 +267,7 @@ impl Segment {
         );
 
         if let Some(backup_file) = backup_path_opt {
-            while !self.no_references() { /* wait until all references released */ }
+            // while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(&backup_file);
             
             // Check if we need to force backup update (e.g., after compaction)
