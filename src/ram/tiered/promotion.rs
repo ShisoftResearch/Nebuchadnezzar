@@ -3,7 +3,7 @@ use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
 use crate::ram::tiered::cell_locking;
 use libc::{mmap, munmap, MAP_PRIVATE, PROT_READ};
-use std::io;
+use std::io::{self, Write};
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -84,7 +84,68 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     // Lock file_state to access or create the backup file handler
     let mut file_state = segment.file_state.lock();
     
-    // Get or create backup file handler
+    // Get backup path and verify it exists BEFORE opening
+    let backup_path = file_state
+        .manager
+        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+        .unwrap_or_else(|| String::from("<unknown>"));
+    
+    // CRITICAL: Verify backup file exists before attempting to open/mmap
+    // A cold segment MUST have a backup file - if it doesn't exist, this is a bug
+    let backup_path_obj = std::path::Path::new(&backup_path);
+    if !backup_path_obj.exists() {
+        error!(
+            "CRITICAL: Segment {} is marked COLD but backup file does not exist: {}",
+            segment.id, backup_path
+        );
+        error!(
+            "This indicates the segment was evicted without proper archiving, or the backup file was deleted"
+        );
+        segment.set_cold();
+        panic!(
+            "Cannot promote segment {}: backup file does not exist at {}",
+            segment.id, backup_path
+        );
+    }
+    
+    // Verify backup file is readable and non-empty
+    match std::fs::metadata(&backup_path) {
+        Ok(metadata) => {
+            if metadata.len() == 0 {
+                error!(
+                    "CRITICAL: Backup file for segment {} exists but is empty: {}",
+                    segment.id, backup_path
+                );
+                segment.set_cold();
+                panic!(
+                    "Cannot promote segment {}: backup file is empty at {}",
+                    segment.id, backup_path
+                );
+            }
+            debug!(
+                "Backup file for segment {} exists and has size {} bytes: {}",
+                segment.id,
+                metadata.len(),
+                backup_path
+            );
+        }
+        Err(e) => {
+            error!(
+                "Failed to get metadata for backup file of segment {}: {} (path: {})",
+                segment.id, e, backup_path
+            );
+            segment.set_cold();
+            panic!(
+                "Cannot promote segment {}: failed to access backup file at {}: {}",
+                segment.id, backup_path, e
+            );
+        }
+    }
+    
+    // Get or create backup file handler for future writes
+    // The file is opened with BOTH read and write permissions, which allows:
+    // 1. mmap with PROT_READ for promotion (this function)
+    // 2. Writing for archive operations (e.g., after compaction by cleaner)
     if file_state.backup.is_none() {
         // Open existing backup file with read+write access
         file_state.backup = match file_state.manager.open_or_create_backup_writer(
@@ -96,53 +157,100 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             Ok(writer) => writer,
             Err(e) => {
                 error!(
-                    "Failed to open backup file for segment {}: {}",
-                    segment.id, e
+                    "Failed to open backup file for segment {}: {} (path: {})",
+                    segment.id, e, backup_path
                 );
                 segment.set_cold();
-                panic!();
+                panic!(
+                    "Cannot promote segment {}: failed to open backup file: {}",
+                    segment.id, e
+                );
             }
         };
     }
 
+    // CRITICAL: Flush the BufWriter before mmapping to ensure all data is on disk
+    // This prevents mmap from reading stale data and avoids potential conflicts
+    if let Some(ref mut writer) = file_state.backup {
+        if let Err(e) = writer.flush() {
+            error!(
+                "Failed to flush backup file for segment {}: {} (path: {})",
+                segment.id, e, backup_path
+            );
+            segment.set_cold();
+            panic!(
+                "Cannot promote segment {}: failed to flush backup file: {}",
+                segment.id, e
+            );
+        }
+        debug!("Flushed backup file for segment {} before mmap", segment.id);
+    }
+
     // Extract file descriptor from the backup file handler
+    // This fd has both read and write permissions, allowing:
+    // - mmap with PROT_READ for promotion
+    // - Future write operations (e.g., archive after compaction)
+    use std::os::unix::io::AsRawFd;
     let fd = if let Some(ref writer) = file_state.backup {
-        use std::os::unix::io::AsRawFd;
         writer.get_ref().as_raw_fd()
     } else {
         error!("Failed to get backup file handler for segment {}", segment.id);
         segment.set_cold();
-        panic!();
+        panic!(
+            "Cannot promote segment {}: no backup file handler available",
+            segment.id
+        );
     };
 
-    // Get backup path for logging
-    let backup_path = file_state
-        .manager
-        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
-        .unwrap_or_else(|| String::from("<unknown>"));
-
-    // Release the file_state lock before performing long operations
-    // The file descriptor remains valid as long as the file is open
+    // Release the file_state lock before performing long operations (mmap, data copy)
+    // The file descriptor remains valid as long as the BufWriter in file_state exists
     drop(file_state);
 
     // Step 6: mmap file to a TEMPORARY location (NOT the segment address)
     // This allows us to scan the data without corrupting the existing segment
     // Get the actual file size BEFORE mmap to avoid mapping beyond the file
-    let file_size = match std::fs::metadata(&backup_path) {
-        Ok(metadata) => metadata.len() as usize,
+    let (file_size, file_permissions) = match std::fs::metadata(&backup_path) {
+        Ok(metadata) => {
+            let size = metadata.len() as usize;
+            let perms = metadata.permissions();
+            debug!(
+                "Backup file for segment {}: size={} bytes, readonly={}, mode={:?}",
+                segment.id,
+                size,
+                perms.readonly(),
+                perms
+            );
+            (size, perms)
+        }
         Err(e) => {
             error!("Failed to get file size for segment {}: {}", segment.id, e);
-            // Note: Don't close fd - it's owned by the BufWriter in file_state
+            segment.set_cold();
             panic!("Failed to get file size for segment {}: {}", segment.id, e);
         }
     };
+
+    // Check if file is readable
+    use std::os::unix::fs::PermissionsExt;
+    let mode = file_permissions.mode();
+    let is_readable = (mode & 0o400) != 0; // Owner read permission
+    if !is_readable {
+        error!(
+            "CRITICAL: Backup file for segment {} is not readable (mode: {:o}): {}",
+            segment.id, mode, backup_path
+        );
+        segment.set_cold();
+        panic!(
+            "Cannot promote segment {}: backup file is not readable (mode: {:o})",
+            segment.id, mode
+        );
+    }
 
     // Limit mapping size to actual file size to avoid SIGBUS
     let map_size = file_size.min(SEGMENT_SIZE);
 
     debug!(
-        "Mapping cold file (fd={}) for segment {} to temporary location (file_size={}, map_size={})",
-        fd, segment.id, file_size, map_size
+        "Mapping cold file (fd={}, path={}) for segment {} to temporary location (file_size={}, map_size={}, mode={:o})",
+        fd, backup_path, segment.id, file_size, map_size, mode
     );
     let temp_addr = unsafe {
         mmap(
@@ -158,13 +266,24 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     if temp_addr == libc::MAP_FAILED {
         let err = io::Error::last_os_error();
         error!(
-            "Failed to mmap cold file for segment {}: {}",
-            segment.id, err
+            "Failed to mmap cold file for segment {}: {} (fd={}, path={}, size={}, mode={:o})",
+            segment.id, err, fd, backup_path, map_size, mode
         );
-        // Note: Don't close fd - it's owned by the BufWriter in file_state
+        error!(
+            "This may indicate: 1) File permission issues, 2) SELinux/AppArmor restrictions, 3) Filesystem doesn't support mmap"
+        );
+        
+        // Try to get more diagnostic info
+        let canonical_path = std::fs::canonicalize(&backup_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(&backup_path));
+        error!(
+            "Canonical backup path: {:?}",
+            canonical_path
+        );
+        
         segment.set_cold();
         panic!(
-            "Failed to mmap cold file for segment {}: {}",
+            "Failed to mmap cold file for segment {}: {} (Check file permissions and filesystem support)",
             segment.id, err
         );
     }
@@ -237,6 +356,10 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     // Step 11: Unmap temporary file
     unsafe { munmap(temp_addr, map_size) };
     debug!("Unmapped temporary mapping for segment {}", segment.id);
+    
+    // Note: The file descriptor remains open in file_state.backup for future use
+    // (e.g., archiving after compaction). It will be closed when the segment is dropped.
+    
     info!(
         "Successfully promoted segment {} to hot storage with cell locking",
         segment.id
