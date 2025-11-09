@@ -14,15 +14,18 @@ use std::thread;
 /// 1. Try to acquire segment lock (skip if already locked by another operation)
 /// 2. Check if already cold (skip if so)
 /// 3. Wait for no active references (prevents races with cleaner)
-/// 4. Lock all cell IDs in the cell index (prevents new readers)
-/// 5. Write segment data to backup file
+/// 4. Write segment data to backup file (acquires and releases file_state)
+/// 5. Lock all cell IDs in the cell index (prevents new readers)
 /// 6. Mark as cold and free physical pages (update tiered_lock)
 /// 7. Unlock all cells
+///
+/// Lock ordering: tiered_lock → file_state → cell_locks
+/// This matches promotion to prevent deadlock.
 ///
 /// This approach:
 /// - Prevents readers from acquiring cell locks during/after eviction
 /// - Ensures no one can access memory that's being freed
-/// - Archive happens while cells are locked (safe)
+/// - Archive happens before cell locking to maintain consistent lock ordering
 pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> {
     debug!("evict_segment called for segment {}", segment.id);
 
@@ -56,25 +59,9 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
-    // Step 4: Lock all cells in the segment
-    let _cell_locks = match cell_locking::lock_all_cells_in_segment(
-        segment,
-        chunk,
-        segment.entry_iter(),
-        false,
-    ) {
-        Ok(cell_locks) => cell_locks,
-        Err(e) => {
-            warn!(
-                "Failed to lock cells for segment {}: {}. Giving up eviction",
-                segment.id, e
-            );
-            segment.set_hot();
-            return Err(e);
-        }
-    };
-
-    // Step 5: Write segment data to backup file while cells are locked
+    // Step 4: Write segment data to backup file BEFORE locking cells
+    // This maintains lock ordering: tiered_lock → file_state → cell_locks
+    // archive() will acquire and release file_state internally
     let archived = match segment.archive() {
         Ok(archived) => archived,
         Err(e) => {
@@ -116,6 +103,25 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             ),
         ));
     }
+
+    // Step 5: Lock all cells in the segment AFTER archiving
+    // This maintains lock ordering: tiered_lock → file_state → cell_locks
+    let _cell_locks = match cell_locking::lock_all_cells_in_segment(
+        segment,
+        chunk,
+        segment.entry_iter(),
+        false,
+    ) {
+        Ok(cell_locks) => cell_locks,
+        Err(e) => {
+            warn!(
+                "Failed to lock cells for segment {}: {}. Giving up eviction",
+                segment.id, e
+            );
+            segment.set_hot();
+            return Err(e);
+        }
+    };
 
     // Step 6: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();

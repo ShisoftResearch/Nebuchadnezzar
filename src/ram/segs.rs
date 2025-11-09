@@ -92,6 +92,16 @@ pub struct Segment {
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
 }
 
+/// File state for a segment, protected by a mutex
+/// 
+/// **LOCK ORDERING INVARIANT**:
+/// To prevent deadlock, locks must be acquired in this order:
+/// 1. `tiered_lock` (atomic, not a mutex)
+/// 2. `file_state` (this mutex)
+/// 3. Cell locks (via cell_index)
+///
+/// All code paths that acquire multiple locks MUST follow this order.
+/// See eviction.rs and promotion.rs for examples.
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
     pub wal: Option<BufWriter<File>>,
