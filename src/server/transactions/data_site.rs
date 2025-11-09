@@ -316,7 +316,13 @@ impl DataManager {
         let meta_ref = self.cell_meta_mutex(id);
         let mut meta = meta_ref.lock();
         let committing = meta.owner.is_some();
-        let read_too_late = &meta.write > tid;
+        
+        // Use the more recent timestamp between the transaction ID and the incoming clock
+        // This allows transactions to proceed even if their original timestamp is stale
+        // due to clock updates from concurrent transactions
+        let effective_ts = if clock > tid { clock } else { tid };
+        let read_too_late = &meta.write > effective_ts;
+        
         txn.last_activity = get_time();
         if txn.state != TxnState::Started {
             return Err(self.response_with(TxnExecResult::StateError(txn.state)));
@@ -327,8 +333,9 @@ impl DataManager {
             // Write timestamp is newer - not realizable even if still committing
             // The timestamp constraint won't change after waiting
             warn!(
-                "ReadTooLate: Transaction {:?} trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
+                "ReadTooLate: Transaction {:?} (effective ts: {:?}) trying to read cell {:?} but write timestamp {:?} is newer. Transaction timestamp is older than cell's write timestamp.",
                 tid,
+                effective_ts,
                 id,
                 meta.write
             );
@@ -345,9 +352,9 @@ impl DataManager {
             return Err(self.response_with(TxnExecResult::Wait));
         }
 
-        // Cell is available, update read timestamp
-        if &meta.read < tid {
-            meta.read = tid.clone()
+        // Cell is available, update read timestamp using the effective timestamp
+        if &meta.read < effective_ts {
+            meta.read = effective_ts.clone()
         }
         return Ok(());
     }
@@ -436,6 +443,10 @@ impl Service for DataManager {
         // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
+        
+        // Use the more recent timestamp between the transaction ID and the incoming clock
+        let effective_ts = if &clock > &tid { clock } else { tid.clone() };
+        
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         if txn.state != TxnState::Started && txn.state != TxnState::Prepared {
@@ -450,13 +461,21 @@ impl Service for DataManager {
         }
         for cell_mutex in &cell_mutices {
             let meta = cell_mutex.lock();
-            if tid < meta.read {
+            if effective_ts < meta.read {
                 // write too late
+                debug!(
+                    "PREPARE: Write too late for {:?} (effective ts: {:?}), cell read timestamp: {:?}",
+                    tid, effective_ts, meta.read
+                );
                 break;
             }
-            if tid < meta.write {
+            if effective_ts < meta.write {
                 // write timestamp conflict - reject during prepare
                 // Thomas Write Rule will be applied during commit phase
+                debug!(
+                    "PREPARE: Write conflict for {:?} (effective ts: {:?}), cell write timestamp: {:?}",
+                    tid, effective_ts, meta.write
+                );
                 break;
             }
             cell_guards.push(meta);
@@ -486,6 +505,10 @@ impl Service for DataManager {
         cells: Vec<CommitOp>,
     ) -> BoxFuture<'_, DataSiteResponse<DMCommitResult>> {
         self.update_clock(&clock);
+        
+        // Use the more recent timestamp between the transaction ID and the incoming clock
+        let effective_ts = if &clock > &tid { &clock } else { &tid };
+        
         let txn_lock = self.get_transaction(&tid);
         let mut txn = txn_lock.lock();
         txn.last_activity = get_time();
@@ -527,16 +550,16 @@ impl Service for DataManager {
 
                         // Apply Thomas Write Rule: Skip if this write is obsolete
                         // Check if a later transaction has already written to this cell
-                        let should_skip = {
+                        let (should_skip, write_ts) = {
                             let meta_ref = self.cell_meta_mutex(&cell_id);
                             let meta = meta_ref.lock();
-                            &tid < &meta.write
+                            (effective_ts < &meta.write, meta.write.clone())
                         };
 
                         if should_skip {
                             debug!(
-                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (tid {:?} < write timestamp)",
-                                cell_id, tid
+                                "Thomas Write Rule: Skipping obsolete write for cell {:?} (effective ts {:?} < write timestamp {:?})",
+                                cell_id, effective_ts, write_ts
                             );
                             continue;
                         }
@@ -562,7 +585,7 @@ impl Service for DataManager {
 
                                 txn.history
                                     .insert(cell_id, CellHistory::new(None, header.version));
-                                self.update_cell_write(&cell_id, &tid);
+                                self.update_cell_write(&cell_id, effective_ts);
                             }
                             Err(error) => {
                                 write_error = Some((cell.id(), error));
@@ -625,7 +648,7 @@ impl Service for DataManager {
                             Ok(()) => {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
-                                self.update_cell_write(cell_id, &tid);
+                                self.update_cell_write(cell_id, effective_ts);
                             }
                             Err(error) => {
                                 // Remove protection if operation failed
@@ -700,7 +723,7 @@ impl Service for DataManager {
                                     cell_id,
                                     CellHistory::new(Some(old_cell_ref), cell.header.version),
                                 );
-                                self.update_cell_write(&cell_id, &tid);
+                                self.update_cell_write(&cell_id, effective_ts);
                             }
                             Err(error) => {
                                 // Remove protection if operation failed
