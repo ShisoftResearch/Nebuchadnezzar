@@ -16,6 +16,7 @@ use crate::{
 use super::schema::Schema;
 use lightning::aarc::Arc as AArc;
 use lightning::map::{Map, PtrHashMap, WordMap, WordMutexGuard};
+use lightning::spin_hint::Backoff;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -356,10 +357,12 @@ impl Chunk {
 
     pub fn try_acquire(&self, size: u32) -> Option<PendingEntry> {
         let mut tried_gc = false;
+        let backoff = Backoff::new();
         loop {
             let head_seg_id = self.get_head_seg_id();
             if head_seg_id == u64::MAX {
                 // Allocating new segment in progress, wait for it to complete
+                backoff.spin();
                 continue;
             }
             // Try to get the head segment. If it's been removed (e.g., by cleaner after
@@ -409,11 +412,6 @@ impl Chunk {
                         debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
                     }
-
-                    if !self.head_seg_id.compare_exchange(head_seg_id, u64::MAX, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-                        // New segment allocated, retry
-                        continue;
-                    }
                     // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
                     // This ensures we never exceed physical memory limit
                     #[cfg(feature = "tiered_memory")]
@@ -436,6 +434,12 @@ impl Chunk {
                         }
                     }
 
+
+                    if !self.head_seg_id.compare_exchange(head_seg_id, u64::MAX, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                        // New segment allocated, retry
+                        backoff.spin();
+                        continue;
+                    }
                     // head segment did not changed and locked, suitable for creating a new segment and point it to
                     let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
                     let new_seg = new_seg_opt.expect("No space left after full GCs");
@@ -443,6 +447,7 @@ impl Chunk {
                     self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     let new_seg_id = new_seg.id;
                     self.put_segment(new_seg);
+                    self.head_seg_id.store(new_seg_id, Ordering::Release);
                     match head.archive() {
                         Ok(false) => {
                             warn!("Old egment {} archive failed after allocation", head.id);
@@ -454,7 +459,6 @@ impl Chunk {
                             debug!("Old segment {} archived after allocation", head.id);
                         },
                     }
-                    self.head_seg_id.store(new_seg_id, Ordering::Release);
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
                 }
