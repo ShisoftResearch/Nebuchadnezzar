@@ -1,8 +1,13 @@
 /// Test to verify that segment allocation maintains 8-byte alignment
 /// even under concurrent stress conditions
-use crate::ram::segs::{Segment, SegmentAllocator, SEGMENT_SIZE};
+use crate::ram::file_manager::SegmentFileManager;
+use crate::ram::segs::{SegmentAllocator, SEGMENT_SIZE};
 use std::sync::Arc;
 use std::thread;
+
+fn new_test_file_manager() -> Arc<SegmentFileManager> {
+    Arc::new(SegmentFileManager::new(None, None))
+}
 
 #[test]
 fn test_segment_initial_alignment() {
@@ -10,11 +15,12 @@ fn test_segment_initial_alignment() {
     println!();
 
     let allocator = Arc::new(SegmentAllocator::new(0, SEGMENT_SIZE * 100));
+    let file_manager = new_test_file_manager();
 
     // Allocate several segments and verify alignment
     for i in 0..10 {
         let seg = allocator
-            .alloc_seg(&None, &None)
+            .alloc_seg(&file_manager)
             .expect("Failed to allocate segment");
         println!(
             "Segment {} address: 0x{:016x} (8-byte aligned: {})",
@@ -40,8 +46,9 @@ fn test_segment_try_acquire_alignment() {
     println!();
 
     let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 10);
+    let file_manager = new_test_file_manager();
     let seg = allocator
-        .alloc_seg(&None, &None)
+        .alloc_seg(&file_manager)
         .expect("Failed to allocate segment");
 
     println!("Initial segment address: 0x{:016x}", seg.addr);
@@ -91,16 +98,18 @@ fn test_segment_concurrent_allocation_alignment() {
     println!();
 
     let allocator = Arc::new(SegmentAllocator::new(0, SEGMENT_SIZE * 1000));
+    let file_manager = new_test_file_manager();
     let num_threads = 10;
     let allocations_per_thread = 50;
 
     let handles: Vec<_> = (0..num_threads)
         .map(|thread_id| {
             let allocator = Arc::clone(&allocator);
+            let file_manager = Arc::clone(&file_manager);
             thread::spawn(move || {
                 let mut misaligned_count = 0;
                 for i in 0..allocations_per_thread {
-                    if let Some(seg) = allocator.alloc_seg(&None, &None) {
+                    if let Some(seg) = allocator.alloc_seg(&file_manager) {
                         if seg.addr % 8 != 0 {
                             eprintln!(
                                 "❌ Thread {} allocation {} got misaligned address: 0x{:016x}",
@@ -148,9 +157,10 @@ fn test_segment_try_acquire_concurrent_alignment() {
     println!();
 
     let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 10);
+    let file_manager = new_test_file_manager();
     let seg = Arc::new(
         allocator
-            .alloc_seg(&None, &None)
+            .alloc_seg(&file_manager)
             .expect("Failed to allocate segment"),
     );
 
@@ -218,8 +228,9 @@ fn test_segment_append_header_increments() {
     println!();
 
     let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 10);
+    let file_manager = new_test_file_manager();
     let seg = allocator
-        .alloc_seg(&None, &None)
+        .alloc_seg(&file_manager)
         .expect("Failed to allocate segment");
 
     println!("Testing REALISTIC allocation sizes (8-byte aligned):");

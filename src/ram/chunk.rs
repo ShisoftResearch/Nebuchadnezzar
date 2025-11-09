@@ -291,20 +291,20 @@ impl Chunk {
     ) -> Chunk {
         let allocate_memory = base_addr == 0;
         let allocator = SegmentAllocator::new_with_base(id, base_addr, size, allocate_memory);
-        
+
         // Create file manager
         let file_manager = Arc::new(SegmentFileManager::new(
             backup_storage.clone(),
             wal_storage.clone(),
         ));
-        
+
         // Initialize storage directories
         if let Err(e) = file_manager.init_directories() {
             panic!("Failed to initialize storage directories: {}", e);
         }
-        
+
         let bootstrap_segment = allocator
-            .alloc_seg(&backup_storage, &wal_storage)
+            .alloc_seg(&file_manager)
             .expect(&format!("No space left for first segment in chunk {}", id));
         let num_segs = {
             let n = size / SEGMENT_SIZE;
@@ -428,9 +428,7 @@ impl Chunk {
                     let header_id = self.get_head_seg_id() as usize;
                     if head_seg_id == header_id {
                         // head segment did not changed and locked, suitable for creating a new segment and point it to
-                        let new_seg_opt = self
-                            .allocator
-                            .alloc_seg(&self.backup_storage, &self.wal_storage);
+                        let new_seg_opt = self.allocator.alloc_seg(&self.file_manager);
                         let new_seg = new_seg_opt.expect("No space left after full GCs");
                         // for performance, won't CAS total_space
                         self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
@@ -917,7 +915,7 @@ impl Chunk {
 
         // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
-            seg.dispense(&self.file_manager);
+            seg.dispense();
         }
     }
 
@@ -1054,10 +1052,10 @@ impl Chunk {
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
-                seg.id != head_seg_id 
-                && seg.no_references()
-                && !self.is_segment_protected(seg.id) // Don't clean protected segments
-                && seg.is_hot() // Don't clean cold segments (tiered memory)
+                seg.id != head_seg_id
+                    && seg.no_references()
+                    && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                    && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -1075,11 +1073,11 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 0.50f32 
-            && head_seg_id != seg.id 
-            && seg.no_references()
-            && !self.is_segment_protected(seg.id) // Don't clean protected segments
-            && seg.is_hot() // Don't clean cold segments (tiered memory)
+                *utilization < 0.50f32
+                    && head_seg_id != seg.id
+                    && seg.no_references()
+                    && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                    && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
@@ -1103,7 +1101,7 @@ impl Chunk {
                     .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                     .is_ok()
                 {
-                    if let Err(e) = segment.archive(&self.file_manager) {
+                    if let Err(e) = segment.archive() {
                         error!(
                             "Cannot archive segment {} (chunk {}), reason:{:?}",
                             seg_id, self.id, e

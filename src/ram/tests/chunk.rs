@@ -623,13 +623,15 @@ fn test_wal_cleanup_after_archive() {
     info!("WAL file exists: {}", wal_file_name);
 
     // Get the expected backup file name using file_manager
-    let backup_file_name = chunk.file_manager.backup_path(segment.chunk_id, segment.id, segment.seq_id)
+    let backup_file_name = chunk
+        .file_manager
+        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
         .expect("Should have backup file path");
     info!("Expected backup file: {}", backup_file_name);
 
     // Archive the segment
     info!("Archiving segment...");
-    let result = segment.archive(&chunk.file_manager).unwrap();
+    let result = segment.archive().unwrap();
     assert!(result, "Archive should succeed");
 
     // Verify backup file exists
@@ -713,13 +715,15 @@ fn test_wal_file_handle_properly_closed() {
     let chunk = &chunks.list[0];
     let seg_ids = chunk.segment_ids();
     let segment = chunk.segs.get(&seg_ids[0]).unwrap();
-    let wal_file_path = chunk.file_manager.wal_path(segment.chunk_id, segment.id, segment.seq_id)
+    let wal_file_path = chunk
+        .file_manager
+        .wal_path(segment.chunk_id, segment.id, segment.seq_id)
         .expect("Should have WAL file path");
 
     info!("Testing file handle closure for: {}", wal_file_path);
 
     // Archive the segment
-    segment.archive(&chunk.file_manager).unwrap();
+    segment.archive().unwrap();
 
     // Try to open the WAL file path (should fail because it's deleted)
     let open_result = OpenOptions::new().read(true).open(&wal_file_path);
@@ -803,15 +807,17 @@ fn test_multiple_segments_wal_cleanup() {
     // Collect WAL and backup file names
     for seg_id in &seg_ids {
         if let Some(segment) = chunk.segs.get(seg_id) {
-            if let Some(wal_name) = chunk
-                .file_manager
-                .wal_path(segment.chunk_id, segment.id, segment.seq_id)
+            if let Some(wal_name) =
+                chunk
+                    .file_manager
+                    .wal_path(segment.chunk_id, segment.id, segment.seq_id)
             {
                 wal_files.push(wal_name);
             }
-            if let Some(backup_name) = chunk
-                .file_manager
-                .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+            if let Some(backup_name) =
+                chunk
+                    .file_manager
+                    .backup_path(segment.chunk_id, segment.id, segment.seq_id)
             {
                 backup_files.push(backup_name);
             }
@@ -832,7 +838,7 @@ fn test_multiple_segments_wal_cleanup() {
                 continue;
             }
 
-            match segment.archive(&chunk.file_manager) {
+            match segment.archive() {
                 Ok(true) => {
                     info!("Archived segment {}", seg_id);
                 }
@@ -932,13 +938,17 @@ fn test_archive_idempotency() {
     let seg_ids = chunk.segment_ids();
     let segment = chunk.segs.get(&seg_ids[0]).unwrap();
 
-    let wal_file = chunk.file_manager.wal_path(segment.chunk_id, segment.id, segment.seq_id)
+    let wal_file = chunk
+        .file_manager
+        .wal_path(segment.chunk_id, segment.id, segment.seq_id)
         .expect("Should have WAL file path");
-    let backup_file = chunk.file_manager.backup_path(segment.chunk_id, segment.id, segment.seq_id)
+    let backup_file = chunk
+        .file_manager
+        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
         .expect("Should have backup file path");
 
     // First archive
-    let result1 = segment.archive(&chunk.file_manager).unwrap();
+    let result1 = segment.archive().unwrap();
     assert!(result1, "First archive should succeed");
     assert!(
         !Path::new(&wal_file).exists(),
@@ -950,13 +960,16 @@ fn test_archive_idempotency() {
     );
 
     // Second archive attempt (should be idempotent)
-    let result2 = segment.archive(&chunk.file_manager).unwrap();
+    let result2 = segment.archive().unwrap();
     assert!(
         !result2,
         "Second archive should return false (already archived)"
     );
     assert!(!Path::new(&wal_file).exists(), "WAL should still not exist");
-    assert!(Path::new(&backup_file).exists(), "Backup should still exist");
+    assert!(
+        Path::new(&backup_file).exists(),
+        "Backup should still exist"
+    );
 
     info!("✓ Archive is idempotent - multiple calls are safe");
 }

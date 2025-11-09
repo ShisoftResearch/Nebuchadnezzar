@@ -3,6 +3,7 @@ use crate::dovahkiin::types::Map;
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
 use crate::ram::entry::{EntryContent, EntryType};
+use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::schema::Field;
 use crate::ram::schema::*;
 use crate::ram::types::*;
@@ -223,10 +224,11 @@ fn test_shrink_fully_utilized_segment() {
 
     // Create a segment allocator
     let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 3);
+    let file_manager = Arc::new(SegmentFileManager::new(None, None));
 
     // Allocate a segment
     let segment = allocator
-        .alloc_seg(&None, &None)
+        .alloc_seg(&file_manager)
         .expect("Failed to allocate segment");
 
     // Set append_header to the bound, making the segment fully utilized
@@ -261,10 +263,11 @@ fn test_shrink_larger_than_segment_size() {
 
     // Create a segment allocator
     let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 3);
+    let file_manager = Arc::new(SegmentFileManager::new(None, None));
 
     // Allocate a segment
     let segment = allocator
-        .alloc_seg(&None, &None)
+        .alloc_seg(&file_manager)
         .expect("Failed to allocate segment");
 
     // Call shrink with size larger than SEGMENT_SIZE - this should not panic

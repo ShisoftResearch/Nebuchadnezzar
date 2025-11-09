@@ -174,7 +174,9 @@ fn test_eviction_on_memory_overflow() {
 
         // Verify cold segments have backup files
         for seg in segments.iter().filter(|s| s.is_cold()) {
-            let backup_path = chunk.file_manager.backup_path(seg.chunk_id, seg.id, seg.seq_id)
+            let backup_path = chunk
+                .file_manager
+                .backup_path(seg.chunk_id, seg.id, seg.seq_id)
                 .expect("Cold segment should have backup file path");
             assert!(
                 std::path::Path::new(&backup_path).exists(),

@@ -17,14 +17,13 @@ impl CompactCleaner {
             debug!("Segment {} is not hot or locked, skipping cleaning", seg.id);
             return 0;
         }
-        
+
         // Clean only if segment have fragments
         let dead_space = seg.total_dead_space();
         if dead_space == 0 {
             debug!(
                 "Skip cleaning chunk {} segment {} for it have no dead spaces",
-                chunk.id,
-                dead_space
+                chunk.id, dead_space
             );
             seg.set_hot();
             return 0;
@@ -50,7 +49,10 @@ impl CompactCleaner {
         // malloc to allocate new memory spaces for segments than maintaining seglets mappings in userspace.
         debug!(
             "Compact cleaning segment {} from chunk {}, is hot {}, segment address {:#x}",
-            seg.id, chunk.id, seg.is_hot(), seg.addr
+            seg.id,
+            chunk.id,
+            seg.is_hot(),
+            seg.addr
         );
 
         // scan and mark live entries
@@ -97,7 +99,7 @@ impl CompactCleaner {
                             header.id()
                         );
                         let cell_guard = chunk.cell_index.lock(header.hash as usize);
-                        
+
                         // Check if cell is still at expected location BEFORE moving
                         if let Some(mut guard) = cell_guard {
                             let actual_addr = *guard;
@@ -105,7 +107,7 @@ impl CompactCleaner {
                                 // Cell still at expected location, safe to move
                                 let old_addr = entry_pos;
                                 let new_addr = cursor;
-                                
+
                                 trace!(
                                     "Memcpy cell entry, size: {}, from {} to {}, seg_addr {}, for {:?}",
                                     entry_size,
@@ -114,7 +116,7 @@ impl CompactCleaner {
                                     seg_addr,
                                     entry.content
                                 );
-                                
+
                                 // Now safe to move - we hold the lock
                                 unsafe {
                                     libc::memmove(
@@ -123,7 +125,7 @@ impl CompactCleaner {
                                         entry_size,
                                     );
                                 }
-                                
+
                                 // Update cell_index to point to new location
                                 *guard = new_addr;
                                 cursor += entry_size;
@@ -164,7 +166,7 @@ impl CompactCleaner {
                             old_addr,
                             new_addr
                         );
-                        
+
                         unsafe {
                             libc::memmove(
                                 new_addr as *mut libc::c_void,
@@ -172,7 +174,7 @@ impl CompactCleaner {
                                 entry_size,
                             );
                         }
-                        
+
                         cursor += entry_size;
                     }
                 } else {
@@ -181,7 +183,8 @@ impl CompactCleaner {
                 }
             });
         seg.append_header.store(cursor, Ordering::Release);
-        seg.tombstones.fetch_sub(released_tombstones as u32, Ordering::Relaxed);
+        seg.tombstones
+            .fetch_sub(released_tombstones as u32, Ordering::Relaxed);
         let used_size = cursor - seg_addr;
         if used_size < SEGMENT_SIZE {
             seg.shrink(used_size);
@@ -206,7 +209,7 @@ impl CompactCleaner {
             "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {}) released {} tombstones",
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
-        
+
         // Release reference before unlocking
         seg.references.fetch_sub(1, Ordering::Relaxed);
         seg.set_hot();

@@ -144,14 +144,20 @@ impl SegmentList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ram::file_manager::SegmentFileManager;
     use crate::ram::segs::Segment;
+    use std::sync::Arc;
+
+    fn new_test_file_manager() -> Arc<SegmentFileManager> {
+        Arc::new(SegmentFileManager::new(None, None))
+    }
 
     #[test]
     fn test_segment_list_basic() {
         let list = SegmentList::new(10);
 
         // Create a dummy segment
-        let segment = AArc::new(Segment::new(0, 0, 0, 0x1000, true, &None, &None));
+        let segment = AArc::new(Segment::new(0, 0, 0, 0x1000, true, new_test_file_manager()));
 
         // Insert
         assert!(list.insert(0, segment.clone()).is_none());
@@ -172,10 +178,18 @@ mod tests {
     #[test]
     fn test_segment_list_iteration() {
         let list = SegmentList::new(10);
+        let file_manager = new_test_file_manager();
 
         // Insert a few segments
         for i in 0..5 {
-            let segment = AArc::new(Segment::new(i as u64, 0, 0, 0x1000 * i, true, &None, &None));
+            let segment = AArc::new(Segment::new(
+                i as u64,
+                0,
+                0,
+                0x1000 * i,
+                true,
+                Arc::clone(&file_manager),
+            ));
             list.insert(i, segment);
         }
 
@@ -197,9 +211,24 @@ mod tests {
     #[test]
     fn test_segment_list_replace() {
         let list = SegmentList::new(10);
+        let file_manager = new_test_file_manager();
 
-        let seg1 = AArc::new(Segment::new(0, 1, 0, 0x1000, true, &None, &None));
-        let seg2 = AArc::new(Segment::new(0, 2, 0, 0x1000, true, &None, &None));
+        let seg1 = AArc::new(Segment::new(
+            0,
+            1,
+            0,
+            0x1000,
+            true,
+            Arc::clone(&file_manager),
+        ));
+        let seg2 = AArc::new(Segment::new(
+            0,
+            2,
+            0,
+            0x1000,
+            true,
+            Arc::clone(&file_manager),
+        ));
 
         // Insert first segment
         assert!(list.insert(0, seg1.clone()).is_none());

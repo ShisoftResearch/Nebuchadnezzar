@@ -16,10 +16,7 @@ pub fn discover_segment_files(
     backup_storage: &Option<String>,
     wal_storage: &Option<String>,
 ) -> io::Result<Vec<SegmentFileInfo>> {
-    let file_manager = SegmentFileManager::new(
-        backup_storage.clone(),
-        wal_storage.clone(),
-    );
+    let file_manager = SegmentFileManager::new(backup_storage.clone(), wal_storage.clone());
     file_manager.discover_files()
 }
 
@@ -42,7 +39,7 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
             // Not enough bytes to read a complete entry header
             break;
         }
-        
+
         // Try to decode entry header
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
 
@@ -53,13 +50,13 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
 
         entries_found += 1;
         let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
-        
+
         // Check if the full entry fits within bounds before advancing
         if cursor + entry_size > bound {
             // Entry would exceed bounds, stop here
             break;
         }
-        
+
         cursor += entry_size;
     }
 
@@ -459,11 +456,9 @@ fn phase2_allocate_and_load(
             "[RECOVERY] Allocating segment with original seq_id {}...",
             file_info.seq_id
         );
-        let seg_opt = chunk.allocator.alloc_seg_with_seq_id(
-            file_info.seq_id,
-            &chunk.backup_storage,
-            &chunk.wal_storage,
-        );
+        let seg_opt = chunk
+            .allocator
+            .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager);
 
         let segment = match seg_opt {
             Some(seg) => {
@@ -818,7 +813,7 @@ mod tests {
             // Archive segments to create backup files
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
 
@@ -885,7 +880,7 @@ mod tests {
             println!("Archiving segments...");
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
             println!("Phase 1 complete, dropping chunks...");
@@ -963,7 +958,7 @@ mod tests {
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
                     println!("Archiving segment {} with seq_id {}", seg.id, seg.seq_id);
-                    let result = seg.archive(&chunk.file_manager).unwrap();
+                    let result = seg.archive().unwrap();
                     println!("Archive result: {}", result);
                 }
             }
@@ -1071,7 +1066,7 @@ mod tests {
             // Archive
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
 
@@ -1102,7 +1097,7 @@ mod tests {
             // Archive with tombstones
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
         }
@@ -1166,7 +1161,7 @@ mod tests {
             // Archive
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
 
@@ -1265,7 +1260,7 @@ mod tests {
             );
 
             // Archive the segment
-            seg.archive(&chunks.list[0].file_manager).unwrap();
+            seg.archive().unwrap();
         }
 
         // Phase 2: Recover and verify append_header is correctly restored
@@ -1340,7 +1335,7 @@ mod tests {
             chunks.write_cell(&mut cell).unwrap();
 
             let seg = &chunks.list[0].segments()[0];
-            seg.archive(&chunks.list[0].file_manager).unwrap();
+            seg.archive().unwrap();
         }
 
         // Phase 2: Recover - should handle file discovery and deduplication gracefully
@@ -1411,7 +1406,7 @@ mod tests {
             // Archive all segments
             for chunk in &chunks.list {
                 for seg in chunk.segments() {
-                    seg.archive(&chunk.file_manager).unwrap();
+                    seg.archive().unwrap();
                 }
             }
 

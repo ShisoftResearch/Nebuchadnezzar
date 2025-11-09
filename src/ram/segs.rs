@@ -1,6 +1,7 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
+use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::io::align_address;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use bifrost::utils::time::get_time;
@@ -17,6 +18,7 @@ use std::sync::atomic::{
     AtomicBool, AtomicI64, AtomicU32, AtomicUsize,
     Ordering::{self, *},
 };
+use std::sync::Arc;
 use std::{io, slice};
 
 use super::entry::ENTRY_HEAD_SIZE;
@@ -64,7 +66,6 @@ pub const WAL_BUFFER_SIZE: usize = 512 * 1024; // 512KB in-memory buffer (reduce
 pub const WAL_SYNC_BATCH_SIZE: usize = 1 * 1024 * 1024; // Sync after 1MB of writes (reduces fsyncs)
 pub const WAL_SYNC_INTERVAL_MS: i64 = 10; // Sync every 10ms (10x less frequent than before)
 
-#[derive(Default)]
 #[repr(C, align(64))] // Ensure consistent memory layout and cache line alignment
 pub struct Segment {
     pub id: u64,
@@ -76,7 +77,7 @@ pub struct Segment {
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
     pub references: AtomicUsize,
-    pub wal_file: parking_lot::Mutex<Option<BufWriter<File>>>,
+    pub file_state: parking_lot::Mutex<SegmentFileState>,
     pub archived: AtomicBool,
     pub dropped: AtomicBool,
     // Tiered memory fields
@@ -90,6 +91,11 @@ pub struct Segment {
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
 }
 
+pub struct SegmentFileState {
+    pub manager: Arc<SegmentFileManager>,
+    pub wal: Option<BufWriter<File>>,
+}
+
 impl Segment {
     pub fn new(
         id: u64,
@@ -97,31 +103,20 @@ impl Segment {
         chunk_id: usize,
         buffer_ptr: usize,
         hot: bool,
-        backup_storage: &Option<String>,
-        wal_storage: &Option<String>,
+        file_manager: Arc<SegmentFileManager>,
     ) -> Segment {
-        use crate::ram::file_manager::SegmentFileManager;
-        
-        let mut wal_file_opt = None;
         let size = SEGMENT_SIZE;
-        
-        // Use file manager for directory and file creation
-        let file_manager = SegmentFileManager::new(
-            backup_storage.clone(),
-            wal_storage.clone(),
-        );
-        
+
         if let Err(e) = file_manager.init_directories() {
             panic!("Failed to initialize storage directories: {}", e);
         }
-        
-        if wal_storage.is_some() {
-            match file_manager.create_wal_file(chunk_id, id, seq_id, WAL_BUFFER_SIZE) {
-                Ok(file_opt) => wal_file_opt = file_opt,
-                Err(e) => panic!("Failed to create WAL file: {}", e),
-            }
-        }
-        
+
+        let wal_file_opt = match file_manager.create_wal_file(chunk_id, id, seq_id, WAL_BUFFER_SIZE)
+        {
+            Ok(opt) => opt,
+            Err(e) => panic!("Failed to create WAL file: {}", e),
+        };
+
         debug!(
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
             chunk_id, id, seq_id, size, buffer_ptr
@@ -137,7 +132,10 @@ impl Segment {
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
             references: AtomicUsize::new(0),
-            wal_file: parking_lot::Mutex::new(wal_file_opt),
+            file_state: parking_lot::Mutex::new(SegmentFileState {
+                manager: file_manager,
+                wal: wal_file_opt,
+            }),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
@@ -203,8 +201,7 @@ impl Segment {
     // dead space plus tombstone spaces
     pub fn total_dead_space(&self) -> u32 {
         // We count tombstone space becasue we want to actively clean them out when they are obsolete
-        let tombstones_space =
-            self.tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
+        let tombstones_space = self.tombstones.load(Ordering::Relaxed) * TOMBSTONE_SIZE_U32;
         let dead_cells_space = self.dead_space();
         return tombstones_space + dead_cells_space;
     }
@@ -243,14 +240,17 @@ impl Segment {
     }
 
     // archive this segment and write the data to backup storage
-    pub fn archive(&self, file_manager: &crate::ram::file_manager::SegmentFileManager) -> Result<bool, io::Error> {
-        let backup_path_opt = file_manager.backup_path(self.chunk_id, self.id, self.seq_id);
-        
+    pub fn archive(&self) -> Result<bool, io::Error> {
+        let mut state = self.file_state.lock();
+        let backup_path_opt = state
+            .manager
+            .backup_path(self.chunk_id, self.id, self.seq_id);
+
         debug!(
             "archive() called for segment {}, backup_path={:?}",
             self.id, backup_path_opt
         );
-        
+
         if let Some(backup_file) = backup_path_opt {
             while !self.no_references() { /* wait until all references released */ }
             let backup_file_path = Path::new(&backup_file);
@@ -263,33 +263,35 @@ impl Segment {
             }
 
             // Check if WAL file exists
-            if file_manager.wal_exists(self.chunk_id, self.id, self.seq_id) {
+            if state
+                .manager
+                .wal_exists(self.chunk_id, self.id, self.seq_id)
+            {
                 // if there is a WAL file ready, copy this file to backup
                 // First, flush and close the WAL file if it's open
-                {
-                    let mut file_opt = self.wal_file.lock();
-                    if let Some(mut writer) = file_opt.take() {
-                        // Flush and sync the file before closing
-                        writer.flush()?;
-                        writer.get_ref().sync_all()?;
-                        // Writer is dropped here, closing the file handle
-                        // file_opt is now None
-                    } else {
-                        // WAL file was already closed or never opened
-                        // This is fine - we'll read it from disk if it exists
-                        debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
-                    }
+                if let Some(mut writer) = state.wal.take() {
+                    // Flush and sync the file before closing
+                    writer.flush()?;
+                    writer.get_ref().sync_all()?;
+                    // Writer is dropped here, closing the file handle
+                    // state.wal is now None
+                } else {
+                    // WAL file was already closed or never opened
+                    // This is fine - we'll read it from disk if it exists
+                    debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
                 }
 
                 // Copy WAL to backup with padding
-                if file_manager.copy_wal_to_backup(
+                if state.manager.copy_wal_to_backup(
                     self.chunk_id,
                     self.id,
                     self.seq_id,
                     Some(SEGMENT_SIZE),
                 )? {
                     // Delete WAL file after successful copy
-                    file_manager.delete_wal(self.chunk_id, self.id, self.seq_id)?;
+                    state
+                        .manager
+                        .delete_wal(self.chunk_id, self.id, self.seq_id)?;
                     return Ok(true);
                 } else {
                     // WAL file doesn't exist, fall through to memory-based archiving
@@ -299,20 +301,24 @@ impl Segment {
 
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
             {
-                let backup_file = file_manager.create_backup_file(self.chunk_id, self.id, self.seq_id)?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to create backup file"))?;
-                
+                let backup_file = state
+                    .manager
+                    .create_backup_file(self.chunk_id, self.id, self.seq_id)?
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::Other, "Failed to create backup file")
+                    })?;
+
                 // Write only the valid data up to append_header to avoid reading from
                 // memory that may have been freed by punch_hole() during compaction.
                 // Promotion uses mmap() which handles variable-sized files correctly.
                 let valid_size = self.append_header() - self.addr;
                 let write_size = valid_size.max(PAGE_SIZE); // At least one page to ensure file exists
-                
+
                 debug!(
                     "Archiving segment {} from memory: valid_size={}, write_size={}",
                     self.id, valid_size, write_size
                 );
-                
+
                 let mut buffer = BufWriter::with_capacity(write_size, backup_file);
                 unsafe {
                     let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
@@ -332,8 +338,8 @@ impl Segment {
     }
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
-        let mut file_opt = self.wal_file.lock();
-        if let Some(ref mut file) = *file_opt {
+        let mut state = self.file_state.lock();
+        if let Some(ref mut file) = state.wal {
             unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write(data_block)?;
@@ -390,8 +396,8 @@ impl Segment {
     /// Force a WAL sync, ensuring all buffered data is persisted to disk
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
-        let mut file_opt = self.wal_file.lock();
-        if let Some(ref mut file) = *file_opt {
+        let mut state = self.file_state.lock();
+        if let Some(ref mut file) = state.wal {
             file.flush()?;
             file.get_ref().sync_all()?;
 
@@ -419,9 +425,13 @@ impl Segment {
         }
     }
     // remove the backup if it have one
-    pub fn dispense(&self, file_manager: &crate::ram::file_manager::SegmentFileManager) {
+    pub fn dispense(&self) {
         debug!("dispense segment {}", self.id);
-        if let Err(e) = file_manager.delete_all(self.chunk_id, self.id, self.seq_id) {
+        let state = self.file_state.lock();
+        if let Err(e) = state
+            .manager
+            .delete_all(self.chunk_id, self.id, self.seq_id)
+        {
             error!("cannot reclaim segment files on dispense: {}", e);
         }
     }
@@ -616,11 +626,7 @@ impl SegmentAllocator {
         self.offset.load(Relaxed) > self.gc_threshold
     }
 
-    pub fn alloc_seg(
-        &self,
-        backup_storage: &Option<String>,
-        wal_storage: &Option<String>,
-    ) -> Option<Segment> {
+    pub fn alloc_seg(&self, file_manager: &Arc<SegmentFileManager>) -> Option<Segment> {
         self.free
             .pop_front()
             .or_else(|| loop {
@@ -649,8 +655,7 @@ impl SegmentAllocator {
                     self.chunk_id,
                     addr,
                     true,
-                    backup_storage,
-                    wal_storage,
+                    file_manager.clone(),
                 )
             })
     }
@@ -660,8 +665,7 @@ impl SegmentAllocator {
     pub fn alloc_seg_with_seq_id(
         &self,
         seq_id: u64,
-        backup_storage: &Option<String>,
-        wal_storage: &Option<String>,
+        file_manager: &Arc<SegmentFileManager>,
     ) -> Option<Segment> {
         // First allocate the address
         self.free
@@ -691,8 +695,7 @@ impl SegmentAllocator {
                     self.chunk_id,
                     addr,
                     true,
-                    backup_storage,
-                    wal_storage,
+                    file_manager.clone(),
                 )
             })
     }
@@ -716,11 +719,9 @@ impl SegmentAllocator {
     }
 }
 
-
 pub unsafe fn madvise_free(_addr: usize, _size: usize) {
     // madvise(addr as *mut c_void, size, MADV_DONTNEED);
 }
-
 
 fn punch_hole(seg_addr: usize, seg_size: usize) {
     let right_boundary = seg_addr + seg_size;

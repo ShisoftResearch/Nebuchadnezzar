@@ -53,9 +53,7 @@ impl CombinedCleaner {
         // Skip cold segments to avoid accessing evicted data (would trigger promotion)
         let segments = selected_segments
             .iter()
-            .filter(|seg| {
-                seg.id != head_seg_id && seg.lock_hot()
-            })
+            .filter(|seg| seg.id != head_seg_id && seg.lock_hot())
             .cloned()
             .collect_vec();
 
@@ -206,7 +204,7 @@ impl CombinedCleaner {
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
                 );
-                for seg in segments.iter() {    
+                for seg in segments.iter() {
                     seg.set_hot();
                 }
                 return 0;
@@ -216,13 +214,12 @@ impl CombinedCleaner {
                 "Updating cell reference, pending segments {}",
                 pending_segments.len()
             );
-            let file_manager = &chunk.file_manager;
             let new_segs = pending_segments
                 .par_iter()
                 .map(|dummy_seg| {
                     let new_seg = chunk
                         .allocator
-                        .alloc_seg(&chunk.backup_storage, &chunk.wal_storage)
+                        .alloc_seg(&chunk.file_manager)
                         .expect("No space left during combine");
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
@@ -265,7 +262,7 @@ impl CombinedCleaner {
                 })
                 .map(|(segment, cells)| {
                     trace!("Putting new segment {}, cells {}", segment.id, cells.len());
-                    segment.archive(file_manager).unwrap();
+                    segment.archive().unwrap();
                     let new_seg_id = segment.id as usize;
                     chunk.put_segment(segment);
                     let new_seg = chunk.segs.get(&new_seg_id).unwrap();

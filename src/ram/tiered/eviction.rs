@@ -65,14 +65,17 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     ) {
         Ok(cell_locks) => cell_locks,
         Err(e) => {
-            warn!("Failed to lock cells for segment {}: {}. Giving up eviction", segment.id, e);
+            warn!(
+                "Failed to lock cells for segment {}: {}. Giving up eviction",
+                segment.id, e
+            );
             segment.set_hot();
             return Err(e);
         }
     };
 
     // Step 5: Write segment data to backup file while cells are locked
-    let archived = match segment.archive(&chunk.file_manager) {
+    let archived = match segment.archive() {
         Ok(archived) => archived,
         Err(e) => {
             error!("Failed to archive segment {}: {}", segment.id, e);
@@ -86,17 +89,21 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     );
 
     // Get backup path and verify it exists
-    let backup_path = match chunk.file_manager.backup_path(segment.chunk_id, segment.id, segment.seq_id) {
-        Some(backup_path) => backup_path,
-        None => {
-            error!("Segment {} has no backup file path", segment.id);
-            segment.set_hot();
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Segment {} has no backup file path", segment.id),
-            ));
-        }
-    };
+    let backup_path =
+        match chunk
+            .file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+        {
+            Some(backup_path) => backup_path,
+            None => {
+                error!("Segment {} has no backup file path", segment.id);
+                segment.set_hot();
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Segment {} has no backup file path", segment.id),
+                ));
+            }
+        };
 
     // Verify file exists (either newly created or already present)
     if !archived && !std::path::Path::new(&backup_path).exists() {

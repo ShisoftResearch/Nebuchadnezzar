@@ -81,14 +81,18 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     }
 
     // Step 5: Get backup file path and open it
-    let backup_path = match chunk.file_manager.backup_path(segment.chunk_id, segment.id, segment.seq_id) {
-        Some(backup_path) => backup_path,
-        None => {
-            error!("Segment {} has no backup file path", segment.id);
-            segment.set_cold();
-            panic!();
-        }
-    };
+    let backup_path =
+        match chunk
+            .file_manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+        {
+            Some(backup_path) => backup_path,
+            None => {
+                error!("Segment {} has no backup file path", segment.id);
+                segment.set_cold();
+                panic!();
+            }
+        };
 
     let path_cstr = match std::ffi::CString::new(backup_path.as_str()) {
         Ok(path_cstr) => path_cstr,
@@ -121,10 +125,10 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             panic!("Failed to get file size for segment {}: {}", segment.id, e);
         }
     };
-    
+
     // Limit mapping size to actual file size to avoid SIGBUS
     let map_size = file_size.min(SEGMENT_SIZE);
-    
+
     debug!(
         "Mapping cold file (fd={}) for segment {} to temporary location (file_size={}, map_size={})",
         fd, segment.id, file_size, map_size
@@ -132,7 +136,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     let temp_addr = unsafe {
         mmap(
             std::ptr::null_mut(),
-            map_size,  // Use actual file size, not SEGMENT_SIZE
+            map_size, // Use actual file size, not SEGMENT_SIZE
             PROT_READ,
             MAP_PRIVATE,
             fd,
@@ -154,7 +158,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             segment.id, err
         );
     }
-    
+
     debug!(
         "Temporary mapping created at {:#x} for segment {} (file_size={}, map_size={})",
         temp_addr as usize, segment.id, file_size, map_size
@@ -164,12 +168,12 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     let temp_start = temp_addr as usize;
     let scanned_boundary = find_append_header(temp_start, map_size);
     let scanned_size = scanned_boundary - temp_start;
-    
+
     debug!(
         "Scanned file for segment {}: found valid data boundary at offset {} (size: {})",
         segment.id, scanned_size, scanned_size
     );
-    
+
     let scan_boundary = scanned_boundary;
 
     let temp_entry_iter = SegmentEntryIter {
@@ -177,18 +181,15 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         cursor: temp_start,
     };
 
-    let _locks = cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
+    let _locks =
+        cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
 
     // Copy data from file (up to map_size) and zero-fill the rest if needed
     let copy_size = scanned_size.min(map_size);
     unsafe {
-        ptr::copy_nonoverlapping(
-            temp_addr as *const u8,
-            segment_addr as *mut u8,
-            copy_size,
-        );
+        ptr::copy_nonoverlapping(temp_addr as *const u8, segment_addr as *mut u8, copy_size);
         // Zero-fill the rest of the segment if file was shorter than SEGMENT_SIZE
         if copy_size < SEGMENT_SIZE {
             ptr::write_bytes(
@@ -200,7 +201,9 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     }
 
     let restored_append_header = segment.addr + scanned_size;
-    segment.append_header.store(restored_append_header, Ordering::Release);
+    segment
+        .append_header
+        .store(restored_append_header, Ordering::Release);
     debug!(
         "Restored append_header for segment {} to {} (offset {}) based on scanned file boundary",
         segment.id, restored_append_header, scanned_size

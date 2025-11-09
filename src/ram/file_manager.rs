@@ -40,21 +40,26 @@ impl SegmentFileManager {
 
     /// Generate backup file path for a segment
     pub fn backup_path(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> Option<String> {
-        self.backup_storage.as_ref().map(|path| {
-            format!("{}/{}-{}-{}.nbackup", path, chunk_id, seg_id, seq_id)
-        })
+        self.backup_storage
+            .as_ref()
+            .map(|path| format!("{}/{}-{}-{}.nbackup", path, chunk_id, seg_id, seq_id))
     }
 
     /// Generate WAL file path for a segment
     pub fn wal_path(&self, chunk_id: usize, seg_id: u64, seq_id: u64) -> Option<String> {
-        self.wal_storage.as_ref().map(|path| {
-            format!("{}/{}-{}-{}.nlog", path, chunk_id, seg_id, seq_id)
-        })
+        self.wal_storage
+            .as_ref()
+            .map(|path| format!("{}/{}-{}-{}.nlog", path, chunk_id, seg_id, seq_id))
     }
 
     /// Create a WAL file with buffering
-    pub fn create_wal_file(&self, chunk_id: usize, seg_id: u64, seq_id: u64, buffer_size: usize) 
-        -> io::Result<Option<BufWriter<File>>> {
+    pub fn create_wal_file(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+        buffer_size: usize,
+    ) -> io::Result<Option<BufWriter<File>>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
             let file = File::create(&wal_path)?;
             Ok(Some(BufWriter::with_capacity(buffer_size, file)))
@@ -64,8 +69,12 @@ impl SegmentFileManager {
     }
 
     /// Create a backup file
-    pub fn create_backup_file(&self, chunk_id: usize, seg_id: u64, seq_id: u64) 
-        -> io::Result<Option<File>> {
+    pub fn create_backup_file(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+    ) -> io::Result<Option<File>> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
             // Ensure parent directory exists
             if let Some(parent) = Path::new(&backup_path).parent() {
@@ -79,8 +88,12 @@ impl SegmentFileManager {
     }
 
     /// Open an existing backup file for reading
-    pub fn open_backup_file(&self, chunk_id: usize, seg_id: u64, seq_id: u64) 
-        -> io::Result<Option<File>> {
+    pub fn open_backup_file(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+    ) -> io::Result<Option<File>> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
             if Path::new(&backup_path).exists() {
                 Ok(Some(File::open(&backup_path)?))
@@ -93,8 +106,12 @@ impl SegmentFileManager {
     }
 
     /// Open an existing WAL file for reading
-    pub fn open_wal_file(&self, chunk_id: usize, seg_id: u64, seq_id: u64) 
-        -> io::Result<Option<File>> {
+    pub fn open_wal_file(
+        &self,
+        chunk_id: usize,
+        seg_id: u64,
+        seq_id: u64,
+    ) -> io::Result<Option<File>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
             if Path::new(&wal_path).exists() {
                 Ok(Some(File::open(&wal_path)?))
@@ -339,19 +356,13 @@ mod tests {
 
     #[test]
     fn test_path_generation() {
-        let mgr = SegmentFileManager::new(
-            Some("/backup".to_string()),
-            Some("/wal".to_string()),
-        );
+        let mgr = SegmentFileManager::new(Some("/backup".to_string()), Some("/wal".to_string()));
 
         assert_eq!(
             mgr.backup_path(1, 2, 3),
             Some("/backup/1-2-3.nbackup".to_string())
         );
-        assert_eq!(
-            mgr.wal_path(1, 2, 3),
-            Some("/wal/1-2-3.nlog".to_string())
-        );
+        assert_eq!(mgr.wal_path(1, 2, 3), Some("/wal/1-2-3.nlog".to_string()));
     }
 
     #[test]
@@ -404,4 +415,3 @@ mod tests {
         assert_eq!(files[2].seq_id, 3);
     }
 }
-

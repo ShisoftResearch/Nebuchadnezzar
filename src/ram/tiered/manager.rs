@@ -128,7 +128,6 @@ impl TieredMemoryManager {
         Ok(evicted_count)
     }
 
-
     /// Check if allocating a new segment would exceed the limit and evict if needed
     ///
     /// This is more aggressive than check_and_evict - it doesn't use the threshold,

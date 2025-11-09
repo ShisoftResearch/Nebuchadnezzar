@@ -46,7 +46,8 @@ impl Cleaner {
                     warn!("Cleaner main thread stopped");
                 }
 
-                #[cfg(not(feature = "cleaner"))] {
+                #[cfg(not(feature = "cleaner"))]
+                {
                     warn!("Cleaner is disabled, the memory would likely to overflow");
                 }
             })
@@ -73,7 +74,10 @@ impl Cleaner {
         let num_segs = chunk.segs.len();
         debug!(
             "Cleaning chunk {}, full {}, segs {}, head seg {}",
-            chunk.id, full, num_segs, chunk.get_head_seg_id()
+            chunk.id,
+            full,
+            num_segs,
+            chunk.get_head_seg_id()
         );
         let segments_compact_per_turn = if full { num_segs } else { num_segs / 5 + 1 };
         let segments_combine_per_turn = if full { num_segs } else { num_segs / 5 + 2 };
@@ -136,7 +140,6 @@ impl Cleaner {
         chunk.check_and_archive_segments();
         debug!("Chunk Cleaned {}", chunk.id);
     }
-
 
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Relaxed);
