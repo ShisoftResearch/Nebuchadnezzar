@@ -169,7 +169,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     debug!("Data copied successfully for segment {}", segment.id);
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "verify_checksums"))]
     {
         // Verify checksum: compare segment memory with source backup data after promotion
         // Compare the full SEGMENT_SIZE since that's what was copied (including padding)

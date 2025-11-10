@@ -63,6 +63,11 @@ compact_cleaner = ["cleaner"]
 # Usage: cargo build --features debug_page_faults
 debug_page_faults = ["page_fault_tracking"]
 
+# Enable CRC32 checksum verification during eviction and promotion
+# Only works in debug builds (debug_assertions must be enabled)
+# Usage: cargo build --features verify_checksums
+verify_checksums = ["tiered_memory"]
+
 tiered_memory = []
 
 [dev-dependencies]

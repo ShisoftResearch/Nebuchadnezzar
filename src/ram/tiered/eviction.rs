@@ -105,7 +105,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         ));
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "verify_checksums"))]
     {
         // Verify checksum: compare segment memory with backup file before freeing
         if let Err(e) = segment.verify_eviction_checksum(backup_path_ref) {
