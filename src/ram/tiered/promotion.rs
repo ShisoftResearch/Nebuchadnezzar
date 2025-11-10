@@ -71,12 +71,11 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     // Step 4: Check if segment is protected by transactions
     if chunk.is_segment_protected(segment.id) {
-        error!(
+        // Well, it should not happen, but if it does, there is nothing we can do about it.
+        warn!(
             "Segment {} is transaction-protected, cannot promote",
             segment.id
         );
-        segment.set_cold();
-        panic!();
     }
 
     // Step 5: Get backup file handler from segment's file_state
