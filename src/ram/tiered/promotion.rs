@@ -73,7 +73,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     if chunk.is_segment_protected(segment.id) {
         // Well, it should not happen, but if it does, there is nothing we can do about it.
         warn!(
-            "Segment {} is transaction-protected, cannot promote",
+            "Segment {} is transaction-protected, should not promote, but it is promoted anyway",
             segment.id
         );
     }
