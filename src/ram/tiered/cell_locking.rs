@@ -90,6 +90,7 @@ pub fn lock_all_cells_in_segment(
             // Check the cell eearly without locking such that the cell is not in the segment, we can skip it.
             if let Some(addr) = chunk.cell_index.get_from_mutex(&(hash as usize)) {
                 if !segment.contains_address(addr) {
+                    stale_cells += 1;
                     continue;
                 }
             }

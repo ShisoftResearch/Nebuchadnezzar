@@ -96,7 +96,10 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         segment.entry_iter(),
         false,
     ) {
-        Ok(cell_locks) => cell_locks,
+        Ok(cell_locks) => {
+            debug!("Successfully locked {} cells for segment {}", cell_locks.locks.len(), segment.id);
+            cell_locks
+        },
         Err(e) => {
             warn!(
                 "Failed to lock cells for segment {}: {}. Giving up eviction",
