@@ -82,7 +82,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     // Step 5: Get backup file handler from segment's file_state
     // Lock file_state to access or create the backup file handler
-    let mut file_state = segment.file_state.lock();
+    let file_state = segment.file_state.lock();
     
     // Get backup path and verify it exists BEFORE opening
     let backup_path = file_state
@@ -90,74 +90,10 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         .backup_path(segment.chunk_id, segment.id, segment.seq_id)
         .unwrap_or_else(|| String::from("<unknown>"));
     
-    // CRITICAL: Verify backup file exists before attempting to open/mmap
-    // A cold segment MUST have a backup file - if it doesn't exist, this is a bug
-    let backup_path_obj = std::path::Path::new(&backup_path);
-    if !backup_path_obj.exists() {
-        error!(
-            "CRITICAL: Segment {} is marked COLD but backup file does not exist: {}",
-            segment.id, backup_path
-        );
-        error!(
-            "This indicates the segment was evicted without proper archiving, or the backup file was deleted"
-        );
+    if file_state.backup.is_none() {
+        error!("CRITICAL: Segment {} is marked COLD but backup file does not exist", segment.id);
         segment.set_cold();
-        panic!(
-            "Cannot promote segment {}: backup file does not exist at {}",
-            segment.id, backup_path
-        );
-    }
-    
-    // Verify backup file is readable and non-empty
-    match std::fs::metadata(&backup_path) {
-        Ok(metadata) => {
-            if metadata.len() == 0 {
-                error!(
-                    "CRITICAL: Backup file for segment {} exists but is empty: {}",
-                    segment.id, backup_path
-                );
-                segment.set_cold();
-                panic!(
-                    "Cannot promote segment {}: backup file is empty at {}",
-                    segment.id, backup_path
-                );
-            }
-            debug!(
-                "Backup file for segment {} exists and has size {} bytes: {}",
-                segment.id,
-                metadata.len(),
-                backup_path
-            );
-        }
-        Err(e) => {
-            error!(
-                "Failed to get metadata for backup file of segment {}: {} (path: {})",
-                segment.id, e, backup_path
-            );
-            segment.set_cold();
-            panic!(
-                "Cannot promote segment {}: failed to access backup file at {}: {}",
-                segment.id, backup_path, e
-            );
-        }
-    }
-    
-    // If a backup writer is currently open for this segment (e.g. due to archiving), flush it so
-    // that the on-disk contents are up-to-date before we read the file. Promotion itself does not
-    // require a persistent file handle.
-    if let Some(ref mut writer) = file_state.backup {
-        if let Err(e) = writer.flush() {
-            error!(
-                "Failed to flush backup file for segment {}: {} (path: {})",
-                segment.id, e, backup_path
-            );
-            segment.set_cold();
-            panic!(
-                "Cannot promote segment {}: failed to flush backup file: {}",
-                segment.id, e
-            );
-        }
-        debug!("Flushed backup file for segment {} before reading", segment.id);
+        panic!("Cannot promote segment {}: backup file does not exist", segment.id);
     }
 
     // Step 6: Read file into a buffer instead of using mmap

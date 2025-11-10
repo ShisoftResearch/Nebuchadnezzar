@@ -123,6 +123,7 @@ pub fn lock_all_cells_in_segment(
                     still_unlocked.push(hash);
                     retry_count += 1;
                     if retry_count >= MAX_RETRY_ATTEMPTS {
+                        warn!("Failed to lock cell {} after {} retries for segment {} for promotion={}", hash, retry_count, segment.id, promoting);
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
                             format!("Failed to lock cell {} after {} retries for segment {} for promotion={}", hash, retry_count, segment.id, promoting),
