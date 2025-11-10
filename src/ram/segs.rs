@@ -5,6 +5,7 @@ use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::io::align_address;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use bifrost::utils::time::get_time;
+use crc32fast::Hasher as Crc32Hasher;
 use libc::*;
 use lightning::list::LinkedRingBufferList;
 use parking_lot;
@@ -252,6 +253,132 @@ impl Segment {
         return self.living_space() as f32 / used_space;
     }
 
+    #[cfg(debug_assertions)]
+    fn calculate_crc32(data: &[u8]) -> u32 {
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(data);
+        hasher.finalize()
+    }
+
+    #[cfg(debug_assertions)]
+    fn verify_archive_checksum(
+        &self,
+        source_data: &[u8],
+        backup_path: &Path,
+        pad_to_size: Option<usize>,
+        segment_id: u64,
+    ) -> Result<(), io::Error> {
+        // Pad source data if needed (for WAL files that are padded to SEGMENT_SIZE)
+        let source_data_padded = if let Some(target_size) = pad_to_size {
+            debug!(
+                "Padding source data: original_size={}, target_size={}",
+                source_data.len(), target_size
+            );
+            if source_data.len() < target_size {
+                let mut padded = source_data.to_vec();
+                padded.resize(target_size, 0);
+                debug!(
+                    "Padded source data: original_size={}, padded_size={}",
+                    source_data.len(), padded.len()
+                );
+                padded
+            } else {
+                debug!("Source data already >= target_size, no padding needed");
+                source_data.to_vec()
+            }
+        } else {
+            source_data.to_vec()
+        };
+        
+        debug!(
+            "Calculating checksum: source_data_padded.len()={}",
+            source_data_padded.len()
+        );
+        let source_checksum = Self::calculate_crc32(&source_data_padded);
+        
+        // Read the backup file to calculate its checksum
+        let mut backup_file = File::open(backup_path)?;
+        let mut backup_data = Vec::new();
+        backup_file.read_to_end(&mut backup_data)?;
+        let backup_checksum = Self::calculate_crc32(&backup_data);
+        
+        if source_checksum != backup_checksum {
+            error!(
+                "CRC32 checksum mismatch for segment {}: source={:08x} (size={}), backup={:08x} (size={}) for segment {}",
+                self.id, source_checksum, source_data_padded.len(), backup_checksum, backup_data.len(), segment_id
+            );
+            // Log first few bytes for debugging
+            let source_preview = if source_data_padded.len() >= 16 {
+                format!("{:02x?}", &source_data_padded[..16])
+            } else {
+                format!("{:02x?}", source_data_padded)
+            };
+            let backup_preview = if backup_data.len() >= 16 {
+                format!("{:02x?}", &backup_data[..16])
+            } else {
+                format!("{:02x?}", backup_data)
+            };
+            error!(
+                "Source data preview (first 16 bytes): {}, Backup data preview (first 16 bytes): {}",
+                source_preview, backup_preview
+            );
+            panic!("CRC32 checksum mismatch for segment {}: source={:08x}, backup={:08x} for segment {}", self.id, source_checksum, backup_checksum, segment_id);
+        } else {
+            debug!(
+                "CRC32 checksum verified for segment {}: {:08x}",
+                self.id, source_checksum
+            );
+        }
+        Ok(())
+    }
+
+    /// Verify checksum of segment memory against backup file (for eviction)
+    /// Only compiled in debug builds
+    #[cfg(debug_assertions)]
+    pub fn verify_eviction_checksum(&self, backup_path: &Path) -> Result<(), io::Error> {
+        let write_size = {
+            let valid_size = self.append_header() - self.addr;
+            valid_size.max(PAGE_SIZE) // At least one page to ensure file exists
+        };
+        
+        unsafe {
+            let segment_data = slice::from_raw_parts(self.addr as *const u8, write_size);
+            // Backup file is padded to SEGMENT_SIZE, so pad source data to match
+            self.verify_archive_checksum(segment_data, backup_path, Some(SEGMENT_SIZE), self.id)
+        }
+    }
+
+    /// Verify checksum of segment memory against source data (for promotion)
+    /// Only compiled in debug builds
+    #[cfg(debug_assertions)]
+    pub fn verify_promotion_checksum(&self, source_data: &[u8]) -> Result<(), io::Error> {
+        // Compare the full SEGMENT_SIZE that was copied during promotion
+        // (not based on append_header, which may be less than SEGMENT_SIZE)
+        let compare_size = SEGMENT_SIZE.min(source_data.len());
+        
+        unsafe {
+            let segment_data = slice::from_raw_parts(self.addr as *const u8, compare_size);
+            let source_slice = &source_data[..compare_size];
+            
+            let segment_checksum = Self::calculate_crc32(segment_data);
+            let source_checksum = Self::calculate_crc32(source_slice);
+            
+            if segment_checksum != source_checksum {
+                error!(
+                    "CRC32 checksum mismatch after promotion for segment {}: segment={:08x}, source={:08x}",
+                    self.id, segment_checksum, source_checksum
+                );
+                panic!("CRC32 checksum mismatch after promotion for segment {}: segment={:08x}, source={:08x}", self.id, segment_checksum, source_checksum);
+            } else {
+                debug!(
+                    "CRC32 checksum verified after promotion for segment {}: {:08x}",
+                    self.id, segment_checksum
+                );
+            }
+        }
+        Ok(())
+    }
+
     // archive this segment and write the data to backup storage
     // The backup file handler is kept open for reuse during promotion
     pub fn archive(&self) -> Result<bool, io::Error> {
@@ -306,6 +433,14 @@ impl Segment {
                     debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
                 }
 
+                // Close any existing backup file handle before copy_wal_to_backup
+                // because copy_wal_to_backup creates a new file, making the old handle stale
+                if let Some(mut backup_writer) = state.backup.take() {
+                    let _ = backup_writer.flush();
+                    let _ = backup_writer.get_ref().sync_all();
+                    // Drop the writer to close the file handle
+                }
+
                 // Copy WAL to backup with padding
                 if state.manager.copy_wal_to_backup(
                     self.chunk_id,
@@ -313,6 +448,24 @@ impl Segment {
                     self.seq_id,
                     Some(SEGMENT_SIZE),
                 )? {
+                    #[cfg(debug_assertions)]
+                    {
+                        // Verify checksum: read WAL file before deletion and compare with backup
+                        if let Some(wal_path) = state.manager.wal_path(self.chunk_id, self.id, self.seq_id) {
+                            let wal_path_ref = Path::new(&wal_path);
+                            if wal_path_ref.exists() {
+                                // Read WAL file for checksum calculation
+                                let wal_data = state.manager.read_file(wal_path_ref)?;
+                                debug!(
+                                    "WAL file size: {}, backup path: {:?}",
+                                    wal_data.len(), backup_file_path
+                                );
+                                // Verify checksum against backup file (accounting for padding to SEGMENT_SIZE)
+                                self.verify_archive_checksum(&wal_data, backup_file_path, Some(SEGMENT_SIZE), self.id)?;
+                            }
+                        }
+                    }
+                    
                     // Delete WAL file after successful copy
                     state
                         .manager
@@ -368,8 +521,27 @@ impl Segment {
                         let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
                         writer.write(data_block)?;
                     }
+                    
+                    // Pad to SEGMENT_SIZE to match WAL-based archiving behavior
+                    if write_size < SEGMENT_SIZE {
+                        let padding_size = SEGMENT_SIZE - write_size;
+                        let padding = vec![0u8; padding_size];
+                        writer.write_all(&padding)?;
+                    }
+                    
                     writer.flush()?;
                     writer.get_ref().sync_all()?;
+                    
+                    #[cfg(debug_assertions)]
+                    {
+                        // Verify checksum: compare segment memory with backup file
+                        // Backup file is padded to SEGMENT_SIZE, so pad source data to match
+                        unsafe {
+                            let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
+                            // Pad to SEGMENT_SIZE to match backup file
+                            self.verify_archive_checksum(data_block, backup_file_path, Some(SEGMENT_SIZE), self.id)?;
+                        }
+                    }
                     
                     debug!(
                         "Archived segment {} to backup file, keeping handler open",

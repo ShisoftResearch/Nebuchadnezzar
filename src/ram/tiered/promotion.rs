@@ -170,6 +170,17 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     debug!("Data copied successfully for segment {}", segment.id);
 
+    #[cfg(debug_assertions)]
+    {
+        // Verify checksum: compare segment memory with source backup data after promotion
+        // Compare the full SEGMENT_SIZE since that's what was copied (including padding)
+        if let Err(e) = segment.verify_promotion_checksum(&temp_buffer) {
+            error!("Checksum verification failed for segment {} after promotion: {}", segment.id, e);
+            segment.set_cold();
+            panic!("Cannot promote segment {}: checksum verification failed: {}", segment.id, e);
+        }
+    }
+
     // Step 9: Mark as hot (update tiered_lock)
     segment.set_hot();
     debug!(

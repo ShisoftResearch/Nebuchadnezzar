@@ -41,6 +41,7 @@ crossbeam-epoch = "*"
 num = "*"
 core_affinity = "0.8.1"
 ndarray = "0.16.1"
+crc32fast = "*"
 
 [features]
 # Enable zero-overhead page fault tracking via mprotect/SIGSEGV

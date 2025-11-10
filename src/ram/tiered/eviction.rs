@@ -59,6 +59,22 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
+    // Re-archive the segment to ensure backup file has the latest data
+    // The segment may have been modified since it was last archived
+    match segment.archive() {
+        Ok(true) => {
+            debug!("Segment {} re-archived successfully before eviction", segment.id);
+        }
+        Ok(false) => {
+            debug!("Segment {} archive returned false (backup may already exist)", segment.id);
+        }
+        Err(e) => {
+            error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+            segment.set_hot();
+            return Err(e);
+        }
+    }
+
     // Get backup path and verify it exists
     let backup_path =
         match chunk
@@ -77,7 +93,8 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         };
 
     // Verify file exists (either newly created or already present)
-    if !std::path::Path::new(&backup_path).exists() {
+    let backup_path_ref = std::path::Path::new(&backup_path);
+    if !backup_path_ref.exists() {
         segment.set_hot();
         return Err(io::Error::new(
             io::ErrorKind::Other,
@@ -86,6 +103,16 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
                 segment.id
             ),
         ));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        // Verify checksum: compare segment memory with backup file before freeing
+        if let Err(e) = segment.verify_eviction_checksum(backup_path_ref) {
+            error!("Checksum verification failed for segment {} during eviction: {}", segment.id, e);
+            segment.set_hot();
+            return Err(e);
+        }
     }
 
     // Step 5: Lock all cells in the segment AFTER archiving
