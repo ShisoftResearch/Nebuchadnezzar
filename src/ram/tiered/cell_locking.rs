@@ -104,6 +104,7 @@ pub fn lock_all_cells_in_segment(
                             locks.push(std::mem::transmute(lock));
                         }
                     } else {
+                        debug!("Cell {} is not in segment {}, dropping lock", hash, segment.id);
                         drop(lock);
                     }
                     retry_count = 0;
