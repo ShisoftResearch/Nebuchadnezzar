@@ -80,6 +80,8 @@ pub fn lock_all_cells_in_segment(
     const MAX_RETRY_ATTEMPTS: usize = 100;
     let backoff = crossbeam::utils::Backoff::new();
     let mut retry_count = 0;
+    let mut stale_cells = 0;
+    let mut skipped_locking_cells = 0;
 
     while !cell_hashes.is_empty() {
         let mut still_unlocked = Vec::new();
@@ -105,13 +107,15 @@ pub fn lock_all_cells_in_segment(
                         }
                     } else {
                         debug!("Cell {} is not in segment {}, dropping lock", hash, segment.id);
+                        stale_cells += 1;
                         drop(lock);
                     }
                     retry_count = 0;
                     backoff.reset();
                 }
                 Some(None) if promoting => {
-                    // When promoting, we can skip the cell if it is not in the segment.
+                    // When promoting, we can skip the cell that is locked.
+                    skipped_locking_cells += 1;
                     continue;
                 }
                 Some(None) => {
@@ -150,8 +154,10 @@ pub fn lock_all_cells_in_segment(
     }
 
     debug!(
-        "Successfully locked all {} cells in segment {}",
+        "Successfully locked {} cells, stale {} cells, skipped locking {} cells in segment {}",
         locks.len(),
+        stale_cells,
+        skipped_locking_cells,
         segment.id
     );
 
