@@ -117,25 +117,25 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
 
     // Step 5: Lock all cells in the segment AFTER archiving
     // This maintains lock ordering: tiered_lock → file_state → cell_locks
-    let _cell_locks = match cell_locking::lock_all_cells_in_segment(
-        segment,
-        chunk,
-        segment.entry_iter(),
-        false,
-    ) {
-        Ok(cell_locks) => {
-            debug!("Successfully locked {} cells for segment {}", cell_locks.locks.len(), segment.id);
-            cell_locks
-        },
-        Err(e) => {
-            warn!(
-                "Failed to lock cells for segment {}: {}. Giving up eviction",
-                segment.id, e
-            );
-            segment.set_hot();
-            return Err(e);
-        }
-    };
+    // let _cell_locks = match cell_locking::lock_all_cells_in_segment(
+    //     segment,
+    //     chunk,
+    //     segment.entry_iter(),
+    //     false,
+    // ) {
+    //     Ok(cell_locks) => {
+    //         debug!("Successfully locked {} cells for segment {}", cell_locks.locks.len(), segment.id);
+    //         cell_locks
+    //     },
+    //     Err(e) => {
+    //         warn!(
+    //             "Failed to lock cells for segment {}: {}. Giving up eviction",
+    //             segment.id, e
+    //         );
+    //         segment.set_hot();
+    //         return Err(e);
+    //     }
+    // };
 
     // Step 6: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();

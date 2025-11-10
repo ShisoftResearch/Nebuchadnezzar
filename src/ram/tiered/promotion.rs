@@ -150,8 +150,8 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         cursor: temp_start,
     };
 
-    let _locks =
-        cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
+    // let _locks =
+    //     cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
     unsafe {
