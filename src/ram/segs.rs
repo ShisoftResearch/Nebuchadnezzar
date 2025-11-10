@@ -403,8 +403,21 @@ impl Segment {
             let has_old_backup = backup_file_path.exists();
             // If backup file already exists, we use make a backup of the existing file
             if has_old_backup {
-                debug!("Backup file {} already exists, deleting", backup_file);
-                fs::rename(&backup_file, format!("{}.old", backup_file))?;
+                debug!("Backup file {} already exists, moving to .old", backup_file);
+                // Handle race condition where file might be deleted between check and rename
+                match fs::rename(&backup_file, format!("{}.old", backup_file)) {
+                    Ok(_) => {
+                        debug!("Successfully moved old backup file to .old");
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // File was deleted between exists() check and rename - this is fine
+                        debug!("Backup file disappeared before rename (likely deleted by another process)");
+                    }
+                    Err(e) => {
+                        // Other errors should be propagated
+                        return Err(e);
+                    }
+                }
                 // Prepare the new backup file
                 state.backup = state.manager.open_or_create_backup_writer(
                     self.chunk_id,
