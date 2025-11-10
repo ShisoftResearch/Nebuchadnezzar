@@ -730,6 +730,17 @@ impl Segment {
             .is_ok()
     }
 
+    pub fn lock_hot_to_cold(&self) -> bool {
+        self.tiered_lock
+            .compare_exchange(
+                HOT_SEGMENT,
+                COLD_SEGMENT | LOCKING_SEGMENT_BITS,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
     /// Mark segment as recently accessed (for CLOCK algorithm)
     /// No-op when tiered memory is disabled
     #[inline]

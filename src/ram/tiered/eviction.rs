@@ -30,7 +30,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     debug!("evict_segment called for segment {}", segment.id);
 
     // Step 1: Try to acquire segment lock (skip if already locked)
-    if !segment.lock_hot() {
+    if !segment.lock_hot_to_cold() {
         debug!("Segment {} is not hot, skipping eviction", segment.id);
         return Err(io::Error::new(io::ErrorKind::Other, "Segment is not hot"));
     }
