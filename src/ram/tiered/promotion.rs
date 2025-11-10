@@ -2,8 +2,7 @@ use crate::ram::chunk::Chunk;
 use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
 use crate::ram::tiered::cell_locking;
-use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek};
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -82,90 +81,62 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
 
     // Step 5: Get backup file handler from segment's file_state
     // Lock file_state to access or create the backup file handler
-    let file_state = segment.file_state.lock();
+    let mut file_state = segment.file_state.lock();
     
-    // Get backup path and verify it exists BEFORE opening
-    let backup_path = file_state
-        .manager
-        .backup_path(segment.chunk_id, segment.id, segment.seq_id)
-        .unwrap_or_else(|| String::from("<unknown>"));
+    // Start with empty buffer - read_to_end will fill it with file contents
+    let mut temp_buffer = Vec::with_capacity(SEGMENT_SIZE);
     
-    if file_state.backup.is_none() {
-        error!("CRITICAL: Segment {} is marked COLD but backup file does not exist", segment.id);
-        segment.set_cold();
-        panic!("Cannot promote segment {}: backup file does not exist", segment.id);
-    }
-
-    // Step 6: Read file into a buffer instead of using mmap
-    // Get the actual file size to determine how much to read
-    let file_size = match std::fs::metadata(&backup_path) {
-        Ok(metadata) => {
-            let size = metadata.len() as usize;
-            debug!(
-                "Backup file for segment {}: size={} bytes",
-                segment.id, size
+    let backup_file = match &mut file_state.backup {
+        Some(file) => file,
+        None => {
+            error!(
+                "CRITICAL: Segment {} is marked COLD but backup file does not exist", segment.id
             );
-            size
-        }
-        Err(e) => {
-            error!("Failed to get file size for segment {}: {}", segment.id, e);
             segment.set_cold();
-            panic!("Failed to get file size for segment {}: {}", segment.id, e);
+            panic!("Cannot promote segment {}: failed to obtain backup file", segment.id);
         }
     };
 
-    // Limit read size to SEGMENT_SIZE
-    let read_size = file_size.min(SEGMENT_SIZE);
-
-    debug!(
-        "Reading cold file (path={}) for segment {} into buffer (file_size={}, read_size={})",
-        backup_path, segment.id, file_size, read_size
-    );
-
-    // Release the file_state lock before performing long operations (cell locking, data copy)
-    drop(file_state);
-
-    // Read file contents into a buffer from a fresh file handle so we don't retain any lingering
-    // descriptors beyond this promotion.
-    let mut temp_buffer = vec![0u8; read_size];
-    if read_size > 0 {
-        let mut backup_file = match File::open(&backup_path) {
-            Ok(file) => file,
-            Err(e) => {
-                error!(
-                    "Failed to open backup file for segment {}: {}",
-                    segment.id, e
-                );
-                segment.set_cold();
-                panic!(
-                    "Cannot promote segment {}: failed to open backup file: {}",
-                    segment.id, e
-                );
-            }
-        };
-
-        if let Err(e) = backup_file.read_exact(&mut temp_buffer) {
-            error!(
-                "Failed to read backup file for segment {}: {}",
-                segment.id, e
-            );
+    match backup_file.rewind() {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Failed to rewind backup file for segment {}: {}", segment.id, e);
             segment.set_cold();
-            panic!(
-                "Cannot promote segment {}: failed to read backup file: {}",
-                segment.id, e
-            );
+            panic!("Cannot promote segment {}: failed to rewind backup file: {}", segment.id, e);
         }
     }
 
+    // Read all file contents (may be less than SEGMENT_SIZE)
+    if let Err(e) = backup_file.get_mut().read_to_end(&mut temp_buffer) {
+        error!(
+            "Failed to read backup file for segment {}: {}",
+            segment.id, e
+        );
+        segment.set_cold();
+        panic!(
+            "Cannot promote segment {}: failed to read backup file: {}",
+            segment.id, e
+        );
+    }
+    
+    let bytes_read = temp_buffer.len();
     debug!(
-        "Successfully read {} bytes from backup file for segment {}",
-        read_size, segment.id
+        "Read {} bytes from backup file for segment {}",
+        bytes_read, segment.id
+    );
+    
+    // Resize to SEGMENT_SIZE, padding with zeros if needed
+    // This ensures the segment memory is fully initialized
+    temp_buffer.resize(SEGMENT_SIZE, 0);
+    debug!(
+        "Resized buffer to {} bytes (padded {} zero bytes) for segment {}",
+        SEGMENT_SIZE, SEGMENT_SIZE - bytes_read, segment.id
     );
 
     // Always scan the buffer to find the actual valid data boundary
     // We need to treat the buffer as a memory region for scanning
     let temp_start = temp_buffer.as_ptr() as usize;
-    let scanned_boundary = find_append_header(temp_start, read_size);
+    let scanned_boundary = find_append_header(temp_start, SEGMENT_SIZE);
     let scanned_size = scanned_boundary - temp_start;
 
     debug!(
@@ -184,19 +155,8 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
-
-    // Copy data from buffer (up to read_size) and zero-fill the rest if needed
-    let copy_size = scanned_size.min(read_size);
     unsafe {
-        ptr::copy_nonoverlapping(temp_buffer.as_ptr(), segment_addr as *mut u8, copy_size);
-        // Zero-fill the rest of the segment if file was shorter than SEGMENT_SIZE
-        if copy_size < SEGMENT_SIZE {
-            ptr::write_bytes(
-                (segment_addr + copy_size) as *mut u8,
-                0,
-                SEGMENT_SIZE - copy_size,
-            );
-        }
+        ptr::copy_nonoverlapping(temp_buffer.as_ptr(), segment_addr as *mut u8, SEGMENT_SIZE);
     }
 
     let restored_append_header = segment.addr + scanned_size;

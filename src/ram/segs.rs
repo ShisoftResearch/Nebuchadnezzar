@@ -279,7 +279,7 @@ impl Segment {
                 debug!("Backup file {} already exists, deleting", backup_file);
                 fs::rename(&backup_file, format!("{}.old", backup_file))?;
                 // Prepare the new backup file
-                state.backup = state.manager.create_backup_writer(
+                state.backup = state.manager.open_or_create_backup_writer(
                     self.chunk_id,
                     self.id,
                     self.seq_id,
@@ -351,7 +351,7 @@ impl Segment {
 
                 // Get or create backup writer
                 if state.backup.is_none() {
-                    state.backup = state.manager.create_backup_writer(
+                    state.backup = state.manager.open_or_create_backup_writer(
                         self.chunk_id,
                         self.id,
                         self.seq_id,

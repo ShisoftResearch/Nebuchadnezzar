@@ -131,21 +131,6 @@ impl SegmentFileManager {
         }
     }
 
-    /// Create a backup file writer with buffering (truncates if exists)
-    pub fn create_backup_writer(
-        &self,
-        chunk_id: usize,
-        seg_id: u64,
-        seq_id: u64,
-        buffer_size: usize,
-    ) -> io::Result<Option<BufWriter<File>>> {
-        if let Some(file) = self.create_backup_file(chunk_id, seg_id, seq_id)? {
-            Ok(Some(BufWriter::with_capacity(buffer_size, file)))
-        } else {
-            Ok(None)
-        }
-    }
-
     /// Open an existing WAL file for reading
     pub fn open_wal_file(
         &self,
