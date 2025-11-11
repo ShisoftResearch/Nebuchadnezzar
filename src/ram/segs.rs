@@ -128,11 +128,13 @@ impl Segment {
             panic!("Failed to initialize storage directories: {}", e);
         }
 
-        // LAZY WAL CREATION: Don't create WAL file until first write
-        // This prevents file descriptor exhaustion when creating many segments
-        // With 5,625+ segments, eager creation would open 5,625+ files immediately
-        // WAL file will be created on-demand in write_wal() when needed
-        let wal_file_opt = None;
+        // EAGER WAL CREATION: Create WAL file at segment construction
+        // Testing: Lazy creation causes transaction rollback tests to fail
+        let wal_file_opt = match file_manager.create_wal_file(chunk_id, id, seq_id)
+        {
+            Ok(opt) => opt,
+            Err(e) => panic!("Failed to create WAL file: {}", e),
+        };
 
         debug!(
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
@@ -584,27 +586,6 @@ impl Segment {
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
         let mut state = self.file_state.lock();
-        
-        // LAZY WAL CREATION: Create WAL file on first write if it doesn't exist
-        // This prevents file descriptor exhaustion with thousands of segments
-        if state.wal.is_none() {
-            match state.manager.create_wal_file(self.chunk_id, self.id, self.seq_id) {
-                Ok(Some(file)) => {
-                    state.wal = Some(file);
-                    debug!("Created WAL file lazily for segment {} on first write", self.id);
-                }
-                Ok(None) => {
-                    // No WAL storage configured, skip WAL write
-                    trace!("No WAL storage configured for segment {}, skipping WAL write", self.id);
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Failed to create WAL file for segment {}: {}", self.id, e);
-                    return Err(e);
-                }
-            }
-        }
-        
         if let Some(ref mut file) = state.wal {
             unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
@@ -663,13 +644,6 @@ impl Segment {
     /// This is useful for transaction commits and other critical durability points
     pub fn force_wal_sync(&self) -> io::Result<()> {
         let mut state = self.file_state.lock();
-        
-        // If WAL doesn't exist, there's nothing to sync (lazy creation means it may not exist yet)
-        if state.wal.is_none() {
-            trace!("No WAL file for segment {} to sync (lazy creation)", self.id);
-            return Ok(());
-        }
-        
         if let Some(ref mut file) = state.wal {
             file.sync_all()?;
 
