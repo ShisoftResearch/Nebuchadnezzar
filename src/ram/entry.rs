@@ -91,11 +91,15 @@ impl Entry {
             release_cursor(cursor);
             (entry, content_read(pos, entry))
         } else {
+            let segment_info = crate::ram::chunk::chunk_and_segment_from_addr(pos)
+                .map(|(chunk_id, segment_id)| format!("chunk={}, segment={}", chunk_id, segment_id))
+                .unwrap_or_else(|| "unknown (address not in allocated range)".to_string());
+            
             panic!(
-                "Cannot decode entry header: invalid entry_type_bits={} (0x{:08x}) at address 0x{:016x}. \
+                "Cannot decode entry header: invalid entry_type_bits={} (0x{:08x}) at address 0x{:016x} ({}). \
                 Valid types are: UNDECIDED(0), CELL(1), TOMBSTONE(2). \
                 This likely indicates memory corruption or reading from an invalid address.",
-                entry_type_bits, entry_type_bits, pos
+                entry_type_bits, entry_type_bits, pos, segment_info
             );
         }
     }
