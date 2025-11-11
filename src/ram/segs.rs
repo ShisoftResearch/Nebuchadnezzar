@@ -532,7 +532,7 @@ impl Segment {
                     
                     unsafe {
                         let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
-                        writer.write(data_block)?;
+                        writer.write_all(data_block)?;  // Use write_all to ensure all bytes are written
                     }
                     
                     // Pad to SEGMENT_SIZE to match WAL-based archiving behavior
@@ -583,7 +583,7 @@ impl Segment {
         if let Some(ref mut file) = state.wal {
             unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
-                file.write(data_block)?;
+                file.write_all(data_block)?;  // Use write_all to ensure all bytes are written
             }
 
             // Transactions control their own sync at commit time

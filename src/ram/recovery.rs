@@ -28,6 +28,9 @@ pub fn load_file_to_memory(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Find the actual append_header by scanning segment data
 pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
+    use byteorder::{ReadBytesExt, LittleEndian};
+    use std::io::Cursor;
+    
     let mut cursor = seg_addr;
     let bound = seg_addr + file_size;
     let mut entries_found = 0;
@@ -40,7 +43,25 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
             break;
         }
 
-        // Try to decode entry header
+        // Pre-validate entry header before calling decode_from to avoid panics on corrupted data
+        let entry_type_bits = unsafe {
+            let mut reader = Cursor::new(std::slice::from_raw_parts(cursor as *const u8, 8));
+            reader.read_u32::<LittleEndian>().unwrap()
+        };
+
+        // Validate entry type bits before attempting decode
+        if let None = EntryType::from_bits(entry_type_bits) {
+            // Invalid entry type - likely corrupted data
+            warn!(
+                "Corrupted entry header detected at offset {} (address 0x{:016x}): \
+                invalid entry_type_bits={} (0x{:08x}). \
+                Treating as end of valid data. Found {} valid entries before corruption.",
+                cursor - seg_addr, cursor, entry_type_bits, entry_type_bits, entries_found
+            );
+            break;
+        }
+
+        // Try to decode entry header (should succeed now that we've validated)
         let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
 
         if entry_header.entry_type == EntryType::UNDECIDED || entry_header.content_length == 0 {

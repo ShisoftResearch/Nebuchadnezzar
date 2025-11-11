@@ -6,8 +6,7 @@
 // from a NebServer instance, showing chunk allocation, hot/cold segments,
 // and overall memory usage.
 
-use nebuchadnezzar::server::{NebServer, ServerOptions, Service};
-use std::sync::Arc;
+use neb::server::{NebServer, ServerOptions, Service};
 
 #[tokio::main]
 async fn main() {
@@ -18,7 +17,7 @@ async fn main() {
     let opts = ServerOptions {
         chunk_count: 4,
         total_size: 1024 * 1024 * 1024, // 1 GB total
-        tiered_config: Some(nebuchadnezzar::ram::tiered::TieredConfig::with_memory_limit(
+        tiered_config: Some(neb::ram::tiered::TieredConfig::with_memory_limit(
             512 * 1024 * 1024, // 512 MB physical limit
         )),
         backup_storage: None,
@@ -35,7 +34,7 @@ async fn main() {
         &opts,
         "127.0.0.1:9000",
         "test_group",
-        |_| async {},
+        async |_| {},
     )
     .await;
 
