@@ -137,7 +137,21 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     //     }
     // };
 
-    // Step 6: Mark as cold and free physical pages (update tiered_lock)
+    // Step 6: Close WAL file to free file descriptor (before marking cold)
+    // Cold segments don't need WAL files - data is safely in backup
+    // WAL will be lazily recreated if segment is promoted and written to again
+    {
+        let mut file_state = segment.file_state.lock();
+        if let Some(wal) = file_state.wal.take() {
+            if let Err(e) = wal.sync_all() {
+                warn!("Failed to sync WAL for segment {} during eviction: {}", segment.id, e);
+            }
+            drop(wal);
+            debug!("Closed WAL file for evicted segment {} (freed file descriptor)", segment.id);
+        }
+    }
+    
+    // Step 7: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();
     debug!(
         "Marked segment {} as COLD (addr {:#x}), about to free physical pages",

@@ -561,13 +561,9 @@ impl Segment {
                     );
                     self.archived.store(true, Ordering::Release);
                     
-                    // Close WAL file after successful archive to free file descriptor
-                    // WAL is no longer needed since data is now in backup
-                    if let Some(wal) = state.wal.take() {
-                        let _ = wal.sync_all();
-                        drop(wal);
-                        debug!("Closed WAL file for archived segment {} (freed file descriptor)", self.id);
-                    }
+                    // NOTE: Do NOT close WAL file here!
+                    // WAL is needed for transaction rollback during recovery
+                    // WAL will be closed when segment is evicted to cold storage
                     
                     return Ok(true);
                 } else {
