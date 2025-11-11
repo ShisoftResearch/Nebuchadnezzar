@@ -464,7 +464,7 @@ impl Segment {
                     self.seq_id,
                     Some(SEGMENT_SIZE),
                 )? {
-                    #[cfg(debug_assertions)]
+                    #[cfg(all(debug_assertions, feature = "verify_checksums"))]
                     {
                         // Verify checksum: read WAL file before deletion and compare with backup
                         if let Some(wal_path) = state.manager.wal_path(self.chunk_id, self.id, self.seq_id) {
