@@ -12,7 +12,6 @@ use parking_lot;
 use std::fs;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::BufWriter;
 use std::path::Path;
 use std::ptr;
 use std::sync::atomic::AtomicU8;
@@ -103,10 +102,15 @@ pub struct Segment {
 ///
 /// All code paths that acquire multiple locks MUST follow this order.
 /// See eviction.rs and promotion.rs for examples.
+/// File state for a segment, protected by a mutex
+/// 
+/// **MEMORY OPTIMIZATION**: Uses unbuffered File handles instead of BufWriter
+/// to avoid accumulating 512KB+ buffers per segment. With thousands of segments,
+/// BufWriter buffers caused multi-GB memory leaks.
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
-    pub wal: Option<BufWriter<File>>,
-    pub backup: Option<BufWriter<File>>,
+    pub wal: Option<File>,
+    pub backup: Option<File>,
 }
 
 impl Segment {
@@ -124,7 +128,7 @@ impl Segment {
             panic!("Failed to initialize storage directories: {}", e);
         }
 
-        let wal_file_opt = match file_manager.create_wal_file(chunk_id, id, seq_id, WAL_BUFFER_SIZE)
+        let wal_file_opt = match file_manager.create_wal_file(chunk_id, id, seq_id)
         {
             Ok(opt) => opt,
             Err(e) => panic!("Failed to create WAL file: {}", e),
@@ -423,7 +427,6 @@ impl Segment {
                     self.chunk_id,
                     self.id,
                     self.seq_id,
-                    SEGMENT_SIZE,
                 )?;
             }
 
@@ -433,12 +436,11 @@ impl Segment {
                 .wal_exists(self.chunk_id, self.id, self.seq_id)
             {
                 // if there is a WAL file ready, copy this file to backup
-                // First, flush and close the WAL file if it's open
-                if let Some(mut writer) = state.wal.take() {
-                    // Flush and sync the file before closing
-                    writer.flush()?;
-                    writer.get_ref().sync_all()?;
-                    // Writer is dropped here, closing the file handle
+                // First, close the WAL file if it's open
+                if let Some(file) = state.wal.take() {
+                    // Sync the file before closing
+                    file.sync_all()?;
+                    // File is dropped here, closing the file handle
                     // state.wal is now None
                 } else {
                     // WAL file was already closed or never opened
@@ -448,10 +450,9 @@ impl Segment {
 
                 // Close any existing backup file handle before copy_wal_to_backup
                 // because copy_wal_to_backup creates a new file, making the old handle stale
-                if let Some(mut backup_writer) = state.backup.take() {
-                    let _ = backup_writer.flush();
-                    let _ = backup_writer.get_ref().sync_all();
-                    // Drop the writer to close the file handle
+                if let Some(backup_file) = state.backup.take() {
+                    let _ = backup_file.sync_all();
+                    // Drop the file to close the file handle
                 }
 
                 // Copy WAL to backup with padding
@@ -490,7 +491,6 @@ impl Segment {
                             self.chunk_id,
                             self.id,
                             self.seq_id,
-                            SEGMENT_SIZE,
                         )?;
                     }
                     self.archived.store(true, Ordering::Release);
@@ -521,29 +521,27 @@ impl Segment {
                         self.chunk_id,
                         self.id,
                         self.seq_id,
-                        SEGMENT_SIZE,
                     )?;
                 }
 
-                if let Some(ref mut writer) = state.backup {
+                if let Some(ref mut file) = state.backup {
                     // Truncate the file to zero and write from beginning
-                    writer.get_mut().set_len(0)?;
-                    writer.get_mut().sync_all()?;
+                    file.set_len(0)?;
+                    file.sync_all()?;
                     
                     unsafe {
                         let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
-                        writer.write_all(data_block)?;  // Use write_all to ensure all bytes are written
+                        file.write_all(data_block)?;  // Use write_all to ensure all bytes are written
                     }
                     
                     // Pad to SEGMENT_SIZE to match WAL-based archiving behavior
                     if write_size < SEGMENT_SIZE {
                         let padding_size = SEGMENT_SIZE - write_size;
                         let padding = vec![0u8; padding_size];
-                        writer.write_all(&padding)?;
+                        file.write_all(&padding)?;
                     }
                     
-                    writer.flush()?;
-                    writer.get_ref().sync_all()?;
+                    file.sync_all()?;
                     
                     #[cfg(debug_assertions)]
                     {
@@ -613,8 +611,8 @@ impl Segment {
                 bytes_written >= WAL_SYNC_BATCH_SIZE || time_since_sync >= WAL_SYNC_INTERVAL_MS;
 
             if should_sync {
-                // Only flush if we're going to sync (sync_data implicitly flushes)
-                file.get_ref().sync_data()?;
+                // Sync data to disk
+                file.sync_data()?;
 
                 // Reset counters after successful sync
                 self.bytes_since_sync.store(0, Ordering::Relaxed);
@@ -639,8 +637,7 @@ impl Segment {
     pub fn force_wal_sync(&self) -> io::Result<()> {
         let mut state = self.file_state.lock();
         if let Some(ref mut file) = state.wal {
-            file.flush()?;
-            file.get_ref().sync_all()?;
+            file.sync_all()?;
 
             // Reset counters after forced sync
             let current_time = get_time();

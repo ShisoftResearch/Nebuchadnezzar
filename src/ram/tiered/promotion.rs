@@ -106,7 +106,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     }
 
     // Read all file contents (may be less than SEGMENT_SIZE)
-    if let Err(e) = backup_file.get_mut().read_to_end(&mut temp_buffer) {
+    if let Err(e) = backup_file.read_to_end(&mut temp_buffer) {
         error!(
             "Failed to read backup file for segment {}: {}",
             segment.id, e

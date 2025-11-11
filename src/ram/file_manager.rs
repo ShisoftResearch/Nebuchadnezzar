@@ -1,5 +1,5 @@
 use std::fs::{self, create_dir_all, remove_file, File};
-use std::io::{self, BufWriter, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 /// Unified file manager for segment file operations
@@ -52,17 +52,16 @@ impl SegmentFileManager {
             .map(|path| format!("{}/{}-{}-{}.nlog", path, chunk_id, seg_id, seq_id))
     }
 
-    /// Create a WAL file with buffering
+    /// Create a WAL file (unbuffered for memory efficiency)
     pub fn create_wal_file(
         &self,
         chunk_id: usize,
         seg_id: u64,
         seq_id: u64,
-        buffer_size: usize,
-    ) -> io::Result<Option<BufWriter<File>>> {
+    ) -> io::Result<Option<File>> {
         if let Some(wal_path) = self.wal_path(chunk_id, seg_id, seq_id) {
             let file = File::create(&wal_path)?;
-            Ok(Some(BufWriter::with_capacity(buffer_size, file)))
+            Ok(Some(file))
         } else {
             Ok(None)
         }
@@ -105,7 +104,7 @@ impl SegmentFileManager {
         }
     }
 
-    /// Open or create a backup file for writing with buffering
+    /// Open or create a backup file for writing (unbuffered for memory efficiency)
     /// If the file exists, it opens for read/write without truncating
     /// If the file doesn't exist, it creates a new one
     pub fn open_or_create_backup_writer(
@@ -113,8 +112,7 @@ impl SegmentFileManager {
         chunk_id: usize,
         seg_id: u64,
         seq_id: u64,
-        buffer_size: usize,
-    ) -> io::Result<Option<BufWriter<File>>> {
+    ) -> io::Result<Option<File>> {
         if let Some(backup_path) = self.backup_path(chunk_id, seg_id, seq_id) {
             // Ensure parent directory exists
             if let Some(parent) = Path::new(&backup_path).parent() {
@@ -125,7 +123,7 @@ impl SegmentFileManager {
                 .write(true)
                 .create(true)
                 .open(&backup_path)?;
-            Ok(Some(BufWriter::with_capacity(buffer_size, file)))
+            Ok(Some(file))
         } else {
             Ok(None)
         }
