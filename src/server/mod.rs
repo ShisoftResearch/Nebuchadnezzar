@@ -28,9 +28,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod cell_rpc;
+pub mod status;
 #[cfg(test)]
 mod tests;
 pub mod transactions;
+
+// Re-export status types for convenience
+pub use status::{ChunkMemoryStatus, ServerMemoryStatus};
 
 pub static CONS_HASH_ID: u64 = hash_ident!(NEB_CONSHASH_MEM_WEIGHTS) as u64;
 

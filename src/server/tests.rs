@@ -884,3 +884,68 @@ pub async fn schema_persistence_multiple_restarts() {
         info!("All multiple restart tests passed!");
     }
 }
+
+#[tokio::test]
+pub async fn memory_status_test() {
+    let _ = env_logger::try_init();
+    
+    // Create server with tiered memory enabled
+    let server = NebServer::new_from_opts(
+        &ServerOptions {
+            chunk_count: 4,
+            total_size: 128 * 1024 * 1024, // 128 MB
+            tiered_config: Some(crate::ram::tiered::TieredConfig::with_memory_limit(
+                64 * 1024 * 1024, // 64 MB physical limit
+            )),
+            backup_storage: None,
+            wal_storage: None,
+            undo_log_storage: None,
+            raft_storage: None,
+            services: vec![],
+            index_enabled: false,
+            enable_recovery: false,
+        },
+        "127.0.0.1:5400",
+        "memory_status_test",
+        async |_| {},
+    )
+    .await;
+
+    // Get memory status
+    let status = server.memory_status();
+
+    // Verify basic statistics
+    assert_eq!(status.total_chunks, 4, "Should have 4 chunks");
+    assert_eq!(status.chunk_details.len(), 4, "Should have details for 4 chunks");
+    assert!(status.total_segments > 0, "Should have at least one segment (bootstrap)");
+    assert!(status.tiered_memory_enabled, "Tiered memory should be enabled");
+    assert_eq!(
+        status.physical_memory_limit_bytes,
+        Some(64 * 1024 * 1024),
+        "Physical limit should be 64 MB"
+    );
+
+    // Each chunk should start with at least one hot segment (bootstrap)
+    for chunk_status in &status.chunk_details {
+        assert!(
+            chunk_status.hot_segments > 0,
+            "Chunk {} should have at least one hot segment",
+            chunk_status.chunk_id
+        );
+        assert_eq!(
+            chunk_status.cold_segments, 0,
+            "Chunk {} should have no cold segments initially",
+            chunk_status.chunk_id
+        );
+    }
+
+    // Test print_summary (just ensure it doesn't panic)
+    status.print_summary();
+
+    // Test JSON serialization
+    let json = serde_json::to_string(&status).expect("Should serialize to JSON");
+    assert!(json.contains("total_chunks"), "JSON should contain total_chunks");
+    assert!(json.contains("tiered_memory_enabled"), "JSON should contain tiered_memory_enabled");
+
+    info!("Memory status test completed successfully");
+}
