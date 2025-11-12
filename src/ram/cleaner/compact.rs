@@ -80,10 +80,11 @@ impl CompactCleaner {
             original_used_space
         );
 
-        // Mark segment as unarchived before modifying it
-        // This makes the segment INELIGIBLE for eviction (CLOCK skips archived=false segments)
-        // preventing race conditions where eviction could select this segment during compaction
+        // Mark segment as unarchived and dirty before modifying it
+        // archived=false makes segment INELIGIBLE for CLOCK eviction victim selection
+        // wal_dirty=true ensures eviction will re-archive if it somehow proceeds
         seg.archived.store(false, Ordering::Relaxed);
+        seg.wal_dirty.store(true, Ordering::Relaxed);
         
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;

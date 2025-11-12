@@ -57,34 +57,39 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
-    // SAFETY: Always re-archive before eviction to ensure backup is current
-    // Even if archived=true, the segment might have been modified by compaction
-    // and there's a race window between CLOCK selection and eviction lock acquisition
-    // where compaction could modify the segment.
-    //
-    // The archived flag in CLOCK (clock.rs:58) prevents selecting un-archived segments,
-    // but by the time we acquire the eviction lock here, compaction might have:
-    // 1. Set archived=false
-    // 2. Modified the segment  
-    // 3. Set archived=true again
-    // 4. But the archive() might not have captured all data correctly
-    //
-    // Re-archiving is idempotent and safe - archive() reads from current segment memory
-    // and overwrites the backup file, so we always get the latest state.
-    debug!("Archiving segment {} before eviction to ensure backup is current", segment.id);
-    match segment.archive() {
-        Ok(true) => {
-            debug!("Segment {} archived successfully before eviction", segment.id);
+    // Check if segment needs archiving based on archived and wal_dirty flags
+    // archived=true means backup file exists
+    // wal_dirty=false means no WAL writes or memory modifications since last archive
+    // Both must be true to skip archiving
+    let is_clean = segment.archived.load(std::sync::atomic::Ordering::Acquire) 
+        && !segment.wal_dirty.load(std::sync::atomic::Ordering::Acquire);
+    
+    if !is_clean {
+        debug!(
+            "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
+            segment.id,
+            segment.archived.load(std::sync::atomic::Ordering::Relaxed),
+            segment.wal_dirty.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        match segment.archive() {
+            Ok(true) => {
+                debug!("Segment {} archived successfully before eviction", segment.id);
+            }
+            Ok(false) => {
+                warn!("Segment {} archive returned false before eviction", segment.id);
+                // Continue anyway - backup file might exist from previous archive
+            }
+            Err(e) => {
+                error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+                segment.set_hot();
+                return Err(e);
+            }
         }
-        Ok(false) => {
-            warn!("Segment {} archive returned false before eviction", segment.id);
-            // Continue anyway - backup file might exist from previous archive
-        }
-        Err(e) => {
-            error!("Failed to archive segment {} before eviction: {}", segment.id, e);
-            segment.set_hot();
-            return Err(e);
-        }
+    } else {
+        debug!(
+            "Segment {} already archived and clean, skipping redundant archive before eviction",
+            segment.id
+        );
     }
 
     // Get backup path and verify it exists

@@ -87,6 +87,9 @@ pub struct Segment {
     /// Cell read/write operations do NOT need this lock, only cell-level locks
     pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
+    /// Tracks if WAL has been written to since last successful archive
+    /// Used to optimize eviction: if archived=true && wal_dirty=false, can skip re-archiving
+    pub wal_dirty: AtomicBool,
     // WAL batch sync tracking (for group commit optimization)
     pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
@@ -160,6 +163,7 @@ impl Segment {
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
+            wal_dirty: AtomicBool::new(false), // Start clean - no WAL writes yet
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
         }
@@ -496,6 +500,7 @@ impl Segment {
                         )?;
                     }
                     self.archived.store(true, Ordering::Release);
+                    self.wal_dirty.store(false, Ordering::Release); // WAL archived and deleted - clean state
                     debug!("WAL file copied to backup and deleted for segment {} (file descriptor freed)", self.id);
                     // Note: WAL file handle was already closed above (line 440) and file deleted from disk
                     return Ok(true);
@@ -562,10 +567,12 @@ impl Segment {
                         self.id
                     );
                     self.archived.store(true, Ordering::Release);
+                    self.wal_dirty.store(false, Ordering::Release); // Backup updated - clean state
                     
                     // NOTE: Do NOT close WAL file here!
                     // WAL is needed for transaction rollback during recovery
                     // WAL will be closed when segment is evicted to cold storage
+                    // However, wal_dirty flag tracks if new writes come in after this archive
                     
                     return Ok(true);
                 } else {
@@ -591,6 +598,10 @@ impl Segment {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write_all(data_block)?;  // Use write_all to ensure all bytes are written
             }
+            
+            // Mark WAL as dirty - segment has unarchived data
+            // This ensures eviction will re-archive before evicting
+            self.wal_dirty.store(true, Ordering::Relaxed);
 
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching
