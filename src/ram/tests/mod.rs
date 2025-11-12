@@ -7,8 +7,6 @@ pub mod segment_alignment_test;
 pub mod string_alignment_check;
 pub mod string_array_tests;
 pub mod throughput_test;
-pub mod tiered_compaction_corruption_test;
-pub mod tiered_txn_compaction_corruption_test;
 pub mod types;
 
 use dovahkiin::types::Type;
