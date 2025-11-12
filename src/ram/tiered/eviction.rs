@@ -56,56 +56,41 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             segment.id, wait_count
         );
     }
-
-    match segment.archive() {
-        Ok(true) => {
-            debug!("Segment {} archived successfully before eviction", segment.id);
-        }
-        Ok(false) => {
-            warn!("Segment {} archive returned false before eviction", segment.id);
-            // Continue anyway - backup file might exist from previous archive
-        }
-        Err(e) => {
-            error!("Failed to archive segment {} before eviction: {}", segment.id, e);
-            segment.set_hot();
-            return Err(e);
-        }
-    }
-
-    // // Check if segment needs archiving based on archived and wal_dirty flags
-    // // archived=true means backup file exists
-    // // wal_dirty=false means no WAL writes or memory modifications since last archive
-    // // Both must be true to skip archiving
-    // let is_clean = segment.is_archived() 
-    //     && !segment.is_dirty();
     
-    // if !is_clean {
-    //     debug!(
-    //         "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
-    //         segment.id,
-    //         segment.is_archived(),
-    //         segment.is_dirty()
-    //     );
-    //     match segment.archive() {
-    //         Ok(true) => {
-    //             debug!("Segment {} archived successfully before eviction", segment.id);
-    //         }
-    //         Ok(false) => {
-    //             warn!("Segment {} archive returned false before eviction", segment.id);
-    //             // Continue anyway - backup file might exist from previous archive
-    //         }
-    //         Err(e) => {
-    //             error!("Failed to archive segment {} before eviction: {}", segment.id, e);
-    //             segment.set_hot();
-    //             return Err(e);
-    //         }
-    //     }
-    // } else {
-    //     debug!(
-    //         "Segment {} already archived and clean, skipping redundant archive before eviction",
-    //         segment.id
-    //     );
-    // }
+    // Check if segment needs archiving based on archived and wal_dirty flags
+    // archived=true means backup file exists
+    // wal_dirty=false means no WAL writes or memory modifications since last archive
+    // Both must be true to skip archiving
+    let is_clean = segment.is_archived() 
+        && !segment.is_dirty();
+    
+    if !is_clean {
+        debug!(
+            "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
+            segment.id,
+            segment.is_archived(),
+            segment.is_dirty()
+        );
+        match segment.archive() {
+            Ok(true) => {
+                debug!("Segment {} archived successfully before eviction", segment.id);
+            }
+            Ok(false) => {
+                warn!("Segment {} archive returned false before eviction", segment.id);
+                // Continue anyway - backup file might exist from previous archive
+            }
+            Err(e) => {
+                error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+                segment.set_hot();
+                return Err(e);
+            }
+        }
+    } else {
+        debug!(
+            "Segment {} already archived and clean, skipping redundant archive before eviction",
+            segment.id
+        );
+    }
 
     // Get backup path and verify it exists
     let backup_path =

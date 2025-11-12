@@ -163,7 +163,7 @@ impl Segment {
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
-            is_dirty: AtomicBool::new(false), // Start clean - no WAL writes yet
+            is_dirty: AtomicBool::new(true), // Start dirty
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
         }
@@ -434,80 +434,6 @@ impl Segment {
                     self.id,
                     self.seq_id,
                 )?;
-            }
-
-            // Check if WAL file exists
-            if state
-                .manager
-                .wal_exists(self.chunk_id, self.id, self.seq_id)
-            {
-                // if there is a WAL file ready, copy this file to backup
-                // First, close the WAL file if it's open
-                if let Some(file) = state.wal.take() {
-                    // Sync the file before closing
-                    file.sync_all()?;
-                    // File is dropped here, closing the file handle
-                    // state.wal is now None
-                } else {
-                    // WAL file was already closed or never opened
-                    // This is fine - we'll read it from disk if it exists
-                    debug!("WAL file mutex is empty for segment {}, will read from disk if file exists", self.id);
-                }
-
-                // Close any existing backup file handle before copy_wal_to_backup
-                // because copy_wal_to_backup creates a new file, making the old handle stale
-                if let Some(backup_file) = state.backup.take() {
-                    let _ = backup_file.sync_all();
-                    // Drop the file to close the file handle
-                }
-
-                // Copy WAL to backup with padding
-                if state.manager.copy_wal_to_backup(
-                    self.chunk_id,
-                    self.id,
-                    self.seq_id,
-                    Some(SEGMENT_SIZE),
-                )? {
-                    #[cfg(all(debug_assertions, feature = "verify_checksums"))]
-                    {
-                        // Verify checksum: read WAL file before deletion and compare with backup
-                        if let Some(wal_path) = state.manager.wal_path(self.chunk_id, self.id, self.seq_id) {
-                            let wal_path_ref = Path::new(&wal_path);
-                            if wal_path_ref.exists() {
-                                // Read WAL file for checksum calculation
-                                let wal_data = state.manager.read_file(wal_path_ref)?;
-                                debug!(
-                                    "WAL file size: {}, backup path: {:?}",
-                                    wal_data.len(), backup_file_path
-                                );
-                                // Verify checksum against backup file (accounting for padding to SEGMENT_SIZE)
-                                self.verify_archive_checksum(&wal_data, backup_file_path, Some(SEGMENT_SIZE), self.id)?;
-                            }
-                        }
-                    }
-                    
-                    // Delete WAL file after successful copy
-                    state
-                        .manager
-                        .delete_wal(self.chunk_id, self.id, self.seq_id)?;
-                    
-                    // Open the backup file for future use (without closing it)
-                    if state.backup.is_none() {
-                        state.backup = state.manager.open_or_create_backup_writer(
-                            self.chunk_id,
-                            self.id,
-                            self.seq_id,
-                        )?;
-                    }
-                    self.set_archived();
-                    self.clear_dirty(); // WAL archived and deleted - clean state
-                    debug!("WAL file copied to backup and deleted for segment {} (file descriptor freed)", self.id);
-                    // Note: WAL file handle was already closed above (line 440) and file deleted from disk
-                    return Ok(true);
-                } else {
-                    // WAL file doesn't exist, fall through to memory-based archiving
-                    debug!("WAL file does not exist for segment {}, falling back to memory-based archiving", self.id);
-                }
             }
 
             // Fallback: write from memory if WAL file doesn't exist or wasn't configured
