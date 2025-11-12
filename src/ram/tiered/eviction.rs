@@ -59,21 +59,21 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
-    // Re-archive the segment to ensure backup file has the latest data
-    // The segment may have been modified since it was last archived
-    match segment.archive() {
-        Ok(true) => {
-            debug!("Segment {} re-archived successfully before eviction", segment.id);
-        }
-        Ok(false) => {
-            debug!("Segment {} archive returned false (backup may already exist)", segment.id);
-        }
-        Err(e) => {
-            error!("Failed to archive segment {} before eviction: {}", segment.id, e);
-            segment.set_hot();
-            return Err(e);
-        }
-    }
+    // // Re-archive the segment to ensure backup file has the latest data
+    // // The segment may have been modified since it was last archived
+    // match segment.archive() {
+    //     Ok(true) => {
+    //         debug!("Segment {} re-archived successfully before eviction", segment.id);
+    //     }
+    //     Ok(false) => {
+    //         debug!("Segment {} archive returned false (backup may already exist)", segment.id);
+    //     }
+    //     Err(e) => {
+    //         error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+    //         segment.set_hot();
+    //         return Err(e);
+    //     }
+    // }
 
     // Get backup path and verify it exists
     let backup_path =
