@@ -448,17 +448,6 @@ impl Chunk {
                     let new_seg_id = new_seg.id;
                     self.put_segment(new_seg);
                     self.head_seg_id.store(new_seg_id, Ordering::Release);
-                    match head.archive() {
-                        Ok(false) => {
-                            warn!("Old egment {} archive failed after allocation", head.id);
-                        },
-                        Err(e) => {
-                            warn!("Old segment {} archive failed after allocation: {}", head.id, e);
-                        },
-                        Ok(true) => {
-                            debug!("Old segment {} archived after allocation", head.id);
-                        },
-                    }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
                 }

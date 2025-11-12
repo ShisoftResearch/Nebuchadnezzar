@@ -1,7 +1,6 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::segs::Segment;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 /// CLOCK eviction policy for selecting victim segments to evict
 ///
@@ -32,6 +31,9 @@ impl ClockEvictionPolicy {
     ///    - If reference bit is clear, select as victim
     /// 3. Advance clock hand
     ///
+    /// Note: Segments don't need to be archived before selection. The eviction
+    /// process will handle archiving if needed.
+    ///
     /// Returns None if no victim can be found (all segments referenced or protected)
     pub fn select_victim(&self, chunk: &Chunk) -> Option<lightning::aarc::Arc<Segment>> {
         let segments = chunk.segments();
@@ -54,11 +56,6 @@ impl ClockEvictionPolicy {
             for i in 0..num_segments {
                 let pos = (start_pos + i) % num_segments;
                 let segment = &segments[pos];
-
-                if !segment.is_archived() {
-                    debug!("CLOCK: seg {} is not archived, skipping", segment.id);
-                    continue;
-                }
 
                 // Skip head segment - it's actively being written to
                 if segment.id == head_seg_id {
