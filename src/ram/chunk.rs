@@ -1258,6 +1258,7 @@ impl Drop for PendingEntry {
         self.seg
             .write_wal(self.addr, self.size, self.skip_sync)
             .unwrap();
+        self.seg.set_dirty();
         self.seg.references.fetch_sub(1, Ordering::Relaxed);
     }
 }

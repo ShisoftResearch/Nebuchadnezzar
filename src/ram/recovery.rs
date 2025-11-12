@@ -390,7 +390,7 @@ fn recover_segment_as_cold(segment: &Segment, file_info: &SegmentFileInfo) -> io
     segment.set_cold();
     // Close the fd since we don't need it anymore (will reopen on promotion)
     unsafe { libc::close(fd) };
-    segment.archived.store(true, Ordering::Release); // Already archived (it's the backup file!)
+    segment.set_archived(); // Already archived (it's the backup file!)
 
     info!(
         "Recovered segment {} as COLD from {}",

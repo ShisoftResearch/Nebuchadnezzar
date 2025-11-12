@@ -61,15 +61,15 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     // archived=true means backup file exists
     // wal_dirty=false means no WAL writes or memory modifications since last archive
     // Both must be true to skip archiving
-    let is_clean = segment.archived.load(std::sync::atomic::Ordering::Acquire) 
-        && !segment.wal_dirty.load(std::sync::atomic::Ordering::Acquire);
+    let is_clean = segment.is_archived() 
+        && !segment.is_dirty();
     
     if !is_clean {
         debug!(
             "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
             segment.id,
-            segment.archived.load(std::sync::atomic::Ordering::Relaxed),
-            segment.wal_dirty.load(std::sync::atomic::Ordering::Relaxed)
+            segment.is_archived(),
+            segment.is_dirty()
         );
         match segment.archive() {
             Ok(true) => {

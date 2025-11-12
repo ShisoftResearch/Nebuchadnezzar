@@ -79,7 +79,7 @@ pub struct Segment {
     pub tombstones: AtomicU32,
     pub references: AtomicUsize,
     pub file_state: parking_lot::Mutex<SegmentFileState>,
-    pub archived: AtomicBool,
+    archived: AtomicBool,
     pub dropped: AtomicBool,
     // Tiered memory fields
     /// Segment lock for tiered memory operations (eviction, promotion, cleaner)
@@ -88,8 +88,8 @@ pub struct Segment {
     pub tiered_lock: AtomicU8, // 1 = hot, 2 = cold, highest bit for locking
     pub reference_bit: AtomicBool, // For CLOCK eviction algorithm (set by mprotect fault handler)
     /// Tracks if WAL has been written to since last successful archive
-    /// Used to optimize eviction: if archived=true && wal_dirty=false, can skip re-archiving
-    pub wal_dirty: AtomicBool,
+    /// Used to optimize eviction: if archived=true && is_dirty=false, can skip re-archiving
+    is_dirty: AtomicBool,
     // WAL batch sync tracking (for group commit optimization)
     pub last_sync_time: AtomicI64, // Timestamp of last fsync in milliseconds
     pub bytes_since_sync: AtomicUsize, // Bytes written since last fsync
@@ -163,7 +163,7 @@ impl Segment {
             dropped: AtomicBool::new(false),
             tiered_lock: AtomicU8::new(tiered_lock),
             reference_bit: AtomicBool::new(false),
-            wal_dirty: AtomicBool::new(false), // Start clean - no WAL writes yet
+            is_dirty: AtomicBool::new(false), // Start clean - no WAL writes yet
             last_sync_time: AtomicI64::new(0),
             bytes_since_sync: AtomicUsize::new(0),
         }
@@ -499,8 +499,8 @@ impl Segment {
                             self.seq_id,
                         )?;
                     }
-                    self.archived.store(true, Ordering::Release);
-                    self.wal_dirty.store(false, Ordering::Release); // WAL archived and deleted - clean state
+                    self.set_archived();
+                    self.clear_dirty(); // WAL archived and deleted - clean state
                     debug!("WAL file copied to backup and deleted for segment {} (file descriptor freed)", self.id);
                     // Note: WAL file handle was already closed above (line 440) and file deleted from disk
                     return Ok(true);
@@ -566,8 +566,8 @@ impl Segment {
                         "Archived segment {} to backup file, keeping backup handler open",
                         self.id
                     );
-                    self.archived.store(true, Ordering::Release);
-                    self.wal_dirty.store(false, Ordering::Release); // Backup updated - clean state
+                    self.set_archived();
+                    self.clear_dirty(); // Backup updated - clean state
                     
                     // NOTE: Do NOT close WAL file here!
                     // WAL is needed for transaction rollback during recovery
@@ -598,11 +598,6 @@ impl Segment {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);
                 file.write_all(data_block)?;  // Use write_all to ensure all bytes are written
             }
-            
-            // Mark WAL as dirty - segment has unarchived data
-            // This ensures eviction will re-archive before evicting
-            self.wal_dirty.store(true, Ordering::Relaxed);
-
             // Transactions control their own sync at commit time
             // For non-transactional writes, use group commit batching
             if skip_sync {
@@ -781,6 +776,30 @@ impl Segment {
     #[inline]
     pub fn contains_address(&self, addr: usize) -> bool {
         self.addr <= addr && addr < self.bound
+    }
+
+    pub fn set_archived(&self) {
+        self.archived.store(true, Ordering::Release);
+    }
+
+    pub fn clear_archived(&self) {
+        self.archived.store(false, Ordering::Release);
+    }
+
+    pub fn set_dirty(&self) {
+        self.is_dirty.store(true, Ordering::Release);
+    }
+
+    pub fn clear_dirty(&self) {
+        self.is_dirty.store(false, Ordering::Release);
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.is_dirty.load(Ordering::Relaxed)
+    }
+
+    pub fn is_archived(&self) -> bool {
+        self.archived.load(Ordering::Relaxed)
     }
 }
 

@@ -55,7 +55,7 @@ impl ClockEvictionPolicy {
                 let pos = (start_pos + i) % num_segments;
                 let segment = &segments[pos];
 
-                if !segment.archived.load(Ordering::Relaxed) {
+                if !segment.is_archived() {
                     debug!("CLOCK: seg {} is not archived, skipping", segment.id);
                     continue;
                 }

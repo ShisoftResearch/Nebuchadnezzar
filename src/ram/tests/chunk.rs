@@ -834,7 +834,7 @@ fn test_multiple_segments_wal_cleanup() {
     for seg_id in &seg_ids {
         if let Some(segment) = chunk.segs.get(seg_id) {
             // Skip if already archived
-            if segment.archived.load(std::sync::atomic::Ordering::Relaxed) {
+            if segment.is_archived() {
                 continue;
             }
 
