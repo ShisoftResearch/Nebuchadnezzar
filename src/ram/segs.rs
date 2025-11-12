@@ -263,14 +263,14 @@ impl Segment {
         return self.living_space() as f32 / used_space;
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
     fn calculate_crc32(data: &[u8]) -> u32 {
         let mut hasher = Crc32Hasher::new();
         hasher.update(data);
         hasher.finalize()
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
     fn verify_archive_checksum(
         &self,
         source_data: &[u8],
@@ -344,7 +344,7 @@ impl Segment {
 
     /// Verify checksum of segment memory against backup file (for eviction)
     /// Only compiled in debug builds
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
     pub fn verify_eviction_checksum(&self, backup_path: &Path) -> Result<(), io::Error> {
         let write_size = {
             let valid_size = self.append_header() - self.addr;
@@ -360,7 +360,7 @@ impl Segment {
 
     /// Verify checksum of segment memory against source data (for promotion)
     /// Only compiled in debug builds
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
     pub fn verify_promotion_checksum(&self, source_data: &[u8]) -> Result<(), io::Error> {
         // Compare the full SEGMENT_SIZE that was copied during promotion
         // (not based on append_header, which may be less than SEGMENT_SIZE)
@@ -477,7 +477,7 @@ impl Segment {
                     
                     file.sync_all()?;
                     
-                    #[cfg(debug_assertions)]
+                    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
                     {
                         // Verify checksum: compare segment memory with backup file
                         // Backup file is padded to SEGMENT_SIZE, so pad source data to match
