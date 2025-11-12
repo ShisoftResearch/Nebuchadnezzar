@@ -779,18 +779,22 @@ impl Segment {
     }
 
     pub fn set_archived(&self) {
+        debug!("set_archived for segment {}", self.id);
         self.archived.store(true, Ordering::Release);
     }
 
     pub fn clear_archived(&self) {
+        debug!("clear_archived for segment {}", self.id);
         self.archived.store(false, Ordering::Release);
     }
 
     pub fn set_dirty(&self) {
+        debug!("set_dirty for segment {}", self.id);
         self.is_dirty.store(true, Ordering::Release);
     }
 
     pub fn clear_dirty(&self) {
+        debug!("clear_dirty for segment {}", self.id);
         self.is_dirty.store(false, Ordering::Release);
     }
 
