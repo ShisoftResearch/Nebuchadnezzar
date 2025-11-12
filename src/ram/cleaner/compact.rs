@@ -80,6 +80,10 @@ impl CompactCleaner {
             original_used_space
         );
 
+        // Mark segment as dirty before modifying it
+        // This ensures eviction knows it needs to re-archive before evicting
+        seg.archived.store(false, Ordering::Relaxed);
+        
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
         let mut released_tombstones = 0;
@@ -204,13 +208,18 @@ impl CompactCleaner {
             );
             0
         };
-        match seg.archive() { // force archive to update backup file
-            Ok(true) => {},
+        // Archive to persist compacted data to backup file
+        // This also sets archived=true on success
+        match seg.archive() {
+            Ok(true) => {
+                debug!("Segment {} archived after compaction", seg.id);
+            },
             Ok(false) => {
-                warn!("Segment {} archive failed after compaction", seg.id);
+                warn!("Segment {} archive returned false after compaction", seg.id);
             },
             Err(e) => {
-                warn!("Segment {} archive failed after compaction: {}", seg.id, e);
+                error!("Segment {} archive failed after compaction: {}", seg.id, e);
+                // Leave archived=false so eviction will know it needs archiving
             },
         }
         debug!(

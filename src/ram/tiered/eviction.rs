@@ -1,6 +1,5 @@
 use crate::ram::chunk::Chunk;
 use crate::ram::segs::{madvise_free, Segment, SEGMENT_SIZE};
-use crate::ram::tiered::cell_locking;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -59,21 +58,27 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
     }
 
-    // // Re-archive the segment to ensure backup file has the latest data
-    // // The segment may have been modified since it was last archived
-    // match segment.archive() {
-    //     Ok(true) => {
-    //         debug!("Segment {} re-archived successfully before eviction", segment.id);
-    //     }
-    //     Ok(false) => {
-    //         debug!("Segment {} archive returned false (backup may already exist)", segment.id);
-    //     }
-    //     Err(e) => {
-    //         error!("Failed to archive segment {} before eviction: {}", segment.id, e);
-    //         segment.set_hot();
-    //         return Err(e);
-    //     }
-    // }
+    // Check if segment needs archiving (only if modified since last archive)
+    // The archived flag is set to true after successful archive and should be
+    // set to false when segment is modified (e.g. by compaction)
+    if !segment.archived.load(Ordering::Relaxed) {
+        debug!("Segment {} not archived, archiving before eviction", segment.id);
+        match segment.archive() {
+            Ok(true) => {
+                debug!("Segment {} archived successfully before eviction", segment.id);
+            }
+            Ok(false) => {
+                debug!("Segment {} archive returned false (backup may already exist)", segment.id);
+            }
+            Err(e) => {
+                error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+                segment.set_hot();
+                return Err(e);
+            }
+        }
+    } else {
+        debug!("Segment {} already archived, skipping redundant archive before eviction", segment.id);
+    }
 
     // Get backup path and verify it exists
     let backup_path =
