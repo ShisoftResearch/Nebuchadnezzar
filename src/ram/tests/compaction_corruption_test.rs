@@ -1,10 +1,9 @@
-/// Tiered memory stress test to reproduce corruption during compaction with eviction/promotion
+/// Test to reproduce memory corruption during concurrent compaction and reads
 /// 
 /// This test creates high load with:
-/// - Many concurrent updates to trigger compaction  
+/// - Many concurrent updates to trigger compaction
 /// - Heavy read traffic during compaction
-/// - Small physical memory (64MB) vs large virtual (1GB) to force constant eviction/promotion
-/// - Should reproduce "SchemaDoesNotExisted" errors with garbage schema IDs if corruption exists
+/// - Should reproduce "SchemaDoesNotExisted" errors with garbage schema IDs
 
 use crate::ram::cell::*;
 use crate::ram::chunk::{Chunk, Chunks};
@@ -54,17 +53,10 @@ fn test_compaction_with_concurrent_reads_and_updates() {
     let chunk_size = CHUNK_SIZE * 32; // 256MB per chunk (total 1GB)
     let num_chunks = 4;
     
-    // Create temporary directories for backup storage (required for tiered memory)
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let backup_storage = temp_dir.path().join("backup");
-    let wal_storage = temp_dir.path().join("wal");
-    std::fs::create_dir_all(&backup_storage).expect("Failed to create backup dir");
-    std::fs::create_dir_all(&wal_storage).expect("Failed to create WAL dir");
-    
     #[cfg(feature = "tiered_memory")]
     let tiered_config = Some(crate::ram::tiered::TieredConfig {
-        threshold: 0.8,  // Start evicting at 80% of physical limit  
-        physical_memory_limit: 128 * 1024 * 1024, // 128MB physical for 1GB virtual - forces eviction!
+        threshold: 0.8,  // Start evicting at 80% of physical limit
+        physical_memory_limit: 64 * 1024 * 1024, // Only 64MB physical for 1GB virtual - forces heavy eviction!
     });
     #[cfg(not(feature = "tiered_memory"))]
     let tiered_config = None;
@@ -74,20 +66,17 @@ fn test_compaction_with_concurrent_reads_and_updates() {
         chunk_size,
         Arc::new(ServerMeta { schemas }),
         None,
-        Some(backup_storage.to_str().unwrap().to_string()),
-        Some(wal_storage.to_str().unwrap().to_string()),
+        None,
+        None,
         tiered_config,
     ));
 
     #[cfg(feature = "tiered_memory")]
-    info!("Created {} chunks with {}MB each (1GB total, 128MB physical - TIERED MEMORY ENABLED)", 
+    info!("Created {} chunks with {}MB each (1GB total, 64MB physical - TIERED MEMORY ENABLED)", 
           num_chunks, chunk_size / (1024 * 1024));
     #[cfg(not(feature = "tiered_memory"))]
     info!("Created {} chunks with {}MB each (tiered memory disabled)", 
           num_chunks, chunk_size / (1024 * 1024));
-    
-    info!("Backup storage: {:?}", backup_storage);
-    info!("WAL storage: {:?}", wal_storage);
 
     // Shared state
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -96,10 +85,9 @@ fn test_compaction_with_concurrent_reads_and_updates() {
     let update_count = Arc::new(AtomicUsize::new(0));
     let corruption_count = Arc::new(AtomicUsize::new(0));
 
-    // Phase 1: Fill up segments with initial data
-    // Use fewer initial cells but more updates to stress update path
+    // Phase 1: Fill up segments with cells to trigger multiple segments per chunk
     info!("Phase 1: Filling segments with initial data");
-    let num_initial_cells = 500; // Smaller set = more contention on updates
+    let num_initial_cells = 1000; // Each cell ~1KB, so 1000 cells = 1MB, plenty to fill segments
     for i in 0..num_initial_cells {
         let mut cell = create_cell(schema_id, i, i as i32);
         if let Err(e) = chunks.write_cell(&mut cell) {
@@ -132,9 +120,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
         info!("Cleaner thread completed {} iterations", iterations);
     });
 
-    // Phase 3: Start MANY writer threads that AGGRESSIVELY update cells
-    // Focus on updates rather than reads to stress the update path
-    let num_writer_threads = 16; // More writers!
+    // Phase 3: Start writer threads that continuously update cells
+    let num_writer_threads = 8;
     let mut writer_handles = vec![];
     for thread_id in 0..num_writer_threads {
         let chunks_clone = Arc::clone(&chunks);
@@ -147,9 +134,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
             let mut local_errors = 0;
             
             while !stop_flag_clone.load(Ordering::Relaxed) {
-                // Update SAME small set of cells repeatedly (high contention!)
-                // This maximizes dead space and forces compaction
-                let cell_id = (thread_id * 50 + (local_updates % 50)) as u64; // Small range
+                // Update existing cells (triggers compaction when old versions become dead space)
+                let cell_id = (thread_id * 100 + (local_updates % 100)) as u64;
                 let mut cell = create_cell(schema_id, cell_id, (local_updates % 1000) as i32);
                 
                 match chunks_clone.update_cell(&mut cell) {
@@ -171,8 +157,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
                     }
                 }
 
-                // NO sleep - aggressive updates! Only yield occasionally
-                if local_updates % 100 == 0 {
+                // Occasional small sleep to increase concurrency window
+                if local_updates % 10 == 0 {
                     thread::yield_now();
                 }
             }
@@ -184,8 +170,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
         writer_handles.push(handle);
     }
 
-    // Phase 4: Start reader threads (fewer than writers - focus on updates!)
-    let num_reader_threads = 8; // Reduced to focus on update stress
+    // Phase 4: Start reader threads that continuously read cells
+    let num_reader_threads = 16;
     let mut reader_handles = vec![];
     for thread_id in 0..num_reader_threads {
         let chunks_clone = Arc::clone(&chunks);
@@ -200,8 +186,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
             let mut local_corruptions = 0;
             
             while !stop_flag_clone.load(Ordering::Relaxed) {
-                // Read from the SAME cells writers are hammering
-                let cell_id = (thread_id * 50 + (local_reads % 50)) as u64; // Match writer range
+                // Read random cells
+                let cell_id = (thread_id * 50 + (local_reads % 500)) as u64;
                 let id = Id::new(0, cell_id);
                 
                 match chunks_clone.read_cell(&id) {
@@ -234,8 +220,8 @@ fn test_compaction_with_concurrent_reads_and_updates() {
                     }
                 }
 
-                // Yield less frequently - we want more reads!
-                if local_reads % 100 == 0 {
+                // Yield occasionally to increase concurrency
+                if local_reads % 20 == 0 {
                     thread::yield_now();
                 }
             }

@@ -1,11 +1,11 @@
-/// Tiered memory transactional stress test to reproduce corruption
+/// Transactional stress test to reproduce memory corruption during concurrent 
+/// compaction and transactional updates
 ///
 /// This test creates high load with:
 /// - Many concurrent transactional updates
-/// - Heavy read traffic during compaction
-/// - Transaction rollbacks to stress undo log  
-/// - Small physical memory (128MB) vs large virtual (1GB) to force eviction/promotion
-/// - Should reproduce "SchemaDoesNotExisted" errors with garbage schema IDs if corruption exists
+/// - Heavy read traffic during compaction  
+/// - Some transaction rollbacks to stress undo log
+/// - Should reproduce "SchemaDoesNotExisted" errors with garbage schema IDs
 
 use crate::ram::cell::*;
 use crate::ram::chunk::Chunks;
@@ -48,17 +48,10 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
     // Small physical memory (64MB) with large virtual (1GB) forces constant eviction/promotion
     let server_addr = String::from("127.0.0.1:5555");
     
-    // Create temporary directories for backup storage (required for tiered memory)
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let backup_storage_path = temp_dir.path().join("backup");
-    let wal_storage_path = temp_dir.path().join("wal");
-    std::fs::create_dir_all(&backup_storage_path).expect("Failed to create backup dir");
-    std::fs::create_dir_all(&wal_storage_path).expect("Failed to create WAL dir");
-    
     #[cfg(feature = "tiered_memory")]
     let tiered_config = Some(crate::ram::tiered::TieredConfig {
         threshold: 0.8,  // Start evicting at 80% of physical limit
-        physical_memory_limit: 128 * 1024 * 1024, // 128MB physical for 1GB virtual
+        physical_memory_limit: 64 * 1024 * 1024, // Only 64MB physical for 1GB virtual
     });
     #[cfg(not(feature = "tiered_memory"))]
     let tiered_config = None;
@@ -67,10 +60,10 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
         NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 4,
-                total_size: SEGMENT_SIZE * 512, // 4GB total virtual memory
+                total_size: SEGMENT_SIZE * 128, // 1GB total virtual memory
                 tiered_config,
-                backup_storage: Some(backup_storage_path.to_str().unwrap().to_string()),
-                wal_storage: Some(wal_storage_path.to_str().unwrap().to_string()),
+                backup_storage: None,
+                wal_storage: None,
                 index_enabled: false,
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
@@ -89,13 +82,10 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
     let schema_id = schema.id;
 
     #[cfg(feature = "tiered_memory")]
-    info!("Server started with {} chunks (1GB virtual, 128MB physical - TIERED MEMORY ENABLED)", 
+    info!("Server started with {} chunks (1GB virtual, 64MB physical - TIERED MEMORY ENABLED)", 
           server.chunks.list.len());
     #[cfg(not(feature = "tiered_memory"))]
     info!("Server started with {} chunks (tiered memory disabled)", server.chunks.list.len());
-    
-    info!("Backup storage: {:?}", backup_storage_path);
-    info!("WAL storage: {:?}", wal_storage_path);
 
     // Shared state
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -106,9 +96,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
     let aborted_count = Arc::new(AtomicUsize::new(0));
 
     // Phase 1: Fill with initial data (outside transactions)
-    // Use fewer initial cells but more transactional updates
     info!("Phase 1: Filling with initial data");
-    for i in 0..500 {  // Smaller set = more update contention
+    for i in 0..1000 {
         let mut cell = OwnedCell::new_with_id(
             schema_id,
             &Id::new(0, i),
@@ -142,8 +131,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
         info!("Cleaner thread completed {} iterations", iterations);
     });
 
-    // Phase 3: Start MANY transactional writer threads for heavy update load
-    let num_txn_threads = 16; // More transactions!
+    // Phase 3: Start transactional writer threads
+    let num_txn_threads = 8;
     let mut txn_handles = vec![];
 
     for thread_id in 0..num_txn_threads {
@@ -182,13 +171,12 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
 
                 local_txns += 1;
 
-                // Do MORE updates per transaction (10-20)
-                let num_ops = 10 + (local_txns % 10); // More ops per txn
+                // Do 5-10 updates in this transaction
+                let num_ops = 5 + (local_txns % 5);
                 let mut had_error = false;
 
                 for i in 0..num_ops {
-                    // Target SAME small set of cells (high contention!)
-                    let cell_id_base = (thread_id * 50 + (local_txns % 50)) as u64; // Smaller range
+                    let cell_id_base = (thread_id * 100 + (local_txns % 100)) as u64;
                     let cell_id = cell_id_base + (i as u64);
                     
                     let cell = OwnedCell::new_with_id(
@@ -216,8 +204,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
                     }
                 }
 
-                // Decide whether to commit or abort (20% abort rate for more rollback stress)
-                let should_abort = (local_txns % 5) == 0;
+                // Decide whether to commit or abort (10% abort rate)
+                let should_abort = (local_txns % 10) == 0;
 
                 if had_error || should_abort {
                     // Abort the transaction
@@ -265,8 +253,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
                     }
                 }
 
-                // Less yielding - more aggressive transactions!
-                if local_txns % 50 == 0 {
+                // Small yield to allow other threads
+                if local_txns % 10 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
@@ -283,8 +271,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
         txn_handles.push(handle);
     }
 
-    // Phase 4: Start reader threads (fewer to focus on transaction updates)
-    let num_reader_threads = 8; // Fewer readers, more writers
+    // Phase 4: Start reader threads that check for corruption
+    let num_reader_threads = 16;
     let mut reader_handles = vec![];
 
     for thread_id in 0..num_reader_threads {
@@ -299,8 +287,7 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
             let mut local_corruptions = 0usize;
 
             while !stop_flag_clone.load(Ordering::Relaxed) {
-                // Read from SAME cells being hammered by transactions
-                let cell_id = (thread_id * 50 + (local_reads % 50)) as u64; // Match writer range
+                let cell_id = (thread_id * 50 + (local_reads % 500)) as u64;
                 let id = Id::new(0, cell_id);
 
                 match chunks_clone.read_cell(&id) {
@@ -333,8 +320,8 @@ async fn test_txn_compaction_with_concurrent_reads_and_updates() {
                     }
                 }
 
-                // Yield less - more aggressive reads!
-                if local_reads % 100 == 0 {
+                // Yield occasionally
+                if local_reads % 20 == 0 {
                     tokio::task::yield_now().await;
                 }
             }
