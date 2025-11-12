@@ -160,6 +160,7 @@ impl OwnedCell {
         }
         let addr_opt = chunk.try_acquire(total_size);
         self.header.version += 1;
+        self.header.timestamp = clock::now();
         match addr_opt {
             None => {
                 error!(
