@@ -447,7 +447,7 @@ impl Chunk {
                     self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     let new_seg_id = new_seg.id;
                     self.put_segment(new_seg);
-                    self.head_seg_id.store(new_seg_id, Ordering::Release);
+                    head.lock_hot();
                     match head.archive() {
                         Ok(false) => {
                             warn!("Old egment {} archive failed after allocation", head.id);
@@ -459,6 +459,8 @@ impl Chunk {
                             debug!("Old segment {} archived after allocation", head.id);
                         },
                     }
+                    head.set_hot();
+                    self.head_seg_id.store(new_seg_id, Ordering::Release);
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
                 }

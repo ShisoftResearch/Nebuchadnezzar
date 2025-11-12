@@ -84,7 +84,7 @@ impl CompactCleaner {
         // archived=false makes segment INELIGIBLE for CLOCK eviction victim selection
         // wal_dirty=true ensures eviction will re-archive if it somehow proceeds
         seg.archived.store(false, Ordering::Relaxed);
-        seg.wal_dirty.store(true, Ordering::Relaxed);
+        seg.dirty.store(true, Ordering::Relaxed);
         
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
