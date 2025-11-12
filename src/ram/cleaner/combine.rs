@@ -224,7 +224,6 @@ impl CombinedCleaner {
                     let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
-                    new_seg.lock_hot();
                     trace!(
                         "Combining segment to new one with id {} with {} cells",
                         new_seg_id,
@@ -316,7 +315,6 @@ impl CombinedCleaner {
                             chunk.mark_dead_entry_with_size(new, entry_size as u32, &new_seg);
                         }
                     });
-                    new_seg.set_hot();
                     new_seg_id
                 })
                 .collect::<Vec<_>>();
