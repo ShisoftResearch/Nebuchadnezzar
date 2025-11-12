@@ -204,7 +204,9 @@ impl CombinedCleaner {
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
                 );
+                // Release references before returning (they were acquired at line 88)
                 for seg in segments.iter() {
+                    seg.references.fetch_sub(1, Ordering::Relaxed);
                     seg.set_hot();
                 }
                 return 0;
