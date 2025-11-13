@@ -1,5 +1,6 @@
 use super::*;
 use crate::ram::cell::{header_from_chunk_raw, OwnedCellRef};
+use crate::ram::segs::SegmentReferenceGuard;
 use crate::ram::types::Id;
 use crate::server::NebServer;
 use crate::{
@@ -14,7 +15,7 @@ use lightning::linked_list::LinkedList;
 use lightning::map::Map;
 use lightning::map::PtrHashMap as LFMap;
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::time::Duration;
 
@@ -37,8 +38,9 @@ struct Transaction {
     affected_cells: Vec<Id>,
     last_activity: i64,
     history: CommitHistory,
-    /// Track (chunk_index, segment_id) pairs protected during this transaction
-    protected_segments: HashSet<(usize, u64)>,
+    /// RAII guards that hold segment references during this transaction
+    /// Automatically released when guards are dropped (no leak risk)
+    segment_guards: Vec<SegmentReferenceGuard>,
 }
 
 #[derive(Debug)]
@@ -153,7 +155,7 @@ impl DataManager {
                 affected_cells: Vec::with_capacity(8), // Pre-allocate for common case
                 last_activity: get_time(),
                 history: BTreeMap::new(),
-                protected_segments: HashSet::with_capacity(4), // Pre-allocate for common case
+                segment_guards: Vec::with_capacity(4), // Pre-allocate for common case
             }));
 
             if self.txns.insert(tid.clone(), txn.clone()).is_none() {
@@ -179,50 +181,21 @@ impl DataManager {
         future::ready(DataSiteResponse::new(&self.server.txn_peer, data)).boxed()
     }
 
-    /// Protect a segment for undo operations during transaction commit
+    /// Create a segment reference guard to prevent eviction during transaction.
+    /// Returns None if segment not found (already freed/evicted).
+    /// The guard is RAII - reference is automatically released when dropped.
     #[inline]
-    fn protect_segment_for_undo(&self, chunk_idx: usize, segment_id: u64) {
+    fn acquire_segment_guard(&self, chunk_idx: usize, segment_id: u64) -> Option<SegmentReferenceGuard> {
         if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
-            if chunk.segs.get(&(segment_id as usize)).is_some() {
-                chunk.protect_segment(segment_id);
-                debug!(
-                    "Protected segment {} in chunk {} for transaction undo",
-                    segment_id, chunk_idx
-                );
-                return;
+            if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
+                return Some(SegmentReferenceGuard::new(segment));
             }
         }
         warn!(
-            "Could not find segment {} in chunk {} to protect",
+            "Could not find segment {} in chunk {} to acquire guard",
             segment_id, chunk_idx
         );
-    }
-
-    /// Release protection for a segment after transaction completion
-    /// This is idempotent - if the segment doesn't exist or wasn't protected, it silently succeeds.
-    #[inline]
-    fn release_segment_protection(&self, chunk_idx: usize, segment_id: u64) {
-        if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
-            if chunk.segs.get(&(segment_id as usize)).is_some() {
-                chunk.release_segment_protection(segment_id);
-                debug!(
-                    "Released protection for segment {} in chunk {} after transaction",
-                    segment_id, chunk_idx
-                );
-                return;
-            }
-        }
-        // Segment not found in chunk - this can happen if segment was freed or chunk doesn't exist
-        // Silently succeed (idempotent operation)
-        debug!("Could not find segment {} in chunk {} to release protection (segment may have been freed)", segment_id, chunk_idx);
-    }
-
-    /// Release all segment protections for a transaction
-    #[inline]
-    fn release_all_segment_protections(&self, protected_segments: &HashSet<(usize, u64)>) {
-        for &(chunk_idx, segment_id) in protected_segments {
-            self.release_segment_protection(chunk_idx, segment_id);
-        }
+        None
     }
     fn rollback(&self, history: &CommitHistory) -> Vec<RollbackFailure> {
         let mut failures = Vec::new();
@@ -617,8 +590,15 @@ impl Service for DataManager {
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
                         let cell_offset = (cell_addr - segment_base_addr) as u64;
 
-                        self.protect_segment_for_undo(chunk_idx, segment_id);
-                        txn.protected_segments.insert((chunk_idx, segment_id));
+                        // Acquire RAII guard to prevent segment eviction during transaction
+                        // Guard automatically releases reference when dropped
+                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                            Some(g) => g,
+                            None => {
+                                write_error = Some((*cell_id, WriteError::ReadError(ReadError::CellDoesNotExisted)));
+                                break;
+                            }
+                        };
 
                         // Write undo log entry before performing the remove
                         // Store old version and exact offset for verification during recovery
@@ -635,7 +615,7 @@ impl Service for DataManager {
                             );
                             if let Err(e) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", e);
-                                // Continue anyway - segment protection will prevent data loss
+                                // Continue anyway - segment guard will prevent data loss
                             }
                         }
 
@@ -648,11 +628,11 @@ impl Service for DataManager {
                                 txn.history
                                     .insert(*cell_id, CellHistory::new(Some(old_cell_ref), 0));
                                 self.update_cell_write(cell_id, effective_ts);
+                                // Keep the guard alive by storing it in transaction
+                                txn.segment_guards.push(guard);
                             }
                             Err(error) => {
-                                // Remove protection if operation failed
-                                txn.protected_segments.remove(&(chunk_idx, segment_id));
-                                self.release_segment_protection(chunk_idx, segment_id);
+                                // Guard dropped here, automatically releasing reference
                                 write_error = Some((*cell_id, error));
                                 break;
                             }
@@ -690,8 +670,15 @@ impl Service for DataManager {
                         let segment_base_addr = chunk.allocator.addr_by_id(segment_id as usize);
                         let cell_offset = (cell_addr - segment_base_addr) as u64;
 
-                        self.protect_segment_for_undo(chunk_idx, segment_id);
-                        txn.protected_segments.insert((chunk_idx, segment_id));
+                        // Acquire RAII guard to prevent segment eviction during transaction
+                        // Guard automatically releases reference when dropped
+                        let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
+                            Some(g) => g,
+                            None => {
+                                write_error = Some((cell_id, WriteError::ReadError(ReadError::CellDoesNotExisted)));
+                                break;
+                            }
+                        };
 
                         // Write undo log entry before performing the update
                         // Store old version and exact offset for verification during recovery
@@ -708,7 +695,7 @@ impl Service for DataManager {
                             );
                             if let Err(e) = undo_log.write_undo_entry(undo_entry) {
                                 error!("Failed to write undo log entry: {:?}", e);
-                                // Continue anyway - segment protection will prevent data loss
+                                // Continue anyway - segment guard will prevent data loss
                             }
                         }
                         cell.header.version = orig_version; // Enforce version consistency
@@ -733,11 +720,11 @@ impl Service for DataManager {
                                     CellHistory::new(old_cell_ref, cell.header.version),
                                 );
                                 self.update_cell_write(&cell_id, effective_ts);
+                                // Keep the guard alive by storing it in transaction
+                                txn.segment_guards.push(guard);
                             }
                             Err(error) => {
-                                // Remove protection if operation failed
-                                txn.protected_segments.remove(&(chunk_idx, segment_id));
-                                self.release_segment_protection(chunk_idx, segment_id);
+                                // Guard dropped here, automatically releasing reference
                                 write_error = Some((cell_id, error));
                                 break;
                             }
@@ -756,10 +743,11 @@ impl Service for DataManager {
 
         // check if any of those operations failed, if yes, rollback and fail this commit
         if let Some((id, error)) = write_error {
-            // Release all segment protections on failure
-            let protected_segments = std::mem::take(&mut txn.protected_segments);
-            drop(txn); // Release the lock before calling release_all_segment_protections
-            self.release_all_segment_protections(&protected_segments);
+            // Release all segment references on failure by dropping guards
+            // Moving guards out of transaction causes them to drop, releasing references
+            let _guards_to_drop = std::mem::take(&mut txn.segment_guards);
+            drop(txn); // Release the lock before guards drop
+            drop(_guards_to_drop); // Explicitly drop guards, releasing all segment references
 
             match error {
                 WriteError::DeletionPredictionFailed | WriteError::UserCanceledUpdate => {
@@ -777,9 +765,11 @@ impl Service for DataManager {
 
             // Sync all segments that were written to during this transaction
             // This ensures durability - data is persisted to disk before commit succeeds
-            for (chunk_idx, seg_id) in &txn.protected_segments {
-                let chunk = &self.server.chunks.list[*chunk_idx];
-                if let Some(segment) = chunk.segs.get(&(*seg_id as usize)) {
+            for guard in &txn.segment_guards {
+                let chunk_idx = guard.chunk_id();
+                let seg_id = guard.segment_id();
+                let chunk = &self.server.chunks.list[chunk_idx];
+                if let Some(segment) = chunk.segs.get(&(seg_id as usize)) {
                     // Use force_wal_sync to ensure WAL is persisted and counters are reset
                     if let Err(e) = segment.force_wal_sync() {
                         error!(
@@ -813,8 +803,8 @@ impl Service for DataManager {
             return self.response_with(AbortResult::CheckFailed(CheckError::AlreadyAborted));
         }
 
-        // Release all segment protections on abort
-        let protected_segments = std::mem::take(&mut txn.protected_segments);
+        // Move guards out before rollback (they need to stay alive during rollback)
+        let guards_to_drop = std::mem::take(&mut txn.segment_guards);
 
         let rollback_failures = {
             debug!(
@@ -832,9 +822,9 @@ impl Service for DataManager {
         txn.last_activity = get_time();
         txn.state = TxnState::Aborted;
 
-        // Release segment protections after marking as aborted
-        drop(txn); // Release the lock before calling release_all_segment_protections
-        self.release_all_segment_protections(&protected_segments);
+        // Release segment references after marking as aborted and rollback complete
+        drop(txn); // Release the lock first
+        drop(guards_to_drop); // Then drop guards, releasing all segment references
 
         self.response_with(AbortResult::Success(rollback_failures))
     }
@@ -891,13 +881,13 @@ impl Service for DataManager {
             }
         }
         async move {
-            // Release all segment protections before wiping out transaction
-            let (protected_segments, txn_state) = {
+            // Release all segment references before wiping out transaction
+            let (guards_to_drop, txn_state) = {
                 let txn_lock = self.get_transaction(&tid);
                 let mut txn = txn_lock.lock();
-                (std::mem::take(&mut txn.protected_segments), txn.state)
+                (std::mem::take(&mut txn.segment_guards), txn.state)
             };
-            self.release_all_segment_protections(&protected_segments);
+            drop(guards_to_drop); // Drop guards, releasing all segment references
 
             // Write commit/abort marker to undo log based on transaction state
             if let Some(ref undo_log) = self.server.undo_log {

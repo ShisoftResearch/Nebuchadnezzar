@@ -793,6 +793,49 @@ impl Segment {
     }
 }
 
+/// RAII guard that holds a reference to a segment, preventing it from being evicted.
+/// The reference count is automatically decremented when the guard is dropped.
+/// This ensures no reference leaks even in error paths or panics.
+pub struct SegmentReferenceGuard {
+    segment: lightning::aarc::Arc<Segment>,
+}
+
+impl SegmentReferenceGuard {
+    /// Create a new guard and increment the segment's reference count
+    pub fn new(segment: lightning::aarc::Arc<Segment>) -> Self {
+        segment.references.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            "SegmentReferenceGuard acquired for segment {} (ref count: {})",
+            segment.id,
+            segment.references.load(Ordering::Relaxed)
+        );
+        Self { segment }
+    }
+
+    /// Get the segment ID
+    pub fn segment_id(&self) -> u64 {
+        self.segment.id
+    }
+
+    /// Get the chunk ID
+    pub fn chunk_id(&self) -> usize {
+        self.segment.chunk_id
+    }
+}
+
+impl Drop for SegmentReferenceGuard {
+    fn drop(&mut self) {
+        let old_count = self.segment.references.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(old_count > 0);
+        debug!(
+            "SegmentReferenceGuard dropped for segment {} (ref count: {} -> {})",
+            self.segment.id,
+            old_count,
+            old_count - 1
+        );
+    }
+}
+
 pub struct SegmentEntryIter {
     pub(crate) bound: usize,
     pub(crate) cursor: usize,

@@ -15,7 +15,7 @@ use crate::{
 
 use super::schema::Schema;
 use lightning::aarc::Arc as AArc;
-use lightning::map::{Map, PtrHashMap, WordMap, WordMutexGuard};
+use lightning::map::{Map, WordMap, WordMutexGuard};
 use lightning::spin_hint::Backoff;
 use lightning::ttl_cache::TTLCache;
 use parking_lot::Mutex;
@@ -156,9 +156,6 @@ pub struct Chunk {
     pub allocator: SegmentAllocator,
     pub index_builder: Option<Arc<IndexBuilder>>,
     pub statistics: ChunkStatistics,
-    /// Maps segment_id to count of incomplete transactions that have cells in this segment
-    /// Used to prevent cleaner from cleaning segments that contain undo data
-    pub protected_segments: PtrHashMap<u64, usize>,
     /// Tiered memory manager for eviction/promotion
     pub tiered_manager: Option<crate::ram::tiered::manager::TieredMemoryManager>,
 }
@@ -344,7 +341,6 @@ impl Chunk {
             head_seg_id: AtomicU64::new(bootstrap_segment.id),
             gc_lock: Mutex::new(()),
             statistics: ChunkStatistics::new(),
-            protected_segments: PtrHashMap::with_capacity(64),
             tiered_manager,
         };
         chunk.put_segment(bootstrap_segment);
@@ -1076,8 +1072,7 @@ impl Chunk {
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
                 seg.id != head_seg_id
-                    && seg.no_references()
-                    && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                    && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
@@ -1098,8 +1093,7 @@ impl Chunk {
             .filter(|(seg, utilization)| {
                 *utilization < 0.80f32
                     && head_seg_id != seg.id
-                    && seg.no_references()
-                    && !self.is_segment_protected(seg.id) // Don't clean protected segments
+                    && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
@@ -1107,56 +1101,6 @@ impl Chunk {
         return mapping;
     }
 
-    /// Protect a segment from being cleaned by the garbage collector.
-    /// This is used when a transaction has cells in this segment that might need to be undone.
-    /// The segment_id is the key, and the value tracks how many incomplete transactions reference it.
-    pub fn protect_segment(&self, segment_id: u64) {
-        if let Ok((mut guard, old_count)) =
-            self.protected_segments.locked_with_upsert(segment_id, 1)
-        {
-            if old_count > 0 {
-                // Entry already existed, increment count
-                *guard += 1;
-            }
-            // If old_count == 0, locked_with_upsert already inserted 1, no need to increment
-            debug!(
-                "Protected segment {} for undo, count: {}",
-                segment_id, *guard
-            );
-        }
-    }
-
-    /// Release protection for a segment when a transaction completes.
-    /// This decrements the reference count and removes the entry if count reaches zero.
-    /// This operation is idempotent - if the segment is not protected, it silently succeeds.
-    pub fn release_segment_protection(&self, segment_id: u64) {
-        if let Some(mut guard) = self.protected_segments.lock(&segment_id) {
-            if *guard > 1 {
-                *guard -= 1;
-                debug!(
-                    "Released protection for segment {}, count: {}",
-                    segment_id, *guard
-                );
-            } else {
-                // Count is 1, remove the entry
-                guard.remove();
-            }
-        } else {
-            // Segment is not protected - this can happen if protection failed earlier
-            // or the segment was already released. Silently succeed (idempotent operation).
-            debug!("Attempted to release protection for unprotected segment {} (already released or never protected)", segment_id);
-        }
-    }
-
-    /// Check if a segment is protected from cleaning due to incomplete transactions.
-    pub fn is_segment_protected(&self, segment_id: u64) -> bool {
-        self.protected_segments.contains_key(&segment_id)
-    }
-
-    /// Get the number of incomplete transactions that reference this segment.
-    pub fn get_segment_protection_count(&self, segment_id: u64) -> usize {
-        self.protected_segments.get(&segment_id).unwrap_or(0)
-    }
 
     /// Get segment information for a cell based on its memory address.
     /// Returns (segment_id, seq_id) for the segment containing the cell.

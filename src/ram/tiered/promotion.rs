@@ -69,12 +69,13 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         segment.id
     );
 
-    // Step 4: Check if segment is protected by transactions
-    if chunk.is_segment_protected(segment.id) {
-        // Well, it should not happen, but if it does, there is nothing we can do about it.
+    // Step 4: Check if segment has active references (including transaction guards)
+    // Promotion should not happen while segment has active references
+    if !segment.no_references() {
         warn!(
-            "Segment {} is transaction-protected, should not promote, but it is promoted anyway",
-            segment.id
+            "Segment {} has active references (ref count: {}), should not promote, but promoting anyway",
+            segment.id,
+            segment.references.load(std::sync::atomic::Ordering::Relaxed)
         );
     }
 

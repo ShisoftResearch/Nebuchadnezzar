@@ -63,15 +63,10 @@ impl ClockEvictionPolicy {
                     continue;
                 }
 
-                // Skip if segment has active references (being read)
+                // Skip if segment has active references (being read or protected by transactions)
+                // SegmentReferenceGuards in transactions increment the reference count
                 if !segment.no_references() {
                     debug!("CLOCK: seg {} has active references, skipping", segment.id);
-                    continue;
-                }
-
-                // Skip if segment is protected by transactions
-                if chunk.is_segment_protected(segment.id) {
-                    debug!("CLOCK: seg {} is protected, skipping", segment.id);
                     continue;
                 }
 
