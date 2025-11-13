@@ -434,8 +434,16 @@ impl Chunk {
                         }
                     }
 
-
-                    if !self.head_seg_id.compare_exchange(head_seg_id, u64::MAX, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if !self
+                        .head_seg_id
+                        .compare_exchange(
+                            head_seg_id,
+                            u64::MAX,
+                            Ordering::AcqRel,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
                         // New segment allocated, retry
                         backoff.spin();
                         continue;
@@ -927,6 +935,9 @@ impl Chunk {
 
         // Now safe to remove and dispose
         if let Some(seg) = self.segs.remove(&(segment_id as usize)) {
+            // Free the segment memory
+            seg.free_memory();
+            // Free the segment files
             seg.dispense();
         }
     }
@@ -1085,7 +1096,7 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 0.50f32
+                *utilization < 0.80f32
                     && head_seg_id != seg.id
                     && seg.no_references()
                     && !self.is_segment_protected(seg.id) // Don't clean protected segments

@@ -56,14 +56,13 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
             segment.id, wait_count
         );
     }
-    
+
     // Check if segment needs archiving based on archived and wal_dirty flags
     // archived=true means backup file exists
     // wal_dirty=false means no WAL writes or memory modifications since last archive
     // Both must be true to skip archiving
-    let is_clean = segment.is_archived() 
-        && !segment.is_dirty();
-    
+    let is_clean = segment.is_archived() && !segment.is_dirty();
+
     if !is_clean {
         debug!(
             "Segment {} needs archiving before eviction (archived={}, wal_dirty={})",
@@ -73,14 +72,23 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         );
         match segment.archive() {
             Ok(true) => {
-                debug!("Segment {} archived successfully before eviction", segment.id);
+                debug!(
+                    "Segment {} archived successfully before eviction",
+                    segment.id
+                );
             }
             Ok(false) => {
-                warn!("Segment {} archive returned false before eviction", segment.id);
+                warn!(
+                    "Segment {} archive returned false before eviction",
+                    segment.id
+                );
                 // Continue anyway - backup file might exist from previous archive
             }
             Err(e) => {
-                error!("Failed to archive segment {} before eviction: {}", segment.id, e);
+                error!(
+                    "Failed to archive segment {} before eviction: {}",
+                    segment.id, e
+                );
                 segment.set_hot();
                 return Err(e);
             }
@@ -115,10 +123,7 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         segment.set_hot();
         return Err(io::Error::new(
             io::ErrorKind::Other,
-            format!(
-                "Segment {} backup file does not exist",
-                segment.id
-            ),
+            format!("Segment {} backup file does not exist", segment.id),
         ));
     }
 
@@ -126,7 +131,10 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     {
         // Verify checksum: compare segment memory with backup file before freeing
         if let Err(e) = segment.verify_eviction_checksum(backup_path_ref) {
-            error!("Checksum verification failed for segment {} during eviction: {}", segment.id, e);
+            error!(
+                "Checksum verification failed for segment {} during eviction: {}",
+                segment.id, e
+            );
             segment.set_hot();
             return Err(e);
         }
@@ -161,22 +169,26 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
         let mut file_state = segment.file_state.lock();
         if let Some(wal) = file_state.wal.take() {
             if let Err(e) = wal.sync_all() {
-                warn!("Failed to sync WAL for segment {} during eviction: {}", segment.id, e);
+                warn!(
+                    "Failed to sync WAL for segment {} during eviction: {}",
+                    segment.id, e
+                );
             }
             drop(wal);
-            debug!("Closed WAL file for evicted segment {} (freed file descriptor)", segment.id);
+            debug!(
+                "Closed WAL file for evicted segment {} (freed file descriptor)",
+                segment.id
+            );
         }
     }
-    
+
     // Step 7: Mark as cold and free physical pages (update tiered_lock)
     segment.set_cold();
     debug!(
         "Marked segment {} as COLD (addr {:#x}), about to free physical pages",
         segment.id, segment.addr
     );
-    unsafe {
-        madvise_free(segment.addr, SEGMENT_SIZE);
-    }
+    segment.free_memory();
     debug!(
         "Freed physical pages for segment {} (addr {:#x})",
         segment.id, segment.addr

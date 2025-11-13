@@ -2092,7 +2092,7 @@ mod tests {
         let raft_path = temp_dir.path().join("raft");
 
         let server_addr = String::from("127.0.0.1:5311"); // Unique port for this test
-        
+
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
             &String::from("test"),
@@ -2101,7 +2101,7 @@ mod tests {
             false,
             false,
         );
-        
+
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
@@ -2120,16 +2120,22 @@ mod tests {
             async move |_| {},
         )
         .await;
-        
+
         // Add schema via async client so it's persisted to Raft
         use crate::client::AsyncClient;
         let client = AsyncClient::new(
             &server.rpc,
             &server.membership,
             &vec![server_addr.clone()],
-            "test"
-        ).await.unwrap();
-        client.new_schema_with_id(schema.clone()).await.unwrap().unwrap();
+            "test",
+        )
+        .await
+        .unwrap();
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
 
         // First, write a cell outside of transaction
         let mut data_map = OwnedMap::new();
@@ -2251,7 +2257,7 @@ mod tests {
         let raft_path = temp_dir.path().join("raft");
 
         let server_addr = String::from("127.0.0.1:5312"); // Unique port for this test
-        
+
         let schema = crate::ram::schema::Schema::new_with_id(
             1,
             &String::from("test"),
@@ -2260,7 +2266,7 @@ mod tests {
             false,
             false,
         );
-        
+
         let server = NebServer::new_from_opts(
             &ServerOptions {
                 chunk_count: 1,
@@ -2279,16 +2285,22 @@ mod tests {
             async move |_| {},
         )
         .await;
-        
+
         // Add schema via async client so it's persisted to Raft
         use crate::client::AsyncClient;
         let client = AsyncClient::new(
             &server.rpc,
             &server.membership,
             &vec![server_addr.clone()],
-            "test"
-        ).await.unwrap();
-        client.new_schema_with_id(schema.clone()).await.unwrap().unwrap();
+            "test",
+        )
+        .await
+        .unwrap();
+        client
+            .new_schema_with_id(schema.clone())
+            .await
+            .unwrap()
+            .unwrap();
 
         // First, write a cell outside of transaction
         let mut data_map = OwnedMap::new();

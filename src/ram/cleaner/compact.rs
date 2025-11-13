@@ -85,7 +85,7 @@ impl CompactCleaner {
         // wal_dirty=true ensures eviction will re-archive if it somehow proceeds
         seg.clear_archived();
         seg.set_dirty();
-        
+
         let seg_addr = seg.addr;
         let mut cursor = seg_addr;
         let mut released_tombstones = 0;
@@ -215,14 +215,14 @@ impl CompactCleaner {
         match seg.archive() {
             Ok(true) => {
                 debug!("Segment {} archived after compaction", seg.id);
-            },
+            }
             Ok(false) => {
                 warn!("Segment {} archive returned false after compaction", seg.id);
-            },
+            }
             Err(e) => {
                 error!("Segment {} archive failed after compaction: {}", seg.id, e);
                 // Leave archived=false so eviction will know it needs archiving
-            },
+            }
         }
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {}) released {} tombstones",

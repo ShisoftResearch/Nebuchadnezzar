@@ -81,27 +81,37 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     // Step 5: Get backup file handler from segment's file_state
     // Lock file_state to access or create the backup file handler
     let mut file_state = segment.file_state.lock();
-    
+
     // Start with empty buffer - read_to_end will fill it with file contents
     let mut temp_buffer = Vec::with_capacity(SEGMENT_SIZE);
-    
+
     let backup_file = match &mut file_state.backup {
         Some(file) => file,
         None => {
             error!(
-                "CRITICAL: Segment {} is marked COLD but backup file does not exist", segment.id
+                "CRITICAL: Segment {} is marked COLD but backup file does not exist",
+                segment.id
             );
             segment.set_cold();
-            panic!("Cannot promote segment {}: failed to obtain backup file", segment.id);
+            panic!(
+                "Cannot promote segment {}: failed to obtain backup file",
+                segment.id
+            );
         }
     };
 
     match backup_file.rewind() {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(e) => {
-            error!("Failed to rewind backup file for segment {}: {}", segment.id, e);
+            error!(
+                "Failed to rewind backup file for segment {}: {}",
+                segment.id, e
+            );
             segment.set_cold();
-            panic!("Cannot promote segment {}: failed to rewind backup file: {}", segment.id, e);
+            panic!(
+                "Cannot promote segment {}: failed to rewind backup file: {}",
+                segment.id, e
+            );
         }
     }
 
@@ -117,19 +127,21 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
             segment.id, e
         );
     }
-    
+
     let bytes_read = temp_buffer.len();
     debug!(
         "Read {} bytes from backup file for segment {}",
         bytes_read, segment.id
     );
-    
+
     // Resize to SEGMENT_SIZE, padding with zeros if needed
     // This ensures the segment memory is fully initialized
     temp_buffer.resize(SEGMENT_SIZE, 0);
     debug!(
         "Resized buffer to {} bytes (padded {} zero bytes) for segment {}",
-        SEGMENT_SIZE, SEGMENT_SIZE - bytes_read, segment.id
+        SEGMENT_SIZE,
+        SEGMENT_SIZE - bytes_read,
+        segment.id
     );
 
     // Always scan the buffer to find the actual valid data boundary
@@ -174,9 +186,15 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         // Verify checksum: compare segment memory with source backup data after promotion
         // Compare the full SEGMENT_SIZE since that's what was copied (including padding)
         if let Err(e) = segment.verify_promotion_checksum(&temp_buffer) {
-            error!("Checksum verification failed for segment {} after promotion: {}", segment.id, e);
+            error!(
+                "Checksum verification failed for segment {} after promotion: {}",
+                segment.id, e
+            );
             segment.set_cold();
-            panic!("Cannot promote segment {}: checksum verification failed: {}", segment.id, e);
+            panic!(
+                "Cannot promote segment {}: checksum verification failed: {}",
+                segment.id, e
+            );
         }
     }
 
@@ -195,7 +213,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
     // Step 11: Buffer cleanup
     // temp_buffer will be automatically dropped and deallocated when it goes out of scope
     debug!("Cleaned up temporary buffer for segment {}", segment.id);
-    
+
     info!(
         "Successfully promoted segment {} to hot storage with cell locking",
         segment.id

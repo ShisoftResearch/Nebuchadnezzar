@@ -3,6 +3,7 @@ use crate::ram::chunk::Chunk;
 use crate::ram::entry::EntryContent;
 use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use itertools::Itertools;
+use lightning::map::Map;
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -46,7 +47,7 @@ impl CombinedCleaner {
     pub fn combine_segments(
         chunk: &Chunk,
         selected_segments: &Vec<lightning::aarc::Arc<Segment>>,
-    ) -> usize {
+    ) -> (usize, usize) {
         let head_seg_id = chunk.get_head_seg_id();
         // Remove the head segment, cold segments, and segments locked by tiered operations
         // Skip locked segments (eviction/promotion in progress) to avoid conflicts
@@ -58,7 +59,7 @@ impl CombinedCleaner {
             .collect_vec();
 
         if segments.len() < 2 {
-            debug!(
+            trace!(
                 "too few segments to combine, chunk {}, segments {}",
                 chunk.id,
                 segments.len()
@@ -66,7 +67,7 @@ impl CombinedCleaner {
             for seg in segments.iter() {
                 seg.set_hot();
             }
-            return 0;
+            return (0, 0);
         }
 
         let space_to_collect = segments
@@ -95,17 +96,22 @@ impl CombinedCleaner {
         let mut deduped_cells: HashMap<u64, DummyEntry> = HashMap::new();
         let mut tombstones: Vec<DummyEntry> = Vec::new();
 
+        let mut num_reduced_segments: isize = 0;
+
         for entry in segments
             .iter()
-            .flat_map(|seg| chunk.live_entries(seg))
-            .filter(|entry| {
+            .flat_map(|seg| chunk.live_entries(seg).map(|entry| (entry, seg.id)))
+            .filter(|(entry, _seg_id)| {
                 // live entries have done a lot of filtering work already
                 // but we still need to remove those tombstones that pointed to segments we are about to combine
                 if let EntryContent::Tombstone(ref tombstone) = entry.content {
-                    return !segment_ids_to_combine.contains(&tombstone.segment_id);
+                    // Exclude tombstones pointing to segments being combined
+                    return !segment_ids_to_combine.contains(&tombstone.segment_id) // Tombstone is not pointing to a segment we are about to combine
+                        && !chunk.cell_index.contains_key(&(tombstone.hash as usize)) // Tombstone is not pointing to a cell that is already in the chunk;
                 }
                 return true;
             })
+            .map(|(entry, _seg_id)| entry)
         {
             let entry_size = entry.meta.entry_size;
             let entry_addr = entry.meta.entry_pos;
@@ -144,40 +150,20 @@ impl CombinedCleaner {
             .collect();
 
         // Sort by timestamp and then by size within timestamp buckets
-        all_entries.sort_by_key(|entry| entry.timestamp);
-
-        let mut sorted_entries = Vec::new();
-        for (_, group) in &all_entries
-            .into_iter()
-            .chunk_by(|entry| entry.timestamp / 10)
-        {
-            let mut group: Vec<_> = group.collect();
-            group.sort_by_key(|entry| entry.size);
-            sorted_entries.extend(group);
-        }
+        all_entries.sort_by_key(|entry| (entry.timestamp, entry.size));
 
         // Reverse to get hottest/largest first
-        sorted_entries.reverse();
+        all_entries.reverse();
 
-        let mut entries: Vec<_> = sorted_entries
-            .into_iter()
-            // provide additional state for whether entry have been claimed on simulation
-            .map(|e| (e, false))
-            .collect();
-
-        debug!("Found {} entries to combine", entries.len());
+        debug!("Found {} entries to combine", all_entries.len());
 
         let mut space_cleaned = 0;
-        if entries.len() > 0 {
+        if all_entries.len() > 0 {
             // Simulate the combine process to determine the efficiency
             let mut pending_segments = Vec::with_capacity(segments.len());
             pending_segments.push(DummySegment::new());
-            for (entry, is_claimed) in entries.iter_mut() {
+            for entry in all_entries.iter() {
                 let entry_size = entry.size;
-                if *is_claimed {
-                    // entry claimed
-                    continue;
-                }
                 {
                     let segment_space_remains =
                         SEGMENT_SIZE - pending_segments.last().unwrap().head;
@@ -192,14 +178,14 @@ impl CombinedCleaner {
                 last_segment.head += entry_size;
 
                 // mark entry claimed
-                *is_claimed = true;
             }
 
             debug!("Checking combine feasibility");
-            let pending_segments_len = pending_segments.len();
-            let segments_to_combine_len = segments.len();
+            let pending_segments_len = pending_segments.len() as isize;
+            let segments_to_combine_len = segments.len() as isize;
             let cleaned_total_live_space = AtomicUsize::new(0);
-            if pending_segments_len >= segments_to_combine_len {
+            num_reduced_segments = segments_to_combine_len - pending_segments_len;
+            if num_reduced_segments <= 0 {
                 debug!(
                     "Trying to combine segments but resulting segments still does not go down {}/{}",
                     pending_segments_len, segments_to_combine_len
@@ -209,7 +195,7 @@ impl CombinedCleaner {
                     seg.references.fetch_sub(1, Ordering::Relaxed);
                     seg.set_hot();
                 }
-                return 0;
+                return (0, 0);
             }
 
             debug!(
@@ -356,6 +342,7 @@ impl CombinedCleaner {
             "End combining segments, totally cleaned {} bytes, with {} segments.",
             space_cleaned, len_cleaned_segments
         );
-        space_cleaned
+        debug_assert!(num_reduced_segments >= 0);
+        (space_cleaned, num_reduced_segments as usize)
     }
 }

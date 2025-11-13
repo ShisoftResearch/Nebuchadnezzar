@@ -92,37 +92,71 @@ impl TieredMemoryManager {
     /// Returns the number of segments successfully evicted
     fn evict_until_target(&self, chunk: &Chunk, target: usize) -> Result<usize, io::Error> {
         let mut evicted_count = 0;
+        let mut attempts_without_progress = 0;
+        const MAX_ATTEMPTS_WITHOUT_PROGRESS: usize = 3;
 
-        for _ in 0..target {
+        // Try to evict target segments, with retries if we're making progress
+        // This allows references to be released over time
+        for attempt in 0..target * 2 {
+            if evicted_count >= target {
+                break; // Successfully evicted enough segments
+            }
+
             match self.clock_policy.select_victim(chunk) {
                 Some(victim) => {
                     match evict_segment(&victim, chunk) {
                         Ok(()) => {
                             evicted_count += 1;
+                            attempts_without_progress = 0; // Reset counter on success
                             debug!(
-                                "Evicted segment {} ({}/{})",
-                                victim.id, evicted_count, target
+                                "Evicted segment {} ({}/{}, attempt {})",
+                                victim.id,
+                                evicted_count,
+                                target,
+                                attempt + 1
                             );
                         }
                         Err(e) => {
                             warn!("Failed to evict segment {}: {}", victim.id, e);
-                            // Continue trying other segments
+                            attempts_without_progress += 1;
                         }
                     }
                 }
                 None => {
-                    // No more victims available
+                    // No more victims available right now
+                    attempts_without_progress += 1;
                     debug!(
-                        "CLOCK could not find more victims, evicted {}/{} segments",
-                        evicted_count, target
+                        "CLOCK could not find victim (attempt {}), evicted {}/{} segments",
+                        attempt + 1,
+                        evicted_count,
+                        target
                     );
-                    break;
                 }
+            }
+
+            // If we haven't made progress in several attempts, give up
+            if attempts_without_progress >= MAX_ATTEMPTS_WITHOUT_PROGRESS {
+                warn!(
+                    "Eviction stalled after {} attempts without progress, evicted {}/{} segments",
+                    MAX_ATTEMPTS_WITHOUT_PROGRESS, evicted_count, target
+                );
+                break;
+            }
+
+            // Small delay to allow references to be released if we're struggling
+            if attempts_without_progress > 0 && evicted_count < target {
+                std::thread::yield_now();
             }
         }
 
         if evicted_count > 0 {
             info!("Evicted {} segments to cold storage", evicted_count);
+        } else if target > 0 {
+            warn!(
+                "Failed to evict any segments (target was {}). Hot segments: {}, all may be protected or have active references",
+                target,
+                chunk.segments().iter().filter(|s| s.is_hot()).count()
+            );
         }
 
         Ok(evicted_count)

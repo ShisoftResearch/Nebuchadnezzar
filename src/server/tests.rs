@@ -888,7 +888,7 @@ pub async fn schema_persistence_multiple_restarts() {
 #[tokio::test]
 pub async fn memory_status_test() {
     let _ = env_logger::try_init();
-    
+
     // Create server with tiered memory enabled
     let server = NebServer::new_from_opts(
         &ServerOptions {
@@ -916,9 +916,19 @@ pub async fn memory_status_test() {
 
     // Verify basic statistics
     assert_eq!(status.total_chunks, 4, "Should have 4 chunks");
-    assert_eq!(status.chunk_details.len(), 4, "Should have details for 4 chunks");
-    assert!(status.total_segments > 0, "Should have at least one segment (bootstrap)");
-    assert!(status.tiered_memory_enabled, "Tiered memory should be enabled");
+    assert_eq!(
+        status.chunk_details.len(),
+        4,
+        "Should have details for 4 chunks"
+    );
+    assert!(
+        status.total_segments > 0,
+        "Should have at least one segment (bootstrap)"
+    );
+    assert!(
+        status.tiered_memory_enabled,
+        "Tiered memory should be enabled"
+    );
     assert_eq!(
         status.physical_memory_limit_bytes,
         Some(64 * 1024 * 1024),
@@ -944,8 +954,14 @@ pub async fn memory_status_test() {
 
     // Test JSON serialization
     let json = serde_json::to_string(&status).expect("Should serialize to JSON");
-    assert!(json.contains("total_chunks"), "JSON should contain total_chunks");
-    assert!(json.contains("tiered_memory_enabled"), "JSON should contain tiered_memory_enabled");
+    assert!(
+        json.contains("total_chunks"),
+        "JSON should contain total_chunks"
+    );
+    assert!(
+        json.contains("tiered_memory_enabled"),
+        "JSON should contain tiered_memory_enabled"
+    );
 
     info!("Memory status test completed successfully");
 }

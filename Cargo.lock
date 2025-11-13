@@ -753,7 +753,7 @@ checksum = "2874a2af47a2325c2001a6e6fad9b16a53b802102b528163885171cf92b15976"
 [[package]]
 name = "lightning-containers"
 version = "0.2.2"
-source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#38f630721a1e58576c381dea9b843bfa081abe1a"
+source = "git+ssh://git@192.168.10.134/shisoft-x/Lightning.git?branch=develop#f89dcf7060dc30a7b21cc965a170002869c2032a"
 dependencies = [
  "affinity",
  "ahash",

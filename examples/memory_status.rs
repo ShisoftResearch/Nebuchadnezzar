@@ -30,13 +30,8 @@ async fn main() {
     };
 
     // Create server instance
-    let server = NebServer::new_from_opts(
-        &opts,
-        "127.0.0.1:9000",
-        "test_group",
-        async |_| {},
-    )
-    .await;
+    let server =
+        NebServer::new_from_opts(&opts, "127.0.0.1:9000", "test_group", async |_| {}).await;
 
     // Get memory status
     let status = server.memory_status();
@@ -46,15 +41,24 @@ async fn main() {
 
     // Access individual fields programmatically
     println!("\n📌 Programmatic Access Example:");
-    println!("  Total memory allocated: {} bytes", status.total_memory_bytes);
-    println!("  Hot memory usage: {} bytes", status.total_hot_memory_bytes);
-    println!("  Cold memory usage: {} bytes", status.total_cold_memory_bytes);
-    
+    println!(
+        "  Total memory allocated: {} bytes",
+        status.total_memory_bytes
+    );
+    println!(
+        "  Hot memory usage: {} bytes",
+        status.total_hot_memory_bytes
+    );
+    println!(
+        "  Cold memory usage: {} bytes",
+        status.total_cold_memory_bytes
+    );
+
     if let Some(limit) = status.physical_memory_limit_bytes {
         let usage_percentage = (status.total_hot_memory_bytes as f64 / limit as f64) * 100.0;
         println!("  Memory limit: {} bytes", limit);
         println!("  Usage: {:.2}%", usage_percentage);
-        
+
         if usage_percentage > 80.0 {
             println!("  ⚠️  WARNING: Memory usage is high!");
         }
@@ -66,9 +70,7 @@ async fn main() {
         if chunk_status.hot_segments > 0 {
             println!(
                 "  Chunk {}: {} hot segments using {} bytes",
-                chunk_status.chunk_id,
-                chunk_status.hot_segments,
-                chunk_status.hot_memory_bytes
+                chunk_status.chunk_id, chunk_status.hot_segments, chunk_status.hot_memory_bytes
             );
         }
     }
@@ -79,4 +81,3 @@ async fn main() {
         println!("{}", json);
     }
 }
-

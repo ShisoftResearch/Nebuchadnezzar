@@ -94,7 +94,7 @@ impl Entry {
             let segment_info = crate::ram::chunk::chunk_and_segment_from_addr(pos)
                 .map(|(chunk_id, segment_id)| format!("chunk={}, segment={}", chunk_id, segment_id))
                 .unwrap_or_else(|| "unknown (address not in allocated range)".to_string());
-            
+
             panic!(
                 "Cannot decode entry header: invalid entry_type_bits={} (0x{:08x}) at address 0x{:016x} ({}). \
                 Valid types are: UNDECIDED(0), CELL(1), TOMBSTONE(2). \

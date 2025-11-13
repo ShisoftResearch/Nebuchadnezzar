@@ -208,7 +208,8 @@ impl NebServer {
                             Ok(txn_index) => {
                                 // Perform rollback for incomplete transactions
                                 // Segments are already in memory, so we can read directly from them
-                                if let Err(e) = log.rollback_incomplete_transactions(txn_index, &chunks)
+                                if let Err(e) =
+                                    log.rollback_incomplete_transactions(txn_index, &chunks)
                                 {
                                     error!("Failed to rollback incomplete transactions: {:?}", e);
                                 }

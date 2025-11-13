@@ -992,7 +992,7 @@ fn test_multiple_segments_in_chunk() {
     // Use a chunk size that can hold multiple segments
     // SEGMENT_SIZE is 8MB, each cell is ~50KB, so 160 cells = 8MB
     // We want to trigger 3-4 segments, so need ~480-640 cells
-    let chunk_size = CHUNK_SIZE * 8;  // 64MB chunk to hold multiple 8MB segments
+    let chunk_size = CHUNK_SIZE * 8; // 64MB chunk to hold multiple 8MB segments
     let chunks = StdArc::new(Chunks::new(
         1,
         chunk_size,
@@ -1009,7 +1009,7 @@ fn test_multiple_segments_in_chunk() {
     // We need to fill up a segment to trigger allocation of a new one
     // SEGMENT_SIZE is typically 8MB, so we need enough cells to fill that
     let num_threads = 8;
-    let cells_per_thread = 60;  // 8 * 60 * ~50KB = 24MB, enough for 3 segments
+    let cells_per_thread = 60; // 8 * 60 * ~50KB = 24MB, enough for 3 segments
     let mut handles = vec![];
 
     for thread_id in 0..num_threads {
@@ -1020,7 +1020,10 @@ fn test_multiple_segments_in_chunk() {
             for i in 0..cells_per_thread {
                 let cell_id = Id::new(1, thread_id * cells_per_thread + i);
                 let mut data_map = OwnedMap::new();
-                data_map.insert(&String::from("id"), OwnedValue::I64((thread_id * cells_per_thread + i) as i64));
+                data_map.insert(
+                    &String::from("id"),
+                    OwnedValue::I64((thread_id * cells_per_thread + i) as i64),
+                );
                 data_map.insert(&String::from("score"), OwnedValue::U64(i));
                 // Add large data to fill segments faster and trigger multiple segment allocations
                 data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
@@ -1040,7 +1043,10 @@ fn test_multiple_segments_in_chunk() {
                     }
                 }
             }
-            info!("Thread {} completed writing {} cells", thread_id, cells_per_thread);
+            info!(
+                "Thread {} completed writing {} cells",
+                thread_id, cells_per_thread
+            );
         });
 
         handles.push(handle);
@@ -1067,11 +1073,7 @@ fn test_multiple_segments_in_chunk() {
     // Verify all segments are accessible
     for seg_id in &seg_ids {
         let segment = chunk.segs.get(seg_id);
-        assert!(
-            segment.is_some(),
-            "Segment {} should be accessible",
-            seg_id
-        );
+        assert!(segment.is_some(), "Segment {} should be accessible", seg_id);
         info!("Segment {} is accessible", seg_id);
     }
 
@@ -1092,8 +1094,8 @@ fn test_multiple_segments_in_chunk() {
 #[test]
 fn test_concurrent_segment_allocation_and_cleanup() {
     use crate::ram::cleaner::Cleaner;
-    use std::sync::Arc as StdArc;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc as StdArc;
     use std::thread;
     use std::time::Duration;
 
@@ -1107,7 +1109,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
     let schemas = LocalSchemasCache::new_local("");
     schemas.new_schema(schema.clone());
 
-    let chunk_size = CHUNK_SIZE * 16;  // 128MB to accommodate many segments
+    let chunk_size = CHUNK_SIZE * 16; // 128MB to accommodate many segments
     let chunks = StdArc::new(Chunks::new(
         1,
         chunk_size,
@@ -1153,7 +1155,10 @@ fn test_concurrent_segment_allocation_and_cleanup() {
             for i in 0..cells_per_thread {
                 let cell_id = Id::new(1, thread_id * cells_per_thread + i);
                 let mut data_map = OwnedMap::new();
-                data_map.insert(&String::from("id"), OwnedValue::I64((thread_id * cells_per_thread + i) as i64));
+                data_map.insert(
+                    &String::from("id"),
+                    OwnedValue::I64((thread_id * cells_per_thread + i) as i64),
+                );
                 data_map.insert(&String::from("score"), OwnedValue::U64(i));
                 // Add large data to fill segments faster
                 data_map.insert(&String::from("name"), OwnedValue::String("x".repeat(50000)));
@@ -1166,7 +1171,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
                 match chunks_clone.write_cell(&mut cell) {
                     Ok(_) => {
                         trace!("Thread {} wrote cell {}", thread_id, i);
-                        
+
                         // Occasionally delete old cells to create dead space for cleaner
                         if i > 10 && i % 5 == 0 {
                             let old_cell_id = Id::new(1, thread_id * cells_per_thread + (i - 10));
@@ -1180,7 +1185,10 @@ fn test_concurrent_segment_allocation_and_cleanup() {
                     }
                 }
             }
-            info!("Thread {} completed writing {} cells", thread_id, cells_per_thread);
+            info!(
+                "Thread {} completed writing {} cells",
+                thread_id, cells_per_thread
+            );
         });
 
         handles.push(handle);

@@ -28,9 +28,9 @@ pub fn load_file_to_memory(path: &Path) -> io::Result<Vec<u8>> {
 
 /// Find the actual append_header by scanning segment data
 pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
-    use byteorder::{ReadBytesExt, LittleEndian};
+    use byteorder::{LittleEndian, ReadBytesExt};
     use std::io::Cursor;
-    
+
     let mut cursor = seg_addr;
     let bound = seg_addr + file_size;
     let mut entries_found = 0;
@@ -56,7 +56,11 @@ pub fn find_append_header(seg_addr: usize, file_size: usize) -> usize {
                 "Corrupted entry header detected at offset {} (address 0x{:016x}): \
                 invalid entry_type_bits={} (0x{:08x}). \
                 Treating as end of valid data. Found {} valid entries before corruption.",
-                cursor - seg_addr, cursor, entry_type_bits, entry_type_bits, entries_found
+                cursor - seg_addr,
+                cursor,
+                entry_type_bits,
+                entry_type_bits,
+                entries_found
             );
             break;
         }

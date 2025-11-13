@@ -41,6 +41,29 @@ impl Cleaner {
                             Self::clean(chunk, false);
                         });
 
+                        // Background eviction: check and evict if memory limit exceeded
+                        #[cfg(feature = "tiered_memory")]
+                        checks_ref_clone.list.par_iter().for_each(|chunk| {
+                            if let Some(ref tiered_manager) = chunk.tiered_manager {
+                                match tiered_manager.evict_for_allocation(chunk) {
+                                    Ok(evicted) => {
+                                        if evicted > 0 {
+                                            debug!(
+                                                "Background eviction: evicted {} segments from chunk {}",
+                                                evicted, chunk.id
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Background eviction failed for chunk {}: {}",
+                                            chunk.id, e
+                                        );
+                                    }
+                                }
+                            }
+                        });
+
                         thread::sleep(Duration::from_millis(sleep_interval_ms));
                     }
                     warn!("Cleaner main thread stopped");
@@ -61,18 +84,21 @@ impl Cleaner {
         return cleaner;
     }
     pub fn clean(chunk: &Chunk, full: bool) {
-        debug!("Ready for clean {}, full {}", chunk.id, full);
+        trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
         let guard = if full {
             Some(chunk.gc_lock.lock())
         } else {
             chunk.gc_lock.try_lock()
         };
         if guard.is_none() {
-            debug!("GC in progress, will not wait it unless full GC");
+            debug!(
+                "Cleaner: Chunk {} GC in progress, will not wait it unless full GC",
+                chunk.id
+            );
             return;
         }
         let num_segs = chunk.segs.len();
-        debug!(
+        trace!(
             "Cleaning chunk {}, full {}, segs {}, head seg {}",
             chunk.id,
             full,
@@ -82,33 +108,12 @@ impl Cleaner {
         let segments_compact_per_turn = if full { num_segs } else { num_segs / 5 + 1 };
         let segments_combine_per_turn = if full { num_segs } else { num_segs / 5 + 2 };
 
-        let mut cleaned_space: usize = 0;
-
-        #[cfg(feature = "compact_cleaner")]
-        {
-            debug!("Starting compact {}", chunk.id);
-            let segments_for_compact = chunk.segs_for_compact_cleaner();
-            debug!(
-                "Selected {} segments for compaction",
-                segments_for_compact.len()
-            );
-            if !segments_for_compact.is_empty() {
-                trace!(
-                    "Chunk {} have {} segments to compact, overflow {}",
-                    chunk.id,
-                    segments_for_compact.len(),
-                    segments_compact_per_turn
-                );
-                cleaned_space += segments_for_compact
-                    .into_par_iter()
-                    .take(segments_compact_per_turn) // limit max segment to clean per turn
-                    .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
-                    .sum::<usize>();
-            }
-        }
+        let mut combiner_cleaned_space: usize = 0;
+        let mut compacter_cleaned_space: usize = 0;
+        let mut reduced_segments_count: usize = 0;
         #[cfg(feature = "combine_cleaner")]
         {
-            debug!("Starting combine {}", chunk.id);
+            trace!("Starting combine for chunk {}", chunk.id);
             let segments_candidates_for_combine = chunk.segs_for_combine_cleaner();
             let num_segments_candidates_for_combine = segments_candidates_for_combine.len();
             let mut segments_for_combine = vec![];
@@ -122,21 +127,45 @@ impl Cleaner {
                 segments_for_combine.push(seg);
                 combining_size = new_size;
             }
-            if !segments_for_combine.is_empty() {
+            if segments_for_combine.len() > 2 {
                 debug!(
                     "Have {} segments to combine, candidates {}",
                     segments_for_combine.len(),
                     num_segments_candidates_for_combine
                 );
-                cleaned_space +=
-                    combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
+
+                let (cleaned_space, num_reduced_segments) = combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
+                combiner_cleaned_space += cleaned_space;
+                reduced_segments_count += num_reduced_segments;
             }
         }
-
+        #[cfg(feature = "compact_cleaner")]
+        {
+            trace!("Starting compact for chunk {}", chunk.id);
+            let segments_for_compact = chunk.segs_for_compact_cleaner();
+            if !segments_for_compact.is_empty() {
+                debug!(
+                    "Selected {} segments for compaction from chunk {}",
+                    segments_for_compact.len(),
+                    chunk.id
+                );
+                compacter_cleaned_space += segments_for_compact
+                    .into_par_iter()
+                    .take(segments_compact_per_turn) // limit max segment to clean per turn
+                    .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
+                    .sum::<usize>();
+            }
+        }
+        let combined_cleaned_space = combiner_cleaned_space + compacter_cleaned_space;
         chunk
             .total_space
-            .fetch_sub(cleaned_space, Ordering::Relaxed);
-        debug!("Chunk Cleaned {}", chunk.id);
+            .fetch_sub(combined_cleaned_space, Ordering::Relaxed);
+        if combined_cleaned_space > 0 {
+            info!(
+                "Chunk {} cleaned total {} bytes, reduced {} segments (combiner {} bytes, compacter {} bytes)",
+                chunk.id, combined_cleaned_space, reduced_segments_count, combiner_cleaned_space, compacter_cleaned_space
+            );
+        }
     }
 
     pub fn stop(&self) {

@@ -718,7 +718,8 @@ impl Service for DataManager {
                                 .chunks
                                 .update_cell_by(&cell_id, |cell_to_update| {
                                     if cell_to_update.header.version == orig_version {
-                                        old_cell_ref = Some((*cell_to_update).to_owned().into_ref());
+                                        old_cell_ref =
+                                            Some((*cell_to_update).to_owned().into_ref());
                                         Some(cell)
                                     } else {
                                         None
