@@ -2,17 +2,20 @@ use super::*;
 use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
-use crate::server::NebServer;
-use bifrost::vector_clock::StandardVectorClock;
+use bifrost::conshash::ConsistentHashing;
+use bifrost::rpc::{RPCClient, ClientPool};
+use bifrost::vector_clock::{StandardVectorClock, ServerVectorClock};
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
 use lightning::map::{Map as LFMapT, PtrHashMap as LFMap};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io;
 // Use async mutex because this module is a distributed coordinator
 use async_std::sync::{Mutex, MutexGuard};
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -21,6 +24,28 @@ type AffectedObjs = BTreeMap<u64, BTreeMap<Id, DataObject>>; // server_id as key
 type DataSitesMap = HashMap<u64, Arc<data_site::AsyncServiceClient>>;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_MANAGER_RPC_SERVICE) as u64;
+
+/// Dependencies needed by TransactionManager, extracted from NebServer to break cyclic dependency
+pub struct TransactionManagerDeps {
+    pub meta: Arc<crate::server::ServerMeta>,
+    pub clock: Arc<ServerVectorClock>,
+    pub server_id: u64,
+    pub consh: Arc<ConsistentHashing>,
+    pub member_pool: Arc<ClientPool>,
+}
+
+impl TransactionManagerDeps {
+    pub fn get_server_id_by_id(&self, id: &Id) -> Option<u64> {
+        self.consh.get_server_id(id.higher)
+    }
+
+    pub async fn get_member_by_server_id(&self, server_id: u64) -> io::Result<Arc<RPCClient>> {
+        let consh = self.consh.clone();
+        self.member_pool
+            .get_by_id(server_id, move |_| consh.to_server_name(server_id))
+            .await
+    }
+}
 
 /// Configuration for wait/retry behavior when transactions encounter conflicts
 #[derive(Clone, Debug)]
@@ -53,6 +78,7 @@ struct Transaction {
     data: HashMap<Id, DataObject>,
     affected_objects: AffectedObjs,
     state: TxnState,
+    last_activity: i64, // Unix timestamp in milliseconds for detecting stale transactions
 }
 
 service! {
@@ -74,32 +100,64 @@ dispatch_rpc_service_functions!(TransactionManager);
 service_with_id!(TransactionManager, DEFAULT_SERVICE_ID);
 
 pub struct TransactionManager {
-    server: Arc<NebServer>,
+    deps: Arc<TransactionManagerDeps>,
     transactions: LFMap<TxnId, TxnMutex>,
+    txn_ids: parking_lot::Mutex<BTreeSet<TxnId>>, // Track TxnIds for iteration (PtrHashMap doesn't support iteration)
     data_sites: LFMap<u64, Arc<data_site::AsyncServiceClient>>,
     wait_config: WaitConfig,
+    shutdown: Arc<AtomicBool>, // Signal to stop background cleanup task
 }
 
 impl TransactionManager {
-    pub fn new(server: &Arc<NebServer>) -> Arc<TransactionManager> {
-        Arc::new(Self {
-            server: server.clone(),
-            transactions: LFMap::with_capacity(128),
-            data_sites: LFMap::with_capacity(8),
-            wait_config: WaitConfig::default(),
-        })
+    pub fn new(deps: Arc<TransactionManagerDeps>) -> Arc<TransactionManager> {
+        Self::new_with_config(deps, WaitConfig::default())
     }
 
     pub fn with_wait_config(
-        server: &Arc<NebServer>,
+        deps: Arc<TransactionManagerDeps>,
         wait_config: WaitConfig,
     ) -> Arc<TransactionManager> {
-        Arc::new(Self {
-            server: server.clone(),
+        Self::new_with_config(deps, wait_config)
+    }
+
+    fn new_with_config(deps: Arc<TransactionManagerDeps>, wait_config: WaitConfig) -> Arc<TransactionManager> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let manager = Arc::new(Self {
+            deps,
             transactions: LFMap::with_capacity(128),
+            txn_ids: parking_lot::Mutex::new(BTreeSet::new()),
             data_sites: LFMap::with_capacity(8),
             wait_config,
-        })
+            shutdown: shutdown.clone(),
+        });
+
+        // Spawn background cleanup task
+        let manager_clone = manager.clone();
+        tokio::spawn(async move {
+            loop {
+                // Check if we should shutdown
+                if shutdown.load(Ordering::Relaxed) {
+                    debug!("TransactionManager cleanup task shutting down");
+                    break;
+                }
+
+                // Sleep for 60 seconds
+                tokio::time::sleep(Duration::from_secs(60)).await;
+
+                // Clean up stale transactions (older than 5 minutes)
+                let cleaned = manager_clone.cleanup_stale_transactions(5 * 60 * 1000);
+                if cleaned > 0 {
+                    warn!("Cleaned up {} stale transactions", cleaned);
+                }
+            }
+        });
+
+        manager
+    }
+
+    /// Returns the current number of living transactions tracked by this TransactionManager
+    pub fn transaction_count(&self) -> usize {
+        self.transactions.len()
     }
 
     /// Helper function for exponential backoff wait with timeout
@@ -188,7 +246,7 @@ impl Service for TransactionManager {
                 match data_obj.cell {
                     Some(ref cell) => {
                         let schema_id = cell.header.schema;
-                        if let Some(schema) = self.server.meta.schemas.get(&schema_id) {
+                        if let Some(schema) = self.deps.meta.schemas.get(&schema_id) {
                             if let OwnedValue::Map(map) = &cell.data {
                                 let mut res = vec![];
                                 'SEARCH: for field in &fields {
@@ -239,7 +297,19 @@ impl Service for TransactionManager {
             // Note: Automatic retry with fresh timestamps removed because it changes
             // the transaction ID mid-flight, breaking the client's reference.
             // For remaining NotRealizable errors, clients should retry with a new transaction.
-            self.do_prepare(&tid).await
+            let result = self.do_prepare(&tid).await;
+            // If prepare failed, abort the transaction to release locks and clean up
+            match &result {
+                Ok(TMPrepareResult::Success) => {
+                    // Transaction prepared successfully, will be cleaned up on commit/abort
+                }
+                Ok(_) | Err(_) => {
+                    // Prepare failed or error occurred, abort to release locks and clean up
+                    // This prevents memory leaks from abandoned transactions
+                    let _ = self.abort(tid.clone()).await;
+                }
+            }
+            result
         }
         .boxed()
     }
@@ -279,7 +349,8 @@ impl Service for TransactionManager {
         .boxed()
     }
     fn begin(&self) -> BoxFuture<'_, Result<TxnId, TMError>> {
-        let id = self.server.txn_peer.clock.inc();
+        let id = self.deps.clock.inc();
+        let now = bifrost::utils::time::get_time();
         if self
             .transactions
             .insert(
@@ -288,6 +359,7 @@ impl Service for TransactionManager {
                     data: HashMap::new(),
                     affected_objects: AffectedObjs::new(),
                     state: TxnState::Started,
+                    last_activity: now,
                 })),
             )
             .is_some()
@@ -295,6 +367,7 @@ impl Service for TransactionManager {
             error!("Transaction id existed: {:?}", id);
             future::ready(Err(TMError::TransactionIdExisted)).boxed()
         } else {
+            self.txn_ids.lock().insert(id.clone());
             future::ready(Ok(id)).boxed()
         }
     }
@@ -309,7 +382,8 @@ impl Service for TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let id = cell.id();
             self.ensure_rw_state(&txn)?;
-            match self.server.get_server_id_by_id(&id) {
+            txn.last_activity = bifrost::utils::time::get_time(); // Update activity timestamp
+            match self.deps.get_server_id_by_id(&id) {
                 Some(server_id) => {
                     let have_cached_cell = txn.data.contains_key(&id);
                     if !have_cached_cell {
@@ -317,7 +391,7 @@ impl Service for TransactionManager {
                             id,
                             DataObject {
                                 server: server_id,
-                                cell: Some(cell.clone()),
+                                cell: Some(cell),
                                 new: true,
                                 version: None,
                                 changed: true,
@@ -329,7 +403,7 @@ impl Service for TransactionManager {
                         if !data_obj.cell.is_none() {
                             return Ok(TxnExecResult::Error(WriteError::CellAlreadyExisted));
                         }
-                        data_obj.cell = Some(cell.clone());
+                        data_obj.cell = Some(cell);
                         data_obj.changed = true;
                         Ok(TxnExecResult::Accepted(()))
                     }
@@ -349,9 +423,10 @@ impl Service for TransactionManager {
             let mut txn = txn_mutex.lock().await;
             let id = cell.id();
             self.ensure_rw_state(&txn)?;
-            match self.server.get_server_id_by_id(&id) {
+            txn.last_activity = bifrost::utils::time::get_time(); // Update activity timestamp
+            match self.deps.get_server_id_by_id(&id) {
                 Some(server_id) => {
-                    let cell = cell.clone();
+                    // cell is already owned by the async block, no need to clone
                     if txn.data.contains_key(&id) {
                         let data_obj = txn.data.get_mut(&id).unwrap();
                         data_obj.cell = Some(cell);
@@ -384,7 +459,7 @@ impl Service for TransactionManager {
             let txn_lock = self.get_transaction(&tid)?;
             let mut txn = txn_lock.lock().await;
             self.ensure_rw_state(&txn)?;
-            match self.server.get_server_id_by_id(&id) {
+            match self.deps.get_server_id_by_id(&id) {
                 Some(server_id) => {
                     if txn.data.contains_key(&id) {
                         let mut new_obj = false;
@@ -430,7 +505,7 @@ impl TransactionManager {
         server_id: u64,
     ) -> io::Result<Arc<data_site::AsyncServiceClient>> {
         if !self.data_sites.contains_key(&server_id) {
-            let client = self.server.get_member_by_server_id(server_id).await?;
+            let client = self.deps.get_member_by_server_id(server_id).await?;
             return Ok(self
                 .data_sites
                 .get_or_insert(server_id, || data_site::AsyncServiceClient::new(&client)));
@@ -444,7 +519,7 @@ impl TransactionManager {
         &self,
         id: &Id,
     ) -> io::Result<(u64, Arc<data_site::AsyncServiceClient>)> {
-        match self.server.get_server_id_by_id(id) {
+        match self.deps.get_server_id_by_id(id) {
             Some(id) => match self.get_data_site(id).await {
                 Ok(site) => Ok((id, site.clone())),
                 Err(e) => Err(e),
@@ -456,10 +531,10 @@ impl TransactionManager {
         }
     }
     fn get_clock(&self) -> StandardVectorClock {
-        self.server.txn_peer.clock.to_clock()
+        self.deps.clock.to_clock()
     }
     fn merge_clock(&self, clock: &StandardVectorClock) {
-        self.server.txn_peer.clock.merge_with(clock)
+        self.deps.clock.merge_with(clock)
     }
     fn get_transaction(&self, tid: &TxnId) -> Result<TxnMutex, TMError> {
         match self.transactions.get(tid) {
@@ -477,7 +552,7 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
-        let self_server_id = self.server.server_id;
+        let self_server_id = self.deps.server_id;
 
         loop {
             // Check timeout
@@ -493,7 +568,7 @@ impl TransactionManager {
                 Ok(dsr) => {
                     self.merge_clock(&dsr.clock);
                     let payload = dsr.payload;
-                    match &payload {
+                    match payload {
                         TxnExecResult::Accepted(cell) => {
                             // Check if there's a pending update in the transaction cache
                             // If the cell was updated locally, we must return the cached updated version
@@ -511,21 +586,26 @@ impl TransactionManager {
                                 }
                                 // Entry exists but not changed - only update if cell is missing
                                 if data_obj.cell.is_none() {
-                                    data_obj.cell = Some(cell.clone());
-                                    data_obj.version = Some(cell.header.version);
+                                    let version = cell.header.version;
+                                    data_obj.cell = Some(cell);
+                                    data_obj.version = Some(version);
                                 }
+                                return Ok(TxnExecResult::Accepted(data_obj.cell.as_ref().unwrap().clone()));
                             } else {
-                                // No entry exists - cache the remote value
+                                // No entry exists - cache the remote value and return it
+                                let version = cell.header.version;
+                                let result = TxnExecResult::Accepted(cell.clone());
                                 txn.data.insert(
                                     id.clone(),
                                     DataObject {
                                         server: server_id,
-                                        version: Some(cell.header.version),
-                                        cell: Some(cell.clone()),
+                                        version: Some(version),
+                                        cell: Some(cell),
                                         new: false,
                                         changed: false,
                                     },
                                 );
+                                return Ok(result);
                             }
                         }
                         TxnExecResult::Wait => {
@@ -534,9 +614,8 @@ impl TransactionManager {
                             attempt += 1;
                             continue;
                         }
-                        _ => {}
+                        other => return Ok(other),
                     }
-                    return Ok(payload);
                 }
                 Err(e) => {
                     error!("{:?}", e);
@@ -556,7 +635,7 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<CellHeader, ReadError>, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
-        let self_server_id = self.server.server_id;
+        let self_server_id = self.deps.server_id;
 
         loop {
             // Check timeout
@@ -601,7 +680,7 @@ impl TransactionManager {
     ) -> Result<TxnExecResult<OwnedCell, ReadError>, TMError> {
         let start_time = std::time::Instant::now();
         let mut attempt = 0u32;
-        let self_server_id = self.server.server_id;
+        let self_server_id = self.deps.server_id;
 
         loop {
             // Check timeout
@@ -673,7 +752,7 @@ impl TransactionManager {
             .collect())
     }
     async fn site_prepare(
-        server: &Arc<NebServer>,
+        deps: &Arc<TransactionManagerDeps>,
         config: &WaitConfig,
         tid: &TxnId,
         objs: &BTreeMap<Id, DataObject>,
@@ -689,21 +768,20 @@ impl TransactionManager {
                 return Ok(DMPrepareResult::NotRealizable); // Give up
             }
 
-            let self_server_id = server.server_id;
+            let self_server_id = deps.server_id;
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
-            let server_for_clock = server.clone();
+            let deps_for_clock = deps.clone();
             let prepare_payload = data_site
                 .prepare(
                     self_server_id,
-                    server.txn_peer.clock.to_clock(),
+                    deps.clock.to_clock(),
                     tid.clone(),
                     cell_ids,
                 )
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {
-                    server_for_clock
-                        .txn_peer
+                    deps_for_clock
                         .clock
                         .merge_with(&prepare_res.clock);
                     prepare_res.payload
@@ -736,7 +814,7 @@ impl TransactionManager {
             .map(|(server, objs)| async move {
                 let data_site = data_sites.get(server).unwrap().clone();
                 TransactionManager::site_prepare(
-                    &self.server,
+                    &self.deps,
                     &self.wait_config,
                     &tid,
                     &objs,
@@ -771,10 +849,13 @@ impl TransactionManager {
                             CommitOp::Read(*cell_id, data_obj.version.unwrap())
                         } else if data_obj.cell.is_none() && !data_obj.new {
                             CommitOp::Remove(*cell_id)
-                        } else if data_obj.new {
-                            CommitOp::Write(data_obj.cell.clone().unwrap())
-                        } else if !data_obj.new {
-                            CommitOp::Update(data_obj.cell.clone().unwrap())
+                        } else if let Some(ref cell) = data_obj.cell {
+                            // Avoid unnecessary conditional logic - just check new flag
+                            if data_obj.new {
+                                CommitOp::Write(cell.clone())
+                            } else {
+                                CommitOp::Update(cell.clone())
+                            }
                         } else {
                             CommitOp::None
                         }
@@ -888,6 +969,52 @@ impl TransactionManager {
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
         self.transactions.remove(tid);
+        self.txn_ids.lock().remove(tid);
+    }
+
+    /// Clean up stale transactions that have been abandoned by clients
+    /// Should be called periodically by a background task
+    /// Returns the number of transactions cleaned up
+    pub fn cleanup_stale_transactions(&self, max_age_ms: i64) -> usize {
+        let now = bifrost::utils::time::get_time();
+        let cutoff = now - max_age_ms;
+        let mut cleaned = 0;
+
+        // Collect stale transaction IDs
+        let stale_txns: Vec<TxnId> = {
+            let txn_ids = self.txn_ids.lock();
+            txn_ids
+                .iter()
+                .filter_map(|tid| {
+                    if let Some(txn_mutex) = self.transactions.get(tid) {
+                        // Try to get the lock without blocking
+                        if let Some(txn_guard) = txn_mutex.try_lock() {
+                            // Clean up if:
+                            // 1. Transaction is old AND
+                            // 2. NOT in Prepared state (those should be cleaned by commit/abort)
+                            if txn_guard.last_activity < cutoff
+                                && txn_guard.state != TxnState::Prepared
+                            {
+                                return Some(tid.clone());
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        // Remove the stale transactions
+        for tid in stale_txns {
+            warn!(
+                "Cleaning up stale transaction {:?} (likely client didn't call prepare/abort)",
+                tid
+            );
+            self.cleanup_transaction(&tid);
+            cleaned += 1;
+        }
+
+        cleaned
     }
 
     /// Performs the actual prepare operation (extracted for retry logic)
@@ -922,5 +1049,13 @@ impl TransactionManager {
             result
         };
         Ok(conclusion)
+    }
+}
+
+impl Drop for TransactionManager {
+    fn drop(&mut self) {
+        // Signal background cleanup task to shutdown
+        self.shutdown.store(true, Ordering::Relaxed);
+        debug!("TransactionManager dropped, signaling cleanup task to stop");
     }
 }

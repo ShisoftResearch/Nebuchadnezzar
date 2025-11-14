@@ -1,6 +1,5 @@
 use crate::ram::segs::SEGMENT_SIZE;
 use crate::server::NebServer;
-
 /// Per-chunk memory statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkMemoryStatus {
@@ -26,6 +25,7 @@ pub struct ServerMemoryStatus {
     pub total_cold_memory_bytes: usize,
     pub total_memory_bytes: usize,
     pub total_cells: usize,
+    pub living_transactions: usize,
     pub physical_memory_limit_bytes: Option<usize>,
     pub tiered_memory_enabled: bool,
 }
@@ -57,6 +57,10 @@ impl ServerMemoryStatus {
         println!("\n📊 Overall Statistics:");
         println!("  • Total Chunks:        {}", self.total_chunks);
         println!("  • Total Cells:         {}", self.total_cells);
+        println!(
+            "  • Living Transactions: {}",
+            self.living_transactions
+        );
         println!(
             "  • Total Segments:      {} (Hot: {}, Cold: {})",
             self.total_segments, self.total_hot_segments, self.total_cold_segments
@@ -195,6 +199,8 @@ impl NebServer {
         let total_physical_limit =
             physical_memory_limit_per_chunk.map(|limit| limit * total_chunks);
 
+        let living_transactions = self.txn_manager.as_ref().map(|tm| tm.transaction_count()).unwrap_or(0);
+
         ServerMemoryStatus {
             total_chunks,
             chunk_details,
@@ -205,6 +211,7 @@ impl NebServer {
             total_cold_memory_bytes: total_cold_segments * SEGMENT_SIZE,
             total_memory_bytes: total_segments * SEGMENT_SIZE,
             total_cells,
+            living_transactions,
             physical_memory_limit_bytes: total_physical_limit,
             tiered_memory_enabled: tiered_enabled,
         }

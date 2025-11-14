@@ -1,5 +1,6 @@
 use crate::client::{AsyncClient, NebClientError};
 use crate::query::data_client::IndexedDataClient;
+use crate::server::transactions::manager::TransactionManager;
 use crate::{client, index::builder::IndexBuilder};
 use bifrost::conshash::weights::Weights;
 use bifrost::conshash::ConsistentHashing;
@@ -10,7 +11,7 @@ use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use bifrost::raft::disk::DiskOptions;
 use bifrost::raft::state_machine::master as sm_master;
-use bifrost::rpc;
+use bifrost::rpc::{self, ClientPool};
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
@@ -105,7 +106,7 @@ pub struct NebServer {
     pub rpc: Arc<rpc::Server>,
     pub consh: Arc<ConsistentHashing>,
     pub membership: Arc<ObserverClient>,
-    pub member_pool: rpc::ClientPool,
+    pub member_pool: Arc<rpc::ClientPool>,
     pub txn_peer: Peer,
     pub raft_service: Arc<raft::RaftService>,
     pub raft_client: Arc<RaftClient>,
@@ -115,6 +116,7 @@ pub struct NebServer {
     pub group_name: String,
     pub neb_client: Arc<AsyncClient>,
     pub undo_log: Option<Arc<transactions::undo_log::UndoLogger>>,
+    pub txn_manager: Option<Arc<transactions::manager::TransactionManager>>,
 }
 
 pub async fn init_conshash(
@@ -234,6 +236,21 @@ impl NebServer {
         // Start cleaner AFTER all recovery (segments + transactions) is complete
         // This ensures segments with old cell data needed for rollback aren't cleaned
         let cleaner = Cleaner::new_and_start(chunks.clone());
+        let mut transaction_manager = None;
+        let member_pool = Arc::new(rpc::ClientPool::new());
+        let txn_peer = Peer::new(server_addr);
+        let clock = txn_peer.clock.clone();
+
+        if opts.services.contains(&Service::Transaction) {
+            transaction_manager = Some(init_txn_manager(
+                rpc_server, 
+                &meta_rc, 
+                &clock, 
+                rpc_server.server_id, 
+                &conshasing, 
+                &member_pool,
+            ).await);
+        }
 
         let server = Arc::new(NebServer {
             chunks,
@@ -242,22 +259,23 @@ impl NebServer {
             rpc: rpc_server.clone(),
             consh: conshasing.clone(),
             membership: membership_client.clone(),
-            member_pool: rpc::ClientPool::new(),
-            txn_peer: Peer::new(server_addr),
+            member_pool: member_pool.clone(),
             raft_service: raft_service.clone(),
             raft_client: raft_client.clone(),
             server_id: rpc_server.server_id,
+            txn_peer: txn_peer,
             indexer: index_builder,
             group_name: group_name.clone(),
             neb_client: neb_client.clone(),
             undo_log,
+            txn_manager: transaction_manager.clone(),
         });
         let servs = proc_services(&opts.services);
         for service in servs {
             match service {
                 Service::Cell => init_cell_rpc_service(rpc_server, &server).await,
                 Service::Transaction | Service::HashIndexer => {
-                    init_txn_service(rpc_server, &server).await
+                    init_txn_data_site_service(rpc_server, &server).await
                 }
                 Service::RangedIndexer => {
                     // Use raft storage path for tree persistence if available
@@ -474,13 +492,13 @@ pub async fn rpc_client_by_id(id: &Id, neb: &Arc<NebServer>) -> Result<Arc<RPCCl
 
 // Peer have a clock, meant to update with other servers in the cluster
 pub struct Peer {
-    pub clock: ServerVectorClock,
+    pub clock: Arc<ServerVectorClock>,
 }
 
 impl Peer {
     pub fn new(server_address: &String) -> Peer {
         Peer {
-            clock: ServerVectorClock::new(server_address),
+            clock: Arc::new(ServerVectorClock::new(server_address)),
         }
     }
 }
@@ -491,10 +509,31 @@ pub async fn init_cell_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<Ne
         .await;
 }
 
-pub async fn init_txn_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_txn_manager(
+    rpc_server: &Arc<Server>,
+    meta: &Arc<ServerMeta>,
+    clock: &Arc<ServerVectorClock>,
+    server_id: u64,
+    consh: &Arc<ConsistentHashing>,
+    member_pool: &Arc<ClientPool>,
+) -> Arc<TransactionManager> {
+    let deps = Arc::new(transactions::manager::TransactionManagerDeps {
+        meta: meta.clone(),
+        clock: clock.clone(),
+        server_id: server_id,
+        consh: consh.clone(),
+        member_pool: member_pool.clone(),
+    });
+    let txn_manager = transactions::manager::TransactionManager::new(deps);
     rpc_server
-        .register_service(&transactions::manager::TransactionManager::new(&neb_server))
+        .register_service(&txn_manager)
         .await;
+    return txn_manager;
+}
+pub async fn init_txn_data_site_service(
+    rpc_server: &Arc<Server>,
+    neb_server: &Arc<NebServer>,
+) {
     rpc_server
         .register_service(&transactions::data_site::DataManager::new(&neb_server))
         .await;
