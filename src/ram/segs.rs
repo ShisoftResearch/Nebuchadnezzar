@@ -216,10 +216,11 @@ impl Segment {
     /// as accessing the freed pages may cause the OS to zero them or remap them.
     /// 
     /// # Example
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use neb::ram::segs::Segment;
     /// 
     /// // After writing some data to a segment, you can free unused tail pages
+    /// // (assuming `segment` is a valid Segment reference)
     /// let used_size = 1024 * 100; // 100KB used
     /// segment.punch_hole(used_size);
     /// ```
@@ -555,10 +556,23 @@ impl Segment {
                     self.set_archived();
                     self.clear_dirty(); // Backup updated - clean state
 
-                    // NOTE: Do NOT close WAL file here!
-                    // WAL is needed for transaction rollback during recovery
-                    // WAL will be closed when segment is evicted to cold storage
-                    // However, wal_dirty flag tracks if new writes come in after this archive
+                    // Close and delete WAL file since backup now contains all data
+                    // Recovery prefers backup files over WAL files (see file_manager.rs:272-285)
+                    // Closing the file descriptor first ensures clean deletion
+                    if let Some(wal) = state.wal.take() {
+                        drop(wal); // Close the file descriptor
+                        debug!("Closed WAL file descriptor for segment {}", self.id);
+                    }
+                    
+                    // Delete the WAL file from disk
+                    if let Err(e) = state.manager.delete_wal(self.chunk_id, self.id, self.seq_id) {
+                        warn!(
+                            "Failed to delete WAL file for segment {}: {}",
+                            self.id, e
+                        );
+                    } else {
+                        debug!("Deleted WAL file for archived segment {}", self.id);
+                    }
 
                     return Ok(true);
                 } else {

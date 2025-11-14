@@ -162,9 +162,11 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
     //     }
     // };
 
-    // Step 6: Close WAL file to free file descriptor (before marking cold)
+    // Step 6: Close and delete WAL file (before marking cold)
     // Cold segments don't need WAL files - data is safely in backup
     // WAL will be lazily recreated if segment is promoted and written to again
+    // Note: WAL should already be deleted during archive, but may exist if segment
+    // was written to after archiving (wal_dirty flag), so we ensure cleanup here
     {
         let mut file_state = segment.file_state.lock();
         if let Some(wal) = file_state.wal.take() {
@@ -179,6 +181,17 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
                 "Closed WAL file for evicted segment {} (freed file descriptor)",
                 segment.id
             );
+        }
+        
+        // Delete WAL file from disk if it exists
+        if let Err(e) = file_state.manager.delete_wal(segment.chunk_id, segment.id, segment.seq_id) {
+            // This is not critical - WAL might already be deleted during archive
+            debug!(
+                "Could not delete WAL for segment {} during eviction: {} (may already be deleted)",
+                segment.id, e
+            );
+        } else {
+            debug!("Deleted WAL file for evicted segment {}", segment.id);
         }
     }
 

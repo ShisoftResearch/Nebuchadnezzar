@@ -408,27 +408,10 @@ impl Chunk {
                         debug!("Allocator meet GC threshold, will try partial GC");
                         Cleaner::clean(self, false);
                     }
-                    // PROACTIVE EVICTION: Evict cold segments BEFORE allocating if needed
-                    // This ensures we never exceed physical memory limit
-                    #[cfg(feature = "tiered_memory")]
-                    if let Some(ref tiered_manager) = self.tiered_manager {
-                        match tiered_manager.evict_for_allocation(self) {
-                            Ok(evicted) => {
-                                if evicted > 0 {
-                                    debug!(
-                                        "Proactively evicted {} segments before allocation in chunk {}",
-                                        evicted, self.id
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Proactive eviction failed before segment allocation: {:?}",
-                                    e
-                                );
-                            }
-                        }
-                    }
+
+                    // We are supposed to do proactive eviction here
+                    // but since we have background proactive eviction in the cleaner thread,
+                    // we don't need to do it during live cell allocation
 
                     if !self
                         .head_seg_id
