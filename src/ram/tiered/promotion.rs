@@ -1,4 +1,5 @@
 use crate::ram::chunk::Chunk;
+use crate::ram::compression;
 use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
 use crate::ram::tiered::cell_locking;
@@ -116,7 +117,7 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         }
     }
 
-    // Read all file contents (may be less than SEGMENT_SIZE)
+    // Read all file contents (may be compressed)
     if let Err(e) = backup_file.read_to_end(&mut temp_buffer) {
         error!(
             "Failed to read backup file for segment {}: {}",
@@ -135,13 +136,38 @@ pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
         bytes_read, segment.id
     );
 
+    // Decompress if the file is compressed (auto-detects compression)
+    temp_buffer = match compression::decompress_if_compressed(&temp_buffer) {
+        Ok(decompressed) => {
+            debug!(
+                "Decompressed backup file for segment {}: {} bytes -> {} bytes",
+                segment.id,
+                bytes_read,
+                decompressed.len()
+            );
+            decompressed
+        }
+        Err(e) => {
+            error!(
+                "Failed to decompress backup file for segment {}: {}",
+                segment.id, e
+            );
+            segment.set_cold();
+            panic!(
+                "Cannot promote segment {}: failed to decompress backup file: {}",
+                segment.id, e
+            );
+        }
+    };
+
     // Resize to SEGMENT_SIZE, padding with zeros if needed
     // This ensures the segment memory is fully initialized
+    let decompressed_size = temp_buffer.len();
     temp_buffer.resize(SEGMENT_SIZE, 0);
     debug!(
         "Resized buffer to {} bytes (padded {} zero bytes) for segment {}",
         SEGMENT_SIZE,
-        SEGMENT_SIZE - bytes_read,
+        SEGMENT_SIZE - decompressed_size,
         segment.id
     );
 

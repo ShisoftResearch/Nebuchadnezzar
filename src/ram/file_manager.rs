@@ -1,6 +1,7 @@
 use std::fs::{self, create_dir_all, remove_file, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use crate::ram::compression;
 
 /// Unified file manager for segment file operations
 /// Centralizes all file path generation, directory management, and file I/O
@@ -243,10 +244,21 @@ impl SegmentFileManager {
     }
 
     /// Read file content into memory
+    /// Automatically decompresses backup files if they are compressed
     pub fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         let mut file = File::open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
+        
+        // Check if this is a backup file by extension
+        if let Some(extension) = path.extension() {
+            if extension == "nbackup" {
+                // Decompress backup files (auto-detects compression)
+                return compression::decompress_if_compressed(&buffer);
+            }
+        }
+        
+        // WAL files are not compressed, return as-is
         Ok(buffer)
     }
 

@@ -215,6 +215,11 @@ impl CompactCleaner {
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
 
+
+        // We are not going to archive here to reduce write amplification.
+        // Eviction will archive the segment for tiered memory
+        // For recovery, even if the segment is not archived, it will still be able to recover from the old backup file.
+
         // Release reference before unlocking
         seg.references.fetch_sub(1, Ordering::Relaxed);
         seg.set_hot();
