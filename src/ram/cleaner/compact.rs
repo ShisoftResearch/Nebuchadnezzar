@@ -210,20 +210,6 @@ impl CompactCleaner {
             );
             0
         };
-        // Archive to persist compacted data to backup file
-        // This also sets archived=true on success
-        match seg.archive() {
-            Ok(true) => {
-                debug!("Segment {} archived after compaction", seg.id);
-            }
-            Ok(false) => {
-                warn!("Segment {} archive returned false after compaction", seg.id);
-            }
-            Err(e) => {
-                error!("Segment {} archive failed after compaction: {}", seg.id, e);
-                // Leave archived=false so eviction will know it needs archiving
-            }
-        }
         debug!(
             "Clean finished for segment {} from chunk {}, cleaned {} bytes ({} -> {}) released {} tombstones",
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
