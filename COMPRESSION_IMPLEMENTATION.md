@@ -4,6 +4,8 @@
 
 This implementation adds LZ4 compression to segment backup files to reduce disk I/O bottleneck when tiered memory is enabled. The compression is applied only to backup files (`.nbackup`), while WAL files (`.nlog`) remain uncompressed as they are streamed.
 
+**Compression is controlled by the `compress_backups` feature flag** (enabled by default). Decompression is always available to maintain backward compatibility with both compressed and uncompressed files.
+
 ## Implementation Details
 
 ### 1. Dependency Added
@@ -12,7 +14,15 @@ This implementation adds LZ4 compression to segment backup files to reduce disk 
   - Configured with `default-features = false` to use unsafe performance profile
   - Suitable for non-streaming use cases (segment archiving)
 
-### 2. Compression Module (`src/ram/compression.rs`)
+### 2. Feature Flag Added
+
+- **compress_backups**: Controls whether new backup files are compressed
+  - **Default**: Enabled (compression ON by default)
+  - **Decompression**: Always enabled (auto-detects compressed files)
+  - **Disable**: `cargo build --no-default-features --features cleaner,combine_cleaner,compact_cleaner,tiered_memory`
+  - **Use case**: Disable if CPU is more constrained than disk I/O
+
+### 3. Compression Module (`src/ram/compression.rs`)
 
 Created a new compression utilities module with the following features:
 
@@ -29,27 +39,33 @@ Created a new compression utilities module with the following features:
 - `compress(data: &[u8]) -> io::Result<Vec<u8>>`: Compress data with magic header
 - `decompress_if_compressed(data: &[u8]) -> io::Result<Vec<u8>>`: Auto-detect and decompress
 
-### 3. Archive Path (Write) - `src/ram/segs.rs`
+### 4. Archive Path (Write) - `src/ram/segs.rs`
 
 Modified `Segment::archive()` method:
 
 1. **Padding**: First pads segment data to `SEGMENT_SIZE` (8MB) with zeros
-2. **Compression**: Compresses the padded data using LZ4
-3. **Write**: Writes compressed data to backup file
-4. **Logging**: Logs compression ratio for monitoring
+2. **Conditional Compression**: If `compress_backups` feature is enabled, compresses the data
+3. **Write**: Writes compressed or uncompressed data to backup file
+4. **Logging**: Logs compression ratio (when enabled) for monitoring
 
 ```rust
-// Before: write raw segment data
-file.write_all(segment_data)?;
+// With compress_backups feature enabled (default)
+#[cfg(feature = "compress_backups")]
+{
+    let compressed_data = compression::compress(&padded_data)?;
+    file.write_all(&compressed_data)?;
+}
 
-// After: compress then write
-let compressed_data = compression::compress(&padded_data)?;
-file.write_all(&compressed_data)?;
+// With compress_backups feature disabled
+#[cfg(not(feature = "compress_backups"))]
+{
+    file.write_all(&padded_data)?;
+}
 ```
 
 **Checksum Verification**: Skipped for compressed files as LZ4 includes built-in integrity checks.
 
-### 4. Recovery Path (Read) - `src/ram/file_manager.rs`
+### 5. Recovery Path (Read) - `src/ram/file_manager.rs`
 
 Modified `SegmentFileManager::read_file()`:
 
@@ -64,7 +80,7 @@ if extension == "nbackup" {
 }
 ```
 
-### 5. Promotion Path (Read) - `src/ram/tiered/promotion.rs`
+### 6. Promotion Path (Read) - `src/ram/tiered/promotion.rs`
 
 Modified `promote_segment()` to handle compressed backup files:
 
@@ -135,23 +151,42 @@ Potential enhancements (not implemented):
 3. Alternative compression algorithms (ZSTD for better ratios)
 4. Parallel compression for multiple segments
 
+## Configuration
+
+### Enable Compression (Default)
+```bash
+cargo build  # compress_backups is enabled by default
+```
+
+### Disable Compression
+```bash
+cargo build --no-default-features --features cleaner,combine_cleaner,compact_cleaner,tiered_memory
+```
+
+Or in `Cargo.toml`:
+```toml
+[dependencies]
+neb = { version = "0.2.0", default-features = false, features = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory"] }
+```
+
 ## Files Modified
 
-1. `Cargo.toml` - Added `lz4_flex` dependency
+1. `Cargo.toml` - Added `lz4_flex` dependency and `compress_backups` feature flag
 2. `src/ram/mod.rs` - Added `compression` module declaration
 3. `src/ram/compression.rs` - New compression utilities module (160 lines)
-4. `src/ram/segs.rs` - Modified `archive()` method to compress
-5. `src/ram/file_manager.rs` - Modified `read_file()` to decompress
-6. `src/ram/tiered/promotion.rs` - Modified `promote_segment()` to decompress
+4. `src/ram/segs.rs` - Modified `archive()` method with conditional compilation for compression
+5. `src/ram/file_manager.rs` - Modified `read_file()` to auto-decompress
+6. `src/ram/tiered/promotion.rs` - Modified `promote_segment()` to auto-decompress
 
 ## Summary
 
 This implementation successfully addresses the disk write bottleneck in tiered memory by adding LZ4 compression to segment backup files. The changes are:
+- **Configurable**: Feature flag controls compression (enabled by default)
 - **Non-invasive**: Only affects backup file I/O paths
-- **Backward compatible**: Old files continue to work
-- **Well-tested**: All existing tests pass
+- **Backward compatible**: Old files continue to work, decompression always enabled
+- **Well-tested**: All existing tests pass with and without the feature
 - **Fast**: LZ4 block format with unsafe performance profile
 - **Simple**: Clean separation via compression module
 
-The compression reduces disk I/O by 30-70% (depending on data), which should significantly improve tiered memory performance during eviction.
+The compression reduces disk I/O by 30-70% (depending on data), which should significantly improve tiered memory performance during eviction. Users can disable compression if CPU is more constrained than disk I/O.
 

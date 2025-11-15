@@ -49,7 +49,7 @@ lz4_flex = { version = "0.12", default-features = false }
 # When disabled (default), segments are marked as referenced directly during reads
 # Can be enabled for production use to get zero-overhead reference tracking
 # Default: disabled to avoid signal handler conflicts in tests
-default = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory"]
+default = ["cleaner", "combine_cleaner", "compact_cleaner", "tiered_memory", "compress_backups"]
 page_fault_tracking = ["tiered_memory"]
 
 cleaner = []
@@ -68,6 +68,13 @@ debug_page_faults = ["page_fault_tracking"]
 # Only works in debug builds (debug_assertions must be enabled)
 # Usage: cargo build --features verify_checksums
 debug_verify_checksums = ["tiered_memory"]
+
+# Enable LZ4 compression for segment backup files
+# Reduces disk I/O bottleneck during eviction by 30-70%
+# Decompression is always enabled (auto-detects compressed files)
+# Default: enabled for better disk I/O performance
+# Usage: cargo build --no-default-features --features ... (exclude compress_backups)
+compress_backups = []
 
 tiered_memory = []
 

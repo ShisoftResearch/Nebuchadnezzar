@@ -1,4 +1,5 @@
 use crate::ram::chunk::Chunk;
+#[cfg(feature = "compress_backups")]
 use crate::ram::compression;
 use crate::ram::entry;
 use crate::ram::entry::EntryMeta;
@@ -519,8 +520,7 @@ impl Segment {
                     file.set_len(0)?;
                     file.sync_all()?;
 
-                    // Compress segment data before writing
-                    let compressed_data = unsafe {
+                    unsafe {
                         let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
                         
                         // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
@@ -530,21 +530,32 @@ impl Segment {
                             padded_data.resize(SEGMENT_SIZE, 0);
                         }
                         
-                        // Compress the padded data
-                        compression::compress(&padded_data)?
-                    };
+                        // Conditionally compress based on feature flag
+                        #[cfg(feature = "compress_backups")]
+                        {
+                            let compressed_data = compression::compress(&padded_data)?;
+                            file.write_all(&compressed_data)?;
+                            debug!(
+                                "Archived segment {} with compression: {} bytes -> {} bytes (ratio: {:.2}%)",
+                                self.id,
+                                SEGMENT_SIZE,
+                                compressed_data.len(),
+                                (compressed_data.len() as f64 / SEGMENT_SIZE as f64) * 100.0
+                            );
+                        }
+                        
+                        #[cfg(not(feature = "compress_backups"))]
+                        {
+                            file.write_all(&padded_data)?;
+                            debug!(
+                                "Archived segment {} without compression: {} bytes",
+                                self.id,
+                                SEGMENT_SIZE
+                            );
+                        }
+                    }
 
-                    // Write compressed data to file
-                    file.write_all(&compressed_data)?;
                     file.sync_all()?;
-                    
-                    debug!(
-                        "Archived segment {} with compression: {} bytes -> {} bytes (ratio: {:.2}%)",
-                        self.id,
-                        SEGMENT_SIZE,
-                        compressed_data.len(),
-                        (compressed_data.len() as f64 / SEGMENT_SIZE as f64) * 100.0
-                    );
 
                     #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
                     {
