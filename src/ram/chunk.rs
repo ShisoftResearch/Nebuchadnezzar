@@ -496,7 +496,7 @@ impl Chunk {
         }
     }
 
-    pub fn location_for_write(&self, hash: u64) -> Option<CellWriteGuard<'_>> {
+    pub fn location_for_write(&self, hash: u64, has_read: bool) -> Option<CellWriteGuard<'_>> {
         let guard = self.cell_index.lock(hash as usize);
         match guard {
             Some(index) => {
@@ -508,7 +508,7 @@ impl Chunk {
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
 
                 #[cfg(feature = "tiered_memory")]
-                {
+                if has_read {
                     // Writes may also need to touch cold segments. If the target segment is cold,
                     // promote it back to hot before proceeding so we never write into unmapped memory.
                     let seg_id = self.allocator.id_by_addr(*index);
@@ -660,7 +660,7 @@ impl Chunk {
             );
         }
 
-        if let Some(mut guard) = self.location_for_write(hash) {
+        if let Some(mut guard) = self.location_for_write(hash, false) {
             let cell_location = *guard;
 
             #[cfg(debug_assertions)]
@@ -701,7 +701,7 @@ impl Chunk {
         }
 
         loop {
-            if let Some(mut guard) = self.location_for_write(hash) {
+            if let Some(mut guard) = self.location_for_write(hash, false) {
                 trace!("Cell {} exists, will update for upsert", hash);
                 let cell_location = *guard;
 
@@ -757,7 +757,7 @@ impl Chunk {
     where
         U: FnOnce(&SharedCell) -> Option<OwnedCell>,
     {
-        if let Some(cell_guard) = self.location_for_write(hash) {
+        if let Some(cell_guard) = self.location_for_write(hash, true) {
             let old_loc = *cell_guard;
 
             #[cfg(debug_assertions)]
