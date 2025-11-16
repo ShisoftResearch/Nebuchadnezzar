@@ -451,32 +451,35 @@ impl Chunk {
                     return Err(ReadError::CellDoesNotExisted);
                 }
 
-                #[cfg(debug_assertions)]
-                self.assert_address_aligned_for_read(*index, "location_for_read", hash);
+                #[cfg(feature = "tiered_memory")]
+                {
+                    #[cfg(debug_assertions)]
+                    self.assert_address_aligned_for_read(*index, "location_for_read", hash);
 
-                // Check if segment is cold and promote if needed
-                let seg_id = self.allocator.id_by_addr(*index);
-                if let Some(segment) = self.segs.get(&seg_id) {
-                    // If segment is cold (evicted to file), promote it back to hot
-                    #[cfg(feature = "tiered_memory")]
-                    if segment.is_cold() {
-                        debug!(
-                            "Cell access triggered promotion of cold segment {}",
-                            segment.id
-                        );
-                        crate::ram::tiered::promotion::promote_segment(&segment, self)
-                    }
+                    // Check if segment is cold and promote if needed
+                    let seg_id = self.allocator.id_by_addr(*index);
+                    if let Some(segment) = self.segs.get(&seg_id) {
+                        // If segment is cold (evicted to file), promote it back to hot
+                        if segment.is_cold() {
+                            use crate::ram::tiered::promotion::promote_segment;
 
-                    // Reference bit tracking:
-                    // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
-                    // Without page_fault_tracking feature: mark reference bit directly here
-                    #[cfg(not(feature = "page_fault_tracking"))]
-                    {
-                        // Mark segment as referenced directly (no page fault tracking)
-                        segment.mark_referenced();
+                            debug!(
+                                "Cell access triggered promotion of cold segment {}",
+                                segment.id
+                            );
+                            promote_segment(&segment)
+                        }
+
+                        // Reference bit tracking:
+                        // With page_fault_tracking feature: mprotect + SIGSEGV handles reference marking automatically
+                        // Without page_fault_tracking feature: mark reference bit directly here
+                        #[cfg(not(feature = "page_fault_tracking"))]
+                        {
+                            // Mark segment as referenced directly (no page fault tracking)
+                            segment.mark_referenced();
+                        }
                     }
                 }
-
                 return Ok(index);
             }
             None => {
@@ -504,7 +507,25 @@ impl Chunk {
                 #[cfg(debug_assertions)]
                 self.assert_address_aligned_for_read(*index, "location_for_write", hash);
 
-                return Some(index);
+                #[cfg(feature = "tiered_memory")]
+                {
+                    // Writes may also need to touch cold segments. If the target segment is cold,
+                    // promote it back to hot before proceeding so we never write into unmapped memory.
+                    let seg_id = self.allocator.id_by_addr(*index);
+                    if let Some(segment) = self.segs.get(&seg_id) {
+                        if segment.is_cold() {
+                            use crate::ram::tiered::promotion::promote_segment;
+
+                            debug!(
+                                "Write access triggered promotion of cold segment {}",
+                                segment.id
+                            );
+                            promote_segment(&segment);
+                        }
+                    }
+                }
+
+                Some(index)
             }
             None => None,
         }

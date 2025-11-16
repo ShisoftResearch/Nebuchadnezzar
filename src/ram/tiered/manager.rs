@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::SEGMENT_SIZE;
+use crate::ram::segs::{SEGMENT_SIZE, Segment};
 use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
@@ -231,14 +231,13 @@ impl TieredMemoryManager {
     /// back into hot storage
     pub fn promote(
         &self,
-        segment: &crate::ram::segs::Segment,
-        chunk: &Chunk,
+        segment: &Segment,
     ) -> Result<(), io::Error> {
         if !self.enabled {
             return Ok(());
         }
 
-        promote_segment(segment, chunk);
+        promote_segment(segment);
 
         // Update cached count after promotion
         self.cached_hot_count.fetch_add(1, Ordering::Relaxed);

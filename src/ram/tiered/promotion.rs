@@ -33,7 +33,7 @@ use std::thread;
 /// - Uses temporary buffer to avoid corrupting segment address
 /// - No "empty window" - data is copied atomically from reader's perspective
 /// This function have to succeed or panic.
-pub fn promote_segment(segment: &Segment, chunk: &Chunk) {
+pub fn promote_segment(segment: &Segment) {
     debug!(
         "Promoting segment {} to hot storage with cell locking",
         segment.id
