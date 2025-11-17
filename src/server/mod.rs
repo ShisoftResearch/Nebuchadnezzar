@@ -178,13 +178,26 @@ impl NebServer {
                 .await
                 .unwrap(),
         );
+        // Create temporary chunks for index builder initialization
+        // Note: chunks will be recreated with index_builder below
+        // If indexing is enabled, register inverted index schemas BEFORE recovery
+        // These schemas are needed for recovery to recognize inverted index cells
+        if opts.index_enabled {
+            meta_rc.schemas.new_schema(crate::index::fulltext::hybrid::inverted_segment_schema());
+            meta_rc.schemas.new_schema(crate::index::fulltext::inverted_stats_schema());
+            debug!("Registered inverted index schemas before recovery");
+        }
+        
+        // Create IndexBuilder first (without inverted indexer initialization)
         let index_builder = if opts.index_enabled {
             Some(Arc::new(
-                IndexBuilder::new(&neb_client, &conshasing, &raft_client).await,
+                IndexBuilder::new(&neb_client, &conshasing, &raft_client, rpc_server.server_id).await,
             ))
         } else {
             None
         };
+        
+        // Create chunks with index_builder
         let chunks = Chunks::new_with_recovery(
             opts.chunk_count,
             opts.total_size,
@@ -197,6 +210,11 @@ impl NebServer {
                 .or_else(|| crate::ram::tiered::TieredConfig::from_env()),
             opts.enable_recovery,
         );
+        
+        // Initialize the inverted indexer with chunks (lazy initialization)
+        if let Some(ref index_builder) = index_builder {
+            index_builder.initialize_inverted_indexer(&chunks);
+        }
 
         // Initialize undo log if storage path is provided and perform rollback
         // This must happen AFTER segment recovery but BEFORE cleaner starts
@@ -300,6 +318,11 @@ impl NebServer {
                     // todo!()
                 }
             }
+        }
+        
+        // Register inverted index RPC service if indexing is enabled
+        if opts.index_enabled {
+            init_inverted_index_rpc_service(rpc_server, &server).await;
         }
 
         Ok(server)
@@ -477,7 +500,12 @@ impl NebServer {
         &*self.raft_client
     }
     pub fn indexed_data_client(&self) -> IndexedDataClient {
-        IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
+        // Use server's indexer clients if available (for BM25 search support)
+        if let Some(ref index_builder) = self.indexer {
+            IndexedDataClient::new_with_indexers(index_builder.clients.clone(), self.consh.clone())
+        } else {
+            IndexedDataClient::new(&self.neb_client, &self.consh, &self.raft_client)
+        }
     }
     pub async fn data_client(&self, members: &Vec<String>) -> Result<AsyncClient, NebClientError> {
         AsyncClient::new(&self.rpc, &self.membership, members, &self.group_name).await
@@ -535,6 +563,17 @@ pub async fn init_txn_data_site_service(rpc_server: &Arc<Server>, neb_server: &A
     rpc_server
         .register_service(&transactions::data_site::DataManager::new(&neb_server))
         .await;
+}
+
+pub async fn init_inverted_index_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+    if let Some(ref index_builder) = neb_server.indexer {
+        if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
+            use crate::index::fulltext::rpc::InvertedIndexRPCService;
+            let service = InvertedIndexRPCService::new(inverted_indexer.clone());
+            rpc_server.register_service(&service).await;
+            info!("Registered inverted index RPC service");
+        }
+    }
 }
 
 pub async fn init_ranged_indexer_service(

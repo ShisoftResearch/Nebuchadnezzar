@@ -13,7 +13,7 @@ use crate::{
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
         hash::get_hash_id_from_value,
-        inverted::BM25Hit,
+        fulltext::BM25Hit,
         ranged::{
             client::cursor::ClientCursor,
             lsm::{
@@ -118,7 +118,16 @@ impl IndexedDataClient {
     ) -> Self {
         Self {
             conshash: conshash.clone(),
-            index_clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client)),
+            // Use 0 as server_id for query-only clients since inverted indexer won't be initialized
+            index_clients: Arc::new(IndexerClients::new_query_only(neb_client, conshash, raft_client, 0)),
+        }
+    }
+    
+    /// Create IndexedDataClient with server's indexer clients (for BM25 search support)
+    pub fn new_with_indexers(index_clients: Arc<IndexerClients>, conshash: Arc<ConsistentHashing>) -> Self {
+        Self {
+            conshash,
+            index_clients,
         }
     }
     pub async fn range_index_scan<'a>(
@@ -889,7 +898,7 @@ mod test {
         let fields = Field::new_schema(vec![Field::new_indexed(
             TEXT_FIELD,
             Type::String,
-            vec![IndexType::InvertedBM25],
+            vec![IndexType::Fulltext],
         )]);
         let schema_id = 777;
         let schema = Schema::new_with_id(schema_id, "bm25_schema", None, fields, false, false);

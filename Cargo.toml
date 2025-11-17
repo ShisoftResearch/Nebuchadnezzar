@@ -82,3 +82,8 @@ tiered_memory = []
 env_logger = "*"
 rayon = "*"
 tempfile = "*"
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+
+[[bench]]
+name = "inverted_index"
+harness = false

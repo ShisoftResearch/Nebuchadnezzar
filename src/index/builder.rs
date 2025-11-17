@@ -4,8 +4,8 @@ use super::{EntryKey, Feature, IndexerClients};
 use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
-use crate::index::inverted::{
-    build_index_meta as build_inverted_index_meta, InvertedIndexMeta, ToOwnedValue,
+use crate::index::fulltext::{
+    build_index_meta as build_inverted_index_meta, FullTextIndexMeta, ToOwnedValue,
 };
 use crate::index::vector::MetricEncoding;
 use crate::ram::cell::{OwnedCell, SharedCell};
@@ -62,7 +62,7 @@ pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
     Vector(VectorIndexMeta),
-    Inverted(InvertedIndexMeta),
+    FullText(FullTextIndexMeta),
 }
 
 // Enum for different types of index components
@@ -128,8 +128,12 @@ impl IndexMeta {
                     )
                     .await?;
             }
-            &IndexMeta::Inverted(ref meta) => {
-                indexers.inverted_client.insert(meta).await?;
+            &IndexMeta::FullText(ref meta) => {
+                if let Some(indexer) = indexers.fulltext_indexer() {
+                    indexer.add_document(meta).await?;
+                } else {
+                    return Err(IndexError::Other("Inverted indexer not available".to_string()));
+                }
             }
         }
         Ok(())
@@ -159,8 +163,12 @@ impl IndexMeta {
                     .remove(&meta.cell_id, meta.schema_id, meta.field_id)
                     .await?;
             }
-            &IndexMeta::Inverted(ref meta) => {
-                indexers.inverted_client.remove(meta).await?;
+            &IndexMeta::FullText(ref meta) => {
+                if let Some(indexer) = indexers.fulltext_indexer() {
+                    indexer.remove_document(meta).await?;
+                } else {
+                    return Err(IndexError::Other("Inverted indexer not available".to_string()));
+                }
             }
         }
         Ok(())
@@ -189,11 +197,17 @@ impl IndexBuilder {
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
+        server_id: u64,
     ) -> Self {
         let _ = IndexerClients::init_index_schema(neb_client).await;
         Self {
-            clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client)),
+            clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client, server_id)),
         }
+    }
+    
+    /// Initialize the inverted indexer with chunks (called after chunks creation)
+    pub fn initialize_inverted_indexer(&self, chunks: &Arc<crate::ram::chunk::Chunks>) {
+        self.clients.initialize_inverted_indexer(chunks);
     }
 
     // Ensure indices are properly set for a cell
@@ -223,7 +237,7 @@ impl IndexBuilder {
     // Ensure scannable indices are set
     fn ensure_scannable(&self, cell: &OwnedCell, indexers: &Arc<IndexerClients>) {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
-        let indexers = indexers.to_owned();
+        let indexers = indexers.clone();
         new_index_task(async move {
             indexers
                 .ranged_client
@@ -236,7 +250,7 @@ impl IndexBuilder {
 
     // Remove indices for a cell
     pub fn remove_indices(&self, cell: &SharedCell, schema: &Schema) {
-        let indexers = self.clients.to_owned();
+        let indexers = self.clients.clone();
         if schema.is_scannable {
             self.remove_scannable(cell, &indexers);
         }
@@ -247,7 +261,7 @@ impl IndexBuilder {
     // Remove scannable indices
     fn remove_scannable(&self, cell: &SharedCell, indexers: &Arc<IndexerClients>) {
         let key = EntryKey::for_scannable(&cell.id(), cell.header.schema);
-        let indexers = indexers.to_owned();
+        let indexers = indexers.clone();
         new_index_task(async move {
             indexers
                 .ranged_client
@@ -312,10 +326,10 @@ impl IndexBuilder {
 
         let (inverted_new, regular_new): (Vec<_>, Vec<_>) = new_values
             .into_iter()
-            .partition(|meta| matches!(meta, IndexMeta::Inverted(_)));
+            .partition(|meta| matches!(meta, IndexMeta::FullText(_)));
         let (inverted_old, regular_old): (Vec<_>, Vec<_>) = old_values
             .into_iter()
-            .partition(|meta| matches!(meta, IndexMeta::Inverted(_)));
+            .partition(|meta| matches!(meta, IndexMeta::FullText(_)));
 
         for new_index in regular_new {
             debug!("Inserting new index: {:?}", new_index);
@@ -381,7 +395,7 @@ where
                             *field_id,
                             metric_encoding,
                         )),
-                        &IndexType::InvertedBM25 => {
+                        &IndexType::Fulltext => {
                             let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
@@ -389,7 +403,7 @@ where
                                 *field_id,
                                 owned_value,
                             ) {
-                                metas.push(IndexMeta::Inverted(meta));
+                                metas.push(IndexMeta::FullText(meta));
                             }
                         }
                         &IndexType::Statistics => {}
@@ -402,7 +416,7 @@ where
                         &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
                         &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
                         &IndexType::Vector(_metric_encoding) => {}
-                        &IndexType::InvertedBM25 => {
+                        &IndexType::Fulltext => {
                             let owned_value = value.to_owned_value();
                             if let Some(meta) = build_inverted_index_meta(
                                 cell.id(),
@@ -410,7 +424,7 @@ where
                                 *field_id,
                                 owned_value,
                             ) {
-                                metas.push(IndexMeta::Inverted(meta));
+                                metas.push(IndexMeta::FullText(meta));
                             }
                         }
                         &IndexType::Statistics => {}

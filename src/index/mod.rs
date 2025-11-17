@@ -4,7 +4,7 @@ mod macros;
 pub mod builder;
 pub mod entry;
 pub mod hash;
-pub mod inverted;
+pub mod fulltext;
 pub mod ranged;
 pub mod vector;
 
@@ -14,6 +14,7 @@ pub const SCHEMA_SCAN_PATT_SIZE: u8 = (FEATURE_SIZE + 8) as u8;
 pub const MAX_KEY_SIZE: usize = KEY_SIZE * 2;
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use bifrost::rpc::RPCError;
 use bifrost::{conshash::ConsistentHashing, raft::client::RaftClient};
@@ -24,9 +25,12 @@ use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::inverted::{inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit, InvertedIndexClient};
+use crate::index::fulltext::{inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit};
+use crate::index::fulltext::hybrid::HybridInvertedIndexer;
 use crate::index::vector::VectorIndexClient;
 use crate::ram::cell::ReadError;
+use crate::ram::chunk::Chunks;
+use std::time::Duration;
 
 use self::ranged::client::cursor::ClientCursor;
 use self::ranged::client::RangedIndexerClient;
@@ -38,20 +42,67 @@ pub struct IndexerClients {
     pub ranged_client: Arc<RangedIndexerClient>,
     pub hashed_client: Arc<HashedIndexClient>,
     pub vector_client: Arc<VectorIndexClient>,
-    pub inverted_client: Arc<InvertedIndexClient>,
+    fulltext_indexer: OnceLock<Arc<HybridInvertedIndexer>>,
+    // Store initialization parameters for lazy initialization
+    server_id: u64,
+    pub(crate) neb_client: Arc<AsyncClient>,
+    conshash: Arc<ConsistentHashing>,
 }
 
 impl IndexerClients {
+    /// Create IndexerClients without inverted indexer (lazy initialization)
     pub fn new(
         neb_client: &Arc<AsyncClient>,
         conshash: &Arc<ConsistentHashing>,
         raft_client: &Arc<RaftClient>,
+        server_id: u64,
     ) -> Self {
         IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
-            inverted_client: Arc::new(InvertedIndexClient::new(neb_client)),
+            fulltext_indexer: OnceLock::new(),
+            server_id,
+            neb_client: neb_client.clone(),
+            conshash: conshash.clone(),
+        }
+    }
+    
+    /// Initialize the inverted indexer with chunks (called once after chunks creation)
+    pub fn initialize_inverted_indexer(&self, chunks: &Arc<Chunks>) {
+        let inverted_indexer = Arc::new(HybridInvertedIndexer::new(
+            self.server_id,
+            self.conshash.clone(),
+            chunks.clone(),
+            self.neb_client.clone(),
+            Duration::from_secs(30), // Flush every 30 seconds
+        ));
+        inverted_indexer.start_background_flush();
+        
+        // OnceLock ensures this can only be set once
+        let _ = self.fulltext_indexer.set(inverted_indexer);
+    }
+    
+    /// Get the inverted indexer if initialized
+    pub fn fulltext_indexer(&self) -> Option<&Arc<HybridInvertedIndexer>> {
+        self.fulltext_indexer.get()
+    }
+    
+    /// Create IndexerClients without hybrid inverted indexer (for query-only clients)
+    pub fn new_query_only(
+        neb_client: &Arc<AsyncClient>,
+        conshash: &Arc<ConsistentHashing>,
+        raft_client: &Arc<RaftClient>,
+        server_id: u64,
+    ) -> Self {
+        IndexerClients {
+            ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
+            hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
+            vector_client: Arc::new(VectorIndexClient::new()),
+            fulltext_indexer: OnceLock::new(), // Empty, won't be initialized
+            server_id,
+            neb_client: neb_client.clone(),
+            conshash: conshash.clone(),
         }
     }
     pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
@@ -97,8 +148,14 @@ impl IndexerClients {
         query: &str,
         limit: usize,
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
-        self.inverted_client
-            .bm25_search(schema_id, field_id, query, limit)
-            .await
+        match self.fulltext_indexer() {
+            Some(indexer) => {
+                match indexer.bm25_search(schema_id, field_id, query, limit).await {
+                    Ok(hits) => Ok(Ok(hits)),
+                    Err(e) => Ok(Err(ReadError::ExecError(format!("Index error: {:?}", e)))),
+                }
+            }
+            None => Ok(Err(ReadError::ExecError("Inverted indexer not available".to_string()))),
+        }
     }
 }
