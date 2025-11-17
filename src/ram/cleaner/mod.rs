@@ -11,6 +11,14 @@ pub mod compact;
 #[cfg(test)]
 mod tests;
 
+lazy_static! {
+    /// Global thread pool for compact cleaning operations
+    static ref COMPACT_CLEAN_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("compact-clean-t{}", idx))
+        .build()
+        .unwrap();
+}
+
 #[allow(dead_code)]
 pub struct Cleaner {
     chunks: Arc<Chunks>,
@@ -35,33 +43,49 @@ impl Cleaner {
             .spawn(move || {
                 #[cfg(feature = "cleaner")]
                 {
+                    // Create thread pools once before the loop for reuse
+                    let clean_pool = rayon::ThreadPoolBuilder::new()
+                        .thread_name(|idx| format!("cleaner-clean-t{}", idx))
+                        .build()
+                        .unwrap();
+                    
+                    #[cfg(feature = "tiered_memory")]
+                    let evict_pool = rayon::ThreadPoolBuilder::new()
+                        .thread_name(|idx| format!("cleaner-evict-t{}", idx))
+                        .build()
+                        .unwrap();
+                    
                     while !stop_tag_ref_clone.load(Ordering::Relaxed) {
                         // Main cleaning: compact and combine segments
-                        checks_ref_clone.list.par_iter().for_each(|chunk| {
-                            Self::clean(chunk, false);
+                        clean_pool.install(|| {
+                            checks_ref_clone.list.par_iter().for_each(|chunk| {
+                                Self::clean(chunk, false);
+                            });
                         });
 
                         // Background eviction: check and evict if memory limit exceeded
                         #[cfg(feature = "tiered_memory")]
-                        checks_ref_clone.list.par_iter().for_each(|chunk| {
-                            if let Some(ref tiered_manager) = chunk.tiered_manager {
-                                match tiered_manager.evict_for_allocation(chunk) {
-                                    Ok(evicted) => {
-                                        if evicted > 0 {
-                                            debug!(
-                                                "Background eviction: evicted {} segments from chunk {}",
-                                                evicted, chunk.id
+                        evict_pool.install(|| {
+                            checks_ref_clone.list.par_iter().for_each(|chunk| {
+                                if let Some(ref tiered_manager) = chunk.tiered_manager {
+                                    match tiered_manager.evict_for_allocation(chunk) {
+                                        Ok(evicted) => {
+                                            if evicted > 0 {
+                                                debug!(
+                                                    "Background eviction: evicted {} segments from chunk {}",
+                                                    evicted, chunk.id
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Background eviction failed for chunk {}: {}",
+                                                chunk.id, e
                                             );
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!(
-                                            "Background eviction failed for chunk {}: {}",
-                                            chunk.id, e
-                                        );
-                                    }
                                 }
-                            }
+                            });
                         });
 
                         thread::sleep(Duration::from_millis(sleep_interval_ms));
@@ -150,11 +174,15 @@ impl Cleaner {
                     segments_for_compact.len(),
                     chunk.id
                 );
-                compacter_cleaned_space += segments_for_compact
-                    .into_par_iter()
-                    .take(segments_compact_per_turn) // limit max segment to clean per turn
-                    .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
-                    .sum::<usize>();
+                
+                // Use global thread pool for compact cleaning
+                compacter_cleaned_space += COMPACT_CLEAN_POOL.install(|| {
+                    segments_for_compact
+                        .into_par_iter()
+                        .take(segments_compact_per_turn) // limit max segment to clean per turn
+                        .map(|segment| compact::CompactCleaner::clean_segment(chunk, &segment))
+                        .sum::<usize>()
+                });
             }
         }
         let combined_cleaned_space = combiner_cleaned_space + compacter_cleaned_space;

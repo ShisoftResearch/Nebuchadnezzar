@@ -32,6 +32,8 @@ static GLOBAL_CHUNK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_ALLOCATED_SIZE: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
+static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
+
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
     GLOBAL_CHUNK_BASE.load(Ordering::Acquire)
@@ -1097,7 +1099,7 @@ impl Chunk {
                 let rate = seg.living_rate();
                 (seg, rate)
             })
-            .filter(|(_, utilization)| *utilization < 0.90f32);
+            .filter(|(_, utilization)| *utilization < 0.75f32);
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
@@ -1107,7 +1109,7 @@ impl Chunk {
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
-        return list.into_iter().map(|pair| pair.0).collect();
+        return list.into_iter().take(MAX_SEGMENTS_FOR_CLEANER).map(|pair| pair.0).collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {
@@ -1121,13 +1123,14 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 0.80f32
+                *utilization < 0.50f32
                     && head_seg_id != seg.id
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());
+        mapping.truncate(MAX_SEGMENTS_FOR_CLEANER);
         return mapping;
     }
 

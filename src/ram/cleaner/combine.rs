@@ -11,6 +11,20 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use libc;
 
+lazy_static! {
+    /// Global thread pool for segment allocation during combine operations
+    static ref COMBINE_ALLOC_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("combine-alloc-t{}", idx))
+        .build()
+        .unwrap();
+    
+    /// Global thread pool for cell index updates during combine operations
+    static ref COMBINE_UPDATE_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("combine-update-t{}", idx))
+        .build()
+        .unwrap();
+}
+
 pub struct CombinedCleaner;
 
 #[derive(Clone)]
@@ -203,14 +217,17 @@ impl CombinedCleaner {
                 "Updating cell reference, pending segments {}",
                 pending_segments.len()
             );
-            let new_segs = pending_segments
-                .par_iter()
-                .map(|dummy_seg| {
-                    let new_seg = chunk
-                        .allocator
-                        .alloc_seg(&chunk.file_manager)
-                        .expect("No space left during combine");
-                    let new_seg_id = new_seg.id;
+            
+            // Use global thread pool for segment allocation
+            let new_segs = COMBINE_ALLOC_POOL.install(|| {
+                pending_segments
+                    .par_iter()
+                    .map(|dummy_seg| {
+                        let new_seg = chunk
+                            .allocator
+                            .alloc_seg(&chunk.file_manager)
+                            .expect("No space left during combine");
+                        let new_seg_id = new_seg.id;
                     let mut cell_mapping = Vec::with_capacity(dummy_seg.entries.len());
                     let mut seg_cursor = new_seg.addr;
                     trace!(
@@ -259,9 +276,12 @@ impl CombinedCleaner {
                     // This prevents deadlocks when multiple threads acquire locks in different orders
                     let mut sorted_cells = cells;
                     sorted_cells.sort_by_key(|(_, _, hash, _, _)| *hash);
-                    sorted_cells.into_par_iter().for_each(|(new, old, hash, ver, entry_size)| {
-                        trace!("Reset cell {} ptr from {} to {}", hash, old, new);
-                        let index = chunk.cell_index.lock(hash as usize);
+                    
+                    // Use global thread pool for cell index updates
+                    COMBINE_UPDATE_POOL.install(|| {
+                        sorted_cells.into_par_iter().for_each(|(new, old, hash, ver, entry_size)| {
+                            trace!("Reset cell {} ptr from {} to {}", hash, old, new);
+                            let index = chunk.cell_index.lock(hash as usize);
                         if let Some(mut actual_addr) = index {
                             if *actual_addr == old {
                                 *actual_addr = new;
@@ -303,10 +323,12 @@ impl CombinedCleaner {
                             // Use mark_dead_entry_with_size to avoid decoding potentially corrupt data
                             chunk.mark_dead_entry_with_size(new, entry_size as u32, &new_seg);
                         }
+                        });
                     });
                     new_seg_id
                 })
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+            });
             space_cleaned = space_to_collect - cleaned_total_live_space.load(Relaxed);
             debug!(
                 "Combined {} segments to {}, total {} bytes, new segs {:?}",
