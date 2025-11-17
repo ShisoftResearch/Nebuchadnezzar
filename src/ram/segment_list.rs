@@ -1,13 +1,22 @@
 use crate::ram::segs::Segment;
 use lightning::aarc::{Arc as AArc, AtomicArc};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A lock-free array-based segment list that provides O(1) access by segment ID.
 /// Uses AtomicArc from Lightning to allow concurrent reads and updates without locks.
 /// Similar to LinkedHashMap but optimized for dense, sequential segment IDs.
+/// 
+/// A bitmap is maintained for fast iteration and counting:
+/// - Iteration: O(capacity/64) instead of O(capacity)
+/// - Count: O(capacity/64) using popcnt instead of full scan
 pub struct SegmentList {
     /// Array of AtomicArc to Segment
     /// Index corresponds to segment ID
     segments: Vec<AtomicArc<Segment>>,
+    /// Bitmap tracking which segments are occupied
+    /// Each AtomicU64 covers 64 segments
+    /// Bit i in bitmap[j] indicates if segment (j*64 + i) is occupied
+    bitmap: Vec<AtomicU64>,
 }
 
 impl SegmentList {
@@ -17,7 +26,42 @@ impl SegmentList {
         for _ in 0..capacity {
             segments.push(AtomicArc::null());
         }
-        SegmentList { segments }
+        
+        // Create bitmap: one u64 per 64 segments
+        let bitmap_size = (capacity + 63) / 64;
+        let mut bitmap = Vec::with_capacity(bitmap_size);
+        for _ in 0..bitmap_size {
+            bitmap.push(AtomicU64::new(0));
+        }
+        
+        SegmentList { segments, bitmap }
+    }
+    
+    /// Set a bit in the bitmap
+    #[inline]
+    fn set_bit(&self, index: usize) {
+        let word_index = index >> 6; // Divide by 64
+        let bit_index = index & 63;  // Modulo 64
+        let mask = 1u64 << bit_index;
+        self.bitmap[word_index].fetch_or(mask, Ordering::Release);
+    }
+    
+    /// Clear a bit in the bitmap
+    #[inline]
+    fn clear_bit(&self, index: usize) {
+        let word_index = index >> 6; // Divide by 64
+        let bit_index = index & 63;  // Modulo 64
+        let mask = !(1u64 << bit_index);
+        self.bitmap[word_index].fetch_and(mask, Ordering::Release);
+    }
+    
+    /// Check if a bit is set in the bitmap
+    #[inline]
+    fn is_bit_set(&self, index: usize) -> bool {
+        let word_index = index >> 6; // Divide by 64
+        let bit_index = index & 63;  // Modulo 64
+        let word = self.bitmap[word_index].load(Ordering::Acquire);
+        (word & (1u64 << bit_index)) != 0
     }
 
     /// Insert or update a segment at the given key (segment ID)
@@ -32,6 +76,10 @@ impl SegmentList {
         }
 
         let old = self.segments[key].swap_ref(segment);
+        
+        // Update bitmap: set the bit for this segment
+        self.set_bit(key);
+        
         if old.is_null() {
             None
         } else {
@@ -62,9 +110,12 @@ impl SegmentList {
         }
 
         let old = self.segments[*key].swap_ref(AArc::null());
+        
         if old.is_null() {
             None
         } else {
+            // Update bitmap: clear the bit for this segment
+            self.clear_bit(*key);
             Some(old)
         }
     }
@@ -74,7 +125,8 @@ impl SegmentList {
         if *key >= self.segments.len() {
             return false;
         }
-        !self.segments[*key].is_null()
+        // Fast path: check bitmap first
+        self.is_bit_set(*key)
     }
 
     /// Get the capacity of the segment list
@@ -84,14 +136,24 @@ impl SegmentList {
 
     /// Iterate over all segment IDs that have active segments
     /// Returns an iterator over keys (segment IDs)
+    /// Uses bitmap for efficient iteration (O(capacity/64) instead of O(capacity))
     pub fn iter_keys(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.segments.len()).filter(move |i| !self.segments[*i].is_null())
+        BitmapIterator {
+            segment_list: self,
+            word_index: 0,
+            current_word: if !self.bitmap.is_empty() { 
+                self.bitmap[0].load(Ordering::Acquire) 
+            } else { 
+                0 
+            },
+        }
     }
 
     /// Iterate over all active segments
     /// Returns an iterator over Arc<Segment>
+    /// Uses bitmap for efficient iteration
     pub fn iter_values(&self) -> impl Iterator<Item = AArc<Segment>> + '_ {
-        (0..self.segments.len()).filter_map(move |i| {
+        self.iter_keys().filter_map(move |i| {
             let arc = self.segments[i].load();
             if arc.is_null() {
                 None
@@ -102,8 +164,9 @@ impl SegmentList {
     }
 
     /// Iterate over all (key, segment) pairs
+    /// Uses bitmap for efficient iteration
     pub fn iter(&self) -> impl Iterator<Item = (usize, AArc<Segment>)> + '_ {
-        (0..self.segments.len()).filter_map(move |i| {
+        self.iter_keys().filter_map(move |i| {
             let arc = self.segments[i].load();
             if arc.is_null() {
                 None
@@ -114,8 +177,12 @@ impl SegmentList {
     }
 
     /// Count the number of active segments
+    /// Uses bitmap with population count for O(capacity/64) performance
     pub fn len(&self) -> usize {
-        self.iter_keys().count()
+        self.bitmap
+            .iter()
+            .map(|word| word.load(Ordering::Acquire).count_ones() as usize)
+            .sum()
     }
 
     /// Check if the list is empty
@@ -136,6 +203,44 @@ impl SegmentList {
     /// Alias for insert() to match LinkedHashMap API
     pub fn insert_back(&self, key: usize, segment: AArc<Segment>) -> Option<AArc<Segment>> {
         self.insert(key, segment)
+    }
+}
+
+/// Iterator that efficiently traverses the bitmap to find occupied segments
+struct BitmapIterator<'a> {
+    segment_list: &'a SegmentList,
+    word_index: usize,
+    current_word: u64,
+}
+
+impl<'a> Iterator for BitmapIterator<'a> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            // Process current word
+            if self.current_word != 0 {
+                // Find the position of the least significant set bit
+                let bit_index = self.current_word.trailing_zeros() as usize;
+                // Clear that bit
+                self.current_word &= self.current_word - 1;
+                // Calculate the segment ID
+                let segment_id = self.word_index * 64 + bit_index;
+                // Make sure we don't exceed capacity
+                if segment_id < self.segment_list.segments.len() {
+                    return Some(segment_id);
+                }
+            }
+            
+            // Move to next word
+            self.word_index += 1;
+            if self.word_index >= self.segment_list.bitmap.len() {
+                return None;
+            }
+            
+            // Load next word
+            self.current_word = self.segment_list.bitmap[self.word_index].load(Ordering::Acquire);
+        }
     }
 }
 
@@ -240,5 +345,86 @@ mod tests {
 
         // Verify new segment is in place
         assert_eq!(list.get(&0).unwrap().seq_id, 2);
+    }
+
+    #[test]
+    fn test_segment_list_bitmap_operations() {
+        let list = SegmentList::new(200); // Test across multiple bitmap words
+        let file_manager = new_test_file_manager();
+
+        // Insert segments at various positions
+        let positions = vec![0, 5, 63, 64, 65, 127, 128, 150, 199];
+        for &pos in &positions {
+            let segment = AArc::new(Segment::new(
+                pos as u64,
+                0,
+                0,
+                0x1000 * pos,
+                true,
+                Arc::clone(&file_manager),
+            ));
+            list.insert(pos, segment);
+        }
+
+        // Verify count is correct
+        assert_eq!(list.len(), positions.len());
+
+        // Verify contains_key works
+        for &pos in &positions {
+            assert!(list.contains_key(&pos));
+        }
+        assert!(!list.contains_key(&1));
+        assert!(!list.contains_key(&100));
+
+        // Verify iteration returns correct keys
+        let keys: Vec<_> = list.iter_keys().collect();
+        assert_eq!(keys, positions);
+
+        // Remove some segments
+        list.remove(&5);
+        list.remove(&128);
+
+        // Verify count updated
+        assert_eq!(list.len(), positions.len() - 2);
+
+        // Verify contains_key updated
+        assert!(!list.contains_key(&5));
+        assert!(!list.contains_key(&128));
+        assert!(list.contains_key(&63));
+        assert!(list.contains_key(&127));
+
+        // Verify iteration skips removed segments
+        let remaining_keys: Vec<_> = list.iter_keys().collect();
+        assert_eq!(remaining_keys, vec![0, 63, 64, 65, 127, 150, 199]);
+    }
+
+    #[test]
+    fn test_segment_list_sparse_iteration() {
+        // Test with a large capacity but few segments
+        // This demonstrates the performance benefit of bitmap iteration
+        let list = SegmentList::new(10000);
+        let file_manager = new_test_file_manager();
+
+        // Insert only 10 segments in a sparse array
+        for i in (0..10).map(|x| x * 1000) {
+            let segment = AArc::new(Segment::new(
+                i as u64,
+                0,
+                0,
+                0x1000 * i,
+                true,
+                Arc::clone(&file_manager),
+            ));
+            list.insert(i, segment);
+        }
+
+        // Count should be fast (O(capacity/64) = ~156 iterations instead of 10000)
+        assert_eq!(list.len(), 10);
+
+        // Iteration should be fast (only visit occupied segments)
+        let keys: Vec<_> = list.iter_keys().collect();
+        assert_eq!(keys.len(), 10);
+        assert_eq!(keys[0], 0);
+        assert_eq!(keys[9], 9000);
     }
 }
