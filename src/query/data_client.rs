@@ -13,6 +13,7 @@ use crate::{
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
         hash::get_hash_id_from_value,
+        inverted::BM25Hit,
         ranged::{
             client::cursor::ClientCursor,
             lsm::{
@@ -195,6 +196,18 @@ impl IndexedDataClient {
             .hashed_query(index_id, field_id, value)
             .await
     }
+
+    pub async fn bm25_search(
+        &self,
+        schema: u32,
+        field_id: u64,
+        query: &str,
+        limit: usize,
+    ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
+        self.index_clients
+            .bm25_search(schema, field_id, query, limit)
+            .await
+    }
 }
 
 impl DataCursor {
@@ -317,10 +330,11 @@ impl DataCursor {
 #[cfg(test)]
 mod test {
     use crate::{
+        index::builder::IndexBuilder,
         index::ranged::lsm::btree::Ordering,
-        query::data_client::{IndexedDataClient, ValueRange, ValueRangeTerm},
+        query::data_client::{ValueRange, ValueRangeTerm},
         ram::{
-            cell::{OwnedCell, ReadError},
+            cell::OwnedCell,
             schema::{Field, IndexType, Schema},
         },
         server::*,
@@ -651,7 +665,7 @@ mod test {
                 undo_log_storage: None,
                 raft_storage: None, // No persistence for regular tests
                 index_enabled: true,
-                services: vec![Service::Cell, Service::Query, Service::HashIndexer],
+                services: vec![Service::Cell, Service::Transaction, Service::Query, Service::HashIndexer],
                 enable_recovery: false,
             },
             &server_addr,
@@ -840,5 +854,110 @@ mod test {
                 returned_id
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bm25_search_returns_ranked_results() {
+        let _ = env_logger::try_init();
+        const TEXT_FIELD: &str = "BODY";
+        let server_addr = String::from("127.0.0.1:6704");
+        let server_group = String::from("bm25_search_test");
+        let server = NebServer::new_from_opts(
+            &ServerOptions {
+                chunk_count: 4,
+                total_size: 64 * 1024 * 1024,
+                tiered_config: None,
+                backup_storage: None,
+                wal_storage: None,
+                undo_log_storage: None,
+                raft_storage: None,
+                index_enabled: true,
+                services: vec![
+                    Service::Cell,
+                    Service::Transaction,
+                    Service::Query,
+                    Service::HashIndexer,
+                ],
+                enable_recovery: false,
+            },
+            &server_addr,
+            &server_group,
+            async |_| {},
+        )
+        .await;
+
+        let fields = Field::new_schema(vec![Field::new_indexed(
+            TEXT_FIELD,
+            Type::String,
+            vec![IndexType::InvertedBM25],
+        )]);
+        let schema_id = 777;
+        let schema = Schema::new_with_id(schema_id, "bm25_schema", None, fields, false, false);
+        let client = server
+            .data_client(&vec![server_addr.clone()])
+            .await
+            .unwrap();
+        client.new_schema_with_id(schema).await.unwrap().unwrap();
+
+        let docs = vec![
+            (
+                Id::new(5, 1),
+                "modern database storage engine with ranking support",
+            ),
+            (
+                Id::new(5, 2),
+                "distributed transactions and consensus protocols",
+            ),
+            (
+                Id::new(5, 3),
+                "ranking algorithms for search and bm25 scoring",
+            ),
+            (Id::new(5, 4), "cooking recipes and kitchen tips"),
+        ];
+
+        for (id, text) in &docs {
+            let mut value = OwnedValue::Map(OwnedMap::new());
+            value[TEXT_FIELD] = OwnedValue::String(text.to_string());
+            let cell = OwnedCell::new_with_id(schema_id, id, value);
+            client.write_cell(cell).await.unwrap().unwrap();
+        }
+
+        for task in IndexBuilder::await_indices().await {
+            match task {
+                Ok(Ok(())) => {}
+                other => panic!("Index task failed: {:?}", other),
+            }
+        }
+
+        let idx_data_client = server.indexed_data_client();
+        let hits = idx_data_client
+            .bm25_search(schema_id, hash_str(TEXT_FIELD), "database ranking", 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            hits.len() >= 2,
+            "Expected at least two hits for query, got {:?}",
+            hits
+        );
+        assert_eq!(
+            hits[0].id, docs[0].0,
+            "Document with both tokens should rank first"
+        );
+        assert_eq!(
+            hits[1].id, docs[2].0,
+            "Ranking-focused document should be second"
+        );
+
+        let empty_hits = idx_data_client
+            .bm25_search(schema_id, hash_str(TEXT_FIELD), "quantum muffins", 5)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            empty_hits.is_empty(),
+            "Irrelevant query should return no matches, got {:?}",
+            empty_hits
+        );
     }
 }

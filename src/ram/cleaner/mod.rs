@@ -134,7 +134,8 @@ impl Cleaner {
                     num_segments_candidates_for_combine
                 );
 
-                let (cleaned_space, num_reduced_segments) = combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
+                let (cleaned_space, num_reduced_segments) =
+                    combine::CombinedCleaner::combine_segments(chunk, &segments_for_combine);
                 combiner_cleaned_space += cleaned_space;
                 reduced_segments_count += num_reduced_segments;
             }

@@ -1,5 +1,5 @@
 use crate::ram::chunk::Chunk;
-use crate::ram::segs::{SEGMENT_SIZE, Segment};
+use crate::ram::segs::{Segment, SEGMENT_SIZE};
 use crate::ram::tiered::clock::ClockEvictionPolicy;
 use crate::ram::tiered::eviction::evict_segment;
 use crate::ram::tiered::promotion::promote_segment;
@@ -229,10 +229,7 @@ impl TieredMemoryManager {
     ///
     /// This is called when a cold segment is accessed and needs to be brought
     /// back into hot storage
-    pub fn promote(
-        &self,
-        segment: &Segment,
-    ) -> Result<(), io::Error> {
+    pub fn promote(&self, segment: &Segment) -> Result<(), io::Error> {
         if !self.enabled {
             return Ok(());
         }

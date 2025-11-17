@@ -49,6 +49,7 @@ pub enum IndexType {
     Ranged,
     Hashed,
     Vector(MetricEncoding),
+    InvertedBM25,
     Statistics,
 }
 

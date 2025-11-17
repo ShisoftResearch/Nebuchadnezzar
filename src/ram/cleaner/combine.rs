@@ -107,7 +107,8 @@ impl CombinedCleaner {
                 if let EntryContent::Tombstone(ref tombstone) = entry.content {
                     // Exclude tombstones pointing to segments being combined
                     return !segment_ids_to_combine.contains(&tombstone.segment_id) // Tombstone is not pointing to a segment we are about to combine
-                        && !chunk.cell_index.contains_key(&(tombstone.hash as usize)) // Tombstone is not pointing to a cell that is already in the chunk;
+                        && !chunk.cell_index.contains_key(&(tombstone.hash as usize));
+                    // Tombstone is not pointing to a cell that is already in the chunk;
                 }
                 return true;
             })

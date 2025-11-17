@@ -309,7 +309,7 @@ pub async fn multi_transaction() {
         .unwrap();
     txn.prepare(txn_2_id.to_owned()).await.unwrap().unwrap();
     txn.commit(txn_2_id.to_owned()).await.unwrap().unwrap();
-    
+
     // With strict timestamp ordering + Wait-Die:
     // T1 (older) should fail to prepare after T2 (newer) has committed
     // because tid_1 < meta.write (set by T2)
