@@ -115,7 +115,6 @@ pub struct Segment {
 pub struct SegmentFileState {
     pub manager: Arc<SegmentFileManager>,
     pub wal: Option<File>,
-    pub backup: Option<File>,
 }
 
 impl Segment {
@@ -133,12 +132,10 @@ impl Segment {
             panic!("Failed to initialize storage directories: {}", e);
         }
 
-        // EAGER WAL CREATION: Create WAL file at segment construction
-        // Testing: Lazy creation causes transaction rollback tests to fail
-        let wal_file_opt = match file_manager.create_wal_file(chunk_id, id, seq_id) {
-            Ok(opt) => opt,
-            Err(e) => panic!("Failed to create WAL file: {}", e),
-        };
+        // WAL files are created lazily on first write. This avoids keeping file descriptors
+        // open for cold/idle segments. Active head segments will create and hold WAL files
+        // while they are being written to.
+        let wal_file_opt = None;
 
         debug!(
             "Creating new segment chunk {}, id {}, seq_id {}, size {}, address {}",
@@ -158,7 +155,6 @@ impl Segment {
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
                 wal: wal_file_opt,
-                backup: None,
             }),
             archived: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
@@ -447,7 +443,7 @@ impl Segment {
     }
 
     // archive this segment and write the data to backup storage
-    // The backup file handler is kept open for reuse during promotion
+    // Backup files are opened on demand and closed immediately after use
     pub fn archive(&self) -> Result<bool, io::Error> {
         let mut state = self.file_state.lock();
         let backup_path_opt = state
@@ -485,8 +481,8 @@ impl Segment {
                         return Err(e);
                     }
                 }
-                // Prepare the new backup file
-                state.backup = state.manager.open_or_create_backup_writer(
+                // Prepare the new backup file by creating a fresh writer
+                let _ = state.manager.open_or_create_backup_writer(
                     self.chunk_id,
                     self.id,
                     self.seq_id,
@@ -506,16 +502,12 @@ impl Segment {
                     self.id, write_size
                 );
 
-                // Get or create backup writer
-                if state.backup.is_none() {
-                    state.backup = state.manager.open_or_create_backup_writer(
-                        self.chunk_id,
-                        self.id,
-                        self.seq_id,
-                    )?;
-                }
-
-                if let Some(ref mut file) = state.backup {
+                // Always open a fresh backup writer for this archive operation
+                if let Some(mut file) = state.manager.open_or_create_backup_writer(
+                    self.chunk_id,
+                    self.id,
+                    self.seq_id,
+                )? {
                     // Truncate the file to zero and write from beginning
                     file.set_len(0)?;
                     file.sync_all()?;
@@ -611,6 +603,13 @@ impl Segment {
 
     pub fn write_wal(&self, addr: usize, size: u32, skip_sync: bool) -> io::Result<()> {
         let mut state = self.file_state.lock();
+        // Lazily create WAL file on first write if not already present
+        if state.wal.is_none() {
+            state.wal = state
+                .manager
+                .create_wal_file(self.chunk_id, self.id, self.seq_id)?;
+        }
+
         if let Some(ref mut file) = state.wal {
             unsafe {
                 let data_block = slice::from_raw_parts(addr as *const u8, size as usize);

@@ -80,48 +80,52 @@ pub fn promote_segment(segment: &Segment) {
         );
     }
 
-    // Step 5: Get backup file handler from segment's file_state
-    // Lock file_state to access or create the backup file handler
-    let mut file_state = segment.file_state.lock();
+    // Step 5: Open backup file on demand instead of keeping it open
+    // This avoids holding file descriptors for idle/cold segments.
+    let backup_path = {
+        let file_state = segment.file_state.lock();
+        match file_state
+            .manager
+            .backup_path(segment.chunk_id, segment.id, segment.seq_id)
+        {
+            Some(path) => path,
+            None => {
+                error!(
+                    "CRITICAL: Segment {} is marked COLD but backup path does not exist",
+                    segment.id
+                );
+                segment.set_cold();
+                panic!(
+                    "Cannot promote segment {}: missing backup path",
+                    segment.id
+                );
+            }
+        }
+    };
 
-    // Start with empty buffer - read_to_end will fill it with file contents
-    let mut temp_buffer = Vec::with_capacity(SEGMENT_SIZE);
-
-    let backup_file = match &mut file_state.backup {
-        Some(file) => file,
-        None => {
+    let mut backup_file = match std::fs::File::open(&backup_path) {
+        Ok(file) => file,
+        Err(e) => {
             error!(
-                "CRITICAL: Segment {} is marked COLD but backup file does not exist",
-                segment.id
+                "Failed to open backup file {} for segment {}: {}",
+                backup_path, segment.id, e
             );
             segment.set_cold();
             panic!(
-                "Cannot promote segment {}: failed to obtain backup file",
-                segment.id
+                "Cannot promote segment {}: failed to open backup file: {}",
+                segment.id, e
             );
         }
     };
 
-    match backup_file.rewind() {
-        Ok(_) => {}
-        Err(e) => {
-            error!(
-                "Failed to rewind backup file for segment {}: {}",
-                segment.id, e
-            );
-            segment.set_cold();
-            panic!(
-                "Cannot promote segment {}: failed to rewind backup file: {}",
-                segment.id, e
-            );
-        }
-    }
+    // Start with empty buffer - read_to_end will fill it with file contents
+    let mut temp_buffer = Vec::with_capacity(SEGMENT_SIZE);
 
     // Read all file contents (may be compressed)
     if let Err(e) = backup_file.read_to_end(&mut temp_buffer) {
         error!(
-            "Failed to read backup file for segment {}: {}",
-            segment.id, e
+            "Failed to read backup file {} for segment {}: {}",
+            backup_path, segment.id, e
         );
         segment.set_cold();
         panic!(

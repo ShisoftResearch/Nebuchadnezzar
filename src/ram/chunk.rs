@@ -434,7 +434,33 @@ impl Chunk {
                     self.total_space.fetch_add(SEGMENT_SIZE, Ordering::Relaxed);
                     let new_seg_id = new_seg.id;
                     self.put_segment(new_seg);
+                    // Publish new head segment id
                     self.head_seg_id.store(new_seg_id, Ordering::Release);
+
+                    // Old head is no longer active for writes. Flush and close its WAL file
+                    // to avoid keeping unnecessary file descriptors open.
+                    if let Some(old_head) = self.segs.get(&(head_seg_id as usize)) {
+                        if let Err(e) = old_head.force_wal_sync() {
+                            warn!(
+                                "Failed to sync WAL for old head segment {}: {}",
+                                head_seg_id, e
+                            );
+                        }
+                        let mut state = old_head.file_state.lock();
+                        if let Some(wal) = state.wal.take() {
+                            if let Err(e) = wal.sync_all() {
+                                warn!(
+                                    "Failed to sync WAL during close for old head segment {}: {}",
+                                    head_seg_id, e
+                                );
+                            }
+                            drop(wal);
+                            debug!(
+                                "Closed WAL file for old head segment {} (freed file descriptor)",
+                                head_seg_id
+                            );
+                        }
+                    }
                     // whether the segment acquisition success or not,
                     // try to get the new segment and try again
                 }
