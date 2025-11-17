@@ -201,22 +201,22 @@ impl Segment {
     }
 
     /// Frees memory pages from this segment starting at the given offset.
-    /// 
+    ///
     /// This function uses `madvise_free` to free pages from the aligned start offset
     /// to the end of the segment. The address is aligned up to the next page boundary
     /// to ensure proper page alignment required by madvise.
-    /// 
+    ///
     /// # Arguments
     /// * `start_offset` - The offset within the segment to start freeing from (will be aligned up to page boundary)
-    /// 
+    ///
     /// # Safety
     /// This function should only be called when the freed region is no longer needed,
     /// as accessing the freed pages may cause the OS to zero them or remap them.
-    /// 
+    ///
     /// # Example
     /// ```rust,ignore
     /// use neb::ram::segs::Segment;
-    /// 
+    ///
     /// // After writing some data to a segment, you can free unused tail pages
     /// // (assuming `segment` is a valid Segment reference)
     /// let used_size = 1024 * 100; // 100KB used
@@ -225,16 +225,16 @@ impl Segment {
     pub fn punch_hole(&self, start_offset: usize) {
         // Calculate the absolute address of the start offset
         let start_addr = self.addr + start_offset;
-        
+
         // Align to the next page boundary (round up)
         let aligned_addr = align_address(PAGE_SIZE, start_addr);
-        
+
         // Calculate the size to free (from aligned address to end of segment)
         let end_addr = self.bound;
-        
+
         if aligned_addr < end_addr {
             let size = end_addr - aligned_addr;
-            
+
             // Only punch hole if we have at least one page to free
             if size >= PAGE_SIZE {
                 debug!(
@@ -514,14 +514,14 @@ impl Segment {
 
                     unsafe {
                         let data_block = slice::from_raw_parts(self.addr as *const u8, write_size);
-                        
+
                         // Create a padded copy to SEGMENT_SIZE to match WAL-based archiving behavior
                         let mut padded_data = Vec::with_capacity(SEGMENT_SIZE);
                         padded_data.extend_from_slice(data_block);
                         if write_size < SEGMENT_SIZE {
                             padded_data.resize(SEGMENT_SIZE, 0);
                         }
-                        
+
                         // Conditionally compress based on feature flag
                         #[cfg(feature = "compress_backups")]
                         {
@@ -535,14 +535,13 @@ impl Segment {
                                 (compressed_data.len() as f64 / SEGMENT_SIZE as f64) * 100.0
                             );
                         }
-                        
+
                         #[cfg(not(feature = "compress_backups"))]
                         {
                             file.write_all(&padded_data)?;
                             debug!(
                                 "Archived segment {} without compression: {} bytes",
-                                self.id,
-                                SEGMENT_SIZE
+                                self.id, SEGMENT_SIZE
                             );
                         }
                     }
@@ -573,13 +572,13 @@ impl Segment {
                         drop(wal); // Close the file descriptor
                         debug!("Closed WAL file descriptor for segment {}", self.id);
                     }
-                    
+
                     // Delete the WAL file from disk
-                    if let Err(e) = state.manager.delete_wal(self.chunk_id, self.id, self.seq_id) {
-                        warn!(
-                            "Failed to delete WAL file for segment {}: {}",
-                            self.id, e
-                        );
+                    if let Err(e) = state
+                        .manager
+                        .delete_wal(self.chunk_id, self.id, self.seq_id)
+                    {
+                        warn!("Failed to delete WAL file for segment {}: {}", self.id, e);
                     } else {
                         debug!("Deleted WAL file for archived segment {}", self.id);
                     }
@@ -1080,7 +1079,10 @@ pub unsafe fn madvise_free(addr: usize, size: usize) {
     if result != 0 {
         let errno = std::io::Error::last_os_error();
         if errno.raw_os_error() == Some(libc::EINVAL) {
-            warn!("MADV_({}) not supported, falling back to MADV_DONTNEED", advice);
+            warn!(
+                "MADV_({}) not supported, falling back to MADV_DONTNEED",
+                advice
+            );
         }
     }
 }
@@ -1092,28 +1094,28 @@ mod tests {
     #[test]
     fn test_punch_hole_alignment() {
         let _ = env_logger::try_init();
-        
+
         // Create a test segment allocator
         let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
         let file_manager = Arc::new(SegmentFileManager::new(None, None));
-        
+
         // Allocate a segment
         let segment = allocator
             .alloc_seg(&file_manager)
             .expect("Failed to allocate segment");
-        
+
         // Test 1: Punch hole from middle of segment (should align up to next page)
         let offset = 1024; // 1KB offset (not page aligned)
         segment.punch_hole(offset);
-        
+
         // Test 2: Punch hole from page-aligned offset
         let aligned_offset = PAGE_SIZE * 2; // 8KB offset (page aligned)
         segment.punch_hole(aligned_offset);
-        
+
         // Test 3: Punch hole from near end of segment (should not free if less than PAGE_SIZE)
         let near_end_offset = SEGMENT_SIZE - PAGE_SIZE / 2;
         segment.punch_hole(near_end_offset);
-        
+
         // If we got here without panicking, the test passes
         assert!(true, "punch_hole executed without errors");
     }
@@ -1121,24 +1123,22 @@ mod tests {
     #[test]
     fn test_punch_hole_edge_cases() {
         let _ = env_logger::try_init();
-        
+
         let allocator = SegmentAllocator::new(0, SEGMENT_SIZE * 2);
         let file_manager = Arc::new(SegmentFileManager::new(None, None));
         let segment = allocator
             .alloc_seg(&file_manager)
             .expect("Failed to allocate segment");
-        
+
         // Test edge case: offset at end of segment
         segment.punch_hole(SEGMENT_SIZE);
-        
+
         // Test edge case: offset beyond end of segment (should do nothing)
         segment.punch_hole(SEGMENT_SIZE + 1000);
-        
+
         // Test edge case: offset at 0 (should free almost entire segment)
         segment.punch_hole(0);
-        
+
         assert!(true, "Edge cases handled correctly");
     }
 }
-
-

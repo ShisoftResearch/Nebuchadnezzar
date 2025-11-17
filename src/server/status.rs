@@ -57,10 +57,7 @@ impl ServerMemoryStatus {
         println!("\n📊 Overall Statistics:");
         println!("  • Total Chunks:        {}", self.total_chunks);
         println!("  • Total Cells:         {}", self.total_cells);
-        println!(
-            "  • Living Transactions: {}",
-            self.living_transactions
-        );
+        println!("  • Living Transactions: {}", self.living_transactions);
         println!(
             "  • Total Segments:      {} (Hot: {}, Cold: {})",
             self.total_segments, self.total_hot_segments, self.total_cold_segments
@@ -199,7 +196,11 @@ impl NebServer {
         let total_physical_limit =
             physical_memory_limit_per_chunk.map(|limit| limit * total_chunks);
 
-        let living_transactions = self.txn_manager.as_ref().map(|tm| tm.transaction_count()).unwrap_or(0);
+        let living_transactions = self
+            .txn_manager
+            .as_ref()
+            .map(|tm| tm.transaction_count())
+            .unwrap_or(0);
 
         ServerMemoryStatus {
             total_chunks,

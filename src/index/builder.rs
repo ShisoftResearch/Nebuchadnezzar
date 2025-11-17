@@ -4,6 +4,9 @@ use super::{EntryKey, Feature, IndexerClients};
 use crate::client::transaction::TxnError;
 use crate::client::AsyncClient;
 use crate::dovahkiin::types::Value;
+use crate::index::inverted::{
+    build_index_meta as build_inverted_index_meta, InvertedIndexMeta, ToOwnedValue,
+};
 use crate::index::vector::MetricEncoding;
 use crate::ram::cell::{OwnedCell, SharedCell};
 use crate::ram::types::Id;
@@ -59,6 +62,7 @@ pub enum IndexMeta {
     Ranged(RangedIndexMeta),
     Hashed(HashedIndexMeta),
     Vector(VectorIndexMeta),
+    Inverted(InvertedIndexMeta),
 }
 
 // Enum for different types of index components
@@ -124,6 +128,9 @@ impl IndexMeta {
                     )
                     .await?;
             }
+            &IndexMeta::Inverted(ref meta) => {
+                indexers.inverted_client.insert(meta).await?;
+            }
         }
         Ok(())
     }
@@ -151,6 +158,9 @@ impl IndexMeta {
                     .vector_client
                     .remove(&meta.cell_id, meta.schema_id, meta.field_id)
                     .await?;
+            }
+            &IndexMeta::Inverted(ref meta) => {
+                indexers.inverted_client.remove(meta).await?;
             }
         }
         Ok(())
@@ -297,27 +307,51 @@ impl IndexBuilder {
 
         // Insert new indices and remove old ones
         debug!("Inserting new indices: {:?}", index_of_new_index);
-        for new_index in index_of_new_index.values() {
+        let new_values = index_of_new_index.into_values().collect::<Vec<_>>();
+        let old_values = index_of_old_index.into_values().collect::<Vec<_>>();
+
+        let (inverted_new, regular_new): (Vec<_>, Vec<_>) = new_values
+            .into_iter()
+            .partition(|meta| matches!(meta, IndexMeta::Inverted(_)));
+        let (inverted_old, regular_old): (Vec<_>, Vec<_>) = old_values
+            .into_iter()
+            .partition(|meta| matches!(meta, IndexMeta::Inverted(_)));
+
+        for new_index in regular_new {
             debug!("Inserting new index: {:?}", new_index);
             new_index.insert(&*indexers).await?;
         }
-        debug!("Removing old indices: {:?}", index_of_old_index);
-        for old_index in index_of_old_index.values() {
+        debug!("Removing old indices: {:?}", regular_old);
+        for old_index in regular_old {
             debug!("Removing old index: {:?}", old_index);
             old_index.remove(&*indexers).await?;
         }
-        debug!("Indices updated: {:?}", index_of_new_index);
+        debug!("Removing old inverted indices: {:?}", inverted_old);
+        for old_index in inverted_old {
+            debug!("Removing inverted index: {:?}", old_index);
+            old_index.remove(&*indexers).await?;
+        }
+        debug!("Inserting new inverted indices: {:?}", inverted_new);
+        for new_index in inverted_new {
+            debug!("Inserting inverted index: {:?}", new_index);
+            new_index.insert(&*indexers).await?;
+        }
         Ok(())
     }
 }
 
 // Function to probe and generate indices for a cell based on its schema
-pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
+pub fn probe_cell_indices<C>(cell: &C, schema: &Schema) -> Vec<IndexRes>
+where
+    C: Cell,
+    <C::Value as Value>::Out: ToOwnedValue,
+{
     let mut res = vec![];
     schema.index_fields.iter().for_each(|(field_id, indices)| {
         if let Some(id_path) = schema.id_index.get(field_id) {
             let value = cell.data().get_in_by_ids(id_path);
             let mut components = vec![];
+            let mut metas = vec![];
 
             // Handle array data
             if value.is_prime_array() {
@@ -347,6 +381,17 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                             *field_id,
                             metric_encoding,
                         )),
+                        &IndexType::InvertedBM25 => {
+                            let owned_value = value.to_owned_value();
+                            if let Some(meta) = build_inverted_index_meta(
+                                cell.id(),
+                                schema.id,
+                                *field_id,
+                                owned_value,
+                            ) {
+                                metas.push(IndexMeta::Inverted(meta));
+                            }
+                        }
                         &IndexType::Statistics => {}
                     }
                 }
@@ -357,13 +402,23 @@ pub fn probe_cell_indices<C: Cell>(cell: &C, schema: &Schema) -> Vec<IndexRes> {
                         &IndexType::Ranged => components.push(IndexComps::Ranged(value.feature())),
                         &IndexType::Hashed => components.push(IndexComps::Hashed(value.hash())),
                         &IndexType::Vector(_metric_encoding) => {}
+                        &IndexType::InvertedBM25 => {
+                            let owned_value = value.to_owned_value();
+                            if let Some(meta) = build_inverted_index_meta(
+                                cell.id(),
+                                schema.id,
+                                *field_id,
+                                owned_value,
+                            ) {
+                                metas.push(IndexMeta::Inverted(meta));
+                            }
+                        }
                         &IndexType::Statistics => {}
                     }
                 }
             }
 
             // Generate index metadata for each component
-            let mut metas = vec![];
             let cell_id = cell.id();
             for comp in components {
                 match comp {

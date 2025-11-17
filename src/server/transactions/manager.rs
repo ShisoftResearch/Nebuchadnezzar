@@ -3,8 +3,8 @@ use crate::ram::cell::CellHeader;
 use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{RPCClient, ClientPool};
-use bifrost::vector_clock::{StandardVectorClock, ServerVectorClock};
+use bifrost::rpc::{ClientPool, RPCClient};
+use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
 use itertools::Itertools;
@@ -120,7 +120,10 @@ impl TransactionManager {
         Self::new_with_config(deps, wait_config)
     }
 
-    fn new_with_config(deps: Arc<TransactionManagerDeps>, wait_config: WaitConfig) -> Arc<TransactionManager> {
+    fn new_with_config(
+        deps: Arc<TransactionManagerDeps>,
+        wait_config: WaitConfig,
+    ) -> Arc<TransactionManager> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             deps,
@@ -590,7 +593,9 @@ impl TransactionManager {
                                     data_obj.cell = Some(cell);
                                     data_obj.version = Some(version);
                                 }
-                                return Ok(TxnExecResult::Accepted(data_obj.cell.as_ref().unwrap().clone()));
+                                return Ok(TxnExecResult::Accepted(
+                                    data_obj.cell.as_ref().unwrap().clone(),
+                                ));
                             } else {
                                 // No entry exists - cache the remote value and return it
                                 let version = cell.header.version;
@@ -772,18 +777,11 @@ impl TransactionManager {
             let cell_ids: Vec<_> = objs.iter().map(|(id, _)| *id).collect();
             let deps_for_clock = deps.clone();
             let prepare_payload = data_site
-                .prepare(
-                    self_server_id,
-                    deps.clock.to_clock(),
-                    tid.clone(),
-                    cell_ids,
-                )
+                .prepare(self_server_id, deps.clock.to_clock(), tid.clone(), cell_ids)
                 .await
                 .map_err(|_| -> TMError { TMError::RPCErrorFromCellServer })
                 .map(move |prepare_res| -> DMPrepareResult {
-                    deps_for_clock
-                        .clock
-                        .merge_with(&prepare_res.clock);
+                    deps_for_clock.clock.merge_with(&prepare_res.clock);
                     prepare_res.payload
                 });
             match prepare_payload {

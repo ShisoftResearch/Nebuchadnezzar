@@ -95,10 +95,7 @@ pub fn promote_segment(segment: &Segment) {
                     segment.id
                 );
                 segment.set_cold();
-                panic!(
-                    "Cannot promote segment {}: missing backup path",
-                    segment.id
-                );
+                panic!("Cannot promote segment {}: missing backup path", segment.id);
             }
         }
     };

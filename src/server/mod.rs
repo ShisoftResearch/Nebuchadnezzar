@@ -11,8 +11,8 @@ use bifrost::raft;
 use bifrost::raft::client::RaftClient;
 use bifrost::raft::disk::DiskOptions;
 use bifrost::raft::state_machine::master as sm_master;
-use bifrost::rpc::{self, ClientPool};
 use bifrost::rpc::DEFAULT_CLIENT_POOL;
+use bifrost::rpc::{self, ClientPool};
 use bifrost::rpc::{RPCClient, RPCError, Server};
 use bifrost::vector_clock::ServerVectorClock;
 use bifrost_plugins::hash_ident;
@@ -242,14 +242,17 @@ impl NebServer {
         let clock = txn_peer.clock.clone();
 
         if opts.services.contains(&Service::Transaction) {
-            transaction_manager = Some(init_txn_manager(
-                rpc_server, 
-                &meta_rc, 
-                &clock, 
-                rpc_server.server_id, 
-                &conshasing, 
-                &member_pool,
-            ).await);
+            transaction_manager = Some(
+                init_txn_manager(
+                    rpc_server,
+                    &meta_rc,
+                    &clock,
+                    rpc_server.server_id,
+                    &conshasing,
+                    &member_pool,
+                )
+                .await,
+            );
         }
 
         let server = Arc::new(NebServer {
@@ -525,15 +528,10 @@ pub async fn init_txn_manager(
         member_pool: member_pool.clone(),
     });
     let txn_manager = transactions::manager::TransactionManager::new(deps);
-    rpc_server
-        .register_service(&txn_manager)
-        .await;
+    rpc_server.register_service(&txn_manager).await;
     return txn_manager;
 }
-pub async fn init_txn_data_site_service(
-    rpc_server: &Arc<Server>,
-    neb_server: &Arc<NebServer>,
-) {
+pub async fn init_txn_data_site_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
     rpc_server
         .register_service(&transactions::data_site::DataManager::new(&neb_server))
         .await;

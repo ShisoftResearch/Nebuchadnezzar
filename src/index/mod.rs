@@ -4,6 +4,7 @@ mod macros;
 pub mod builder;
 pub mod entry;
 pub mod hash;
+pub mod inverted;
 pub mod ranged;
 pub mod vector;
 
@@ -23,7 +24,8 @@ use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::vector::{VectorIndexClient, VectorIndexerCore};
+use crate::index::inverted::{inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit, InvertedIndexClient};
+use crate::index::vector::VectorIndexClient;
 use crate::ram::cell::ReadError;
 
 use self::ranged::client::cursor::ClientCursor;
@@ -36,6 +38,7 @@ pub struct IndexerClients {
     pub ranged_client: Arc<RangedIndexerClient>,
     pub hashed_client: Arc<HashedIndexClient>,
     pub vector_client: Arc<VectorIndexClient>,
+    pub inverted_client: Arc<InvertedIndexClient>,
 }
 
 impl IndexerClients {
@@ -48,11 +51,21 @@ impl IndexerClients {
             ranged_client: Arc::new(RangedIndexerClient::new(conshash, raft_client)),
             hashed_client: Arc::new(HashedIndexClient::new(neb_client)),
             vector_client: Arc::new(VectorIndexClient::new()),
+            inverted_client: Arc::new(InvertedIndexClient::new(neb_client)),
         }
     }
     pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
         let hash_index_schema = hash_index_schema();
         let _ = neb_client.new_schema_with_id(hash_index_schema).await;
+        let _ = neb_client
+            .new_schema_with_id(inverted_index_schema())
+            .await;
+        let _ = neb_client
+            .new_schema_with_id(inverted_stats_schema())
+            .await;
+        let _ = neb_client
+            .new_schema_with_id(inverted_doc_schema())
+            .await;
     }
     pub fn range_seek<'a>(
         &'a self,
@@ -75,5 +88,17 @@ impl IndexerClients {
         value: &OwnedValue,
     ) -> Result<Result<Vec<Id>, ReadError>, RPCError> {
         HashedIndexClient::query(&self.hashed_client, index_id, field_id, value).await
+    }
+
+    pub async fn bm25_search(
+        &self,
+        schema_id: u32,
+        field_id: u64,
+        query: &str,
+        limit: usize,
+    ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
+        self.inverted_client
+            .bm25_search(schema_id, field_id, query, limit)
+            .await
     }
 }

@@ -182,9 +182,12 @@ pub fn evict_segment(segment: &Segment, chunk: &Chunk) -> Result<(), io::Error> 
                 segment.id
             );
         }
-        
+
         // Delete WAL file from disk if it exists
-        if let Err(e) = file_state.manager.delete_wal(segment.chunk_id, segment.id, segment.seq_id) {
+        if let Err(e) = file_state
+            .manager
+            .delete_wal(segment.chunk_id, segment.id, segment.seq_id)
+        {
             // This is not critical - WAL might already be deleted during archive
             debug!(
                 "Could not delete WAL for segment {} during eviction: {} (may already be deleted)",

@@ -1131,7 +1131,6 @@ impl Chunk {
         return mapping;
     }
 
-
     /// Get segment information for a cell based on its memory address.
     /// Returns (segment_id, seq_id) for the segment containing the cell.
     pub fn get_cell_segment_info(&self, cell_addr: usize) -> (u64, u64) {

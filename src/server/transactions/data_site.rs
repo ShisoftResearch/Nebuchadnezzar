@@ -26,11 +26,11 @@ type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 
 /// Per-cell metadata for concurrency control
-/// 
+///
 /// Implements a hybrid timestamp-ordering + lock-based protocol with Wait-Die:
 /// - `read` / `write`: Track timestamps for timestamp-ordering validation
 /// - `owner`: Acts as a write lock during prepare/commit phases
-/// 
+///
 /// Wait-Die Protocol:
 /// - When a transaction wants to acquire a cell already owned by another:
 ///   - If requester is YOUNGER (higher timestamp): DIE (abort immediately)
@@ -196,7 +196,11 @@ impl DataManager {
     /// Returns None if segment not found (already freed/evicted).
     /// The guard is RAII - reference is automatically released when dropped.
     #[inline]
-    fn acquire_segment_guard(&self, chunk_idx: usize, segment_id: u64) -> Option<SegmentReferenceGuard> {
+    fn acquire_segment_guard(
+        &self,
+        chunk_idx: usize,
+        segment_id: u64,
+    ) -> Option<SegmentReferenceGuard> {
         if let Some(chunk) = self.server.chunks.list.get(chunk_idx) {
             if let Some(segment) = chunk.segs.get(&(segment_id as usize)) {
                 return Some(SegmentReferenceGuard::new(segment));
@@ -460,7 +464,7 @@ impl Service for DataManager {
         }
         for cell_mutex in &cell_mutices {
             let meta = cell_mutex.lock();
-            
+
             // Wait-Die Protocol: Check if another transaction owns this cell
             // This implements lock-based concurrency control to reduce timestamp-ordering aborts
             if let Some(ref owner_tid) = meta.owner {
@@ -482,10 +486,10 @@ impl Service for DataManager {
                     }
                 }
             }
-            
+
             // Timestamp ordering validation (STRICT)
             // Ensures strict serializability and linearizability
-            // 
+            //
             // Read-Write Conflict Check:
             // Enforce write-after-read constraint - prevents writing with older
             // timestamp than existing reads
@@ -496,7 +500,7 @@ impl Service for DataManager {
                 );
                 break;
             }
-            
+
             // Write-Write Conflict Check (STRICT):
             // Enforce write-after-write constraint - prevents timestamp inversions
             // This ensures:
@@ -511,7 +515,7 @@ impl Service for DataManager {
                 );
                 break;
             }
-            
+
             cell_guards.push(meta);
         }
         if cell_guards.len() != cell_ids.len() {
@@ -657,7 +661,10 @@ impl Service for DataManager {
                         let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
                             Some(g) => g,
                             None => {
-                                write_error = Some((*cell_id, WriteError::ReadError(ReadError::CellDoesNotExisted)));
+                                write_error = Some((
+                                    *cell_id,
+                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                ));
                                 break;
                             }
                         };
@@ -737,7 +744,10 @@ impl Service for DataManager {
                         let guard = match self.acquire_segment_guard(chunk_idx, segment_id) {
                             Some(g) => g,
                             None => {
-                                write_error = Some((cell_id, WriteError::ReadError(ReadError::CellDoesNotExisted)));
+                                write_error = Some((
+                                    cell_id,
+                                    WriteError::ReadError(ReadError::CellDoesNotExisted),
+                                ));
                                 break;
                             }
                         };
