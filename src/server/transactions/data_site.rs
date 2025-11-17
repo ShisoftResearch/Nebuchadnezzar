@@ -25,12 +25,23 @@ type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
 
+/// Per-cell metadata for concurrency control
+/// 
+/// Implements a hybrid timestamp-ordering + lock-based protocol with Wait-Die:
+/// - `read` / `write`: Track timestamps for timestamp-ordering validation
+/// - `owner`: Acts as a write lock during prepare/commit phases
+/// 
+/// Wait-Die Protocol:
+/// - When a transaction wants to acquire a cell already owned by another:
+///   - If requester is YOUNGER (higher timestamp): DIE (abort immediately)
+///   - If requester is OLDER (lower timestamp): WAIT (backoff and retry)
+/// - This prevents deadlock while reducing contention on hot cells
+/// - Waiters poll via backoff rather than blocking on a condition variable
 #[derive(Debug)]
 pub struct CellMeta {
     read: TxnId,
     write: TxnId,
-    owner: Option<TxnId>, // transaction that owns the cell in Committing state
-                          // Note: We don't track waiting transactions anymore - waiters just poll instead
+    owner: Option<TxnId>, // transaction that owns the cell (write lock) during prepare/commit
 }
 
 struct Transaction {
@@ -411,9 +422,27 @@ impl Service for DataManager {
         tid: TxnId,
         cell_ids: Vec<Id>,
     ) -> BoxFuture<'_, DataSiteResponse<DMPrepareResult>> {
-        // In this stage, data manager will not do any write operation but mark cell owner in their meta as a lock
-        // It will also check if write are realizable. If not, transaction manager should retry with new id
-        // cell_ids must be sorted to avoid deadlock. It can be done from data manager by using BTreeMap keys
+        // PREPARE PHASE: Two-Phase Commit with Wait-Die Concurrency Control
+        //
+        // This function implements the first phase of 2PC with a hybrid protocol:
+        // 1. Wait-Die lock-based conflict resolution (NEW)
+        // 2. Timestamp-ordering validation (EXISTING)
+        //
+        // Wait-Die Protocol (prevents deadlock on lock conflicts):
+        // - If cell.owner exists and != tid:
+        //   - Younger txn (tid > owner): DIE → return NotRealizable (abort)
+        //   - Older txn (tid < owner): WAIT → return Wait (TM will backoff & retry)
+        // - This reduces cascading aborts on hot cells vs pure timestamp ordering
+        //
+        // Timestamp Ordering (validates serializability - RELAXED):
+        // - Check tid >= meta.read (write-after-read constraint) - STRICT
+        // - meta.write check REMOVED - handled by locks + Thomas Write Rule
+        // - This allows higher concurrency on hot cells while maintaining serializability
+        //
+        // Lock Acquisition:
+        // - If all checks pass, set meta.owner = Some(tid) for each cell
+        // - cell_ids must be sorted to avoid deadlock on mutex acquisition
+        // - Locks are released in the `end` phase after commit/abort
         debug!("PREPARE FOR {:?}, {} cells", &tid, cell_ids.len());
         self.update_clock(&clock);
 
@@ -431,25 +460,55 @@ impl Service for DataManager {
         }
         for cell_mutex in &cell_mutices {
             let meta = cell_mutex.lock();
-            // Use original tid (not effective_ts) for all conflict checks
-            // This ensures strict serializability for both read-write and write-write conflicts
-            // The effective_ts optimization is disabled to prevent bypassing conflicts
+            
+            // Wait-Die Protocol: Check if another transaction owns this cell
+            // This implements lock-based concurrency control to reduce timestamp-ordering aborts
+            if let Some(ref owner_tid) = meta.owner {
+                if owner_tid != &tid {
+                    if tid > *owner_tid {
+                        // Younger transaction "dies" (aborts immediately)
+                        debug!(
+                            "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?}",
+                            tid, owner_tid
+                        );
+                        return self.response_with(DMPrepareResult::NotRealizable);
+                    } else {
+                        // Older transaction waits for younger owner to release
+                        debug!(
+                            "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?}",
+                            tid, owner_tid
+                        );
+                        return self.response_with(DMPrepareResult::Wait);
+                    }
+                }
+            }
+            
+            // Timestamp ordering validation - relaxed for lock-centric protocol
+            // 
+            // Read-Write Conflict Check (STRICT):
+            // Still enforce write-after-read constraint to ensure no transaction
+            // reads a value that will be overwritten by an older write
             if tid < meta.read {
-                // write too late - another transaction with newer timestamp already read
                 debug!(
                     "PREPARE: Write too late for {:?} (tid: {:?}), cell read timestamp: {:?}",
                     tid, tid, meta.read
                 );
                 break;
             }
-            if tid < meta.write {
-                // write timestamp conflict - another transaction with newer timestamp already wrote
-                debug!(
-                    "PREPARE: Write conflict for {:?} (tid: {:?}), cell write timestamp: {:?}",
-                    tid, tid, meta.write
-                );
-                break;
-            }
+            
+            // Write-Write Conflict Check (RELAXED):
+            // With Wait-Die + locks, we can allow concurrent writes.
+            // The lock (meta.owner) serializes actual writes, and Thomas Write Rule
+            // in commit phase handles ordering. This significantly reduces aborts
+            // on hot cells while maintaining serializability.
+            //
+            // Previously strict check (now removed):
+            // if tid < meta.write { break; }
+            //
+            // Rationale: If we have the lock (via Wait-Die), we can write regardless
+            // of meta.write timestamp. The commit phase will apply writes in lock order,
+            // and Thomas Write Rule skips obsolete writes.
+            
             cell_guards.push(meta);
         }
         if cell_guards.len() != cell_ids.len() {
