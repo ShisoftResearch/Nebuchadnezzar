@@ -33,13 +33,17 @@ If cell.owner exists and owner ≠ requesting_txn:
 - **Reduced cascading aborts**: Hot cells now have an implicit queue instead of causing all conflicting txns to abort
 - **Better throughput**: Transactions pay waiting time once instead of repeated full abort+2PC retries
 
-### 2. Timestamp Ordering Validation (EXISTING)
+### 2. Timestamp Ordering Validation (RELAXED)
 
-After passing Wait-Die checks, the existing TO validation still runs:
-- `tid >= meta.read` (write-after-read constraint)
-- `tid >= meta.write` (write-after-write constraint)
+After passing Wait-Die checks, a relaxed TO validation runs:
+- `tid >= meta.read` (write-after-read constraint) - **STRICT**: Still enforced to prevent reading uncommitted/stale data
+- `tid >= meta.write` (write-after-write constraint) - **REMOVED**: Handled by locks + Thomas Write Rule instead
 
-This preserves **strict serializability** guarantees.
+This **relaxation significantly increases concurrency** on hot cells while preserving **serializability**:
+- Multiple transactions can prepare writes concurrently (no write-write timestamp abort)
+- Wait-Die ensures lock ordering (prevents deadlock)
+- Thomas Write Rule in commit phase skips obsolete writes (maintains correctness)
+- Read-write ordering still enforced via `meta.read` check
 
 ## Implementation Details
 

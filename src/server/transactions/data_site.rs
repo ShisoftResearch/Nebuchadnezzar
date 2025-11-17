@@ -434,10 +434,10 @@ impl Service for DataManager {
         //   - Older txn (tid < owner): WAIT → return Wait (TM will backoff & retry)
         // - This reduces cascading aborts on hot cells vs pure timestamp ordering
         //
-        // Timestamp Ordering (validates serializability):
-        // - Check tid >= meta.read (write-after-read constraint)
-        // - Check tid >= meta.write (write-after-write constraint)
-        // - These ensure strict serializability alongside Wait-Die
+        // Timestamp Ordering (validates serializability - RELAXED):
+        // - Check tid >= meta.read (write-after-read constraint) - STRICT
+        // - meta.write check REMOVED - handled by locks + Thomas Write Rule
+        // - This allows higher concurrency on hot cells while maintaining serializability
         //
         // Lock Acquisition:
         // - If all checks pass, set meta.owner = Some(tid) for each cell
@@ -483,25 +483,32 @@ impl Service for DataManager {
                 }
             }
             
-            // Use original tid (not effective_ts) for all conflict checks
-            // This ensures strict serializability for both read-write and write-write conflicts
-            // The effective_ts optimization is disabled to prevent bypassing conflicts
+            // Timestamp ordering validation - relaxed for lock-centric protocol
+            // 
+            // Read-Write Conflict Check (STRICT):
+            // Still enforce write-after-read constraint to ensure no transaction
+            // reads a value that will be overwritten by an older write
             if tid < meta.read {
-                // write too late - another transaction with newer timestamp already read
                 debug!(
                     "PREPARE: Write too late for {:?} (tid: {:?}), cell read timestamp: {:?}",
                     tid, tid, meta.read
                 );
                 break;
             }
-            if tid < meta.write {
-                // write timestamp conflict - another transaction with newer timestamp already wrote
-                debug!(
-                    "PREPARE: Write conflict for {:?} (tid: {:?}), cell write timestamp: {:?}",
-                    tid, tid, meta.write
-                );
-                break;
-            }
+            
+            // Write-Write Conflict Check (RELAXED):
+            // With Wait-Die + locks, we can allow concurrent writes.
+            // The lock (meta.owner) serializes actual writes, and Thomas Write Rule
+            // in commit phase handles ordering. This significantly reduces aborts
+            // on hot cells while maintaining serializability.
+            //
+            // Previously strict check (now removed):
+            // if tid < meta.write { break; }
+            //
+            // Rationale: If we have the lock (via Wait-Die), we can write regardless
+            // of meta.write timestamp. The commit phase will apply writes in lock order,
+            // and Thomas Write Rule skips obsolete writes.
+            
             cell_guards.push(meta);
         }
         if cell_guards.len() != cell_ids.len() {
