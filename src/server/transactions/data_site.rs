@@ -176,14 +176,20 @@ impl DataManager {
         }
     }
     fn cell_meta_mutex(&self, id: &Id) -> CellMetaMutex {
-        self.cell_list.push_back(*id);
-        self.cells.get_or_insert(*id, || {
+        // Check if entry exists to avoid duplicate list insertions
+        let is_new = self.cells.get(id).is_none();
+        let arc = self.cells.get_or_insert(*id, || {
             Arc::new(Mutex::new(CellMeta {
                 read: TxnId::new(),
                 write: TxnId::new(),
                 owner: None,
             }))
-        })
+        });
+        // Only push to list if this was a new insertion
+        if is_new {
+            self.cell_list.push_back(*id);
+        }
+        arc
     }
     fn response_with<T: Send>(&self, data: T) -> BoxFuture<'_, DataSiteResponse<T>>
     where
@@ -269,24 +275,42 @@ impl DataManager {
                 .cloned()
                 .unwrap_or_else(|| self.server.txn_peer.clock.to_clock())
         };
-        let mut cell_to_evict = Vec::new();
+        let mut cells_to_evict = Vec::new();
+
+        // First pass: collect cells with their metadata (while holding locks)
         for cell_id_ref in self.cell_list.iter_front() {
             let cell_id = cell_id_ref.deref();
             if let Some(cell_meta) = self.cells.get(&cell_id) {
                 let meta = cell_meta.lock();
                 if meta.write < oldest_transaction && meta.read < oldest_transaction {
-                    cell_to_evict.push(cell_id_ref);
+                    cells_to_evict.push((cell_id_ref, cell_meta.clone()));
                 } else {
                     // Cells are ordered by activity, stop at first active one
                     break;
                 }
             } else {
-                cell_to_evict.push(cell_id_ref);
+                // Cell not in map but in list - just remove from list
+                cell_id_ref.remove();
             }
         }
-        for evicted_cell in &cell_to_evict {
-            self.cells.remove(&evicted_cell.deref());
-            evicted_cell.remove();
+
+        // Second pass: re-check and remove (prevents TOCTOU race)
+        for (cell_id_ref, cell_meta) in cells_to_evict {
+            let cell_id = cell_id_ref.deref();
+
+            // Re-check timestamps while holding lock before removal
+            // This prevents evicting cells that became active after first check
+            let should_evict = {
+                let meta = cell_meta.lock();
+                meta.write < oldest_transaction
+                    && meta.read < oldest_transaction
+                    && meta.owner.is_none()  // Don't evict if locked by a transaction
+            };
+
+            if should_evict {
+                self.cells.remove(&cell_id);
+                cell_id_ref.remove();
+            }
         }
     }
     fn prepare_read<T: Send>(
