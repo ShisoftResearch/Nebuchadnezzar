@@ -11,7 +11,6 @@ use std::mem;
 
 use crate::index::vector::MetricEncoding;
 use crate::ram::io::align_address;
-use crate::ram::io::align_ptr_addr;
 use crate::server::NebServer;
 use crate::utils::thread_id;
 

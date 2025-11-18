@@ -7,6 +7,7 @@ use crate::ram::file_manager::SegmentFileManager;
 use crate::ram::io::align_address;
 use crate::ram::tombstone::TOMBSTONE_SIZE_U32;
 use bifrost::utils::time::get_time;
+#[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
 use crc32fast::Hasher as Crc32Hasher;
 use libc::*;
 use lightning::list::LinkedRingBufferList;

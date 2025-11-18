@@ -13,7 +13,9 @@
 /// Overhead: One signal + one syscall (~1-2μs) on first access after protection
 ///
 /// This feature can be disabled via Cargo.toml to use direct reference marking instead.
+#[cfg(feature = "page_fault_tracking")]
 use crate::ram::segs::SEGMENT_SIZE;
+#[cfg(feature = "page_fault_tracking")]
 use libc::{PROT_NONE, PROT_READ, PROT_WRITE};
 
 #[cfg(feature = "page_fault_tracking")]

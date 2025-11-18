@@ -1,9 +1,7 @@
-use crate::ram::chunk::Chunk;
 use crate::ram::compression;
 use crate::ram::recovery::find_append_header;
 use crate::ram::segs::{Segment, SegmentEntryIter, SEGMENT_SIZE};
-use crate::ram::tiered::cell_locking;
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::ptr;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -185,13 +183,13 @@ pub fn promote_segment(segment: &Segment) {
 
     let scan_boundary = scanned_boundary;
 
-    let temp_entry_iter = SegmentEntryIter {
+    let _temp_entry_iter = SegmentEntryIter {
         bound: scan_boundary,
         cursor: temp_start,
     };
 
     // let _locks =
-    //     cell_locking::lock_all_cells_in_segment(segment, chunk, temp_entry_iter, true).unwrap();
+    //     cell_locking::lock_all_cells_in_segment(segment, chunk, _temp_entry_iter, true).unwrap();
 
     let segment_addr = segment.addr;
     unsafe {
@@ -209,7 +207,7 @@ pub fn promote_segment(segment: &Segment) {
 
     debug!("Data copied successfully for segment {}", segment.id);
 
-    #[cfg(all(debug_assertions, feature = "verify_checksums"))]
+    #[cfg(all(debug_assertions, feature = "debug_verify_checksums"))]
     {
         // Verify checksum: compare segment memory with source backup data after promotion
         // Compare the full SEGMENT_SIZE since that's what was copied (including padding)

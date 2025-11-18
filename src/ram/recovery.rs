@@ -5,10 +5,10 @@ use super::file_manager::{SegmentFileInfo, SegmentFileManager};
 use super::segs::{Segment, SEGMENT_SIZE};
 use super::tombstone::Tombstone;
 use libc::{c_void, mmap, open, MAP_FIXED, MAP_PRIVATE, O_RDONLY, PROT_READ};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 /// Discover all segment files in storage directories
