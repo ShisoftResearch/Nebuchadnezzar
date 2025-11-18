@@ -28,10 +28,28 @@ impl SegmentList {
         }
         
         // Create bitmap: one u64 per 64 segments
-        let bitmap_size = (capacity + 63) / 64;
+        // Formula: (capacity + 63) / 64 ensures we have enough words
+        // For capacity=64: (64+63)/64 = 1 word (covers 0..63)
+        // For capacity=65: (65+63)/64 = 2 words (covers 0..127, safe)
+        let bitmap_size = if capacity == 0 {
+            0
+        } else {
+            (capacity + 63) / 64
+        };
         let mut bitmap = Vec::with_capacity(bitmap_size);
         for _ in 0..bitmap_size {
             bitmap.push(AtomicU64::new(0));
+        }
+        
+        // Verify bitmap size is sufficient for all valid indices
+        if capacity > 0 {
+            let max_index = capacity - 1;
+            let required_word_index = max_index >> 6;
+            debug_assert!(
+                required_word_index < bitmap_size,
+                "Bitmap size {} insufficient for capacity {} (max_index={}, required_word_index={})",
+                bitmap_size, capacity, max_index, required_word_index
+            );
         }
         
         SegmentList { segments, bitmap }
@@ -42,6 +60,14 @@ impl SegmentList {
     fn set_bit(&self, index: usize) {
         let word_index = index >> 6; // Divide by 64
         let bit_index = index & 63;  // Modulo 64
+        // Runtime bounds check to prevent heap corruption
+        #[cfg(debug_assertions)]
+        if word_index >= self.bitmap.len() {
+            panic!(
+                "Bitmap word_index {} out of bounds (bitmap len: {}, index: {}, capacity: {})",
+                word_index, self.bitmap.len(), index, self.segments.len()
+            );
+        }
         let mask = 1u64 << bit_index;
         self.bitmap[word_index].fetch_or(mask, Ordering::Release);
     }
@@ -51,6 +77,14 @@ impl SegmentList {
     fn clear_bit(&self, index: usize) {
         let word_index = index >> 6; // Divide by 64
         let bit_index = index & 63;  // Modulo 64
+        // Runtime bounds check to prevent heap corruption
+        #[cfg(debug_assertions)]
+        if word_index >= self.bitmap.len() {
+            panic!(
+                "Bitmap word_index {} out of bounds (bitmap len: {}, index: {}, capacity: {})",
+                word_index, self.bitmap.len(), index, self.segments.len()
+            );
+        }
         let mask = !(1u64 << bit_index);
         self.bitmap[word_index].fetch_and(mask, Ordering::Release);
     }
@@ -60,6 +94,9 @@ impl SegmentList {
     fn is_bit_set(&self, index: usize) -> bool {
         let word_index = index >> 6; // Divide by 64
         let bit_index = index & 63;  // Modulo 64
+        if word_index >= self.bitmap.len() {
+            return false;
+        }
         let word = self.bitmap[word_index].load(Ordering::Acquire);
         (word & (1u64 << bit_index)) != 0
     }
@@ -125,8 +162,13 @@ impl SegmentList {
         if *key >= self.segments.len() {
             return false;
         }
-        // Fast path: check bitmap first
-        self.is_bit_set(*key)
+        // Fast path: check bitmap first, but verify with actual segment
+        // This handles race conditions where bitmap might be out of sync
+        if !self.is_bit_set(*key) {
+            return false;
+        }
+        // Double-check by actually loading the segment to handle race conditions
+        !self.segments[*key].is_null()
     }
 
     /// Get the capacity of the segment list
