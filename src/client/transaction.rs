@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bifrost::rpc::RPCError;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum NotRealizableReason {
     ReadTooLate(Id),
     EarlyConflict(Id),
@@ -17,12 +17,61 @@ pub enum NotRealizableReason {
 }
 
 #[derive(Debug)]
+pub struct RetryInfo {
+    pub attempts: u32,
+    pub reasons: Vec<NotRealizableReason>,
+    pub last_reason: Option<NotRealizableReason>,
+}
+
+impl std::fmt::Display for RetryInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Failed after {} attempts. Last reason: {:?}",
+            self.attempts,
+            self.last_reason
+        )?;
+
+        // Count occurrences of each reason type
+        let mut read_too_late_count = 0;
+        let mut early_conflict_count = 0;
+        let mut prepare_error_count = 0;
+        let mut cell_changed_count = 0;
+
+        for reason in &self.reasons {
+            match reason {
+                NotRealizableReason::ReadTooLate(_) => read_too_late_count += 1,
+                NotRealizableReason::EarlyConflict(_) => early_conflict_count += 1,
+                NotRealizableReason::PrepareError => prepare_error_count += 1,
+                NotRealizableReason::CellChanged(_) => cell_changed_count += 1,
+            }
+        }
+
+        write!(f, "\nFailure breakdown:")?;
+        if read_too_late_count > 0 {
+            write!(f, "\n  ReadTooLate: {} times", read_too_late_count)?;
+        }
+        if early_conflict_count > 0 {
+            write!(f, "\n  EarlyConflict: {} times", early_conflict_count)?;
+        }
+        if prepare_error_count > 0 {
+            write!(f, "\n  PrepareError: {} times", prepare_error_count)?;
+        }
+        if cell_changed_count > 0 {
+            write!(f, "\n  CellChanged: {} times", cell_changed_count)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
 pub enum TxnError {
     CannotFindAServer,
     IoError(io::Error),
     CannotBegin,
     NotRealizable(NotRealizableReason),
-    TooManyRetry,
+    TooManyRetry(RetryInfo),
     InternalError,
     Aborted(Option<Vec<RollbackFailure>>),
     RPCError(RPCError),

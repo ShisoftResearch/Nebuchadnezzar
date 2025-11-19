@@ -218,6 +218,7 @@ impl AsyncClient {
             Err(e) => return Err(TxnError::IoError(e)),
         };
         let mut retried = 0;
+        let mut retry_reasons = Vec::new();
         let mut txn = Transaction {
             tid: TxnId::new(),
             state: StdCell::new(txn_server::TxnState::Started),
@@ -281,6 +282,7 @@ impl AsyncClient {
                     return Ok(exec_value.unwrap());
                 }
                 Err(TxnError::NotRealizable(reason)) => {
+                    retry_reasons.push(reason.clone());
                     let abort_result = txn.abort().await; // continue the loop to retry
                     debug!(
                         "TXN NOT REALIZABLE ({:?}), ABORT: {:?}",
@@ -297,7 +299,23 @@ impl AsyncClient {
             retried += 1;
             debug!("Client retry transaction, {:?} times", retried);
         }
-        Err(TxnError::TooManyRetry)
+
+        let last_reason = retry_reasons.last().cloned();
+        warn!(
+            "Transaction exceeded maximum retry limit ({}). {}",
+            TRANSACTION_MAX_RETRY,
+            if let Some(ref reason) = last_reason {
+                format!("Last failure: {:?}", reason)
+            } else {
+                "No failure reasons recorded".to_string()
+            }
+        );
+
+        Err(TxnError::TooManyRetry(RetryInfo {
+            attempts: retried,
+            reasons: retry_reasons,
+            last_reason,
+        }))
     }
 
     pub async fn schema_by_name(&self, name: &String) -> Result<Option<Schema>, ExecError> {
