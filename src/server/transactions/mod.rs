@@ -91,10 +91,23 @@ pub enum AbortResult {
     Success(Option<Vec<RollbackFailure>>),
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
+pub struct LockReleaseFailure {
+    pub cell_id: Id,
+    pub reason: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum EndResult {
     CheckFailed(CheckError),
-    SomeLocksNotReleased,
+    SomeLocksNotReleased {
+        released: usize,
+        total: usize,
+        failures: Vec<LockReleaseFailure>,
+    },
+    LockReleaseRetriesExhausted {
+        failures: Vec<LockReleaseFailure>,
+    },
     Success,
 }
 

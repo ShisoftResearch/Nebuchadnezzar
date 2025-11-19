@@ -21,6 +21,16 @@ use std::time::Duration;
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(TXN_DATA_MANAGER_RPC_SERVICE) as u64;
 
+// Lock timeout in milliseconds - locks held longer than this are considered stale
+// and can be reclaimed (default: 30 seconds)
+const LOCK_TIMEOUT_MS: i64 = 30_000;
+
+// Maximum retries for lock release (Option 6: Two-Phase Lock Release)
+const MAX_LOCK_RELEASE_RETRIES: usize = 3;
+
+// Backoff between lock release retries in milliseconds
+const LOCK_RELEASE_RETRY_BACKOFF_MS: u64 = 100;
+
 type CommitHistory = BTreeMap<Id, CellHistory>;
 type CellMetaMutex = Arc<Mutex<CellMeta>>;
 type TxnMutex = Arc<Mutex<Transaction>>;
@@ -30,6 +40,7 @@ type TxnMutex = Arc<Mutex<Transaction>>;
 /// Implements a hybrid timestamp-ordering + lock-based protocol with Wait-Die:
 /// - `read` / `write`: Track timestamps for timestamp-ordering validation
 /// - `owner`: Acts as a write lock during prepare/commit phases
+/// - `lock_acquired_at`: Timestamp when lock was acquired (for timeout detection)
 ///
 /// Wait-Die Protocol:
 /// - When a transaction wants to acquire a cell already owned by another:
@@ -37,11 +48,16 @@ type TxnMutex = Arc<Mutex<Transaction>>;
 ///   - If requester is OLDER (lower timestamp): WAIT (backoff and retry)
 /// - This prevents deadlock while reducing contention on hot cells
 /// - Waiters poll via backoff rather than blocking on a condition variable
+///
+/// Lock Timeout:
+/// - Locks are considered stale after LOCK_TIMEOUT_MS milliseconds
+/// - Stale locks can be reclaimed by any transaction (logged as warning)
 #[derive(Debug)]
 pub struct CellMeta {
     read: TxnId,
     write: TxnId,
     owner: Option<TxnId>, // transaction that owns the cell (write lock) during prepare/commit
+    lock_acquired_at: Option<i64>, // timestamp when lock was acquired (milliseconds since epoch)
 }
 
 struct Transaction {
@@ -183,6 +199,7 @@ impl DataManager {
                 read: TxnId::new(),
                 write: TxnId::new(),
                 owner: None,
+                lock_acquired_at: None,
             }))
         });
         // Only push to list if this was a new insertion
@@ -370,6 +387,83 @@ impl DataManager {
         }
         return Ok(());
     }
+
+    /// Attempt to release locks for a transaction
+    /// Returns (number of locks released, Vec of failures)
+    /// Option 5: Ensures metadata isn't cleaned up while locks are held
+    /// Option 6: Provides detailed failure information for retry logic
+    fn attempt_lock_release(
+        &self,
+        tid: &TxnId,
+        affected_cell_ids: &[Id],
+    ) -> (usize, Vec<LockReleaseFailure>) {
+        let mut released_count = 0;
+        let mut failures = Vec::new();
+        let current_time = get_time();
+
+        for cell_id in affected_cell_ids {
+            if let Some(cell_mutex) = self.cells.get(cell_id) {
+                let mut meta = cell_mutex.lock();
+
+                // Verify this transaction owns the lock
+                match &meta.owner {
+                    Some(owner_tid) if owner_tid == tid => {
+                        // Release the lock
+                        let lock_age = meta
+                            .lock_acquired_at
+                            .map(|acquired| current_time - acquired)
+                            .unwrap_or(0);
+
+                        meta.owner = None;
+                        meta.lock_acquired_at = None;
+                        released_count += 1;
+
+                        debug!(
+                            "Released lock on cell {:?} owned by {:?} (held for {}ms)",
+                            cell_id, tid, lock_age
+                        );
+                    }
+                    Some(other_tid) => {
+                        // Lock owned by different transaction - this is a problem
+                        let reason = format!(
+                            "Cell lock owned by different transaction: {:?}",
+                            other_tid
+                        );
+                        warn!(
+                            "Cannot release lock on cell {:?} for {:?}: {}",
+                            cell_id, tid, reason
+                        );
+                        failures.push(LockReleaseFailure {
+                            cell_id: *cell_id,
+                            reason,
+                        });
+                    }
+                    None => {
+                        // Lock not held - might have been released already or never acquired
+                        debug!(
+                            "Lock on cell {:?} not held by {:?} (already released or never acquired)",
+                            cell_id, tid
+                        );
+                        // Don't count as failure if lock was already released
+                        released_count += 1;
+                    }
+                }
+            } else {
+                // Cell metadata not found - Option 5: Metadata cleanup protection
+                let reason = "Cell metadata not found (may have been cleaned up)".to_string();
+                warn!(
+                    "Cannot release lock on cell {:?} for {:?}: {}",
+                    cell_id, tid, reason
+                );
+                failures.push(LockReleaseFailure {
+                    cell_id: *cell_id,
+                    reason,
+                });
+            }
+        }
+
+        (released_count, failures)
+    }
 }
 
 impl Service for DataManager {
@@ -487,24 +581,40 @@ impl Service for DataManager {
             cell_mutices.push(self.cell_meta_mutex(cell_id));
         }
         for cell_mutex in &cell_mutices {
-            let meta = cell_mutex.lock();
+            let mut meta = cell_mutex.lock();
+            let current_time = get_time();
 
             // Wait-Die Protocol: Check if another transaction owns this cell
             // This implements lock-based concurrency control to reduce timestamp-ordering aborts
             if let Some(ref owner_tid) = meta.owner {
                 if owner_tid != &tid {
-                    if tid > *owner_tid {
+                    // Option 2: Check if lock has timed out (stale lock detection)
+                    let lock_age = meta
+                        .lock_acquired_at
+                        .map(|acquired| current_time - acquired)
+                        .unwrap_or(0);
+
+                    if lock_age > LOCK_TIMEOUT_MS {
+                        // Lock is stale - reclaim it
+                        warn!(
+                            "PREPARE: Reclaiming stale lock on cell (held for {}ms by {:?}), now claimed by {:?}",
+                            lock_age, owner_tid, tid
+                        );
+                        meta.owner = None;
+                        meta.lock_acquired_at = None;
+                        // Continue to acquire the lock below
+                    } else if tid > *owner_tid {
                         // Younger transaction "dies" (aborts immediately)
                         debug!(
-                            "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?}",
-                            tid, owner_tid
+                            "PREPARE Wait-Die: younger txn {:?} aborted, cell owned by older {:?} (lock age: {}ms)",
+                            tid, owner_tid, lock_age
                         );
                         return self.response_with(DMPrepareResult::NotRealizable);
                     } else {
                         // Older transaction waits for younger owner to release
                         debug!(
-                            "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?}",
-                            tid, owner_tid
+                            "PREPARE Wait-Die: older txn {:?} waits for younger owner {:?} (lock age: {}ms)",
+                            tid, owner_tid, lock_age
                         );
                         return self.response_with(DMPrepareResult::Wait);
                     }
@@ -550,8 +660,11 @@ impl Service for DataManager {
             );
             return self.response_with(DMPrepareResult::NotRealizable); // need retry
         } else {
+            let lock_time = get_time();
             for mut meta in cell_guards {
-                meta.owner = Some(tid.clone()) // set owner to lock this cell
+                meta.owner = Some(tid.clone()); // set owner to lock this cell
+                meta.lock_acquired_at = Some(lock_time); // Option 1: Record lock acquisition time
+                debug!("Lock acquired for cell by {:?} at {}", tid, lock_time);
             }
             txn.state = TxnState::Prepared;
             txn.affected_cells = cell_ids; // for cell number check
@@ -931,9 +1044,9 @@ impl Service for DataManager {
     ) -> BoxFuture<'_, DataSiteResponse<EndResult>> {
         debug!(">> END {:?}", tid);
         self.update_clock(&clock);
-        let mut released_locks = 0;
-        let affected_cells;
-        {
+
+        // Option 6: Two-Phase Lock Release with Verification and Retry
+        let (affected_cell_ids, txn_state) = {
             let txn_lock = self.get_transaction(&tid);
             let txn = txn_lock.lock();
             if !(txn.state == TxnState::Aborted || txn.state == TxnState::Committed) {
@@ -945,43 +1058,79 @@ impl Service for DataManager {
                 txn.state,
                 tid
             );
-            let affected_len = txn.affected_cells.len();
-            // Reserve to avoid reallocations when many cells are touched
-            let mut cell_mutices = Vec::with_capacity(affected_len);
-            let mut cell_guards = Vec::with_capacity(affected_len);
-            {
-                for cell_id in &txn.affected_cells {
-                    if let Some(meta) = self.cells.get(cell_id) {
-                        cell_mutices.push(meta.clone());
-                    } else {
-                        // Cell metadata not found - might have been cleaned up
-                        // This is OK, just means we don't need to release a lock for it
-                        debug!("Cell {:?} in affected_cells but not in cells map", cell_id);
-                    }
+            (txn.affected_cells.clone(), txn.state)
+        };
+
+        // Attempt lock release with retries
+        let mut retry_attempt = 0;
+        let mut lock_release_result = None;
+
+        while retry_attempt <= MAX_LOCK_RELEASE_RETRIES {
+            if retry_attempt > 0 {
+                debug!(
+                    "Retrying lock release for {:?} (attempt {}/{})",
+                    tid,
+                    retry_attempt,
+                    MAX_LOCK_RELEASE_RETRIES
+                );
+                std::thread::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS));
+            }
+
+            let (released_count, failed_releases) = self.attempt_lock_release(&tid, &affected_cell_ids);
+            let total_cells = affected_cell_ids.len();
+
+            if failed_releases.is_empty() {
+                // All locks released successfully
+                debug!(
+                    "Successfully released all {} locks for {:?}",
+                    released_count, tid
+                );
+                lock_release_result = Some(Ok(()));
+                break;
+            } else if retry_attempt == MAX_LOCK_RELEASE_RETRIES {
+                // Retries exhausted - CRITICAL ERROR
+                error!(
+                    "CRITICAL: Lock release retries exhausted for {:?}: {}/{} locks released, {} failures",
+                    tid,
+                    released_count,
+                    total_cells,
+                    failed_releases.len()
+                );
+                for failure in &failed_releases {
+                    error!(
+                        "  - Cell {:?} lock release failed: {}",
+                        failure.cell_id, failure.reason
+                    );
+                }
+                lock_release_result = Some(Err((released_count, total_cells, failed_releases)));
+                break;
+            } else {
+                // Partial failure on this attempt, will retry
+                error!(
+                    "Lock release failed for {:?} on attempt {}/{}: {}/{} locks released, {} failures - retrying",
+                    tid,
+                    retry_attempt + 1,
+                    MAX_LOCK_RELEASE_RETRIES + 1,
+                    released_count,
+                    total_cells,
+                    failed_releases.len()
+                );
+                for failure in &failed_releases {
+                    error!(
+                        "  - Cell {:?} lock release failed: {}",
+                        failure.cell_id, failure.reason
+                    );
                 }
             }
-            // Use the actual number of cells we found metadata for, not affected_len
-            affected_cells = cell_mutices.len();
-            for cell_mutex in &cell_mutices {
-                cell_guards.push(cell_mutex.lock()); // lock all affected cells one by one
-            }
-            for mut meta in cell_guards {
-                if meta.owner.as_ref() == Some(&tid) {
-                    // Release ownership - waiting transactions will discover this on their next poll
-                    meta.owner = None;
-                    released_locks += 1;
-                    debug!("Released lock on cell owned by {:?}", tid);
-                } else {
-                    warn!("affected txn does not own the cell");
-                }
-            }
+
+            retry_attempt += 1;
         }
         async move {
             // Release all segment references before wiping out transaction
-            let (guards_to_drop, txn_state) = {
+            let guards_to_drop = {
                 let txn_lock = self.get_transaction(&tid);
                 let mut txn = txn_lock.lock();
-                (std::mem::take(&mut txn.segment_guards), txn.state)
+                std::mem::take(&mut txn.segment_guards)
             };
             drop(guards_to_drop); // Drop guards, releasing all segment references
 
@@ -999,18 +1148,43 @@ impl Service for DataManager {
 
             self.wipe_out_transaction(&tid);
             self.cleanup_signal.store(true, Relaxed);
-            if released_locks == affected_cells {
-                debug!(
-                    "ENDED: {:?} with all locks ({}) released",
-                    tid, released_locks
-                );
-                self.response_with(EndResult::Success).await
-            } else {
-                warn!(
-                    "ENDED: {:?} with SOME locks ({}/{}) NOT released",
-                    tid, released_locks, affected_cells
-                );
-                self.response_with(EndResult::SomeLocksNotReleased).await
+
+            // Return appropriate result based on lock release outcome
+            match lock_release_result {
+                Some(Ok(())) => {
+                    debug!("ENDED: {:?} with all locks released", tid);
+                    self.response_with(EndResult::Success).await
+                }
+                Some(Err((released, total, failures))) => {
+                    // Option 1: Hard error on lock release failure
+                    error!(
+                        "ENDED: {:?} with lock release failures ({}/{} released)",
+                        tid, released, total
+                    );
+                    if failures.len() == total {
+                        // Complete failure - retries exhausted
+                        self.response_with(EndResult::LockReleaseRetriesExhausted {
+                            failures,
+                        })
+                        .await
+                    } else {
+                        // Partial failure
+                        self.response_with(EndResult::SomeLocksNotReleased {
+                            released,
+                            total,
+                            failures,
+                        })
+                        .await
+                    }
+                }
+                None => {
+                    // This shouldn't happen, but handle it gracefully
+                    error!("ENDED: {:?} with unknown lock release status", tid);
+                    self.response_with(EndResult::LockReleaseRetriesExhausted {
+                        failures: vec![],
+                    })
+                    .await
+                }
             }
         }
         .boxed()

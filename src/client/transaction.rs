@@ -209,7 +209,32 @@ impl Transaction {
         self.state.set(TxnState::Committed);
         match self.client.commit(self.tid.to_owned()).await {
             Ok(Ok(EndResult::Success)) => return Ok(()),
-            Ok(Ok(EndResult::SomeLocksNotReleased)) => return Ok(()),
+            Ok(Ok(EndResult::SomeLocksNotReleased {
+                released,
+                total,
+                ref failures,
+            })) => {
+                // Partial lock release - log warning but allow commit to succeed
+                warn!(
+                    "Transaction {:?} committed but some locks not released: {}/{} released, {} failures",
+                    self.tid,
+                    released,
+                    total,
+                    failures.len()
+                );
+                return Ok(());
+            }
+            Ok(Ok(EndResult::LockReleaseRetriesExhausted { ref failures })) => {
+                // Complete lock release failure - this is an error
+                error!(
+                    "Transaction {:?} commit failed: lock release retries exhausted, {} failures",
+                    self.tid,
+                    failures.len()
+                );
+                Err(TxnError::CommitError(EndResult::LockReleaseRetriesExhausted {
+                    failures: failures.clone(),
+                }))
+            }
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),
             Err(e) => Err(TxnError::RPCError(e)),
