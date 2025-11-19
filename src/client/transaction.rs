@@ -3,6 +3,7 @@ use crate::ram::types::Id;
 use crate::server::transactions::TxnId;
 use crate::server::transactions::*;
 use std::cell::Cell as StdCell;
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -16,10 +17,29 @@ pub enum NotRealizableReason {
     CellChanged(Id),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReasonType {
+    ReadTooLate,
+    EarlyConflict,
+    PrepareError,
+    CellChanged,
+}
+
+impl From<&NotRealizableReason> for ReasonType {
+    fn from(reason: &NotRealizableReason) -> Self {
+        match reason {
+            NotRealizableReason::ReadTooLate(_) => ReasonType::ReadTooLate,
+            NotRealizableReason::EarlyConflict(_) => ReasonType::EarlyConflict,
+            NotRealizableReason::PrepareError => ReasonType::PrepareError,
+            NotRealizableReason::CellChanged(_) => ReasonType::CellChanged,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RetryInfo {
     pub attempts: u32,
-    pub reasons: Vec<NotRealizableReason>,
+    pub reason_counts: HashMap<ReasonType, u32>,
     pub last_reason: Option<NotRealizableReason>,
 }
 
@@ -28,37 +48,21 @@ impl std::fmt::Display for RetryInfo {
         write!(
             f,
             "Failed after {} attempts. Last reason: {:?}",
-            self.attempts,
-            self.last_reason
+            self.attempts, self.last_reason
         )?;
 
-        // Count occurrences of each reason type
-        let mut read_too_late_count = 0;
-        let mut early_conflict_count = 0;
-        let mut prepare_error_count = 0;
-        let mut cell_changed_count = 0;
-
-        for reason in &self.reasons {
-            match reason {
-                NotRealizableReason::ReadTooLate(_) => read_too_late_count += 1,
-                NotRealizableReason::EarlyConflict(_) => early_conflict_count += 1,
-                NotRealizableReason::PrepareError => prepare_error_count += 1,
-                NotRealizableReason::CellChanged(_) => cell_changed_count += 1,
-            }
-        }
-
         write!(f, "\nFailure breakdown:")?;
-        if read_too_late_count > 0 {
-            write!(f, "\n  ReadTooLate: {} times", read_too_late_count)?;
+        if let Some(&count) = self.reason_counts.get(&ReasonType::ReadTooLate) {
+            write!(f, "\n  ReadTooLate: {} times", count)?;
         }
-        if early_conflict_count > 0 {
-            write!(f, "\n  EarlyConflict: {} times", early_conflict_count)?;
+        if let Some(&count) = self.reason_counts.get(&ReasonType::EarlyConflict) {
+            write!(f, "\n  EarlyConflict: {} times", count)?;
         }
-        if prepare_error_count > 0 {
-            write!(f, "\n  PrepareError: {} times", prepare_error_count)?;
+        if let Some(&count) = self.reason_counts.get(&ReasonType::PrepareError) {
+            write!(f, "\n  PrepareError: {} times", count)?;
         }
-        if cell_changed_count > 0 {
-            write!(f, "\n  CellChanged: {} times", cell_changed_count)?;
+        if let Some(&count) = self.reason_counts.get(&ReasonType::CellChanged) {
+            write!(f, "\n  CellChanged: {} times", count)?;
         }
 
         Ok(())

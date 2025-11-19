@@ -218,7 +218,8 @@ impl AsyncClient {
             Err(e) => return Err(TxnError::IoError(e)),
         };
         let mut retried = 0;
-        let mut retry_reasons = Vec::new();
+        let mut retry_reason_counts = HashMap::new();
+        let mut last_retry_reason = None;
         let mut txn = Transaction {
             tid: TxnId::new(),
             state: StdCell::new(txn_server::TxnState::Started),
@@ -282,7 +283,9 @@ impl AsyncClient {
                     return Ok(exec_value.unwrap());
                 }
                 Err(TxnError::NotRealizable(reason)) => {
-                    retry_reasons.push(reason.clone());
+                    let reason_type = transaction::ReasonType::from(&reason);
+                    *retry_reason_counts.entry(reason_type).or_insert(0) += 1;
+                    last_retry_reason = Some(reason.clone());
                     let abort_result = txn.abort().await; // continue the loop to retry
                     debug!(
                         "TXN NOT REALIZABLE ({:?}), ABORT: {:?}",
@@ -300,11 +303,10 @@ impl AsyncClient {
             debug!("Client retry transaction, {:?} times", retried);
         }
 
-        let last_reason = retry_reasons.last().cloned();
         warn!(
             "Transaction exceeded maximum retry limit ({}). {}",
             TRANSACTION_MAX_RETRY,
-            if let Some(ref reason) = last_reason {
+            if let Some(ref reason) = last_retry_reason {
                 format!("Last failure: {:?}", reason)
             } else {
                 "No failure reasons recorded".to_string()
@@ -313,8 +315,8 @@ impl AsyncClient {
 
         Err(TxnError::TooManyRetry(RetryInfo {
             attempts: retried,
-            reasons: retry_reasons,
-            last_reason,
+            reason_counts: retry_reason_counts,
+            last_reason: last_retry_reason,
         }))
     }
 
