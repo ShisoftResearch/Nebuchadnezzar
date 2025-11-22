@@ -65,6 +65,7 @@ pub enum TxnState {
     Aborted,
     Prepared,
     Committed,
+    Cleanup,
 }
 
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -124,6 +125,7 @@ pub enum CheckError {
     NotCommitted,
     AlreadyCommitted,
     AlreadyAborted,
+    AlreadyCleanup,
     CannotEnd,
 }
 

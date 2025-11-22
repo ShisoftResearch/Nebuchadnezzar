@@ -699,6 +699,9 @@ impl Service for DataManager {
                 return self
                     .response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCommitted));
             }
+            TxnState::Cleanup => {
+                return self.response_with(DMCommitResult::CheckFailed(CheckError::AlreadyCleanup));
+            }
             TxnState::Prepared => {}
         };
         // check cell list integrity

@@ -46,12 +46,35 @@ impl LSMTree {
         tree_1.persist_root(neb_client).await;
         let level_ids = vec![tree_0.head_id(), tree_1.head_id()];
         let lsm_tree_cell = lsm_tree_cell(&level_ids, id, None);
-        neb_client.write_cell(lsm_tree_cell).await.unwrap().unwrap();
-        Self {
-            mem_tree: Atomic::new(Box::new(tree_m)),
-            trans_mem_tree: Atomic::null(),
-            disk_trees: [Box::new(tree_0), Box::new(tree_1)],
-            deletion: deletion_ref,
+        match neb_client.write_cell(lsm_tree_cell).await {
+            Ok(Ok(_)) => {
+                // Cell successfully created
+                Self {
+                    mem_tree: Atomic::new(Box::new(tree_m)),
+                    trans_mem_tree: Atomic::null(),
+                    disk_trees: [Box::new(tree_0), Box::new(tree_1)],
+                    deletion: deletion_ref,
+                }
+            }
+            Ok(Err(e)) => {
+                // Handle CellAlreadyExisted - cell was already created, likely during recovery
+                // Read the existing cell and use its tree structure
+                use crate::ram::cell::WriteError;
+                match e {
+                    WriteError::CellAlreadyExisted => {
+                        info!("LSM tree cell already exists for {:?}, recovering from existing cell", id);
+                        Self::recover(neb_client, id).await
+                    }
+                    _ => {
+                        // Other write errors should still panic
+                        panic!("Failed to create LSM tree cell: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                // RPC errors should panic
+                panic!("RPC error creating LSM tree cell: {:?}", e);
+            }
         }
     }
 

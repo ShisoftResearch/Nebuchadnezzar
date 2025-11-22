@@ -4,6 +4,7 @@ use crate::ram::cell::{ReadError, WriteError};
 use crate::ram::types::{Id, OwnedValue};
 use bifrost::conshash::ConsistentHashing;
 use bifrost::rpc::{ClientPool, RPCClient};
+use bifrost::utils::time::get_time;
 use bifrost::vector_clock::{ServerVectorClock, StandardVectorClock};
 use bifrost_plugins::hash_ident;
 use dovahkiin::types::Map;
@@ -966,7 +967,14 @@ impl TransactionManager {
         self.ensure_txn_state(txn, TxnState::Started)
     }
     fn cleanup_transaction(&self, tid: &TxnId) {
-        self.transactions.remove(tid);
+        let txn = self.transactions.remove(tid);
+        if let Some(txn) = txn {
+            let mut txn_guard = txn.lock_blocking();
+            txn_guard.data.clear();
+            txn_guard.affected_objects.clear();
+            txn_guard.state = TxnState::Cleanup;
+            txn_guard.last_activity = get_time();
+        }
         self.txn_ids.lock().remove(tid);
     }
 
