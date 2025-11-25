@@ -448,3 +448,4 @@ This gives users the choice based on their specific workload requirements.
 For Nebuchadnezzar's graph workloads, **the relaxed protocol (serializability) is the right default**, with an option to enable strict mode for special cases.
 
 
+

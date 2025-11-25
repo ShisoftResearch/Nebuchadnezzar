@@ -469,3 +469,4 @@ If this test **passes** → your architecture is already safe ✓
 Would you like me to check your actual edge storage implementation to confirm?
 
 
+

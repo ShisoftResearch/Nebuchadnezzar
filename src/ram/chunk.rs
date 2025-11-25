@@ -34,6 +34,9 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
+static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.30f32;
+static DEAD_RATE_FOR_COMPACT_CLEANER: f32 = 0.5f32;
+
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
     GLOBAL_CHUNK_BASE.load(Ordering::Acquire)
@@ -1099,7 +1102,7 @@ impl Chunk {
                 let rate = seg.living_rate();
                 (seg, rate)
             })
-            .filter(|(_, utilization)| *utilization < 0.75f32);
+            .filter(|(_, utilization)| *utilization < DEAD_RATE_FOR_COMPACT_CLEANER);
         let head_seg_id = self.get_head_seg_id();
         let mut list: Vec<_> = utilization_selection
             .filter(|(seg, _)| {
@@ -1123,7 +1126,7 @@ impl Chunk {
                 (seg, segment_utilization)
             })
             .filter(|(seg, utilization)| {
-                *utilization < 0.50f32
+                *utilization < DEAD_RATE_FOR_COMBINE_CLEANER
                     && head_seg_id != seg.id
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
