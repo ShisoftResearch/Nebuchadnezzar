@@ -856,24 +856,24 @@ pub fn recover_chunks(
         ));
     }
 
-    // We have files to recover; ensure raft storage is ready so schemas can also recover.
-    // If raft storage is missing, allow recovery to proceed but warn that schemas will need
-    // to be recreated (e.g., cold start scenario).
+    // We have files to recover; ensure raft storage is configured so schemas can also recover.
+    // If a path is provided, allow cold start by creating the directory. If none is provided,
+    // panic to avoid restoring data without schemas.
     if files.len() > 0 {
         match raft_storage {
             Some(path) => {
                 if let Err(e) = fs::create_dir_all(Path::new(path)) {
-                    warn!(
+                    panic!(
                         "Segment files found for recovery but failed to prepare raft_storage at {}: {}. \
-                        Schema recovery may fail; continuing recovery of segments.",
+                        Schema recovery cannot proceed safely.",
                         path, e
                     );
                 }
             }
             None => {
-                warn!(
+                panic!(
                     "Segment files found for recovery but raft_storage is not configured. \
-                    Proceeding with segment recovery; schemas will need to be recreated (cold start)."
+                    Recovery would restore data without schemas; please configure raft_storage."
                 );
             }
         }
