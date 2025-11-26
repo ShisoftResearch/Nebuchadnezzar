@@ -828,6 +828,7 @@ pub fn recover_chunks(
     config: &RecoveryConfig,
     backup_storage: &Option<String>,
     wal_storage: &Option<String>,
+    raft_storage: &Option<String>,
     chunks: &[Chunk],
 ) -> io::Result<()> {
     info!("=== Starting parallel recovery from storage directories ===");
@@ -853,6 +854,26 @@ pub fn recover_chunks(
             io::ErrorKind::InvalidData,
             "Configuration cannot fit recovered segments",
         ));
+    }
+
+    // We have files to recover; ensure raft storage is configured so schemas can also recover
+    if files.len() > 0 {
+        match raft_storage {
+            Some(path) if Path::new(path).exists() => {}
+            Some(path) => {
+                panic!(
+                    "Segment files found for recovery but raft_storage path {} does not exist. \
+                    Recovery would restore data without schemas; please configure raft_storage.",
+                    path
+                );
+            }
+            None => {
+                panic!(
+                    "Segment files found for recovery but raft_storage is not configured. \
+                    Recovery would restore data without schemas; please configure raft_storage."
+                );
+            }
+        }
     }
 
     // Phase 1.5: Pre-set next_seq_id for each chunk BEFORE allocating segments
@@ -944,6 +965,12 @@ mod tests {
         schemas
     }
 
+    fn temp_raft_dir() -> (TempDir, String) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        (dir, path)
+    }
+
     // Purpose: Validate parsing of segment filenames `{chunk}-{seg}-{seq}.{nlog|nbackup}`
     // and correct discrimination of WAL vs backup extensions.
     #[test]
@@ -981,6 +1008,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Phase 1: Create chunks, write data, and let it persist
         let cell_ids: Vec<Id> = (0..10).map(|i| Id::new(0, i)).collect();
@@ -995,6 +1023,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,  // no tiered memory
                 false, // no recovery on first run
+                Some(raft_path.clone()),
             );
 
             // Write cells
@@ -1026,6 +1055,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true, // enable recovery
+                Some(raft_path.clone()),
             );
 
             // Verify recovered data
@@ -1046,6 +1076,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         let cell_id = Id::new(0, 42);
 
@@ -1062,6 +1093,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             println!("Writing cell...");
@@ -1117,6 +1149,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true, // recover first
+                Some(raft_path.clone()),
             );
             println!("Chunks recovered successfully");
             println!(
@@ -1204,6 +1237,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
             println!(
                 "Chunks recovered, cell count: {}",
@@ -1234,6 +1268,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         let cell_ids: Vec<Id> = (0..5).map(|i| Id::new(0, i)).collect();
 
@@ -1249,6 +1284,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             for id in &cell_ids {
@@ -1278,6 +1314,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true, // recover
+                Some(raft_path.clone()),
             );
 
             // Delete cells 0, 2, 4
@@ -1307,6 +1344,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
 
             // Should only have cells 1 and 3
@@ -1328,6 +1366,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         let initial_seq_id: u64;
 
@@ -1343,6 +1382,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             // Write enough cells to allocate multiple segments
@@ -1374,6 +1414,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
 
             let recovered_seq_id =
@@ -1397,6 +1438,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Try to recover when no files exist
         let schemas = setup_test_schema();
@@ -1409,6 +1451,7 @@ mod tests {
             Some(wal_dir.path().to_str().unwrap().to_string()),
             None, // no tiered memory
             true, // enable recovery even though nothing to recover
+            Some(raft_path.clone()),
         );
 
         // Should create fresh chunks with no data
@@ -1422,6 +1465,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Phase 1: Write data and get actual append position
         let actual_append_offset: usize;
@@ -1436,6 +1480,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             // Write a few cells
@@ -1468,6 +1513,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
 
             // Find the segment with data (non-zero offset)
@@ -1509,6 +1555,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Phase 1: Create backup for a segment
         {
@@ -1522,6 +1569,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             let mut cell = default_cell(&Id::new(0, 1));
@@ -1543,6 +1591,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
 
             // Verify data integrity
@@ -1574,6 +1623,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Cycle 1: Write initial batch of cells
         {
@@ -1587,6 +1637,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 false,
+                Some(raft_path.clone()),
             );
 
             // Write cells 0-9
@@ -1617,6 +1668,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true, // Recover from backups
+                Some(raft_path.clone()),
             );
 
             // Verify cells from cycle 1
@@ -1653,6 +1705,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             // Verify all cells from cycles 1 and 2
@@ -1689,6 +1742,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             // Verify all 30 cells from all cycles survived
@@ -1708,6 +1762,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         let cell_id = Id::new(0, 42);
 
@@ -1723,6 +1778,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 false,
+                Some(raft_path.clone()),
             );
 
             let mut cell = default_cell(&cell_id);
@@ -1747,6 +1803,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             // Update to version 2
@@ -1782,6 +1839,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             // Update to version 3
@@ -1817,6 +1875,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             let cell = chunks.read_cell(&cell_id).unwrap();
@@ -1839,6 +1898,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         let cell_ids: Vec<Id> = (0..10).map(|i| Id::new(0, i)).collect();
 
@@ -1854,6 +1914,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 false,
+                Some(raft_path.clone()),
             );
 
             for id in &cell_ids {
@@ -1882,6 +1943,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             assert_eq!(chunks.list[0].cell_count(), 10);
@@ -1912,6 +1974,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             // Should have 5 cells (odd numbers: 1, 3, 5, 7, 9)
@@ -1937,6 +2000,7 @@ mod tests {
         let _ = env_logger::try_init();
         let wal_dir = TempDir::new().unwrap();
         let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
 
         // Phase 1: Create multiple chunks with data
         {
@@ -1950,6 +2014,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 false,
+                Some(raft_path.clone()),
             );
 
             // Write data to different chunks
@@ -1982,6 +2047,7 @@ mod tests {
                 Some(wal_dir.path().to_str().unwrap().to_string()),
                 None, // no tiered memory
                 true,
+                Some(raft_path.clone()),
             );
 
             let total_cells: usize = chunks.list.iter().map(|c| c.cell_count()).sum();

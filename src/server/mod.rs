@@ -209,6 +209,7 @@ impl NebServer {
                 .clone()
                 .or_else(|| crate::ram::tiered::TieredConfig::from_env()),
             opts.enable_recovery,
+            opts.raft_storage.clone(),
         );
         
         // Initialize the inverted indexer with chunks (lazy initialization)

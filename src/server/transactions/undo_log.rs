@@ -1738,6 +1738,9 @@ mod tests {
         let log_dir = temp_dir.path().join("undo");
         let backup_dir = temp_dir.path().join("backup");
         let wal_dir = temp_dir.path().join("wal");
+        let raft_dir = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_dir).unwrap();
+        let raft_path = raft_dir.to_str().unwrap().to_string();
 
         // Setup schema
         use crate::ram::schema::Field;
@@ -1806,6 +1809,7 @@ mod tests {
                 Some(wal_dir.to_str().unwrap().to_string()),
                 None,
                 true,
+                Some(raft_path.clone()),
             );
 
             let undo_log = UndoLogger::new(log_dir.to_str().unwrap().to_string()).unwrap();
@@ -1955,6 +1959,9 @@ mod tests {
         let undo_log_path = temp_dir.path().join("undo");
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
+        let raft_path = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_path).unwrap();
+        let raft_path_str = raft_path.to_str().unwrap().to_string();
 
         let server_addr = String::from("127.0.0.1:5310"); // Unique port for this test
         let server = NebServer::new_from_opts(
@@ -1968,7 +1975,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
             &server_addr,
             "test",
@@ -2047,7 +2054,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
             &server_addr,
             "test",
@@ -2090,6 +2097,7 @@ mod tests {
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
         let raft_path = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_path).unwrap();
 
         let server_addr = String::from("127.0.0.1:5311"); // Unique port for this test
 
@@ -2402,6 +2410,9 @@ mod tests {
         let undo_log_path = temp_dir.path().join("undo");
         let backup_path = temp_dir.path().join("backup");
         let wal_path = temp_dir.path().join("wal");
+        let raft_path = temp_dir.path().join("raft");
+        std::fs::create_dir_all(&raft_path).unwrap();
+        let raft_path_str = raft_path.to_str().unwrap().to_string();
 
         let server_addr = String::from("127.0.0.1:5320"); // Unique port for this test
                                                           // Use unique group name to avoid conflicts with other tests
@@ -2417,7 +2428,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: false,
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
             &server_addr,
             group_name,
@@ -2491,7 +2502,7 @@ mod tests {
                 services: vec![Service::Cell, Service::Transaction],
                 enable_recovery: true, // Enable recovery
                 undo_log_storage: Some(undo_log_path.to_str().unwrap().to_string()),
-                raft_storage: None, // No persistence for regular tests
+                raft_storage: Some(raft_path_str.clone()), // Needed for schema recovery when segments exist
             },
             &server_addr,
             group_name,

@@ -1266,6 +1266,7 @@ impl Chunks {
             wal_storage,
             tiered_config,
             false,
+            None,
         )
     }
 
@@ -1278,6 +1279,7 @@ impl Chunks {
         wal_storage: Option<String>,
         tiered_config: Option<crate::ram::tiered::TieredConfig>,
         enable_recovery: bool,
+        raft_storage: Option<String>,
     ) -> Arc<Chunks> {
         use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_READ, PROT_WRITE};
         use std::ptr;
@@ -1402,6 +1404,7 @@ impl Chunks {
                 &config,
                 &backup_storage,
                 &wal_storage,
+                &raft_storage,
                 &chunks_arc.list,
             ) {
                 Ok(()) => {
