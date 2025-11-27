@@ -474,88 +474,90 @@ fn phase2a_allocate_segments(
     let mut allocated: Vec<(usize, AllocatedSegment)> = files
         .par_iter()
         .enumerate()
-        .map(|(idx, file_info)| -> io::Result<(usize, AllocatedSegment)> {
-            let chunk = &chunks[file_info.chunk_id];
+        .map(
+            |(idx, file_info)| -> io::Result<(usize, AllocatedSegment)> {
+                let chunk = &chunks[file_info.chunk_id];
 
-            debug!(
-                "Allocating segment: chunk={}, seg={}, seq={}, path={}",
-                file_info.chunk_id,
-                file_info.seg_id,
-                file_info.seq_id,
-                file_info.path.display()
-            );
-
-            // Load file data
-            let file_data = load_file_to_memory(&file_info.path)?;
-
-            if file_data.len() > SEGMENT_SIZE {
-                error!(
-                    "File {} size {} exceeds segment size {}",
-                    file_info.path.display(),
-                    file_data.len(),
-                    SEGMENT_SIZE
+                debug!(
+                    "Allocating segment: chunk={}, seg={}, seq={}, path={}",
+                    file_info.chunk_id,
+                    file_info.seg_id,
+                    file_info.seq_id,
+                    file_info.path.display()
                 );
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "File size exceeds segment capacity",
-                ));
-            }
 
-            // Allocate segment with original seq_id
-            let segment = chunk
-                .allocator
-                .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager)
-                .ok_or_else(|| {
+                // Load file data
+                let file_data = load_file_to_memory(&file_info.path)?;
+
+                if file_data.len() > SEGMENT_SIZE {
                     error!(
-                        "Failed to allocate segment for chunk {} during recovery",
-                        file_info.chunk_id
+                        "File {} size {} exceeds segment size {}",
+                        file_info.path.display(),
+                        file_data.len(),
+                        SEGMENT_SIZE
                     );
-                    io::Error::new(
-                        io::ErrorKind::OutOfMemory,
-                        "Cannot allocate segment during recovery",
-                    )
-                })?;
-
-            // Determine recovery mode and reserve hot memory under lock to avoid races
-            let should_recover_cold = {
-                let mut hot_used = hot_memory_used.lock().unwrap();
-                let recover_cold = should_recover_as_cold(chunk, file_info, &hot_used);
-                if !recover_cold {
-                    *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "File size exceeds segment capacity",
+                    ));
                 }
-                recover_cold
-            };
 
-            // Recover segment data
-            if should_recover_cold {
-                recover_segment_as_cold(&segment, file_info)?;
-            } else {
-                recover_segment_as_hot(&segment, &file_data);
-            }
+                // Allocate segment with original seq_id
+                let segment = chunk
+                    .allocator
+                    .alloc_seg_with_seq_id(file_info.seq_id, &chunk.file_manager)
+                    .ok_or_else(|| {
+                        error!(
+                            "Failed to allocate segment for chunk {} during recovery",
+                            file_info.chunk_id
+                        );
+                        io::Error::new(
+                            io::ErrorKind::OutOfMemory,
+                            "Cannot allocate segment during recovery",
+                        )
+                    })?;
 
-            // Calculate append_header
-            let append_header = find_append_header(segment.addr, file_data.len());
+                // Determine recovery mode and reserve hot memory under lock to avoid races
+                let should_recover_cold = {
+                    let mut hot_used = hot_memory_used.lock().unwrap();
+                    let recover_cold = should_recover_as_cold(chunk, file_info, &hot_used);
+                    if !recover_cold {
+                        *hot_used.entry(file_info.chunk_id).or_insert(0) += SEGMENT_SIZE;
+                    }
+                    recover_cold
+                };
 
-            info!(
-                "Allocated segment: chunk={} seg={} seq={} append_offset={} mode={}",
-                file_info.chunk_id,
-                segment.id,
-                segment.seq_id,
-                append_header - segment.addr,
-                if should_recover_cold { "COLD" } else { "HOT" }
-            );
+                // Recover segment data
+                if should_recover_cold {
+                    recover_segment_as_cold(&segment, file_info)?;
+                } else {
+                    recover_segment_as_hot(&segment, &file_data);
+                }
 
-            Ok((
-                idx,
-                AllocatedSegment {
-                    segment: lightning::aarc::Arc::new(segment),
-                    file_info: file_info.clone(),
-                    file_data,
-                    append_header,
-                    is_cold: should_recover_cold,
-                },
-            ))
-        })
+                // Calculate append_header
+                let append_header = find_append_header(segment.addr, file_data.len());
+
+                info!(
+                    "Allocated segment: chunk={} seg={} seq={} append_offset={} mode={}",
+                    file_info.chunk_id,
+                    segment.id,
+                    segment.seq_id,
+                    append_header - segment.addr,
+                    if should_recover_cold { "COLD" } else { "HOT" }
+                );
+
+                Ok((
+                    idx,
+                    AllocatedSegment {
+                        segment: lightning::aarc::Arc::new(segment),
+                        file_info: file_info.clone(),
+                        file_data,
+                        append_header,
+                        is_cold: should_recover_cold,
+                    },
+                ))
+            },
+        )
         .collect::<io::Result<Vec<_>>>()?;
 
     // Preserve original file ordering to keep downstream progress reporting deterministic
@@ -590,11 +592,7 @@ fn phase2b_3_4_parallel_scan(
             chunk.segs.insert_back(segment.id as usize, segment.clone());
 
             // Scan segment and update cell index
-            let stashed = scan_segment_and_update_index(
-                chunk,
-                segment,
-                alloc.append_header,
-            );
+            let stashed = scan_segment_and_update_index(chunk, segment, alloc.append_header);
 
             // Unmap cold segments immediately after scanning
             // They will be remapped by promotion process when accessed
@@ -610,7 +608,11 @@ fn phase2b_3_4_parallel_scan(
             // Update progress
             let completed = progress.fetch_add(1, Ordering::Relaxed) + 1;
             if completed % 10 == 0 || completed == allocated.len() {
-                info!("Recovery progress: {}/{} segments processed", completed, allocated.len());
+                info!(
+                    "Recovery progress: {}/{} segments processed",
+                    completed,
+                    allocated.len()
+                );
             }
 
             stashed
@@ -646,38 +648,29 @@ fn scan_segment_and_update_index(
                 let hash = cell_header.hash;
 
                 // Lock this specific cell in the index (spins until acquired)
-                if let Some(mut guard) = chunk.cell_index.try_insert_locked(hash as usize) {
+                let mut guard = chunk.cell_index.lock_or_insert(hash as usize, cursor);
+                if *guard != cursor {
+                    // It is not an insert
                     let existing_addr = *guard;
+                    // Check version
+                    let existing_header =
+                        cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
-                    if existing_addr == 0 {
-                        // No existing cell, insert this one
+                    if cell_header.version > existing_header.version {
+                        // New version is newer, update index
                         *guard = cursor;
+                        // Old cell becomes dead space (cleaner will handle it)
                         debug!(
-                            "Recovered cell hash={} version={} in segment={}",
-                            hash, cell_header.version, segment.id
+                            "Updated cell hash={} from version={} to version={} in segment={}",
+                            hash, existing_header.version, cell_header.version, segment.id
                         );
                     } else {
-                        // Check version
-                        let existing_header = cell_header_from_entry_content_addr(
-                            Entry::content_pos(existing_addr)
+                        // This cell is older, mark as dead
+                        dead_space += entry_header.content_length;
+                        debug!(
+                            "Cell hash={} has older version={} (current={}), marking dead",
+                            hash, cell_header.version, existing_header.version
                         );
-
-                        if cell_header.version > existing_header.version {
-                            // New version is newer, update index
-                            *guard = cursor;
-                            // Old cell becomes dead space (cleaner will handle it)
-                            debug!(
-                                "Updated cell hash={} from version={} to version={} in segment={}",
-                                hash, existing_header.version, cell_header.version, segment.id
-                            );
-                        } else {
-                            // This cell is older, mark as dead
-                            dead_space += entry_header.content_length;
-                            debug!(
-                                "Cell hash={} has older version={} (current={}), marking dead",
-                                hash, cell_header.version, existing_header.version
-                            );
-                        }
                     }
                 }
             }
@@ -690,46 +683,42 @@ fn scan_segment_and_update_index(
                 tombstone_count += 1;
 
                 // Try to lock the cell
-                if let Some(mut guard) = chunk.cell_index.try_insert_locked(hash as usize) {
+                if let Some(mut guard) = chunk.cell_index.lock(hash as usize) {
                     let existing_addr = *guard;
+                    // Cell exists, check version
+                    let cell_header =
+                        cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
-                    if existing_addr == 0 {
-                        // No cell exists, stash tombstone for later check
+                    if tombstone.version >= cell_header.version {
+                        // Tombstone is newer or equal, delete cell
+                        *guard = 0;
+                        debug!(
+                            "Deleted cell hash={} version={} with tombstone version={}",
+                            hash, cell_header.version, tombstone.version
+                        );
+                    } else {
+                        // Tombstone might still be valid if a newer cell appears later
                         stashed_tombstones.push(StashedTombstone {
                             hash,
                             version: tombstone.version,
                             chunk_id: chunk.id,
                         });
                         debug!(
-                            "Stashed tombstone hash={} version={} (no cell yet)",
-                            hash, tombstone.version
+                            "Stashed tombstone hash={} version={} (older than cell version={})",
+                            hash, tombstone.version, cell_header.version
                         );
-                    } else {
-                        // Cell exists, check version
-                        let cell_header = cell_header_from_entry_content_addr(
-                            Entry::content_pos(existing_addr)
-                        );
-
-                        if tombstone.version >= cell_header.version {
-                            // Tombstone is newer or equal, delete cell
-                            *guard = 0;
-                            debug!(
-                                "Deleted cell hash={} version={} with tombstone version={}",
-                                hash, cell_header.version, tombstone.version
-                            );
-                        } else {
-                            // Tombstone might still be valid if a newer cell appears later
-                            stashed_tombstones.push(StashedTombstone {
-                                hash,
-                                version: tombstone.version,
-                                chunk_id: chunk.id,
-                            });
-                            debug!(
-                                "Stashed tombstone hash={} version={} (older than cell version={})",
-                                hash, tombstone.version, cell_header.version
-                            );
-                        }
                     }
+                } else {
+                    // No cell exists, stash tombstone for later check
+                    stashed_tombstones.push(StashedTombstone {
+                        hash,
+                        version: tombstone.version,
+                        chunk_id: chunk.id,
+                    });
+                    debug!(
+                        "Stashed tombstone hash={} version={} (no cell yet)",
+                        hash, tombstone.version
+                    );
                 }
             }
 
@@ -760,9 +749,7 @@ fn scan_segment_and_update_index(
 }
 
 /// Merge stashed tombstones from all threads, keeping latest version per hash
-fn merge_stashed_tombstones(
-    all_stashed: Vec<Vec<StashedTombstone>>,
-) -> Vec<StashedTombstone> {
+fn merge_stashed_tombstones(all_stashed: Vec<Vec<StashedTombstone>>) -> Vec<StashedTombstone> {
     let mut merged: HashMap<u64, StashedTombstone> = HashMap::new();
 
     for stashed_list in all_stashed {
@@ -784,10 +771,7 @@ fn merge_stashed_tombstones(
 }
 
 /// Apply stashed tombstones to cell indices
-fn apply_stashed_tombstones(
-    stashed: &[StashedTombstone],
-    chunks: &[Chunk],
-) {
+fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
     info!("Applying {} stashed tombstones...", stashed.len());
 
     let mut applied_count = 0;
@@ -795,22 +779,18 @@ fn apply_stashed_tombstones(
     for tombstone in stashed {
         let chunk = &chunks[tombstone.chunk_id];
 
-        if let Some(mut guard) = chunk.cell_index.try_insert_locked(tombstone.hash as usize) {
+        if let Some(mut guard) = chunk.cell_index.lock(tombstone.hash as usize) {
             let existing_addr = *guard;
+            let cell_header =
+                cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
-            if existing_addr != 0 {
-                let cell_header = cell_header_from_entry_content_addr(
-                    Entry::content_pos(existing_addr)
-                );
-
-                if tombstone.version >= cell_header.version {
-                    *guard = 0; // Delete cell
-                    applied_count += 1;
-                    debug!(
-                        "Applied stashed tombstone: deleted cell hash={} version={} with tombstone version={}",
-                        tombstone.hash, cell_header.version, tombstone.version
-                    );
-                }
+            if tombstone.version >= cell_header.version {
+                *guard = 0; // Delete cell
+                applied_count += 1;
+                debug!(
+                "Applied stashed tombstone: deleted cell hash={} version={} with tombstone version={}",
+                tombstone.hash, cell_header.version, tombstone.version
+            );
             }
         }
     }
@@ -940,6 +920,8 @@ mod tests {
     use crate::ram::types::Id;
     use crate::server::ServerMeta;
     use dovahkiin::types::Type;
+    use std::collections::HashSet;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1257,6 +1239,199 @@ mod tests {
             let cell_owned = cell.to_owned();
             let id_val = cell_owned.data["id"].i32().unwrap();
             assert_eq!(*id_val, 999);
+        }
+    }
+
+    // Purpose: Ensure multiple versions land in different segments with distinct
+    // header versions and that recovery restores the latest version/data.
+    #[test]
+    fn test_recovery_with_multi_segment_versions() {
+        let _ = env_logger::try_init();
+        let wal_dir = TempDir::new().unwrap();
+        let backup_dir = TempDir::new().unwrap();
+        let (_raft_dir, raft_path) = temp_raft_dir();
+
+        // Helpers scoped to this test
+        fn collect_versions_for_hash(chunk: &Chunk, hash: u64) -> Vec<(u64, u64)> {
+            let mut versions = Vec::new();
+            for seg in chunk.segments() {
+                let mut cursor = seg.addr;
+                let bound = seg.append_header.load(Ordering::Relaxed);
+                while cursor < bound {
+                    let (entry_header, _) = Entry::decode_from(cursor, |_, header| header);
+                    let entry_size = ENTRY_HEAD_SIZE + entry_header.content_length as usize;
+                    if entry_header.entry_type == EntryType::CELL {
+                        let content_addr = Entry::content_pos(cursor);
+                        let header = cell_header_from_entry_content_addr(content_addr);
+                        if header.hash == hash {
+                            versions.push((seg.id, header.version));
+                        }
+                    }
+                    cursor += entry_size;
+                }
+            }
+            versions
+        }
+
+        fn list_all_files(dir: &Path) -> Vec<String> {
+            let mut files = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        files.extend(list_all_files(&path));
+                    } else if let Some(name) = path.file_name() {
+                        files.push(name.to_string_lossy().to_string());
+                    }
+                }
+            }
+            files
+        }
+
+        fn force_new_segment(
+            chunks: &Chunks,
+            chunk: &Chunk,
+            filler_counter: &mut i32,
+            payload_size: usize,
+        ) {
+            let initial_head = chunk.get_head_seg_id();
+            let mut attempts = 0;
+            while chunk.get_head_seg_id() == initial_head {
+                let filler_id = Id::new(0, *filler_counter as u64);
+                let mut filler = OwnedCell {
+                    header: CellHeader::new(0, &filler_id),
+                    data: data_map_value!(id: *filler_counter, data: vec![0xEEu8; payload_size]),
+                };
+                chunks.write_cell(&mut filler).unwrap();
+                *filler_counter += 1;
+                attempts += 1;
+                assert!(
+                    attempts < 128,
+                    "failed to switch to a new segment after {} filler writes",
+                    attempts
+                );
+            }
+        }
+
+        let cell_id = Id::new(0, 7);
+        let payload_size = 128 * 1024; // 128KB payload to rotate segments with moderate writes
+        let latest_version: u64;
+        let latest_marker: i32;
+
+        {
+            let schemas = setup_test_schema();
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4, // allow multiple segments for this chunk
+                Arc::new(ServerMeta { schemas }),
+                None, // index_builder
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
+                false,
+                Some(raft_path.clone()),
+            );
+
+            let chunk = &chunks.list[0];
+            let mut current_version = 1u64;
+            let mut filler_counter: i32 = 10_000;
+
+            // Version 1
+            let mut v1_cell = OwnedCell {
+                header: CellHeader::new(0, &cell_id),
+                data: data_map_value!(id: 101i32, data: vec![0x11u8; payload_size]),
+            };
+            v1_cell.header.version = current_version;
+            let v1_header = chunks.write_cell(&mut v1_cell).unwrap();
+            current_version = v1_header.version;
+
+            // Version 2 in a new segment
+            force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
+            let mut v2_cell = OwnedCell {
+                header: CellHeader::new(0, &cell_id),
+                data: data_map_value!(id: 202i32, data: vec![0x22u8; payload_size]),
+            };
+            v2_cell.header.version = current_version;
+            let v2_header = chunks.update_cell(&mut v2_cell).unwrap();
+            current_version = v2_header.version;
+
+            // Version 3 in yet another segment
+            force_new_segment(&chunks, chunk, &mut filler_counter, payload_size);
+            let mut v3_cell = OwnedCell {
+                header: CellHeader::new(0, &cell_id),
+                data: data_map_value!(id: 303i32, data: vec![0x33u8; payload_size]),
+            };
+            v3_cell.header.version = current_version;
+            let v3_header = chunks.update_cell(&mut v3_cell).unwrap();
+            latest_marker = 303;
+
+            let versions = collect_versions_for_hash(chunk, cell_id.lower);
+            println!("Written versions: {:?}", versions);
+            assert_eq!(versions.len(), 3, "expected three stored versions");
+            let version_set: HashSet<u64> = versions.iter().map(|(_, v)| *v).collect();
+            assert_eq!(
+                version_set,
+                HashSet::from_iter([v1_header.version, v2_header.version, v3_header.version]),
+                "stored versions should match written versions"
+            );
+            latest_version = *version_set.iter().max().unwrap();
+            let seg_set: HashSet<u64> = versions.iter().map(|(seg, _)| *seg).collect();
+            assert_eq!(
+                seg_set.len(),
+                3,
+                "each version should reside in a different segment"
+            );
+
+            let mut archived_segments = Vec::new();
+            for seg in chunk.segments() {
+                let archived = seg.archive().unwrap();
+                archived_segments.push((seg.id, seg.seq_id, archived));
+            }
+            println!("Archived segments: {:?}", archived_segments);
+
+            let backup_files = list_all_files(backup_dir.path());
+            let wal_files = list_all_files(wal_dir.path());
+            println!(
+                "Backup files: {} {:?}, WAL files: {} {:?}",
+                backup_files.len(),
+                backup_files,
+                wal_files.len(),
+                wal_files
+            );
+            assert!(
+                backup_files.len() >= 3,
+                "expected backups for all segments, found {}",
+                backup_files.len()
+            );
+        }
+
+        // Simulate crash and recover
+        {
+            let schemas = setup_test_schema();
+            let chunks = Chunks::new_with_recovery(
+                1,
+                TEST_SEGMENT_SIZE * 4,
+                Arc::new(ServerMeta { schemas }),
+                None, // index_builder
+                Some(backup_dir.path().to_str().unwrap().to_string()),
+                Some(wal_dir.path().to_str().unwrap().to_string()),
+                None, // no tiered memory
+                true, // recover from backups
+                Some(raft_path.clone()),
+            );
+
+            let recovered = chunks.read_cell(&cell_id).unwrap().to_owned();
+            let recovered_versions = collect_versions_for_hash(&chunks.list[0], cell_id.lower);
+            println!("Recovered versions: {:?}", recovered_versions);
+            assert_eq!(
+                recovered.header.version, latest_version,
+                "recovered cell should have the latest version"
+            );
+            assert_eq!(
+                *recovered.data["id"].i32().unwrap(),
+                latest_marker,
+                "recovered cell should contain the latest payload"
+            );
         }
     }
 
@@ -1885,7 +2060,10 @@ mod tests {
             let cell_owned = cell.to_owned();
 
             // Should have latest update with id=999 (version may be auto-incremented)
-            assert!(cell_owned.header.version >= 3, "Version should be at least 3");
+            assert!(
+                cell_owned.header.version >= 3,
+                "Version should be at least 3"
+            );
             let id_val = cell_owned.data["id"].i32().unwrap();
             assert_eq!(*id_val, 999, "Should have the latest updated value");
         }
