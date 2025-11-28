@@ -174,7 +174,7 @@ impl TieredMemoryManager {
         }
 
         // Get current hot segment count (use cached value for speed)
-        let hot_segments_count = self.get_hot_count_cached(chunk);
+        let hot_segments_count = self.hot_count_cached(chunk);
 
         // Sanity check: if count is unreasonably large, clamp it
         // On 64-bit: usize::MAX / SEGMENT_SIZE ≈ 2^41 segments (unrealistic)
@@ -246,7 +246,7 @@ impl TieredMemoryManager {
     ///
     /// This avoids scanning all segments on every check, only doing full scans
     /// every 10 seconds to verify/update the cached count.
-    fn get_hot_count_cached(&self, chunk: &Chunk) -> usize {
+    pub fn hot_count_cached(&self, chunk: &Chunk) -> usize {
         // Check if we need to do a full scan (every 10 seconds)
         let should_full_scan = if let Ok(mut last_scan) = self.last_full_scan.try_lock() {
             if last_scan.elapsed() >= Duration::from_secs(10) {

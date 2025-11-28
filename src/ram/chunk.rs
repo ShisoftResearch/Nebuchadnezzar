@@ -404,14 +404,14 @@ impl Chunk {
                             return None;
                         } else {
                             debug!("No space left for chunk {}, emergency full GC", self.id);
-                            Cleaner::clean(self, true);
+                            let _ = Cleaner::clean(self, true);
                             tried_gc = true;
                             continue;
                         }
                     }
                     if self.allocator.meet_gc_threshold() {
                         debug!("Allocator meet GC threshold, will try partial GC");
-                        Cleaner::clean(self, false);
+                        let _ = Cleaner::clean(self, false);
                     }
 
                     // We are supposed to do proactive eviction here

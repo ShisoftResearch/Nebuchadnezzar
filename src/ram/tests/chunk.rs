@@ -1135,7 +1135,7 @@ fn test_concurrent_segment_allocation_and_cleanup() {
                 debug!("Cleaner iteration {}", iteration);
             }
             // Run partial GC to trigger segment cleanup
-            Cleaner::clean(&chunks_for_cleaner.list[0], false);
+            let _ = Cleaner::clean(&chunks_for_cleaner.list[0], false);
             // Small sleep to let writers make progress
             thread::sleep(Duration::from_micros(100));
         }

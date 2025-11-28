@@ -1,4 +1,5 @@
 use crate::ram::chunk::{Chunk, Chunks};
+use crate::ram::segs::SEGMENT_SIZE;
 use rayon::prelude::*;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,11 +56,15 @@ impl Cleaner {
                         .build()
                         .unwrap();
                     
+                    let mut idle_rounds: u32 = 0;
                     while !stop_tag_ref_clone.load(Ordering::Relaxed) {
+                        let progress = AtomicBool::new(false);
                         // Main cleaning: compact and combine segments
                         clean_pool.install(|| {
                             checks_ref_clone.list.par_iter().for_each(|chunk| {
-                                Self::clean(chunk, false);
+                                if Self::clean(chunk, false) {
+                                    progress.store(true, Ordering::Relaxed);
+                                }
                             });
                         });
 
@@ -68,27 +73,41 @@ impl Cleaner {
                         evict_pool.install(|| {
                             checks_ref_clone.list.par_iter().for_each(|chunk| {
                                 if let Some(ref tiered_manager) = chunk.tiered_manager {
-                                    match tiered_manager.evict_for_allocation(chunk) {
-                                        Ok(evicted) => {
-                                            if evicted > 0 {
-                                                debug!(
-                                                    "Background eviction: evicted {} segments from chunk {}",
-                                                    evicted, chunk.id
+                                    // Cheap skip: only evict if we're above physical limit
+                                    let hot = tiered_manager.hot_count_cached(chunk);
+                                    if hot * SEGMENT_SIZE > tiered_manager.physical_memory_limit {
+                                        match tiered_manager.evict_for_allocation(chunk) {
+                                            Ok(evicted) => {
+                                                if evicted > 0 {
+                                                    progress.store(true, Ordering::Relaxed);
+                                                    debug!(
+                                                        "Background eviction: evicted {} segments from chunk {}",
+                                                        evicted, chunk.id
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Background eviction failed for chunk {}: {}",
+                                                    chunk.id, e
                                                 );
                                             }
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Background eviction failed for chunk {}: {}",
-                                                chunk.id, e
-                                            );
                                         }
                                     }
                                 }
                             });
                         });
 
-                        thread::sleep(Duration::from_millis(sleep_interval_ms));
+                        if progress.load(Ordering::Relaxed) {
+                            idle_rounds = 0;
+                            thread::sleep(Duration::from_millis(sleep_interval_ms));
+                        } else {
+                            // Back off when no work is done to avoid spinning
+                            idle_rounds = (idle_rounds + 1).min(50);
+                            let backoff_ms =
+                                sleep_interval_ms.saturating_mul((idle_rounds + 1) as u64);
+                            thread::sleep(Duration::from_millis(backoff_ms.min(5_000)));
+                        }
                     }
                     warn!("Cleaner main thread stopped");
                 }
@@ -107,7 +126,8 @@ impl Cleaner {
         };
         return cleaner;
     }
-    pub fn clean(chunk: &Chunk, full: bool) {
+    /// Returns true if any cleaning work reclaimed space or reduced segments.
+    pub fn clean(chunk: &Chunk, full: bool) -> bool {
         trace!("Cleaner: ready for clean {}, full {}", chunk.id, full);
         let guard = if full {
             Some(chunk.gc_lock.lock())
@@ -119,7 +139,7 @@ impl Cleaner {
                 "Cleaner: Chunk {} GC in progress, will not wait it unless full GC",
                 chunk.id
             );
-            return;
+            return false;
         }
         let num_segs = chunk.segs.len();
         trace!(
@@ -195,6 +215,7 @@ impl Cleaner {
                 chunk.id, combined_cleaned_space, reduced_segments_count, combiner_cleaned_space, compacter_cleaned_space
             );
         }
+        combined_cleaned_space > 0 || reduced_segments_count > 0
     }
 
     pub fn stop(&self) {
