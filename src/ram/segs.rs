@@ -17,9 +17,8 @@ use std::fs::File;
 use std::io::prelude::*;
 use std::path::Path;
 use std::ptr;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{
-    AtomicBool, AtomicI64, AtomicU32, AtomicUsize,
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize,
     Ordering::{self, *},
 };
 use std::sync::Arc;
@@ -80,6 +79,10 @@ pub struct Segment {
     pub append_header: AtomicUsize,
     pub dead_space: AtomicU32,
     pub tombstones: AtomicU32,
+    /// Generation counter for changes that introduce dead space (dead cells or tombstones)
+    dead_bytes_generation: AtomicU64,
+    /// Marker used by cleaners to skip segments that were cleaned without reclaiming space
+    last_no_progress_clean_generation: AtomicU64,
     pub references: AtomicUsize,
     pub file_state: parking_lot::Mutex<SegmentFileState>,
     archived: AtomicBool,
@@ -152,6 +155,8 @@ impl Segment {
             append_header: AtomicUsize::new(buffer_ptr),
             dead_space: AtomicU32::new(0),
             tombstones: AtomicU32::new(0),
+            dead_bytes_generation: AtomicU64::new(0),
+            last_no_progress_clean_generation: AtomicU64::new(0),
             references: AtomicUsize::new(0),
             file_state: parking_lot::Mutex::new(SegmentFileState {
                 manager: file_manager,
@@ -272,6 +277,41 @@ impl Segment {
 
     pub fn dead_space(&self) -> u32 {
         self.dead_space.load(Ordering::Relaxed)
+    }
+
+    /// Track changes that introduce new dead bytes so cleaners can detect progress.
+    #[inline]
+    pub fn note_dead_bytes_change(&self) {
+        // Clear any "no progress" marker when new dead bytes show up so the cleaner
+        // can try again.
+        self.last_no_progress_clean_generation
+            .store(0, Ordering::Relaxed);
+        self.dead_bytes_generation
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mark this segment as cleaned without reclaiming space for the current generation.
+    #[inline]
+    pub fn mark_clean_no_progress(&self) {
+        let gen = self.dead_bytes_generation.load(Ordering::Relaxed);
+        if gen > 0 {
+            self.last_no_progress_clean_generation
+                .store(gen, Ordering::Relaxed);
+        }
+    }
+
+    /// Clear the "no progress" marker so the cleaner can reconsider this segment.
+    #[inline]
+    pub fn clear_clean_no_progress(&self) {
+        self.last_no_progress_clean_generation
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// Returns true if the cleaner already tried this generation and reclaimed nothing.
+    #[inline]
+    pub fn cleaned_without_progress(&self) -> bool {
+        let gen = self.dead_bytes_generation.load(Ordering::Relaxed);
+        gen > 0 && gen == self.last_no_progress_clean_generation.load(Ordering::Relaxed)
     }
 
     // dead space plus tombstone spaces

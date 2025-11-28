@@ -658,6 +658,13 @@ fn scan_segment_and_update_index(
 
                     if cell_header.version > existing_header.version {
                         // New version is newer, update index
+                        if let Some(old_seg) = chunk.locate_segment(existing_addr) {
+                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                            old_seg
+                                .dead_space
+                                .fetch_add(entry.content_length, Ordering::Relaxed);
+                            old_seg.note_dead_bytes_change();
+                        }
                         *guard = cursor;
                         // Old cell becomes dead space (cleaner will handle it)
                         debug!(
@@ -685,6 +692,11 @@ fn scan_segment_and_update_index(
                 // Try to lock the cell
                 if let Some(mut guard) = chunk.cell_index.lock(hash as usize) {
                     let existing_addr = *guard;
+                    if existing_addr == 0 {
+                        // Already removed by a newer tombstone
+                        cursor += entry_size;
+                        continue;
+                    }
                     // Cell exists, check version
                     let cell_header =
                         cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
@@ -692,6 +704,13 @@ fn scan_segment_and_update_index(
                     if tombstone.version >= cell_header.version {
                         // Tombstone is newer or equal, delete cell
                         *guard = 0;
+                        if let Some(target_seg) = chunk.locate_segment(existing_addr) {
+                            let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                            target_seg
+                                .dead_space
+                                .fetch_add(entry.content_length, Ordering::Relaxed);
+                            target_seg.note_dead_bytes_change();
+                        }
                         debug!(
                             "Deleted cell hash={} version={} with tombstone version={}",
                             hash, cell_header.version, tombstone.version
@@ -736,6 +755,9 @@ fn scan_segment_and_update_index(
     // Update segment statistics
     segment.dead_space.store(dead_space, Ordering::Release);
     segment.tombstones.store(tombstone_count, Ordering::Release);
+    if dead_space > 0 || tombstone_count > 0 {
+        segment.note_dead_bytes_change();
+    }
 
     debug!(
         "Segment {} scanned: {} dead bytes, {} tombstones, {} stashed tombstones",
@@ -781,11 +803,20 @@ fn apply_stashed_tombstones(stashed: &[StashedTombstone], chunks: &[Chunk]) {
 
         if let Some(mut guard) = chunk.cell_index.lock(tombstone.hash as usize) {
             let existing_addr = *guard;
+            if existing_addr == 0 {
+                continue;
+            }
             let cell_header =
                 cell_header_from_entry_content_addr(Entry::content_pos(existing_addr));
 
             if tombstone.version >= cell_header.version {
                 *guard = 0; // Delete cell
+                if let Some(seg) = chunk.locate_segment(existing_addr) {
+                    let (entry, _) = Entry::decode_from(existing_addr, |_, _| {});
+                    seg.dead_space
+                        .fetch_add(entry.content_length, Ordering::Relaxed);
+                    seg.note_dead_bytes_change();
+                }
                 applied_count += 1;
                 debug!(
                 "Applied stashed tombstone: deleted cell hash={} version={} with tombstone version={}",

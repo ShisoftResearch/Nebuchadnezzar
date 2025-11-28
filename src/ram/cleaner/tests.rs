@@ -12,6 +12,7 @@ use env_logger;
 use lightning::map::Map as LFMap;
 use std;
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 pub const DATA_SIZE: usize = 1000 * 1024; // nearly 1MB
@@ -213,6 +214,75 @@ pub fn full_clean_cycle() {
         let cell = chunks.read_cell(&id).unwrap();
         assert_eq!(cell.to_owned().data, default_cell(&id).data);
     });
+}
+
+#[test]
+fn compact_marks_no_progress_and_skips_segment() {
+    let _ = env_logger::try_init();
+    let schema = Schema::new("cleaner_skip_test", None, default_fields(), false, false);
+    let schemas = LocalSchemasCache::new_local("");
+    schemas.new_schema(schema);
+    let chunks = Chunks::new(
+        1,
+        MAX_SEGMENT_SIZE * 3,
+        Arc::new(ServerMeta { schemas }),
+        None,
+        None,
+        None,
+        None,
+    );
+    let chunk = &chunks.list[0];
+
+    // Write enough data to force the chunk to allocate a second (non-head) segment.
+    for i in 0..10 {
+        let mut cell = default_cell(&Id::new(0, i));
+        chunks.write_cell(&mut cell).unwrap();
+    }
+    assert!(
+        chunk.segments().len() >= 2,
+        "expected at least two segments after writes"
+    );
+
+    let head_id = chunk.get_head_seg_id();
+    let victim_seg = chunk
+        .segments()
+        .into_iter()
+        .find(|seg| seg.id != head_id)
+        .expect("need a non-head segment to compact");
+
+    // Artificially mark the segment as fragmented without actually removing cells.
+    let fake_dead = victim_seg.used_spaces() / 2 + 1;
+    victim_seg
+        .dead_space
+        .store(fake_dead, Ordering::Relaxed);
+    victim_seg.note_dead_bytes_change();
+
+    let initial_candidates = chunk.segs_for_compact_cleaner();
+    assert!(
+        initial_candidates.iter().any(|seg| seg.id == victim_seg.id),
+        "segment should be considered for compaction when utilization drops"
+    );
+
+    let reclaimed = compact::CompactCleaner::clean_segment(chunk, &victim_seg);
+    assert_eq!(reclaimed, 0, "no space should be reclaimed without dead cells");
+    assert!(
+        victim_seg.cleaned_without_progress(),
+        "segment should record a no-progress clean"
+    );
+
+    let after_candidates = chunk.segs_for_compact_cleaner();
+    assert!(
+        after_candidates.iter().all(|seg| seg.id != victim_seg.id),
+        "segment cleaned without progress should be skipped until state changes"
+    );
+
+    // New dead bytes should clear the marker and allow the segment to be cleaned again.
+    chunk.mark_dead_entry_with_size(victim_seg.addr, 8, &victim_seg);
+    let refreshed_candidates = chunk.segs_for_compact_cleaner();
+    assert!(
+        refreshed_candidates.iter().any(|seg| seg.id == victim_seg.id),
+        "new dead bytes should make segment eligible for compaction again"
+    );
 }
 
 #[test]

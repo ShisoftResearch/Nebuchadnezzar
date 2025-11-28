@@ -1009,6 +1009,7 @@ impl Chunk {
             cell_header.hash,
         );
         pending_entry.seg.tombstones.fetch_add(1, Ordering::Relaxed);
+        pending_entry.seg.note_dead_bytes_change();
     }
 
     pub fn put_tombstone_by_cell_loc(&self, cell_location: usize) -> Result<(), WriteError> {
@@ -1052,6 +1053,7 @@ impl Chunk {
             seg.id
         );
         seg.dead_space.fetch_add(size, Ordering::Relaxed);
+        seg.note_dead_bytes_change();
     }
 
     // Decodes entry to get size and marks it dead
@@ -1109,6 +1111,7 @@ impl Chunk {
                 seg.id != head_seg_id
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
+                    && !seg.cleaned_without_progress()
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
@@ -1134,6 +1137,7 @@ impl Chunk {
                     && head_seg_id != seg.id
                     && seg.no_references() // Includes transaction protection via SegmentReferenceGuards
                     && seg.is_hot() // Don't clean cold segments (tiered memory)
+                    && !seg.cleaned_without_progress()
             })
             .collect();
         mapping.sort_by(|(_, util1), (_, util2)| util1.partial_cmp(util2).unwrap());

@@ -215,6 +215,14 @@ impl CompactCleaner {
             seg.id, chunk.id, space_cleaned, original_used_space, final_used_space, released_tombstones
         );
 
+        if space_cleaned == 0 {
+            seg.mark_clean_no_progress();
+        } else {
+            seg.clear_clean_no_progress();
+            // After compaction all live entries have been packed, reset dead bytes counter
+            seg.dead_space.store(0, Ordering::Relaxed);
+        }
+
         // We are not going to archive here to reduce write amplification.
         // Eviction will archive the segment for tiered memory
         // For recovery, even if the segment is not archived, it will still be able to recover from the old backup file.

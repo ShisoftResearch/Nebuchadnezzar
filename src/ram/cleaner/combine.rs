@@ -201,15 +201,18 @@ impl CombinedCleaner {
             let cleaned_total_live_space = AtomicUsize::new(0);
             num_reduced_segments = segments_to_combine_len - pending_segments_len;
             if num_reduced_segments <= 0 {
-                debug!(
-                    "Trying to combine segments but resulting segments still does not go down {}/{}",
-                    pending_segments_len, segments_to_combine_len
-                );
-                // Release references before returning (they were acquired at line 88)
-                for seg in segments.iter() {
-                    seg.references.fetch_sub(1, Ordering::Relaxed);
-                    seg.set_hot();
-                }
+            debug!(
+                "Trying to combine segments but resulting segments still does not go down {}/{}",
+                pending_segments_len, segments_to_combine_len
+            );
+            for seg in segments.iter() {
+                seg.mark_clean_no_progress();
+            }
+            // Release references before returning (they were acquired at line 88)
+            for seg in segments.iter() {
+                seg.references.fetch_sub(1, Ordering::Relaxed);
+                seg.set_hot();
+            }
                 return (0, 0);
             }
 
