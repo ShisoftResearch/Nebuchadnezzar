@@ -183,20 +183,25 @@ impl NebServer {
         // If indexing is enabled, register inverted index schemas BEFORE recovery
         // These schemas are needed for recovery to recognize inverted index cells
         if opts.index_enabled {
-            meta_rc.schemas.new_schema(crate::index::fulltext::hybrid::inverted_segment_schema());
-            meta_rc.schemas.new_schema(crate::index::fulltext::inverted_stats_schema());
+            meta_rc
+                .schemas
+                .new_schema(crate::index::fulltext::hybrid::inverted_segment_schema());
+            meta_rc
+                .schemas
+                .new_schema(crate::index::fulltext::inverted_stats_schema());
             debug!("Registered inverted index schemas before recovery");
         }
-        
+
         // Create IndexBuilder first (without inverted indexer initialization)
         let index_builder = if opts.index_enabled {
             Some(Arc::new(
-                IndexBuilder::new(&neb_client, &conshasing, &raft_client, rpc_server.server_id).await,
+                IndexBuilder::new(&neb_client, &conshasing, &raft_client, rpc_server.server_id)
+                    .await,
             ))
         } else {
             None
         };
-        
+
         // Create chunks with index_builder
         let chunks = Chunks::new_with_recovery(
             opts.chunk_count,
@@ -211,7 +216,7 @@ impl NebServer {
             opts.enable_recovery,
             opts.raft_storage.clone(),
         );
-        
+
         // Initialize the inverted indexer with chunks (lazy initialization)
         if let Some(ref index_builder) = index_builder {
             index_builder.initialize_inverted_indexer(&chunks);
@@ -320,7 +325,7 @@ impl NebServer {
                 }
             }
         }
-        
+
         // Register inverted index RPC service if indexing is enabled
         if opts.index_enabled {
             init_inverted_index_rpc_service(rpc_server, &server).await;
@@ -566,7 +571,10 @@ pub async fn init_txn_data_site_service(rpc_server: &Arc<Server>, neb_server: &A
         .await;
 }
 
-pub async fn init_inverted_index_rpc_service(rpc_server: &Arc<Server>, neb_server: &Arc<NebServer>) {
+pub async fn init_inverted_index_rpc_service(
+    rpc_server: &Arc<Server>,
+    neb_server: &Arc<NebServer>,
+) {
     if let Some(ref index_builder) = neb_server.indexer {
         if let Some(inverted_indexer) = index_builder.clients.fulltext_indexer() {
             use crate::index::fulltext::rpc::InvertedIndexRPCService;

@@ -17,7 +17,7 @@ lazy_static! {
         .thread_name(|idx| format!("combine-alloc-t{}", idx))
         .build()
         .unwrap();
-    
+
     /// Global thread pool for cell index updates during combine operations
     static ref COMBINE_UPDATE_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("combine-update-t{}", idx))
@@ -217,7 +217,7 @@ impl CombinedCleaner {
                 "Updating cell reference, pending segments {}",
                 pending_segments.len()
             );
-            
+
             // Use global thread pool for segment allocation
             let new_segs = COMBINE_ALLOC_POOL.install(|| {
                 pending_segments

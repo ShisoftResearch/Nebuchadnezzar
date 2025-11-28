@@ -1112,7 +1112,11 @@ impl Chunk {
             })
             .collect();
         list.sort_by(|pair1, pair2| pair1.1.partial_cmp(&pair2.1).unwrap());
-        return list.into_iter().take(MAX_SEGMENTS_FOR_CLEANER).map(|pair| pair.0).collect();
+        return list
+            .into_iter()
+            .take(MAX_SEGMENTS_FOR_CLEANER)
+            .map(|pair| pair.0)
+            .collect();
     }
 
     pub fn segs_for_combine_cleaner(&self) -> Vec<(AArc<Segment>, f32)> {

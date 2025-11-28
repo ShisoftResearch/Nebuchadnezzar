@@ -231,9 +231,11 @@ impl Transaction {
                     self.tid,
                     failures.len()
                 );
-                Err(TxnError::CommitError(EndResult::LockReleaseRetriesExhausted {
-                    failures: failures.clone(),
-                }))
+                Err(TxnError::CommitError(
+                    EndResult::LockReleaseRetriesExhausted {
+                        failures: failures.clone(),
+                    },
+                ))
             }
             Ok(Ok(er)) => Err(TxnError::CommitError(er)),
             Ok(Err(tme)) => Err(TxnError::ManagerError(tme)),

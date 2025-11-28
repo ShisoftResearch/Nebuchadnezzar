@@ -3,8 +3,8 @@ mod macros;
 #[macro_use]
 pub mod builder;
 pub mod entry;
-pub mod hash;
 pub mod fulltext;
+pub mod hash;
 pub mod ranged;
 pub mod vector;
 
@@ -25,8 +25,10 @@ use futures::Future;
 use hash::{hash_index_schema, HashedIndexClient};
 
 use crate::client::AsyncClient;
-use crate::index::fulltext::{inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit};
 use crate::index::fulltext::hybrid::HybridInvertedIndexer;
+use crate::index::fulltext::{
+    inverted_doc_schema, inverted_index_schema, inverted_stats_schema, BM25Hit,
+};
 use crate::index::vector::VectorIndexClient;
 use crate::ram::cell::ReadError;
 use crate::ram::chunk::Chunks;
@@ -67,7 +69,7 @@ impl IndexerClients {
             conshash: conshash.clone(),
         }
     }
-    
+
     /// Initialize the inverted indexer with chunks (called once after chunks creation)
     pub fn initialize_inverted_indexer(&self, chunks: &Arc<Chunks>) {
         let inverted_indexer = Arc::new(HybridInvertedIndexer::new(
@@ -78,16 +80,16 @@ impl IndexerClients {
             Duration::from_secs(30), // Flush every 30 seconds
         ));
         inverted_indexer.start_background_flush();
-        
+
         // OnceLock ensures this can only be set once
         let _ = self.fulltext_indexer.set(inverted_indexer);
     }
-    
+
     /// Get the inverted indexer if initialized
     pub fn fulltext_indexer(&self) -> Option<&Arc<HybridInvertedIndexer>> {
         self.fulltext_indexer.get()
     }
-    
+
     /// Create IndexerClients without hybrid inverted indexer (for query-only clients)
     pub fn new_query_only(
         neb_client: &Arc<AsyncClient>,
@@ -108,15 +110,9 @@ impl IndexerClients {
     pub async fn init_index_schema(neb_client: &Arc<AsyncClient>) {
         let hash_index_schema = hash_index_schema();
         let _ = neb_client.new_schema_with_id(hash_index_schema).await;
-        let _ = neb_client
-            .new_schema_with_id(inverted_index_schema())
-            .await;
-        let _ = neb_client
-            .new_schema_with_id(inverted_stats_schema())
-            .await;
-        let _ = neb_client
-            .new_schema_with_id(inverted_doc_schema())
-            .await;
+        let _ = neb_client.new_schema_with_id(inverted_index_schema()).await;
+        let _ = neb_client.new_schema_with_id(inverted_stats_schema()).await;
+        let _ = neb_client.new_schema_with_id(inverted_doc_schema()).await;
     }
     pub fn range_seek<'a>(
         &'a self,
@@ -149,13 +145,13 @@ impl IndexerClients {
         limit: usize,
     ) -> Result<Result<Vec<BM25Hit>, ReadError>, RPCError> {
         match self.fulltext_indexer() {
-            Some(indexer) => {
-                match indexer.bm25_search(schema_id, field_id, query, limit).await {
-                    Ok(hits) => Ok(Ok(hits)),
-                    Err(e) => Ok(Err(ReadError::ExecError(format!("Index error: {:?}", e)))),
-                }
-            }
-            None => Ok(Err(ReadError::ExecError("Inverted indexer not available".to_string()))),
+            Some(indexer) => match indexer.bm25_search(schema_id, field_id, query, limit).await {
+                Ok(hits) => Ok(Ok(hits)),
+                Err(e) => Ok(Err(ReadError::ExecError(format!("Index error: {:?}", e)))),
+            },
+            None => Ok(Err(ReadError::ExecError(
+                "Inverted indexer not available".to_string(),
+            ))),
         }
     }
 }

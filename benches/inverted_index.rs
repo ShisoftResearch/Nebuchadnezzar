@@ -1,14 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use neb::index::fulltext::hybrid::HybridInvertedIndexer;
-use neb::index::fulltext::{build_index_meta, FullTextIndexMeta};
-use neb::ram::chunk::Chunks;
-use neb::ram::schema::LocalSchemasCache;
-use neb::ram::types::{Id, OwnedValue};
-use neb::server::ServerMeta;
-#[cfg(not(debug_assertions))]
-use lightning::map::{Map, PtrHashMap as LFHashMap};
-use bifrost::conshash::ConsistentHashing;
 use bifrost::conshash::weights::Weights;
+use bifrost::conshash::ConsistentHashing;
 use bifrost::membership::client::ObserverClient;
 use bifrost::membership::member::MemberService;
 use bifrost::membership::server::Membership;
@@ -17,6 +8,15 @@ use bifrost::raft::client::RaftClient;
 use bifrost::raft::disk::DiskOptions;
 use bifrost::rpc::Server;
 use bifrost_hasher::hash_str;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+#[cfg(not(debug_assertions))]
+use lightning::map::{Map, PtrHashMap as LFHashMap};
+use neb::index::fulltext::hybrid::HybridInvertedIndexer;
+use neb::index::fulltext::{build_index_meta, FullTextIndexMeta};
+use neb::ram::chunk::Chunks;
+use neb::ram::schema::LocalSchemasCache;
+use neb::ram::types::{Id, OwnedValue};
+use neb::server::ServerMeta;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -45,47 +45,45 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
         schemas.new_schema(schema);
         return;
     }
-    
+
     #[cfg(not(debug_assertions))]
     {
         // In release mode, we need to bypass the check
         // We'll use the public API but catch the panic, or use a workaround
         // Actually, let's just use the public method and handle it differently
         // Since new_schema panics in release, we'll use a different approach
-        
+
         // For benchmarks, we can use a feature flag or just accept that schemas
         // need to be registered differently. Let's use a workaround by accessing
         // the internal structure via unsafe (safe in benchmark context)
-        use std::sync::Arc;
         use std::mem;
-        
+        use std::sync::Arc;
+
         // Define internal structures matching the private ones
         type SchemaRef = Arc<neb::ram::schema::Schema>;
-        
+
         struct LocalSchemasMapInternal {
             schema_map: LFHashMap<u32, SchemaRef>,
             name_map: LFHashMap<String, u32>,
         }
-        
+
         struct LocalSchemasCacheInternal {
             map: Arc<LocalSchemasMapInternal>,
         }
-        
+
         // Transmute to access private fields
-        let internal: &LocalSchemasCacheInternal = unsafe {
-            mem::transmute(schemas)
-        };
-        
+        let internal: &LocalSchemasCacheInternal = unsafe { mem::transmute(schemas) };
+
         let name = schema.name.clone();
         let id = schema.id;
-        
+
         // Check if schema already exists
         if let Some(existing_id) = internal.map.name_map.get(&name) {
             if existing_id != id {
                 return; // Skip on collision
             }
         }
-        
+
         // Insert into maps
         internal.map.name_map.insert(name.clone(), id);
         internal.map.schema_map.insert(id, Arc::new(schema));
@@ -95,9 +93,12 @@ fn register_schema(schemas: &LocalSchemasCache, schema: neb::ram::schema::Schema
 // Helper to create test chunks
 fn create_test_chunks() -> Arc<Chunks> {
     let schemas = LocalSchemasCache::new_local("");
-    register_schema(&schemas, neb::index::fulltext::hybrid::inverted_segment_schema());
+    register_schema(
+        &schemas,
+        neb::index::fulltext::hybrid::inverted_segment_schema(),
+    );
     register_schema(&schemas, neb::index::fulltext::inverted_stats_schema());
-    
+
     Chunks::new(
         1,
         64 * 1024 * 1024, // 64MB
@@ -181,19 +182,20 @@ fn create_test_meta(schema_id: u32, field_id: u64, doc_id: Id, text: &str) -> Fu
         schema_id,
         field_id,
         OwnedValue::String(text.to_string()),
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 // Helper to find owned document IDs
-fn find_owned_doc_ids(
-    conshash: &ConsistentHashing,
-    server_id: u64,
-    count: usize,
-) -> Vec<Id> {
+fn find_owned_doc_ids(conshash: &ConsistentHashing, server_id: u64, count: usize) -> Vec<Id> {
     let mut doc_ids = Vec::new();
     for i in 0..10000 {
         let test_id = Id::new(i, i);
-        if conshash.get_server_id(test_id.higher).map(|sid| sid == server_id).unwrap_or(false) {
+        if conshash
+            .get_server_id(test_id.higher)
+            .map(|sid| sid == server_id)
+            .unwrap_or(false)
+        {
             doc_ids.push(test_id);
             if doc_ids.len() >= count {
                 break;
@@ -206,74 +208,72 @@ fn find_owned_doc_ids(
 // Benchmark: Indexing performance with varying document counts
 fn bench_indexing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     // Set up infrastructure outside benchmark loop
     let (chunks, conshash, server_id, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29400";
         let group_name = "bench_indexing";
         let conshash_id = 3000u64;
-        
-        let (conshash, _raft_client, server_id) = setup_test_conshash(server_addr, group_name, conshash_id).await;
-        
+
+        let (conshash, _raft_client, server_id) =
+            setup_test_conshash(server_addr, group_name, conshash_id).await;
+
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
-        
+
         (chunks, conshash, server_id, schema_id, field_id)
     });
-    
+
     let mut group = c.benchmark_group("indexing");
-    
+
     for doc_count in [10, 100, 1000, 5000].iter() {
         let doc_ids = find_owned_doc_ids(&conshash, server_id, *doc_count);
-        
-        group.bench_with_input(
-            BenchmarkId::from_parameter(doc_count),
-            doc_count,
-            |b, _| {
-                b.to_async(&rt).iter(|| async {
-                    let indexer = HybridInvertedIndexer::new(
-                        server_id,
-                        conshash.clone(),
-                        chunks.clone(),
-                        Duration::from_secs(60), // Long flush interval for pure indexing benchmark
-                    );
-                    
-                    for (i, doc_id) in doc_ids.iter().enumerate() {
-                        let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
-                        let meta = create_test_meta(schema_id, field_id, *doc_id, text);
-                        indexer.add_document(&meta).await.unwrap();
-                    }
-                    
-                    black_box(&indexer);
-                });
-            },
-        );
+
+        group.bench_with_input(BenchmarkId::from_parameter(doc_count), doc_count, |b, _| {
+            b.to_async(&rt).iter(|| async {
+                let indexer = HybridInvertedIndexer::new(
+                    server_id,
+                    conshash.clone(),
+                    chunks.clone(),
+                    Duration::from_secs(60), // Long flush interval for pure indexing benchmark
+                );
+
+                for (i, doc_id) in doc_ids.iter().enumerate() {
+                    let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
+                    let meta = create_test_meta(schema_id, field_id, *doc_id, text);
+                    indexer.add_document(&meta).await.unwrap();
+                }
+
+                black_box(&indexer);
+            });
+        });
     }
-    
+
     group.finish();
 }
 
 // Benchmark: Search performance with varying document counts
 fn bench_search(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     // Set up infrastructure and pre-populate indexers outside benchmark loop
     let (indexers, doc_id_sets, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29401";
         let group_name = "bench_search";
         let conshash_id = 3001u64;
-        
-        let (conshash, _raft_client, server_id) = setup_test_conshash(server_addr, group_name, conshash_id).await;
-        
+
+        let (conshash, _raft_client, server_id) =
+            setup_test_conshash(server_addr, group_name, conshash_id).await;
+
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
-        
+
         // Pre-populate indexers with different document counts
         let mut indexers = Vec::new();
         let mut doc_id_sets = Vec::new();
-        
+
         for doc_count in [10, 100, 1000, 5000].iter() {
             let doc_ids = find_owned_doc_ids(&conshash, server_id, *doc_count);
             let indexer = HybridInvertedIndexer::new(
@@ -282,23 +282,23 @@ fn bench_search(c: &mut Criterion) {
                 chunks.clone(),
                 Duration::from_secs(60),
             );
-            
+
             // Pre-index documents
             for (i, doc_id) in doc_ids.iter().enumerate() {
                 let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
                 let meta = create_test_meta(schema_id, field_id, *doc_id, text);
                 indexer.add_document(&meta).await.unwrap();
             }
-            
+
             indexers.push(indexer);
             doc_id_sets.push((*doc_count, doc_ids));
         }
-        
+
         (indexers, doc_id_sets, schema_id, field_id)
     });
-    
+
     let mut group = c.benchmark_group("search");
-    
+
     // Test different query types
     let queries = vec![
         ("single_word", "rust"),
@@ -306,56 +306,58 @@ fn bench_search(c: &mut Criterion) {
         ("phrase", "database systems"),
         ("common_word", "the"),
     ];
-    
+
     for (doc_count, _) in &doc_id_sets {
         for (query_name, query_text) in &queries {
-            let indexer = &indexers[doc_id_sets.iter().position(|(c, _)| c == doc_count).unwrap()];
-            
+            let indexer = &indexers[doc_id_sets
+                .iter()
+                .position(|(c, _)| c == doc_count)
+                .unwrap()];
+
             group.bench_with_input(
                 BenchmarkId::new(format!("{}_docs", doc_count), query_name),
                 query_text,
                 |b, query| {
                     b.to_async(&rt).iter(|| async {
-                        let hits = indexer.bm25_search(
-                            schema_id,
-                            field_id,
-                            black_box(query),
-                            10,
-                        ).await.unwrap();
+                        let hits = indexer
+                            .bm25_search(schema_id, field_id, black_box(query), 10)
+                            .await
+                            .unwrap();
                         black_box(hits);
                     });
                 },
             );
         }
     }
-    
+
     group.finish();
 }
 
 // Benchmark: Concurrent indexing performance
 fn bench_concurrent_indexing(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     // Set up infrastructure outside benchmark loop
     let (chunks, conshash, server_id, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29402";
         let group_name = "bench_concurrent";
         let conshash_id = 3002u64;
-        
-        let (conshash, _raft_client, server_id) = setup_test_conshash(server_addr, group_name, conshash_id).await;
-        
+
+        let (conshash, _raft_client, server_id) =
+            setup_test_conshash(server_addr, group_name, conshash_id).await;
+
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
-        
+
         (chunks, conshash, server_id, schema_id, field_id)
     });
-    
+
     let mut group = c.benchmark_group("concurrent_indexing");
-    
+
     for concurrent_docs in [10, 50, 100, 500].iter() {
         let doc_ids = find_owned_doc_ids(&conshash, server_id, *concurrent_docs);
-        
+
         group.bench_with_input(
             BenchmarkId::from_parameter(concurrent_docs),
             concurrent_docs,
@@ -367,49 +369,50 @@ fn bench_concurrent_indexing(c: &mut Criterion) {
                         chunks.clone(),
                         Duration::from_secs(60),
                     ));
-                    
+
                     // Index documents concurrently
                     let mut handles = Vec::new();
                     for (i, doc_id) in doc_ids.iter().enumerate() {
                         let indexer_clone = indexer.clone();
                         let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
                         let meta = create_test_meta(schema_id, field_id, *doc_id, text);
-                        
+
                         handles.push(tokio::spawn(async move {
                             indexer_clone.add_document(&meta).await.unwrap();
                         }));
                     }
-                    
+
                     // Wait for all to complete
                     for handle in handles {
                         handle.await.unwrap();
                     }
-                    
+
                     black_box(&indexer);
                 });
             },
         );
     }
-    
+
     group.finish();
 }
 
 // Benchmark: Search with varying result limits
 fn bench_search_limit(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    
+
     // Set up infrastructure and pre-populate indexer outside benchmark loop
     let (indexer, schema_id, field_id) = rt.block_on(async {
         let chunks = create_test_chunks();
         let server_addr = "127.0.0.1:29403";
         let group_name = "bench_search_limit";
         let conshash_id = 3003u64;
-        
-        let (conshash, _raft_client, server_id) = setup_test_conshash(server_addr, group_name, conshash_id).await;
-        
+
+        let (conshash, _raft_client, server_id) =
+            setup_test_conshash(server_addr, group_name, conshash_id).await;
+
         let schema_id = 100u32;
         let field_id = hash_str("content") as u64;
-        
+
         // Pre-populate with 1000 documents
         let doc_ids = find_owned_doc_ids(&conshash, server_id, 1000);
         let indexer = HybridInvertedIndexer::new(
@@ -418,36 +421,30 @@ fn bench_search_limit(c: &mut Criterion) {
             chunks.clone(),
             Duration::from_secs(60),
         );
-        
+
         for (i, doc_id) in doc_ids.iter().enumerate() {
             let text = SAMPLE_TEXTS[i % SAMPLE_TEXTS.len()];
             let meta = create_test_meta(schema_id, field_id, *doc_id, text);
             indexer.add_document(&meta).await.unwrap();
         }
-        
+
         (indexer, schema_id, field_id)
     });
-    
+
     let mut group = c.benchmark_group("search_limit");
-    
+
     for limit in [1, 10, 50, 100].iter() {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(limit),
-            limit,
-            |b, limit| {
-                b.to_async(&rt).iter(|| async {
-                    let hits = indexer.bm25_search(
-                        schema_id,
-                        field_id,
-                        black_box("rust programming"),
-                        *limit,
-                    ).await.unwrap();
-                    black_box(hits);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(limit), limit, |b, limit| {
+            b.to_async(&rt).iter(|| async {
+                let hits = indexer
+                    .bm25_search(schema_id, field_id, black_box("rust programming"), *limit)
+                    .await
+                    .unwrap();
+                black_box(hits);
+            });
+        });
     }
-    
+
     group.finish();
 }
 
@@ -459,4 +456,3 @@ criterion_group!(
     bench_search_limit
 );
 criterion_main!(benches);
-

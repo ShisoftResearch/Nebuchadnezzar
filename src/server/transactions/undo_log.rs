@@ -508,6 +508,16 @@ impl UndoLogger {
             let entry_addr = *guard; // This is the Entry address, not content address
             drop(guard); // Release lock early
 
+            // The index may hold a zero value if a tombstone was applied during recovery.
+            // Treat this as "not found" instead of attempting to read from null.
+            if entry_addr == 0 {
+                debug!(
+                    "Cell {:?} not found in index during rollback (stored addr=0)",
+                    entry.cell_id
+                );
+                return Ok(());
+            }
+
             // Convert entry address to content address
             let content_addr = Entry::content_pos(entry_addr);
 

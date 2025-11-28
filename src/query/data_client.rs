@@ -12,8 +12,8 @@ use crate::{
     client::{client_by_server_name, AsyncClient},
     index::{
         entry::{MAX_FEATURE, MIN_FEATURE},
-        hash::get_hash_id_from_value,
         fulltext::BM25Hit,
+        hash::get_hash_id_from_value,
         ranged::{
             client::cursor::ClientCursor,
             lsm::{
@@ -119,12 +119,20 @@ impl IndexedDataClient {
         Self {
             conshash: conshash.clone(),
             // Use 0 as server_id for query-only clients since inverted indexer won't be initialized
-            index_clients: Arc::new(IndexerClients::new_query_only(neb_client, conshash, raft_client, 0)),
+            index_clients: Arc::new(IndexerClients::new_query_only(
+                neb_client,
+                conshash,
+                raft_client,
+                0,
+            )),
         }
     }
-    
+
     /// Create IndexedDataClient with server's indexer clients (for BM25 search support)
-    pub fn new_with_indexers(index_clients: Arc<IndexerClients>, conshash: Arc<ConsistentHashing>) -> Self {
+    pub fn new_with_indexers(
+        index_clients: Arc<IndexerClients>,
+        conshash: Arc<ConsistentHashing>,
+    ) -> Self {
         Self {
             conshash,
             index_clients,
@@ -674,7 +682,12 @@ mod test {
                 undo_log_storage: None,
                 raft_storage: None, // No persistence for regular tests
                 index_enabled: true,
-                services: vec![Service::Cell, Service::Transaction, Service::Query, Service::HashIndexer],
+                services: vec![
+                    Service::Cell,
+                    Service::Transaction,
+                    Service::Query,
+                    Service::HashIndexer,
+                ],
                 enable_recovery: false,
             },
             &server_addr,

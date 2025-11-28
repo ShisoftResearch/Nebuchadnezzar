@@ -321,7 +321,7 @@ impl DataManager {
                 let meta = cell_meta.lock();
                 meta.write < oldest_transaction
                     && meta.read < oldest_transaction
-                    && meta.owner.is_none()  // Don't evict if locked by a transaction
+                    && meta.owner.is_none() // Don't evict if locked by a transaction
             };
 
             if should_evict {
@@ -425,10 +425,8 @@ impl DataManager {
                     }
                     Some(other_tid) => {
                         // Lock owned by different transaction - this is a problem
-                        let reason = format!(
-                            "Cell lock owned by different transaction: {:?}",
-                            other_tid
-                        );
+                        let reason =
+                            format!("Cell lock owned by different transaction: {:?}", other_tid);
                         warn!(
                             "Cannot release lock on cell {:?} for {:?}: {}",
                             cell_id, tid, reason
@@ -1072,14 +1070,13 @@ impl Service for DataManager {
             if retry_attempt > 0 {
                 debug!(
                     "Retrying lock release for {:?} (attempt {}/{})",
-                    tid,
-                    retry_attempt,
-                    MAX_LOCK_RELEASE_RETRIES
+                    tid, retry_attempt, MAX_LOCK_RELEASE_RETRIES
                 );
                 std::thread::sleep(Duration::from_millis(LOCK_RELEASE_RETRY_BACKOFF_MS));
             }
 
-            let (released_count, failed_releases) = self.attempt_lock_release(&tid, &affected_cell_ids);
+            let (released_count, failed_releases) =
+                self.attempt_lock_release(&tid, &affected_cell_ids);
             let total_cells = affected_cell_ids.len();
 
             if failed_releases.is_empty() {
@@ -1166,10 +1163,8 @@ impl Service for DataManager {
                     );
                     if failures.len() == total {
                         // Complete failure - retries exhausted
-                        self.response_with(EndResult::LockReleaseRetriesExhausted {
-                            failures,
-                        })
-                        .await
+                        self.response_with(EndResult::LockReleaseRetriesExhausted { failures })
+                            .await
                     } else {
                         // Partial failure
                         self.response_with(EndResult::SomeLocksNotReleased {
@@ -1183,10 +1178,8 @@ impl Service for DataManager {
                 None => {
                     // This shouldn't happen, but handle it gracefully
                     error!("ENDED: {:?} with unknown lock release status", tid);
-                    self.response_with(EndResult::LockReleaseRetriesExhausted {
-                        failures: vec![],
-                    })
-                    .await
+                    self.response_with(EndResult::LockReleaseRetriesExhausted { failures: vec![] })
+                        .await
                 }
             }
         }

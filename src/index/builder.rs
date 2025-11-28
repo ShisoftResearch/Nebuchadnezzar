@@ -132,7 +132,9 @@ impl IndexMeta {
                 if let Some(indexer) = indexers.fulltext_indexer() {
                     indexer.add_document(meta).await?;
                 } else {
-                    return Err(IndexError::Other("Inverted indexer not available".to_string()));
+                    return Err(IndexError::Other(
+                        "Inverted indexer not available".to_string(),
+                    ));
                 }
             }
         }
@@ -167,7 +169,9 @@ impl IndexMeta {
                 if let Some(indexer) = indexers.fulltext_indexer() {
                     indexer.remove_document(meta).await?;
                 } else {
-                    return Err(IndexError::Other("Inverted indexer not available".to_string()));
+                    return Err(IndexError::Other(
+                        "Inverted indexer not available".to_string(),
+                    ));
                 }
             }
         }
@@ -201,10 +205,15 @@ impl IndexBuilder {
     ) -> Self {
         let _ = IndexerClients::init_index_schema(neb_client).await;
         Self {
-            clients: Arc::new(IndexerClients::new(neb_client, conshash, raft_client, server_id)),
+            clients: Arc::new(IndexerClients::new(
+                neb_client,
+                conshash,
+                raft_client,
+                server_id,
+            )),
         }
     }
-    
+
     /// Initialize the inverted indexer with chunks (called after chunks creation)
     pub fn initialize_inverted_indexer(&self, chunks: &Arc<crate::ram::chunk::Chunks>) {
         self.clients.initialize_inverted_indexer(chunks);

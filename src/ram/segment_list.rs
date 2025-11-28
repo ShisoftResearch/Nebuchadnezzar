@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// A lock-free array-based segment list that provides O(1) access by segment ID.
 /// Uses AtomicArc from Lightning to allow concurrent reads and updates without locks.
 /// Similar to LinkedHashMap but optimized for dense, sequential segment IDs.
-/// 
+///
 /// A bitmap is maintained for fast iteration and counting:
 /// - Iteration: O(capacity/64) instead of O(capacity)
 /// - Count: O(capacity/64) using popcnt instead of full scan
@@ -26,7 +26,7 @@ impl SegmentList {
         for _ in 0..capacity {
             segments.push(AtomicArc::null());
         }
-        
+
         // Create bitmap: one u64 per 64 segments
         // Formula: (capacity + 63) / 64 ensures we have enough words
         // For capacity=64: (64+63)/64 = 1 word (covers 0..63)
@@ -40,7 +40,7 @@ impl SegmentList {
         for _ in 0..bitmap_size {
             bitmap.push(AtomicU64::new(0));
         }
-        
+
         // Verify bitmap size is sufficient for all valid indices
         if capacity > 0 {
             let max_index = capacity - 1;
@@ -51,49 +51,55 @@ impl SegmentList {
                 bitmap_size, capacity, max_index, required_word_index
             );
         }
-        
+
         SegmentList { segments, bitmap }
     }
-    
+
     /// Set a bit in the bitmap
     #[inline]
     fn set_bit(&self, index: usize) {
         let word_index = index >> 6; // Divide by 64
-        let bit_index = index & 63;  // Modulo 64
-        // Runtime bounds check to prevent heap corruption
+        let bit_index = index & 63; // Modulo 64
+                                    // Runtime bounds check to prevent heap corruption
         #[cfg(debug_assertions)]
         if word_index >= self.bitmap.len() {
             panic!(
                 "Bitmap word_index {} out of bounds (bitmap len: {}, index: {}, capacity: {})",
-                word_index, self.bitmap.len(), index, self.segments.len()
+                word_index,
+                self.bitmap.len(),
+                index,
+                self.segments.len()
             );
         }
         let mask = 1u64 << bit_index;
         self.bitmap[word_index].fetch_or(mask, Ordering::Release);
     }
-    
+
     /// Clear a bit in the bitmap
     #[inline]
     fn clear_bit(&self, index: usize) {
         let word_index = index >> 6; // Divide by 64
-        let bit_index = index & 63;  // Modulo 64
-        // Runtime bounds check to prevent heap corruption
+        let bit_index = index & 63; // Modulo 64
+                                    // Runtime bounds check to prevent heap corruption
         #[cfg(debug_assertions)]
         if word_index >= self.bitmap.len() {
             panic!(
                 "Bitmap word_index {} out of bounds (bitmap len: {}, index: {}, capacity: {})",
-                word_index, self.bitmap.len(), index, self.segments.len()
+                word_index,
+                self.bitmap.len(),
+                index,
+                self.segments.len()
             );
         }
         let mask = !(1u64 << bit_index);
         self.bitmap[word_index].fetch_and(mask, Ordering::Release);
     }
-    
+
     /// Check if a bit is set in the bitmap
     #[inline]
     fn is_bit_set(&self, index: usize) -> bool {
         let word_index = index >> 6; // Divide by 64
-        let bit_index = index & 63;  // Modulo 64
+        let bit_index = index & 63; // Modulo 64
         if word_index >= self.bitmap.len() {
             return false;
         }
@@ -113,10 +119,10 @@ impl SegmentList {
         }
 
         let old = self.segments[key].swap_ref(segment);
-        
+
         // Update bitmap: set the bit for this segment
         self.set_bit(key);
-        
+
         if old.is_null() {
             None
         } else {
@@ -147,7 +153,7 @@ impl SegmentList {
         }
 
         let old = self.segments[*key].swap_ref(AArc::null());
-        
+
         if old.is_null() {
             None
         } else {
@@ -183,10 +189,10 @@ impl SegmentList {
         BitmapIterator {
             segment_list: self,
             word_index: 0,
-            current_word: if !self.bitmap.is_empty() { 
-                self.bitmap[0].load(Ordering::Acquire) 
-            } else { 
-                0 
+            current_word: if !self.bitmap.is_empty() {
+                self.bitmap[0].load(Ordering::Acquire)
+            } else {
+                0
             },
         }
     }
@@ -273,13 +279,13 @@ impl<'a> Iterator for BitmapIterator<'a> {
                     return Some(segment_id);
                 }
             }
-            
+
             // Move to next word
             self.word_index += 1;
             if self.word_index >= self.segment_list.bitmap.len() {
                 return None;
             }
-            
+
             // Load next word
             self.current_word = self.segment_list.bitmap[self.word_index].load(Ordering::Acquire);
         }

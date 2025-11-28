@@ -174,7 +174,7 @@ impl Cleaner {
                     segments_for_compact.len(),
                     chunk.id
                 );
-                
+
                 // Use global thread pool for compact cleaning
                 compacter_cleaned_space += COMPACT_CLEAN_POOL.install(|| {
                     segments_for_compact

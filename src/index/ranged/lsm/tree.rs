@@ -62,7 +62,10 @@ impl LSMTree {
                 use crate::ram::cell::WriteError;
                 match e {
                     WriteError::CellAlreadyExisted => {
-                        info!("LSM tree cell already exists for {:?}, recovering from existing cell", id);
+                        info!(
+                            "LSM tree cell already exists for {:?}, recovering from existing cell",
+                            id
+                        );
                         Self::recover(neb_client, id).await
                     }
                     _ => {

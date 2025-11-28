@@ -11,9 +11,9 @@ use crate::ram::schema::{Field, Schema};
 use crate::ram::types::{Id, Map, OwnedMap, OwnedPrimArray, OwnedValue, SharedValue};
 
 // Submodules
+pub mod coordinator;
 pub mod hybrid;
 pub mod rpc;
-pub mod coordinator;
 
 // ============================================================================
 // Constants and Configuration
@@ -38,7 +38,7 @@ lazy_static! {
     pub static ref INVERTED_INDEX_SCHEMA_ID: u32 = hash_str(INVERTED_INDEX_SCHEMA) as u32;
     pub static ref INVERTED_STATS_SCHEMA_ID: u32 = hash_str(INVERTED_STATS_SCHEMA) as u32;
     pub static ref INVERTED_DOC_SCHEMA_ID: u32 = hash_str(INVERTED_DOC_SCHEMA) as u32;
-    
+
     // Made public for use in submodules
     pub(crate) static ref DOC_IDS_FIELD_ID: u64 = hash_str(DOC_IDS_FIELD);
     pub(crate) static ref TERM_FREQS_FIELD_ID: u64 = hash_str(TERM_FREQS_FIELD);
@@ -242,4 +242,3 @@ pub(crate) fn bm25_score(tf: f32, doc_len: f32, avg_doc_len: f32, idf: f32) -> f
     }
     idf * (tf * (BM25_K1 + 1.0)) / denom
 }
-

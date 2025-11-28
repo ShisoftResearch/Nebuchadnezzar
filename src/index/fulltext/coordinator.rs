@@ -5,11 +5,10 @@
 /// 2. Aggregation of results from multiple nodes
 /// 3. Global statistics computation
 /// 4. Transparent routing to appropriate nodes
-
 use std::collections::HashMap;
 
 use bifrost::conshash::ConsistentHashing;
-use bifrost::rpc::{ClientPool, RPCError, RPCClient};
+use bifrost::rpc::{ClientPool, RPCClient, RPCError};
 use futures::future::join_all;
 use log::error;
 
@@ -18,13 +17,12 @@ use crate::ram::types::Id;
 use crate::server::NebServer;
 use std::sync::Arc;
 
-use super::{BM25Hit, bm25_score, compute_idf, tokenize_query};
 use super::rpc::{
-    InvertedSearchRequest, InvertedSearchResponse,
-    FieldStatsRequest, FieldStatsResponse,
-    TermPostingsRequest, TermPostingsResponse,
-    AsyncServiceClient, DEFAULT_SERVICE_ID, InvertedIndexError,
+    AsyncServiceClient, FieldStatsRequest, FieldStatsResponse, InvertedIndexError,
+    InvertedSearchRequest, InvertedSearchResponse, TermPostingsRequest, TermPostingsResponse,
+    DEFAULT_SERVICE_ID,
 };
+use super::{bm25_score, compute_idf, tokenize_query, BM25Hit};
 
 /// Distributed inverted index coordinator
 ///
@@ -47,9 +45,7 @@ impl DistributedInvertedIndexCoordinator {
     async fn get_all_server_ids(&self) -> Vec<u64> {
         // Get all active members from the membership
         match self.conshash.membership().all_members(true).await {
-            Ok((members, _)) => {
-                members.into_iter().map(|m| m.id).collect()
-            }
+            Ok((members, _)) => members.into_iter().map(|m| m.id).collect(),
             Err(e) => {
                 error!("Failed to get all members: {:?}", e);
                 vec![]
@@ -61,16 +57,17 @@ impl DistributedInvertedIndexCoordinator {
     async fn get_client(&self, server_id: u64) -> Result<Arc<AsyncServiceClient>, RPCError> {
         // Get the server address from consistent hashing
         let server_addr = self.conshash.to_server_name(server_id);
-        
+
         // Get or create RPC client from the client pool
-        let rpc_client = self.client_pool
+        let rpc_client = self
+            .client_pool
             .get_by_id(server_id, |_| server_addr)
             .await
             .map_err(|e| RPCError::IOError(e))?;
-        
+
         // Create the async service client using helper function
         let service_client = client_by_rpc_client(&rpc_client);
-        
+
         Ok(service_client)
     }
 
@@ -108,9 +105,7 @@ impl DistributedInvertedIndexCoordinator {
                 query: query.to_string(),
                 limit, // Each node returns top K
             };
-            tasks.push(async move {
-                client.search_local(req).await
-            });
+            tasks.push(async move { client.search_local(req).await });
         }
 
         let responses = join_all(tasks).await;
@@ -154,7 +149,8 @@ impl DistributedInvertedIndexCoordinator {
                 global_doc_count,
                 global_total_length,
                 limit,
-            ).await?
+            )
+            .await?
         } else {
             // Simple merge: sum scores for duplicate documents
             self.merge_hits(all_hits, limit)
@@ -222,7 +218,7 @@ impl DistributedInvertedIndexCoordinator {
 
         for term_hash in &query_terms {
             let mut all_postings = vec![];
-            
+
             for server_id in &server_ids {
                 let client = self.get_client(*server_id).await?;
                 let req = TermPostingsRequest {
@@ -230,7 +226,7 @@ impl DistributedInvertedIndexCoordinator {
                     field_id,
                     term_hash: *term_hash,
                 };
-                
+
                 match client.get_term_postings(req).await {
                     Ok(Ok(resp)) => {
                         all_postings.extend(resp.postings);
@@ -245,13 +241,13 @@ impl DistributedInvertedIndexCoordinator {
                     }
                 }
             }
-            
+
             term_postings.insert(*term_hash, all_postings);
         }
 
         // Recompute BM25 scores with global statistics
         let mut new_scores: HashMap<Id, f32> = HashMap::new();
-        
+
         for term_hash in query_terms {
             if let Some(postings) = term_postings.get(&term_hash) {
                 // Global document frequency for this term
@@ -259,20 +255,20 @@ impl DistributedInvertedIndexCoordinator {
                 if df == 0 {
                     continue;
                 }
-                
+
                 // Compute global IDF
                 let idf = compute_idf(global_doc_count, df);
                 if idf <= 0.0 {
                     continue;
                 }
-                
+
                 // Update scores for each document
                 for (doc_id, tf, doc_len) in postings {
                     // Only score documents that were in the original result set
                     if !doc_ids.contains_key(doc_id) {
                         continue;
                     }
-                    
+
                     let score = bm25_score(*tf as f32, *doc_len as f32, avg_doc_len, idf);
                     if score > 0.0 {
                         *new_scores.entry(*doc_id).or_insert(0.0) += score;
@@ -286,7 +282,7 @@ impl DistributedInvertedIndexCoordinator {
             .into_iter()
             .map(|(id, score)| BM25Hit { id, score })
             .collect();
-        
+
         final_hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
         if final_hits.len() > limit {
             final_hits.truncate(limit);
@@ -303,13 +299,14 @@ impl DistributedInvertedIndexCoordinator {
     ) -> Result<FieldStatsResponse, RPCError> {
         let server_ids = self.get_all_server_ids().await;
         let mut tasks = vec![];
-        
+
         for server_id in &server_ids {
             let client = self.get_client(*server_id).await?;
-            let req = FieldStatsRequest { schema_id, field_id };
-            tasks.push(async move {
-                client.get_field_stats(req).await
-            });
+            let req = FieldStatsRequest {
+                schema_id,
+                field_id,
+            };
+            tasks.push(async move { client.get_field_stats(req).await });
         }
 
         let responses = join_all(tasks).await;
@@ -392,12 +389,17 @@ impl CoordinatorBuilder {
     }
 
     pub fn build(self) -> Result<DistributedInvertedIndexCoordinator, String> {
-        let conshash = self.conshash
+        let conshash = self
+            .conshash
             .ok_or_else(|| "ConsistentHashing not set".to_string())?;
-        let client_pool = self.client_pool
+        let client_pool = self
+            .client_pool
             .ok_or_else(|| "ClientPool not set".to_string())?;
-        
-        Ok(DistributedInvertedIndexCoordinator::new(conshash, client_pool))
+
+        Ok(DistributedInvertedIndexCoordinator::new(
+            conshash,
+            client_pool,
+        ))
     }
 }
 
@@ -406,4 +408,3 @@ impl Default for CoordinatorBuilder {
         Self::new()
     }
 }
-

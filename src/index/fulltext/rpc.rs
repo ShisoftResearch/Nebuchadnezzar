@@ -1,18 +1,17 @@
 /// RPC service for distributed inverted index queries
-/// 
+///
 /// Each server exposes an RPC endpoint that allows coordinators to:
 /// 1. Query the local partition (owned documents only)
 /// 2. Aggregate results from multiple nodes
 /// 3. Return partial results for distributed BM25 scoring
-
 use bifrost::rpc::*;
 use bifrost_plugins::hash_ident;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use super::{hybrid::HybridInvertedIndexer, BM25Hit};
 use crate::ram::types::Id;
-use super::{BM25Hit, hybrid::HybridInvertedIndexer};
 
 pub static DEFAULT_SERVICE_ID: u64 = hash_ident!(NEB_INVERTED_INDEX_RPC_SERVICE) as u64;
 
@@ -89,42 +88,62 @@ service! {
 service_with_id!(InvertedIndexRPCService, DEFAULT_SERVICE_ID);
 
 impl Service for InvertedIndexRPCService {
-    fn search_local(&self, req: InvertedSearchRequest) -> BoxFuture<'_, Result<InvertedSearchResponse, InvertedIndexError>> {
+    fn search_local(
+        &self,
+        req: InvertedSearchRequest,
+    ) -> BoxFuture<'_, Result<InvertedSearchResponse, InvertedIndexError>> {
         async move {
-            let hits = self.indexer
+            let hits = self
+                .indexer
                 .bm25_search(req.schema_id, req.field_id, &req.query, req.limit)
                 .await
                 .map_err(|e| InvertedIndexError::SearchError(format!("{:?}", e)))?;
 
-            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id).await;
+            let stats = self
+                .indexer
+                .get_field_stats(req.schema_id, req.field_id)
+                .await;
 
             Ok(InvertedSearchResponse {
                 hits,
                 local_doc_count: stats.doc_count,
                 local_total_length: stats.total_length,
             })
-        }.boxed()
+        }
+        .boxed()
     }
 
-    fn get_field_stats(&self, req: FieldStatsRequest) -> BoxFuture<'_, Result<FieldStatsResponse, InvertedIndexError>> {
+    fn get_field_stats(
+        &self,
+        req: FieldStatsRequest,
+    ) -> BoxFuture<'_, Result<FieldStatsResponse, InvertedIndexError>> {
         async move {
-            let stats = self.indexer.get_field_stats(req.schema_id, req.field_id).await;
+            let stats = self
+                .indexer
+                .get_field_stats(req.schema_id, req.field_id)
+                .await;
 
             Ok(FieldStatsResponse {
                 doc_count: stats.doc_count,
                 total_length: stats.total_length,
             })
-        }.boxed()
+        }
+        .boxed()
     }
 
-    fn get_term_postings(&self, req: TermPostingsRequest) -> BoxFuture<'_, Result<TermPostingsResponse, InvertedIndexError>> {
+    fn get_term_postings(
+        &self,
+        req: TermPostingsRequest,
+    ) -> BoxFuture<'_, Result<TermPostingsResponse, InvertedIndexError>> {
         async move {
-            let postings = self.indexer
+            let postings = self
+                .indexer
                 .get_term_postings(req.schema_id, req.field_id, req.term_hash)
                 .await;
 
             Ok(TermPostingsResponse { postings })
-        }.boxed()
+        }
+        .boxed()
     }
 }
 
