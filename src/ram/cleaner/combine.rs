@@ -11,16 +11,22 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use libc;
 
+// Rayon threads default to a small stack; combining can touch large frames when
+// copying entries. Give the pools a larger stack to avoid overflow under heavy loads.
+const COMBINE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024; // 8MB
+
 lazy_static! {
     /// Global thread pool for segment allocation during combine operations
     static ref COMBINE_ALLOC_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("combine-alloc-t{}", idx))
+        .stack_size(COMBINE_THREAD_STACK_SIZE)
         .build()
         .unwrap();
 
     /// Global thread pool for cell index updates during combine operations
     static ref COMBINE_UPDATE_POOL: rayon::ThreadPool = rayon::ThreadPoolBuilder::new()
         .thread_name(|idx| format!("combine-update-t{}", idx))
+        .stack_size(COMBINE_THREAD_STACK_SIZE)
         .build()
         .unwrap();
 }

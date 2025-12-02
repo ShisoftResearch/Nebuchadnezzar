@@ -34,8 +34,8 @@ static GLOBAL_CHUNKS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 static MAX_SEGMENTS_FOR_CLEANER: usize = 16;
 
-static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.30f32;
-static DEAD_RATE_FOR_COMPACT_CLEANER: f32 = 0.5f32;
+static DEAD_RATE_FOR_COMBINE_CLEANER: f32 = 0.50f32;
+static DEAD_RATE_FOR_COMPACT_CLEANER: f32 = 0.75f32;
 
 /// Get the current global chunk base address
 pub fn get_global_chunk_base() -> usize {
